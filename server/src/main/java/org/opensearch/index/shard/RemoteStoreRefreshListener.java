@@ -34,7 +34,6 @@ import org.opensearch.index.remote.RemoteSegmentTransferTracker;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.store.DataFormatAwareStoreDirectory;
 import org.opensearch.index.store.RemoteSegmentStoreDirectory;
-import org.opensearch.index.store.remote.MetadataUploadContext;
 import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadata;
 import org.opensearch.index.translog.Translog;
 import org.opensearch.indices.RemoteStoreSettings;
@@ -516,18 +515,15 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
             throw new UnsupportedOperationException("Encountered null TranslogGeneration while uploading metadata to remote segment store");
         } else {
             long translogFileGeneration = translogGeneration.translogFileGeneration;
-            remoteDirectory.getActiveStrategy()
-                .uploadMetadata(
-                    new MetadataUploadContext(
-                        localSegmentsPostRefresh,
-                        catalogSnapshotCloned,
-                        storeDirectory,
-                        translogFileGeneration,
-                        replicationCheckpoint,
-                        indexShard.getNodeId(),
-                        serializer
-                    )
-                );
+            remoteDirectory.uploadMetadata(
+                localSegmentsPostRefresh,
+                catalogSnapshotCloned,
+                storeDirectory,
+                translogFileGeneration,
+                replicationCheckpoint,
+                indexShard.getNodeId(),
+                serializer
+            );
         }
     }
 

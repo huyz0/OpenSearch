@@ -24,7 +24,6 @@ import org.opensearch.index.store.RemoteDirectory;
 import org.opensearch.index.store.RemoteSegmentStoreDirectory;
 import org.opensearch.index.store.lockmanager.RemoteStoreLockManager;
 import org.opensearch.index.store.remote.RemoteStoreSegmentStrategy;
-import org.opensearch.index.store.remote.UploadContext;
 import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadata;
 import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadataHandlerFactory;
 import org.opensearch.test.OpenSearchTestCase;
@@ -168,35 +167,42 @@ public class TarSegmentUploadStrategyTests extends OpenSearchTestCase {
                 Collections.emptyMap(),
                 0L
             );
-        TarSegmentUploadStrategy baseStrategy = new TarSegmentUploadStrategy();
-        RemoteStoreSegmentStrategy strategy = baseStrategy.getShardInstance(remoteDirectory, remoteMetadataDir, shardId);
+        RemoteStoreSegmentStrategy strategy = new TarSegmentUploadStrategy();
         remoteDirectory.setStrategySupplier(() -> strategy);
         AtomicBoolean listenerCalled = new AtomicBoolean(false);
-        ActionListener<Void> listener = ActionListener.wrap(
-            resp -> listenerCalled.set(true),
-            ex -> fail("Upload failed: " + ex.getMessage())
-        );
+        RemoteStoreSegmentStrategy.UploadListener listener = new RemoteStoreSegmentStrategy.UploadListener() {
+            @Override
+            public void onUploadStart(String file) {}
 
-        UploadContext context = new UploadContext(
-            Arrays.asList("_1.cfe", "_1.cfs"),
-            Arrays.asList("_1.cfe", "_1.cfs"),
+            @Override
+            public void onUploadSuccess(String file) {}
+
+            @Override
+            public void onUploadFailure(String file, Exception ex) {}
+
+            @Override
+            public void onAllUploadsSuccess() {
+                listenerCalled.set(true);
+            }
+
+            @Override
+            public void onAllUploadsFailure(Exception ex) {
+                fail("Upload failed: " + ex.getMessage());
+            }
+        };
+
+        RemoteStoreSegmentStrategy.UploadContext context = new RemoteStoreSegmentStrategy.UploadContext(
+            Arrays.asList(
+                new RemoteStoreSegmentStrategy.UploadContext.SegmentFile("_1.cfe", true),
+                new RemoteStoreSegmentStrategy.UploadContext.SegmentFile("_1.cfs", true)
+            ),
             storeDirectory,
             checkpoint,
-            new RemoteStoreSegmentStrategy.UploadCallback() {
-                @Override
-                public void onUploadStart(String file) {}
-
-                @Override
-                public void onUploadSuccess(String file) {}
-
-                @Override
-                public void onUploadFailure(String file, Exception ex) {}
-            },
             false,
             null
         );
 
-        strategy.upload(context, listener);
+        strategy.upload(remoteDirectory, shardId, context, listener);
 
         assertTrue(listenerCalled.get());
 

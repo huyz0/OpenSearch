@@ -99,110 +99,73 @@ graph TD
 
 ### 1. Strategy Interface Contracts
 
-#### A. `RemoteStoreSegmentStrategy`
-Abstracts remote segment storage layouts, transfers, and restoration. The strategy controls how segments are packaged, uploaded, and read, defining separate hooks for uploading data (`upload`) and uploading metadata (`uploadMetadata`). This separation allows strategies to determine whether to write separate metadata files (like the default strategy) or make `uploadMetadata` a complete no-op (like the tar strategy, which bundles metadata inline within the data archive as `index.bin`). By delegating read operations (`openInput`, `fileLength`), the strategy can decide how to retrieve data (for example, by utilizing block-range seeks directly on a bundled `.tar` archive containing an inline catalog without needing separate metadata files on S3), keeping the OpenSearch core clean of format-specific logic.
-
+##### A. `RemoteStoreSegmentStrategy`
+Abstracts remote segment storage layouts, transfers, and restoration. The strategy controls how segments are packaged, uploaded, and deleted, defining separate hooks for uploading data (`upload`) and uploading metadata (`uploadMetadata`). 
+This separation allows strategies to determine whether to write separate metadata files (like the default strategy) or make `uploadMetadata` a complete no-op (like the tar strategy, which bundles metadata inline within the data archive as `index.bin`). 
+By encapsulating metadata queries under a decoupled `MetadataReader`, the strategy can decide how to discover and retrieve metadata (for example, by utilizing block-range seeks to read metadata inline from a bundled archive rather than listing separate files on the remote store), keeping the OpenSearch core clean of format-specific logic.
 
 ```java
 @ExperimentalApi
 public interface RemoteStoreSegmentStrategy {
 
-    /**
-     * Callback interface to notify about upload lifecycle events per segment file.
-     */
+    void upload(RemoteSegmentStoreDirectory remoteDirectory, ShardId shardId, UploadContext context, UploadListener listener)
+        throws IOException;
+
+    void uploadMetadata(RemoteSegmentStoreDirectory remoteDirectory, ShardId shardId, MetadataUploadContext context) throws IOException;
+
+    void deleteStaleSegments(RemoteSegmentStoreDirectory remoteDirectory, ShardId shardId, int minCommitsToKeep) throws IOException;
+
+    void deleteFile(RemoteSegmentStoreDirectory remoteDirectory, ShardId shardId, String name) throws IOException;
+
+    MetadataReader getMetadataReader(RemoteSegmentStoreDirectory remoteDirectory, ShardId shardId);
+
     @ExperimentalApi
-    interface UploadCallback {
+    public static record UploadContext(Collection<SegmentFile> segmentFiles, Directory storeDirectory, ReplicationCheckpoint checkpoint,
+        boolean isLowPriorityUpload, CryptoMetadata cryptoMetadata) {
+
+        @ExperimentalApi
+        public static record SegmentFile(String name, boolean toUpload) {
+        }
+    }
+
+    @ExperimentalApi
+    public interface UploadListener {
         void onUploadStart(String file);
 
         void onUploadSuccess(String file);
 
         void onUploadFailure(String file, Exception ex);
+
+        void onAllUploadsSuccess();
+
+        void onAllUploadsFailure(Exception ex);
     }
 
-    void upload(
-        Collection<String> localSegments,
-        Map<String, Long> localSegmentsSizeMap,
-        Collection<String> activeFiles,
-        Directory storeDirectory,
-        RemoteSegmentStoreDirectory remoteDirectory,
-        ReplicationCheckpoint checkpoint,
-        ActionListener<Void> listener,
-        UploadCallback callback,
-        boolean isLowPriorityUpload,
-        CryptoMetadata cryptoMetadata
-    ) throws IOException;
+    @ExperimentalApi
+    public static record MetadataUploadContext(Collection<String> activeSegmentFiles, CatalogSnapshot catalogSnapshot,
+        Directory storeDirectory, long translogGeneration, ReplicationCheckpoint checkpoint, String nodeId, CheckedFunction<
+            CatalogSnapshot,
+            byte[],
+            IOException> catalogSnapshotToCommitSerializer) {
+    }
 
-    void uploadMetadata(
-        Collection<String> segmentFiles,
-        CatalogSnapshot catalogSnapshot,
-        Directory storeDirectory,
-        long translogGeneration,
-        ReplicationCheckpoint replicationCheckpoint,
-        String nodeId,
-        CheckedFunction<CatalogSnapshot, byte[], IOException> catalogSnapshotToCommitSerializer,
-        RemoteSegmentStoreDirectory remoteDirectory
-    ) throws IOException;
+    @ExperimentalApi
+    public interface MetadataReader {
 
-    RemoteSegmentMetadata init(RemoteDirectory remoteDataDirectory, RemoteDirectory remoteMetadataDirectory, ShardId shardId)
-        throws IOException;
+        RemoteSegmentMetadata readMetadata() throws IOException;
 
-    IndexInput openInput(
-        String name,
-        IOContext context,
-        RemoteDirectory remoteDataDirectory,
-        Map<String, RemoteSegmentStoreDirectory.UploadedSegmentMetadata> uploadedSegments
-    ) throws IOException;
+        RemoteSegmentMetadata readMetadata(long primaryTerm, long generation) throws IOException;
 
-    IndexInput openBlockInput(
-        String name,
-        long position,
-        long length,
-        IOContext context,
-        RemoteDirectory remoteDataDirectory,
-        Map<String, RemoteSegmentStoreDirectory.UploadedSegmentMetadata> uploadedSegments
-    ) throws IOException;
+        RemoteSegmentMetadata readMetadata(long timestamp) throws IOException;
 
-    long fileLength(
-        String name,
-        RemoteDirectory remoteDataDirectory,
-        Map<String, RemoteSegmentStoreDirectory.UploadedSegmentMetadata> uploadedSegments
-    ) throws IOException;
+        RemoteSegmentMetadata readMetadata(String filename) throws IOException;
 
-    void deleteStaleSegments(RemoteSegmentStoreDirectory remoteDirectory, int minCommitsToKeep) throws IOException;
+        Map<String, RemoteSegmentMetadata> readLatestNMetadata(int count) throws IOException;
 
-    void deleteFile(String name, RemoteSegmentStoreDirectory remoteDirectory) throws IOException;
-
-    String getMetadataFileForCommit(
-        long primaryTerm,
-        long generation,
-        RemoteDirectory remoteDataDirectory,
-        RemoteDirectory remoteMetadataDirectory
-    ) throws IOException;
-
-    RemoteSegmentMetadata readMetadata(String filename, RemoteDirectory remoteDataDirectory, RemoteDirectory remoteMetadataDirectory)
-        throws IOException;
-
-    RemoteSegmentMetadata initializeToSpecificTimestamp(
-        long timestamp,
-        RemoteDirectory remoteDataDirectory,
-        RemoteDirectory remoteMetadataDirectory
-    ) throws IOException;
-
-    RemoteSegmentMetadata initializeToSpecificCommit(
-        long primaryTerm,
-        long commitGeneration,
-        String acquirerId,
-        RemoteDirectory remoteDataDirectory,
-        RemoteDirectory remoteMetadataDirectory,
-        RemoteStoreLockManager mdLockManager
-    ) throws IOException;
-
-    Map<String, RemoteSegmentMetadata> readLatestNMetadataFiles(
-        int count,
-        RemoteDirectory remoteDataDirectory,
-        RemoteDirectory remoteMetadataDirectory
-    ) throws IOException;
+        String getMetadataFilename(long primaryTerm, long generation) throws IOException;
+    }
 }
+
 ```
 
 #### B. `RemoteStoreTranslogStrategy`
@@ -220,7 +183,7 @@ public interface RemoteStoreTranslogStrategy {
 
     boolean downloadTranslog(ShardId shardId, String primaryTerm, String generation, Path location) throws IOException;
 
-    default boolean download(ShardId shardId, Path location, org.apache.logging.log4j.Logger logger, boolean seedRemote, long timestamp)
+    default boolean download(ShardId shardId, Path location, boolean seedRemote, long timestamp)
         throws IOException {
         return false;
     }
@@ -280,10 +243,10 @@ Pluggable strategies can completely replace default remote store behaviors becau
 1. **Complete File Layout Autonomy**:
    * The core engine does not enforce a 1-to-1 mapping between local Lucene or translog files and S3 objects.
    * A custom strategy has full authority to write individual files, compress them, or pack multiple files into a single streamed `.tar` archive (as done in `TarSegmentUploadStrategy` and `TarTranslogUploadStrategy`).
-   * Remote file names can contain layout directives (e.g. `bundle_uuid.tar#offset`) that the strategy parses during reads.
+   * Remote file names can contain layout directives (e.g. `bundle_uuid.tar#offset`) that the strategy's metadata reader parses to resolve locations.
 2. **Metadata-Free S3 Layouts**:
    * Under the default strategy, the core uploads separate `.metadata` (segments) or `txlog_*` (translog) files to S3, which are read during recovery.
-   * Under custom strategies, metadata files can be completely eliminated. The `rbs-tar` segment strategy writes a binary `index.bin` metadata block at the start of every tar file. When `openInput` or recovery is triggered, the strategy issues an S3 Range GET to read `index.bin` and construct the metadata mapping in-memory without accessing separate metadata files on S3.
+   * Under custom strategies, metadata files can be completely eliminated. The `rbs-tar` segment strategy writes a binary `index.bin` metadata block at the start of every tar file. When recovery is triggered, the strategy's metadata reader issues an S3 Range GET to read `index.bin` and construct the metadata mapping in-memory without accessing separate metadata files on S3.
 3. **Decoupled Garbage Collection (GC)**:
    * The core's segment and translog deletion routines are delegated to the strategy interfaces.
    * For segments, the `rbs-tar` strategy intercepts deletion calls, checks dependencies across active metadata, and deletes S3 tar archives only when all constituent segments are inactive.
@@ -301,8 +264,8 @@ Allowing strategy configuration settings (`index.remote_store.segment.strategy` 
 
 * **Segment Path**: A shard's remote store repository must support reading and cleaning up segment files uploaded under different strategies.
   - **Strategy Attribution in Metadata**: When a segment file is uploaded, the name of the strategy used for its upload is recorded in the core Lucene commit metadata file (e.g., `UploadedSegmentMetadata` written once per refresh).
-  - **Delegation of Reads**: When a file is read (via `openInput`), `RemoteSegmentStoreDirectory` looks up the file's metadata and delegates the operation directly to the strategy that originally performed the upload (`strategy.openInput(...)`). This keeps the OpenSearch core entirely clean of format-specific layout details, such as offset parsing or file bundling mechanics.
-  - **Metadata-Free S3 Layout**: Because the read path is delegated entirely to the strategy, custom packaging strategies (like the tar strategy) can be completely self-contained on S3. The tar strategy puts `index.bin` as the first entry inside the `.tar` archive. When `openInput` is invoked, the plugin performs an S3 Range GET to read `index.bin` from the start of the archive and build its file-to-offset catalog, removing any need for separate metadata or coordinate files on S3.
+  - **Decoupled Reads via Uploaded Metadata**: Lucene directory reads (`openInput`) are resolved by looking up `UploadedSegmentMetadata` from the catalog. Each strategy registers a subclass implementation of `UploadedSegmentMetadata` (such as `TarUploadedSegmentMetadata`) which overrides `openStream(position, length)` to perform range requests on S3 directly using offset and size details, keeping the core completely independent of offset-seeking or bundling layouts.
+  - **Metadata-Free S3 Layout**: Because the metadata reader is decoupled, custom packaging strategies (like the tar strategy) can be completely self-contained on S3. The tar strategy puts `index.bin` as the first entry inside the `.tar` archive. During recovery or directory initialization, the strategy's `MetadataReader` performs an S3 Range GET to read `index.bin` from the start of the archive and build the file-to-offset metadata catalog, removing any need for separate metadata or coordinate files on S3.
 * **Translog Path**: During peer recovery or primary restoration, a shard reconstructs translogs across a range of generations. If the strategy has been switched, this range will contain translog files written under different formats.
   - **Metadata-Attributed Restoration**: The metadata file uploaded for each translog snapshot (`TranslogTransferMetadata`) records the strategy type used for the transfer.
   - **Generation-by-Generation Recovery**: The recovery engine iterates through generations and delegates the download of each generation file to the strategy registered in its respective metadata file.
@@ -317,29 +280,6 @@ Allowing strategy configuration settings (`index.remote_store.segment.strategy` 
 ### 3. Settings Validation
 
 * **Cluster-Wide Feature Validation**: When an index setting is updated dynamically, the cluster coordinator validates that the proposed strategy is registered and active on all nodes in the cluster before approving the settings change. This prevents shards from relocating to a node that lacks the plugin registering the strategy, which would cause initialization failures.
-
-## Architectural Consideration: Unified vs. Separated Metadata Strategies
-
-We evaluated whether metadata management (such as file listings, offset maps, or translog metadata tables) should be extracted into a separate extension point (e.g., `RemoteStoreMetadataStrategy`). 
-
-We recommend encapsulating metadata management within the individual segment and translog strategies for the following reasons:
-
-### 1. Tight Semantic Coupling
-The metadata schema is highly dependent on the physical layout chosen by the strategy.
-* For the **Default Strategy**, metadata is a simple mapping of logical file names to their corresponding remote object keys.
-* For a **Bundled/Tar Strategy**, metadata must track complex layout properties, such as physical archive keys, byte offsets, file lengths, and checksums within the archive.
-* A generic metadata interface trying to accommodate both models without leaking layout-specific details (like offsets and archive mappings) would result in a leaky abstraction.
-
-### 2. Efficiency through Co-location
-Encapsulating metadata allows strategies to implement co-location optimizations:
-* **Inline Metadata**: A bundling strategy can package the file catalog (`index.bin`) directly inside the data archive itself (e.g., as the first entry in a tar stream). This allows the strategy to download only the metadata using a small S3 Range GET on the archive, eliminating separate metadata file round-trips.
-* **Unified Transport Actions**: A bundled translog strategy can upload node-wide metadata reports and ACK them in the same network request as the translog bundle, reducing overall RPC overhead.
-* If the metadata strategy were separated, these coordinated data/metadata optimizations would require complex inter-plugin APIs.
-
-### 3. Reduced System Complexity
-By keeping metadata management within the main strategy interfaces, we:
-* Avoid configuration mismatches (such as configuring a bundled segment strategy but failing to configure the corresponding offset-aware metadata strategy).
-* Simplify the plugin developer experience by requiring the implementation of a single coherent strategy interface rather than coordinating multiple detached extension points.
 
 ## Example Use Cases
 

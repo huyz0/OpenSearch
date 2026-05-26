@@ -45,6 +45,7 @@ import org.opensearch.index.store.lockmanager.RemoteStoreCommitLevelLockManager;
 import org.opensearch.index.store.lockmanager.RemoteStoreLockManager;
 import org.opensearch.index.store.remote.FormatBlobRouter;
 import org.opensearch.index.store.remote.RemoteSegmentFile;
+import org.opensearch.index.store.remote.RemoteStoreSegmentStrategy;
 import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadata;
 import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadataHandlerFactory;
 import org.opensearch.indices.replication.checkpoint.ReplicationCheckpoint;
@@ -146,8 +147,9 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
 
     private final AtomicLong metadataUploadCounter = new AtomicLong(0);
 
-    private volatile java.util.function.Supplier<org.opensearch.index.store.remote.RemoteStoreSegmentStrategy> strategySupplier =
-        () -> new org.opensearch.index.store.remote.DefaultRemoteStoreSegmentStrategy();
+    private volatile java.util.function.Supplier<org.opensearch.index.store.remote.RemoteStoreSegmentStrategy> strategySupplier = () -> {
+        throw new IllegalStateException("Strategy supplier not initialized");
+    };
 
     public void setStrategySupplier(
         java.util.function.Supplier<org.opensearch.index.store.remote.RemoteStoreSegmentStrategy> strategySupplier
@@ -206,17 +208,7 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
         this.pendingDownloadMergedSegments = pendingDownloadMergedSegments;
         this.shardId = shardId;
         this.formatBlobRouter = remoteDataDirectory.getFormatBlobRouter().orElse(null);
-        this.strategySupplier = () -> {
-            try {
-                return new org.opensearch.index.store.remote.DefaultRemoteStoreSegmentStrategy().getShardInstance(
-                    this,
-                    remoteMetadataDirectory,
-                    shardId
-                );
-            } catch (IOException e) {
-                throw new RuntimeException(e);
-            }
-        };
+        this.strategySupplier = () -> { return new org.opensearch.index.store.remote.DefaultRemoteStoreSegmentStrategy(); };
         init();
     }
 
@@ -230,7 +222,7 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
      */
     public RemoteSegmentMetadata init() throws IOException {
         logger.debug("Start initialisation of remote segment metadata");
-        RemoteSegmentMetadata remoteSegmentMetadata = getActiveStrategy().init();
+        RemoteSegmentMetadata remoteSegmentMetadata = getMetadataReader().readMetadata();
         if (remoteSegmentMetadata != null) {
             replaceUploadedSegments(remoteSegmentMetadata.getMetadata());
         } else {
@@ -240,27 +232,8 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
         return remoteSegmentMetadata;
     }
 
-    /**
-     * Initializes the cache to a specific commit which keeps track of all the segment files uploaded to the
-     * remote segment store.
-     * this is currently used to restore snapshots, where we want to copy segment files from a given commit.
-     * TODO: check if we can return read only RemoteSegmentStoreDirectory object from here.
-     *
-     * @throws IOException if there were any failures in reading the metadata file
-     */
-    public RemoteSegmentMetadata initializeToSpecificCommit(long primaryTerm, long commitGeneration, String acquirerId) throws IOException {
-        RemoteSegmentMetadata remoteSegmentMetadata = getActiveStrategy().initializeToSpecificCommit(
-            primaryTerm,
-            commitGeneration,
-            acquirerId,
-            mdLockManager
-        );
-        if (remoteSegmentMetadata != null) {
-            replaceUploadedSegments(remoteSegmentMetadata.getMetadata());
-        } else {
-            replaceUploadedSegments(Collections.emptyMap());
-        }
-        return remoteSegmentMetadata;
+    public RemoteStoreSegmentStrategy.MetadataReader getMetadataReader() {
+        return getActiveStrategy().getMetadataReader(this, shardId);
     }
 
     /**
@@ -271,7 +244,7 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
      * @throws IOException If an I/O error occurs while reading the metadata file.
      */
     public RemoteSegmentMetadata initializeToSpecificTimestamp(long timestamp) throws IOException {
-        RemoteSegmentMetadata remoteSegmentMetadata = getActiveStrategy().initializeToSpecificTimestamp(timestamp);
+        RemoteSegmentMetadata remoteSegmentMetadata = getMetadataReader().readMetadata(timestamp);
         if (remoteSegmentMetadata != null) {
             replaceUploadedSegments(remoteSegmentMetadata.getMetadata());
         } else {
@@ -294,11 +267,11 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
      * @throws IOException if there were any failures in reading the metadata file
      */
     public RemoteSegmentMetadata readLatestMetadataFile() throws IOException {
-        return getActiveStrategy().init();
+        return getMetadataReader().readMetadata();
     }
 
     private RemoteSegmentMetadata readMetadataFile(String metadataFilename) throws IOException {
-        return getActiveStrategy().readMetadata(metadataFilename);
+        return getMetadataReader().readMetadata(metadataFilename);
     }
 
     /**
@@ -309,7 +282,7 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
      * @throws IOException if reading any metadata file fails
      */
     public Map<String, RemoteSegmentMetadata> readLatestNMetadataFiles(int count) throws IOException {
-        return getActiveStrategy().readLatestNMetadataFiles(count);
+        return getMetadataReader().readLatestNMetadata(count);
     }
 
     /**
@@ -535,7 +508,7 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
      */
     @Override
     public synchronized void deleteFile(final String name) throws IOException {
-        getActiveStrategy().deleteFile(name);
+        getActiveStrategy().deleteFile(this, shardId, name);
     }
 
     /**
@@ -720,7 +693,7 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
 
     // Visible for testing
     String getMetadataFileForCommit(long primaryTerm, long generation) throws IOException {
-        return getActiveStrategy().getMetadataFileForCommit(primaryTerm, generation);
+        return getMetadataReader().getMetadataFilename(primaryTerm, generation);
     }
 
     private void postUpload(Directory from, String src, String remoteFilename, String checksum) throws IOException {
@@ -815,7 +788,9 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
         CheckedFunction<CatalogSnapshot, byte[], IOException> catalogSnapshotToCommitSerializer
     ) throws IOException {
         getActiveStrategy().uploadMetadata(
-            new org.opensearch.index.store.remote.MetadataUploadContext(
+            this,
+            shardId,
+            new org.opensearch.index.store.remote.RemoteStoreSegmentStrategy.MetadataUploadContext(
                 segmentFiles,
                 catalogSnapshot,
                 storeDirectory,
@@ -936,7 +911,7 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
 
     /**
      * Replace entire uploaded segments map + rebuild format cache.
-     * Called by init(), initializeToSpecificCommit(), initializeToSpecificTimestamp().
+     * Called by init(), initializeToSpecificTimestamp().
      */
     private void replaceUploadedSegments(Map<String, ? extends RemoteSegmentFile> newSegments) {
         Map<String, UploadedSegmentMetadata> castMap = newSegments.entrySet()
@@ -1072,7 +1047,7 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
      * @throws IOException in case of I/O error while reading from / writing to remote segment store
      */
     public void deleteStaleSegments(int lastNMetadataFilesToKeep) throws IOException {
-        getActiveStrategy().deleteStaleSegments(lastNMetadataFilesToKeep);
+        getActiveStrategy().deleteStaleSegments(this, shardId, lastNMetadataFilesToKeep);
     }
 
     public void deleteStaleSegmentsAsync(int lastNMetadataFilesToKeep) {

@@ -27,12 +27,9 @@ import org.opensearch.index.remote.RemoteStoreUtils;
 import org.opensearch.index.store.RemoteDirectory;
 import org.opensearch.index.store.RemoteSegmentStoreDirectory;
 import org.opensearch.index.store.RemoteSegmentStoreDirectory.UploadedSegmentMetadata;
-import org.opensearch.index.store.lockmanager.RemoteStoreLockManager;
 import org.opensearch.index.store.lockmanager.RemoteStoreMetadataLockManager;
-import org.opensearch.index.store.remote.MetadataUploadContext;
 import org.opensearch.index.store.remote.RemoteSegmentFile;
 import org.opensearch.index.store.remote.RemoteStoreSegmentStrategy;
-import org.opensearch.index.store.remote.UploadContext;
 import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadata;
 import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadataHandlerFactory;
 import org.opensearch.indices.replication.checkpoint.ReplicationCheckpoint;
@@ -43,13 +40,13 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.NoSuchFileException;
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * A segment upload strategy that packages segment files of a refresh batch into a single tar archive.
@@ -59,37 +56,7 @@ public final class TarSegmentUploadStrategy implements RemoteStoreSegmentStrateg
 
     private static final Logger logger = LogManager.getLogger(TarSegmentUploadStrategy.class);
 
-    private final RemoteSegmentStoreDirectory remoteDirectory;
-    private final RemoteDirectory remoteDataDirectory;
-    private final RemoteDirectory remoteMetadataDirectory;
-    private final ShardId shardId;
-
-    public TarSegmentUploadStrategy() {
-        this.remoteDirectory = null;
-        this.remoteDataDirectory = null;
-        this.remoteMetadataDirectory = null;
-        this.shardId = null;
-    }
-
-    private TarSegmentUploadStrategy(
-        RemoteSegmentStoreDirectory remoteDirectory,
-        RemoteDirectory remoteMetadataDirectory,
-        ShardId shardId
-    ) {
-        this.remoteDirectory = remoteDirectory;
-        this.remoteDataDirectory = (RemoteDirectory) remoteDirectory.getDelegate();
-        this.remoteMetadataDirectory = remoteMetadataDirectory;
-        this.shardId = shardId;
-    }
-
-    @Override
-    public RemoteStoreSegmentStrategy getShardInstance(
-        RemoteSegmentStoreDirectory remoteDirectory,
-        RemoteDirectory remoteMetadataDirectory,
-        ShardId shardId
-    ) throws IOException {
-        return new TarSegmentUploadStrategy(remoteDirectory, remoteMetadataDirectory, shardId);
-    }
+    public TarSegmentUploadStrategy() {}
 
     public static String getBundleFilename(
         long primaryTerm,
@@ -149,17 +116,29 @@ public final class TarSegmentUploadStrategy implements RemoteStoreSegmentStrateg
     }
 
     @Override
-    public void upload(UploadContext context, ActionListener<Void> listener) throws IOException {
-        final Collection<String> filesToUpload = context.getFilesToUpload();
-        final Collection<String> activeSegmentFiles = context.getActiveSegmentFiles();
-        final Directory storeDirectory = context.getStoreDirectory();
-        final ReplicationCheckpoint checkpoint = context.getCheckpoint();
-        final UploadCallback callback = context.getCallback();
+    public void upload(
+        RemoteSegmentStoreDirectory remoteDirectory,
+        ShardId shardId,
+        RemoteStoreSegmentStrategy.UploadContext context,
+        RemoteStoreSegmentStrategy.UploadListener listener
+    ) throws IOException {
+        final List<String> filesToUpload = context.segmentFiles()
+            .stream()
+            .filter(RemoteStoreSegmentStrategy.UploadContext.SegmentFile::toUpload)
+            .map(RemoteStoreSegmentStrategy.UploadContext.SegmentFile::name)
+            .collect(Collectors.toList());
+        final List<String> activeSegmentFiles = context.segmentFiles()
+            .stream()
+            .map(RemoteStoreSegmentStrategy.UploadContext.SegmentFile::name)
+            .collect(Collectors.toList());
+        final Directory storeDirectory = context.storeDirectory();
+        final ReplicationCheckpoint checkpoint = context.checkpoint();
         final boolean isLowPriorityUpload = context.isLowPriorityUpload();
-        final CryptoMetadata cryptoMetadata = context.getCryptoMetadata();
+        final CryptoMetadata cryptoMetadata = context.cryptoMetadata();
+        final RemoteDirectory remoteDataDirectory = (RemoteDirectory) remoteDirectory.getDelegate();
 
         if (filesToUpload.isEmpty()) {
-            listener.onResponse(null);
+            listener.onAllUploadsSuccess();
             return;
         }
 
@@ -281,7 +260,7 @@ public final class TarSegmentUploadStrategy implements RemoteStoreSegmentStrateg
 
         // Notify upload starts
         for (final String file : filesToUpload) {
-            callback.onUploadStart(file);
+            listener.onUploadStart(file);
         }
 
         final byte[] finalIndexBinBytes = indexBinBytes;
@@ -317,24 +296,24 @@ public final class TarSegmentUploadStrategy implements RemoteStoreSegmentStrateg
 
         final ActionListener<Void> wrapListener = ActionListener.wrap(resp -> {
             for (final String file : filesToUpload) {
-                callback.onUploadSuccess(file);
+                listener.onUploadSuccess(file);
             }
             try {
                 storeDirectory.deleteFile(bundleName);
             } catch (final IOException e) {
                 // ignore
             }
-            listener.onResponse(null);
+            listener.onAllUploadsSuccess();
         }, ex -> {
             for (final String file : filesToUpload) {
-                callback.onUploadFailure(file, ex);
+                listener.onUploadFailure(file, ex);
             }
             try {
                 storeDirectory.deleteFile(bundleName);
             } catch (final IOException e) {
                 // ignore
             }
-            listener.onFailure(ex);
+            listener.onAllUploadsFailure(ex);
         });
 
         final Directory remoteDataDir = remoteDirectory.getDelegate();
@@ -363,12 +342,15 @@ public final class TarSegmentUploadStrategy implements RemoteStoreSegmentStrateg
     }
 
     @Override
-    public void uploadMetadata(MetadataUploadContext context) throws IOException {
+    public void uploadMetadata(
+        RemoteSegmentStoreDirectory remoteDirectory,
+        ShardId shardId,
+        RemoteStoreSegmentStrategy.MetadataUploadContext context
+    ) throws IOException {
         // NO-OP: Tar strategy uploads everything atomically in upload(...)
     }
 
-    @Override
-    public RemoteSegmentMetadata init() throws IOException {
+    public RemoteSegmentMetadata init(RemoteSegmentStoreDirectory remoteDirectory, RemoteDirectory remoteDataDirectory) throws IOException {
         logger.debug("Start initialisation of remote segment metadata");
 
         final List<String> bundleFiles = remoteDataDirectory.listFilesByPrefixInLexicographicOrder(
@@ -385,10 +367,14 @@ public final class TarSegmentUploadStrategy implements RemoteStoreSegmentStrateg
 
         final String latestBundle = bundleFiles.get(0);
         logger.trace("Reading latest bundle file {}", latestBundle);
-        return readMetadata(latestBundle);
+        return readMetadata(remoteDirectory, remoteDataDirectory, latestBundle);
     }
 
-    private RemoteSegmentMetadata postProcessMetadata(RemoteSegmentMetadata rawMetadata) {
+    private RemoteSegmentMetadata postProcessMetadata(
+        RemoteSegmentStoreDirectory remoteDirectory,
+        RemoteDirectory remoteDataDirectory,
+        RemoteSegmentMetadata rawMetadata
+    ) {
         if (rawMetadata == null) {
             return null;
         }
@@ -413,11 +399,12 @@ public final class TarSegmentUploadStrategy implements RemoteStoreSegmentStrateg
     }
 
     @Override
-    public void deleteStaleSegments(int minCommitsToKeep) throws IOException {
+    public void deleteStaleSegments(RemoteSegmentStoreDirectory remoteDirectory, ShardId shardId, int minCommitsToKeep) throws IOException {
         if (minCommitsToKeep == -1) {
             return;
         }
 
+        final RemoteDirectory remoteDataDirectory = (RemoteDirectory) remoteDirectory.getDelegate();
         final List<String> allBundles = remoteDataDirectory.listFilesByPrefixInLexicographicOrder("rbs_bundle__", Integer.MAX_VALUE);
 
         if (allBundles.size() <= minCommitsToKeep) {
@@ -470,7 +457,7 @@ public final class TarSegmentUploadStrategy implements RemoteStoreSegmentStrateg
         final Set<String> referencedBundles = new HashSet<>(activeBundles);
         for (final String activeBundle : activeBundles) {
             try {
-                final RemoteSegmentMetadata meta = readMetadata(activeBundle);
+                final RemoteSegmentMetadata meta = readMetadata(remoteDirectory, remoteDataDirectory, activeBundle);
                 for (final RemoteSegmentFile segMeta : meta.getMetadata().values()) {
                     final String[] parts = ((UploadedSegmentMetadata) segMeta).getUploadedFilename().split("#");
                     referencedBundles.add(parts[0]);
@@ -506,12 +493,11 @@ public final class TarSegmentUploadStrategy implements RemoteStoreSegmentStrateg
     }
 
     @Override
-    public void deleteFile(String name) throws IOException {
+    public void deleteFile(RemoteSegmentStoreDirectory remoteDirectory, ShardId shardId, String name) throws IOException {
         remoteDirectory.removeUploadedSegment(name);
     }
 
-    @Override
-    public String getMetadataFileForCommit(long primaryTerm, long generation) throws IOException {
+    public String getMetadataFileForCommit(RemoteDirectory remoteDataDirectory, long primaryTerm, long generation) throws IOException {
         final String prefix = String.join(
             "__",
             "rbs_bundle",
@@ -527,8 +513,11 @@ public final class TarSegmentUploadStrategy implements RemoteStoreSegmentStrateg
         return bundleFiles.get(0);
     }
 
-    @Override
-    public RemoteSegmentMetadata readMetadata(String filename) throws IOException {
+    public RemoteSegmentMetadata readMetadata(
+        RemoteSegmentStoreDirectory remoteDirectory,
+        RemoteDirectory remoteDataDirectory,
+        String filename
+    ) throws IOException {
         final long fileLength = remoteDataDirectory.fileLength(filename);
         final int initialFetchSize = (int) Math.min(65536, fileLength);
         byte[] firstBlock;
@@ -542,7 +531,6 @@ public final class TarSegmentUploadStrategy implements RemoteStoreSegmentStrateg
             indexBinBytes = new byte[indexBinSize];
             System.arraycopy(firstBlock, 512, indexBinBytes, 0, indexBinSize);
         } else {
-            final int exactFetchSize = indexBinSize + 512;
             try (InputStream inputStream = remoteDataDirectory.getBlobContainer().readBlob(filename, 512, indexBinSize)) {
                 indexBinBytes = inputStream.readAllBytes();
             }
@@ -557,7 +545,7 @@ public final class TarSegmentUploadStrategy implements RemoteStoreSegmentStrateg
         final RemoteSegmentMetadata remoteMetadata = wrapper.readStream(new ByteArrayIndexInput(filename, indexBinBytes));
 
         // Post process to bind TarUploadedSegmentMetadata
-        final RemoteSegmentMetadata processedMetadata = postProcessMetadata(remoteMetadata);
+        final RemoteSegmentMetadata processedMetadata = postProcessMetadata(remoteDirectory, remoteDataDirectory, remoteMetadata);
 
         // Retrieve actual segmentInfosBytes by reading the segments_N file from this or other bundles
         final Map<String, RemoteSegmentFile> metadataMap = processedMetadata.getMetadata();
@@ -581,8 +569,11 @@ public final class TarSegmentUploadStrategy implements RemoteStoreSegmentStrateg
         return new RemoteSegmentMetadata(metadataMap, segmentInfosBytes, processedMetadata.getReplicationCheckpoint());
     }
 
-    @Override
-    public RemoteSegmentMetadata initializeToSpecificTimestamp(long timestamp) throws IOException {
+    public RemoteSegmentMetadata initializeToSpecificTimestamp(
+        RemoteDirectory remoteDataDirectory,
+        RemoteSegmentStoreDirectory remoteDirectory,
+        long timestamp
+    ) throws IOException {
         final List<String> bundleFiles = remoteDataDirectory.listFilesByPrefixInLexicographicOrder("rbs_bundle__", Integer.MAX_VALUE);
         final Set<String> lockedBundleFiles = RemoteStoreUtils.getPinnedTimestampLockedFiles(
             bundleFiles,
@@ -598,33 +589,67 @@ public final class TarSegmentUploadStrategy implements RemoteStoreSegmentStrateg
             throw new IOException("Expected exactly one bundle file matching timestamp: " + timestamp + " but got " + lockedBundleFiles);
         }
         final String bundleFile = lockedBundleFiles.iterator().next();
-        return readMetadata(bundleFile);
+        return readMetadata(remoteDirectory, remoteDataDirectory, bundleFile);
     }
 
-    @Override
-    public RemoteSegmentMetadata initializeToSpecificCommit(
-        long primaryTerm,
-        long commitGeneration,
-        String acquirerId,
-        RemoteStoreLockManager mdLockManager
+    public Map<String, RemoteSegmentMetadata> readLatestNMetadataFiles(
+        RemoteSegmentStoreDirectory remoteDirectory,
+        RemoteDirectory remoteDataDirectory,
+        int count
     ) throws IOException {
-        final String prefix = String.join(
-            "__",
-            "rbs_bundle",
-            RemoteStoreUtils.invertLong(primaryTerm),
-            RemoteStoreUtils.invertLong(commitGeneration)
-        );
-        final String bundleFile = ((RemoteStoreMetadataLockManager) mdLockManager).fetchLockedMetadataFile(prefix, acquirerId);
-        return readMetadata(bundleFile);
-    }
-
-    @Override
-    public Map<String, RemoteSegmentMetadata> readLatestNMetadataFiles(int count) throws IOException {
         final Map<String, RemoteSegmentMetadata> metadataMap = new java.util.LinkedHashMap<>();
         final List<String> bundleFiles = remoteDataDirectory.listFilesByPrefixInLexicographicOrder("rbs_bundle__", count);
         for (final String file : bundleFiles) {
-            metadataMap.put(file, readMetadata(file));
+            metadataMap.put(file, readMetadata(remoteDirectory, remoteDataDirectory, file));
         }
         return metadataMap;
+    }
+
+    @Override
+    public RemoteStoreSegmentStrategy.MetadataReader getMetadataReader(RemoteSegmentStoreDirectory remoteDirectory, ShardId shardId) {
+        return new TarRemoteSegmentMetadataReader(remoteDirectory, shardId);
+    }
+
+    private class TarRemoteSegmentMetadataReader implements RemoteStoreSegmentStrategy.MetadataReader {
+        private final RemoteSegmentStoreDirectory remoteDirectory;
+        private final RemoteDirectory remoteDataDirectory;
+        private final ShardId shardId;
+
+        public TarRemoteSegmentMetadataReader(RemoteSegmentStoreDirectory remoteDirectory, ShardId shardId) {
+            this.remoteDirectory = remoteDirectory;
+            this.remoteDataDirectory = (RemoteDirectory) remoteDirectory.getDelegate();
+            this.shardId = shardId;
+        }
+
+        @Override
+        public RemoteSegmentMetadata readMetadata() throws IOException {
+            return init(remoteDirectory, remoteDataDirectory);
+        }
+
+        @Override
+        public RemoteSegmentMetadata readMetadata(long primaryTerm, long generation) throws IOException {
+            String metadataFile = getMetadataFileForCommit(remoteDataDirectory, primaryTerm, generation);
+            return TarSegmentUploadStrategy.this.readMetadata(remoteDirectory, remoteDataDirectory, metadataFile);
+        }
+
+        @Override
+        public RemoteSegmentMetadata readMetadata(long timestamp) throws IOException {
+            return initializeToSpecificTimestamp(remoteDataDirectory, remoteDirectory, timestamp);
+        }
+
+        @Override
+        public RemoteSegmentMetadata readMetadata(String filename) throws IOException {
+            return TarSegmentUploadStrategy.this.readMetadata(remoteDirectory, remoteDataDirectory, filename);
+        }
+
+        @Override
+        public Map<String, RemoteSegmentMetadata> readLatestNMetadata(int count) throws IOException {
+            return readLatestNMetadataFiles(remoteDirectory, remoteDataDirectory, count);
+        }
+
+        @Override
+        public String getMetadataFilename(long primaryTerm, long generation) throws IOException {
+            return getMetadataFileForCommit(remoteDataDirectory, primaryTerm, generation);
+        }
     }
 }

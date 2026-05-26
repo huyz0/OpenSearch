@@ -25,7 +25,6 @@ import org.opensearch.index.store.RemoteDirectory;
 import org.opensearch.index.store.RemoteSegmentStoreDirectory;
 import org.opensearch.index.store.RemoteSegmentStoreDirectory.MetadataFilenameUtils;
 import org.opensearch.index.store.RemoteSegmentStoreDirectory.UploadedSegmentMetadata;
-import org.opensearch.index.store.lockmanager.RemoteStoreLockManager;
 import org.opensearch.index.store.lockmanager.RemoteStoreMetadataLockManager;
 import org.opensearch.index.store.remote.metadata.DefaultUploadedSegmentMetadata;
 import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadata;
@@ -62,58 +61,55 @@ public final class DefaultRemoteStoreSegmentStrategy implements RemoteStoreSegme
         RemoteSegmentMetadata.METADATA_CODEC
     );
 
-    private final RemoteSegmentStoreDirectory remoteDirectory;
-    private final RemoteDirectory remoteDataDirectory;
-    private final RemoteDirectory remoteMetadataDirectory;
-    private final ShardId shardId;
-
-    public DefaultRemoteStoreSegmentStrategy() {
-        this.remoteDirectory = null;
-        this.remoteDataDirectory = null;
-        this.remoteMetadataDirectory = null;
-        this.shardId = null;
-    }
-
-    private DefaultRemoteStoreSegmentStrategy(
-        RemoteSegmentStoreDirectory remoteDirectory,
-        RemoteDirectory remoteMetadataDirectory,
-        ShardId shardId
-    ) {
-        this.remoteDirectory = remoteDirectory;
-        this.remoteDataDirectory = (RemoteDirectory) remoteDirectory.getDelegate();
-        this.remoteMetadataDirectory = remoteMetadataDirectory;
-        this.shardId = shardId;
-    }
+    public DefaultRemoteStoreSegmentStrategy() {}
 
     @Override
-    public RemoteStoreSegmentStrategy getShardInstance(
+    public void upload(
         RemoteSegmentStoreDirectory remoteDirectory,
-        RemoteDirectory remoteMetadataDirectory,
-        ShardId shardId
+        ShardId shardId,
+        RemoteStoreSegmentStrategy.UploadContext context,
+        RemoteStoreSegmentStrategy.UploadListener listener
     ) throws IOException {
-        return new DefaultRemoteStoreSegmentStrategy(remoteDirectory, remoteMetadataDirectory, shardId);
-    }
+        final List<String> filesToUpload = context.segmentFiles()
+            .stream()
+            .filter(RemoteStoreSegmentStrategy.UploadContext.SegmentFile::toUpload)
+            .map(RemoteStoreSegmentStrategy.UploadContext.SegmentFile::name)
+            .collect(Collectors.toList());
 
-    @Override
-    public void upload(UploadContext context, ActionListener<Void> listener) throws IOException {
-        final Collection<String> filesToUpload = context.getFilesToUpload();
-        final Directory storeDirectory = context.getStoreDirectory();
-        final RemoteStoreSegmentStrategy.UploadCallback callback = context.getCallback();
+        if (filesToUpload.isEmpty()) {
+            listener.onAllUploadsSuccess();
+            return;
+        }
+
+        final Directory storeDirectory = context.storeDirectory();
         final boolean isLowPriorityUpload = context.isLowPriorityUpload();
+        final RemoteDirectory remoteDataDirectory = (RemoteDirectory) remoteDirectory.getDelegate();
 
-        final org.opensearch.action.support.GroupedActionListener<Void> batchUploadListener =
-            new org.opensearch.action.support.GroupedActionListener<>(ActionListener.map(listener, resp -> null), filesToUpload.size());
+        final ActionListener<Collection<Void>> batchUploadListener = new ActionListener<Collection<Void>>() {
+            @Override
+            public void onResponse(Collection<Void> resp) {
+                listener.onAllUploadsSuccess();
+            }
+
+            @Override
+            public void onFailure(Exception ex) {
+                listener.onAllUploadsFailure(ex);
+            }
+        };
+
+        final org.opensearch.action.support.GroupedActionListener<Void> groupedListener =
+            new org.opensearch.action.support.GroupedActionListener<>(batchUploadListener, filesToUpload.size());
 
         for (final String localSegment : filesToUpload) {
             final ActionListener<Void> aggregatedListener = ActionListener.wrap(resp -> {
-                callback.onUploadSuccess(localSegment);
-                batchUploadListener.onResponse(resp);
+                listener.onUploadSuccess(localSegment);
+                groupedListener.onResponse(resp);
             }, ex -> {
-                callback.onUploadFailure(localSegment, ex);
-                batchUploadListener.onFailure(ex);
+                listener.onUploadFailure(localSegment, ex);
+                groupedListener.onFailure(ex);
             });
 
-            callback.onUploadStart(localSegment);
+            listener.onUploadStart(localSegment);
 
             // Register DefaultUploadedSegmentMetadata once the copy completes
             final Runnable postUpload = () -> {
@@ -143,7 +139,7 @@ public final class DefaultRemoteStoreSegmentStrategy implements RemoteStoreSegme
                 postUpload,
                 aggregatedListener,
                 isLowPriorityUpload,
-                context.getCryptoMetadata()
+                context.cryptoMetadata()
             );
 
             if (uploaded == false) {
@@ -160,24 +156,29 @@ public final class DefaultRemoteStoreSegmentStrategy implements RemoteStoreSegme
     }
 
     @Override
-    public void uploadMetadata(MetadataUploadContext context) throws IOException {
+    public void uploadMetadata(
+        RemoteSegmentStoreDirectory remoteDirectory,
+        ShardId shardId,
+        RemoteStoreSegmentStrategy.MetadataUploadContext context
+    ) throws IOException {
         String metadataFilename = MetadataFilenameUtils.getMetadataFilename(
-            context.getCheckpoint().getPrimaryTerm(),
-            context.getCatalogSnapshot().getGeneration(),
-            context.getTranslogGeneration(),
+            context.checkpoint().getPrimaryTerm(),
+            context.catalogSnapshot().getGeneration(),
+            context.translogGeneration(),
             remoteDirectory.getMetadataUploadCounter().incrementAndGet(),
             RemoteSegmentMetadata.CURRENT_VERSION,
-            context.getNodeId()
+            context.nodeId()
         );
+        final RemoteDirectory remoteMetadataDirectory = remoteDirectory.getMetadataDirectory();
         try {
-            try (IndexOutput indexOutput = context.getStoreDirectory().createOutput(metadataFilename, IOContext.DEFAULT)) {
+            try (IndexOutput indexOutput = context.storeDirectory().createOutput(metadataFilename, IOContext.DEFAULT)) {
                 Map<String, String> uploadedSegmentsMap = new java.util.HashMap<>();
-                for (String file : context.getActiveSegmentFiles()) {
+                for (String file : context.activeSegmentFiles()) {
                     if (remoteDirectory.getSegmentsUploadedToRemoteStore().containsKey(file)) {
                         UploadedSegmentMetadata metadata = remoteDirectory.getSegmentsUploadedToRemoteStore().get(file);
                         metadata.setWrittenByMajor(
                             LuceneVersionConverter.toLuceneOrLatest(
-                                context.getCatalogSnapshot().getFormatVersionForFile(metadata.getOriginalFilename())
+                                context.catalogSnapshot().getFormatVersionForFile(metadata.getOriginalFilename())
                             ).major
                         );
                         uploadedSegmentsMap.put(file, metadata.toString());
@@ -186,33 +187,29 @@ public final class DefaultRemoteStoreSegmentStrategy implements RemoteStoreSegme
                     }
                 }
 
-                Objects.requireNonNull(
-                    context.getCatalogSnapshotToCommitSerializer(),
-                    "catalogSnapshotToCommitSerializer must be supplied"
-                );
-                final byte[] segmentInfoSnapshotByteArray = context.getCatalogSnapshotToCommitSerializer()
-                    .apply(context.getCatalogSnapshot());
+                Objects.requireNonNull(context.catalogSnapshotToCommitSerializer(), "catalogSnapshotToCommitSerializer must be supplied");
+                final byte[] segmentInfoSnapshotByteArray = context.catalogSnapshotToCommitSerializer().apply(context.catalogSnapshot());
 
                 metadataStreamWrapper.writeStream(
                     indexOutput,
                     new RemoteSegmentMetadata(
                         RemoteSegmentMetadata.fromMapOfStrings(uploadedSegmentsMap),
                         segmentInfoSnapshotByteArray,
-                        context.getCheckpoint()
+                        context.checkpoint()
                     )
                 );
             }
-            context.getStoreDirectory().sync(Collections.singleton(metadataFilename));
-            remoteMetadataDirectory.copyFrom(context.getStoreDirectory(), metadataFilename, metadataFilename, IOContext.DEFAULT);
+            context.storeDirectory().sync(Collections.singleton(metadataFilename));
+            remoteMetadataDirectory.copyFrom(context.storeDirectory(), metadataFilename, metadataFilename, IOContext.DEFAULT);
         } finally {
-            tryAndDeleteLocalFile(metadataFilename, context.getStoreDirectory());
+            tryAndDeleteLocalFile(metadataFilename, context.storeDirectory());
         }
     }
 
-    @Override
-    public RemoteSegmentMetadata init() throws IOException {
+    private RemoteSegmentMetadata init(RemoteSegmentStoreDirectory remoteDirectory) throws IOException {
         logger.debug("Start initialisation of remote segment metadata");
         RemoteSegmentMetadata remoteSegmentMetadata = null;
+        final RemoteDirectory remoteMetadataDirectory = remoteDirectory.getMetadataDirectory();
 
         List<String> metadataFiles = remoteMetadataDirectory.listFilesByPrefixInLexicographicOrder(
             MetadataFilenameUtils.METADATA_PREFIX,
@@ -224,7 +221,7 @@ public final class DefaultRemoteStoreSegmentStrategy implements RemoteStoreSegme
         if (!metadataFiles.isEmpty()) {
             String latestMetadataFile = metadataFiles.get(0);
             logger.trace("Reading latest Metadata file {}", latestMetadataFile);
-            remoteSegmentMetadata = readMetadata(latestMetadataFile);
+            remoteSegmentMetadata = readMetadata(remoteDirectory, latestMetadataFile);
         } else {
             logger.trace("No metadata file found, this can happen for new index with no data uploaded to remote segment store");
         }
@@ -233,17 +230,23 @@ public final class DefaultRemoteStoreSegmentStrategy implements RemoteStoreSegme
         return remoteSegmentMetadata;
     }
 
-    private RemoteSegmentMetadata readMetadataFile(String metadataFilename) throws IOException {
+    private RemoteSegmentMetadata readMetadataFile(RemoteSegmentStoreDirectory remoteDirectory, String metadataFilename)
+        throws IOException {
+        final RemoteDirectory remoteMetadataDirectory = remoteDirectory.getMetadataDirectory();
         try (InputStream inputStream = remoteMetadataDirectory.getBlobStream(metadataFilename)) {
             byte[] metadataBytes = inputStream.readAllBytes();
-            return postProcessMetadata(metadataStreamWrapper.readStream(new ByteArrayIndexInput(metadataFilename, metadataBytes)));
+            return postProcessMetadata(
+                remoteDirectory,
+                metadataStreamWrapper.readStream(new ByteArrayIndexInput(metadataFilename, metadataBytes))
+            );
         }
     }
 
-    private RemoteSegmentMetadata postProcessMetadata(RemoteSegmentMetadata rawMetadata) {
+    private RemoteSegmentMetadata postProcessMetadata(RemoteSegmentStoreDirectory remoteDirectory, RemoteSegmentMetadata rawMetadata) {
         if (rawMetadata == null) {
             return null;
         }
+        final RemoteDirectory remoteDataDirectory = (RemoteDirectory) remoteDirectory.getDelegate();
         Map<String, RemoteSegmentFile> processedMap = new HashMap<>();
         for (Map.Entry<String, RemoteSegmentFile> entry : rawMetadata.getMetadata().entrySet()) {
             UploadedSegmentMetadata raw = (UploadedSegmentMetadata) entry.getValue();
@@ -261,13 +264,16 @@ public final class DefaultRemoteStoreSegmentStrategy implements RemoteStoreSegme
     }
 
     @Override
-    public void deleteStaleSegments(int minCommitsToKeep) throws IOException {
+    public void deleteStaleSegments(RemoteSegmentStoreDirectory remoteDirectory, ShardId shardId, int minCommitsToKeep) throws IOException {
         if (minCommitsToKeep == -1) {
             logger.info(
                 "Stale segment deletion is disabled if cluster.remote_store.index.segment_metadata.retention.max_count is set to -1"
             );
             return;
         }
+
+        final RemoteDirectory remoteMetadataDirectory = remoteDirectory.getMetadataDirectory();
+        final RemoteDirectory remoteDataDirectory = (RemoteDirectory) remoteDirectory.getDelegate();
 
         List<String> sortedMetadataFileList = remoteMetadataDirectory.listFilesByPrefixInLexicographicOrder(
             MetadataFilenameUtils.METADATA_PREFIX,
@@ -349,7 +355,7 @@ public final class DefaultRemoteStoreSegmentStrategy implements RemoteStoreSegme
         );
 
         for (String metadataFile : metadataFilesToFilterActiveSegments) {
-            Map<String, RemoteSegmentFile> segmentMetadataMap = readMetadata(metadataFile).getMetadata();
+            Map<String, RemoteSegmentFile> segmentMetadataMap = readMetadata(remoteDirectory, metadataFile).getMetadata();
             activeSegmentFilesMetadataMap.putAll(segmentMetadataMap);
             activeSegmentRemoteFilenames.addAll(
                 segmentMetadataMap.values()
@@ -364,7 +370,7 @@ public final class DefaultRemoteStoreSegmentStrategy implements RemoteStoreSegme
 
         final Set<String> deletedSegmentFiles = new HashSet<>();
         for (final String metadataFile : metadataFilesToBeDeleted) {
-            final Map<String, RemoteSegmentFile> staleSegmentFilesMetadataMap = readMetadata(metadataFile).getMetadata();
+            final Map<String, RemoteSegmentFile> staleSegmentFilesMetadataMap = readMetadata(remoteDirectory, metadataFile).getMetadata();
             final Set<String> staleSegmentRemoteFilenames = staleSegmentFilesMetadataMap.values()
                 .stream()
                 .map(metadata -> ((UploadedSegmentMetadata) metadata).getUploadedFilename())
@@ -416,8 +422,9 @@ public final class DefaultRemoteStoreSegmentStrategy implements RemoteStoreSegme
     }
 
     @Override
-    public void deleteFile(String name) throws IOException {
+    public void deleteFile(RemoteSegmentStoreDirectory remoteDirectory, ShardId shardId, String name) throws IOException {
         final String remoteFilename = remoteDirectory.getExistingRemoteFilename(name);
+        final RemoteDirectory remoteDataDirectory = (RemoteDirectory) remoteDirectory.getDelegate();
         if (remoteFilename != null) {
             remoteDataDirectory.deleteFile(remoteFilename);
             remoteDirectory.removeUploadedSegment(name);
@@ -435,8 +442,9 @@ public final class DefaultRemoteStoreSegmentStrategy implements RemoteStoreSegme
         }
     }
 
-    @Override
-    public String getMetadataFileForCommit(long primaryTerm, long generation) throws IOException {
+    private String getMetadataFileForCommit(RemoteSegmentStoreDirectory remoteDirectory, long primaryTerm, long generation)
+        throws IOException {
+        final RemoteDirectory remoteMetadataDirectory = remoteDirectory.getMetadataDirectory();
         List<String> metadataFiles = remoteMetadataDirectory.listFilesByPrefixInLexicographicOrder(
             MetadataFilenameUtils.getMetadataFilePrefixForCommit(primaryTerm, generation),
             1
@@ -450,13 +458,13 @@ public final class DefaultRemoteStoreSegmentStrategy implements RemoteStoreSegme
         return metadataFiles.get(0);
     }
 
-    @Override
-    public RemoteSegmentMetadata readMetadata(String filename) throws IOException {
-        return readMetadataFile(filename);
+    private RemoteSegmentMetadata readMetadata(RemoteSegmentStoreDirectory remoteDirectory, String filename) throws IOException {
+        return readMetadataFile(remoteDirectory, filename);
     }
 
-    @Override
-    public RemoteSegmentMetadata initializeToSpecificTimestamp(long timestamp) throws IOException {
+    private RemoteSegmentMetadata initializeToSpecificTimestamp(RemoteSegmentStoreDirectory remoteDirectory, long timestamp)
+        throws IOException {
+        final RemoteDirectory remoteMetadataDirectory = remoteDirectory.getMetadataDirectory();
         List<String> metadataFiles = remoteMetadataDirectory.listFilesByPrefixInLexicographicOrder(
             MetadataFilenameUtils.METADATA_PREFIX,
             Integer.MAX_VALUE
@@ -477,31 +485,66 @@ public final class DefaultRemoteStoreSegmentStrategy implements RemoteStoreSegme
             );
         }
         String metadataFile = lockedMetadataFiles.iterator().next();
-        return readMetadata(metadataFile);
+        return readMetadata(remoteDirectory, metadataFile);
     }
 
-    @Override
-    public RemoteSegmentMetadata initializeToSpecificCommit(
-        long primaryTerm,
-        long commitGeneration,
-        String acquirerId,
-        RemoteStoreLockManager mdLockManager
-    ) throws IOException {
-        String metadataFilePrefix = MetadataFilenameUtils.getMetadataFilePrefixForCommit(primaryTerm, commitGeneration);
-        String metadataFile = ((RemoteStoreMetadataLockManager) mdLockManager).fetchLockedMetadataFile(metadataFilePrefix, acquirerId);
-        return readMetadata(metadataFile);
-    }
-
-    @Override
-    public Map<String, RemoteSegmentMetadata> readLatestNMetadataFiles(int count) throws IOException {
+    private Map<String, RemoteSegmentMetadata> readLatestNMetadataFiles(RemoteSegmentStoreDirectory remoteDirectory, int count)
+        throws IOException {
+        final RemoteDirectory remoteMetadataDirectory = remoteDirectory.getMetadataDirectory();
         Map<String, RemoteSegmentMetadata> metadataMap = new java.util.LinkedHashMap<>();
         List<String> metadataFiles = remoteMetadataDirectory.listFilesByPrefixInLexicographicOrder(
             MetadataFilenameUtils.METADATA_PREFIX,
             count
         );
         for (String file : metadataFiles) {
-            metadataMap.put(file, readMetadata(file));
+            metadataMap.put(file, readMetadata(remoteDirectory, file));
         }
         return metadataMap;
+    }
+
+    @Override
+    public RemoteStoreSegmentStrategy.MetadataReader getMetadataReader(RemoteSegmentStoreDirectory remoteDirectory, ShardId shardId) {
+        return new DefaultRemoteStoreSegmentMetadataReader(remoteDirectory, shardId);
+    }
+
+    private class DefaultRemoteStoreSegmentMetadataReader implements RemoteStoreSegmentStrategy.MetadataReader {
+        private final RemoteSegmentStoreDirectory remoteDirectory;
+        private final ShardId shardId;
+
+        public DefaultRemoteStoreSegmentMetadataReader(RemoteSegmentStoreDirectory remoteDirectory, ShardId shardId) {
+            this.remoteDirectory = remoteDirectory;
+            this.shardId = shardId;
+        }
+
+        @Override
+        public RemoteSegmentMetadata readMetadata() throws IOException {
+            return init(remoteDirectory);
+        }
+
+        @Override
+        public RemoteSegmentMetadata readMetadata(long primaryTerm, long generation) throws IOException {
+            String metadataFile = getMetadataFileForCommit(remoteDirectory, primaryTerm, generation);
+            return DefaultRemoteStoreSegmentStrategy.this.readMetadata(remoteDirectory, metadataFile);
+        }
+
+        @Override
+        public RemoteSegmentMetadata readMetadata(long timestamp) throws IOException {
+            return initializeToSpecificTimestamp(remoteDirectory, timestamp);
+        }
+
+        @Override
+        public RemoteSegmentMetadata readMetadata(String filename) throws IOException {
+            return DefaultRemoteStoreSegmentStrategy.this.readMetadata(remoteDirectory, filename);
+        }
+
+        @Override
+        public Map<String, RemoteSegmentMetadata> readLatestNMetadata(int count) throws IOException {
+            return readLatestNMetadataFiles(remoteDirectory, count);
+        }
+
+        @Override
+        public String getMetadataFilename(long primaryTerm, long generation) throws IOException {
+            return getMetadataFileForCommit(remoteDirectory, primaryTerm, generation);
+        }
     }
 }
