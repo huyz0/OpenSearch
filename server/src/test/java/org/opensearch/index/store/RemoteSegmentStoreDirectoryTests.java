@@ -1197,7 +1197,6 @@ public class RemoteSegmentStoreDirectoryTests extends BaseRemoteSegmentStoreDire
             verify(remoteDataDirectory).deleteFiles(
                 argThat(files -> files != null && new HashSet<>(files).equals(expectedFilesToDelete_3))
             );
-            verify(remoteDataDirectory).deleteFiles(new ArrayList<>());
         });
 
         verify(remoteMetadataDirectory).deleteFile(metadataFilename3);

@@ -198,7 +198,7 @@ public class FormatBlobRouter {
      * @param blobKey the remote blob key (e.g., "_0.pqt__UUID")
      * @param format the data format name (e.g., "parquet")
      */
-    public void registerBlobFormat(String blobKey, String format) {
+    public synchronized void registerBlobFormat(String blobKey, String format) {
         if (blobKey != null && format != null) {
             var updated = new HashMap<>(blobFormatCache);
             updated.put(blobKey, format);
@@ -212,7 +212,7 @@ public class FormatBlobRouter {
      *
      * @param blobKey the remote blob key to unregister
      */
-    public void unregisterBlobFormat(String blobKey) {
+    public synchronized void unregisterBlobFormat(String blobKey) {
         if (blobKey != null) {
             var updated = new HashMap<>(blobFormatCache);
             updated.remove(blobKey);
@@ -227,7 +227,7 @@ public class FormatBlobRouter {
      *
      * @param blobKeyToFormat the new complete mapping of blob key to format
      */
-    public void replaceBlobFormatCache(Map<String, String> blobKeyToFormat) {
+    public synchronized void replaceBlobFormatCache(Map<String, String> blobKeyToFormat) {
         blobFormatCache = Map.copyOf(blobKeyToFormat);
     }
 

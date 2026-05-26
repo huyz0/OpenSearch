@@ -355,7 +355,12 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
          */
         private int writtenByMajor;
 
-        UploadedSegmentMetadata(String originalFilename, String uploadedFilename, String checksum, long length) {
+        public UploadedSegmentMetadata(
+            final String originalFilename,
+            final String uploadedFilename,
+            final String checksum,
+            final long length
+        ) {
             this.originalFilename = originalFilename;
             this.uploadedFilename = uploadedFilename;
             this.checksum = checksum;
@@ -528,12 +533,20 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
      * @throws IOException if the file exists but could not be deleted.
      */
     @Override
-    public void deleteFile(String name) throws IOException {
-        String remoteFilename = getExistingRemoteFilename(name);
+    public synchronized void deleteFile(final String name) throws IOException {
+        final String remoteFilename = getExistingRemoteFilename(name);
         if (remoteFilename != null) {
-            // Step 1: delete from remote (format cache entry still available for routing)
-            remoteDataDirectory.deleteFile(remoteFilename);
-            // Step 2: cleanup map + format cache AFTER the remote delete
+            if (remoteFilename.contains("#")) {
+                final String baseTar = remoteFilename.split("#")[0];
+                final boolean hasOtherActive = segmentsUploadedToRemoteStore.entrySet()
+                    .stream()
+                    .anyMatch(entry -> entry.getKey().equals(name) == false && entry.getValue().uploadedFilename.startsWith(baseTar + "#"));
+                if (hasOtherActive == false) {
+                    remoteDataDirectory.deleteFile(baseTar);
+                }
+            } else {
+                remoteDataDirectory.deleteFile(remoteFilename);
+            }
             removeUploadedSegment(name);
         }
     }
@@ -578,10 +591,16 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
      * @throws NoSuchFileException if the file does not exist either in cache or remote segment store
      */
     @Override
-    public IndexInput openInput(String name, IOContext context) throws IOException {
-        String remoteFilename = getExistingRemoteFilename(name);
-        long fileLength = fileLength(name);
+    public IndexInput openInput(final String name, final IOContext context) throws IOException {
+        final String remoteFilename = getExistingRemoteFilename(name);
+        final long fileLength = fileLength(name);
         if (remoteFilename != null) {
+            if (remoteFilename.contains("#")) {
+                final String[] parts = remoteFilename.split("#");
+                final String tarName = parts[0];
+                final long offset = Long.parseLong(parts[1]);
+                return remoteDataDirectory.openBlockInput(tarName, offset, fileLength, Long.MAX_VALUE, context);
+            }
             return remoteDataDirectory.openInput(remoteFilename, fileLength, context);
         } else {
             throw new NoSuchFileException(name);
@@ -600,10 +619,17 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
      * @throws NoSuchFileException if the file does not exist
      */
 
-    public IndexInput openBlockInput(String name, long position, long length, IOContext context) throws IOException {
-        String remoteFilename = getExistingRemoteFilename(name);
-        long fileLength = fileLength(name);
+    public IndexInput openBlockInput(final String name, final long position, final long length, final IOContext context)
+        throws IOException {
+        final String remoteFilename = getExistingRemoteFilename(name);
+        final long fileLength = fileLength(name);
         if (remoteFilename != null) {
+            if (remoteFilename.contains("#")) {
+                final String[] parts = remoteFilename.split("#");
+                final String tarName = parts[0];
+                final long offset = Long.parseLong(parts[1]);
+                return remoteDataDirectory.openBlockInput(tarName, offset + position, length, Long.MAX_VALUE, context);
+            }
             return remoteDataDirectory.openBlockInput(remoteFilename, position, length, fileLength, context);
         } else {
             throw new NoSuchFileException(name);
@@ -980,8 +1006,8 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
      * </ul>
      *
      */
-    private String getChecksumOfLocalFile(Directory directory, String file) throws IOException {
-        DataFormatAwareStoreDirectory dfasd = DataFormatAwareStoreDirectory.unwrap(directory);
+    public String getChecksumOfLocalFile(final Directory directory, final String file) throws IOException {
+        final DataFormatAwareStoreDirectory dfasd = DataFormatAwareStoreDirectory.unwrap(directory);
         if (dfasd != null) {
             return dfasd.calculateUploadChecksum(file);
         }
@@ -1038,7 +1064,7 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
      * Add a segment to uploaded map + register its format in cache.
      * Called by postUpload().
      */
-    private void addUploadedSegment(String localFilename, UploadedSegmentMetadata metadata) {
+    public void addUploadedSegment(final String localFilename, final UploadedSegmentMetadata metadata) {
         segmentsUploadedToRemoteStore.put(localFilename, metadata);
         registerFormatForBlob(metadata.getUploadedFilename(), metadata.getOriginalFilename());
     }
@@ -1076,15 +1102,15 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
         formatBlobRouter.replaceBlobFormatCache(blobKeyToFormat);
     }
 
-    private String getNewRemoteSegmentFilename(String localFilename) {
+    public String getNewRemoteSegmentFilename(final String localFilename) {
         // Strip format prefix if present before appending UUID.
         // For optimized indices, localFilename may be "format/filename" (e.g., "parquet/_0.pqt").
         // The blob key should be "filename__UUID" (e.g., "_0.pqt__UUID"), not "parquet/_0.pqt__UUID".
-        String plainFilename = FileMetadata.parseFile(localFilename);
-        return plainFilename + SEGMENT_NAME_UUID_SEPARATOR + UUIDs.base64UUID();
+        final String fileOnly = getLocalSegmentFilename(localFilename);
+        return fileOnly + SEGMENT_NAME_UUID_SEPARATOR + UUIDs.base64UUID();
     }
 
-    private String getLocalSegmentFilename(String remoteFilename) {
+    private String getLocalSegmentFilename(final String remoteFilename) {
         return remoteFilename.split(SEGMENT_NAME_UUID_SEPARATOR)[0];
     }
 
@@ -1251,30 +1277,43 @@ public final class RemoteSegmentStoreDirectory extends FilterDirectory implement
                 segmentMetadataMap.values().stream().map(metadata -> metadata.uploadedFilename).collect(Collectors.toSet())
             );
         }
-        Set<String> deletedSegmentFiles = new HashSet<>();
-        for (String metadataFile : metadataFilesToBeDeleted) {
-            Map<String, UploadedSegmentMetadata> staleSegmentFilesMetadataMap = readMetadataFile(metadataFile).getMetadata();
-            Set<String> staleSegmentRemoteFilenames = staleSegmentFilesMetadataMap.values()
+        final Set<String> activeBaseNames = activeSegmentRemoteFilenames.stream()
+            .map(f -> f.contains("#") ? f.split("#")[0] : f)
+            .collect(Collectors.toSet());
+
+        final Set<String> deletedSegmentFiles = new HashSet<>();
+        for (final String metadataFile : metadataFilesToBeDeleted) {
+            final Map<String, UploadedSegmentMetadata> staleSegmentFilesMetadataMap = readMetadataFile(metadataFile).getMetadata();
+            final Set<String> staleSegmentRemoteFilenames = staleSegmentFilesMetadataMap.values()
                 .stream()
                 .map(metadata -> metadata.uploadedFilename)
                 .collect(Collectors.toSet());
 
             // Collect all files to delete for this metadata file
-            List<String> filesToDelete = staleSegmentRemoteFilenames.stream()
-                .filter(file -> activeSegmentRemoteFilenames.contains(file) == false)
+            final List<String> filesToDelete = staleSegmentRemoteFilenames.stream()
+                .map(file -> file.contains("#") ? file.split("#")[0] : file)
+                .filter(file -> activeBaseNames.contains(file) == false)
                 .filter(file -> deletedSegmentFiles.contains(file) == false)
+                .distinct()
                 .collect(Collectors.toList());
 
-            AtomicBoolean deletionSuccessful = new AtomicBoolean(true);
+            final AtomicBoolean deletionSuccessful = new AtomicBoolean(true);
             try {
-                // Batch delete all stale segment files
-                remoteDataDirectory.deleteFiles(filesToDelete);
-                deletedSegmentFiles.addAll(filesToDelete);
+                if (filesToDelete.isEmpty() == false) {
+                    // Batch delete all stale segment files
+                    remoteDataDirectory.deleteFiles(filesToDelete);
+                    deletedSegmentFiles.addAll(filesToDelete);
+                }
 
                 // Update cache after successful batch deletion
-                for (String file : filesToDelete) {
-                    if (!activeSegmentFilesMetadataMap.containsKey(getLocalSegmentFilename(file))) {
-                        removeUploadedSegment(getLocalSegmentFilename(file));
+                for (final Map.Entry<String, UploadedSegmentMetadata> entry : staleSegmentFilesMetadataMap.entrySet()) {
+                    final String localFile = entry.getKey();
+                    final String remoteFile = entry.getValue().uploadedFilename;
+                    final String baseRemoteFile = remoteFile.contains("#") ? remoteFile.split("#")[0] : remoteFile;
+                    if (filesToDelete.contains(baseRemoteFile) || deletedSegmentFiles.contains(baseRemoteFile)) {
+                        if (activeSegmentFilesMetadataMap.containsKey(localFile) == false) {
+                            removeUploadedSegment(localFile);
+                        }
                     }
                 }
             } catch (IOException e) {

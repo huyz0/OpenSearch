@@ -13,14 +13,14 @@ import org.apache.logging.log4j.message.ParameterizedMessage;
 import org.apache.lucene.index.CorruptIndexException;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FilterDirectory;
-import org.apache.lucene.store.IOContext;
-import org.opensearch.action.support.GroupedActionListener;
 import org.opensearch.cluster.metadata.CryptoMetadata;
 import org.opensearch.common.logging.Loggers;
 import org.opensearch.common.util.UploadListener;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.index.store.RemoteSegmentStoreDirectory;
 import org.opensearch.index.store.RemoteSyncListener;
+import org.opensearch.index.store.remote.DefaultRemoteStoreSegmentStrategy;
+import org.opensearch.index.store.remote.RemoteStoreSegmentStrategy;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -95,34 +95,68 @@ public class RemoteStoreUploaderService implements RemoteStoreUploader {
         }
 
         logger.debug("Effective new segments files to upload {}", localSegments);
-        ActionListener<Collection<Void>> mappedListener = ActionListener.map(listener, resp -> null);
-        GroupedActionListener<Void> batchUploadListener = new GroupedActionListener<>(mappedListener, localSegments.size());
 
-        for (String localSegment : localSegments) {
-            // Initializing listener here to ensure that the stats increment operations are thread-safe
-            UploadListener statsListener = uploadListenerFunction.apply(localSegmentsSizeMap);
-            ActionListener<Void> aggregatedListener = ActionListener.wrap(resp -> {
-                statsListener.onSuccess(localSegment);
-                batchUploadListener.onResponse(resp);
-                // Once uploaded to Remote, local files become eligible for eviction from FileCache
-                notifyAfterSyncToRemote(localSegment);
-            }, ex -> {
+        final Map<String, RemoteStoreSegmentStrategy> segmentStrategies = indexShard.getRemoteStoreSegmentStrategies();
+        final RemoteStoreSegmentStrategy strategy;
+        if (segmentStrategies != null && indexShard.indexSettings() != null) {
+            final String strategyName = indexShard.indexSettings().getRemoteStoreSegmentStrategy();
+            if ("default".equals(strategyName)) {
+                strategy = new DefaultRemoteStoreSegmentStrategy();
+            } else {
+                final RemoteStoreSegmentStrategy matched = segmentStrategies.get(strategyName);
+                if (matched == null) {
+                    throw new IllegalArgumentException("Unknown segment strategy: " + strategyName);
+                }
+                strategy = matched;
+            }
+        } else {
+            strategy = new DefaultRemoteStoreSegmentStrategy();
+        }
+
+        final java.util.concurrent.ConcurrentMap<String, UploadListener> statsListeners = new java.util.concurrent.ConcurrentHashMap<>();
+        final RemoteStoreSegmentStrategy.UploadCallback callback = new RemoteStoreSegmentStrategy.UploadCallback() {
+            @Override
+            public void onUploadStart(final String file) {
+                final UploadListener statsListener = uploadListenerFunction.apply(localSegmentsSizeMap);
+                statsListeners.put(file, statsListener);
+                statsListener.beforeUpload(file);
+            }
+
+            @Override
+            public void onUploadSuccess(final String file) {
+                final UploadListener statsListener = statsListeners.remove(file);
+                if (statsListener != null) {
+                    statsListener.onSuccess(file);
+                }
+                notifyAfterSyncToRemote(file);
+            }
+
+            @Override
+            public void onUploadFailure(final String file, final Exception ex) {
                 logger.warn(() -> new ParameterizedMessage("Exception: [{}] while uploading segment files", ex), ex);
                 if (ex instanceof CorruptIndexException) {
                     indexShard.failShard(ex.getMessage(), ex);
                 }
-                statsListener.onFailure(localSegment);
-                batchUploadListener.onFailure(ex);
-            });
-            statsListener.beforeUpload(localSegment);
-            remoteDirectory.copyFrom(
+                final UploadListener statsListener = statsListeners.remove(file);
+                if (statsListener != null) {
+                    statsListener.onFailure(file);
+                }
+            }
+        };
+
+        try {
+            strategy.upload(
+                localSegments,
+                localSegmentsSizeMap,
                 storeDirectory,
-                localSegment,
-                IOContext.DEFAULT,
-                aggregatedListener,
+                remoteDirectory,
+                listener,
+                callback,
                 isLowPriorityUpload,
                 cryptoMetadata
             );
+        } catch (Exception ex) {
+            listener.onFailure(ex);
         }
     }
 

@@ -194,6 +194,7 @@ import org.opensearch.index.store.Store;
 import org.opensearch.index.store.Store.MetadataSnapshot;
 import org.opensearch.index.store.StoreFileMetadata;
 import org.opensearch.index.store.StoreStats;
+import org.opensearch.index.store.remote.RemoteStoreSegmentStrategy;
 import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadata;
 import org.opensearch.index.translog.RemoteBlobStoreInternalTranslogFactory;
 import org.opensearch.index.translog.RemoteFsTranslog;
@@ -203,6 +204,7 @@ import org.opensearch.index.translog.TranslogConfig;
 import org.opensearch.index.translog.TranslogFactory;
 import org.opensearch.index.translog.TranslogRecoveryRunner;
 import org.opensearch.index.translog.TranslogStats;
+import org.opensearch.index.translog.transfer.RemoteStoreTranslogStrategy;
 import org.opensearch.index.warmer.ShardIndexWarmerService;
 import org.opensearch.index.warmer.WarmerStats;
 import org.opensearch.indices.IndexingMemoryController;
@@ -422,6 +424,9 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
 
     private final Map<String, FormatChecksumStrategy> checksumStrategies;
 
+    private final Map<String, RemoteStoreSegmentStrategy> segmentStrategies;
+    private final Map<String, RemoteStoreTranslogStrategy> translogStrategies;
+
     @InternalApi
     public IndexShard(
         final ShardRouting shardRouting,
@@ -463,7 +468,9 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         @Nullable final MergedSegmentPublisher mergedSegmentPublisher,
         @Nullable final ReferencedSegmentsPublisher referencedSegmentsPublisher,
         final Map<String, FormatChecksumStrategy> checksumStrategies,
-        @Nullable final DataFormatRegistry dataFormatRegistry
+        @Nullable final DataFormatRegistry dataFormatRegistry,
+        final Map<String, RemoteStoreSegmentStrategy> segmentStrategies,
+        final Map<String, RemoteStoreTranslogStrategy> translogStrategies
     ) throws IOException {
         super(shardRouting.shardId(), indexSettings);
         assert shardRouting.initializing();
@@ -619,6 +626,16 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         }
         this.dataFormatRegistry = dataFormatRegistry;
         this.checksumStrategies = checksumStrategies;
+        this.segmentStrategies = segmentStrategies;
+        this.translogStrategies = translogStrategies;
+    }
+
+    public Map<String, RemoteStoreSegmentStrategy> getRemoteStoreSegmentStrategies() {
+        return segmentStrategies;
+    }
+
+    public Map<String, RemoteStoreTranslogStrategy> getRemoteStoreTranslogStrategies() {
+        return translogStrategies;
     }
 
     /**
@@ -5791,6 +5808,16 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         long timestamp,
         boolean isServerSideEncryptionEnabled
     ) throws IOException {
+        String strategyName = indexSettings().getRemoteStoreTranslogStrategy();
+        RemoteStoreTranslogStrategy strategy;
+        if ("default".equals(strategyName)) {
+            strategy = null;
+        } else {
+            strategy = translogStrategies.get(strategyName);
+            if (strategy == null) {
+                throw new IllegalArgumentException("Unknown translog strategy: " + strategyName);
+            }
+        }
         RemoteFsTranslog.download(
             repository,
             shardId,
@@ -5802,7 +5829,8 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
             shouldSeedRemoteStore(),
             isTranslogMetadataEnabled,
             timestamp,
-            isServerSideEncryptionEnabled
+            isServerSideEncryptionEnabled,
+            strategy
         );
     }
 
