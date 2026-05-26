@@ -16,12 +16,17 @@ import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
 import org.opensearch.cluster.metadata.CryptoMetadata;
 import org.opensearch.common.blobstore.BlobContainer;
+import org.opensearch.common.io.VersionedCodecStreamWrapper;
+import org.opensearch.common.lucene.store.ByteArrayIndexInput;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.store.RemoteDirectory;
 import org.opensearch.index.store.RemoteSegmentStoreDirectory;
 import org.opensearch.index.store.lockmanager.RemoteStoreLockManager;
 import org.opensearch.index.store.remote.RemoteStoreSegmentStrategy;
+import org.opensearch.index.store.remote.UploadContext;
+import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadata;
+import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadataHandlerFactory;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.threadpool.ThreadPool;
 
@@ -35,7 +40,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import static org.mockito.Mockito.anyLong;
+import static org.mockito.Mockito.anyString;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * Unit tests for TarSegmentUploadStrategy.
@@ -58,10 +66,6 @@ public class TarSegmentUploadStrategyTests extends OpenSearchTestCase {
             out.writeBytes(cfsContent, 0, cfsContent.length);
             CodecUtil.writeFooter(out);
         }
-
-        Map<String, Long> localSegmentsSizeMap = new HashMap<>();
-        localSegmentsSizeMap.put("_1.cfe", storeDirectory.fileLength("_1.cfe"));
-        localSegmentsSizeMap.put("_1.cfs", storeDirectory.fileLength("_1.cfs"));
 
         // Instantiate real RemoteDirectory subclasses that delegate to ByteBuffersDirectory
         BlobContainer dummyBlobContainer = mock(BlobContainer.class);
@@ -120,6 +124,18 @@ public class TarSegmentUploadStrategyTests extends OpenSearchTestCase {
             }
         };
 
+        when(dummyBlobContainer.readBlob(anyString(), anyLong(), anyLong())).thenAnswer(invocation -> {
+            String blobName = invocation.getArgument(0);
+            long position = invocation.getArgument(1);
+            long length = invocation.getArgument(2);
+            IndexInput fullInput = remoteDataInnerDir.openInput(blobName, IOContext.DEFAULT);
+            byte[] bytes = new byte[(int) length];
+            fullInput.seek(position);
+            fullInput.readBytes(bytes, 0, (int) length);
+            fullInput.close();
+            return new ByteArrayInputStream(bytes);
+        });
+
         RemoteDirectory remoteMetadataDir = new RemoteDirectory(dummyBlobContainer) {
             @Override
             public List<String> listFilesByPrefixInLexicographicOrder(String filenamePrefix, int limit) throws IOException {
@@ -141,19 +157,31 @@ public class TarSegmentUploadStrategyTests extends OpenSearchTestCase {
         );
 
         // Perform Upload
-        TarSegmentUploadStrategy strategy = new TarSegmentUploadStrategy();
+        final org.opensearch.indices.replication.checkpoint.ReplicationCheckpoint checkpoint =
+            new org.opensearch.indices.replication.checkpoint.ReplicationCheckpoint(
+                shardId,
+                1L,
+                1L,
+                0L,
+                0L,
+                "codec",
+                Collections.emptyMap(),
+                0L
+            );
+        TarSegmentUploadStrategy baseStrategy = new TarSegmentUploadStrategy();
+        RemoteStoreSegmentStrategy strategy = baseStrategy.getShardInstance(remoteDirectory, remoteMetadataDir, shardId);
+        remoteDirectory.setStrategySupplier(() -> strategy);
         AtomicBoolean listenerCalled = new AtomicBoolean(false);
         ActionListener<Void> listener = ActionListener.wrap(
             resp -> listenerCalled.set(true),
             ex -> fail("Upload failed: " + ex.getMessage())
         );
 
-        strategy.upload(
+        UploadContext context = new UploadContext(
             Arrays.asList("_1.cfe", "_1.cfs"),
-            localSegmentsSizeMap,
+            Arrays.asList("_1.cfe", "_1.cfs"),
             storeDirectory,
-            remoteDirectory,
-            listener,
+            checkpoint,
             new RemoteStoreSegmentStrategy.UploadCallback() {
                 @Override
                 public void onUploadStart(String file) {}
@@ -167,6 +195,8 @@ public class TarSegmentUploadStrategyTests extends OpenSearchTestCase {
             false,
             null
         );
+
+        strategy.upload(context, listener);
 
         assertTrue(listenerCalled.get());
 
@@ -203,10 +233,20 @@ public class TarSegmentUploadStrategyTests extends OpenSearchTestCase {
                 assertNotNull(entry);
                 assertEquals("index.bin", entry.getName());
                 byte[] indexBinData = tis.readAllBytes();
-                assertEquals('S', indexBinData[0]);
-                assertEquals('T', indexBinData[1]);
-                assertEquals('R', indexBinData[2]);
-                assertEquals('I', indexBinData[3]);
+                assertTrue(indexBinData.length > 0);
+
+                // Deserialize and verify using VersionedCodecStreamWrapper
+                final VersionedCodecStreamWrapper<RemoteSegmentMetadata> wrapper = new VersionedCodecStreamWrapper<>(
+                    new RemoteSegmentMetadataHandlerFactory(),
+                    RemoteSegmentMetadata.VERSION_ONE,
+                    RemoteSegmentMetadata.CURRENT_VERSION,
+                    RemoteSegmentMetadata.METADATA_CODEC
+                );
+                final RemoteSegmentMetadata deserialized = wrapper.readStream(new ByteArrayIndexInput("index.bin", indexBinData));
+                assertNotNull(deserialized);
+                assertEquals(2, deserialized.getMetadata().size());
+                assertTrue(deserialized.getMetadata().containsKey("_1.cfe"));
+                assertTrue(deserialized.getMetadata().containsKey("_1.cfs"));
 
                 // Second Entry: _1.cfe
                 entry = tis.getNextEntry();

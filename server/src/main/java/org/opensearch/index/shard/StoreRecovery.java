@@ -67,6 +67,7 @@ import org.opensearch.index.snapshots.blobstore.RemoteStoreShardShallowCopySnaps
 import org.opensearch.index.store.RemoteSegmentStoreDirectory;
 import org.opensearch.index.store.RemoteSegmentStoreDirectoryFactory;
 import org.opensearch.index.store.Store;
+import org.opensearch.index.store.remote.RemoteStoreSegmentStrategy;
 import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadata;
 import org.opensearch.index.translog.Checkpoint;
 import org.opensearch.index.translog.Translog;
@@ -86,6 +87,7 @@ import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
@@ -429,6 +431,32 @@ final class StoreRecovery {
                     false,
                     indexShard.indexSettings
                 );
+                sourceRemoteDirectory.setStrategySupplier(() -> {
+                    try {
+                        final Map<String, RemoteStoreSegmentStrategy> segmentStrategies = indexShard.getRemoteStoreSegmentStrategies();
+                        final RemoteStoreSegmentStrategy baseStrategy;
+                        if (segmentStrategies != null && indexShard.indexSettings() != null) {
+                            final String strategyName = indexShard.indexSettings().getRemoteStoreSegmentStrategy();
+                            if ("default".equals(strategyName)) {
+                                baseStrategy = new org.opensearch.index.store.remote.DefaultRemoteStoreSegmentStrategy();
+                            } else {
+                                final RemoteStoreSegmentStrategy matched = segmentStrategies.get(strategyName);
+                                baseStrategy = matched != null
+                                    ? matched
+                                    : new org.opensearch.index.store.remote.DefaultRemoteStoreSegmentStrategy();
+                            }
+                        } else {
+                            baseStrategy = new org.opensearch.index.store.remote.DefaultRemoteStoreSegmentStrategy();
+                        }
+                        return baseStrategy.getShardInstance(
+                            sourceRemoteDirectory,
+                            sourceRemoteDirectory.getMetadataDirectory(),
+                            indexShard.shardId()
+                        );
+                    } catch (IOException e) {
+                        throw new RuntimeException("Failed to initialize remote segment strategy for recovery source directory", e);
+                    }
+                });
                 RemoteSegmentMetadata remoteSegmentMetadata = sourceRemoteDirectory.initializeToSpecificCommit(
                     primaryTerm,
                     commitGeneration,
@@ -514,6 +542,32 @@ final class StoreRecovery {
                         false,
                         indexShard.indexSettings
                     );
+                    sourceRemoteDirectory.setStrategySupplier(() -> {
+                        try {
+                            final Map<String, RemoteStoreSegmentStrategy> segmentStrategies = indexShard.getRemoteStoreSegmentStrategies();
+                            final RemoteStoreSegmentStrategy baseStrategy;
+                            if (segmentStrategies != null && indexShard.indexSettings() != null) {
+                                final String strategyName = indexShard.indexSettings().getRemoteStoreSegmentStrategy();
+                                if ("default".equals(strategyName)) {
+                                    baseStrategy = new org.opensearch.index.store.remote.DefaultRemoteStoreSegmentStrategy();
+                                } else {
+                                    final RemoteStoreSegmentStrategy matched = segmentStrategies.get(strategyName);
+                                    baseStrategy = matched != null
+                                        ? matched
+                                        : new org.opensearch.index.store.remote.DefaultRemoteStoreSegmentStrategy();
+                                }
+                            } else {
+                                baseStrategy = new org.opensearch.index.store.remote.DefaultRemoteStoreSegmentStrategy();
+                            }
+                            return baseStrategy.getShardInstance(
+                                sourceRemoteDirectory,
+                                sourceRemoteDirectory.getMetadataDirectory(),
+                                indexShard.shardId()
+                            );
+                        } catch (IOException e) {
+                            throw new RuntimeException("Failed to initialize remote segment strategy for recovery source directory", e);
+                        }
+                    });
                     RemoteSegmentMetadata remoteSegmentMetadata = sourceRemoteDirectory.initializeToSpecificTimestamp(
                         recoverySource.pinnedTimestamp()
                     );

@@ -8,7 +8,7 @@
 
 package org.opensearch.index.store.remote;
 
-import org.opensearch.common.annotation.InternalApi;
+import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.common.blobstore.BlobPath;
@@ -51,7 +51,7 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * @opensearch.internal
  */
-@InternalApi
+@ExperimentalApi
 public class FormatBlobRouter {
 
     /** Formats that route to the base blob container (same path as single-format RemoteDirectory). */

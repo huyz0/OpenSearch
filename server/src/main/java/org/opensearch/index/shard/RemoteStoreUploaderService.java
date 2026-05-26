@@ -19,9 +19,10 @@ import org.opensearch.common.util.UploadListener;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.index.store.RemoteSegmentStoreDirectory;
 import org.opensearch.index.store.RemoteSyncListener;
-import org.opensearch.index.store.remote.DefaultRemoteStoreSegmentStrategy;
 import org.opensearch.index.store.remote.RemoteStoreSegmentStrategy;
+import org.opensearch.indices.replication.checkpoint.ReplicationCheckpoint;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
@@ -48,6 +49,29 @@ public class RemoteStoreUploaderService implements RemoteStoreUploader {
         this.remoteDirectory = remoteDirectory;
         // One-time chain walk at construction — register the sync listener from the directory stack
         registerSyncListenersFromDirectory(storeDirectory);
+        // Configure strategy supplier on the remote directory
+        remoteDirectory.setStrategySupplier(() -> {
+            try {
+                final Map<String, RemoteStoreSegmentStrategy> segmentStrategies = indexShard.getRemoteStoreSegmentStrategies();
+                final RemoteStoreSegmentStrategy baseStrategy;
+                if (segmentStrategies != null && indexShard.indexSettings() != null) {
+                    final String strategyName = indexShard.indexSettings().getRemoteStoreSegmentStrategy();
+                    if ("default".equals(strategyName)) {
+                        baseStrategy = new org.opensearch.index.store.remote.DefaultRemoteStoreSegmentStrategy();
+                    } else {
+                        final RemoteStoreSegmentStrategy matched = segmentStrategies.get(strategyName);
+                        baseStrategy = matched != null
+                            ? matched
+                            : new org.opensearch.index.store.remote.DefaultRemoteStoreSegmentStrategy();
+                    }
+                } else {
+                    baseStrategy = new org.opensearch.index.store.remote.DefaultRemoteStoreSegmentStrategy();
+                }
+                return baseStrategy.getShardInstance(remoteDirectory, remoteDirectory.getMetadataDirectory(), indexShard.shardId());
+            } catch (IOException e) {
+                throw new RuntimeException("Failed to initialize remote segment strategy for shard", e);
+            }
+        });
     }
 
     /**
@@ -83,6 +107,8 @@ public class RemoteStoreUploaderService implements RemoteStoreUploader {
     public void uploadSegments(
         Collection<String> localSegments,
         Map<String, Long> localSegmentsSizeMap,
+        Collection<String> activeFiles,
+        ReplicationCheckpoint checkpoint,
         ActionListener<Void> listener,
         Function<Map<String, Long>, UploadListener> uploadListenerFunction,
         boolean isLowPriorityUpload,
@@ -96,22 +122,7 @@ public class RemoteStoreUploaderService implements RemoteStoreUploader {
 
         logger.debug("Effective new segments files to upload {}", localSegments);
 
-        final Map<String, RemoteStoreSegmentStrategy> segmentStrategies = indexShard.getRemoteStoreSegmentStrategies();
-        final RemoteStoreSegmentStrategy strategy;
-        if (segmentStrategies != null && indexShard.indexSettings() != null) {
-            final String strategyName = indexShard.indexSettings().getRemoteStoreSegmentStrategy();
-            if ("default".equals(strategyName)) {
-                strategy = new DefaultRemoteStoreSegmentStrategy();
-            } else {
-                final RemoteStoreSegmentStrategy matched = segmentStrategies.get(strategyName);
-                if (matched == null) {
-                    throw new IllegalArgumentException("Unknown segment strategy: " + strategyName);
-                }
-                strategy = matched;
-            }
-        } else {
-            strategy = new DefaultRemoteStoreSegmentStrategy();
-        }
+        final RemoteStoreSegmentStrategy strategy = remoteDirectory.getActiveStrategy();
 
         final java.util.concurrent.ConcurrentMap<String, UploadListener> statsListeners = new java.util.concurrent.ConcurrentHashMap<>();
         final RemoteStoreSegmentStrategy.UploadCallback callback = new RemoteStoreSegmentStrategy.UploadCallback() {
@@ -146,14 +157,16 @@ public class RemoteStoreUploaderService implements RemoteStoreUploader {
 
         try {
             strategy.upload(
-                localSegments,
-                localSegmentsSizeMap,
-                storeDirectory,
-                remoteDirectory,
-                listener,
-                callback,
-                isLowPriorityUpload,
-                cryptoMetadata
+                new org.opensearch.index.store.remote.UploadContext(
+                    localSegments,
+                    activeFiles,
+                    storeDirectory,
+                    checkpoint,
+                    callback,
+                    isLowPriorityUpload,
+                    cryptoMetadata
+                ),
+                listener
             );
         } catch (Exception ex) {
             listener.onFailure(ex);

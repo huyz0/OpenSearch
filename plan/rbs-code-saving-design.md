@@ -172,9 +172,73 @@ When a new master is elected, it reconstructs the live registry in **$<300\text{
 
 ---
 
-## 11. Testing Strategy (TDD Approach)
+## 11. Pluggable Extension Points & Strategy Contracts
+
+To support pluggable segment and translog storage layouts, OpenSearch Core (`server`) exposes new extension interfaces and registry hooks.
+
+### A. The Plugin Interface (`RemoteStorePlugin`)
+Plugins register their custom strategies by implementing the `RemoteStorePlugin` interface:
+```java
+@ExperimentalApi
+public interface RemoteStorePlugin {
+    default Map<String, RemoteStoreSegmentStrategy> getRemoteStoreSegmentStrategies() {
+        return Collections.emptyMap();
+    }
+
+    default Map<String, RemoteStoreTranslogStrategy> getRemoteStoreTranslogStrategies() {
+        return Collections.emptyMap();
+    }
+}
+```
+During node initialization, `IndicesService` collects these strategy maps from all active plugins, registers standard `"default"` fallback implementations, and exposes them. Shards lookup the strategy name defined in `IndexSettings` (`index.remote_store.segment.strategy` and `index.remote_store.translog.strategy`) and load the matching implementation from the registry maps.
+
+### B. Segment Strategy Contract (`RemoteStoreSegmentStrategy`)
+This interface encapsulates all read, write, metadata management, seeking, lock tracking, and garbage collection behaviors for segment files:
+* **Upload Path**:
+  * `upload(...)`: Executes the physical copy/upload of segment files to the remote repository.
+  * `uploadMetadata(...)`: Uploads metadata files. Custom strategies like `rbs-tar` can make this a NO-OP since segment metadata is written inline as `index.bin` inside the archive.
+* **Read Path**:
+  * `openInput(...)` & `openBlockInput(...)`: Retrieve standard or block-based range GET slices from the remote store.
+  * `fileLength(...)`: Queries the size of a segment file (e.g. from local memory mappings or parsed inline headers).
+* **Metadata & Lock Tracking**:
+  * `init(...)`, `readMetadata(...)`, `initializeToSpecificTimestamp(...)`, `initializeToSpecificCommit(...)`, `readLatestNMetadataFiles(...)`, and `getMetadataFileForCommit(...)` delegate all metadata discovery, parsing, and timestamp/commit lock management to the strategy.
+* **Deletion & GC**:
+  * `deleteFile(...)`: Removes a single file.
+  * `deleteStaleSegments(...)`: Custom garbage collection routing. In `rbs-tar`, it group stale segments by physical tar file and deletes the tar only when all constituent segments are inactive.
+
+### C. Translog Strategy Contract (`RemoteStoreTranslogStrategy`)
+This interface manages the lifetime, transfer, and restoration of translog snapshots:
+* `transferSnapshot(...)`: Uploads translog snapshots. Under the default strategy, it transfers files one-by-one; under the `rbs-tar` strategy, it delegates uploads to the node-level aggregation queue (`NodeTranslogUploadQueue`).
+* `downloadTranslog(...)`: Downloads individual translog generations during recovery.
+* `download(...)`: Custom download handler that allows a strategy to bypass the default recovery routine entirely. `TarTranslogUploadStrategy` uses this to coordinate recovery coordinates with the Master node, falling back to direct range-based S3 scans under master unavailability.
+
+---
+
+## 12. Complete Replacement of Default Behavior
+
+Pluggable strategies can completely replace default remote store behaviors because the OpenSearch core has been decoupled from any specific storage format, file extension, metadata schema, or garbage collection model:
+
+1. **Complete File Layout Autonomy**:
+   * *Default Strategy*: Directly writes individual segment/translog files to S3 paths.
+   * *Tar Strategy*: Bundles multiple files into a single `.tar` archive and uses custom naming conventions (e.g., `<bundle_uuid>.tar#offset`).
+2. **Metadata-Free S3 Layouts**:
+   * *Default Strategy*: Requires uploading separate `.metadata` (segments) or `txlog_*` (translog) files to S3, leading to additional PUT costs.
+   * *Tar Strategy*: Integrates metadata inline inside the archives (as `index.bin`). It eliminates metadata files entirely, discovering state by listing archives and performing Range GETs on the inline headers.
+3. **Optimized Garbage Collection (GC)**:
+   * *Default Strategy*: GC runs per shard, invoking S3 lists and batch deletes for metadata/data files.
+   * *Tar Strategy*: Segment GC tracks active dependencies across shared tar files; translog GC is offloaded to a central master scheduler checking index state, reducing S3 LIST calls to zero.
+4. **Custom Recovery Routing**:
+   * *Default Strategy*: One-by-one sequential file downloads from S3.
+   * *Tar Strategy*: Queries master coordinates via TCP to fetch exact byte slices, avoiding redundant file-level downloads and extra S3 latency.
+
+By delegating the entire lifecycle (upload, read, metadata, lock, and deletion) to the strategy interfaces, core classes like `RemoteSegmentStoreDirectory` and `RemoteFsTranslog` act as pure orchestrators, making the underlying S3 layout 100% pluggable.
+
+---
+
+## 13. Testing Strategy (TDD Approach)
 
 1. **Red Test Creation**: Write unit/integration tests that assert on the expected outcomes (e.g. tar streaming output, block offsets, parallel registry lookups, zero-empty-upload assertions) before writing code.
 2. **Minimal implementation**: Write the minimum strategy code required to pass the test cases.
 3. **Verify via spotless**: Run `./gradlew spotlessApply` to verify and enforce imports-based code styles.
 4. **Mock Repository**: Use the `FsBlobStoreRepository` test fixtures to simulate S3 remote stores locally and assert on exact API call counts.
+

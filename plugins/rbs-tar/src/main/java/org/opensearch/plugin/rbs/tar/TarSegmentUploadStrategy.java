@@ -8,25 +8,48 @@
 
 package org.opensearch.plugin.rbs.tar;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.apache.lucene.store.ByteBuffersDataOutput;
+import org.apache.lucene.store.ByteBuffersIndexOutput;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
 import org.opensearch.cluster.metadata.CryptoMetadata;
 import org.opensearch.common.UUIDs;
+import org.opensearch.common.collect.Tuple;
+import org.opensearch.common.io.VersionedCodecStreamWrapper;
+import org.opensearch.common.lucene.store.ByteArrayIndexInput;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.index.remote.RemoteStoreUtils;
 import org.opensearch.index.store.RemoteDirectory;
 import org.opensearch.index.store.RemoteSegmentStoreDirectory;
+import org.opensearch.index.store.RemoteSegmentStoreDirectory.UploadedSegmentMetadata;
+import org.opensearch.index.store.lockmanager.RemoteStoreLockManager;
+import org.opensearch.index.store.lockmanager.RemoteStoreMetadataLockManager;
+import org.opensearch.index.store.remote.MetadataUploadContext;
+import org.opensearch.index.store.remote.RemoteSegmentFile;
 import org.opensearch.index.store.remote.RemoteStoreSegmentStrategy;
+import org.opensearch.index.store.remote.UploadContext;
+import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadata;
+import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadataHandlerFactory;
+import org.opensearch.indices.replication.checkpoint.ReplicationCheckpoint;
+import org.opensearch.node.remotestore.RemoteStorePinnedTimestampService;
 
-import java.io.ByteArrayOutputStream;
-import java.io.DataOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
-import java.nio.charset.StandardCharsets;
+import java.nio.file.NoSuchFileException;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
 
 /**
  * A segment upload strategy that packages segment files of a refresh batch into a single tar archive.
@@ -34,63 +57,186 @@ import java.util.Map;
  */
 public final class TarSegmentUploadStrategy implements RemoteStoreSegmentStrategy {
 
+    private static final Logger logger = LogManager.getLogger(TarSegmentUploadStrategy.class);
+
+    private final RemoteSegmentStoreDirectory remoteDirectory;
+    private final RemoteDirectory remoteDataDirectory;
+    private final RemoteDirectory remoteMetadataDirectory;
+    private final ShardId shardId;
+
+    public TarSegmentUploadStrategy() {
+        this.remoteDirectory = null;
+        this.remoteDataDirectory = null;
+        this.remoteMetadataDirectory = null;
+        this.shardId = null;
+    }
+
+    private TarSegmentUploadStrategy(
+        RemoteSegmentStoreDirectory remoteDirectory,
+        RemoteDirectory remoteMetadataDirectory,
+        ShardId shardId
+    ) {
+        this.remoteDirectory = remoteDirectory;
+        this.remoteDataDirectory = (RemoteDirectory) remoteDirectory.getDelegate();
+        this.remoteMetadataDirectory = remoteMetadataDirectory;
+        this.shardId = shardId;
+    }
+
     @Override
-    public void upload(
-        final Collection<String> localSegments,
-        final Map<String, Long> localSegmentsSizeMap,
-        final Directory storeDirectory,
-        final RemoteSegmentStoreDirectory remoteDirectory,
-        final ActionListener<Void> listener,
-        final UploadCallback callback,
-        final boolean isLowPriorityUpload,
-        final CryptoMetadata cryptoMetadata
+    public RemoteStoreSegmentStrategy getShardInstance(
+        RemoteSegmentStoreDirectory remoteDirectory,
+        RemoteDirectory remoteMetadataDirectory,
+        ShardId shardId
     ) throws IOException {
-        if (localSegments.isEmpty()) {
+        return new TarSegmentUploadStrategy(remoteDirectory, remoteMetadataDirectory, shardId);
+    }
+
+    public static String getBundleFilename(
+        long primaryTerm,
+        long generation,
+        long translogGeneration,
+        long uploadCounter,
+        int metadataVersion,
+        String nodeId,
+        long creationTimestamp
+    ) {
+        return String.join(
+            "__",
+            "rbs_bundle",
+            RemoteStoreUtils.invertLong(primaryTerm),
+            RemoteStoreUtils.invertLong(generation),
+            RemoteStoreUtils.invertLong(translogGeneration),
+            RemoteStoreUtils.invertLong(uploadCounter),
+            String.valueOf(Objects.hash(nodeId)),
+            RemoteStoreUtils.invertLong(creationTimestamp),
+            metadataVersion + ".tar"
+        );
+    }
+
+    public static long getTimestamp(String filename) {
+        String[] filenameTokens = filename.split("__");
+        String tsToken = filenameTokens[filenameTokens.length - 2];
+        return RemoteStoreUtils.invertLong(tsToken);
+    }
+
+    public static Tuple<String, String> getNodeIdByPrimaryTermAndGen(String filename) {
+        String[] tokens = filename.split("__");
+        if (tokens.length < 8) {
+            return null;
+        }
+        String primaryTermAndGen = String.join("__", tokens[1], tokens[2], tokens[3]);
+        return new Tuple<>(primaryTermAndGen, tokens[5]);
+    }
+
+    private static int parseOctal(byte[] buffer, int offset, int length) {
+        long value = 0;
+        int end = offset + length;
+        int start = offset;
+        while (start < end && (buffer[start] == ' ' || buffer[start] == '0')) {
+            start++;
+        }
+        for (int i = start; i < end; i++) {
+            byte b = buffer[i];
+            if (b == 0 || b == ' ' || b == '\t') {
+                break;
+            }
+            if (b < '0' || b > '7') {
+                throw new IllegalArgumentException("Invalid octal digit: " + (char) b);
+            }
+            value = (value << 3) + (b - '0');
+        }
+        return (int) value;
+    }
+
+    @Override
+    public void upload(UploadContext context, ActionListener<Void> listener) throws IOException {
+        final Collection<String> filesToUpload = context.getFilesToUpload();
+        final Collection<String> activeSegmentFiles = context.getActiveSegmentFiles();
+        final Directory storeDirectory = context.getStoreDirectory();
+        final ReplicationCheckpoint checkpoint = context.getCheckpoint();
+        final UploadCallback callback = context.getCallback();
+        final boolean isLowPriorityUpload = context.isLowPriorityUpload();
+        final CryptoMetadata cryptoMetadata = context.getCryptoMetadata();
+
+        if (filesToUpload.isEmpty()) {
             listener.onResponse(null);
             return;
         }
 
-        // Generate unique tar base name and local temporary name
+        final long creationTimestamp = System.currentTimeMillis();
         final String bundleUuid = UUIDs.randomBase64UUID();
-        final String bundleName = "rbs_bundle_" + bundleUuid + ".tar";
+        final long uploadCounter = remoteDirectory.getMetadataUploadCounter().incrementAndGet();
+        final String bundleName = getBundleFilename(
+            checkpoint.getPrimaryTerm(),
+            checkpoint.getSegmentsGen(),
+            0L,
+            uploadCounter,
+            RemoteSegmentMetadata.CURRENT_VERSION,
+            "rbs_node",
+            creationTimestamp
+        );
         final String remoteTarName = remoteDirectory.getNewRemoteSegmentFilename(bundleName);
 
-        // Pre-calculate file offsets in tar archive
-        final int indexBinSize = calculateIndexBinSize(localSegments);
-        final int indexBinPadding = (512 - (indexBinSize % 512)) % 512;
-        long currentOffset = 512L + indexBinSize + indexBinPadding;
+        // Circular size / offset calculation for index.bin
+        int indexBinSize = 2048; // starting guess
+        Map<String, Long> fileOffsets = new HashMap<>();
+        byte[] indexBinBytes = null;
 
-        final Map<String, Long> fileOffsets = new HashMap<>();
-        final Map<String, String> fileChecksums = new HashMap<>();
-        for (final String file : localSegments) {
-            currentOffset += 512L; // skip header for this file
-            fileOffsets.put(file, currentOffset);
-
-            final String checksumStr = remoteDirectory.getChecksumOfLocalFile(storeDirectory, file);
-            fileChecksums.put(file, checksumStr);
-
-            final long length = localSegmentsSizeMap.get(file);
-            final long filePadding = (512L - (length % 512L)) % 512L;
-            currentOffset += length + filePadding;
-        }
-
-        // Build index.bin in memory
-        final ByteArrayOutputStream indexBinStream = new ByteArrayOutputStream(indexBinSize);
-        try (DataOutputStream dos = new DataOutputStream(indexBinStream)) {
-            dos.write(new byte[] { 'S', 'T', 'R', 'I' });
-            dos.writeByte(1);
-            dos.writeShort(localSegments.size());
-            for (final String file : localSegments) {
-                final byte[] nameBytes = file.getBytes(StandardCharsets.UTF_8);
-                dos.writeShort(nameBytes.length);
-                dos.write(nameBytes);
-                dos.writeLong(fileOffsets.get(file));
-                dos.writeLong(localSegmentsSizeMap.get(file));
-                final long checksum = Long.parseLong(fileChecksums.get(file));
-                dos.writeLong(checksum);
+        for (int iter = 0; iter < 3; iter++) {
+            int indexBinPadding = (512 - (indexBinSize % 512)) % 512;
+            long currentOffset = 512L + indexBinSize + indexBinPadding;
+            fileOffsets.clear();
+            for (final String file : filesToUpload) {
+                currentOffset += 512L;
+                fileOffsets.put(file, currentOffset);
+                final long length = storeDirectory.fileLength(file);
+                final long filePadding = (512L - (length % 512L)) % 512L;
+                currentOffset += length + filePadding;
             }
+
+            final Map<String, RemoteSegmentFile> uploadedSegmentsMap = new HashMap<>();
+            for (final String file : activeSegmentFiles) {
+                if (filesToUpload.contains(file)) {
+                    final String checksum = remoteDirectory.getChecksumOfLocalFile(storeDirectory, file);
+                    final long length = storeDirectory.fileLength(file);
+                    final TarUploadedSegmentMetadata meta = new TarUploadedSegmentMetadata(
+                        file,
+                        remoteTarName,
+                        fileOffsets.get(file),
+                        checksum,
+                        length,
+                        remoteDataDirectory
+                    );
+                    meta.setWrittenByMajor(org.apache.lucene.util.Version.LATEST.major);
+                    uploadedSegmentsMap.put(file, meta);
+                } else {
+                    final RemoteSegmentFile existing = remoteDirectory.getSegmentsUploadedToRemoteStore().get(file);
+                    if (existing == null) {
+                        throw new NoSuchFileException(file);
+                    }
+                    uploadedSegmentsMap.put(file, existing);
+                }
+            }
+
+            final RemoteSegmentMetadata remoteMetadata = new RemoteSegmentMetadata(uploadedSegmentsMap, new byte[0], checkpoint);
+
+            final VersionedCodecStreamWrapper<RemoteSegmentMetadata> wrapper = new VersionedCodecStreamWrapper<>(
+                new RemoteSegmentMetadataHandlerFactory(),
+                RemoteSegmentMetadata.VERSION_ONE,
+                RemoteSegmentMetadata.CURRENT_VERSION,
+                RemoteSegmentMetadata.METADATA_CODEC
+            );
+            final ByteBuffersDataOutput byteBuffersIndexOutput = new ByteBuffersDataOutput();
+            try (IndexOutput indexOutput = new ByteBuffersIndexOutput(byteBuffersIndexOutput, "index.bin", "index.bin")) {
+                wrapper.writeStream(indexOutput, remoteMetadata);
+            }
+            indexBinBytes = byteBuffersIndexOutput.toArrayCopy();
+
+            if (indexBinBytes.length == indexBinSize) {
+                break;
+            }
+            indexBinSize = indexBinBytes.length;
         }
-        final byte[] indexBinBytes = indexBinStream.toByteArray();
 
         // Write tar archive to temporary local file
         final IndexOutput indexOutput = storeDirectory.createOutput(bundleName, IOContext.DEFAULT);
@@ -112,15 +258,13 @@ public final class TarSegmentUploadStrategy implements RemoteStoreSegmentStrateg
         };
 
         try (TarOutputStream tos = new TarOutputStream(os)) {
-            // Write index.bin as the first entry
             tos.putNextEntry("index.bin", indexBinBytes.length);
             tos.write(indexBinBytes);
             tos.closeEntry();
 
-            // Stream each segment file
             final byte[] buf = new byte[8192];
-            for (final String file : localSegments) {
-                final long length = localSegmentsSizeMap.get(file);
+            for (final String file : filesToUpload) {
+                final long length = storeDirectory.fileLength(file);
                 tos.putNextEntry(file, length);
                 try (IndexInput indexInput = storeDirectory.openInput(file, IOContext.READONCE)) {
                     long remaining = length;
@@ -136,20 +280,35 @@ public final class TarSegmentUploadStrategy implements RemoteStoreSegmentStrateg
         }
 
         // Notify upload starts
-        for (final String file : localSegments) {
+        for (final String file : filesToUpload) {
             callback.onUploadStart(file);
         }
 
+        final byte[] finalIndexBinBytes = indexBinBytes;
+        final Map<String, Long> finalFileOffsets = fileOffsets;
         final Runnable postUploadRunner = () -> {
             try {
-                // Register all uploaded segments
-                for (final String file : localSegments) {
-                    final long length = localSegmentsSizeMap.get(file);
-                    final String checksum = fileChecksums.get(file);
-                    final String remotePath = remoteTarName + "#" + fileOffsets.get(file);
-                    final RemoteSegmentStoreDirectory.UploadedSegmentMetadata metadata =
-                        new RemoteSegmentStoreDirectory.UploadedSegmentMetadata(file, remotePath, checksum, length);
-                    remoteDirectory.addUploadedSegment(file, metadata);
+                for (final String file : activeSegmentFiles) {
+                    if (filesToUpload.contains(file)) {
+                        final String checksum = remoteDirectory.getChecksumOfLocalFile(storeDirectory, file);
+                        final long length = storeDirectory.fileLength(file);
+                        final TarUploadedSegmentMetadata metadata = new TarUploadedSegmentMetadata(
+                            file,
+                            remoteTarName,
+                            finalFileOffsets.get(file),
+                            checksum,
+                            length,
+                            remoteDataDirectory
+                        );
+                        metadata.setWrittenByMajor(org.apache.lucene.util.Version.LATEST.major);
+                        remoteDirectory.addUploadedSegment(file, metadata);
+                    } else {
+                        // Keep or ensure present
+                        final UploadedSegmentMetadata existing = remoteDirectory.getSegmentsUploadedToRemoteStore().get(file);
+                        if (existing != null) {
+                            remoteDirectory.addUploadedSegment(file, existing);
+                        }
+                    }
                 }
             } catch (final Exception e) {
                 throw new RuntimeException("Exception in post-upload segment registration", e);
@@ -157,27 +316,23 @@ public final class TarSegmentUploadStrategy implements RemoteStoreSegmentStrateg
         };
 
         final ActionListener<Void> wrapListener = ActionListener.wrap(resp -> {
-            // Success: notify uploader service
-            for (final String file : localSegments) {
+            for (final String file : filesToUpload) {
                 callback.onUploadSuccess(file);
             }
-            // Cleanup local temp file
             try {
                 storeDirectory.deleteFile(bundleName);
             } catch (final IOException e) {
-                // Ignore
+                // ignore
             }
             listener.onResponse(null);
         }, ex -> {
-            // Failure: notify error
-            for (final String file : localSegments) {
+            for (final String file : filesToUpload) {
                 callback.onUploadFailure(file, ex);
             }
-            // Cleanup local temp file
             try {
                 storeDirectory.deleteFile(bundleName);
             } catch (final IOException e) {
-                // Ignore
+                // ignore
             }
             listener.onFailure(ex);
         });
@@ -207,12 +362,269 @@ public final class TarSegmentUploadStrategy implements RemoteStoreSegmentStrateg
         }
     }
 
-    private int calculateIndexBinSize(final Collection<String> files) {
-        int size = 7;
-        for (final String file : files) {
-            final byte[] nameBytes = file.getBytes(StandardCharsets.UTF_8);
-            size += 26 + nameBytes.length;
+    @Override
+    public void uploadMetadata(MetadataUploadContext context) throws IOException {
+        // NO-OP: Tar strategy uploads everything atomically in upload(...)
+    }
+
+    @Override
+    public RemoteSegmentMetadata init() throws IOException {
+        logger.debug("Start initialisation of remote segment metadata");
+
+        final List<String> bundleFiles = remoteDataDirectory.listFilesByPrefixInLexicographicOrder(
+            "rbs_bundle__",
+            RemoteSegmentStoreDirectory.METADATA_FILES_TO_FETCH
+        );
+
+        RemoteStoreUtils.verifyNoMultipleWriters(bundleFiles, TarSegmentUploadStrategy::getNodeIdByPrimaryTermAndGen);
+
+        if (bundleFiles.isEmpty()) {
+            logger.trace("No bundle file found, this can happen for new index with no data uploaded to remote segment store");
+            return null;
         }
-        return size;
+
+        final String latestBundle = bundleFiles.get(0);
+        logger.trace("Reading latest bundle file {}", latestBundle);
+        return readMetadata(latestBundle);
+    }
+
+    private RemoteSegmentMetadata postProcessMetadata(RemoteSegmentMetadata rawMetadata) {
+        if (rawMetadata == null) {
+            return null;
+        }
+        Map<String, RemoteSegmentFile> processedMap = new HashMap<>();
+        for (Map.Entry<String, RemoteSegmentFile> entry : rawMetadata.getMetadata().entrySet()) {
+            UploadedSegmentMetadata raw = (UploadedSegmentMetadata) entry.getValue();
+            final String[] parts = raw.getUploadedFilename().split("#");
+            final String tarFilename = parts[0];
+            final long offset = Long.parseLong(parts[1]);
+            TarUploadedSegmentMetadata processed = new TarUploadedSegmentMetadata(
+                raw.getOriginalFilename(),
+                tarFilename,
+                offset,
+                raw.getChecksum(),
+                raw.getLength(),
+                remoteDataDirectory
+            );
+            processed.setWrittenByMajor(raw.getWrittenByMajor());
+            processedMap.put(entry.getKey(), processed);
+        }
+        return new RemoteSegmentMetadata(processedMap, rawMetadata.getSegmentInfosBytes(), rawMetadata.getReplicationCheckpoint());
+    }
+
+    @Override
+    public void deleteStaleSegments(int minCommitsToKeep) throws IOException {
+        if (minCommitsToKeep == -1) {
+            return;
+        }
+
+        final List<String> allBundles = remoteDataDirectory.listFilesByPrefixInLexicographicOrder("rbs_bundle__", Integer.MAX_VALUE);
+
+        if (allBundles.size() <= minCommitsToKeep) {
+            return;
+        }
+
+        if (minCommitsToKeep != 0 && RemoteStoreUtils.isPinnedTimestampStateStale()) {
+            logger.warn("Skipping remote segment store garbage collection as last fetch of pinned timestamp is stale");
+            return;
+        }
+
+        final Tuple<Long, Set<Long>> pinnedTimestampsState = RemoteStorePinnedTimestampService.getPinnedTimestamps();
+        final Set<Long> pinnedTimestamps = new HashSet<>(pinnedTimestampsState.v2());
+        pinnedTimestamps.add(pinnedTimestampsState.v1());
+
+        final Set<String> implicitLockedFiles = RemoteStoreUtils.getPinnedTimestampLockedFiles(
+            allBundles,
+            pinnedTimestamps,
+            remoteDirectory.getMetadataFilePinnedTimestampMap(),
+            TarSegmentUploadStrategy::getTimestamp,
+            TarSegmentUploadStrategy::getNodeIdByPrimaryTermAndGen
+        );
+
+        final Set<String> allLockFiles = new HashSet<>(implicitLockedFiles);
+        try {
+            allLockFiles.addAll(
+                ((RemoteStoreMetadataLockManager) remoteDirectory.getMetadataLockManager()).fetchLockedMetadataFiles("rbs_bundle")
+            );
+        } catch (final Exception e) {
+            logger.error("Exception while fetching segment metadata lock files, skipping deleteStaleSegments", e);
+            return;
+        }
+
+        final List<String> activeBundles = new ArrayList<>();
+        final List<String> bundlesEligibleToDelete = new ArrayList<>();
+
+        for (int i = 0; i < allBundles.size(); i++) {
+            final String bundle = allBundles.get(i);
+            if (i < minCommitsToKeep || allLockFiles.contains(bundle)) {
+                activeBundles.add(bundle);
+            } else {
+                bundlesEligibleToDelete.add(bundle);
+            }
+        }
+
+        if (bundlesEligibleToDelete.isEmpty()) {
+            return;
+        }
+
+        final Set<String> referencedBundles = new HashSet<>(activeBundles);
+        for (final String activeBundle : activeBundles) {
+            try {
+                final RemoteSegmentMetadata meta = readMetadata(activeBundle);
+                for (final RemoteSegmentFile segMeta : meta.getMetadata().values()) {
+                    final String[] parts = ((UploadedSegmentMetadata) segMeta).getUploadedFilename().split("#");
+                    referencedBundles.add(parts[0]);
+                }
+            } catch (final Exception e) {
+                logger.warn("Failed to read metadata from active bundle: " + activeBundle + ", assuming it is needed", e);
+            }
+        }
+
+        final List<String> bundlesToDelete = new ArrayList<>();
+        for (final String bundle : bundlesEligibleToDelete) {
+            if (!referencedBundles.contains(bundle)) {
+                bundlesToDelete.add(bundle);
+            }
+        }
+
+        if (bundlesToDelete.isEmpty() == false) {
+            logger.info("Deleting stale bundles: {}", bundlesToDelete);
+            remoteDataDirectory.deleteFiles(bundlesToDelete);
+
+            final Map<String, UploadedSegmentMetadata> activeSegments = remoteDirectory.getSegmentsUploadedToRemoteStore();
+            final List<String> toRemove = new ArrayList<>();
+            for (final Map.Entry<String, UploadedSegmentMetadata> entry : activeSegments.entrySet()) {
+                final String[] parts = entry.getValue().getUploadedFilename().split("#");
+                if (bundlesToDelete.contains(parts[0])) {
+                    toRemove.add(entry.getKey());
+                }
+            }
+            for (final String file : toRemove) {
+                remoteDirectory.removeUploadedSegment(file);
+            }
+        }
+    }
+
+    @Override
+    public void deleteFile(String name) throws IOException {
+        remoteDirectory.removeUploadedSegment(name);
+    }
+
+    @Override
+    public String getMetadataFileForCommit(long primaryTerm, long generation) throws IOException {
+        final String prefix = String.join(
+            "__",
+            "rbs_bundle",
+            RemoteStoreUtils.invertLong(primaryTerm),
+            RemoteStoreUtils.invertLong(generation)
+        );
+        final List<String> bundleFiles = remoteDataDirectory.listFilesByPrefixInLexicographicOrder(prefix, 1);
+        if (bundleFiles.isEmpty()) {
+            throw new NoSuchFileException(
+                "Bundle file is not present for given primary term " + primaryTerm + " and generation " + generation
+            );
+        }
+        return bundleFiles.get(0);
+    }
+
+    @Override
+    public RemoteSegmentMetadata readMetadata(String filename) throws IOException {
+        final long fileLength = remoteDataDirectory.fileLength(filename);
+        final int initialFetchSize = (int) Math.min(65536, fileLength);
+        byte[] firstBlock;
+        try (InputStream inputStream = remoteDataDirectory.getBlobContainer().readBlob(filename, 0, initialFetchSize)) {
+            firstBlock = inputStream.readAllBytes();
+        }
+
+        final int indexBinSize = parseOctal(firstBlock, 124, 12);
+        byte[] indexBinBytes;
+        if (indexBinSize + 512 <= initialFetchSize) {
+            indexBinBytes = new byte[indexBinSize];
+            System.arraycopy(firstBlock, 512, indexBinBytes, 0, indexBinSize);
+        } else {
+            final int exactFetchSize = indexBinSize + 512;
+            try (InputStream inputStream = remoteDataDirectory.getBlobContainer().readBlob(filename, 512, indexBinSize)) {
+                indexBinBytes = inputStream.readAllBytes();
+            }
+        }
+
+        final VersionedCodecStreamWrapper<RemoteSegmentMetadata> wrapper = new VersionedCodecStreamWrapper<>(
+            new RemoteSegmentMetadataHandlerFactory(),
+            RemoteSegmentMetadata.VERSION_ONE,
+            RemoteSegmentMetadata.CURRENT_VERSION,
+            RemoteSegmentMetadata.METADATA_CODEC
+        );
+        final RemoteSegmentMetadata remoteMetadata = wrapper.readStream(new ByteArrayIndexInput(filename, indexBinBytes));
+
+        // Post process to bind TarUploadedSegmentMetadata
+        final RemoteSegmentMetadata processedMetadata = postProcessMetadata(remoteMetadata);
+
+        // Retrieve actual segmentInfosBytes by reading the segments_N file from this or other bundles
+        final Map<String, RemoteSegmentFile> metadataMap = processedMetadata.getMetadata();
+        String segmentsNFile = null;
+        for (final String file : metadataMap.keySet()) {
+            if (file.startsWith(org.apache.lucene.index.IndexFileNames.SEGMENTS)) {
+                segmentsNFile = file;
+                break;
+            }
+        }
+
+        byte[] segmentInfosBytes = new byte[0];
+        if (segmentsNFile != null) {
+            final UploadedSegmentMetadata segmentsMeta = (UploadedSegmentMetadata) metadataMap.get(segmentsNFile);
+            final long length = segmentsMeta.getLength();
+            try (InputStream segmentsStream = segmentsMeta.openStream(0, length)) {
+                segmentInfosBytes = segmentsStream.readAllBytes();
+            }
+        }
+
+        return new RemoteSegmentMetadata(metadataMap, segmentInfosBytes, processedMetadata.getReplicationCheckpoint());
+    }
+
+    @Override
+    public RemoteSegmentMetadata initializeToSpecificTimestamp(long timestamp) throws IOException {
+        final List<String> bundleFiles = remoteDataDirectory.listFilesByPrefixInLexicographicOrder("rbs_bundle__", Integer.MAX_VALUE);
+        final Set<String> lockedBundleFiles = RemoteStoreUtils.getPinnedTimestampLockedFiles(
+            bundleFiles,
+            Set.of(timestamp),
+            TarSegmentUploadStrategy::getTimestamp,
+            TarSegmentUploadStrategy::getNodeIdByPrimaryTermAndGen,
+            true
+        );
+        if (lockedBundleFiles.isEmpty()) {
+            return null;
+        }
+        if (lockedBundleFiles.size() > 1) {
+            throw new IOException("Expected exactly one bundle file matching timestamp: " + timestamp + " but got " + lockedBundleFiles);
+        }
+        final String bundleFile = lockedBundleFiles.iterator().next();
+        return readMetadata(bundleFile);
+    }
+
+    @Override
+    public RemoteSegmentMetadata initializeToSpecificCommit(
+        long primaryTerm,
+        long commitGeneration,
+        String acquirerId,
+        RemoteStoreLockManager mdLockManager
+    ) throws IOException {
+        final String prefix = String.join(
+            "__",
+            "rbs_bundle",
+            RemoteStoreUtils.invertLong(primaryTerm),
+            RemoteStoreUtils.invertLong(commitGeneration)
+        );
+        final String bundleFile = ((RemoteStoreMetadataLockManager) mdLockManager).fetchLockedMetadataFile(prefix, acquirerId);
+        return readMetadata(bundleFile);
+    }
+
+    @Override
+    public Map<String, RemoteSegmentMetadata> readLatestNMetadataFiles(int count) throws IOException {
+        final Map<String, RemoteSegmentMetadata> metadataMap = new java.util.LinkedHashMap<>();
+        final List<String> bundleFiles = remoteDataDirectory.listFilesByPrefixInLexicographicOrder("rbs_bundle__", count);
+        for (final String file : bundleFiles) {
+            metadataMap.put(file, readMetadata(file));
+        }
+        return metadataMap;
     }
 }

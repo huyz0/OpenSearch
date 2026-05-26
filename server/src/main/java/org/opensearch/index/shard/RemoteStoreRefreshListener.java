@@ -34,6 +34,7 @@ import org.opensearch.index.remote.RemoteSegmentTransferTracker;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.store.DataFormatAwareStoreDirectory;
 import org.opensearch.index.store.RemoteSegmentStoreDirectory;
+import org.opensearch.index.store.remote.MetadataUploadContext;
 import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadata;
 import org.opensearch.index.translog.Translog;
 import org.opensearch.indices.RemoteStoreSettings;
@@ -319,7 +320,13 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
                     }, latch);
 
                     // Start the segments files upload with crypto
-                    uploadNewSegments(localSegmentsPostRefresh, localSegmentsSizeMap, segmentUploadsCompletedListener, cryptoMetadata);
+                    uploadNewSegments(
+                        localSegmentsPostRefresh,
+                        localSegmentsSizeMap,
+                        checkpoint,
+                        segmentUploadsCompletedListener,
+                        cryptoMetadata
+                    );
                     if (latch.await(
                         remoteStoreSettings.getClusterRemoteSegmentTransferTimeout().millis(),
                         TimeUnit.MILLISECONDS
@@ -373,6 +380,7 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
     private void uploadNewSegments(
         Collection<String> localSegmentsPostRefresh,
         Map<String, Long> localSegmentsSizeMap,
+        ReplicationCheckpoint checkpoint,
         ActionListener<Void> segmentUploadsCompletedListener,
         CryptoMetadata cryptoMetadata
     ) {
@@ -384,6 +392,8 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
         remoteStoreUploader.uploadSegments(
             filteredFiles,
             localSegmentsSizeMap,
+            localSegmentsPostRefresh,
+            checkpoint,
             segmentUploadsCompletedListener,
             uploadListenerFunction,
             isLowPriorityUpload(),
@@ -506,15 +516,18 @@ public final class RemoteStoreRefreshListener extends ReleasableRetryableRefresh
             throw new UnsupportedOperationException("Encountered null TranslogGeneration while uploading metadata to remote segment store");
         } else {
             long translogFileGeneration = translogGeneration.translogFileGeneration;
-            remoteDirectory.uploadMetadata(
-                localSegmentsPostRefresh,
-                catalogSnapshotCloned,
-                storeDirectory,
-                translogFileGeneration,
-                replicationCheckpoint,
-                indexShard.getNodeId(),
-                serializer
-            );
+            remoteDirectory.getActiveStrategy()
+                .uploadMetadata(
+                    new MetadataUploadContext(
+                        localSegmentsPostRefresh,
+                        catalogSnapshotCloned,
+                        storeDirectory,
+                        translogFileGeneration,
+                        replicationCheckpoint,
+                        indexShard.getNodeId(),
+                        serializer
+                    )
+                );
         }
     }
 
