@@ -451,7 +451,7 @@ public class IndicesService extends AbstractLifecycleComponent
     final IndicesRequestCache indicesRequestCache; // pkg-private for testing
     private final IndicesQueryCache indicesQueryCache;
     private final MetaStateService metaStateService;
-    private final Collection<Function<IndexSettings, Optional<EngineFactory>>> engineFactoryProviders;
+    private final Collection<BiFunction<IndexSettings, ShardRouting, Optional<EngineFactory>>> engineFactoryProviders;
     private final Map<String, IndexStorePlugin.DirectoryFactory> directoryFactories;
     private final Map<String, IndexStorePlugin.CompositeDirectoryFactory> compositeDirectoryFactories;
     private final Map<String, IngestionConsumerFactory> ingestionConsumerFactories;
@@ -511,7 +511,7 @@ public class IndicesService extends AbstractLifecycleComponent
         ClusterService clusterService,
         Client client,
         MetaStateService metaStateService,
-        Collection<Function<IndexSettings, Optional<EngineFactory>>> engineFactoryProviders,
+        Collection<BiFunction<IndexSettings, ShardRouting, Optional<EngineFactory>>> engineFactoryProviders,
         Map<String, IndexStorePlugin.DirectoryFactory> directoryFactories,
         Map<String, IndexStorePlugin.CompositeDirectoryFactory> compositeDirectoryFactories,
         Map<String, org.opensearch.index.store.DataFormatAwareStoreDirectoryFactory> dataFormatAwareStoreDirectoryFactories,
@@ -702,7 +702,7 @@ public class IndicesService extends AbstractLifecycleComponent
         ClusterService clusterService,
         Client client,
         MetaStateService metaStateService,
-        Collection<Function<IndexSettings, Optional<EngineFactory>>> engineFactoryProviders,
+        Collection<BiFunction<IndexSettings, ShardRouting, Optional<EngineFactory>>> engineFactoryProviders,
         Map<String, IndexStorePlugin.DirectoryFactory> directoryFactories,
         ValuesSourceRegistry valuesSourceRegistry,
         Map<String, IndexStorePlugin.RecoveryStateFactory> recoveryStateFactories,
@@ -1176,6 +1176,7 @@ public class IndicesService extends AbstractLifecycleComponent
             idxSettings,
             analysisRegistry,
             getIndexerFactory(idxSettings),
+            this::getIndexerFactory,
             getEngineConfigFactory(idxSettings),
             directoryFactories,
             compositeDirectoryFactories,
@@ -1258,14 +1259,28 @@ public class IndicesService extends AbstractLifecycleComponent
     }
 
     private IndexerFactory getIndexerFactory(final IndexSettings idxSettings) {
+        return getIndexerFactory(idxSettings, null);
+    }
+
+    /**
+     * Resolves the {@link IndexerFactory} for a specific shard copy. {@code shardRouting} is {@code null} when
+     * resolving the index-wide default ahead of any shard being allocated (e.g. administrative lookups); it is
+     * non-null when resolving for an actual shard, letting registered {@link org.opensearch.plugins.EnginePlugin}s
+     * pick a different engine depending on the shard's role (see {@link ShardRouting#isSearchOnly()}).
+     */
+    private IndexerFactory getIndexerFactory(final IndexSettings idxSettings, @Nullable final ShardRouting shardRouting) {
         if (idxSettings.isPluggableDataFormatEnabled()) {
             return new DataFormatAwareIndexerFactory();
         } else {
-            return new EngineBackedIndexerFactory(getEngineFactory(idxSettings));
+            return new EngineBackedIndexerFactory(getEngineFactory(idxSettings, shardRouting));
         }
     }
 
     private EngineFactory getEngineFactory(final IndexSettings idxSettings) {
+        return getEngineFactory(idxSettings, null);
+    }
+
+    private EngineFactory getEngineFactory(final IndexSettings idxSettings, @Nullable final ShardRouting shardRouting) {
         final IndexMetadata indexMetadata = idxSettings.getIndexMetadata();
         if (indexMetadata != null && indexMetadata.getState() == IndexMetadata.State.CLOSE) {
             // NoOpEngine takes precedence as long as the index is closed
@@ -1279,7 +1294,7 @@ public class IndicesService extends AbstractLifecycleComponent
         }
 
         final List<Optional<EngineFactory>> engineFactories = engineFactoryProviders.stream()
-            .map(engineFactoryProvider -> engineFactoryProvider.apply(idxSettings))
+            .map(engineFactoryProvider -> engineFactoryProvider.apply(idxSettings, shardRouting))
             .filter(maybe -> Objects.requireNonNull(maybe).isPresent())
             .collect(Collectors.toList());
         if (engineFactories.isEmpty()) {
@@ -1319,6 +1334,7 @@ public class IndicesService extends AbstractLifecycleComponent
             idxSettings,
             analysisRegistry,
             getIndexerFactory(idxSettings),
+            null,
             getEngineConfigFactory(idxSettings),
             directoryFactories,
             compositeDirectoryFactories,

@@ -168,9 +168,13 @@ public class InternalEngine extends Engine {
     @Nullable
     protected final String historyUUID;
 
-    private final OpenSearchConcurrentMergeScheduler mergeScheduler;
-    private final ExternalReaderManager externalReaderManager;
-    private final OpenSearchReaderManager internalReaderManager;
+    // Widened from private to protected so that subclasses providing an alternative durability/replication layer
+    // (e.g. an EnginePlugin-supplied engine backed by remote storage) can hook into merge scheduling and commit
+    // deletion lifecycle without having to reimplement them; the mechanics of merging, reading, and deletion-policy
+    // bookkeeping are agnostic to where the underlying commit/segment bytes ultimately live.
+    protected final OpenSearchConcurrentMergeScheduler mergeScheduler;
+    protected final ExternalReaderManager externalReaderManager;
+    protected final OpenSearchReaderManager internalReaderManager;
 
     private final Lock flushLock = new ReentrantLock();
     private final ReentrantLock optimizeLock = new ReentrantLock();
@@ -179,7 +183,7 @@ public class InternalEngine extends Engine {
 
     private final IndexingThrottler throttle;
 
-    private final CombinedDeletionPolicy combinedDeletionPolicy;
+    protected final CombinedDeletionPolicy combinedDeletionPolicy;
 
     // How many callers are currently requesting index throttling. Currently there are only two situations where we do this: when merges
     // are falling behind and when writing indexing buffer to disk is too slow. When this is 0, there is no throttling, else we throttling
@@ -243,7 +247,7 @@ public class InternalEngine extends Engine {
         boolean success = false;
         try {
             this.lastDeleteVersionPruneTimeMSec = engineConfig.getThreadPool().relativeTimeInMillis();
-            mergeScheduler = scheduler = new EngineMergeScheduler(
+            mergeScheduler = scheduler = newMergeScheduler(
                 engineConfig.getShardId(),
                 engineConfig.getIndexSettings(),
                 getMergedSegmentTransferTracker()
@@ -2105,11 +2109,31 @@ public class InternalEngine extends Engine {
         return documentIndexWriter.getConfig();
     }
 
-    private final class EngineMergeScheduler extends OpenSearchConcurrentMergeScheduler {
+    /**
+     * Factory hook for the merge scheduler installed for this engine. Subclasses can override this to return a
+     * subclass of {@link EngineMergeScheduler} (e.g. one that warms/evicts a remote-storage cache around merges)
+     * without having to reimplement the throttling bookkeeping {@link EngineMergeScheduler} already provides.
+     */
+    protected EngineMergeScheduler newMergeScheduler(
+        ShardId shardId,
+        IndexSettings indexSettings,
+        MergedSegmentTransferTracker mergedSegmentTransferTracker
+    ) {
+        return new EngineMergeScheduler(shardId, indexSettings, mergedSegmentTransferTracker);
+    }
+
+    // Not final: subclasses that need custom merge behavior (e.g. warming a remote-storage cache around a merge)
+    // can extend this class and override beforeMerge/afterMerge/etc., then hand back their own instance from
+    // newMergeScheduler() below instead of reimplementing the throttling bookkeeping done here.
+    protected class EngineMergeScheduler extends OpenSearchConcurrentMergeScheduler {
         private final AtomicInteger numMergesInFlight = new AtomicInteger(0);
         private final AtomicBoolean isThrottling = new AtomicBoolean();
 
-        EngineMergeScheduler(ShardId shardId, IndexSettings indexSettings, MergedSegmentTransferTracker mergedSegmentTransferTracker) {
+        protected EngineMergeScheduler(
+            ShardId shardId,
+            IndexSettings indexSettings,
+            MergedSegmentTransferTracker mergedSegmentTransferTracker
+        ) {
             super(shardId, indexSettings, mergedSegmentTransferTracker);
         }
 

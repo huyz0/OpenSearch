@@ -32,6 +32,8 @@
 
 package org.opensearch.plugins;
 
+import org.opensearch.cluster.routing.ShardRouting;
+import org.opensearch.common.Nullable;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.codec.AdditionalCodecs;
@@ -64,6 +66,23 @@ public interface EnginePlugin {
      */
     default Optional<EngineFactory> getEngineFactory(IndexSettings indexSettings) {
         return Optional.empty();
+    }
+
+    /**
+     * When a shard is created this method is invoked for each engine plugin, in addition to
+     * {@link #getEngineFactory(IndexSettings)}. Unlike the index-level method, this overload also receives the shard's
+     * {@link ShardRouting}, so a plugin can select a different {@link EngineFactory} depending on the role of the shard copy
+     * being created (for example, a promotable/writable copy versus a search-only copy that will never be promoted to
+     * primary). {@code shardRouting} is {@code null} when the factory is being resolved ahead of any shard being allocated
+     * (e.g. for administrative index-level lookups); plugins that only care about the index-wide default engine can ignore
+     * this overload entirely.
+     * <p>
+     * The default implementation delegates to {@link #getEngineFactory(IndexSettings)} so existing plugins are unaffected.
+     *
+     * @return an optional engine factory
+     */
+    default Optional<EngineFactory> getEngineFactory(IndexSettings indexSettings, @Nullable ShardRouting shardRouting) {
+        return getEngineFactory(indexSettings);
     }
 
     /**

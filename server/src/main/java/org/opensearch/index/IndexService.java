@@ -182,6 +182,11 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
     private final NamedWriteableRegistry namedWriteableRegistry;
     private final SimilarityService similarityService;
     private final IndexerFactory indexerFactory;
+    // Resolves the IndexerFactory (and, transitively, the EngineFactory) for a specific shard copy, given its
+    // ShardRouting. Lets an EnginePlugin pick a different engine for e.g. a search-only replica than for a
+    // promotable one, which the index-wide `indexerFactory` above cannot express since it is fixed at index-service
+    // creation time, before any shard (or its role) exists.
+    private final BiFunction<IndexSettings, ShardRouting, IndexerFactory> indexerFactoryProvider;
     private final EngineConfigFactory engineConfigFactory;
     private final IndexWarmer warmer;
     private volatile Map<Integer, IndexShard> shards = emptyMap();
@@ -236,6 +241,7 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
         ShardStoreDeleter shardStoreDeleter,
         IndexAnalyzers indexAnalyzers,
         IndexerFactory indexerFactory,
+        @Nullable BiFunction<IndexSettings, ShardRouting, IndexerFactory> indexerFactoryProvider,
         EngineConfigFactory engineConfigFactory,
         CircuitBreakerService circuitBreakerService,
         BigArrays bigArrays,
@@ -356,6 +362,9 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
         this.remoteDirectoryFactory = remoteDirectoryFactory;
         this.recoveryStateFactory = recoveryStateFactory;
         this.indexerFactory = Objects.requireNonNull(indexerFactory);
+        this.indexerFactoryProvider = indexerFactoryProvider != null
+            ? indexerFactoryProvider
+            : (settings, routing) -> this.indexerFactory;
         this.engineConfigFactory = Objects.requireNonNull(engineConfigFactory);
         // initialize this last -- otherwise if the wrapper requires any other member to be non-null we fail with an NPE
         this.readerWrapper = wrapperFactory.apply(this);
@@ -451,6 +460,7 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
             shardStoreDeleter,
             indexAnalyzers,
             indexerFactory,
+            null,
             engineConfigFactory,
             circuitBreakerService,
             bigArrays,
@@ -862,7 +872,7 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
                 indexCache,
                 mapperService,
                 similarityService,
-                indexerFactory,
+                indexerFactoryProvider.apply(this.indexSettings, routing),
                 engineConfigFactory,
                 eventListener,
                 readerWrapper,

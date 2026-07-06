@@ -47,6 +47,7 @@ import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.CheckedFunction;
 import org.opensearch.common.CheckedTriFunction;
+import org.opensearch.common.Nullable;
 import org.opensearch.common.SetOnce;
 import org.opensearch.common.TriFunction;
 import org.opensearch.common.annotation.ExperimentalApi;
@@ -273,6 +274,10 @@ public final class IndexModule {
     private final IndexSettings indexSettings;
     private final AnalysisRegistry analysisRegistry;
     private final IndexerFactory indexerFactory;
+    // Resolves the IndexerFactory for a specific shard copy given its ShardRouting, so an EnginePlugin can select a
+    // different engine for shard roles that will never be promoted to primary (e.g. search-only replicas) than for
+    // promotable ones. Falls back to the index-wide `indexerFactory` above when absent.
+    private final BiFunction<IndexSettings, ShardRouting, IndexerFactory> indexerFactoryProvider;
     private final EngineConfigFactory engineConfigFactory;
     private final SetOnce<Function<IndexService, CheckedFunction<DirectoryReader, DirectoryReader, IOException>>> indexReaderWrapper =
         new SetOnce<>();
@@ -306,6 +311,7 @@ public final class IndexModule {
         final IndexSettings indexSettings,
         final AnalysisRegistry analysisRegistry,
         final IndexerFactory indexerFactory,
+        @Nullable final BiFunction<IndexSettings, ShardRouting, IndexerFactory> indexerFactoryProvider,
         final EngineConfigFactory engineConfigFactory,
         final Map<String, IndexStorePlugin.DirectoryFactory> directoryFactories,
         final Map<String, IndexStorePlugin.CompositeDirectoryFactory> compositeDirectoryFactories,
@@ -320,6 +326,9 @@ public final class IndexModule {
         this.indexSettings = indexSettings;
         this.analysisRegistry = analysisRegistry;
         this.indexerFactory = Objects.requireNonNull(indexerFactory);
+        this.indexerFactoryProvider = indexerFactoryProvider != null
+            ? indexerFactoryProvider
+            : (settings, routing) -> this.indexerFactory;
         this.engineConfigFactory = Objects.requireNonNull(engineConfigFactory);
         this.searchOperationListeners.add(new SearchSlowLog(indexSettings));
         this.indexOperationListeners.add(new IndexingSlowLog(indexSettings));
@@ -349,6 +358,7 @@ public final class IndexModule {
             indexSettings,
             analysisRegistry,
             new EngineBackedIndexerFactory(engineFactory),
+            null,
             engineConfigFactory,
             directoryFactories,
             Collections.emptyMap(),
@@ -1063,6 +1073,7 @@ public final class IndexModule {
                 shardStoreDeleter,
                 indexAnalyzers,
                 indexerFactory,
+                indexerFactoryProvider,
                 engineConfigFactory,
                 circuitBreakerService,
                 bigArrays,
