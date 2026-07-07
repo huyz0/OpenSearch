@@ -548,6 +548,21 @@ manifest without a full engine reopen. Still open: manifest-change notifications
 unification, admission control. Milestone: search-only shards serve queries with no local index,
 freshness lag p99 < 15 s under sustained ingest.
 
+**Plugin wiring (done).** `ServerlessStoragePlugin implements EnginePlugin` assembles everything
+above into a working `getEngineFactory(IndexSettings, ShardRouting)`: an index only gets an
+object-store engine if it opts in via `index.serverless_storage.enabled` (every other index is
+untouched, matching Goal 6), each shard gets its own blob container scoped to
+`indices/<index-uuid>/<shard>/` under a node-configured base path (resolved through
+`Environment#resolveRepoFile`, the same sanctioned path-resolution seam `repository-fs` uses,
+rather than trusting an arbitrary settings string directly), and `ShardRouting.isSearchOnly()`
+picks `ReaderEngineFactory` vs. `WriterEngineFactory`. Verified end-to-end at the settings/routing
+level (opted-out index gets no factory, missing base path fails loudly, primary/search-only/absent
+routing each resolve to the right factory type). The base path is local-filesystem-only for now,
+for the same reason noted throughout this document: no real S3/GCS/Azure `compareAndSwapRegister`
+implementation exists yet, unverified without cloud credentials. Swapping in a real
+repository-backed container only touches one method (`blobContainerFor`); nothing else in the
+plugin or the classes it wires together is FS-specific.
+
 **Phase 4 — Topology (4–6 weeks).** Role-separated allocation, suspended writers,
 scale-to-zero/cold-start, balancer hysteresis. Milestone: idle index consumes zero compute;
 first query after idle returns < 5 s p95 for a cached-manifest index.
