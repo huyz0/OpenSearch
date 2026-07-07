@@ -14,12 +14,13 @@ import java.util.Optional;
 /**
  * The narrow interface hiding the shard-head truth layer (rfc-serverless-metadata-plane.md
  * &sect;4/&sect;7): per-shard linearizable state (primary term, writer/compactor lease, latest
- * published manifest generation), mutated only via compare-and-swap. Object-store-backed
- * implementations use native conditional writes (S3 If-Match, GCS generation preconditions,
- * Azure ETag If-Match); {@link org.opensearch.serverless.storage.shardstate.fs.FsShardStateStore}
- * is the reference implementation used for local testing. Swapping the implementation behind
- * this interface (e.g. to a FoundationDB-backed store, &sect;7's designed escape hatch) never
- * requires touching a caller.
+ * published manifest generation), mutated only via compare-and-swap. {@link BlobContainerShardStateStore}
+ * implements this generically on top of {@link org.opensearch.common.blobstore.BlobContainer#compareAndSwapRegister},
+ * so any blob container that implements that primitive with its own native conditional write (S3
+ * If-Match, GCS generation preconditions, Azure ETag If-Match, or real local-filesystem atomicity
+ * for {@code FsBlobContainer}) gets a working {@code ShardStateStore} with zero additional code.
+ * Swapping the implementation behind this interface (e.g. to a FoundationDB-backed store,
+ * &sect;7's designed escape hatch) never requires touching a caller.
  */
 public interface ShardStateStore {
 

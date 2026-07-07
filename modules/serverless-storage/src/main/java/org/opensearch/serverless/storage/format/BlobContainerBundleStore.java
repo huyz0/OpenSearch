@@ -30,11 +30,17 @@ public final class BlobContainerBundleStore {
         this.blobContainer = blobContainer;
     }
 
-    /** Packs {@code files} into one bundle and uploads it under {@code bundleName} in a single write. */
+    /**
+     * Packs {@code files} into one bundle and uploads it under {@code bundleName} in a single
+     * write. Uses {@link BlobContainer#writeBlobAtomic} rather than plain {@code writeBlob}:
+     * bundles must be atomically visible-or-absent, never observable half-written, since readers
+     * fetch byte ranges out of them concurrently with no coordination (rfc-serverless-opensearch.md
+     * &sect;6.2).
+     */
     public SegmentBundle writeBundle(String bundleName, List<BundleFileContent> files) throws IOException {
         SegmentBundle bundle = BundleWriter.write(files);
         try (InputStream in = new ByteArrayInputStream(bundle.bytes())) {
-            blobContainer.writeBlob(bundleName, in, bundle.length(), true);
+            blobContainer.writeBlobAtomic(bundleName, in, bundle.length(), true);
         }
         return bundle;
     }

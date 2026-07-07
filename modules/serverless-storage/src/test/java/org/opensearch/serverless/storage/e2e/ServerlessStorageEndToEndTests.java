@@ -22,11 +22,11 @@ import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.manifest.CommitManifest;
 import org.opensearch.serverless.storage.manifest.FileReference;
 import org.opensearch.serverless.storage.manifest.PruningStats;
+import org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore;
 import org.opensearch.serverless.storage.shardstate.CasResult;
 import org.opensearch.serverless.storage.shardstate.ShardHead;
 import org.opensearch.serverless.storage.shardstate.ShardStateStore;
 import org.opensearch.serverless.storage.shardstate.VersionedShardHead;
-import org.opensearch.serverless.storage.shardstate.fs.FsShardStateStore;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.LinkedHashMap;
@@ -55,7 +55,7 @@ public class ServerlessStorageEndToEndTests extends OpenSearchTestCase {
         BlobContainer blobContainer = newFsBlobContainer();
         BlobContainerBundleStore bundleStore = new BlobContainerBundleStore(blobContainer);
         BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(blobContainer);
-        ShardStateStore shardStateStore = new FsShardStateStore(createTempDir());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(newFsBlobContainer());
 
         // 1. Shard activation: a writer wins first-ever activation via put-if-absent CAS.
         assertEquals(

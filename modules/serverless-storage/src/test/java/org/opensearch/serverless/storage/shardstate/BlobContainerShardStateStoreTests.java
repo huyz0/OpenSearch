@@ -6,14 +6,15 @@
  * compatible open source license.
  */
 
-package org.opensearch.serverless.storage.shardstate.fs;
+package org.opensearch.serverless.storage.shardstate;
 
-import org.opensearch.serverless.storage.shardstate.CasResult;
-import org.opensearch.serverless.storage.shardstate.ShardHead;
-import org.opensearch.serverless.storage.shardstate.ShardStateStore;
-import org.opensearch.serverless.storage.shardstate.VersionedShardHead;
+import org.opensearch.common.blobstore.BlobContainer;
+import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.fs.FsBlobContainer;
+import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -23,10 +24,21 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
-public class FsShardStateStoreTests extends OpenSearchTestCase {
+/**
+ * Exercises {@link ShardStateStore} through {@link BlobContainerShardStateStore} backed by a real
+ * {@link FsBlobContainer} &mdash; the same correctness properties as before this class replaced
+ * the bespoke {@code FsShardStateStore} (which duplicated file-locking logic now generalized into
+ * {@code FsBlobContainer.compareAndSwapRegister}), just reached through the generic primitive.
+ */
+public class BlobContainerShardStateStoreTests extends OpenSearchTestCase {
+
+    private BlobContainer newFsBlobContainer(Path dir) throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, dir, false);
+        return new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+    }
 
     private ShardStateStore newStore() throws Exception {
-        return new FsShardStateStore(createTempDir());
+        return new BlobContainerShardStateStore(newFsBlobContainer(createTempDir()));
     }
 
     public void testGetOnNeverActivatedShardReturnsEmpty() throws Exception {
@@ -187,13 +199,13 @@ public class FsShardStateStoreTests extends OpenSearchTestCase {
     }
 
     public void testStateSurvivesAcrossStoreInstancesPointedAtSameDirectory() throws Exception {
-        java.nio.file.Path dir = createTempDir();
-        ShardStateStore first = new FsShardStateStore(dir);
+        Path dir = createTempDir();
+        ShardStateStore first = new BlobContainerShardStateStore(newFsBlobContainer(dir));
         first.compareAndSet("idx", 0, Optional.empty(), ShardHead.initial().withPublishedGeneration(5));
 
         // A different store instance (simulating a different node/process reading the same
         // backing storage) must see the same state.
-        ShardStateStore second = new FsShardStateStore(dir);
+        ShardStateStore second = new BlobContainerShardStateStore(newFsBlobContainer(dir));
         VersionedShardHead read = second.get("idx", 0).orElseThrow();
         assertEquals(5L, read.head().latestManifestGeneration());
     }

@@ -30,13 +30,17 @@ public final class BlobContainerManifestStore {
         this.blobContainer = blobContainer;
     }
 
-    /** Writes {@code manifest} under its canonical name. Manifests are immutable, so this always writes a brand new blob. */
+    /**
+     * Writes {@code manifest} under its canonical name. Manifests are immutable, so this always
+     * writes a brand new blob. Uses {@link BlobContainer#writeBlobAtomic} rather than plain
+     * {@code writeBlob}: a reader must never observe a partially-written manifest.
+     */
     public void writeManifest(CommitManifest manifest) throws IOException {
         BytesStreamOutput out = new BytesStreamOutput();
         manifest.writeTo(out);
         byte[] bytes = BytesReference.toBytes(out.bytes());
         try (InputStream in = new ByteArrayInputStream(bytes)) {
-            blobContainer.writeBlob(manifest.manifestName(), in, bytes.length, true);
+            blobContainer.writeBlobAtomic(manifest.manifestName(), in, bytes.length, true);
         }
     }
 
