@@ -9,13 +9,19 @@
 package org.opensearch.serverless.storage.writerengine;
 
 import org.apache.lucene.index.SegmentInfos;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.index.engine.DocumentIndexWriter;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.EngineException;
 import org.opensearch.index.engine.InternalEngine;
 import org.opensearch.index.seqno.SequenceNumbers;
+import org.opensearch.serverless.storage.directory.ShardDirectory;
+import org.opensearch.serverless.storage.directory.ShardDirectoryEntry;
+import org.opensearch.serverless.storage.directory.ShardRole;
 import org.opensearch.serverless.storage.manifest.PruningStats;
 import org.opensearch.serverless.storage.manifest.WalPosition;
+import org.opensearch.threadpool.Scheduler;
+import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
 
@@ -32,18 +38,72 @@ import java.io.IOException;
  * whose files it packages exists. The commit stays valid locally (it does not corrupt anything),
  * but the engine is failed so this node stops serving as the shard's writer, matching how any
  * other fatal engine condition (e.g. a translog failure) is handled today.
+ *
+ * <p>Besides reporting to the {@link ShardDirectory} once on activation, this engine also refreshes
+ * that entry on a fixed schedule for as long as it stays open (rfc-serverless-metadata-plane.md
+ * &sect;13 risk #1, "metastability of the directory tier"): relying only on on-demand re-report
+ * after a miss means a burst of expiries can turn into a burst of {@code ShardStateStore} reads all
+ * at once, which is exactly the correlated-load failure mode that risk describes. Refreshing well
+ * before the entry's TTL elapses keeps the entry's staleness bounded by the refresh interval
+ * instead of by traffic patterns, and spreads the read load out over time instead of clumping it at
+ * expiry.
  */
 public class ObjectStoreWriterEngine extends InternalEngine {
+
+    /** How long a directory entry for a writer shard is trusted before it's treated as stale. */
+    private static final long DIRECTORY_ENTRY_TTL_MILLIS = 60_000L;
+
+    /**
+     * Refresh well inside the TTL, not at its edge: a refresh that only just beats expiry still
+     * leaves a window where a slow/delayed scheduler tick lets the entry lapse anyway.
+     */
+    private static final TimeValue DIRECTORY_REFRESH_INTERVAL = TimeValue.timeValueMillis(DIRECTORY_ENTRY_TTL_MILLIS / 3);
 
     private final ObjectStoreCommitHeadPublisher headPublisher;
     private final String indexUuid;
     private final int shardId;
+    private final ShardDirectory shardDirectory;
+    private final String localNodeId;
+    private final Scheduler.Cancellable directoryRefreshTask;
 
-    public ObjectStoreWriterEngine(EngineConfig engineConfig, ObjectStoreCommitHeadPublisher headPublisher) {
+    public ObjectStoreWriterEngine(
+        EngineConfig engineConfig,
+        ObjectStoreCommitHeadPublisher headPublisher,
+        ShardDirectory shardDirectory,
+        String localNodeId
+    ) {
         super(engineConfig);
         this.headPublisher = headPublisher;
         this.indexUuid = engineConfig.getShardId().getIndex().getUUID();
         this.shardId = engineConfig.getShardId().getId();
+        this.shardDirectory = shardDirectory;
+        this.localNodeId = localNodeId;
+        // Report once synchronously so the shard is discoverable immediately on activation, rather
+        // than waiting out the first refresh interval; scheduleWithFixedDelay's first execution
+        // only happens after DIRECTORY_REFRESH_INTERVAL elapses, not on registration.
+        refreshDirectoryEntry();
+        this.directoryRefreshTask = engineConfig.getThreadPool()
+            .scheduleWithFixedDelay(this::refreshDirectoryEntry, DIRECTORY_REFRESH_INTERVAL, ThreadPool.Names.GENERIC);
+    }
+
+    private void refreshDirectoryEntry() {
+        shardDirectory.report(
+            indexUuid,
+            shardId,
+            new ShardDirectoryEntry(
+                localNodeId,
+                ShardRole.WRITER,
+                engineConfig.getPrimaryTermSupplier().getAsLong(),
+                0,
+                System.currentTimeMillis() + DIRECTORY_ENTRY_TTL_MILLIS
+            )
+        );
+    }
+
+    @Override
+    public void close() throws IOException {
+        directoryRefreshTask.cancel();
+        super.close();
     }
 
     @Override

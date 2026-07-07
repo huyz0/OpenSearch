@@ -23,6 +23,8 @@ import org.opensearch.index.mapper.ParsedDocument;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.store.Store;
 import org.opensearch.index.translog.Translog;
+import org.opensearch.serverless.storage.directory.InMemoryShardDirectory;
+import org.opensearch.serverless.storage.directory.ShardDirectory;
 import org.opensearch.serverless.storage.format.BlobContainerBundleStore;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore;
@@ -40,8 +42,10 @@ import java.util.Optional;
 public class ObjectStoreWriterEngineTests extends EngineTestCase {
 
     private static final String INDEX_UUID = "idx";
+    private static final String LOCAL_NODE_ID = "test-node";
 
     private Store lastOpenedStore;
+    private final ShardDirectory shardDirectory = new InMemoryShardDirectory();
 
     private ObjectStoreWriterEngine openWriterEngine(ShardStateStore shardStateStore, ObjectStoreCommitPublisher commitPublisher)
         throws Exception {
@@ -55,7 +59,9 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
         EngineConfig engineConfig = config(defaultSettings, store, translogPath, newMergePolicy(), null);
         ObjectStoreWriterEngine engine = new ObjectStoreWriterEngine(
             engineConfig,
-            new ObjectStoreCommitHeadPublisher(commitPublisher, shardStateStore)
+            new ObjectStoreCommitHeadPublisher(commitPublisher, shardStateStore),
+            shardDirectory,
+            LOCAL_NODE_ID
         );
         engine.translogManager().recoverFromTranslog(translogHandler, engine.getProcessedLocalCheckpoint(), Long.MAX_VALUE);
         return engine;
@@ -100,6 +106,28 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
             );
             assertTrue("a manifest should have been published as the shard head after flush", head.isPresent());
             assertEquals(primaryTerm.get(), head.get().head().primaryTerm());
+        } finally {
+            IOUtils.close(engine, lastOpenedStore);
+        }
+    }
+
+    public void testOpeningTheEngineReportsToTheShardDirectory() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+
+        ObjectStoreWriterEngine engine = openWriterEngine(shardStateStore, commitPublisher);
+        try {
+            org.opensearch.serverless.storage.directory.ShardDirectoryEntry entry = shardDirectory.lookup(
+                shardId.getIndex().getUUID(),
+                shardId.getId()
+            ).orElseThrow(() -> new AssertionError("opening the engine should report an entry to the shard directory"));
+            assertEquals(LOCAL_NODE_ID, entry.nodeId());
+            assertEquals(org.opensearch.serverless.storage.directory.ShardRole.WRITER, entry.role());
         } finally {
             IOUtils.close(engine, lastOpenedStore);
         }
