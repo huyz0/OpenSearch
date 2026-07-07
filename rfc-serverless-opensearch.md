@@ -562,7 +562,8 @@ routing each resolve to the right factory type). The base path is local-filesyst
 nothing else in the plugin or the classes it wires together is FS-specific) pending the
 `repository-s3` register support noted below extending to this plugin's own wiring.
 
-**`compareAndSwapRegister` backends: FS done; S3 done; GCS done; Azure not started.**
+**`compareAndSwapRegister` backends: FS done; S3 done; GCS done; Azure done -- all four planned
+backends now implemented.**
 `S3BlobContainer.readRegister`/`compareAndSwapRegister` are implemented using S3's real
 conditional-write primitives (`If-Match`/`If-None-Match` on `PutObject`) as the actual concurrency
 guard -- a freshly-read generation is checked client-side purely as a fast-fail, but the
@@ -590,13 +591,29 @@ conflict, and 8 concurrent CAS-retry-loop incrementers losing zero updates, plus
 `GoogleCloudStorageBlobStoreRepositoryTests` suite (16 tests) still passing against the extended
 fixture.
 
-Azure remains unimplemented. `test/fixtures/azure-fixture` exists (unlike GCS, this one hasn't been
-inspected yet for what conditional-write support it already has or would need), so the next
-increment in this vein is the same shape as the two above: implement
-`AzureBlobContainer.readRegister`/`compareAndSwapRegister` using Azure's conditional-write headers
-(`If-Match`/`If-None-Match` on blob upload, keyed off Azure's own ETag concept), extend the fixture
-to enforce them for real if it doesn't already, and verify with the same put-if-absent /
-stale-conflict / concurrent-incrementer test shape.
+`AzureBlobStore.readRegister`/`compareAndSwapRegister` follow the same shape as S3 (Azure ETags are
+opaque like S3's, so a self-managed generation counter is embedded in the register's own bytes,
+unlike GCS's native generation field): `BlobRequestConditions.setIfNoneMatch(ETAG_WILDCARD)` /
+`setIfMatch(etag)` are Azure's own atomic conditional-write primitives on blob upload, evaluated
+server-side the same way. `test/fixtures/azure-fixture`'s `AzureHttpHandler` already had partial
+`If-None-Match: *` support (a real, if narrow, existing feature -- used by the plugin's own
+`failIfAlreadyExists` writes) but no `If-Match` handling and no ETag exposure on GET/HEAD/PUT
+responses at all, so those were added. One genuine bug surfaced and fixed during verification, not
+a design choice: the Azure SDK's `BlobDownloadHeaders#getETag()` strips the HTTP quoting before
+handing the ETag back to callers, and `setIfMatch()` expects that same unquoted form -- the fixture
+initially generated and stored quoted ETags, so every real `If-Match` comparison failed against a
+value the SDK itself had produced from the fixture's own prior response. Verified with the same
+test shape as S3/GCS: put-if-absent, stale-generation conflict, and 8 concurrent CAS-retry-loop
+incrementers losing zero updates, plus the full existing `AzureBlobStoreRepositoryTests` suite (13
+tests, including its own randomized transient-fault injection) still passing against the extended
+fixture.
+
+All four backends `compareAndSwapRegister` was planned for (FS, S3, GCS, Azure) are now real,
+tested implementations -- this seam is no longer blocked on cloud credentials for verification.
+Each of the three cloud fixtures (S3, GCS, Azure) needed real conditional-write enforcement added
+where it didn't already exist, and each of those additions is a generally useful improvement to
+shared test infrastructure other plugins' tests benefit from too, not a special-cased double built
+only for this RFC's purposes.
 
 **Phase 4 — Topology (4–6 weeks).** Role-separated allocation, suspended writers,
 scale-to-zero/cold-start, balancer hysteresis. Milestone: idle index consumes zero compute;

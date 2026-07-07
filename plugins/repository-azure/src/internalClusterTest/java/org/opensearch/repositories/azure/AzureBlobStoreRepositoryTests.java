@@ -42,9 +42,13 @@ import com.azure.storage.common.policy.RetryPolicyType;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.common.SuppressForbidden;
+import org.opensearch.common.blobstore.BlobContainer;
+import org.opensearch.common.blobstore.BlobRegister;
+import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.regex.Regex;
 import org.opensearch.common.settings.MockSecureSettings;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.unit.ByteSizeUnit;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.plugins.ExtensiblePlugin;
@@ -59,6 +63,7 @@ import java.util.Base64;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Map;
+import java.util.Optional;
 import java.util.regex.Pattern;
 
 import fixture.azure.AzureHttpHandler;
@@ -114,6 +119,125 @@ public class AzureBlobStoreRepositoryTests extends OpenSearchMockAPIBasedReposit
             .put(AzureStorageSettings.ENDPOINT_SUFFIX_SETTING.getConcreteSettingForNamespace("test").getKey(), endpoint)
             .setSecureSettings(secureSettings)
             .build();
+    }
+
+    /**
+     * Exercises {@link AzureBlobContainer#compareAndSwapRegister}/{@code readRegister} against the
+     * real {@link AzureHttpHandler} fixture (extended to enforce real Azure If-Match/If-None-Match
+     * conditional-write semantics for exactly this purpose): proof that the conditional-write guard
+     * is actually enforced server-side, not merely that our request-construction code compiles.
+     */
+    public void testCompareAndSwapRegisterUsesRealConditionalWrites() throws Exception {
+        final String repoName = createRepository(randomName());
+        final BlobContainer container = getBlobContainer(repoName);
+        final String registerName = "test-register";
+        try {
+            BlobRegisterCasResult first = container.compareAndSwapRegister(
+                registerName,
+                BlobRegister.ABSENT_GENERATION,
+                new BytesArray("v1".getBytes(StandardCharsets.UTF_8))
+            );
+            assertTrue(first.applied());
+            assertEquals(1L, first.currentGeneration());
+
+            BlobRegisterCasResult racerConflict = container.compareAndSwapRegister(
+                registerName,
+                BlobRegister.ABSENT_GENERATION,
+                new BytesArray("racer".getBytes(StandardCharsets.UTF_8))
+            );
+            assertFalse("a second put-if-absent must lose to the one that already succeeded", racerConflict.applied());
+            assertEquals(1L, racerConflict.currentGeneration());
+
+            Optional<BlobRegister> read = container.readRegister(registerName);
+            assertTrue(read.isPresent());
+            assertEquals(1L, read.get().generation());
+            assertEquals("v1", read.get().value().utf8ToString());
+
+            BlobRegisterCasResult staleUpdate = container.compareAndSwapRegister(
+                registerName,
+                0L,
+                new BytesArray("stale".getBytes(StandardCharsets.UTF_8))
+            );
+            assertFalse(staleUpdate.applied());
+            assertEquals(1L, staleUpdate.currentGeneration());
+
+            BlobRegisterCasResult goodUpdate = container.compareAndSwapRegister(
+                registerName,
+                1L,
+                new BytesArray("v2".getBytes(StandardCharsets.UTF_8))
+            );
+            assertTrue(goodUpdate.applied());
+            assertEquals(2L, goodUpdate.currentGeneration());
+            assertEquals("v2", container.readRegister(registerName).get().value().utf8ToString());
+        } finally {
+            container.deleteBlobsIgnoringIfNotExists(Collections.singletonList(registerName));
+        }
+    }
+
+    /**
+     * Concurrent CAS-retry-loop updates against the same register must never lose an update: only
+     * meaningful against a fixture that actually enforces conditional writes server-side.
+     */
+    public void testConcurrentCompareAndSwapRegisterRetryLoopLosesNoUpdates() throws Exception {
+        final String repoName = createRepository(randomName());
+        final BlobContainer container = getBlobContainer(repoName);
+        final String registerName = "counter-register";
+
+        int incrementerCount = 8;
+        java.util.concurrent.ExecutorService executor = java.util.concurrent.Executors.newFixedThreadPool(incrementerCount);
+        java.util.concurrent.CountDownLatch startLatch = new java.util.concurrent.CountDownLatch(1);
+        try {
+            java.util.List<java.util.concurrent.Future<?>> futures = new java.util.ArrayList<>();
+            for (int i = 0; i < incrementerCount; i++) {
+                futures.add(executor.submit(() -> {
+                    try {
+                        startLatch.await();
+                        for (int attempt = 0; attempt < 50; attempt++) {
+                            Optional<BlobRegister> current = container.readRegister(registerName);
+                            long currentGeneration = current.map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
+                            int currentValue = current.map(r -> Integer.parseInt(r.value().utf8ToString())).orElse(0);
+                            BlobRegisterCasResult result = container.compareAndSwapRegister(
+                                registerName,
+                                currentGeneration,
+                                new BytesArray(Integer.toString(currentValue + 1).getBytes(StandardCharsets.UTF_8))
+                            );
+                            if (result.applied()) {
+                                return;
+                            }
+                        }
+                        throw new AssertionError("failed to apply an increment after 50 attempts");
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                }));
+            }
+            startLatch.countDown();
+            for (java.util.concurrent.Future<?> future : futures) {
+                future.get(60, java.util.concurrent.TimeUnit.SECONDS);
+            }
+        } finally {
+            executor.shutdown();
+        }
+
+        try {
+            int finalValue = Integer.parseInt(container.readRegister(registerName).get().value().utf8ToString());
+            assertEquals(
+                "every concurrent incrementer's update must be reflected, none lost to a missed conflict",
+                incrementerCount,
+                finalValue
+            );
+        } finally {
+            container.deleteBlobsIgnoringIfNotExists(Collections.singletonList(registerName));
+        }
+    }
+
+    private BlobContainer getBlobContainer(String repoName) {
+        final org.opensearch.repositories.RepositoriesService repositoriesService = internalCluster().getClusterManagerNodeInstance(
+            org.opensearch.repositories.RepositoriesService.class
+        );
+        final org.opensearch.repositories.blobstore.BlobStoreRepository repository =
+            (org.opensearch.repositories.blobstore.BlobStoreRepository) repositoriesService.repository(repoName);
+        return repository.blobStore().blobContainer(repository.basePath());
     }
 
     /**
