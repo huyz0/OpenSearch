@@ -619,22 +619,30 @@ only for this RFC's purposes.
 scale-to-zero/cold-start, balancer hysteresis. Milestone: idle index consumes zero compute;
 first query after idle returns < 5 s p95 for a cached-manifest index.
 
-**Phase 4.5 — Compaction service (candidate selection + rebase protocol done; not wired to a
-real merge).** Its hard dependency, shard-head CAS (metadata-plane RFC Phase 2.5), is done and
-now generically `BlobContainer`-backed (`BlobContainerShardStateStore`). On top of it,
-`CompactionPolicy` (candidate selection from segment-count/size/delete-ratio metrics, matching
-&sect;7.4's "readable without opening the shard") and `CompactionRebaseExecutor` (the
-rebase-on-CAS-conflict publication loop itself) are implemented and tested, including the
-rebase protocol's two defining properties under real concurrency: a compactor that gets raced by
-a concurrent writer publication rebases and eventually succeeds rather than corrupting or losing
-the writer's update, and many concurrent publishers hammering the same shard never lose an
-update between them. What's still open: wiring an actual Lucene merge into
-`CompactionPublisher` (today it's a caller-supplied function, exercised in tests with synthetic
-head transitions, not a real segment merge), `_forcemerge` redefinition, and the compactor
-role/lease-offload negotiation with an active writer. Milestone (not yet met): a quiescent
-40-segment shard is compacted to size-tiered shape with no writer ever activating, concurrently
-with a surprise writer re-activation (rebase test — the *protocol* for this is now tested; the
-*real merge* is not).
+**Phase 4.5 — Compaction service (candidate selection, rebase protocol, and a real Lucene merge
+all done; size-tiered policy and lease-offload negotiation still open).** Its hard dependency,
+shard-head CAS (metadata-plane RFC Phase 2.5), is done and generically `BlobContainer`-backed
+(`BlobContainerShardStateStore`). `CompactionPolicy` (candidate selection from
+segment-count/size/delete-ratio metrics, matching &sect;7.4's "readable without opening the
+shard") and `CompactionRebaseExecutor` (the rebase-on-CAS-conflict publication loop) are
+implemented and tested, including the rebase protocol's two defining properties under real
+concurrency. `LuceneMergeCompactionPublisher` is the real `CompactionPublisher` that was missing:
+materializes the shard's current commit, folds every segment into one via an actual `IndexWriter`
+merge (`addIndexes` + `forceMerge(1)` -- no document is re-parsed, only segment files combined),
+and republishes the result as a new manifest, carrying over the seq-no/checkpoint/mapping-version
+metadata a pure segment merge doesn't change. Verified against a real multi-segment index: all
+documents survive with none lost or duplicated, the result is genuinely one segment, and a
+compaction whose starting point is raced by a concurrent writer publication rebases onto the
+writer's newer generation rather than overwriting it (using the already-tested rebase executor,
+now exercised with a real merge instead of a synthetic head transition). Known, explicitly
+accepted inefficiency: every rebase retry redoes the full materialize-merge-publish sequence
+rather than caching the (generation-independent) merged bundle across retries -- correct, not
+maximally cheap under contention. Still open: real size-tiered candidate shaping (today's merge is
+always "merge everything to 1 segment," not proportional to `CompactionPolicy`'s targets),
+`_forcemerge` redefinition, and the compactor role/lease-offload negotiation with an active writer.
+Milestone (not yet met): a quiescent 40-segment shard is compacted to size-tiered shape with no
+writer ever activating, concurrently with a surprise writer re-activation (the rebase *protocol*
+and a real merge are now both tested together; size-tiered shaping specifically is not).
 
 **Phase 4.6 — Snapshots/clones/PITR (manifest pinning done; clone/PITR policy not started).**
 Durable pins (§6.5) are implemented as `DurablePinRegistry`/`BlobContainerDurablePinRegistry` —
