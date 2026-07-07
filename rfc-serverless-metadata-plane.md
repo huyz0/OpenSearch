@@ -265,6 +265,18 @@ sub-second failover SLAs demand ms-level lease churn), swap the implementation w
 the architecture. Do not adopt B: running consensus groups *about* shard placement recreates
 the problem it solves, one level down.
 
+**Implementation update:** rather than a bespoke shard-head store, the CAS primitive was pushed
+one layer down into the object-store abstraction itself. `BlobContainer` gained two default
+methods, `readRegister`/`compareAndSwapRegister` (generation-versioned register semantics,
+defaulting to `UnsupportedOperationException` so no existing implementer breaks), with a real
+implementation for `FsBlobContainer`. `ShardStateStore` is now `BlobContainerShardStateStore`, a
+thin translation layer over that primitive with **no storage-backend code of its own** — it
+works against any `BlobContainer` that implements the primitive. This means S3/GCS/Azure support
+is now "implement `compareAndSwapRegister` once per repository plugin using that provider's
+native conditional write," not "build a whole new shard-head store per backend" — the reuse the
+original design called for, achieved by generalizing the primitive rather than duplicating a
+CAS implementation inside this module.
+
 ## 8. Do We Still Need a Cluster-Manager Node?
 
 Break down what the elected cluster-manager does today, and where each duty goes:
