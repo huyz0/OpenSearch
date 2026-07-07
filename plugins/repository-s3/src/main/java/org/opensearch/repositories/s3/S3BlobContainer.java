@@ -37,6 +37,7 @@ import software.amazon.awssdk.core.async.AsyncResponseTransformer;
 import software.amazon.awssdk.core.exception.SdkException;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.services.s3.S3AsyncClient;
+import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.AbortMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.CommonPrefix;
 import software.amazon.awssdk.services.s3.model.CompleteMultipartUploadRequest;
@@ -53,6 +54,7 @@ import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
 import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 import software.amazon.awssdk.services.s3.model.ObjectAttributes;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
+import software.amazon.awssdk.services.s3.model.S3Exception;
 import software.amazon.awssdk.services.s3.model.UploadPartRequest;
 import software.amazon.awssdk.services.s3.model.UploadPartResponse;
 import software.amazon.awssdk.services.s3.paginators.ListObjectsV2Iterable;
@@ -72,6 +74,8 @@ import org.opensearch.common.blobstore.AsyncMultiStreamBlobContainer;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.BlobRegister;
+import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.BlobStoreException;
 import org.opensearch.common.blobstore.DeleteResult;
 import org.opensearch.common.blobstore.InputStreamWithMetadata;
@@ -85,6 +89,8 @@ import org.opensearch.common.io.InputStreamContainer;
 import org.opensearch.common.util.concurrent.FutureUtils;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.Strings;
+import org.opensearch.core.common.bytes.BytesArray;
+import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.common.unit.ByteSizeUnit;
 import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.repositories.s3.async.S3AsyncDeleteHelper;
@@ -98,9 +104,11 @@ import java.io.BufferedInputStream;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -984,5 +992,137 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
         } catch (Exception e) {
             completionListener.onFailure(new IOException("Failed to initiate async blob deletion", e));
         }
+    }
+
+    /**
+     * Reads the register at {@code blobName}: an ordinary object whose body is {@code <8-byte
+     * big-endian generation><value bytes>}, per the same wire format {@code FsBlobContainer} uses.
+     */
+    @Override
+    public Optional<BlobRegister> readRegister(String blobName) throws IOException {
+        String key = buildKey(blobName);
+        try (AmazonS3Reference clientReference = blobStore.clientReference()) {
+            GetObjectRequest getObjectRequest = GetObjectRequest.builder()
+                .bucket(blobStore.bucket())
+                .key(key)
+                .expectedBucketOwner(blobStore.expectedBucketOwner())
+                .build();
+            try (
+                ResponseInputStream<GetObjectResponse> response = AccessController.doPrivileged(
+                    () -> clientReference.get().getObject(getObjectRequest)
+                )
+            ) {
+                return Optional.of(deserializeRegister(response.readAllBytes()));
+            }
+        } catch (NoSuchKeyException e) {
+            return Optional.empty();
+        } catch (S3Exception e) {
+            // Real S3 responds to a missing key with a NoSuchKeyException-typed 404, but not every
+            // S3-compatible endpoint (including the fixture this is verified against) returns the
+            // error body needed for the SDK to unmarshal that specific type, so a bare 404 must be
+            // treated as absence too rather than surfacing as a generic failure.
+            if (e.statusCode() == 404) {
+                return Optional.empty();
+            }
+            throw new IOException("Unable to read register [" + blobName + "]", e);
+        } catch (SdkException e) {
+            throw new IOException("Unable to read register [" + blobName + "]", e);
+        }
+    }
+
+    /**
+     * CASes the register at {@code blobName} using S3's real conditional-write primitives
+     * ({@code If-Match}/{@code If-None-Match}) as the actual concurrency guard, rather than
+     * anything client-side: {@code expectedGeneration} is checked against a freshly-read current
+     * generation purely as a fast-fail (no point attempting a write we already know is stale), but
+     * the authoritative check is the conditional {@code PutObject} itself, which S3 evaluates
+     * atomically against the object's live ETag. A concurrent writer racing between our read and
+     * our put is caught there (as a 412 response), not missed.
+     */
+    @Override
+    public BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
+        throws IOException {
+        String key = buildKey(blobName);
+        try (AmazonS3Reference clientReference = blobStore.clientReference()) {
+            S3Client client = clientReference.get();
+
+            String currentETag;
+            long currentGeneration;
+            try {
+                GetObjectRequest getObjectRequest = GetObjectRequest.builder()
+                    .bucket(blobStore.bucket())
+                    .key(key)
+                    .expectedBucketOwner(blobStore.expectedBucketOwner())
+                    .build();
+                try (
+                    ResponseInputStream<GetObjectResponse> response = AccessController.doPrivileged(
+                        () -> client.getObject(getObjectRequest)
+                    )
+                ) {
+                    currentETag = response.response().eTag();
+                    currentGeneration = deserializeRegister(response.readAllBytes()).generation();
+                }
+            } catch (NoSuchKeyException e) {
+                currentETag = null;
+                currentGeneration = BlobRegister.ABSENT_GENERATION;
+            } catch (S3Exception e) {
+                // See readRegister: a bare 404 (not a properly-typed NoSuchKeyException) also means absent.
+                if (e.statusCode() != 404) {
+                    throw e;
+                }
+                currentETag = null;
+                currentGeneration = BlobRegister.ABSENT_GENERATION;
+            }
+
+            if (currentGeneration != expectedGeneration) {
+                return BlobRegisterCasResult.conflict(currentGeneration);
+            }
+
+            long newGeneration = expectedGeneration + 1;
+            byte[] bytesToWrite = serializeRegister(newGeneration, newValue);
+            PutObjectRequest.Builder putObjectRequestBuilder = PutObjectRequest.builder()
+                .bucket(blobStore.bucket())
+                .key(key)
+                .contentLength((long) bytesToWrite.length)
+                .expectedBucketOwner(blobStore.expectedBucketOwner());
+            if (currentETag == null) {
+                putObjectRequestBuilder.ifNoneMatch("*");
+            } else {
+                putObjectRequestBuilder.ifMatch(currentETag);
+            }
+            PutObjectRequest putObjectRequest = putObjectRequestBuilder.build();
+
+            try {
+                AccessController.doPrivileged(() -> client.putObject(putObjectRequest, RequestBody.fromBytes(bytesToWrite)));
+                return BlobRegisterCasResult.applied(newGeneration);
+            } catch (S3Exception e) {
+                if (e.statusCode() == 412) {
+                    // Someone raced us between our read and this put; report a conflict rather
+                    // than a wrapped exception so the caller re-reads and retries as normal.
+                    return BlobRegisterCasResult.conflict(
+                        readRegister(blobName).map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION)
+                    );
+                }
+                throw e;
+            }
+        } catch (SdkException e) {
+            throw new IOException("Unable to CAS register [" + blobName + "]", e);
+        }
+    }
+
+    private static BlobRegister deserializeRegister(byte[] bytes) {
+        ByteBuffer buffer = ByteBuffer.wrap(bytes);
+        long generation = buffer.getLong();
+        byte[] value = new byte[buffer.remaining()];
+        buffer.get(value);
+        return new BlobRegister(generation, new BytesArray(value));
+    }
+
+    private static byte[] serializeRegister(long generation, BytesReference value) {
+        byte[] valueBytes = BytesReference.toBytes(value);
+        ByteBuffer buffer = ByteBuffer.allocate(8 + valueBytes.length);
+        buffer.putLong(generation);
+        buffer.put(valueBytes);
+        return buffer.array();
     }
 }

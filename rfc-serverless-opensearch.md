@@ -557,11 +557,26 @@ untouched, matching Goal 6), each shard gets its own blob container scoped to
 rather than trusting an arbitrary settings string directly), and `ShardRouting.isSearchOnly()`
 picks `ReaderEngineFactory` vs. `WriterEngineFactory`. Verified end-to-end at the settings/routing
 level (opted-out index gets no factory, missing base path fails loudly, primary/search-only/absent
-routing each resolve to the right factory type). The base path is local-filesystem-only for now,
-for the same reason noted throughout this document: no real S3/GCS/Azure `compareAndSwapRegister`
-implementation exists yet, unverified without cloud credentials. Swapping in a real
-repository-backed container only touches one method (`blobContainerFor`); nothing else in the
-plugin or the classes it wires together is FS-specific.
+routing each resolve to the right factory type). The base path is local-filesystem-only for now
+(swapping in a real repository-backed container only touches one method, `blobContainerFor`;
+nothing else in the plugin or the classes it wires together is FS-specific) pending the
+`repository-s3` register support noted below extending to this plugin's own wiring.
+
+**`compareAndSwapRegister` backends: FS done; S3 done; GCS/Azure not started.**
+`S3BlobContainer.readRegister`/`compareAndSwapRegister` are implemented using S3's real
+conditional-write primitives (`If-Match`/`If-None-Match` on `PutObject`) as the actual concurrency
+guard -- a freshly-read generation is checked client-side purely as a fast-fail, but the
+authoritative check is S3 itself evaluating the conditional `PutObject` atomically against the
+object's live ETag, so a racing writer between our read and our write is caught there (a 412
+response mapped to `VERSION_CONFLICT`), not missed. This could not have been verified as anything
+more than "compiles against the SDK" without a fixture that actually enforces those headers, so
+`test/fixtures/s3-fixture`'s `S3HttpHandler` (shared by every `repository-s3` test) was extended to
+honor `If-Match`/`If-None-Match` on `PutObject` with real 412 semantics -- a small, generally
+useful addition to that fixture, not a special-cased test double. Verified end-to-end against that
+now-honest fixture: put-if-absent, stale-generation conflict, and (the property that actually
+matters) 8 concurrent CAS-retry-loop incrementers against one register losing zero updates. GCS and
+Azure backends remain unimplemented; unlike S3 there was no existing in-repo fixture to extend for
+either, so that work also includes building one.
 
 **Phase 4 — Topology (4–6 weeks).** Role-separated allocation, suspended writers,
 scale-to-zero/cold-start, balancer hysteresis. Milestone: idle index consumes zero compute;
