@@ -13,8 +13,6 @@ import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.EngineCreationFailureException;
 import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.serverless.storage.directory.ShardDirectory;
-import org.opensearch.serverless.storage.directory.ShardDirectoryEntry;
-import org.opensearch.serverless.storage.directory.ShardRole;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.manifest.CommitManifest;
 import org.opensearch.serverless.storage.shardstate.ShardHead;
@@ -31,9 +29,6 @@ import java.util.Optional;
  * should not exist for, so it fails engine creation rather than opening an empty index.
  */
 public final class ReaderEngineFactory implements EngineFactory {
-
-    /** How long a directory entry for a reader shard is trusted before it's treated as stale. */
-    private static final long DIRECTORY_ENTRY_TTL_MILLIS = 60_000L;
 
     private final ShardStateStore shardStateStore;
     private final BlobContainerManifestStore manifestStore;
@@ -66,21 +61,12 @@ public final class ReaderEngineFactory implements EngineFactory {
             }
             ShardHead shardHead = head.get().head();
             CommitManifest manifest = manifestStore.readManifest(shardHead.primaryTerm(), shardHead.latestManifestGeneration());
-            Engine engine = ObjectStoreReaderEngine.open(config, manifest, materializer);
-            // Report to the directory tier on activation, same as the writer path -- a hint for
-            // coordinators, never required for correctness (see ShardDirectory's javadoc).
-            shardDirectory.report(
-                indexUuid,
-                shardId,
-                new ShardDirectoryEntry(
-                    localNodeId,
-                    ShardRole.READER,
-                    shardHead.primaryTerm(),
-                    shardHead.latestManifestGeneration(),
-                    System.currentTimeMillis() + DIRECTORY_ENTRY_TTL_MILLIS
-                )
-            );
-            return engine;
+            // ObjectStoreReaderEngine reports to the directory tier itself, both on activation and
+            // on a fixed refresh schedule for as long as it stays open (rfc-serverless-metadata-plane.md
+            // &sect;9 activation path step 3, &sect;13 risk #1 metastability mitigation) -- see its
+            // javadoc. This is a hint, not a fact, so a report failure is never worth failing engine
+            // construction over.
+            return ObjectStoreReaderEngine.open(config, manifest, materializer, shardHead.primaryTerm(), shardDirectory, localNodeId);
         } catch (RuntimeException e) {
             throw e;
         } catch (Exception e) {

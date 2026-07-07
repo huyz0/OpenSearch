@@ -27,8 +27,11 @@ import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.index.engine.Engine;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.EngineTestCase;
-import org.opensearch.index.engine.ReadOnlyEngine;
 import org.opensearch.index.store.Store;
+import org.opensearch.serverless.storage.directory.InMemoryShardDirectory;
+import org.opensearch.serverless.storage.directory.ShardDirectory;
+import org.opensearch.serverless.storage.directory.ShardDirectoryEntry;
+import org.opensearch.serverless.storage.directory.ShardRole;
 import org.opensearch.serverless.storage.format.BlobContainerBundleStore;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.manifest.CommitManifest;
@@ -40,6 +43,8 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
 
     private static final String INDEX_UUID = "idx";
     private static final int SHARD_ID = 0;
+    private static final String LOCAL_NODE_ID = "test-node";
+    private static final long PRIMARY_TERM = 1;
 
     public void testMaterializerProducesARealSearchableLuceneCommit() throws Exception {
         FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
@@ -133,12 +138,29 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
         try (Store store = createStore()) {
             EngineConfig engineConfig = config(defaultSettings, store, createTempDir(), newMergePolicy(), null);
             ObjectStoreCommitMaterializer materializer = new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer));
+            ShardDirectory shardDirectory = new InMemoryShardDirectory();
 
-            try (ReadOnlyEngine readerEngine = ObjectStoreReaderEngine.open(engineConfig, manifest, materializer)) {
+            try (
+                ObjectStoreReaderEngine readerEngine = ObjectStoreReaderEngine.open(
+                    engineConfig,
+                    manifest,
+                    materializer,
+                    PRIMARY_TERM,
+                    shardDirectory,
+                    LOCAL_NODE_ID
+                )
+            ) {
                 try (Engine.Searcher searcher = readerEngine.acquireSearcher("test")) {
                     TopDocs hits = searcher.search(new TermQuery(new Term("id", "1")), 10);
                     assertEquals(1, hits.totalHits.value());
                 }
+
+                ShardDirectoryEntry entry = shardDirectory.lookup(
+                    engineConfig.getShardId().getIndex().getUUID(),
+                    engineConfig.getShardId().getId()
+                ).orElseThrow(() -> new AssertionError("opening the reader engine should report an entry to the shard directory"));
+                assertEquals(LOCAL_NODE_ID, entry.nodeId());
+                assertEquals(ShardRole.READER, entry.role());
             }
         }
     }

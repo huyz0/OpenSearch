@@ -377,25 +377,35 @@ control cell's small replicated log, which can itself checkpoint to the object s
   object-store engine (opt-in per index via `index.serverless_storage.enabled`) -- classic
   indices' primary-term authority is untouched, and there is no migration path yet between the
   two for an existing index.
-- **Phase 4 (extended) — Directory tier (first slice + writer-side refresh done); gossip
-  membership not started.** `ShardDirectory`/`InMemoryShardDirectory` is a real, tested,
-  single-node-correct directory: a TTL-expiring, self-correcting hint cache (never a source of
-  truth -- see its javadoc), wired into both `WriterEngineFactory` and `ReaderEngineFactory` to
-  report on shard activation. `ObjectStoreWriterEngine` now also refreshes its own entry on a
-  fixed schedule (a third of the TTL) for as long as it stays open, canceled cleanly on
-  `close()` -- the risk-#1 mitigation below, verified for writer shards. Reader shards still only
-  report once, on activation: `ObjectStoreReaderEngine.open` is a static factory returning a
-  plain `ReadOnlyEngine`, not a class with its own lifecycle to hook a scheduled task and its
-  cancellation into, so giving readers the same refresh needs that factory turned into a real
-  engine subclass first -- deliberately not done here to keep this slice bounded. Still not the
-  target design: no partitioning across multiple directory node instances (so no single instance
-  can hold all of a 100M-shard deployment's ~2M active entries without being one very large
-  single process), no replication, and no rebuild-from-listing recovery path. This is the "one
-  directory node's correct local behavior" the target design's "tens of directory nodes,
-  DynamoDB-style" would be built from, not that design itself. Gossip/SWIM membership is
-  unstarted -- see the companion discussion on whether it's needed at all before node-fleet size
-  (not shard count, which is already handled by shard-heads + this directory) actually demands
-  it.
+- **Phase 4 (extended) — Directory tier: refresh, partitioning, and recovery all have a real,
+  tested first slice; gossip membership not started.** `ShardDirectory`/`InMemoryShardDirectory`
+  is a real, tested, single-node-correct directory: a TTL-expiring, self-correcting hint cache
+  (never a source of truth -- see its javadoc), wired into both `WriterEngineFactory` and
+  `ReaderEngineFactory` to report on shard activation. Both `ObjectStoreWriterEngine` and
+  `ObjectStoreReaderEngine` now refresh their own entry on a fixed schedule (a third of the TTL)
+  for as long as they stay open, canceled cleanly on `close()` -- the risk-#1 mitigation below,
+  now verified for both roles. (`ObjectStoreReaderEngine` had to become a real `ReadOnlyEngine`
+  subclass instead of a static factory to get a lifecycle to hook the scheduled task and its
+  cancellation into.) `PartitionedShardDirectory`/`ConsistentHashRing` consistent-hash a shard key
+  across a fixed set of backing `ShardDirectory` instances -- a tested, deterministic
+  key-to-partition mapping, but still purely in-process: each "partition" is a local object, not a
+  connection to a separate directory-node process, so this is the routing-selection logic the real
+  multi-node design would reuse, not multi-node itself. `DirectoryRebuildService` recovers a
+  directory instance that lost all its state by walking a root `BlobContainer`'s
+  `<indexUuid>/<shardId>` children and re-reporting a writer hint for every shard with a
+  currently-unexpired lease; it can only ever recover writer hints, since `ShardHead` has no
+  record of which nodes hold a shard open read-only -- reader entries repopulate the ordinary way,
+  from the next activation. Still not the target design: no dynamic membership for
+  `PartitionedShardDirectory` (partition count is fixed at construction; resizing means rebuilding
+  the whole ring, which reshuffles every key -- the same limitation any modulo-based partitioning
+  scheme has, consistent hashing only bounds how *much* reshuffles, not whether any does), and no
+  replication (losing one partition's backing process loses every entry it held, full stop -- a
+  rebuild recovers writer hints from `ShardStateStore`, but only once run, not automatically on
+  partition loss). This is the "one directory node's correct local behavior" the target design's
+  "tens of directory nodes, DynamoDB-style" would be built from, not that design itself. Gossip/SWIM
+  membership is unstarted -- see the companion discussion on whether it's needed at all before
+  node-fleet size (not shard count, which is already handled by shard-heads + this directory)
+  actually demands it.
 - **Phase 5.5 — Control-cell diet.** Strip routing table and allocation from the coordination
   path for serverless indices; virtualized compat APIs; scale test: 10M shards (1 rack), then
   10⁸ (simulated heads + real active set).
@@ -403,13 +413,15 @@ control cell's small replicated log, which can itself checkpoint to the object s
 ## 13. Risks
 
 1. **Metastability of the directory tier** — the exact failure DynamoDB's paper warns about.
-   Mitigation is partially baked in: `ObjectStoreWriterEngine` refreshes its directory entry on a
-   fixed schedule well inside the TTL, so a writer shard's entry staleness is bounded by the
-   refresh interval rather than by traffic patterns, spreading `ShardStateStore` load out instead
-   of clumping it at expiry. Reader shards don't have this yet (see Phase 4 extended above), and
-   load tests must still include cache-wipe storms once the directory is actually partitioned
-   across multiple nodes -- this mitigation only protects a single directory instance's own load,
-   not cross-instance correlated misses after a partition reshuffle.
+   Mitigation is baked in for both roles: `ObjectStoreWriterEngine` and `ObjectStoreReaderEngine`
+   each refresh their own directory entry on a fixed schedule well inside the TTL, so a shard's
+   entry staleness is bounded by the refresh interval rather than by traffic patterns, spreading
+   `ShardStateStore` load out instead of clumping it at expiry. What's still missing: load tests
+   that actually exercise cache-wipe storms once the directory is truly partitioned across
+   multiple *processes* (today's `PartitionedShardDirectory` only partitions across in-process
+   objects, so there's no real cross-process correlated-miss scenario to load test yet), and
+   `DirectoryRebuildService`'s walk is manually triggered, not wired to run automatically the
+   moment a partition is detected empty/lost.
 2. **Object-store CAS behavioral variance** across providers (ETag semantics vs generation
    preconditions; throttling of hot single keys). Mitigation: conformance test suite per
    repository implementation; shard-heads are per-shard so no single hot key exists.
