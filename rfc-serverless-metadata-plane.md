@@ -352,15 +352,19 @@ control cell's small replicated log, which can itself checkpoint to the object s
 
 ## 12. Phasing (Amends Companion RFC §16)
 
-- **Phase 2.5 — Shard-head & lease protocol (interface + FS reference implementation done).**
-  `ShardStateStore`/`ShardHead`/`VersionedShardHead`/`CasResult` plus `FsShardStateStore` are
-  implemented and tested in `modules/serverless-storage` (same branch as the companion RFC's
-  Phase 1). Threading-level correctness is verified directly rather than only argued: a
-  many-thread activation race resolves to exactly one winner, and concurrent publishers racing
-  with retry (the compactor rebase protocol's core property) never lose an update — both run
-  repeatedly in CI-style repetition to rule out flakiness, standing in for the
-  TLA+/lightweight-formal model this phase still owes for the full term/lease/activation state
-  machine (a from-scratch model, not yet done — the tests cover the two properties that matter
+- **Phase 2.5 — Shard-head & lease protocol (interface + generic BlobContainer-backed
+  implementation done).** `ShardStateStore`/`ShardHead`/`VersionedShardHead`/`CasResult` plus
+  `BlobContainerShardStateStore` (built on `BlobContainer.compareAndSwapRegister`, so it works
+  against any conforming blob container — FS today, real object stores once their plugins
+  implement the primitive) are implemented and tested in `modules/serverless-storage` (same
+  branch as the companion RFC's Phase 1), and the compaction service's rebase protocol
+  (companion RFC Phase 4.5) is now built and tested on top of it. Threading-level correctness is
+  verified directly rather than only argued: a many-thread activation race resolves to exactly
+  one winner, and concurrent publishers racing with retry (the compactor rebase protocol's core
+  property) never lose an update — both run repeatedly in CI-style repetition to rule out
+  flakiness, standing in for the TLA+/lightweight-formal model this phase still owes for the
+  full term/lease/activation state machine (a from-scratch model, not yet done — the tests cover
+  the two properties that matter
   most operationally, not the full state space). Still open: an object-store-backed
   implementation (S3 If-Match / GCS generation preconditions / Azure ETag If-Match) behind the
   same interface, and the dual-activation chaos-test gate. Bridge note: until an engine actually

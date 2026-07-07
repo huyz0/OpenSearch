@@ -519,15 +519,22 @@ local index, freshness lag p99 < 15 s under sustained ingest.
 scale-to-zero/cold-start, balancer hysteresis. Milestone: idle index consumes zero compute;
 first query after idle returns < 5 s p95 for a cached-manifest index.
 
-**Phase 4.5 — Compaction service.** Its hard dependency, shard-head CAS
-(metadata-plane RFC Phase 2.5), is **done**: `ShardStateStore`/`ShardHead`/`CasResult` plus the
-`FsShardStateStore` reference implementation, with concurrency-correctness tests (exactly one
-winner in a many-thread activation race; no lost updates under concurrent publishers with
-retry — the rebase protocol's core property) run repeatedly to rule out flakiness. The
-compaction service itself &mdash; candidate selection from manifests, compactor leases,
-`_forcemerge` redefinition &mdash; is not yet started. Milestone (not yet met): a quiescent
+**Phase 4.5 — Compaction service (candidate selection + rebase protocol done; not wired to a
+real merge).** Its hard dependency, shard-head CAS (metadata-plane RFC Phase 2.5), is done and
+now generically `BlobContainer`-backed (`BlobContainerShardStateStore`). On top of it,
+`CompactionPolicy` (candidate selection from segment-count/size/delete-ratio metrics, matching
+&sect;7.4's "readable without opening the shard") and `CompactionRebaseExecutor` (the
+rebase-on-CAS-conflict publication loop itself) are implemented and tested, including the
+rebase protocol's two defining properties under real concurrency: a compactor that gets raced by
+a concurrent writer publication rebases and eventually succeeds rather than corrupting or losing
+the writer's update, and many concurrent publishers hammering the same shard never lose an
+update between them. What's still open: wiring an actual Lucene merge into
+`CompactionPublisher` (today it's a caller-supplied function, exercised in tests with synthetic
+head transitions, not a real segment merge), `_forcemerge` redefinition, and the compactor
+role/lease-offload negotiation with an active writer. Milestone (not yet met): a quiescent
 40-segment shard is compacted to size-tiered shape with no writer ever activating, concurrently
-with a surprise writer re-activation (rebase test).
+with a surprise writer re-activation (rebase test — the *protocol* for this is now tested; the
+*real merge* is not).
 
 **Phase 4.6 — Snapshots/clones/PITR (2–3 weeks).** Manifest pinning (durable pins, §6.5),
 zero-copy clone with cross-index bundle refcounts, PITR retention policy (§14). Gated on the
