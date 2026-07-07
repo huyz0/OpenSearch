@@ -693,6 +693,18 @@ directions documented so serverless adoption is not a one-way door.
    model-checked (TLA+ or equivalent) before Phase 1 completes — this is the one component
    where a design bug destroys data. The model must cover cross-index bundle references from
    clones (§14) and compactor/writer publication races (§7.4), not just the single-writer case.
+   **Status**: a first TLA+ model of the core primitive underneath all of this —
+   `ShardHead`'s term/lease/generation state machine and its version-CAS guard — is written at
+   `plugins/serverless-storage/formal/ShardHead.tla` (with a companion `ShardHead.cfg`), stating
+   five properties: at most one valid lease holder at a time, term never decreases, generation
+   never regresses within a term, a new term always resets generation to 0, and — the one that
+   actually matters — a `Publish` action can only ever succeed when its actor is the *real*
+   current holder, not merely believes itself to be. This is written but **not yet
+   machine-checked with TLC** in this repo (tooling wasn't set up in this session); running
+   `java -jar tla2tools.jar -config ShardHead.cfg ShardHead.tla` is the immediate next step
+   before trusting it. It also does not yet cover clones/cross-index references or the
+   compactor-vs-writer rebase race (§7.4) called out above — those need their own actions added
+   to the model, not just this base activation/publish machine.
 6. **Interplay with existing warm/composite work.** Writable warm solves an overlapping problem
    (disk smaller than data) with a different mechanism (composite local+remote directory under a
    writable engine). Decision needed: converge warm onto the reader-engine + bundle layout in
