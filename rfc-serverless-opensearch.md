@@ -520,19 +520,33 @@ term already holds the head -- verified with real `IndexWriter` commits and a re
 `BlobContainerShardStateStore`, including the fenced-out and idempotent-retry cases.
 `ObjectStoreWriterEngine extends InternalEngine` wires this in: it overrides `commitIndexWriter` to
 call `super` (local commit unchanged) and then `ObjectStoreCommitHeadPublisher`, failing the engine
-if this writer has been fenced out. This wiring class itself is thin glue verified by compilation
-and by the fully-tested class it delegates to, not by an `EngineTestCase`-based test (would require
-depending on `:server`'s test sourceset from a plugin module, which the build doesn't currently
-support without new build plumbing -- a real gap, not a shortcut taken lightly). Still open: local
-Lucene commit/translog retention policy once object storage becomes the durability source of truth
-(right now local files are kept exactly as a normal `InternalEngine` would keep them, so this is
-belt-and-suspenders durability today rather than the disk-bandwidth savings &sect;5/&sect;6 target).
-Milestone (not yet met): an index whose durability is object-store-only survives `kill -9` of its
-node with zero data loss (durable ack mode), recovering by manifest+WAL replay.
+if this writer has been fenced out -- verified end-to-end via a real `EngineTestCase`-provisioned
+engine (`test:framework` already carries `EngineTestCase`, so this needed no new build plumbing):
+one test confirms a flush publishes a manifest onto the shard head, another confirms a writer
+already superseded by a higher term has its engine failed by the very next flush, including that
+subsequent writes are then also rejected. Still open: local Lucene commit/translog retention policy
+once object storage becomes the durability source of truth (right now local files are kept exactly
+as a normal `InternalEngine` would keep them, so this is belt-and-suspenders durability today rather
+than the disk-bandwidth savings &sect;5/&sect;6 target). Milestone (not yet met): an index whose
+durability is object-store-only survives `kill -9` of its node with zero data loss (durable ack
+mode), recovering by manifest+WAL replay.
 
-**Phase 3 — Reader engine (6–8 weeks).** `ObjectStoreReaderEngine`, manifest notifications,
-block cache unification, admission control. Milestone: search-only shards serve queries with no
-local index, freshness lag p99 < 15 s under sustained ingest.
+**Phase 3 — Reader engine (materializer and open-from-manifest done; refresh-to-newer-generation
+and notification wiring still open).** `ObjectStoreCommitMaterializer` fetches every file a
+`CommitManifest` references (checksum-verified) and writes it into a target Lucene `Directory`,
+producing an ordinary valid commit -- proven by opening a plain `DirectoryReader` against a
+materialized manifest and running a real query, and separately by opening a full
+`ReadOnlyEngine` against one via `ObjectStoreReaderEngine.open`. Deliberately reuses
+`ReadOnlyEngine` rather than writing a new `Engine` subclass: once materialization has populated
+the store's directory, `ReadOnlyEngine` already implements the entire read-only surface (search,
+get, completion stats, refusing writes) against exactly that, so the object-store-specific work
+stays confined to materialization itself. Two scoped tradeoffs, both explicit rather than
+accidental: (1) full-materialization, not the lazy/block-cached object-store-native `Directory`
+this phase's milestone targets -- correct and useful for small segment sets today, not the
+eventual read path; (2) one fixed generation per `open` call, no in-place refresh to a newer
+manifest without a full engine reopen. Still open: manifest-change notifications, block cache
+unification, admission control. Milestone: search-only shards serve queries with no local index,
+freshness lag p99 < 15 s under sustained ingest.
 
 **Phase 4 — Topology (4–6 weeks).** Role-separated allocation, suspended writers,
 scale-to-zero/cold-start, balancer hysteresis. Milestone: idle index consumes zero compute;
