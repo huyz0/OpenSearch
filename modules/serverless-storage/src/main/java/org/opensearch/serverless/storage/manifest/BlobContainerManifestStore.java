@@ -50,4 +50,9 @@ public final class BlobContainerManifestStore {
             return new CommitManifest(StreamInput.wrap(in.readAllBytes()));
         }
     }
+
+    /** Whether a manifest for this (primaryTerm, generation) has already been written. */
+    public boolean manifestExists(long primaryTerm, long generation) throws IOException {
+        return blobContainer.blobExists(CommitManifest.manifestName(primaryTerm, generation));
+    }
 }

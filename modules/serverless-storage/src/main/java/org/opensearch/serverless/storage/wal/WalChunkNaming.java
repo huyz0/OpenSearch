@@ -15,13 +15,23 @@ package org.opensearch.serverless.storage.wal;
  */
 public final class WalChunkNaming {
 
+    public static final String LOG_BLOB_PREFIX = "log-";
+
     private WalChunkNaming() {}
 
     public static String blobName(String writerEpoch, long chunkSequence) {
-        return "log-" + chunkSequence;
+        return LOG_BLOB_PREFIX + chunkSequence;
     }
 
     public static String blobPath(String writerEpoch, long chunkSequence) {
         return "wal/" + writerEpoch + "/" + blobName(writerEpoch, chunkSequence);
+    }
+
+    /** Inverse of {@link #blobName}: recovers the chunk sequence from a blob name it produced. */
+    public static long parseChunkSequence(String blobName) {
+        if (blobName.startsWith(LOG_BLOB_PREFIX) == false) {
+            throw new IllegalArgumentException("not a WAL chunk blob name: " + blobName);
+        }
+        return Long.parseLong(blobName.substring(LOG_BLOB_PREFIX.length()));
     }
 }

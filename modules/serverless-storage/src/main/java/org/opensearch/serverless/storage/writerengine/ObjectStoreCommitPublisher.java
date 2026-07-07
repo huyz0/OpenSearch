@@ -59,6 +59,11 @@ public final class ObjectStoreCommitPublisher {
      * them leaves an orphaned bundle, which is a correctness non-issue (bundles are addressed only
      * through a written manifest, so an unreferenced bundle is simply eligible for GC) rather than
      * a corruption -- never the reverse (a manifest referencing a bundle that failed to write).
+     *
+     * <p>Idempotent under retry: a (primaryTerm, generation) pair uniquely identifies one Lucene
+     * commit, so if a manifest for it was already published (e.g. the caller timed out waiting for
+     * a first call that actually succeeded), this returns that existing manifest unchanged rather
+     * than re-uploading and overwriting the bundle.
      */
     public CommitManifest publishCommit(
         Directory directory,
@@ -73,6 +78,10 @@ public final class ObjectStoreCommitPublisher {
         long mappingVersion,
         PruningStats pruningStats
     ) throws IOException {
+        if (manifestStore.manifestExists(primaryTerm, generation)) {
+            return manifestStore.readManifest(primaryTerm, generation);
+        }
+
         Collection<String> fileNames = segmentInfos.files(true);
         List<BundleFileContent> contents = new java.util.ArrayList<>(fileNames.size());
         for (String fileName : fileNames) {

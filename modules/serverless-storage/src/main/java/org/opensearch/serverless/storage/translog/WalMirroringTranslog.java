@@ -34,6 +34,14 @@ import java.util.function.LongSupplier;
  */
 public class WalMirroringTranslog extends LocalTranslog {
 
+    /**
+     * A transient object-store error mirroring one operation should not fail the whole engine on
+     * the first blip: retry a bounded number of times with a short backoff before giving up and
+     * propagating the failure to the caller.
+     */
+    static final int MAX_MIRROR_FLUSH_ATTEMPTS = 3;
+    static final long RETRY_BASE_DELAY_MILLIS = 10;
+
     private final WalChunkService walChunkService;
     private final String indexUuid;
     private final int shardId;
@@ -75,7 +83,33 @@ public class WalMirroringTranslog extends LocalTranslog {
         // fsync gives; a deployment that wants real cross-shard group-commit batching would flush
         // WalChunkService on a timer/size threshold from a shared scheduler instead, independent
         // of any single shard's Translog.
-        walChunkService.flush();
+        flushWithRetry();
         return location;
+    }
+
+    /**
+     * The operation is already durable in the local translog by the time this runs (see {@link
+     * #add}), so a transient failure writing its WAL mirror chunk should not immediately fail the
+     * whole engine -- retry a few times first. {@link WalChunkService#flush} re-attempts writing
+     * everything currently buffered (not just this operation's record), so a retry here never
+     * loses or duplicates records: on success the buffer is drained exactly once.
+     */
+    private void flushWithRetry() throws IOException {
+        for (int attempt = 1; attempt <= MAX_MIRROR_FLUSH_ATTEMPTS; attempt++) {
+            try {
+                walChunkService.flush();
+                return;
+            } catch (IOException e) {
+                if (attempt == MAX_MIRROR_FLUSH_ATTEMPTS) {
+                    throw e;
+                }
+                try {
+                    Thread.sleep(RETRY_BASE_DELAY_MILLIS * attempt);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw e;
+                }
+            }
+        }
     }
 }

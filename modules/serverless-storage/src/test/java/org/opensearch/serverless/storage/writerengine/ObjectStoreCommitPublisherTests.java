@@ -147,6 +147,58 @@ public class ObjectStoreCommitPublisherTests extends OpenSearchTestCase {
         }
     }
 
+    public void testRetriedPublishForTheSameGenerationIsANoOpAndReturnsTheExistingManifest() throws Exception {
+        try (Directory directory = new ByteBuffersDirectory()) {
+            SegmentInfos segmentInfos = commitTwoDocuments(directory);
+
+            CommitManifest first = publisher.publishCommit(
+                directory,
+                segmentInfos,
+                INDEX_UUID,
+                SHARD_ID,
+                1,
+                0,
+                1,
+                1,
+                new WalPosition("epoch-0", 0),
+                0,
+                PruningStats.empty()
+            );
+
+            String bundleName = first.files().values().iterator().next().bundleName();
+            byte[] bundleBytesAfterFirstPublish;
+            try (java.io.InputStream in = blobContainer.readBlob(bundleName)) {
+                bundleBytesAfterFirstPublish = in.readAllBytes();
+            }
+
+            // A retry for the identical (primaryTerm, generation) must not re-upload the bundle:
+            // it should short-circuit to the already-published manifest.
+            CommitManifest retried = publisher.publishCommit(
+                directory,
+                segmentInfos,
+                INDEX_UUID,
+                SHARD_ID,
+                1,
+                0,
+                999, // deliberately different metadata to prove this is ignored, not re-published
+                999,
+                new WalPosition("epoch-1", 42),
+                999,
+                PruningStats.empty()
+            );
+
+            assertEquals(first.manifestName(), retried.manifestName());
+            assertEquals(first.maxSeqNo(), retried.maxSeqNo());
+            assertEquals(first.walPosition(), retried.walPosition());
+
+            byte[] bundleBytesAfterRetry;
+            try (java.io.InputStream in = blobContainer.readBlob(bundleName)) {
+                bundleBytesAfterRetry = in.readAllBytes();
+            }
+            assertArrayEquals(bundleBytesAfterFirstPublish, bundleBytesAfterRetry);
+        }
+    }
+
     private static byte[] readFile(Directory directory, String fileName) throws IOException {
         try (IndexInput input = directory.openInput(fileName, IOContext.READONCE)) {
             byte[] bytes = new byte[(int) input.length()];

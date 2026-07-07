@@ -12,6 +12,7 @@ import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.fs.FsBlobContainer;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
+import org.opensearch.common.blobstore.support.FilterBlobContainer;
 import org.opensearch.common.util.BigArrays;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
@@ -105,6 +106,96 @@ public class WalMirroringTranslogTests extends OpenSearchTestCase {
                 }
             }
             assertEquals(java.util.Set.of(0L, 1L), seqNosSeen);
+        }
+    }
+
+    public void testAddSurvivesTransientWalMirrorFailuresWithinTheRetryBudget() throws Exception {
+        FailNTimesBlobContainer faulty = new FailNTimesBlobContainer(blobContainer, WalMirroringTranslog.MAX_MIRROR_FLUSH_ATTEMPTS - 1);
+        WalChunkService flakyWalChunkService = new WalChunkService(faulty, "epoch-0");
+
+        Path path = createTempDir();
+        TranslogConfig config = new TranslogConfig(shardId, path, indexSettings, BigArrays.NON_RECYCLING_INSTANCE, "node-0", false);
+        String translogUUID = Translog.createEmptyTranslog(path, SequenceNumbers.UNASSIGNED_SEQ_NO, shardId, 1L);
+        try (
+            WalMirroringTranslog translog = new WalMirroringTranslog(
+                config,
+                translogUUID,
+                new DefaultTranslogDeletionPolicy(-1, -1, Integer.MAX_VALUE),
+                () -> SequenceNumbers.UNASSIGNED_SEQ_NO,
+                () -> 1L,
+                seqNo -> {},
+                TranslogOperationHelper.DEFAULT,
+                flakyWalChunkService
+            )
+        ) {
+            // Must not throw: the first (MAX_MIRROR_FLUSH_ATTEMPTS - 1) flush attempts fail, but
+            // the last one within the retry budget succeeds.
+            translog.add(new Translog.Index("id-1", 0, 1, "{\"field\":1}".getBytes("UTF-8")));
+        }
+
+        // The successful attempt lands at whatever sequence number it reached (earlier attempts
+        // that failed before writing still consume a sequence number), so scan by prefix rather
+        // than assuming it's log-0.
+        List<WalRecord> allRecords = new java.util.ArrayList<>();
+        for (String blobName : blobContainer.listBlobsByPrefix(WalChunkNaming.LOG_BLOB_PREFIX).keySet()) {
+            byte[] chunkBytes;
+            try (java.io.InputStream in = blobContainer.readBlob(blobName)) {
+                chunkBytes = in.readAllBytes();
+            }
+            allRecords.addAll(WalChunkReader.readRecords(chunkBytes));
+        }
+        assertEquals(1, allRecords.size());
+    }
+
+    public void testAddFailsAfterExhaustingTheRetryBudget() throws Exception {
+        FailNTimesBlobContainer faulty = new FailNTimesBlobContainer(blobContainer, WalMirroringTranslog.MAX_MIRROR_FLUSH_ATTEMPTS);
+        WalChunkService alwaysFlakyWalChunkService = new WalChunkService(faulty, "epoch-0");
+
+        Path path = createTempDir();
+        TranslogConfig config = new TranslogConfig(shardId, path, indexSettings, BigArrays.NON_RECYCLING_INSTANCE, "node-0", false);
+        String translogUUID = Translog.createEmptyTranslog(path, SequenceNumbers.UNASSIGNED_SEQ_NO, shardId, 1L);
+        try (
+            WalMirroringTranslog translog = new WalMirroringTranslog(
+                config,
+                translogUUID,
+                new DefaultTranslogDeletionPolicy(-1, -1, Integer.MAX_VALUE),
+                () -> SequenceNumbers.UNASSIGNED_SEQ_NO,
+                () -> 1L,
+                seqNo -> {},
+                TranslogOperationHelper.DEFAULT,
+                alwaysFlakyWalChunkService
+            )
+        ) {
+            expectThrows(
+                java.io.IOException.class,
+                () -> translog.add(new Translog.Index("id-1", 0, 1, "{\"field\":1}".getBytes("UTF-8")))
+            );
+        }
+    }
+
+    /** Fails the first {@code failureCount} writeBlob calls, then delegates normally. */
+    private static final class FailNTimesBlobContainer extends FilterBlobContainer {
+
+        private int remainingFailures;
+
+        FailNTimesBlobContainer(BlobContainer delegate, int failureCount) {
+            super(delegate);
+            this.remainingFailures = failureCount;
+        }
+
+        @Override
+        protected BlobContainer wrapChild(BlobContainer child) {
+            return new FailNTimesBlobContainer(child, remainingFailures);
+        }
+
+        @Override
+        public synchronized void writeBlob(String blobName, java.io.InputStream inputStream, long blobSize, boolean failIfAlreadyExists)
+            throws java.io.IOException {
+            if (remainingFailures > 0) {
+                remainingFailures--;
+                throw new java.io.IOException("injected transient failure writing " + blobName);
+            }
+            super.writeBlob(blobName, inputStream, blobSize, failIfAlreadyExists);
         }
     }
 }

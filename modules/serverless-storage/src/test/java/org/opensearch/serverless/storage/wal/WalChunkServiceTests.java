@@ -62,6 +62,28 @@ public class WalChunkServiceTests extends OpenSearchTestCase {
         assertEquals(1, service.flush());
     }
 
+    public void testResumesChunkSequenceFromExistingBlobsUnderTheSameEpoch() throws Exception {
+        BlobContainer blobContainer = newBlobContainer();
+        WalChunkService firstLifetime = new WalChunkService(blobContainer, "epoch-0");
+        firstLifetime.append(new WalRecord("idx", 0, 0, "a".getBytes("UTF-8")));
+        assertEquals(0, firstLifetime.flush());
+        firstLifetime.append(new WalRecord("idx", 0, 1, "b".getBytes("UTF-8")));
+        assertEquals(1, firstLifetime.flush());
+
+        // A new instance against the same container/epoch (e.g. after a process restart) must
+        // not restart the sequence at 0 and overwrite the chunks the prior instance wrote.
+        WalChunkService secondLifetime = new WalChunkService(blobContainer, "epoch-0");
+        secondLifetime.append(new WalRecord("idx", 0, 2, "c".getBytes("UTF-8")));
+        assertEquals(2, secondLifetime.flush());
+
+        byte[] chunk0Bytes;
+        try (InputStream in = blobContainer.readBlob(WalChunkNaming.blobName("epoch-0", 0))) {
+            chunk0Bytes = in.readAllBytes();
+        }
+        assertEquals(1, WalChunkReader.readRecords(chunk0Bytes).size());
+        assertEquals(0L, WalChunkReader.readRecords(chunk0Bytes).get(0).seqNo());
+    }
+
     public void testConcurrentAppendsAreAllCapturedByFlush() throws Exception {
         BlobContainer blobContainer = newBlobContainer();
         WalChunkService service = new WalChunkService(blobContainer, "epoch-0");

@@ -9,6 +9,7 @@
 package org.opensearch.serverless.storage.wal;
 
 import org.opensearch.common.blobstore.BlobContainer;
+import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.core.common.bytes.BytesArray;
 
 import java.io.IOException;
@@ -27,17 +28,37 @@ import java.util.concurrent.atomic.AtomicLong;
  * actually durably writes a chunk. A caller wanting synchronous durability per operation (as a
  * local translog does) should flush after every append; a caller wanting real group-commit
  * batching across shards should flush on a timer or size threshold instead.
+ *
+ * <p>The chunk sequence for a given {@code writerEpoch} resumes from whatever is already present
+ * in the blob container rather than always starting at 0: a caller must pick a {@code
+ * writerEpoch} that is unique to one actual writer lifetime (e.g. derived from the shard's
+ * primary term, not reused verbatim across a plain process restart under the same term), but a
+ * fresh {@link WalChunkService} instance constructed against a container that already holds
+ * chunks for that epoch (e.g. after a process restart before the term changed) will not overwrite
+ * them.
  */
 public final class WalChunkService {
 
     private final BlobContainer blobContainer;
     private final String writerEpoch;
-    private final AtomicLong nextChunkSequence = new AtomicLong(0);
+    private final AtomicLong nextChunkSequence;
     private final List<WalRecord> buffered = new ArrayList<>();
 
-    public WalChunkService(BlobContainer blobContainer, String writerEpoch) {
+    public WalChunkService(BlobContainer blobContainer, String writerEpoch) throws IOException {
         this.blobContainer = blobContainer;
         this.writerEpoch = writerEpoch;
+        this.nextChunkSequence = new AtomicLong(firstUnusedChunkSequence(blobContainer, writerEpoch));
+    }
+
+    private static long firstUnusedChunkSequence(BlobContainer blobContainer, String writerEpoch) throws IOException {
+        long maxExisting = -1;
+        for (BlobMetadata blob : blobContainer.listBlobsByPrefix(WalChunkNaming.LOG_BLOB_PREFIX).values()) {
+            long sequence = WalChunkNaming.parseChunkSequence(blob.name());
+            if (sequence > maxExisting) {
+                maxExisting = sequence;
+            }
+        }
+        return maxExisting + 1;
     }
 
     public synchronized void append(WalRecord record) {
