@@ -365,15 +365,30 @@ control cell's small replicated log, which can itself checkpoint to the object s
   flakiness, standing in for the TLA+/lightweight-formal model this phase still owes for the
   full term/lease/activation state machine (a from-scratch model, not yet done — the tests cover
   the two properties that matter
-  most operationally, not the full state space). Still open: an object-store-backed
-  implementation (S3 If-Match / GCS generation preconditions / Azure ETag If-Match) behind the
-  same interface, and the dual-activation chaos-test gate. Bridge note: until an engine actually
-  consumes it, primary-term authority in the data plane remains classic cluster coordination
-  (companion RFC §7.1); wiring `ShardStateStore` in as that authority, and unblocking the
-  compaction service (companion RFC Phase 4.5) that depends on its head pointer, are both still
-  open.
-- **Phase 4 (extended) — Directory tier + gossip membership.** Directory service, constant-load
-  client caching, rebuild-from-listing; SWIM membership behind the existing node-join API.
+  most operationally, not the full state space). Object-store-backed implementations are now
+  done for all three major providers (S3 `If-Match`/`If-None-Match`, GCS `generationMatch`/
+  `doesNotExist`, Azure `BlobRequestConditions`), each verified against a real conditional-write
+  enforcing test fixture, not just "compiles against the SDK." Still open: the dual-activation
+  chaos-test gate. Bridge note updated: the engine consumption this note was waiting on is now
+  done — `ObjectStoreWriterEngine`/`ReaderEngineFactory` (companion RFC's engine layer) construct
+  their `ShardStateStore` per shard and treat it as the authority for term-fencing and manifest
+  generation, verified end-to-end (a writer fenced out by a higher term has its engine fail on
+  the next flush). What's *not* done: this authority only governs shards running the
+  object-store engine (opt-in per index via `index.serverless_storage.enabled`) -- classic
+  indices' primary-term authority is untouched, and there is no migration path yet between the
+  two for an existing index.
+- **Phase 4 (extended) — Directory tier (first slice done); gossip membership not started.**
+  `ShardDirectory`/`InMemoryShardDirectory` is a real, tested, single-node-correct directory: a
+  TTL-expiring, self-correcting hint cache (never a source of truth -- see its javadoc), wired
+  into both `WriterEngineFactory` and `ReaderEngineFactory` to report on shard activation.
+  Explicitly *not* the target design yet: no partitioning across multiple directory node
+  instances (so no single instance can hold all of a 100M-shard deployment's ~2M active entries
+  without being one very large single process), no replication, no client-side constant-load
+  refresh, and no rebuild-from-listing recovery path. This is the "one directory node's correct
+  local behavior" the target design's "tens of directory nodes, DynamoDB-style" would be built
+  from, not that design itself. Gossip/SWIM membership is unstarted -- see the companion
+  discussion on whether it's needed at all before node-fleet size (not shard count, which is
+  already handled by shard-heads + this directory) actually demands it.
 - **Phase 5.5 — Control-cell diet.** Strip routing table and allocation from the coordination
   path for serverless indices; virtualized compat APIs; scale test: 10M shards (1 rack), then
   10⁸ (simulated heads + real active set).

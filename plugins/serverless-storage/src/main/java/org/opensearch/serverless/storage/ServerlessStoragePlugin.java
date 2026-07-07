@@ -32,6 +32,8 @@ import org.opensearch.plugins.Plugin;
 import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.script.ScriptService;
 import org.opensearch.serverless.storage.allocation.ReaderShardPlacementAllocationDecider;
+import org.opensearch.serverless.storage.directory.InMemoryShardDirectory;
+import org.opensearch.serverless.storage.directory.ShardDirectory;
 import org.opensearch.serverless.storage.format.BlobContainerBundleStore;
 import org.opensearch.serverless.storage.format.BundleFileReader;
 import org.opensearch.serverless.storage.format.LocalDiskCachingBundleStore;
@@ -106,6 +108,11 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     private volatile Path basePath;
     private volatile Path localCacheRoot;
     private volatile EncryptionKeyProvider encryptionKeyProvider;
+    private volatile String localNodeId = "unknown-node";
+    // One node-local directory instance shared by every shard on this node -- matches the target
+    // design's "one node block cache" shape (&sect;9) rather than a per-shard instance, and needs
+    // no I/O to construct, so it's safe to build eagerly rather than threading through createComponents.
+    private final ShardDirectory shardDirectory = new InMemoryShardDirectory();
 
     @Override
     public List<Setting<?>> getSettings() {
@@ -135,6 +142,9 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         }
         if (nodeEnvironment != null && nodeEnvironment.nodeDataPaths().length > 0) {
             localCacheRoot = nodeEnvironment.nodeDataPaths()[0].resolve("serverless_storage_cache");
+        }
+        if (clusterService != null) {
+            localNodeId = clusterService.localNode().getId();
         }
         try (SecureString encryptionKey = SERVERLESS_STORAGE_ENCRYPTION_KEY_SETTING.get(environment.settings())) {
             if (encryptionKey.length() > 0) {
@@ -182,16 +192,29 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             if (isReaderShard) {
                 BundleFileReader readPath = bundleStore;
                 if (localCacheRoot != null) {
-                    // The directory tier (rfc-serverless-opensearch.md &sect;9): a reader shard
+                    // The cache layer (rfc-serverless-opensearch.md &sect;9): a reader shard
                     // re-fetches the same bundle files across queries far more often than a writer
                     // re-reads its own recent writes, so caching is wired in for reader shards only.
+                    // Not to be confused with the *shard-location* directory tier (metadata-plane
+                    // RFC &sect;8/&sect;9/&sect;11, `shardDirectory` below) -- this one caches
+                    // bytes, that one caches "which node has this shard open."
                     Path shardCacheDir = localCacheRoot.resolve(indexUuid).resolve(String.valueOf(shardIdValue));
                     readPath = new LocalDiskCachingBundleStore(bundleStore, shardCacheDir);
                 }
-                return Optional.of(new ReaderEngineFactory(shardStateStore, manifestStore, new ObjectStoreCommitMaterializer(readPath)));
+                return Optional.of(
+                    new ReaderEngineFactory(
+                        shardStateStore,
+                        manifestStore,
+                        new ObjectStoreCommitMaterializer(readPath),
+                        shardDirectory,
+                        localNodeId
+                    )
+                );
             }
             ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(bundleStore, manifestStore);
-            return Optional.of(new WriterEngineFactory(new ObjectStoreCommitHeadPublisher(commitPublisher, shardStateStore)));
+            return Optional.of(
+                new WriterEngineFactory(new ObjectStoreCommitHeadPublisher(commitPublisher, shardStateStore), shardDirectory, localNodeId)
+            );
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
