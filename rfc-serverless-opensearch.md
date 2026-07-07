@@ -504,21 +504,29 @@ against a real filesystem blob store with no mocks. JMH microbenchmarks establis
 throughput for both formats. Remaining for this phase: one real cloud-object-store integration
 test (currently FS/mock only, per the original scope note above).
 
-**Phase 2 — Writer engine (WAL format, translog adapter, and commit publishing done; engine
-wiring itself not started).** WAL chunk format (`WalChunkWriter`/`WalChunkReader`/`WalRecord`,
-&sect;6.4) is implemented and tested, including a multi-shard group-commit/per-shard-replay-filter
-test. The WAL-backed translog adapter (`WalMirroringTranslogFactory`/`WalMirroringTranslog`) plugs
-into the existing `translogFactorySupplier` seam, keeps `LocalTranslog`'s on-disk recovery
-untouched, and mirrors every appended operation into a node-level `WalChunkService` that
-group-commits buffered records into WAL chunk blobs. `ObjectStoreCommitPublisher` is also done: it
-takes one local Lucene commit's `SegmentInfos`, packs every referenced file into a `SegmentBundle`,
-and writes the corresponding `CommitManifest` -- verified against a real `IndexWriter` commit, with
-byte-exact round-trip checks between the local Lucene files and what comes back out of the bundle.
-Still open: an actual `ObjectStoreWriterEngine extends InternalEngine` that calls the publisher
-from `commitIndexWriter` and publishes the resulting manifest as the shard's new head via the
-shard-state CAS (term-fencing this correctly, and deciding local-disk retention policy once object
-storage is the durability source of truth, is the remaining design work -- this piece already
-builds the artifacts but doesn't yet decide when a generation becomes the shard's official head).
+**Phase 2 — Writer engine (WAL format, translog adapter, commit publishing, and head CAS wiring
+done; local-disk retention policy once object storage is authoritative still open).** WAL chunk
+format (`WalChunkWriter`/`WalChunkReader`/`WalRecord`, &sect;6.4) is implemented and tested,
+including a multi-shard group-commit/per-shard-replay-filter test. The WAL-backed translog adapter
+(`WalMirroringTranslogFactory`/`WalMirroringTranslog`) plugs into the existing
+`translogFactorySupplier` seam, keeps `LocalTranslog`'s on-disk recovery untouched, mirrors every
+appended operation into a node-level `WalChunkService` that group-commits buffered records into WAL
+chunk blobs, and retries a transient mirror failure before failing the write. `ObjectStoreCommitPublisher`
+packs one local Lucene commit's `SegmentInfos` into a `SegmentBundle` and writes the corresponding
+`CommitManifest`, idempotently under retry. `ObjectStoreCommitHeadPublisher` makes the term-fencing
+decision `ObjectStoreCommitPublisher` deliberately doesn't: it CASes the packaged manifest onto the
+shard's head via `ShardStateStore`, refusing to publish (and reporting so) if a different primary
+term already holds the head -- verified with real `IndexWriter` commits and a real
+`BlobContainerShardStateStore`, including the fenced-out and idempotent-retry cases.
+`ObjectStoreWriterEngine extends InternalEngine` wires this in: it overrides `commitIndexWriter` to
+call `super` (local commit unchanged) and then `ObjectStoreCommitHeadPublisher`, failing the engine
+if this writer has been fenced out. This wiring class itself is thin glue verified by compilation
+and by the fully-tested class it delegates to, not by an `EngineTestCase`-based test (would require
+depending on `:server`'s test sourceset from a plugin module, which the build doesn't currently
+support without new build plumbing -- a real gap, not a shortcut taken lightly). Still open: local
+Lucene commit/translog retention policy once object storage becomes the durability source of truth
+(right now local files are kept exactly as a normal `InternalEngine` would keep them, so this is
+belt-and-suspenders durability today rather than the disk-bandwidth savings &sect;5/&sect;6 target).
 Milestone (not yet met): an index whose durability is object-store-only survives `kill -9` of its
 node with zero data loss (durable ack mode), recovering by manifest+WAL replay.
 
