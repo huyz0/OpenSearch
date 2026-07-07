@@ -408,7 +408,29 @@ control cell's small replicated log, which can itself checkpoint to the object s
   actually demands it.
 - **Phase 5.5 — Control-cell diet.** Strip routing table and allocation from the coordination
   path for serverless indices; virtualized compat APIs; scale test: 10M shards (1 rack), then
-  10⁸ (simulated heads + real active set).
+  10⁸ (simulated heads + real active set). **Deliberately not attempted yet** (see status note
+  below) -- unlike the directory-tier work, this phase can't be scoped into a bounded, additive
+  slice: it means changing what today's `Coordinator`/`RoutingTable`/`ClusterState` publish
+  pipeline does for every existing classic-mode index too, since serverless and classic indices
+  currently share that one pipeline. A bounded first cut would need to either (a) teach the
+  existing coordination path to skip publishing routing entries for object-store-engine shards --
+  real surgery on code every non-serverless deployment also depends on, with high regression risk
+  for a change nobody outside this plugin asked for -- or (b) stand up a genuinely separate,
+  parallel control-cell process from scratch, which is not a "slice," it's the plugin's second
+  major subsystem. Recommendation: treat this as its own follow-on RFC amendment with its own
+  design review, not something to bolt onto this one in passing.
+- **Gossip/SWIM node membership.** **Deliberately not attempted.** Per the discussion that led to
+  building the directory tier (§5/§8's design already anticipated this): gossip's target is
+  node-fleet size scaling into the thousands, a *different* axis from the shard-count scaling this
+  RFC's `ShardHead`/directory-tier work already solves. OpenSearch's `Coordinator` today does not
+  separate membership from cluster-state publish at all (`DiscoveryNodes` travels through the same
+  `Coordinator`-driven, consensus-published `ClusterState` as routing table and index metadata --
+  confirmed by reading `FollowersChecker`/`LeaderChecker`/`JoinHelper`/`Publication`, not assumed),
+  so a real gossip layer means displacing part of that pipeline, not adding beside it -- the same
+  category of risk as the control-cell diet above, and premature before there is an actual
+  node-fleet-size deployment target motivating it. No code for this exists in the plugin; building
+  a toy gossip layer that isn't load-bearing anywhere would be worse than not building one, since
+  it would look done without being trustworthy.
 
 ## 13. Risks
 
