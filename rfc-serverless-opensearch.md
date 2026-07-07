@@ -562,7 +562,7 @@ routing each resolve to the right factory type). The base path is local-filesyst
 nothing else in the plugin or the classes it wires together is FS-specific) pending the
 `repository-s3` register support noted below extending to this plugin's own wiring.
 
-**`compareAndSwapRegister` backends: FS done; S3 done; GCS/Azure not started.**
+**`compareAndSwapRegister` backends: FS done; S3 done; GCS done; Azure not started.**
 `S3BlobContainer.readRegister`/`compareAndSwapRegister` are implemented using S3's real
 conditional-write primitives (`If-Match`/`If-None-Match` on `PutObject`) as the actual concurrency
 guard -- a freshly-read generation is checked client-side purely as a fast-fail, but the
@@ -574,9 +574,29 @@ more than "compiles against the SDK" without a fixture that actually enforces th
 honor `If-Match`/`If-None-Match` on `PutObject` with real 412 semantics -- a small, generally
 useful addition to that fixture, not a special-cased test double. Verified end-to-end against that
 now-honest fixture: put-if-absent, stale-generation conflict, and (the property that actually
-matters) 8 concurrent CAS-retry-loop incrementers against one register losing zero updates. GCS and
-Azure backends remain unimplemented; unlike S3 there was no existing in-repo fixture to extend for
-either, so that work also includes building one.
+matters) 8 concurrent CAS-retry-loop incrementers against one register losing zero updates.
+
+`GoogleCloudStorageBlobStore.readRegister`/`compareAndSwapRegister` follow the same shape but map
+onto our `BlobRegister.generation()` abstraction even more directly than S3: GCS objects already
+carry a real, monotonically increasing generation number as first-class metadata (unlike S3's
+opaque ETag), so no self-managed counter needs to be embedded in the register's own bytes at
+all -- the value is stored verbatim, and `BlobTargetOption.doesNotExist()` /
+`generationMatch(long)` are GCS's own atomic conditional-write primitives, evaluated server-side
+exactly like S3's `If-Match`. `test/fixtures/gcs-fixture`'s `GoogleCloudStorageHttpHandler` (shared
+by every `repository-gcs` test) didn't track per-object generations or enforce `ifGenerationMatch`
+at all before this, so both were added -- again a generally useful fixture extension, not a
+special-cased double. Verified with the same test shape as S3: put-if-absent, stale-generation
+conflict, and 8 concurrent CAS-retry-loop incrementers losing zero updates, plus the full existing
+`GoogleCloudStorageBlobStoreRepositoryTests` suite (16 tests) still passing against the extended
+fixture.
+
+Azure remains unimplemented. `test/fixtures/azure-fixture` exists (unlike GCS, this one hasn't been
+inspected yet for what conditional-write support it already has or would need), so the next
+increment in this vein is the same shape as the two above: implement
+`AzureBlobContainer.readRegister`/`compareAndSwapRegister` using Azure's conditional-write headers
+(`If-Match`/`If-None-Match` on blob upload, keyed off Azure's own ETag concept), extend the fixture
+to enforce them for real if it doesn't already, and verify with the same put-if-absent /
+stale-conflict / concurrent-incrementer test shape.
 
 **Phase 4 — Topology (4–6 weeks).** Role-separated allocation, suspended writers,
 scale-to-zero/cold-start, balancer hysteresis. Milestone: idle index consumes zero compute;
