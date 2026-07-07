@@ -14,8 +14,10 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
+import org.opensearch.common.settings.SecureSetting;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
+import org.opensearch.core.common.settings.SecureString;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.env.Environment;
 import org.opensearch.env.NodeEnvironment;
@@ -31,6 +33,9 @@ import org.opensearch.serverless.storage.format.LocalDiskCachingBundleStore;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.readerengine.ObjectStoreCommitMaterializer;
 import org.opensearch.serverless.storage.readerengine.ReaderEngineFactory;
+import org.opensearch.serverless.storage.security.EncryptingBlobContainer;
+import org.opensearch.serverless.storage.security.EncryptionKeyProvider;
+import org.opensearch.serverless.storage.security.StaticEncryptionKeyProvider;
 import org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore;
 import org.opensearch.serverless.storage.shardstate.ShardStateStore;
 import org.opensearch.serverless.storage.writerengine.ObjectStoreCommitHeadPublisher;
@@ -43,6 +48,7 @@ import org.opensearch.watcher.ResourceWatcherService;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Path;
+import java.util.Base64;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
@@ -59,12 +65,13 @@ import java.util.function.Supplier;
  * classic mode stays default and untouched.
  *
  * <p>The blob container backing an opted-in index is, for now, always a local-filesystem
- * container rooted at {@link #SERVERLESS_STORAGE_BASE_PATH_SETTING} -- there is no real
- * S3/GCS/Azure {@code compareAndSwapRegister} implementation yet (rfc-serverless-opensearch.md's
- * own scope note: real cloud-backed register implementations are unverified without cloud
- * credentials). Swapping in a real repository-backed container later only touches {@link
- * #blobContainerFor}; nothing else in this class or the engine/factory classes it wires together
- * is FS-specific.
+ * container rooted at {@link #SERVERLESS_STORAGE_BASE_PATH_SETTING}. S3, GCS, and Azure all have
+ * real, tested {@code compareAndSwapRegister} implementations in their own repository plugins
+ * (see {@code S3BlobContainer}/{@code GoogleCloudStorageBlobStore}/{@code AzureBlobStore}); this
+ * plugin doesn't yet construct one of those concrete containers instead of the local-filesystem
+ * one, which is the remaining piece of wiring, not a correctness gap in the register primitive
+ * itself. Swapping in a real repository-backed container only touches {@link #blobContainerFor};
+ * nothing else in this class or the engine/factory classes it wires together is FS-specific.
  */
 public class ServerlessStoragePlugin extends Plugin implements EnginePlugin {
 
@@ -80,12 +87,24 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin {
         Setting.Property.NodeScope
     );
 
+    /**
+     * Base64-encoded raw AES key bytes (16/24/32 bytes decoded, for AES-128/192/256). A keystore
+     * secret, not a plaintext setting, since it's key material -- matches how repository-s3/gcs/
+     * azure hold their own credentials. Optional: if unset, blob content is stored unencrypted
+     * (today's default, unchanged for every existing deployment of this plugin).
+     */
+    public static final Setting<SecureString> SERVERLESS_STORAGE_ENCRYPTION_KEY_SETTING = SecureSetting.secureString(
+        "serverless_storage.encryption_key",
+        null
+    );
+
     private volatile Path basePath;
     private volatile Path localCacheRoot;
+    private volatile EncryptionKeyProvider encryptionKeyProvider;
 
     @Override
     public List<Setting<?>> getSettings() {
-        return List.of(SERVERLESS_STORAGE_ENABLED_SETTING, SERVERLESS_STORAGE_BASE_PATH_SETTING);
+        return List.of(SERVERLESS_STORAGE_ENABLED_SETTING, SERVERLESS_STORAGE_BASE_PATH_SETTING, SERVERLESS_STORAGE_ENCRYPTION_KEY_SETTING);
     }
 
     @Override
@@ -111,6 +130,12 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin {
         }
         if (nodeEnvironment != null && nodeEnvironment.nodeDataPaths().length > 0) {
             localCacheRoot = nodeEnvironment.nodeDataPaths()[0].resolve("serverless_storage_cache");
+        }
+        try (SecureString encryptionKey = SERVERLESS_STORAGE_ENCRYPTION_KEY_SETTING.get(environment.settings())) {
+            if (encryptionKey.length() > 0) {
+                byte[] rawKeyBytes = Base64.getDecoder().decode(new String(encryptionKey.getChars()));
+                encryptionKeyProvider = StaticEncryptionKeyProvider.fromRawKeyBytes(rawKeyBytes);
+            }
         }
         return Collections.emptyList();
     }
@@ -138,6 +163,12 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin {
             // just <term>-<generation> with no index/shard component, since it assumes the
             // container it lives in is already shard-scoped.
             BlobContainer blobContainer = blobContainerFor(basePath, indexUuid, shardIdValue);
+            if (encryptionKeyProvider != null) {
+                // Wrapping here, at the one seam every downstream class already depends on
+                // abstractly (BlobContainer), is the entire integration -- see
+                // EncryptingBlobContainer's javadoc for the ranged-read tradeoff this implies.
+                blobContainer = new EncryptingBlobContainer(blobContainer, encryptionKeyProvider);
+            }
             ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
             BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(blobContainer);
             BlobContainerBundleStore bundleStore = new BlobContainerBundleStore(blobContainer);

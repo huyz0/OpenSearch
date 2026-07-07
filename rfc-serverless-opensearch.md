@@ -359,6 +359,17 @@ Reuse note: the existing `FileCache` used by searchable snapshots/warm is the st
 the work is unifying its keying to the bundle layout and making it the single cache for all
 remote reads, rather than adding a fourth cache.
 
+**Status: a first, minimal slice done; not the design above.** `LocalDiskCachingBundleStore` is a
+read-through, whole-file, unbounded local-disk cache in front of any `BundleFileReader`, wired in
+for reader shards in `ServerlessStoragePlugin`. It gets the *correctness* half right (bundle files
+are immutable, so no invalidation is needed; a corrupted local copy is detected via checksum and
+re-fetched rather than trusted) and the basic hit-path right (16 concurrent readers of the same
+file share exactly one real fetch; a fresh instance over the same directory survives a process
+restart) but is not the design above: no block granularity (whole files, not 1 MB regions), no
+node-shared single cache (one instance per shard, not one per node), no eviction/pinning policy at
+all (unbounded -- a real deployment would fill its disk), and no warming/prefetch. This is the
+foundation such a cache would sit on top of, not a replacement for building it.
+
 ## 10. Allocation, Topology, and Autoscaling
 
 - **Node roles**: `ingest-compute` (hosts writer shards), `search-compute` (hosts reader
@@ -416,6 +427,27 @@ The security plugin's document/field-level security model evaluates at query tim
 and is unaffected structurally — but the *cache* is node-shared, so cache keys must never leak
 across indices (they don't: keyed by bundle object key), and cache-timing side channels between
 tenants are accepted as out of scope pending the multi-tenancy effort (§3).
+
+**Status: bundles/manifests encryption done; WAL per-record envelope encryption and credential
+scoping not started.** `EncryptingBlobContainer` implements the second bullet directly: it wraps
+any real `BlobContainer` transparently (AES-256-GCM, random IV per blob, authenticated -- a
+tampered or corrupted blob fails to decrypt loudly rather than silently), and because it's wired
+in at the per-shard container construction seam in `ServerlessStoragePlugin`, every bundle,
+manifest, and shard-state register that shard writes is encrypted with the same index-scoped key,
+matching "bundles and manifests are single-index by construction... encrypt bundle payloads with
+the index data key" exactly (registers are the one deliberate exception -- passed through
+unencrypted, since they carry no document data, only node ids/terms/generations). Optional and
+backward compatible: unset by default, every existing deployment of this plugin is untouched.
+**Known, explicit tradeoff**, not yet resolved: encryption is applied to the whole blob, so a
+ranged read still fetches and decrypts the entire blob before slicing in memory, rather than
+truly reading only the requested byte range off the wire -- true partial-range decryption needs a
+seekable cipher mode (AES-CTR) with block-offset bookkeeping, real additional work not done here;
+the directory tier (below) is what actually absorbs this cost once a bundle's plaintext is cached
+locally. **Not implemented**: the WAL-specific per-record envelope encryption design (bullet 1) --
+`WalChunkService` is a node-level shared component, not routed through a per-shard
+`EncryptingBlobContainer`, so WAL chunks are not yet encrypted at all; and credential scoping per
+tier (bullet 3), which needs IAM/role-assumption wiring per cloud backend, not just a core
+primitive like the ones built so far.
 
 ## 13. Degraded Modes: Object-Store Brownouts
 

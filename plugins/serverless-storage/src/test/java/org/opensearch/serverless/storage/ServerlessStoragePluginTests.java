@@ -12,6 +12,7 @@ import org.opensearch.cluster.routing.RecoverySource;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.ShardRoutingState;
 import org.opensearch.cluster.routing.TestShardRouting;
+import org.opensearch.common.settings.MockSecureSettings;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
@@ -25,6 +26,7 @@ import org.opensearch.test.IndexSettingsModule;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.nio.file.Path;
+import java.util.Base64;
 import java.util.Optional;
 
 public class ServerlessStoragePluginTests extends OpenSearchTestCase {
@@ -100,6 +102,35 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
     public void testNoShardRoutingDefaultsToAWriterEngineFactory() {
         ServerlessStoragePlugin plugin = newPlugin(createTempDir());
         Optional<EngineFactory> factory = plugin.getEngineFactory(indexSettings(true), null);
+        assertTrue(factory.isPresent());
+        assertTrue(factory.get() instanceof WriterEngineFactory);
+    }
+
+    public void testEncryptionKeyConfiguredDoesNotBreakEngineFactoryConstruction() throws Exception {
+        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin();
+        Path basePath = createTempDir();
+
+        MockSecureSettings secureSettings = new MockSecureSettings();
+        byte[] rawKeyBytes = new byte[32];
+        random().nextBytes(rawKeyBytes);
+        secureSettings.setString(
+            ServerlessStoragePlugin.SERVERLESS_STORAGE_ENCRYPTION_KEY_SETTING.getKey(),
+            Base64.getEncoder().encodeToString(rawKeyBytes)
+        );
+        Settings nodeSettings = Settings.builder()
+            .put("path.home", createTempDir().toString())
+            .putList("path.repo", basePath.toString())
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey(), basePath.toString())
+            .setSecureSettings(secureSettings)
+            .build();
+        Environment environment = TestEnvironment.newEnvironment(nodeSettings);
+        plugin.createComponents(null, null, null, null, null, null, environment, null, null, null, null);
+
+        IndexSettings settings = indexSettings(true);
+        ShardId shardId = new ShardId(settings.getIndex(), 0);
+        ShardRouting primaryRouting = TestShardRouting.newShardRouting(shardId, "node-1", true, ShardRoutingState.STARTED);
+
+        Optional<EngineFactory> factory = plugin.getEngineFactory(settings, primaryRouting);
         assertTrue(factory.isPresent());
         assertTrue(factory.get() instanceof WriterEngineFactory);
     }
