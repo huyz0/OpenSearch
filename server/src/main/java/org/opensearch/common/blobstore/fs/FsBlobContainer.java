@@ -38,17 +38,23 @@ import org.opensearch.common.UUIDs;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.BlobRegister;
+import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.DeleteResult;
 import org.opensearch.common.blobstore.support.AbstractBlobContainer;
 import org.opensearch.common.blobstore.support.PlainBlobMetadata;
 import org.opensearch.common.io.Streams;
 import org.opensearch.common.util.io.IOUtils;
+import org.opensearch.core.common.bytes.BytesArray;
+import org.opensearch.core.common.bytes.BytesReference;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
+import java.nio.channels.FileChannel;
 import java.nio.channels.SeekableByteChannel;
 import java.nio.file.DirectoryStream;
 import java.nio.file.FileAlreadyExistsException;
@@ -64,7 +70,10 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 
 import static java.util.Collections.unmodifiableMap;
 
@@ -84,6 +93,12 @@ public class FsBlobContainer extends AbstractBlobContainer {
 
     protected final FsBlobStore blobStore;
     protected final Path path;
+
+    // Guards readRegister/compareAndSwapRegister: FileChannel#lock() is documented as
+    // inter-process only, and a second overlapping lock() from a different FileChannel in the
+    // *same* JVM throws OverlappingFileLockException rather than blocking, so real intra-process
+    // mutual exclusion has to come from here, not from the filesystem.
+    private final ConcurrentHashMap<String, ReentrantLock> registerLocksByBlobName = new ConcurrentHashMap<>();
 
     public FsBlobContainer(FsBlobStore blobStore, BlobPath blobPath, Path path) {
         super(blobPath);
@@ -279,5 +294,79 @@ public class FsBlobContainer extends AbstractBlobContainer {
      */
     public static boolean isTempBlobName(final String blobName) {
         return blobName.startsWith(TEMP_FILE_PREFIX);
+    }
+
+    @Override
+    public Optional<BlobRegister> readRegister(String blobName) throws IOException {
+        Path registerPath = path.resolve(blobName);
+        if (Files.exists(registerPath) == false) {
+            return Optional.empty();
+        }
+        ReentrantLock lock = registerLockFor(blobName);
+        lock.lock();
+        try (FileChannel channel = FileChannel.open(registerPath, StandardOpenOption.READ)) {
+            return readRegisterUnderLock(channel);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Override
+    public BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
+        throws IOException {
+        Path registerPath = path.resolve(blobName);
+        Files.createDirectories(path);
+
+        ReentrantLock lock = registerLockFor(blobName);
+        lock.lock();
+        try (
+            FileChannel channel = FileChannel.open(
+                registerPath,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.READ,
+                StandardOpenOption.WRITE
+            )
+        ) {
+            Optional<BlobRegister> current = readRegisterUnderLock(channel);
+            long currentGeneration = current.map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
+            if (currentGeneration != expectedGeneration) {
+                return BlobRegisterCasResult.conflict(currentGeneration);
+            }
+
+            long newGeneration = currentGeneration + 1;
+            writeRegisterUnderLock(channel, newGeneration, newValue);
+            return BlobRegisterCasResult.applied(newGeneration);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private ReentrantLock registerLockFor(String blobName) {
+        return registerLocksByBlobName.computeIfAbsent(blobName, name -> new ReentrantLock());
+    }
+
+    private Optional<BlobRegister> readRegisterUnderLock(FileChannel channel) throws IOException {
+        long size = channel.size();
+        if (size == 0) {
+            return Optional.empty();
+        }
+        byte[] bytes = org.opensearch.common.io.Channels.readFromFileChannel(channel, 0, (int) size);
+        ByteBuffer buffer = ByteBuffer.wrap(bytes);
+        long generation = buffer.getLong();
+        byte[] value = new byte[buffer.remaining()];
+        buffer.get(value);
+        return Optional.of(new BlobRegister(generation, new BytesArray(value)));
+    }
+
+    private void writeRegisterUnderLock(FileChannel channel, long newGeneration, BytesReference newValue) throws IOException {
+        byte[] valueBytes = BytesReference.toBytes(newValue);
+        ByteBuffer buffer = ByteBuffer.allocate(8 + valueBytes.length);
+        buffer.putLong(newGeneration);
+        buffer.put(valueBytes);
+        buffer.flip();
+
+        channel.truncate(0);
+        org.opensearch.common.io.Channels.writeToChannel(buffer.array(), channel, 0);
+        channel.force(true);
     }
 }

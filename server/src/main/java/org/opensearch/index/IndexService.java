@@ -362,9 +362,7 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
         this.remoteDirectoryFactory = remoteDirectoryFactory;
         this.recoveryStateFactory = recoveryStateFactory;
         this.indexerFactory = Objects.requireNonNull(indexerFactory);
-        this.indexerFactoryProvider = indexerFactoryProvider != null
-            ? indexerFactoryProvider
-            : (settings, routing) -> this.indexerFactory;
+        this.indexerFactoryProvider = indexerFactoryProvider != null ? indexerFactoryProvider : (settings, routing) -> this.indexerFactory;
         this.engineConfigFactory = Objects.requireNonNull(engineConfigFactory);
         // initialize this last -- otherwise if the wrapper requires any other member to be non-null we fail with an NPE
         this.readerWrapper = wrapperFactory.apply(this);

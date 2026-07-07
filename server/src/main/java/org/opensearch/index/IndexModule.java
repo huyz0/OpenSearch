@@ -326,9 +326,7 @@ public final class IndexModule {
         this.indexSettings = indexSettings;
         this.analysisRegistry = analysisRegistry;
         this.indexerFactory = Objects.requireNonNull(indexerFactory);
-        this.indexerFactoryProvider = indexerFactoryProvider != null
-            ? indexerFactoryProvider
-            : (settings, routing) -> this.indexerFactory;
+        this.indexerFactoryProvider = indexerFactoryProvider != null ? indexerFactoryProvider : (settings, routing) -> this.indexerFactory;
         this.engineConfigFactory = Objects.requireNonNull(engineConfigFactory);
         this.searchOperationListeners.add(new SearchSlowLog(indexSettings));
         this.indexOperationListeners.add(new IndexingSlowLog(indexSettings));

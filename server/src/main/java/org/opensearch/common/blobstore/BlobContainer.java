@@ -37,6 +37,7 @@ import org.opensearch.cluster.metadata.CryptoMetadata;
 import org.opensearch.common.Nullable;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.core.common.bytes.BytesReference;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -46,6 +47,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * An interface for managing a repository of blob entries, where each blob entry is just a named group of bytes.
@@ -361,5 +363,36 @@ public interface BlobContainer {
         List<BlobMetadata> blobNames = new ArrayList<>(listBlobsByPrefix(blobNamePrefix).values());
         blobNames.sort(blobNameSortOrder.comparator());
         return blobNames.subList(0, Math.min(blobNames.size(), limit));
+    }
+
+    /**
+     * Reads the current value of a "register" blob &mdash; a small blob whose writes are
+     * arbitrated by {@link #compareAndSwapRegister}, giving callers a generic optimistic-
+     * concurrency primitive independent of which repository backend they run against.
+     *
+     * @return empty if the register has never been written (generation {@link BlobRegister#ABSENT_GENERATION}).
+     * @throws UnsupportedOperationException if this blob container does not implement register semantics.
+     */
+    default Optional<BlobRegister> readRegister(String blobName) throws IOException {
+        throw new UnsupportedOperationException(getClass() + " does not support readRegister");
+    }
+
+    /**
+     * Atomically replaces a register blob's value, succeeding only if its current generation
+     * equals {@code expectedGeneration}. Pass {@link BlobRegister#ABSENT_GENERATION} to mean "the
+     * register must not exist yet" (first-ever write, i.e. put-if-absent semantics).
+     *
+     * <p>This is the seam production serverless implementations use to back a shard-head CAS
+     * protocol (rfc-serverless-metadata-plane.md &sect;4/&sect;7): a native-object-store-backed
+     * container implements this with its provider's conditional write (S3 If-Match, GCS
+     * generation preconditions, Azure ETag If-Match); {@link org.opensearch.common.blobstore.fs.FsBlobContainer}
+     * implements it with real local-filesystem atomicity for filesystem repositories and tests.
+     *
+     * @return whether the write applied, and either way the generation now actually stored.
+     * @throws UnsupportedOperationException if this blob container does not implement register semantics.
+     */
+    default BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
+        throws IOException {
+        throw new UnsupportedOperationException(getClass() + " does not support compareAndSwapRegister");
     }
 }
