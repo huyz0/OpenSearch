@@ -340,13 +340,22 @@ control cell's small replicated log, which can itself checkpoint to the object s
 
 ## 12. Phasing (Amends Companion RFC §16)
 
-- **Phase 2.5 — Shard-head & lease protocol.** `ShardStateStore` interface + object-store CAS
-  implementation; TLA+/lightweight-formal model of term/lease/activation (extends the GC
-  model-checking commitment, companion RFC §18.5). *Gate: dual-activation chaos tests. Bridge
-  note: until this phase, primary-term authority stays with classic cluster coordination
-  (companion RFC §7.1); this phase swaps the authority behind `ShardStateStore` to shard-head
-  CAS with no engine-visible change. This phase also unblocks the compaction service
-  (companion RFC Phase 4.5), whose multi-publisher rebase protocol requires the head pointer.*
+- **Phase 2.5 — Shard-head & lease protocol (interface + FS reference implementation done).**
+  `ShardStateStore`/`ShardHead`/`VersionedShardHead`/`CasResult` plus `FsShardStateStore` are
+  implemented and tested in `modules/serverless-storage` (same branch as the companion RFC's
+  Phase 1). Threading-level correctness is verified directly rather than only argued: a
+  many-thread activation race resolves to exactly one winner, and concurrent publishers racing
+  with retry (the compactor rebase protocol's core property) never lose an update — both run
+  repeatedly in CI-style repetition to rule out flakiness, standing in for the
+  TLA+/lightweight-formal model this phase still owes for the full term/lease/activation state
+  machine (a from-scratch model, not yet done — the tests cover the two properties that matter
+  most operationally, not the full state space). Still open: an object-store-backed
+  implementation (S3 If-Match / GCS generation preconditions / Azure ETag If-Match) behind the
+  same interface, and the dual-activation chaos-test gate. Bridge note: until an engine actually
+  consumes it, primary-term authority in the data plane remains classic cluster coordination
+  (companion RFC §7.1); wiring `ShardStateStore` in as that authority, and unblocking the
+  compaction service (companion RFC Phase 4.5) that depends on its head pointer, are both still
+  open.
 - **Phase 4 (extended) — Directory tier + gossip membership.** Directory service, constant-load
   client caching, rebuild-from-listing; SWIM membership behind the existing node-join API.
 - **Phase 5.5 — Control-cell diet.** Strip routing table and allocation from the coordination

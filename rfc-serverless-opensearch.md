@@ -488,16 +488,28 @@ autoscaling signal emitters, serverless-mode settings and API annotations applic
 
 ## 16. Phased Roadmap
 
-**Phase 0 — Seams (done/in review).** Branch `feature/pluggable-engine-per-shard-role`:
-role-aware engine dispatch + engine extensibility. Add core seams 3–7 as individual small PRs.
+**Phase 0 — Seams (done).** Branch `feature/pluggable-engine-per-shard-role`:
+role-aware engine dispatch + engine extensibility, landed in core (`EnginePlugin`,
+`IndicesService`/`IndexModule`/`IndexService` per-shard resolution, `InternalEngine`
+extensibility). Core seams 3–7 remain open as individual small PRs.
 
-**Phase 1 — Storage format (4–6 weeks).** Bundle writer/reader, manifest schema, layout,
-GC with leases, repository-level integration tests against FS/mock + one real object store.
-No engine changes yet — testable standalone.
+**Phase 1 — Storage format (done, standalone; not yet wired to an engine).** Implemented in
+`modules/serverless-storage` on the same branch: `BundleWriter`/`BundleReader` (segment bundles,
+&sect;6.2), `CommitManifest`/`FileReference`/`PruningStats`/`WalPosition` (manifest schema,
+&sect;6.3), `ManifestRetentionPolicy`/`BundleReferenceCounter` (GC rules, &sect;6.5, including
+the cross-index-clone reference-counting case), and `BlobContainerBundleStore`/
+`BlobContainerManifestStore` (real I/O against `BlobContainer`, FS-tested). An end-to-end test
+(`ServerlessStorageEndToEndTests`) exercises the full write&rarr;publish&rarr;read&rarr;GC cycle
+against a real filesystem blob store with no mocks. JMH microbenchmarks establish baseline
+throughput for both formats. Remaining for this phase: one real cloud-object-store integration
+test (currently FS/mock only, per the original scope note above).
 
-**Phase 2 — Writer engine (6–8 weeks).** `ObjectStoreWriterEngine` + node WAL service +
-WAL-backed translog adapter. Milestone: an index whose durability is object-store-only survives
-`kill -9` of its node with zero data loss (durable ack mode), recovering by manifest+WAL replay.
+**Phase 2 — Writer engine (WAL format done; engine itself not started).** WAL chunk format
+(`WalChunkWriter`/`WalChunkReader`/`WalRecord`, &sect;6.4) is implemented and tested in the same
+module, including a multi-shard group-commit/per-shard-replay-filter test. Still open:
+`ObjectStoreWriterEngine` itself and the WAL-backed translog adapter that plugs into it.
+Milestone (not yet met): an index whose durability is object-store-only survives `kill -9` of
+its node with zero data loss (durable ack mode), recovering by manifest+WAL replay.
 
 **Phase 3 — Reader engine (6–8 weeks).** `ObjectStoreReaderEngine`, manifest notifications,
 block cache unification, admission control. Milestone: search-only shards serve queries with no
@@ -507,9 +519,13 @@ local index, freshness lag p99 < 15 s under sustained ingest.
 scale-to-zero/cold-start, balancer hysteresis. Milestone: idle index consumes zero compute;
 first query after idle returns < 5 s p95 for a cached-manifest index.
 
-**Phase 4.5 — Compaction service (3–4 weeks).** Requires shard-head CAS (metadata-plane RFC
-Phase 2.5) — see the hard dependency in §7.4. Candidate selection from manifests, compactor
-leases, rebase-on-CAS-conflict protocol, `_forcemerge` redefinition. Milestone: a quiescent
+**Phase 4.5 — Compaction service.** Its hard dependency, shard-head CAS
+(metadata-plane RFC Phase 2.5), is **done**: `ShardStateStore`/`ShardHead`/`CasResult` plus the
+`FsShardStateStore` reference implementation, with concurrency-correctness tests (exactly one
+winner in a many-thread activation race; no lost updates under concurrent publishers with
+retry — the rebase protocol's core property) run repeatedly to rule out flakiness. The
+compaction service itself &mdash; candidate selection from manifests, compactor leases,
+`_forcemerge` redefinition &mdash; is not yet started. Milestone (not yet met): a quiescent
 40-segment shard is compacted to size-tiered shape with no writer ever activating, concurrently
 with a surprise writer re-activation (rebase test).
 
