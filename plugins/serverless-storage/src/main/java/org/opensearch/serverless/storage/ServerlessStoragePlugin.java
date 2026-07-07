@@ -26,6 +26,8 @@ import org.opensearch.plugins.Plugin;
 import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.script.ScriptService;
 import org.opensearch.serverless.storage.format.BlobContainerBundleStore;
+import org.opensearch.serverless.storage.format.BundleFileReader;
+import org.opensearch.serverless.storage.format.LocalDiskCachingBundleStore;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.readerengine.ObjectStoreCommitMaterializer;
 import org.opensearch.serverless.storage.readerengine.ReaderEngineFactory;
@@ -79,6 +81,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin {
     );
 
     private volatile Path basePath;
+    private volatile Path localCacheRoot;
 
     @Override
     public List<Setting<?>> getSettings() {
@@ -105,6 +108,9 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin {
             // repository-fs / repository-url use: it refuses to resolve anything outside the
             // node's configured allowed-paths, rather than trusting an arbitrary settings string.
             basePath = environment.resolveRepoFile(configuredBasePath);
+        }
+        if (nodeEnvironment != null && nodeEnvironment.nodeDataPaths().length > 0) {
+            localCacheRoot = nodeEnvironment.nodeDataPaths()[0].resolve("serverless_storage_cache");
         }
         return Collections.emptyList();
     }
@@ -138,7 +144,15 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin {
 
             boolean isReaderShard = shardRouting != null && shardRouting.isSearchOnly();
             if (isReaderShard) {
-                return Optional.of(new ReaderEngineFactory(shardStateStore, manifestStore, new ObjectStoreCommitMaterializer(bundleStore)));
+                BundleFileReader readPath = bundleStore;
+                if (localCacheRoot != null) {
+                    // The directory tier (rfc-serverless-opensearch.md &sect;9): a reader shard
+                    // re-fetches the same bundle files across queries far more often than a writer
+                    // re-reads its own recent writes, so caching is wired in for reader shards only.
+                    Path shardCacheDir = localCacheRoot.resolve(indexUuid).resolve(String.valueOf(shardIdValue));
+                    readPath = new LocalDiskCachingBundleStore(bundleStore, shardCacheDir);
+                }
+                return Optional.of(new ReaderEngineFactory(shardStateStore, manifestStore, new ObjectStoreCommitMaterializer(readPath)));
             }
             ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(bundleStore, manifestStore);
             return Optional.of(new WriterEngineFactory(new ObjectStoreCommitHeadPublisher(commitPublisher, shardStateStore)));
