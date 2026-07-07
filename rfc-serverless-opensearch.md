@@ -536,9 +536,18 @@ role/lease-offload negotiation with an active writer. Milestone (not yet met): a
 with a surprise writer re-activation (rebase test — the *protocol* for this is now tested; the
 *real merge* is not).
 
-**Phase 4.6 — Snapshots/clones/PITR (2–3 weeks).** Manifest pinning (durable pins, §6.5),
-zero-copy clone with cross-index bundle refcounts, PITR retention policy (§14). Gated on the
-extended GC model check.
+**Phase 4.6 — Snapshots/clones/PITR (manifest pinning done; clone/PITR policy not started).**
+Durable pins (§6.5) are implemented as `DurablePinRegistry`/`BlobContainerDurablePinRegistry` —
+same generic `BlobContainer.compareAndSwapRegister`-backed pattern as the shard-head store, so a
+snapshot pin survives independently of any node's lease. `PinRecord` names *why* a generation is
+pinned (snapshot id, `"pitr"`, ...) so independent retention reasons on one shard never clobber
+each other; add/remove are idempotent, CAS-retry-based, and tested under concurrent pinners on
+the same shard. An integration test confirms the full lifecycle end to end against
+`ManifestRetentionPolicy`: pin a generation via the real registry, verify it survives a GC sweep
+that would otherwise delete it, remove the pin, verify the generation becomes deletable again.
+Not yet done: zero-copy clone with cross-index bundle refcounts, PITR retention policy wiring
+(the registry is the building block; nothing yet decides *when* to add a `"pitr"` pin), and the
+extended GC model check this phase is gated on.
 
 **Phase 5 — Hardening (ongoing).** Chaos suite (§17) including full object-store outage modes
 (§13), performance tuning of bundle/WAL batch parameters, API gating audit, autoscaling signal
