@@ -504,16 +504,23 @@ against a real filesystem blob store with no mocks. JMH microbenchmarks establis
 throughput for both formats. Remaining for this phase: one real cloud-object-store integration
 test (currently FS/mock only, per the original scope note above).
 
-**Phase 2 — Writer engine (WAL format + translog adapter done; engine itself not started).** WAL
-chunk format (`WalChunkWriter`/`WalChunkReader`/`WalRecord`, &sect;6.4) is implemented and tested
-in the same module, including a multi-shard group-commit/per-shard-replay-filter test. The
-WAL-backed translog adapter (`WalMirroringTranslogFactory`/`WalMirroringTranslog`) is also done:
-it plugs into the existing `translogFactorySupplier` seam, keeps `LocalTranslog`'s on-disk
-recovery untouched, and additionally mirrors every appended operation into a node-level
-`WalChunkService` that group-commits buffered records into WAL chunk blobs. Still open:
-`ObjectStoreWriterEngine` itself (the piece that would use this translog and skip local segment
-persistence). Milestone (not yet met): an index whose durability is object-store-only survives
-`kill -9` of its node with zero data loss (durable ack mode), recovering by manifest+WAL replay.
+**Phase 2 — Writer engine (WAL format, translog adapter, and commit publishing done; engine
+wiring itself not started).** WAL chunk format (`WalChunkWriter`/`WalChunkReader`/`WalRecord`,
+&sect;6.4) is implemented and tested, including a multi-shard group-commit/per-shard-replay-filter
+test. The WAL-backed translog adapter (`WalMirroringTranslogFactory`/`WalMirroringTranslog`) plugs
+into the existing `translogFactorySupplier` seam, keeps `LocalTranslog`'s on-disk recovery
+untouched, and mirrors every appended operation into a node-level `WalChunkService` that
+group-commits buffered records into WAL chunk blobs. `ObjectStoreCommitPublisher` is also done: it
+takes one local Lucene commit's `SegmentInfos`, packs every referenced file into a `SegmentBundle`,
+and writes the corresponding `CommitManifest` -- verified against a real `IndexWriter` commit, with
+byte-exact round-trip checks between the local Lucene files and what comes back out of the bundle.
+Still open: an actual `ObjectStoreWriterEngine extends InternalEngine` that calls the publisher
+from `commitIndexWriter` and publishes the resulting manifest as the shard's new head via the
+shard-state CAS (term-fencing this correctly, and deciding local-disk retention policy once object
+storage is the durability source of truth, is the remaining design work -- this piece already
+builds the artifacts but doesn't yet decide when a generation becomes the shard's official head).
+Milestone (not yet met): an index whose durability is object-store-only survives `kill -9` of its
+node with zero data loss (durable ack mode), recovering by manifest+WAL replay.
 
 **Phase 3 — Reader engine (6–8 weeks).** `ObjectStoreReaderEngine`, manifest notifications,
 block cache unification, admission control. Milestone: search-only shards serve queries with no
