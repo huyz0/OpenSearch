@@ -22,7 +22,7 @@ import java.util.List;
  * the format itself never depends on {@link BlobContainer} so it stays trivially unit-testable
  * in memory, while this class carries the I/O.
  */
-public final class BlobContainerBundleStore {
+public final class BlobContainerBundleStore implements BundleFileReader {
 
     private final BlobContainer blobContainer;
 
@@ -70,6 +70,7 @@ public final class BlobContainerBundleStore {
     }
 
     /** Fetches and checksum-verifies exactly the bytes of one file described by {@code entry}. */
+    @Override
     public byte[] readFile(String bundleName, BundleFileEntry entry) throws IOException {
         byte[] raw = readRange(bundleName, entry.offset(), entry.length());
         // extractFile expects the entry's offset to be relative to the start of the array it's

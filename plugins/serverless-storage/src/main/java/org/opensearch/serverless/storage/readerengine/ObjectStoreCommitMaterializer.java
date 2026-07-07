@@ -11,8 +11,8 @@ package org.opensearch.serverless.storage.readerengine;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexOutput;
-import org.opensearch.serverless.storage.format.BlobContainerBundleStore;
 import org.opensearch.serverless.storage.format.BundleFileEntry;
+import org.opensearch.serverless.storage.format.BundleFileReader;
 import org.opensearch.serverless.storage.manifest.CommitManifest;
 import org.opensearch.serverless.storage.manifest.FileReference;
 
@@ -34,9 +34,9 @@ import java.util.Map;
  */
 public final class ObjectStoreCommitMaterializer {
 
-    private final BlobContainerBundleStore bundleStore;
+    private final BundleFileReader bundleStore;
 
-    public ObjectStoreCommitMaterializer(BlobContainerBundleStore bundleStore) {
+    public ObjectStoreCommitMaterializer(BundleFileReader bundleStore) {
         this.bundleStore = bundleStore;
     }
 
