@@ -86,34 +86,54 @@ public class BundleWriterReaderTests extends OpenSearchTestCase {
         assertTrue(e.getMessage().contains("checksum mismatch"));
     }
 
-    public void testCorruptedHeaderIsRejected() {
+    public void testCorruptedFormatVersionByteIsRejectedWithSpecificMessage() {
         SegmentBundle bundle = BundleWriter.write(List.of(new BundleFileContent("_0.si", randomByteArrayOfLength(64))));
         byte[] corrupted = bundle.bytes().clone();
-        // flip a byte inside the header (well before the body starts)
-        corrupted[6] ^= 0xFF;
+        corrupted[6] ^= 0xFF; // last byte of the 4-byte format-version field
 
-        expectThrows(BundleFormatException.class, () -> BundleReader.parseHeader(corrupted));
+        BundleFormatException e = expectThrows(BundleFormatException.class, () -> BundleReader.parseHeader(corrupted));
+        assertTrue(e.getMessage(), e.getMessage().contains("unsupported bundle format version"));
     }
 
-    public void testTruncatedBundleIsRejected() {
+    // Regression test for a real bug: BundleFormatException extends IOException, so an explicit
+    // `throw new BundleFormatException(...)` inside the same try block as a trailing
+    // `catch (IOException e)` was re-caught by that generic clause and re-wrapped into an
+    // unhelpful message, destroying the specific diagnosis (see WalChunkReader's identical fix).
+    public void testCorruptedHeaderChecksumIsRejectedWithSpecificMessage() {
+        SegmentBundle bundle = BundleWriter.write(List.of(new BundleFileContent("_0.si", randomByteArrayOfLength(64))));
+        byte[] corrupted = bundle.bytes().clone();
+        // Flip a byte within an entry's stored length/checksum fields (inside the header, well
+        // after the version field) so the header parses structurally fine but its trailing
+        // checksum no longer matches -- this exercises the checksum-mismatch branch specifically,
+        // as opposed to the format-version or magic-header branches exercised by other tests.
+        corrupted[20] ^= 0xFF;
+
+        BundleFormatException e = expectThrows(BundleFormatException.class, () -> BundleReader.parseHeader(corrupted));
+        assertTrue(e.getMessage(), e.getMessage().contains("bundle header checksum mismatch"));
+    }
+
+    public void testTruncatedBundleIsRejectedWithSpecificMessage() {
         SegmentBundle bundle = BundleWriter.write(
             List.of(new BundleFileContent("a", randomByteArrayOfLength(100)), new BundleFileContent("b", randomByteArrayOfLength(100)))
         );
         byte[] truncated = new byte[10];
         System.arraycopy(bundle.bytes(), 0, truncated, 0, truncated.length);
 
-        expectThrows(BundleFormatException.class, () -> BundleReader.parseHeader(truncated));
+        BundleFormatException e = expectThrows(BundleFormatException.class, () -> BundleReader.parseHeader(truncated));
+        assertTrue(e.getMessage(), e.getMessage().contains("truncated"));
     }
 
-    public void testNotABundleIsRejected() {
+    public void testNotABundleIsRejectedWithSpecificMessage() {
         byte[] junk = randomByteArrayOfLength(100);
-        expectThrows(BundleFormatException.class, () -> BundleReader.parseHeader(junk));
+        BundleFormatException e = expectThrows(BundleFormatException.class, () -> BundleReader.parseHeader(junk));
+        assertTrue(e.getMessage(), e.getMessage().contains("bad magic header"));
     }
 
     public void testExtractFileOutOfRangeIsRejected() throws Exception {
         SegmentBundle bundle = BundleWriter.write(List.of(new BundleFileContent("a", randomByteArrayOfLength(10))));
         BundleFileEntry outOfRange = new BundleFileEntry("a", bundle.length() - 1, 1000, 0);
-        expectThrows(BundleFormatException.class, () -> BundleReader.extractFile(bundle.bytes(), outOfRange));
+        BundleFormatException e = expectThrows(BundleFormatException.class, () -> BundleReader.extractFile(bundle.bytes(), outOfRange));
+        assertTrue(e.getMessage(), e.getMessage().contains("is outside bundle of length"));
     }
 
     public void testDuplicateFileNamesAreRejectedOnWrite() {
@@ -124,7 +144,8 @@ public class BundleWriterReaderTests extends OpenSearchTestCase {
             new BundleFileContent("dup", randomByteArrayOfLength(5))
         );
         SegmentBundle bundle = BundleWriter.write(files);
-        expectThrows(BundleFormatException.class, () -> BundleReader.parseHeader(bundle.bytes()));
+        BundleFormatException e = expectThrows(BundleFormatException.class, () -> BundleReader.parseHeader(bundle.bytes()));
+        assertTrue(e.getMessage(), e.getMessage().contains("duplicate file name"));
     }
 
     public void testEmptyBundleOfZeroFiles() throws Exception {

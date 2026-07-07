@@ -90,6 +90,11 @@ public final class BundleReader {
             return new BundleHeader(headerLength, entries);
         } catch (EOFException e) {
             throw new BundleFormatException("truncated bundle header", e);
+        } catch (BundleFormatException e) {
+            // Already the specific exception (bad magic, checksum mismatch, duplicate name,
+            // etc.) -- rethrow as-is. BundleFormatException IS-A IOException, so without this
+            // clause the generic catch below would re-wrap it into a useless generic message.
+            throw e;
         } catch (IOException e) {
             throw new BundleFormatException("failed to parse bundle header", e);
         }
