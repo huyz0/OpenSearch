@@ -10,12 +10,15 @@ package org.opensearch.serverless.storage;
 
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.routing.ShardRouting;
+import org.opensearch.cluster.routing.allocation.decider.AllocationDecider;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
+import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.SecureSetting;
 import org.opensearch.common.settings.Setting;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.common.settings.SecureString;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
@@ -23,10 +26,12 @@ import org.opensearch.env.Environment;
 import org.opensearch.env.NodeEnvironment;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.EngineFactory;
+import org.opensearch.plugins.ClusterPlugin;
 import org.opensearch.plugins.EnginePlugin;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.script.ScriptService;
+import org.opensearch.serverless.storage.allocation.ReaderShardPlacementAllocationDecider;
 import org.opensearch.serverless.storage.format.BlobContainerBundleStore;
 import org.opensearch.serverless.storage.format.BundleFileReader;
 import org.opensearch.serverless.storage.format.LocalDiskCachingBundleStore;
@@ -73,7 +78,7 @@ import java.util.function.Supplier;
  * itself. Swapping in a real repository-backed container only touches {@link #blobContainerFor};
  * nothing else in this class or the engine/factory classes it wires together is FS-specific.
  */
-public class ServerlessStoragePlugin extends Plugin implements EnginePlugin {
+public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, ClusterPlugin {
 
     public static final Setting<Boolean> SERVERLESS_STORAGE_ENABLED_SETTING = Setting.boolSetting(
         "index.serverless_storage.enabled",
@@ -196,5 +201,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin {
         FsBlobStore blobStore = new FsBlobStore(1024 * 1024, basePath, false);
         BlobPath shardPath = BlobPath.cleanPath().add(indexUuid).add(String.valueOf(shardId));
         return blobStore.blobContainer(shardPath);
+    }
+
+    @Override
+    public Collection<AllocationDecider> createAllocationDeciders(Settings settings, ClusterSettings clusterSettings) {
+        return Collections.singletonList(new ReaderShardPlacementAllocationDecider());
     }
 }
