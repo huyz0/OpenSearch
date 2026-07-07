@@ -64,4 +64,18 @@ public final class CompactionPolicy {
         }
         return false;
     }
+
+    /**
+     * How many segments a compaction of {@code totalBytes} worth of data should merge down to,
+     * so the result is size-tiered (each resulting segment under {@code maxTargetBundleSizeBytes})
+     * rather than always one giant segment regardless of how much data that segment would hold.
+     * Never fewer than 1: a compaction that runs at all always merges to at least one segment.
+     */
+    public int targetSegmentCount(long totalBytes) {
+        if (totalBytes <= 0) {
+            return 1;
+        }
+        long segments = (totalBytes + maxTargetBundleSizeBytes - 1) / maxTargetBundleSizeBytes; // ceiling division
+        return (int) Math.max(1, segments);
+    }
 }

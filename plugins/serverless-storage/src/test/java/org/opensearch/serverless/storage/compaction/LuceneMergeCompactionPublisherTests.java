@@ -104,7 +104,8 @@ public class LuceneMergeCompactionPublisherTests extends OpenSearchTestCase {
                 SHARD_ID,
                 manifestStore,
                 new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer)),
-                commitPublisher
+                commitPublisher,
+                CompactionPolicy.withDefaults()
             );
             CompactionRebaseExecutor rebaseExecutor = new CompactionRebaseExecutor(shardStateStore, 10);
 
@@ -136,6 +137,78 @@ public class LuceneMergeCompactionPublisherTests extends OpenSearchTestCase {
                         TopDocs hits = searcher.search(new TermQuery(new Term("id", "doc-" + i)), 10);
                         assertEquals("doc-" + i + " must survive compaction", 1, hits.totalHits.value());
                     }
+                }
+            }
+        }
+    }
+
+    public void testCompactionShapesToMultipleSegmentsWhenSourceExceedsOneTargetBundle() throws Exception {
+        try (Directory sourceDirectory = new ByteBuffersDirectory()) {
+            SegmentInfos sourceInfos = commitSeparateSegments(sourceDirectory, 6);
+            assertTrue("test setup should produce multiple segments", sourceInfos.size() > 1);
+
+            CommitManifest sourceManifest = commitPublisher.publishCommit(
+                sourceDirectory,
+                sourceInfos,
+                INDEX_UUID,
+                SHARD_ID,
+                1,
+                sourceInfos.getGeneration(),
+                5,
+                5,
+                new WalPosition("epoch-0", 0),
+                0,
+                PruningStats.empty()
+            );
+            ShardHead initialHead = new ShardHead(1, "node-1", Long.MAX_VALUE, sourceManifest.generation());
+            assertEquals(CasResult.SUCCESS, shardStateStore.compareAndSet(INDEX_UUID, SHARD_ID, Optional.empty(), initialHead));
+
+            long totalBytes = sourceManifest.files().values().stream().mapToLong(f -> f.length()).sum();
+            assertTrue("test setup should have produced a non-trivial total size", totalBytes > 0);
+            // A tiny max-target-bundle-size relative to the real source size forces more than one
+            // target segment -- this is what proves the policy's target actually reaches the merge,
+            // not just that shouldCompact()'s independent threshold logic works.
+            CompactionPolicy tightPolicy = new CompactionPolicy(2, Math.max(1, totalBytes / 3), 1.0);
+            int expectedTargetSegments = tightPolicy.targetSegmentCount(totalBytes);
+            assertTrue("test setup should force more than one target segment", expectedTargetSegments > 1);
+
+            LuceneMergeCompactionPublisher compactionPublisher = new LuceneMergeCompactionPublisher(
+                INDEX_UUID,
+                SHARD_ID,
+                manifestStore,
+                new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer)),
+                commitPublisher,
+                tightPolicy
+            );
+            CompactionRebaseExecutor rebaseExecutor = new CompactionRebaseExecutor(shardStateStore, 10);
+
+            RebaseResult result = rebaseExecutor.publish(INDEX_UUID, SHARD_ID, compactionPublisher);
+            assertEquals(RebaseResult.Outcome.PUBLISHED, result.outcome());
+
+            ShardHead compactedHead = shardStateStore.get(INDEX_UUID, SHARD_ID).orElseThrow().head();
+            CommitManifest compactedManifest = manifestStore.readManifest(
+                compactedHead.primaryTerm(),
+                compactedHead.latestManifestGeneration()
+            );
+
+            try (Directory materializedDirectory = new ByteBuffersDirectory()) {
+                new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer)).materialize(
+                    compactedManifest,
+                    materializedDirectory
+                );
+                try (DirectoryReader reader = DirectoryReader.open(materializedDirectory)) {
+                    assertTrue(
+                        "compaction under a tight target-bundle-size should not collapse to a single segment,"
+                            + " got "
+                            + reader.leaves().size()
+                            + " leaves",
+                        reader.leaves().size() > 1
+                    );
+                    assertTrue(
+                        "compaction must never exceed forceMerge's requested segment count",
+                        reader.leaves().size() <= expectedTargetSegments
+                    );
+                    assertEquals("compaction must not lose or duplicate documents", 6, reader.numDocs());
                 }
             }
         }
@@ -187,7 +260,8 @@ public class LuceneMergeCompactionPublisherTests extends OpenSearchTestCase {
                 SHARD_ID,
                 manifestStore,
                 new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer)),
-                commitPublisher
+                commitPublisher,
+                CompactionPolicy.withDefaults()
             );
             CompactionRebaseExecutor rebaseExecutor = new CompactionRebaseExecutor(shardStateStore, 10);
 

@@ -67,4 +67,24 @@ public class CompactionPolicyTests extends OpenSearchTestCase {
         expectThrows(IllegalArgumentException.class, () -> new CompactionPolicy(10, 5 * GB, -0.1));
         expectThrows(IllegalArgumentException.class, () -> new CompactionPolicy(10, 5 * GB, 1.1));
     }
+
+    public void testTargetSegmentCountIsOneWhenTotalSizeFitsInOneBundle() {
+        CompactionPolicy policy = new CompactionPolicy(10, 5 * GB, 0.2);
+        assertEquals(1, policy.targetSegmentCount(0));
+        assertEquals(1, policy.targetSegmentCount(GB));
+        assertEquals(1, policy.targetSegmentCount(5 * GB));
+    }
+
+    public void testTargetSegmentCountScalesWithTotalSize() {
+        CompactionPolicy policy = new CompactionPolicy(10, GB, 0.2);
+        assertEquals(2, policy.targetSegmentCount(GB + 1));
+        assertEquals(3, policy.targetSegmentCount(2 * GB + 1));
+        assertEquals(10, policy.targetSegmentCount(10 * GB));
+    }
+
+    public void testTargetSegmentCountNeverGoesBelowOne() {
+        CompactionPolicy policy = new CompactionPolicy(10, GB, 0.2);
+        assertEquals(1, policy.targetSegmentCount(-1));
+        assertEquals(1, policy.targetSegmentCount(0));
+    }
 }
