@@ -356,7 +356,7 @@ control cell's small replicated log, which can itself checkpoint to the object s
   implementation done).** `ShardStateStore`/`ShardHead`/`VersionedShardHead`/`CasResult` plus
   `BlobContainerShardStateStore` (built on `BlobContainer.compareAndSwapRegister`, so it works
   against any conforming blob container — FS today, real object stores once their plugins
-  implement the primitive) are implemented and tested in `modules/serverless-storage` (same
+  implement the primitive) are implemented and tested in `plugins/serverless-storage` (same
   branch as the companion RFC's Phase 1), and the compaction service's rebase protocol
   (companion RFC Phase 4.5) is now built and tested on top of it. Threading-level correctness is
   verified directly rather than only argued: a many-thread activation race resolves to exactly

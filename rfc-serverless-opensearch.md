@@ -494,7 +494,7 @@ role-aware engine dispatch + engine extensibility, landed in core (`EnginePlugin
 extensibility). Core seams 3–7 remain open as individual small PRs.
 
 **Phase 1 — Storage format (done, standalone; not yet wired to an engine).** Implemented in
-`modules/serverless-storage` on the same branch: `BundleWriter`/`BundleReader` (segment bundles,
+`plugins/serverless-storage` on the same branch: `BundleWriter`/`BundleReader` (segment bundles,
 &sect;6.2), `CommitManifest`/`FileReference`/`PruningStats`/`WalPosition` (manifest schema,
 &sect;6.3), `ManifestRetentionPolicy`/`BundleReferenceCounter` (GC rules, &sect;6.5, including
 the cross-index-clone reference-counting case), and `BlobContainerBundleStore`/
