@@ -585,11 +585,12 @@ global checkpoint that, for a shard with no replicas, would otherwise never adva
 plugin's full test suite pass unchanged, confirming every other engine's default behavior is
 untouched.
 
-### 7.1.2 Cross-node writer failover: allocation and activation materialization (design, not yet implemented)
+### 7.1.2 Cross-node writer failover: allocation (implemented) and activation materialization (design, not yet implemented)
 
-**Status**: design only, written up here before any code, matching &sect;7.1.1's own "safety argument
-gets scrutiny first" discipline — this is a bigger, riskier piece of surface (it touches core
-allocation, not just an `Engine`/`IndexShard` seam) and deserves the same treatment.
+**Status**: design written up here before any code, matching &sect;7.1.1's own "safety argument gets
+scrutiny first" discipline — this is a bigger, riskier piece of surface (it touches core allocation,
+not just an `Engine`/`IndexShard` seam) and deserves the same treatment. The allocation half is now
+implemented (see below); the store-population half remains design only.
 
 **The gap this closes.** &sect;6.4's WAL replay (fencing formally verified, fetch/filter/decode
 implemented, apply-to-shard wired through a real core seam) only recovers operations *after* the
@@ -674,14 +675,35 @@ other core seam this effort has added (`Engine#engineRecoveryOperations()`,
 `Engine#globalCheckpointSupplierForCombinedDeletionPolicy`, `InternalEngine#getLocalCheckpointTracker`)
 already follows.
 
-**Not yet implemented.** This section is the design; &sect;16 Phase 2 tracks it as the next concrete
-increment. What's proven and doesn't need to be re-litigated: the term-fencing CAS that makes
-"any node can try" safe (&sect;6.4/&sect;6.5, formally verified), the WAL replay fencing and
-fetch/filter/decode/apply chain that runs once local Lucene is correct (&sect;6.4, formally verified
-and tested), and now — via direct reading of core allocator/recovery code rather than assumption —
-that neither open problem needs the large, risky core surgery (a new `RecoverySource.Type` with
-allocation-dispatch changes) originally feared; both are additive, small, and one of the two needs
-no core change at all.
+**Allocation half — implemented, no core change needed, exactly as designed above.**
+`ServerlessStorageExistingShardsAllocator` (`allocation/ServerlessStorageExistingShardsAllocator.java`)
+implements `ExistingShardsAllocator`: `allocateUnassigned` picks the first
+`AllocationDeciders`-approved node for a shard and initializes it immediately, never consulting
+local shard-data presence at all (no `TransportNodesListGatewayStartedShards`, no allocation-id
+bookkeeping, no caches — there is nothing to cache when there is no fetch);
+`explainUnassignedShardAllocation` mirrors the same logic for the `_cluster/allocation/explain` API.
+`ServerlessStorageIndexSettingProvider` (registered via `Plugin#getAdditionalIndexSettingProviders()`)
+is what actually selects it per-index: `index.allocation.existing_shards_allocator` carries
+`PrivateIndex` and can't be set directly at index creation, so this provider injects it
+automatically for every index with `index.serverless_storage.enabled` set, the same way core itself
+uses `IndexSettingProvider` for other managed defaults. `ServerlessStoragePlugin` registers the
+allocator under its own name via `ClusterPlugin#getExistingShardsAllocators()` — additive to a seam
+the plugin already implements `ClusterPlugin` for. Verified with real `RoutingAllocation`/
+`AllocationDeciders` fixtures (`OpenSearchAllocationTestCase`): allocates immediately when every
+decider says yes (the scenario that would deadlock `PrimaryShardAllocator` forever), correctly
+removes-and-ignores with `DECIDERS_NO` when every decider says no, and the explain-API path returns
+the matching `YES`/`NO` `AllocationDecision` in each case.
+
+**Store-population half — still design only.** The `StoreRecovery#internalRecoverFromStore` hook
+(materialize before the `si == null && indexShouldExists` throw) is not yet implemented; &sect;16
+Phase 2 tracks it as the next concrete increment. What's proven and doesn't need to be re-litigated:
+the term-fencing CAS that makes "any node can try" safe (&sect;6.4/&sect;6.5, formally verified), the
+WAL replay fencing and fetch/filter/decode/apply chain that runs once local Lucene is correct
+(&sect;6.4, formally verified and tested), and now the allocation half above, which turned out to
+need no core change at all. The remaining piece is the smaller of the two core-adjacent changes this
+section originally scoped, and is real core surgery (one conditional branch in one `StoreRecovery`
+method plus a new small SPI method) rather than a plugin-only addition — the allocation half's
+"zero core changes" result doesn't extend to it.
 
 ### 7.2 Reader engine
 
@@ -1162,15 +1184,18 @@ read/filter/decode side is implemented and tested against a real two-writer fail
 apply step is now wired end to end** through a new generic core seam (`Engine#engineRecoveryOperations()`,
 `IndexShard#openEngineAndRecoverFromTranslog()`, &sect;7.1) proven with a real `IndexShard` in
 `EngineRecoveryOperationsTests`. **What the "no crash-survival integration test exists yet" note
-above is still waiting on turned out to be two real, deeper gaps, both now found, scoped, and
-designed (not yet implemented) rather than the single `RecoverySource.Type` originally feared**:
-store population (a small, narrow `StoreRecovery` hook, no new `RecoverySource.Type` needed after
-all) and allocation (a plugin-supplied `ExistingShardsAllocator`, needing *zero* core changes) --
-full design in &sect;7.1.2, written up before code per this effort's own established discipline for
-anything touching core allocation. Every piece downstream of "local Lucene already has the right
-content" (fencing math, fetch/filter/decode, apply-to-shard) is proven correct; getting local Lucene
-to that state on a genuinely empty node, and getting such a shard allocated anywhere at all, are
-both designed and ready for implementation.
+above is still waiting on turned out to be two real, deeper gaps, found, scoped, and designed
+rather than the single `RecoverySource.Type` originally feared** (&sect;7.1.2): store population (a
+small, narrow `StoreRecovery` hook, no new `RecoverySource.Type` needed after all -- still design
+only) and allocation (a plugin-supplied `ExistingShardsAllocator`, needing *zero* core changes --
+**now implemented**: `ServerlessStorageExistingShardsAllocator` sidesteps
+`PrimaryShardAllocator`'s indefinite-unassignment deadlock entirely, `ServerlessStorageIndexSettingProvider`
+selects it automatically for every serverless-storage index, both tested with real
+`RoutingAllocation`/`AllocationDeciders` fixtures). Every piece downstream of "local Lucene already
+has the right content" (fencing math, fetch/filter/decode, apply-to-shard) is proven correct;
+getting such a shard allocated anywhere at all is now solved and tested; getting local Lucene to
+the right state on a genuinely empty node is the one remaining piece, designed and ready for
+implementation.
 
 **Phase 3 — Reader engine (materializer and open-from-manifest done; refresh-to-newer-generation
 and notification wiring still open).** `ObjectStoreCommitMaterializer` fetches every file a

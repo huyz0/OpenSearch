@@ -10,6 +10,7 @@ package org.opensearch.serverless.storage;
 
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.routing.ShardRouting;
+import org.opensearch.cluster.routing.allocation.ExistingShardsAllocator;
 import org.opensearch.cluster.routing.allocation.decider.AllocationDecider;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.UUIDs;
@@ -29,12 +30,14 @@ import org.opensearch.env.Environment;
 import org.opensearch.env.NodeEnvironment;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.EngineFactory;
+import org.opensearch.index.shard.IndexSettingProvider;
 import org.opensearch.plugins.ClusterPlugin;
 import org.opensearch.plugins.EnginePlugin;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.script.ScriptService;
 import org.opensearch.serverless.storage.allocation.ReaderShardPlacementAllocationDecider;
+import org.opensearch.serverless.storage.allocation.ServerlessStorageExistingShardsAllocator;
 import org.opensearch.serverless.storage.directory.InMemoryShardDirectory;
 import org.opensearch.serverless.storage.directory.ShardDirectory;
 import org.opensearch.serverless.storage.format.BlobContainerBundleStore;
@@ -69,6 +72,7 @@ import java.util.Base64;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.function.Supplier;
 
@@ -362,6 +366,23 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     @Override
     public Collection<AllocationDecider> createAllocationDeciders(Settings settings, ClusterSettings clusterSettings) {
         return Collections.singletonList(new ReaderShardPlacementAllocationDecider());
+    }
+
+    /**
+     * Registers {@link ServerlessStorageExistingShardsAllocator} under its own name -- see that
+     * class's own javadoc for why serverless-storage indices need it instead of the default
+     * gateway allocator (rfc-serverless-opensearch.md &sect;7.1.2). {@link
+     * ServerlessStorageIndexSettingProvider} is what actually selects it per-index; registering it
+     * here alone has no effect on any index that doesn't also opt in via that provider.
+     */
+    @Override
+    public Map<String, ExistingShardsAllocator> getExistingShardsAllocators() {
+        return Collections.singletonMap(ServerlessStorageExistingShardsAllocator.NAME, new ServerlessStorageExistingShardsAllocator());
+    }
+
+    @Override
+    public Collection<IndexSettingProvider> getAdditionalIndexSettingProviders() {
+        return Collections.singletonList(new ServerlessStorageIndexSettingProvider());
     }
 
     /** The node-shared bundle cache {@link #createComponents} built -- test-only visibility, not part of the plugin's contract. */
