@@ -121,6 +121,11 @@ public final class WalChunkService {
         return buffered.size();
     }
 
+    /** The epoch every chunk this service writes is keyed under -- see this class's own javadoc for what it identifies. */
+    public String writerEpoch() {
+        return writerEpoch;
+    }
+
     /**
      * Pulls every currently-buffered record belonging to {@code key} out of the shared buffer and
      * writes them into their own dedicated chunk immediately, leaving every other shard's buffered

@@ -379,4 +379,61 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
             IOUtils.close(engine, lastOpenedStore);
         }
     }
+
+    public void testWalMirroringPublishesARealWalPositionInsteadOfThePlaceholder() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+
+        FsBlobStore walBlobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer walBlobContainer = new FsBlobContainer(walBlobStore, BlobPath.cleanPath(), walBlobStore.path());
+        org.opensearch.serverless.storage.wal.WalChunkService walChunkService = new org.opensearch.serverless.storage.wal.WalChunkService(
+            walBlobContainer,
+            "node-epoch-0"
+        );
+
+        Store store = createStore();
+        lastOpenedStore = store;
+        store.createEmpty(defaultSettings.getIndexVersionCreated().luceneVersion);
+        java.nio.file.Path translogPath = createTempDir();
+        String translogUuid = Translog.createEmptyTranslog(translogPath, SequenceNumbers.NO_OPS_PERFORMED, shardId, primaryTerm.get());
+        store.associateIndexWithNewTranslog(translogUuid);
+        EngineConfig engineConfig = config(defaultSettings, store, translogPath, newMergePolicy(), null);
+
+        ObjectStoreWriterEngine engine = new ObjectStoreWriterEngine(
+            engineConfig,
+            new ObjectStoreCommitHeadPublisher(commitPublisher, shardStateStore),
+            shardDirectory,
+            LOCAL_NODE_ID,
+            null,
+            walChunkService
+        );
+        try {
+            engine.translogManager().recoverFromTranslog(translogHandler, engine.getProcessedLocalCheckpoint(), Long.MAX_VALUE);
+            assertNotNull(
+                "WAL mirroring must be wired in when a WalChunkService is configured -- the ThreadLocal bridge across super() must have worked",
+                engine.walMirroringTranslogForTesting()
+            );
+
+            index(engine, "1");
+            engine.flush(true, true);
+
+            ShardHead head = shardStateStore.get(shardId.getIndex().getUUID(), shardId.getId()).orElseThrow().head();
+            CommitManifest manifest = new BlobContainerManifestStore(blobContainer).readManifest(
+                head.primaryTerm(),
+                head.latestManifestGeneration()
+            );
+            assertEquals("node-epoch-0", manifest.walPosition().writerEpoch());
+            assertTrue(
+                "the published WalPosition must reflect a real flushed chunk sequence, not the old (String.valueOf(primaryTerm), 0) placeholder",
+                manifest.walPosition().offset() >= 0
+            );
+        } finally {
+            IOUtils.close(engine, lastOpenedStore);
+        }
+    }
 }

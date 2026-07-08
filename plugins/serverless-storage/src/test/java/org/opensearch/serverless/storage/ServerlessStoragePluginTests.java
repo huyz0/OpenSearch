@@ -136,6 +136,41 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
         assertTrue(factory.get() instanceof WriterEngineFactory);
     }
 
+    public void testWalMirroringEnabledDoesNotBreakEngineFactoryConstruction() {
+        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin();
+        Path basePath = createTempDir();
+        Settings nodeSettings = Settings.builder()
+            .put("path.home", createTempDir().toString())
+            .putList("path.repo", basePath.toString())
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey(), basePath.toString())
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING.getKey(), true)
+            .build();
+        Environment environment = TestEnvironment.newEnvironment(nodeSettings);
+        plugin.createComponents(null, null, null, null, null, null, environment, null, null, null, null);
+
+        IndexSettings settings = indexSettings(true);
+        ShardId shardId = new ShardId(settings.getIndex(), 0);
+        ShardRouting primaryRouting = TestShardRouting.newShardRouting(shardId, "node-1", true, ShardRoutingState.STARTED);
+
+        Optional<EngineFactory> factory = plugin.getEngineFactory(settings, primaryRouting);
+        assertTrue(factory.isPresent());
+        assertTrue(factory.get() instanceof WriterEngineFactory);
+    }
+
+    public void testWalMirroringDisabledByDefaultStillConstructsAWriterEngineFactory() {
+        // The default-off setting must never be a hard requirement: every existing deployment of
+        // this plugin (and every other test in this class) constructs a WriterEngineFactory with
+        // WAL mirroring untouched, and that must keep working unchanged.
+        ServerlessStoragePlugin plugin = newPlugin(createTempDir());
+        IndexSettings settings = indexSettings(true);
+        ShardId shardId = new ShardId(settings.getIndex(), 0);
+        ShardRouting primaryRouting = TestShardRouting.newShardRouting(shardId, "node-1", true, ShardRoutingState.STARTED);
+
+        Optional<EngineFactory> factory = plugin.getEngineFactory(settings, primaryRouting);
+        assertTrue(factory.isPresent());
+        assertTrue(factory.get() instanceof WriterEngineFactory);
+    }
+
     public void testBundleCacheSizeSettingDefaultsToAPositiveFractionOfHeap() {
         Environment environment = TestEnvironment.newEnvironment(buildEnvSettings(Settings.EMPTY));
         long defaultBytes = ServerlessStoragePlugin.SERVERLESS_STORAGE_BUNDLE_CACHE_SIZE_SETTING.get(environment.settings()).getBytes();

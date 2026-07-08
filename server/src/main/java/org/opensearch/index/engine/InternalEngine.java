@@ -2303,7 +2303,7 @@ public class InternalEngine extends Engine {
         return mergeScheduler.onGoingMerges().size();
     }
 
-    LocalCheckpointTracker getLocalCheckpointTracker() {
+    protected LocalCheckpointTracker getLocalCheckpointTracker() {
         return localCheckpointTracker;
     }
 

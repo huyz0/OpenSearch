@@ -14,6 +14,7 @@ import org.opensearch.index.engine.EngineCreationFailureException;
 import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.serverless.storage.directory.ShardDirectory;
 import org.opensearch.serverless.storage.retention.PitrRetentionConfig;
+import org.opensearch.serverless.storage.wal.WalChunkService;
 
 /** {@link EngineFactory} for writer shards: produces {@link ObjectStoreWriterEngine}s. */
 public final class WriterEngineFactory implements EngineFactory {
@@ -22,9 +23,10 @@ public final class WriterEngineFactory implements EngineFactory {
     private final ShardDirectory shardDirectory;
     private final String localNodeId;
     private final PitrRetentionConfig pitrRetentionConfig;
+    private final WalChunkService walChunkService;
 
     public WriterEngineFactory(ObjectStoreCommitHeadPublisher headPublisher, ShardDirectory shardDirectory, String localNodeId) {
-        this(headPublisher, shardDirectory, localNodeId, null);
+        this(headPublisher, shardDirectory, localNodeId, null, null);
     }
 
     public WriterEngineFactory(
@@ -33,10 +35,22 @@ public final class WriterEngineFactory implements EngineFactory {
         String localNodeId,
         PitrRetentionConfig pitrRetentionConfig
     ) {
+        this(headPublisher, shardDirectory, localNodeId, pitrRetentionConfig, null);
+    }
+
+    /** @param walChunkService {@code null} disables WAL mirroring entirely, same shape as every other optional feature in this plugin. */
+    public WriterEngineFactory(
+        ObjectStoreCommitHeadPublisher headPublisher,
+        ShardDirectory shardDirectory,
+        String localNodeId,
+        PitrRetentionConfig pitrRetentionConfig,
+        WalChunkService walChunkService
+    ) {
         this.headPublisher = headPublisher;
         this.shardDirectory = shardDirectory;
         this.localNodeId = localNodeId;
         this.pitrRetentionConfig = pitrRetentionConfig;
+        this.walChunkService = walChunkService;
     }
 
     @Override
@@ -47,8 +61,9 @@ public final class WriterEngineFactory implements EngineFactory {
             // &sect;9 activation path step 3, &sect;13 risk #1 metastability mitigation) -- see its
             // javadoc. This is a hint, not a fact, so a report failure is never worth failing engine
             // construction over. It also owns PITR retention reconciliation when pitrRetentionConfig
-            // is configured (null disables it, same shape as encryption).
-            return new ObjectStoreWriterEngine(config, headPublisher, shardDirectory, localNodeId, pitrRetentionConfig);
+            // is configured (null disables it, same shape as encryption), and WAL mirroring when
+            // walChunkService is configured (null disables it the same way).
+            return new ObjectStoreWriterEngine(config, headPublisher, shardDirectory, localNodeId, pitrRetentionConfig, walChunkService);
         } catch (RuntimeException e) {
             throw e;
         } catch (Exception e) {

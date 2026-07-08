@@ -15,8 +15,11 @@ import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.EngineException;
 import org.opensearch.index.engine.InternalEngine;
 import org.opensearch.index.seqno.SequenceNumbers;
+import org.opensearch.index.translog.InternalTranslogManager;
 import org.opensearch.index.translog.TranslogDeletionPolicy;
 import org.opensearch.index.translog.TranslogManager;
+import org.opensearch.index.translog.TranslogOperationHelper;
+import org.opensearch.index.translog.listener.CompositeTranslogEventListener;
 import org.opensearch.serverless.storage.directory.ShardDirectory;
 import org.opensearch.serverless.storage.directory.ShardDirectoryEntry;
 import org.opensearch.serverless.storage.directory.ShardRole;
@@ -24,6 +27,9 @@ import org.opensearch.serverless.storage.manifest.PruningStats;
 import org.opensearch.serverless.storage.manifest.WalPosition;
 import org.opensearch.serverless.storage.retention.PitrRetentionConfig;
 import org.opensearch.serverless.storage.retention.PitrRetentionSchedulerTask;
+import org.opensearch.serverless.storage.translog.WalMirroringTranslog;
+import org.opensearch.serverless.storage.translog.WalMirroringTranslogFactory;
+import org.opensearch.serverless.storage.wal.WalChunkService;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 
@@ -85,6 +91,7 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     private final String localNodeId;
     private final Scheduler.Cancellable directoryRefreshTask;
     private final PitrRetentionSchedulerTask pitrRetentionTask;
+    private final WalChunkService walChunkService;
 
     // Deliberately has NO initializer expression. InternalEngine's own constructor calls
     // getTranslogDeletionPolicy(EngineConfig) (overridden below) from inside super(engineConfig),
@@ -93,13 +100,30 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     // assigns during super(). See rfc-serverless-opensearch.md &sect;7.1.1.
     private ObjectStoreDurabilityTranslogDeletionPolicy translogDeletionPolicy;
 
+    // Same no-initializer pattern as translogDeletionPolicy above: createTranslogManager
+    // (overridden below) is also called from inside super(engineConfig). Stays null when
+    // walChunkService is null (WAL mirroring disabled) -- see commitIndexWriter's use of it.
+    private WalMirroringTranslog walMirroringTranslog;
+
+    /**
+     * Bridges {@code walChunkService} across the {@code super(engineConfig)} call: {@link
+     * #createTranslogManager} (overridden below) needs it, but is invoked from inside {@code
+     * InternalEngine}'s own constructor, before this class's constructor body -- and therefore
+     * before any constructor argument of this class, not just its fields -- is reachable from that
+     * call. A thread-local set immediately before {@code super(...)} and cleared immediately after
+     * is the standard way around this specific Java constructor-ordering limitation; construction
+     * is synchronous and non-reentrant on one thread, so there is no window where this could leak
+     * across two unrelated engines' construction.
+     */
+    private static final ThreadLocal<WalChunkService> CONSTRUCTION_WAL_CHUNK_SERVICE = new ThreadLocal<>();
+
     public ObjectStoreWriterEngine(
         EngineConfig engineConfig,
         ObjectStoreCommitHeadPublisher headPublisher,
         ShardDirectory shardDirectory,
         String localNodeId
     ) {
-        this(engineConfig, headPublisher, shardDirectory, localNodeId, null);
+        this(engineConfig, headPublisher, shardDirectory, localNodeId, null, null);
     }
 
     public ObjectStoreWriterEngine(
@@ -109,12 +133,47 @@ public class ObjectStoreWriterEngine extends InternalEngine {
         String localNodeId,
         PitrRetentionConfig pitrRetentionConfig
     ) {
+        this(engineConfig, headPublisher, shardDirectory, localNodeId, pitrRetentionConfig, null);
+    }
+
+    /** @param walChunkService {@code null} disables WAL mirroring entirely, same shape as every other optional feature in this plugin. */
+    public ObjectStoreWriterEngine(
+        EngineConfig engineConfig,
+        ObjectStoreCommitHeadPublisher headPublisher,
+        ShardDirectory shardDirectory,
+        String localNodeId,
+        PitrRetentionConfig pitrRetentionConfig,
+        WalChunkService walChunkService
+    ) {
+        this(
+            engineConfig,
+            headPublisher,
+            shardDirectory,
+            localNodeId,
+            pitrRetentionConfig,
+            walChunkService,
+            beginConstruction(walChunkService)
+        );
+    }
+
+    /** @param ignored only exists so the thread-local set above can run as an argument expression, strictly before {@code super(...)}. */
+    private ObjectStoreWriterEngine(
+        EngineConfig engineConfig,
+        ObjectStoreCommitHeadPublisher headPublisher,
+        ShardDirectory shardDirectory,
+        String localNodeId,
+        PitrRetentionConfig pitrRetentionConfig,
+        WalChunkService walChunkService,
+        Void ignored
+    ) {
         super(engineConfig);
+        CONSTRUCTION_WAL_CHUNK_SERVICE.remove();
         this.headPublisher = headPublisher;
         this.indexUuid = engineConfig.getShardId().getIndex().getUUID();
         this.shardId = engineConfig.getShardId().getId();
         this.shardDirectory = shardDirectory;
         this.localNodeId = localNodeId;
+        this.walChunkService = walChunkService;
         // Report once synchronously so the shard is discoverable immediately on activation, rather
         // than waiting out the first refresh interval; scheduleWithFixedDelay's first execution
         // only happens after DIRECTORY_REFRESH_INTERVAL elapses, not on registration.
@@ -145,6 +204,54 @@ public class ObjectStoreWriterEngine extends InternalEngine {
         return translogDeletionPolicy;
     }
 
+    /** Sets {@link #CONSTRUCTION_WAL_CHUNK_SERVICE}; returns {@code null} so it can be used as the last argument evaluated before {@code super(...)}. */
+    private static Void beginConstruction(WalChunkService walChunkService) {
+        CONSTRUCTION_WAL_CHUNK_SERVICE.set(walChunkService);
+        return null;
+    }
+
+    /**
+     * Wires WAL mirroring into this engine's translog (rfc-serverless-opensearch.md &sect;6.4):
+     * when {@link #walChunkService} is configured, every operation appended to this shard's
+     * translog is additionally mirrored into it, and {@link WalMirroringTranslog#lastFlushedWalChunkSequence()}
+     * becomes {@link #commitIndexWriter}'s source for a real {@link WalPosition} instead of the
+     * placeholder used before this was wired in. {@code InternalEngine.createTranslogManager}'s own
+     * body is duplicated here rather than delegated to, because the one seam that would avoid that
+     * -- {@code EngineConfig#getTranslogFactory()} -- is fixed before this engine is even
+     * constructed (built by core, immutable, no plugin hook to override it per-shard); overriding
+     * this method and substituting a {@link WalMirroringTranslogFactory} directly is the actual
+     * available seam, matching {@code getTranslogDeletionPolicy} and
+     * {@code globalCheckpointSupplierForCombinedDeletionPolicy} above.
+     */
+    @Override
+    protected TranslogManager createTranslogManager(
+        String translogUUID,
+        TranslogDeletionPolicy translogDeletionPolicy,
+        CompositeTranslogEventListener translogEventListener
+    ) throws IOException {
+        WalChunkService configuredWalChunkService = CONSTRUCTION_WAL_CHUNK_SERVICE.get();
+        if (configuredWalChunkService == null) {
+            return super.createTranslogManager(translogUUID, translogDeletionPolicy, translogEventListener);
+        }
+        InternalTranslogManager manager = new InternalTranslogManager(
+            engineConfig.getTranslogConfig(),
+            engineConfig.getPrimaryTermSupplier(),
+            engineConfig.getGlobalCheckpointSupplier(),
+            translogDeletionPolicy,
+            engineConfig.getShardId(),
+            readLock,
+            this::getLocalCheckpointTracker,
+            translogUUID,
+            translogEventListener,
+            this::ensureOpen,
+            new WalMirroringTranslogFactory(configuredWalChunkService),
+            engineConfig.getStartedPrimarySupplier(),
+            TranslogOperationHelper.create(engineConfig)
+        );
+        this.walMirroringTranslog = (WalMirroringTranslog) manager.getTranslog();
+        return manager;
+    }
+
     /**
      * The other half of &sect;7.1.1's local retention design: widens the threshold {@link
      * org.opensearch.index.engine.CombinedDeletionPolicy} uses to decide which local Lucene
@@ -168,6 +275,26 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     /** The durability-driven translog deletion policy this engine constructed -- test-only visibility, not part of the plugin's contract. */
     ObjectStoreDurabilityTranslogDeletionPolicy translogDeletionPolicyForTesting() {
         return translogDeletionPolicy;
+    }
+
+    /** The WAL-mirroring translog this engine constructed, or {@code null} if WAL mirroring is disabled -- test-only visibility. */
+    WalMirroringTranslog walMirroringTranslogForTesting() {
+        return walMirroringTranslog;
+    }
+
+    /**
+     * The manifest's real {@code WalPosition} once WAL mirroring is wired in (&sect;6.4), instead
+     * of the {@code (String.valueOf(primaryTerm), 0)} placeholder used before this was tracked at
+     * all. When WAL mirroring is disabled ({@link #walMirroringTranslog} is {@code null}), the
+     * placeholder shape is kept so every existing caller/test that never configured a {@link
+     * WalChunkService} keeps working unchanged -- this manifest simply carries no real WAL
+     * coverage information, matching today's behavior exactly.
+     */
+    private WalPosition currentWalPosition() {
+        if (walMirroringTranslog == null) {
+            return new WalPosition(String.valueOf(engineConfig.getPrimaryTermSupplier().getAsLong()), 0);
+        }
+        return new WalPosition(walChunkService.writerEpoch(), walMirroringTranslog.lastFlushedWalChunkSequence());
     }
 
     private void refreshDirectoryEntry() {
@@ -211,7 +338,7 @@ public class ObjectStoreWriterEngine extends InternalEngine {
                 primaryTerm,
                 maxSeqNo,
                 localCheckpoint,
-                new WalPosition(String.valueOf(primaryTerm), 0),
+                currentWalPosition(),
                 0,
                 PruningStats.empty()
             );

@@ -12,6 +12,7 @@ import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.allocation.decider.AllocationDecider;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.UUIDs;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
@@ -53,6 +54,7 @@ import org.opensearch.serverless.storage.security.EncryptionKeyProvider;
 import org.opensearch.serverless.storage.security.StaticEncryptionKeyProvider;
 import org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore;
 import org.opensearch.serverless.storage.shardstate.ShardStateStore;
+import org.opensearch.serverless.storage.wal.WalChunkService;
 import org.opensearch.serverless.storage.writerengine.ObjectStoreCommitHeadPublisher;
 import org.opensearch.serverless.storage.writerengine.ObjectStoreCommitPublisher;
 import org.opensearch.serverless.storage.writerengine.WriterEngineFactory;
@@ -158,6 +160,22 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         Setting.Property.NodeScope
     );
 
+    /**
+     * Enables the node-level WAL service (rfc-serverless-opensearch.md &sect;6.4): every writer
+     * shard's translog additionally mirrors each operation into a shared, node-scoped WAL chunk
+     * stream, durable ahead of the next commit/publish. One {@link WalChunkService} instance is
+     * built per node incarnation (see {@link #createComponents}) and shared by every writer shard
+     * on the node -- the entire reason this is a node-level service and not a per-shard one is the
+     * cross-shard group-commit batching that sharing enables (&sect;6.4's cost-sanity argument).
+     * Default off: this is new wiring, without production experience behind it yet, unlike the
+     * commit-publish path it sits alongside.
+     */
+    public static final Setting<Boolean> SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING = Setting.boolSetting(
+        "serverless_storage.wal_mirroring.enabled",
+        false,
+        Setting.Property.NodeScope
+    );
+
     private volatile Path basePath;
     private volatile Path localCacheRoot;
     private volatile EncryptionKeyProvider encryptionKeyProvider;
@@ -165,6 +183,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     private volatile InMemoryPlaintextBundleCache sharedBundleCache;
     private volatile long pitrWindowMillis = -1;
     private volatile ReaderShardAdmissionController readerShardAdmissionController;
+    private volatile WalChunkService sharedWalChunkService;
     // One node-local directory instance shared by every shard on this node -- matches the target
     // design's "one node block cache" shape (&sect;9) rather than a per-shard instance, and needs
     // no I/O to construct, so it's safe to build eagerly rather than threading through createComponents.
@@ -178,7 +197,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_ENCRYPTION_KEY_SETTING,
             SERVERLESS_STORAGE_BUNDLE_CACHE_SIZE_SETTING,
             SERVERLESS_STORAGE_PITR_WINDOW_SETTING,
-            SERVERLESS_STORAGE_MAX_CONCURRENT_READER_SHARDS_SETTING
+            SERVERLESS_STORAGE_MAX_CONCURRENT_READER_SHARDS_SETTING,
+            SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING
         );
     }
 
@@ -221,6 +241,24 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             if (encryptionKey.length() > 0) {
                 byte[] rawKeyBytes = Base64.getDecoder().decode(new String(encryptionKey.getChars()));
                 encryptionKeyProvider = StaticEncryptionKeyProvider.fromRawKeyBytes(rawKeyBytes);
+            }
+        }
+        if (basePath != null && SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING.get(environment.settings())) {
+            try {
+                // A dedicated top-level container, separate from every index/shard's own
+                // <indexUuid>/<shardId>/ path -- the WAL chunk stream is node-scoped, spanning
+                // every writer shard (and index) on this node, not any one shard's storage
+                // (rfc-serverless-opensearch.md &sect;6.4, see WalChunkService's own javadoc).
+                FsBlobStore walBlobStore = new FsBlobStore(1024 * 1024, basePath, false);
+                BlobContainer walBlobContainer = walBlobStore.blobContainer(BlobPath.cleanPath().add("wal"));
+                // A fresh epoch per node incarnation (see WalChunkService's own javadoc for what
+                // this identifies) -- fencing during replay is a per-record primaryTerm filter, not
+                // an epoch-directory one, so nothing depends on this value being stable across
+                // restarts; it only needs to be unique enough that this process's chunk sequence
+                // numbering never collides with a prior incarnation's.
+                sharedWalChunkService = new WalChunkService(walBlobContainer, UUIDs.base64UUID());
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
             }
         }
         return Collections.emptyList();
@@ -306,7 +344,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                     new ObjectStoreCommitHeadPublisher(commitPublisher, shardStateStore),
                     shardDirectory,
                     localNodeId,
-                    pitrRetentionConfig
+                    pitrRetentionConfig,
+                    sharedWalChunkService
                 )
             );
         } catch (IOException e) {

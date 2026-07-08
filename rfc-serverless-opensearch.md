@@ -171,10 +171,54 @@ translog as the durability mechanism between commits:
   per hour; the design goal is that WAL request cost stays two orders of magnitude below the
   compute cost of the node producing it.
 
-Integration point: `TranslogFactory` is already resolved per shard via
-`BiFunction<IndexSettings, ShardRouting, TranslogFactory>` — the WAL-backed translog adapter
-slots in there without core changes. Local translog fsync is disabled for writer shards
-(durability is delegated), which also removes a disk-bandwidth consumer from the hot path.
+**Integration point, corrected**: this section originally assumed `TranslogFactory`'s per-shard
+`BiFunction<IndexSettings, ShardRouting, TranslogFactory>` resolution (`IndicesService`) was a
+plugin-extensible seam the WAL-backed translog adapter could slot into without core changes. It
+isn't — that `BiFunction` is computed inside `IndicesService` itself, choosing between
+`InternalTranslogFactory`/`RemoteBlobStoreInternalTranslogFactory` based on settings, with no
+plugin hook to override it. The seam that actually works is `InternalEngine#createTranslogManager`
+(already `protected`/overridable, the same pattern `getTranslogDeletionPolicy` and &sect;7.1.1's
+`globalCheckpointSupplierForCombinedDeletionPolicy` use) — `ObjectStoreWriterEngine` overrides it
+and constructs an `InternalTranslogManager` directly with a `WalMirroringTranslogFactory` in place
+of `engineConfig.getTranslogFactory()`. This needed one further small core change:
+`InternalEngine#getLocalCheckpointTracker()`, which that constructor needs, was package-private
+(inconsistent with its sibling accessors `readLock`/`ensureOpen` used in the same method, both
+already `protected`/`public`) — widened to `protected`. **Not yet true**: "local translog fsync is
+disabled for writer shards" — `WalMirroringTranslog extends LocalTranslog` and mirrors into the WAL
+*in addition to* normal local fsync (deliberately, per its own javadoc: "Local translog files
+remain the source of truth for recovery on this node exactly as they are today"), so this is
+belt-and-suspenders today, not yet the disk-bandwidth-saving swap this line originally described --
+matching &sect;7.1.1's own local-translog-retention story, which already trims aggressively once a
+commit is durable, independent of whether WAL mirroring is active.
+
+**Status**: implemented and wired into the real writer engine, gated behind
+`serverless_storage.wal_mirroring.enabled` (default off — new wiring without production
+experience yet). One `WalChunkService` instance is built per node incarnation in
+`ServerlessStoragePlugin#createComponents` (a dedicated top-level `wal/` blob container, separate
+from any index/shard's own path, with a fresh UUID epoch each node start) and shared by every
+writer shard on the node, matching the cross-shard batching this section's cost-sanity argument
+depends on. `WalRecord` now carries `primaryTerm` (wire format bumped to version 2) — see the
+fencing note below. `WalMirroringTranslog#lastFlushedWalChunkSequence()` is what
+`ObjectStoreCommitHeadPublisher`'s manifest now records as the real `WalPosition`, replacing a
+permanent `(String.valueOf(primaryTerm), 0)` placeholder that had never actually been wired to
+anything. Verified end-to-end (a real engine, WAL mirroring enabled, asserts the published
+manifest's `WalPosition` reflects a real chunk sequence, and that the constructor-ordering bridge
+this needed -- a `ThreadLocal` set immediately before `super(engineConfig)` and cleared immediately
+after, since `createTranslogManager` needs the constructor argument before any field or even
+another constructor's local variable is reachable from that call -- actually works, not just
+compiles).
+
+**Fencing, resolved**: `WalChunkService`'s own javadoc previously contradicted itself on what a
+"writer epoch" is -- described as both node-level (spanning every writer shard, matching this
+section's cross-shard design) and "unique to one actual writer lifetime... derived from the
+shard's primary term" (shard-term-scoped). Resolved as node-level, matching the actual reason a
+node-level WAL service exists over a per-shard one. That rules out fencing a superseded writer by
+discarding its epoch directory (a shared epoch can't be discarded without fencing every other
+shard using it) — fencing is a per-record filter instead: `WalChunkReader#filterByShardAndMinimumTerm`
+only accepts a record whose `primaryTerm` is at least the term being replayed under, mirroring how
+`ShardHead`'s own term-fencing already treats a lower term as stale. This is a prerequisite for,
+not yet the same thing as, an actual WAL-replay recovery mechanism — see &sect;16 Phase 2's
+"still open" note for what remains.
 
 ### 6.5 Garbage collection and leases
 
