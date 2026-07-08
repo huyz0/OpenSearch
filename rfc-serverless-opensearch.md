@@ -310,6 +310,32 @@ shard benefit).
 which finally gives it honest semantics: it no longer monopolizes a data node's threads, and it
 works on indices that have no writer at all.
 
+**Status: verified correct while a writer is active, via a narrower path than this section
+originally proposed.** `_forcemerge`'s REST/transport chain only ever reaches an engine while a
+writer is actively open on some node (`IndexShard.forceMerge` requires a live shard); a design
+that unconditionally redirects it to this section's *object-store-materialized* compaction
+service -- independent of whatever local Lucene state that active writer holds -- creates two
+divergent generation-numbering paths for the same shard: the compactor's publish advances
+`latestManifestGeneration` based on the object store's history, while the writer's own next
+ordinary flush independently computes its next generation from its *local* `IndexWriter`'s
+segment-generation counter (see `ObjectStoreWriterEngine#commitIndexWriter`). If the compactor's
+publish lands a generation number at or ahead of what the writer's own counter would produce
+next, `ObjectStoreCommitHeadPublisher#publishCommitAsHead` treats the writer's subsequent real
+commit as "already published" and silently drops it -- never surfaced as an error, just a lost
+write. This was caught during design, before being built, not found by a test after the fact.
+`ObjectStoreWriterEngine` therefore does *not* override `forceMerge`: it inherits
+`InternalEngine`'s real local Lucene merge unchanged, which is safe precisely because the already
+-verified `commitIndexWriter` override publishes the merge's result through the same
+generation-numbering path every ordinary flush uses -- there is only ever one path when a writer
+is open, not two. Verified directly: indexing across three separate flushes (three real Lucene
+segments), then `forceMerge(maxNumSegments=1)`, publishes a strictly newer generation whose
+materialized manifest is genuinely one segment with all three documents intact. What §7 actually
+proposed -- routing `_forcemerge` through this service so it "works on indices that have no
+writer at all" -- remains unbuilt and is still the right target for *that* case specifically; it
+needs either a real check that no writer is currently active before redirecting, or a fencing
+protocol between the compactor and a writer that might activate mid-compaction, neither of which
+exists yet. That case is exactly the "no writer ever activating" milestone below, still open.
+
 ## 8. Publication and Consistency
 
 - After each manifest upload, the writer sends a small **publication notification**
@@ -774,8 +800,11 @@ overwriting it (using the already-tested rebase executor, now exercised with a r
 of a synthetic head transition). Known, explicitly accepted inefficiency: every rebase retry
 redoes the full materialize-merge-publish sequence rather than caching the
 (generation-independent) merged bundle across retries -- correct, not maximally cheap under
-contention. Still open: `_forcemerge` redefinition, and the compactor role/lease-offload
-negotiation with an active writer. Milestone (not yet met): a quiescent 40-segment shard is
+contention. `_forcemerge` while a writer is active is now verified, deliberately *not* via the
+redirect-to-compaction-service design &sect;7 originally called for -- see that section's status
+note for why. Still open: `_forcemerge` when no writer is active (the actual "no writer ever
+activating" case this service exists for), and the compactor role/lease-offload negotiation with
+an active writer. Milestone (not yet met): a quiescent 40-segment shard is
 compacted to size-tiered shape with no writer ever activating, concurrently with a surprise writer
 re-activation (the rebase protocol, a real merge, and size-tiered shaping are now all tested
 together; only the "no writer ever activating" background-scheduling half of this milestone is

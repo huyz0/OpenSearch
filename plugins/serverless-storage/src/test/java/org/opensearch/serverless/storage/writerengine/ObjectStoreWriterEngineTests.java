@@ -8,7 +8,11 @@
 
 package org.opensearch.serverless.storage.writerengine;
 
+import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.Term;
+import org.apache.lucene.store.ByteBuffersDirectory;
+import org.apache.lucene.store.Directory;
+import org.opensearch.common.UUIDs;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.fs.FsBlobContainer;
@@ -27,9 +31,12 @@ import org.opensearch.serverless.storage.directory.InMemoryShardDirectory;
 import org.opensearch.serverless.storage.directory.ShardDirectory;
 import org.opensearch.serverless.storage.format.BlobContainerBundleStore;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
+import org.opensearch.serverless.storage.manifest.CommitManifest;
+import org.opensearch.serverless.storage.readerengine.ObjectStoreCommitMaterializer;
 import org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore;
 import org.opensearch.serverless.storage.shardstate.ShardHead;
 import org.opensearch.serverless.storage.shardstate.ShardStateStore;
+import org.opensearch.serverless.storage.shardstate.VersionedShardHead;
 
 import java.util.Optional;
 
@@ -128,6 +135,58 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
             ).orElseThrow(() -> new AssertionError("opening the engine should report an entry to the shard directory"));
             assertEquals(LOCAL_NODE_ID, entry.nodeId());
             assertEquals(org.opensearch.serverless.storage.directory.ShardRole.WRITER, entry.role());
+        } finally {
+            IOUtils.close(engine, lastOpenedStore);
+        }
+    }
+
+    public void testForceMergePublishesAGenuinelyMergedManifestPreservingAllDocuments() throws Exception {
+        // _forcemerge reaches an engine only while a writer is actively open (IndexShard.forceMerge
+        // requires a live shard) -- exactly the case where redirecting it to a *separate*,
+        // object-store-materialized compaction path (independent of this engine's own local Lucene
+        // generation counter) would let the two diverge and silently drop this writer's next real
+        // commit. So this doesn't override forceMerge at all: it inherits InternalEngine's real
+        // local-Lucene merge, and relies on the already-overridden commitIndexWriter (the same path
+        // an ordinary flush publishes through) to publish the merged result correctly. This test is
+        // the proof that inheritance alone is actually correct here, not an assumption.
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        BlobContainerBundleStore bundleStore = new BlobContainerBundleStore(blobContainer);
+        BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(bundleStore, manifestStore);
+
+        ObjectStoreWriterEngine engine = openWriterEngine(shardStateStore, commitPublisher);
+        try {
+            // Index and flush separately so multiple real Lucene segments exist before merging.
+            index(engine, "1");
+            engine.flush(true, true);
+            index(engine, "2");
+            engine.flush(true, true);
+            index(engine, "3");
+            engine.flush(true, true);
+
+            VersionedShardHead beforeMerge = shardStateStore.get(shardId.getIndex().getUUID(), shardId.getId()).orElseThrow();
+
+            engine.forceMerge(true, 1, false, false, false, UUIDs.randomBase64UUID());
+
+            VersionedShardHead afterMerge = shardStateStore.get(shardId.getIndex().getUUID(), shardId.getId()).orElseThrow();
+            assertTrue(
+                "forceMerge must publish a newer generation, not silently no-op",
+                afterMerge.head().latestManifestGeneration() > beforeMerge.head().latestManifestGeneration()
+            );
+
+            CommitManifest mergedManifest = manifestStore.readManifest(
+                afterMerge.head().primaryTerm(),
+                afterMerge.head().latestManifestGeneration()
+            );
+            try (Directory materialized = new ByteBuffersDirectory()) {
+                new ObjectStoreCommitMaterializer(bundleStore).materialize(mergedManifest, materialized);
+                try (DirectoryReader reader = DirectoryReader.open(materialized)) {
+                    assertEquals("forceMerge(maxNumSegments=1) must genuinely merge down to one segment", 1, reader.leaves().size());
+                    assertEquals("no document may be lost or duplicated by the merge", 3, reader.numDocs());
+                }
+            }
         } finally {
             IOUtils.close(engine, lastOpenedStore);
         }
