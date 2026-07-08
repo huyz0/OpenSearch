@@ -810,18 +810,38 @@ re-activation (the rebase protocol, a real merge, and size-tiered shaping are no
 together; only the "no writer ever activating" background-scheduling half of this milestone is
 not, since nothing yet decides *when* to run a compaction unprompted).
 
-**Phase 4.6 — Snapshots/clones/PITR (manifest pinning done; clone/PITR policy not started).**
-Durable pins (§6.5) are implemented as `DurablePinRegistry`/`BlobContainerDurablePinRegistry` —
-same generic `BlobContainer.compareAndSwapRegister`-backed pattern as the shard-head store, so a
+**Phase 4.6 — Snapshots/clones/PITR (manifest pinning and PITR retention wiring done; clone not
+started).** Durable pins (§6.5) are implemented as `DurablePinRegistry`/`BlobContainerDurablePinRegistry`
+— same generic `BlobContainer.compareAndSwapRegister`-backed pattern as the shard-head store, so a
 snapshot pin survives independently of any node's lease. `PinRecord` names *why* a generation is
 pinned (snapshot id, `"pitr"`, ...) so independent retention reasons on one shard never clobber
 each other; add/remove are idempotent, CAS-retry-based, and tested under concurrent pinners on
 the same shard. An integration test confirms the full lifecycle end to end against
 `ManifestRetentionPolicy`: pin a generation via the real registry, verify it survives a GC sweep
 that would otherwise delete it, remove the pin, verify the generation becomes deletable again.
-Not yet done: zero-copy clone with cross-index bundle refcounts, PITR retention policy wiring
-(the registry is the building block; nothing yet decides *when* to add a `"pitr"` pin), and the
-extended GC model check this phase is gated on.
+
+PITR retention wiring -- previously the one piece missing ("the registry is the building block;
+nothing yet decides *when* to add a `"pitr"` pin") -- is now real: `PitrRetentionPolicy` (pure,
+no I/O, mirroring `ManifestRetentionPolicy`'s shape) decides which manifest generations must
+currently carry a `"pitr"` pin so any timestamp within the retention window can be restored to --
+every manifest created inside the window, plus the single most-recent manifest immediately before
+it (so a restore request right at the window's edge still resolves to something).
+`PitrRetentionReconciler` is the impure counterpart: reads a shard's current `"pitr"` pins,
+diffs against what the policy requires right now, and applies exactly that diff to a real
+`DurablePinRegistry`, touching no other pinning reason on the shard. Idempotent by construction --
+calling it more often than the window actually moves is wasted work, never incorrect.
+
+Building this surfaced a real, pre-existing gap in `DurablePinRegistry` itself, not just a missing
+caller: `removePin(String pinId)` removes *every* pin sharing that reason, which is correct for a
+single-generation reason like a snapshot but wrong for PITR, where many generations share the
+*same* `"pitr"` pinId simultaneously -- calling it to drop one aged-out generation would have
+silently deleted every other in-window PITR pin too. Added `removePin(String, int, PinRecord)`,
+matching on the full pin (reason + term + generation) so one generation's pin can be removed
+without touching any other generation's pin under the same reason; `removePin(String, int,
+String)`'s original all-matching-reason behavior is unchanged and still used for snapshots. Not
+yet done: zero-copy clone with cross-index bundle refcounts, actually invoking
+`PitrRetentionReconciler` on a schedule per shard (it exists and is correct; nothing yet calls it
+periodically), and the extended GC model check this phase is gated on.
 
 **Phase 5 — Hardening (ongoing).** Chaos suite (§17) including full object-store outage modes
 (§13), performance tuning of bundle/WAL batch parameters, API gating audit, autoscaling signal

@@ -91,6 +91,31 @@ public class BlobContainerDurablePinRegistryTests extends OpenSearchTestCase {
         assertEquals(1, registry.getPins(INDEX_UUID, SHARD_ID).size());
     }
 
+    public void testRemovingByExactPinRecordLeavesOtherGenerationsOfTheSameReasonIntact() throws Exception {
+        // PITR pins many generations under the SAME pinId ("pitr") -- removePin(String pinId)
+        // would wipe all of them out at once, which is correct for a single-generation reason
+        // like a snapshot but wrong here. removePin(PinRecord) must remove only the one generation.
+        DurablePinRegistry registry = newRegistry();
+        PinRecord pitrGen3 = new PinRecord("pitr", 1, 3);
+        PinRecord pitrGen5 = new PinRecord("pitr", 1, 5);
+        registry.addPin(INDEX_UUID, SHARD_ID, pitrGen3);
+        registry.addPin(INDEX_UUID, SHARD_ID, pitrGen5);
+
+        registry.removePin(INDEX_UUID, SHARD_ID, pitrGen3);
+
+        assertEquals(Set.of(pitrGen5), registry.getPins(INDEX_UUID, SHARD_ID));
+    }
+
+    public void testRemovingAnExactPinRecordThatWasNeverPresentIsANoOp() throws Exception {
+        DurablePinRegistry registry = newRegistry();
+        PinRecord existing = new PinRecord("pitr", 1, 3);
+        registry.addPin(INDEX_UUID, SHARD_ID, existing);
+
+        registry.removePin(INDEX_UUID, SHARD_ID, new PinRecord("pitr", 1, 999));
+
+        assertEquals(Set.of(existing), registry.getPins(INDEX_UUID, SHARD_ID));
+    }
+
     public void testDifferentShardsAreIndependent() throws Exception {
         DurablePinRegistry registry = newRegistry();
         registry.addPin(INDEX_UUID, 0, new PinRecord("snapshot-1", 1, 5));

@@ -48,6 +48,21 @@ public interface DurablePinRegistry {
      * Removes every pin with the given {@code pinId} (e.g. a snapshot was deleted). A no-op if
      * that pin was never present. Safe under concurrent pin additions/removals from other reasons
      * on the same shard.
+     *
+     * <p><b>Only safe when {@code pinId} names exactly one generation</b> (the common case: one
+     * snapshot pins one generation per shard). A reason that pins <em>several</em> generations at
+     * once under the same {@code pinId} -- PITR does exactly this, one pin per manifest inside the
+     * retention window -- must use {@link #removePin(String, int, PinRecord)} instead to remove one
+     * generation's pin without wiping out every other generation sharing that reason.
      */
     void removePin(String indexUuid, int shardId, String pinId) throws IOException;
+
+    /**
+     * Removes exactly the given pin record (matched on {@code pinId}, term, and generation
+     * together), leaving any other pin with the same {@code pinId} on a different generation
+     * untouched. A no-op if that exact pin was never present. Safe under concurrent pin
+     * additions/removals from other reasons, or other generations of the same reason, on the same
+     * shard.
+     */
+    void removePin(String indexUuid, int shardId, PinRecord pin) throws IOException;
 }

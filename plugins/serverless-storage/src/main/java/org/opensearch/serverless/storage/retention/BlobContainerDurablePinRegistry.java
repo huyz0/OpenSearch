@@ -71,6 +71,18 @@ public final class BlobContainerDurablePinRegistry implements DurablePinRegistry
         });
     }
 
+    @Override
+    public void removePin(String indexUuid, int shardId, PinRecord pin) throws IOException {
+        mutate(indexUuid, shardId, current -> {
+            if (current.contains(pin) == false) {
+                return current; // no-op: that exact pin was never present
+            }
+            Set<PinRecord> next = new HashSet<>(current);
+            next.remove(pin);
+            return next;
+        });
+    }
+
     private void mutate(String indexUuid, int shardId, UnaryOperator<Set<PinRecord>> mutation) throws IOException {
         String registerName = registerName(indexUuid, shardId);
         for (int attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
