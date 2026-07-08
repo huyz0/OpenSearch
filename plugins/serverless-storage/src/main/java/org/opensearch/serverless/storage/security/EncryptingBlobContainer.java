@@ -14,16 +14,9 @@ import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.support.FilterBlobContainer;
 import org.opensearch.core.common.bytes.BytesReference;
 
-import javax.crypto.BadPaddingException;
-import javax.crypto.Cipher;
-import javax.crypto.IllegalBlockSizeException;
-import javax.crypto.spec.GCMParameterSpec;
-
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.security.GeneralSecurityException;
-import java.security.SecureRandom;
 import java.util.Arrays;
 import java.util.Optional;
 
@@ -59,12 +52,8 @@ import java.util.Optional;
  */
 public final class EncryptingBlobContainer extends FilterBlobContainer {
 
-    private static final int GCM_IV_LENGTH_BYTES = 12;
-    private static final int GCM_TAG_LENGTH_BITS = 128;
-
     private final BlobContainer delegate;
     private final EncryptionKeyProvider keyProvider;
-    private final SecureRandom random = new SecureRandom();
 
     public EncryptingBlobContainer(BlobContainer delegate, EncryptionKeyProvider keyProvider) {
         super(delegate);
@@ -125,35 +114,10 @@ public final class EncryptingBlobContainer extends FilterBlobContainer {
     }
 
     private byte[] encrypt(byte[] plaintext) throws IOException {
-        byte[] iv = new byte[GCM_IV_LENGTH_BYTES];
-        random.nextBytes(iv);
-        try {
-            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-            cipher.init(Cipher.ENCRYPT_MODE, keyProvider.currentKey(), new GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv));
-            byte[] ciphertext = cipher.doFinal(plaintext);
-            byte[] result = new byte[iv.length + ciphertext.length];
-            System.arraycopy(iv, 0, result, 0, iv.length);
-            System.arraycopy(ciphertext, 0, result, iv.length, ciphertext.length);
-            return result;
-        } catch (GeneralSecurityException e) {
-            throw new IOException("failed to encrypt blob", e);
-        }
+        return AesGcmCipher.encrypt(plaintext, keyProvider.currentKey());
     }
 
     private byte[] decrypt(byte[] ivAndCiphertext) throws IOException {
-        if (ivAndCiphertext.length < GCM_IV_LENGTH_BYTES) {
-            throw new IOException("ciphertext too short to contain an IV: " + ivAndCiphertext.length + " bytes");
-        }
-        byte[] iv = Arrays.copyOfRange(ivAndCiphertext, 0, GCM_IV_LENGTH_BYTES);
-        byte[] ciphertext = Arrays.copyOfRange(ivAndCiphertext, GCM_IV_LENGTH_BYTES, ivAndCiphertext.length);
-        try {
-            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-            cipher.init(Cipher.DECRYPT_MODE, keyProvider.currentKey(), new GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv));
-            return cipher.doFinal(ciphertext);
-        } catch (BadPaddingException | IllegalBlockSizeException e) {
-            throw new IOException("blob failed authentication -- wrong key, or the blob was corrupted/tampered with", e);
-        } catch (GeneralSecurityException e) {
-            throw new IOException("failed to decrypt blob", e);
-        }
+        return AesGcmCipher.decrypt(ivAndCiphertext, keyProvider.currentKey());
     }
 }

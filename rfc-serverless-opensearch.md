@@ -460,11 +460,30 @@ ranged read still fetches and decrypts the entire blob before slicing in memory,
 truly reading only the requested byte range off the wire -- true partial-range decryption needs a
 seekable cipher mode (AES-CTR) with block-offset bookkeeping, real additional work not done here;
 the directory tier (below) is what actually absorbs this cost once a bundle's plaintext is cached
-locally. **Not implemented**: the WAL-specific per-record envelope encryption design (bullet 1) --
-`WalChunkService` is a node-level shared component, not routed through a per-shard
-`EncryptingBlobContainer`, so WAL chunks are not yet encrypted at all; and credential scoping per
-tier (bullet 3), which needs IAM/role-assumption wiring per cloud backend, not just a core
-primitive like the ones built so far.
+locally. **Now implemented**: the WAL-specific per-record envelope encryption design (bullet 1).
+`WalChunkService` is a node-level shared component that group-commits records from many shards
+(potentially many indices) into one chunk blob, so it can't just be routed through a per-shard
+`EncryptingBlobContainer` the way bundle/manifest/register containers are -- a single whole-blob
+key wouldn't respect per-index key boundaries. Instead, `WalRecordCrypto` encrypts each `WalRecord`'s
+`payload` individually (leaving `indexUuid`/`shardId`/`seqNo` plaintext, since a chunk reader needs
+them to route/filter records without decrypting anything), and `EncryptingWalChunkService` wraps
+`WalChunkService` so every `append` is encrypted before it ever reaches the underlying service,
+which stays completely unaware encryption is happening -- it already treated `payload` as opaque
+bytes by design. The AES/GCM envelope logic itself was extracted out of `EncryptingBlobContainer`
+into a shared `AesGcmCipher` utility rather than duplicated. Verified: a chunk written through
+`EncryptingWalChunkService` contains ciphertext, not the plaintext payload, when read back raw;
+decrypting via `WalRecordCrypto#decryptAll` with the right key recovers the exact original
+payloads and preserves indexUuid/shardId/seqNo through the real wire format; a wrong key fails
+loudly rather than returning garbage. **Known, explicit limitation**: today's
+`EncryptionKeyProvider` only ever supplies one key regardless of index, so this doesn't yet buy
+real per-index key isolation for WAL data the way whole-blob encryption does for bundles --
+the record-level design means it will, the moment a per-index-aware key provider exists, without
+any WAL wire-format or wiring change; and `WalChunkService`/`EncryptingWalChunkService` are not
+yet wired into the plugin at all (no `TranslogFactory` hook constructs one), matching this phase's
+pre-existing "notification wiring still open" status -- this is a real, tested component waiting
+for that integration, not integrated into a running engine yet. **Not implemented**: credential
+scoping per tier (bullet 3), which needs IAM/role-assumption wiring per cloud backend, not just a
+core primitive like the ones built so far.
 
 ## 13. Degraded Modes: Object-Store Brownouts
 
