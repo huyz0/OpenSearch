@@ -465,22 +465,24 @@ allocator (e.g. a Netty-`ByteBuf`-style pool) is worth taking on as a dependency
   shard-head CAS + a directory tier + a minimal control cell — see that document for the target
   state and the bridge between the two.
 
-**Status: node-role placement done as a real `AllocationDecider`; cost model, autoscaling hooks,
-and mandatory remote cluster state not started.** `ReaderShardPlacementAllocationDecider` is the
-"new decider" the first bullet calls for, though scoped to just the reader side for now: a node
+**Status: node-role placement done as a real `AllocationDecider`, now symmetric in both
+directions; cost model, autoscaling hooks, and mandatory remote cluster state not started.**
+`ReaderShardPlacementAllocationDecider` is the "new decider" the first bullet calls for. A node
 opts in to hosting reader shards via `node.attr.serverless_storage_reader: "true"` (the same
 node-attribute mechanism `cluster.routing.allocation.require.*` filters already use), and reader
-shards of a serverless-storage index can only be allocated to such a node. Every other shard --
-writer shards of a serverless index, any shard of a non-serverless index -- gets a `YES` (no
-opinion) from this decider, exactly the behavior every other `AllocationDecider` in the allocator
-is expected to have. Verified directly against `canAllocate`: a reader-capable node is allowed, an
-ordinary node is refused, and both writer shards and shards of non-opted-in indices are
-unaffected. Not implemented: the symmetric "forbid writer shards on search-compute nodes" half of
-the first bullet (nothing currently stops a writer shard from landing on a reader-capable node --
-only reader placement is *required* to be capability-gated, not writer placement *excluded* from
-it), the placement cost model / cache-locality hysteresis (second bullet), every autoscaling hook
-(third bullet -- no signal collection or scale-to-zero mechanism exists), and mandatory remote
-cluster state enforcement (fourth bullet).
+shards of a serverless-storage index can only be allocated to such a node -- and, the "vice versa"
+half that was previously missing, a *writer* shard (or any other non-reader copy) of a
+serverless-storage index may no longer land on a reader-designated node either, so that reserved
+reader capacity is never silently consumed by an ordinary writer/primary shard. Writer shards have
+no opt-in attribute of their own and stay unrestricted everywhere else, matching how writer
+placement works outside serverless storage today. Every shard of a non-serverless index gets a
+`YES` (no opinion) from this decider regardless of node, exactly the behavior every other
+`AllocationDecider` in the allocator is expected to have. Verified directly against `canAllocate`:
+a reader shard is allowed only on a reader-designated node; a writer shard is allowed everywhere
+*except* a reader-designated node; a non-serverless index's shards are unaffected even on a
+reader-designated node. Not implemented: the placement cost model / cache-locality hysteresis
+(second bullet), every autoscaling hook (third bullet -- no signal collection or scale-to-zero
+mechanism exists), and mandatory remote cluster state enforcement (fourth bullet).
 
 ## 11. API Surface in Serverless Mode
 

@@ -98,7 +98,7 @@ public class ReaderShardPlacementAllocationDeciderTests extends OpenSearchAlloca
         assertEquals(Decision.Type.NO, decider.canAllocate(readerShard, ordinaryRoutingNode, allocation).type());
     }
 
-    public void testWriterShardOfServerlessIndexHasNoOpinionFromThisDecider() {
+    public void testWriterShardOfServerlessIndexIsUnrestrictedOnAnOrdinaryNode() {
         ClusterState state = buildClusterState();
         RoutingAllocation allocation = newAllocation(state);
         ReaderShardPlacementAllocationDecider decider = new ReaderShardPlacementAllocationDecider();
@@ -108,6 +108,32 @@ public class ReaderShardPlacementAllocationDeciderTests extends OpenSearchAlloca
 
         RoutingNode ordinaryRoutingNode = state.getRoutingNodes().node("ordinary-node");
         assertEquals(Decision.Type.YES, decider.canAllocate(writerShard, ordinaryRoutingNode, allocation).type());
+    }
+
+    public void testWriterShardOfServerlessIndexIsForbiddenFromAReaderDesignatedNode() {
+        // The "vice versa" half of the node-role split (rfc-serverless-opensearch.md &sect;10):
+        // reader-designated capacity must never be silently consumed by an ordinary writer shard.
+        ClusterState state = buildClusterState();
+        RoutingAllocation allocation = newAllocation(state);
+        ReaderShardPlacementAllocationDecider decider = new ReaderShardPlacementAllocationDecider();
+
+        ShardId shardId = new ShardId(new Index(SERVERLESS_INDEX, state.metadata().index(SERVERLESS_INDEX).getIndexUUID()), 0);
+        ShardRouting writerShard = TestShardRouting.newShardRouting(shardId, "reader-node", true, ShardRoutingState.STARTED);
+
+        RoutingNode readerCapableRoutingNode = state.getRoutingNodes().node("reader-node");
+        assertEquals(Decision.Type.NO, decider.canAllocate(writerShard, readerCapableRoutingNode, allocation).type());
+    }
+
+    public void testWriterShardOfANonServerlessIndexIsUnrestrictedEvenOnAReaderDesignatedNode() {
+        ClusterState state = buildClusterState();
+        RoutingAllocation allocation = newAllocation(state);
+        ReaderShardPlacementAllocationDecider decider = new ReaderShardPlacementAllocationDecider();
+
+        ShardId shardId = new ShardId(new Index(CLASSIC_INDEX, state.metadata().index(CLASSIC_INDEX).getIndexUUID()), 0);
+        ShardRouting writerShard = TestShardRouting.newShardRouting(shardId, "reader-node", true, ShardRoutingState.STARTED);
+
+        RoutingNode readerCapableRoutingNode = state.getRoutingNodes().node("reader-node");
+        assertEquals(Decision.Type.YES, decider.canAllocate(writerShard, readerCapableRoutingNode, allocation).type());
     }
 
     public void testReaderShardOfANonServerlessIndexHasNoOpinionFromThisDecider() {
