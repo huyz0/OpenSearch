@@ -98,12 +98,21 @@ public final class WalChunkReader {
     }
 
     /**
-     * The fencing-aware filter replay actually needs: only records for this shard whose {@code
-     * primaryTerm} is at least {@code minPrimaryTerm} -- a record written under an older term is
-     * from a writer this shard's own term-fencing (via {@code ShardHead}) has already superseded,
-     * and must never be re-applied, no matter where in the (shared, node-level) chunk stream it
-     * happens to sit. See {@link WalRecord}'s own javadoc for why this is a per-record filter
-     * rather than a directory-level one.
+     * A necessary, but on its own <b>not sufficient</b>, piece of replay fencing: excludes records
+     * from a term that never validly held the lease at all. What it does <em>not</em> catch: a
+     * writer N1 holding term T1, unaware its lease has already been reassigned to N2/T2 (paused,
+     * slow GC, network delay before it next tries to publish and discovers the fencing), can keep
+     * appending WAL records correctly tagged {@code term=T1} for a real window after T1 stopped
+     * being current -- {@code WalChunkService#append} performs no fencing check of its own, it is
+     * unconditional. Those late records are indistinguishable, by term alone, from N1's legitimate
+     * pre-fencing writes: term-tagging says "written by whoever believed T1 was current," not
+     * "written while T1 actually was current." A correct replay-time safety argument needs either
+     * a real append-time fencing token (not implemented -- would need a check against the live
+     * {@code ShardHead} on every append, in tension with this service's whole reason for existing:
+     * cheap, unsynchronized buffering) or a different cutoff entirely, tied to the actual moment of
+     * lease transfer rather than to term identity. Do not treat this method as a complete fencing
+     * mechanism until that's resolved -- rfc-serverless-opensearch.md &sect;16 Phase 2 tracks this
+     * as still open.
      */
     public static List<WalRecord> filterByShardAndMinimumTerm(List<WalRecord> records, String indexUuid, int shardId, long minPrimaryTerm) {
         List<WalRecord> filtered = new ArrayList<>();

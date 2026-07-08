@@ -208,17 +208,31 @@ after, since `createTranslogManager` needs the constructor argument before any f
 another constructor's local variable is reachable from that call -- actually works, not just
 compiles).
 
-**Fencing, resolved**: `WalChunkService`'s own javadoc previously contradicted itself on what a
-"writer epoch" is -- described as both node-level (spanning every writer shard, matching this
-section's cross-shard design) and "unique to one actual writer lifetime... derived from the
-shard's primary term" (shard-term-scoped). Resolved as node-level, matching the actual reason a
-node-level WAL service exists over a per-shard one. That rules out fencing a superseded writer by
-discarding its epoch directory (a shared epoch can't be discarded without fencing every other
-shard using it) — fencing is a per-record filter instead: `WalChunkReader#filterByShardAndMinimumTerm`
-only accepts a record whose `primaryTerm` is at least the term being replayed under, mirroring how
-`ShardHead`'s own term-fencing already treats a lower term as stale. This is a prerequisite for,
-not yet the same thing as, an actual WAL-replay recovery mechanism — see &sect;16 Phase 2's
-"still open" note for what remains.
+**Writer-epoch sharing model, resolved; fencing itself, only partially.** `WalChunkService`'s own
+javadoc previously contradicted itself on what a "writer epoch" is -- described as both node-level
+(spanning every writer shard, matching this section's cross-shard design) and "unique to one
+actual writer lifetime... derived from the shard's primary term" (shard-term-scoped). Resolved as
+node-level, matching the actual reason a node-level WAL service exists over a per-shard one -- that
+part is settled. It rules out fencing a superseded writer by discarding its epoch directory (a
+shared epoch can't be discarded without fencing every other shard using it), so
+`WalChunkReader#filterByShardAndMinimumTerm` filters per-record instead, accepting only a record
+whose `primaryTerm` is at least the term being replayed under.
+
+**That filter is a necessary but not sufficient fencing mechanism, found by hand-tracing before
+writing any replay code** (the same discipline that caught real bugs in `ShardHead.tla` earlier
+this effort): it correctly excludes a term that never validly held the lease at all, but cannot
+exclude a record legitimately tagged with a once-valid term that was actually appended *after*
+that term was superseded. Concretely: writer N1 holds term T1; the lease is reassigned to N2/T2;
+N1, unaware (paused, slow GC, or simply hasn't yet attempted a publish that would reveal the
+fencing), keeps appending WAL records correctly tagged `term=T1` for a real window after T1 stopped
+being current -- `WalChunkService#append` performs no fencing check of its own, it is
+unconditional. Term-tagging says "written by whoever believed T1 was current," not "written while
+T1 actually was current," and no term-only filter can distinguish those. Closing this needs either
+a real append-time fencing check (in tension with this service's reason for existing: cheap,
+unsynchronized buffering) or a cutoff tied to the actual moment of lease transfer rather than to
+term identity -- **not yet designed, let alone modeled or implemented**. Until it is, this filter
+and the WAL mirroring it supports are prerequisites for, not a safe substitute for, an actual
+WAL-replay recovery mechanism -- see &sect;16 Phase 2's "still open" note.
 
 ### 6.5 Garbage collection and leases
 

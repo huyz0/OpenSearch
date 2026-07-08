@@ -18,17 +18,20 @@ import java.util.Objects;
  * That separation is deliberate &mdash; the WAL wire format and the encryption policy are
  * independent concerns.
  *
- * <p>{@code primaryTerm} is what makes fencing possible under this WAL service's actual sharing
- * model: one {@code writerEpoch} (and its chunk stream) spans every writer shard on the node for
- * as long as the node's own WAL service component stays up, mixing many shards' (and, over time,
- * many terms') records together in the same chunks -- the entire reason a node-level WAL service
- * exists over a per-shard one is exactly this cross-shard batching (rfc-serverless-opensearch.md
- * &sect;6.4's cost-sanity argument). That rules out "fence a superseded writer by discarding its
- * epoch directory" (a shared epoch can't be discarded without also fencing every other shard
- * using it); fencing during replay must instead be a per-record filter -- a shard replaying its
- * own WAL only ever applies records whose {@code primaryTerm} is at least the term it is
- * replaying under, exactly as {@link org.opensearch.serverless.storage.shardstate.ShardHead}'s
- * own term-fencing already treats a lower term as stale.
+ * <p>{@code primaryTerm} is a necessary, but on its own <b>not sufficient</b>, piece of fencing
+ * under this WAL service's actual sharing model: one {@code writerEpoch} (and its chunk stream)
+ * spans every writer shard on the node for as long as the node's own WAL service component stays
+ * up, mixing many shards' (and, over time, many terms') records together in the same chunks -- the
+ * entire reason a node-level WAL service exists over a per-shard one is exactly this cross-shard
+ * batching (rfc-serverless-opensearch.md &sect;6.4's cost-sanity argument). That rules out "fence a
+ * superseded writer by discarding its epoch directory" (a shared epoch can't be discarded without
+ * also fencing every other shard using it). A per-record {@code primaryTerm} filter (see {@link
+ * WalChunkReader#filterByShardAndMinimumTerm}) correctly excludes records from a term that never
+ * validly held the lease at all, but cannot by itself exclude a record legitimately tagged with a
+ * once-valid term that was actually written <em>after</em> that term was superseded (a writer
+ * unaware it has just been fenced can keep appending for a real window) -- see that method's own
+ * javadoc for why closing this gap needs either an append-time fencing check (not implemented) or
+ * a cutoff tied to the actual moment of lease transfer, not to term identity alone.
  */
 public final class WalRecord {
 
