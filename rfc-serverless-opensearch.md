@@ -392,6 +392,35 @@ garbage) when read by an instance holding a different key; the in-memory LRU cor
 least-recently-used entry once its byte budget is exceeded, and an entry larger than the entire
 budget is still served correctly, just never cached.
 
+**One node-shared instance, not one per shard -- and why it's on-heap rather than off-heap.**
+The first cut of this cache was a bug: each reader shard's engine factory built its own instance
+with a fixed cap, so a node hosting a thousand reader shards had no relationship between the
+cache's total footprint and what the node could actually afford -- worst case, shard-count times
+the per-shard cap. `InMemoryPlaintextBundleCache` no longer holds a fixed delegate or is
+constructed per shard: `ServerlessStoragePlugin` builds exactly one instance in
+`createComponents`, sized from `serverless_storage.bundle_cache.size` (a percentage-of-heap or
+absolute-byte-value setting, the same idiom `indices.fielddata.cache.size` uses -- default `5%`,
+deliberately conservative since this cache has no production tuning behind it yet, unlike
+fielddata's long-validated `35%`). `CachingBundleFileReader` adapts that one shared instance back
+into a plain `BundleFileReader` per shard, so each shard's engine factory still gets something
+that looks like its own reader, while every shard's reads actually compete for the same node-wide
+budget. Bundle names already embed index UUID and shard id (`ObjectStoreCommitPublisher`), so
+cache keys can never collide across shards despite sharing one map.
+
+Off-heap storage (native memory, immune to GC scan cost, sizeable independently of `-Xmx`) is the
+right target given the RFC's actual scale goal -- at hundreds of millions of shards with
+thousands of hot reader shards per node, a useful cache is realistically GB-scale, which competes
+hard with heap sized for indexing/search if left on-heap. It is deliberately not done here: the
+JDK Foreign Memory API (`java.lang.foreign.Arena`/`MemorySegment`), the safe modern way to do
+this, is still a preview feature on this project's JDK 21 toolchain (confirmed by actually
+compiling against it -- `error: Arena is a preview API and is disabled by default`), not
+finalized until JDK 22+; and the legacy alternative (`ByteBuffer.allocateDirect` plus manually
+forcing its `Cleaner` to run early on eviction) needs reflective access blocked by the module
+system without JVM-wide flags, and is genuinely unsafe under concurrent access -- an evicted
+buffer forcibly freed while another reader still holds a reference is a use-after-free, not just
+a bug. Revisit once the build's JDK floor moves to 22+, or a proper reference-counted off-heap
+allocator (e.g. a Netty-`ByteBuf`-style pool) is worth taking on as a dependency.
+
 ## 10. Allocation, Topology, and Autoscaling
 
 - **Node roles**: `ingest-compute` (hosts writer shards), `search-compute` (hosts reader

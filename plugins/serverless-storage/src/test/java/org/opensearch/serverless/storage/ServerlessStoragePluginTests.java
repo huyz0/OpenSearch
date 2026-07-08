@@ -20,6 +20,7 @@ import org.opensearch.env.Environment;
 import org.opensearch.env.TestEnvironment;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.EngineFactory;
+import org.opensearch.serverless.storage.format.InMemoryPlaintextBundleCache;
 import org.opensearch.serverless.storage.readerengine.ReaderEngineFactory;
 import org.opensearch.serverless.storage.writerengine.WriterEngineFactory;
 import org.opensearch.test.IndexSettingsModule;
@@ -133,5 +134,64 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
         Optional<EngineFactory> factory = plugin.getEngineFactory(settings, primaryRouting);
         assertTrue(factory.isPresent());
         assertTrue(factory.get() instanceof WriterEngineFactory);
+    }
+
+    public void testBundleCacheSizeSettingDefaultsToAPositiveFractionOfHeap() {
+        Environment environment = TestEnvironment.newEnvironment(buildEnvSettings(Settings.EMPTY));
+        long defaultBytes = ServerlessStoragePlugin.SERVERLESS_STORAGE_BUNDLE_CACHE_SIZE_SETTING.get(environment.settings()).getBytes();
+        assertTrue("the 5% default must resolve to a real, positive byte budget", defaultBytes > 0);
+    }
+
+    public void testBundleCacheSizeSettingHonorsAnExplicitAbsoluteValue() {
+        Settings nodeSettings = Settings.builder()
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_BUNDLE_CACHE_SIZE_SETTING.getKey(), "2kb")
+            .build();
+        Environment environment = TestEnvironment.newEnvironment(buildEnvSettings(nodeSettings));
+        long bytes = ServerlessStoragePlugin.SERVERLESS_STORAGE_BUNDLE_CACHE_SIZE_SETTING.get(environment.settings()).getBytes();
+        assertEquals(2048, bytes);
+    }
+
+    public void testTheSharedBundleCacheIsOneInstanceThatServesBundlesFromDifferentShardsWithoutCollision() throws Exception {
+        Settings nodeSettings = Settings.builder()
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_BUNDLE_CACHE_SIZE_SETTING.getKey(), "1mb")
+            .build();
+        Environment environment = TestEnvironment.newEnvironment(buildEnvSettings(nodeSettings));
+        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin();
+        plugin.createComponents(null, null, null, null, null, null, environment, null, null, null, null);
+
+        InMemoryPlaintextBundleCache sharedCache = plugin.sharedBundleCacheForTesting();
+        assertNotNull("createComponents must construct the shared cache", sharedCache);
+
+        // Two different "shards" (distinguished by bundle name, which is already index/shard-scoped
+        // in real callers) reading through the same shared instance must not collide or interfere.
+        byte[] shardAPayload = "shard-a-bytes".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] shardBPayload = "shard-b-bytes".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        org.opensearch.serverless.storage.format.BundleFileEntry entry = new org.opensearch.serverless.storage.format.BundleFileEntry(
+            "f",
+            0,
+            shardAPayload.length,
+            0
+        );
+        java.util.concurrent.atomic.AtomicInteger callsA = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.atomic.AtomicInteger callsB = new java.util.concurrent.atomic.AtomicInteger();
+
+        byte[] firstA = sharedCache.readFile("bundle-shard-a", entry, (bundleName, e) -> {
+            callsA.incrementAndGet();
+            return shardAPayload;
+        });
+        byte[] firstB = sharedCache.readFile("bundle-shard-b", entry, (bundleName, e) -> {
+            callsB.incrementAndGet();
+            return shardBPayload;
+        });
+        byte[] secondA = sharedCache.readFile("bundle-shard-a", entry, (bundleName, e) -> {
+            callsA.incrementAndGet();
+            return shardAPayload;
+        });
+
+        assertArrayEquals(shardAPayload, firstA);
+        assertArrayEquals(shardBPayload, firstB);
+        assertArrayEquals(shardAPayload, secondA);
+        assertEquals("second shard-a read must be a cache hit, not a re-fetch", 1, callsA.get());
+        assertEquals(1, callsB.get());
     }
 }

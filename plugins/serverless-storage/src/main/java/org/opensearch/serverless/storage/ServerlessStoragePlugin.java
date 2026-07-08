@@ -21,6 +21,7 @@ import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.common.settings.SecureString;
+import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.env.Environment;
 import org.opensearch.env.NodeEnvironment;
@@ -36,6 +37,7 @@ import org.opensearch.serverless.storage.directory.InMemoryShardDirectory;
 import org.opensearch.serverless.storage.directory.ShardDirectory;
 import org.opensearch.serverless.storage.format.BlobContainerBundleStore;
 import org.opensearch.serverless.storage.format.BundleFileReader;
+import org.opensearch.serverless.storage.format.CachingBundleFileReader;
 import org.opensearch.serverless.storage.format.InMemoryPlaintextBundleCache;
 import org.opensearch.serverless.storage.format.LocalDiskCachingBundleStore;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
@@ -107,18 +109,30 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
-     * Cap on the in-memory plaintext bundle-file cache in front of {@link LocalDiskCachingBundleStore}
-     * (per reader shard). Keeps the hot working set decrypted in heap so most reads skip both disk
-     * I/O and, when encryption is enabled, the decrypt the disk tier's ciphertext would otherwise
-     * cost on every hit -- see {@link InMemoryPlaintextBundleCache}'s javadoc. Not yet a node
-     * setting: a fixed default until real workload data justifies making it tunable.
+     * Budget for the node-shared in-memory plaintext bundle-file cache in front of every reader
+     * shard's {@link LocalDiskCachingBundleStore} (one {@link InMemoryPlaintextBundleCache}
+     * instance per node, not per shard -- see its javadoc for why a per-shard cache doesn't
+     * compose at scale: a thousand reader shards on one node, each with its own fixed cap, has no
+     * relationship to what the node can actually afford). Expressed as a percentage of heap (or an
+     * absolute byte value), the same idiom {@code indices.fielddata.cache.size} uses -- percentage
+     * of *heap* specifically, not of node-wide native memory the way {@code
+     * indices.memory.native_index_buffer_size} is, because entries are plain heap {@code byte[]}
+     * today: true off-heap storage would need the JDK Foreign Memory API, which is still a preview
+     * feature on this project's JDK 21 toolchain (confirmed by compiling against it) and not
+     * something to enable build-wide for one cache. A conservative default, not a tuned one --
+     * unlike fielddata's long-validated 35%, this cache has no production experience behind it yet.
      */
-    private static final long IN_MEMORY_BUNDLE_CACHE_MAX_BYTES = 64L * 1024 * 1024;
+    public static final Setting<ByteSizeValue> SERVERLESS_STORAGE_BUNDLE_CACHE_SIZE_SETTING = Setting.memorySizeSetting(
+        "serverless_storage.bundle_cache.size",
+        "5%",
+        Setting.Property.NodeScope
+    );
 
     private volatile Path basePath;
     private volatile Path localCacheRoot;
     private volatile EncryptionKeyProvider encryptionKeyProvider;
     private volatile String localNodeId = "unknown-node";
+    private volatile InMemoryPlaintextBundleCache sharedBundleCache;
     // One node-local directory instance shared by every shard on this node -- matches the target
     // design's "one node block cache" shape (&sect;9) rather than a per-shard instance, and needs
     // no I/O to construct, so it's safe to build eagerly rather than threading through createComponents.
@@ -126,7 +140,12 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
 
     @Override
     public List<Setting<?>> getSettings() {
-        return List.of(SERVERLESS_STORAGE_ENABLED_SETTING, SERVERLESS_STORAGE_BASE_PATH_SETTING, SERVERLESS_STORAGE_ENCRYPTION_KEY_SETTING);
+        return List.of(
+            SERVERLESS_STORAGE_ENABLED_SETTING,
+            SERVERLESS_STORAGE_BASE_PATH_SETTING,
+            SERVERLESS_STORAGE_ENCRYPTION_KEY_SETTING,
+            SERVERLESS_STORAGE_BUNDLE_CACHE_SIZE_SETTING
+        );
     }
 
     @Override
@@ -156,6 +175,9 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         if (clusterService != null) {
             localNodeId = clusterService.localNode().getId();
         }
+        sharedBundleCache = new InMemoryPlaintextBundleCache(
+            SERVERLESS_STORAGE_BUNDLE_CACHE_SIZE_SETTING.get(environment.settings()).getBytes()
+        );
         try (SecureString encryptionKey = SERVERLESS_STORAGE_ENCRYPTION_KEY_SETTING.get(environment.settings())) {
             if (encryptionKey.length() > 0) {
                 byte[] rawKeyBytes = Base64.getDecoder().decode(new String(encryptionKey.getChars()));
@@ -212,11 +234,12 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                     // The disk tier holds ciphertext when encryption is enabled (encryptionKeyProvider
                     // non-null), so a reader node's local disk/page cache never holds plaintext at
                     // rest -- see LocalDiskCachingBundleStore's javadoc. The in-memory tier in front
-                    // of it is what keeps the actually-hot working set decrypted, so most reads never
-                    // pay that decrypt cost repeatedly; only a disk-cache hit that missed this layer
-                    // does.
+                    // of it (one instance shared by every reader shard on the node, not one per
+                    // shard -- see InMemoryPlaintextBundleCache's javadoc) is what keeps the
+                    // actually-hot working set decrypted, so most reads never pay that decrypt cost
+                    // repeatedly; only a disk-cache hit that missed this layer does.
                     BundleFileReader diskCache = new LocalDiskCachingBundleStore(bundleStore, shardCacheDir, encryptionKeyProvider);
-                    readPath = new InMemoryPlaintextBundleCache(diskCache, IN_MEMORY_BUNDLE_CACHE_MAX_BYTES);
+                    readPath = new CachingBundleFileReader(sharedBundleCache, diskCache);
                 }
                 return Optional.of(
                     new ReaderEngineFactory(
@@ -246,5 +269,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     @Override
     public Collection<AllocationDecider> createAllocationDeciders(Settings settings, ClusterSettings clusterSettings) {
         return Collections.singletonList(new ReaderShardPlacementAllocationDecider());
+    }
+
+    /** The node-shared bundle cache {@link #createComponents} built -- test-only visibility, not part of the plugin's contract. */
+    InMemoryPlaintextBundleCache sharedBundleCacheForTesting() {
+        return sharedBundleCache;
     }
 }

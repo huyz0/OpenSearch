@@ -28,15 +28,18 @@ import java.util.concurrent.atomic.AtomicLong;
  * entire cap is never cached at all (it would immediately evict everything else for a single-use
  * gain) -- it is still served correctly, just via a pass-through miss every time.
  *
- * <p>Safe to use even when nothing is encrypted (the delegate is a plain object-store fetch, or an
- * unencrypted {@link LocalDiskCachingBundleStore}): it has no opinion on what its delegate does,
- * only that whatever bytes it returns are safe to hold in heap and safe to hand back verbatim on a
- * later hit for the same {@code (bundleName, entry)}, which is true either way since bundle files
- * are immutable.
+ * <p><b>One instance per node, not per shard.</b> A budget is only meaningful against the node's
+ * actual memory, so this class deliberately holds no per-shard state and no fixed delegate: {@link
+ * #readFile} takes the miss-path {@link BundleFileReader} as an argument instead of a constructor
+ * field, so one shared instance -- sized against the whole node's budget, not guessed per shard --
+ * serves every reader shard on the node. {@link CachingBundleFileReader} adapts this back into a
+ * plain {@link BundleFileReader} for a specific shard's miss path, which is what a shard's engine
+ * factory actually wires up. Cache keys are the bundle name plus the entry's offset/length/checksum;
+ * bundle names already embed index UUID and shard id (see {@code ObjectStoreCommitPublisher}), so
+ * two different shards can never collide on the same key.
  */
-public final class InMemoryPlaintextBundleCache implements BundleFileReader {
+public final class InMemoryPlaintextBundleCache {
 
-    private final BundleFileReader delegate;
     private final long maxTotalBytes;
     private final Object lock = new Object();
     private final LinkedHashMap<String, byte[]> entriesByKey;
@@ -44,19 +47,21 @@ public final class InMemoryPlaintextBundleCache implements BundleFileReader {
     private final AtomicLong hitCount = new AtomicLong();
     private final AtomicLong missCount = new AtomicLong();
 
-    public InMemoryPlaintextBundleCache(BundleFileReader delegate, long maxTotalBytes) {
+    public InMemoryPlaintextBundleCache(long maxTotalBytes) {
         if (maxTotalBytes < 0) {
             throw new IllegalArgumentException("maxTotalBytes must be >= 0, got " + maxTotalBytes);
         }
-        this.delegate = delegate;
         this.maxTotalBytes = maxTotalBytes;
         // accessOrder=true turns iteration order into LRU order; removeEldestEntry below is never
         // used since eviction has to happen by total bytes, not entry count, so it's done manually.
         this.entriesByKey = new LinkedHashMap<>(16, 0.75f, true);
     }
 
-    @Override
-    public byte[] readFile(String bundleName, BundleFileEntry entry) throws IOException {
+    /**
+     * Returns the cached bytes for {@code (bundleName, entry)} if present, otherwise fetches them
+     * from {@code onMiss}, caches the result (subject to the byte budget), and returns it.
+     */
+    public byte[] readFile(String bundleName, BundleFileEntry entry, BundleFileReader onMiss) throws IOException {
         String key = cacheKey(bundleName, entry);
         synchronized (lock) {
             byte[] cached = entriesByKey.get(key); // get(), not containsKey+get, so this also marks it most-recently-used
@@ -67,7 +72,7 @@ public final class InMemoryPlaintextBundleCache implements BundleFileReader {
         }
 
         missCount.incrementAndGet();
-        byte[] fresh = delegate.readFile(bundleName, entry);
+        byte[] fresh = onMiss.readFile(bundleName, entry);
 
         synchronized (lock) {
             if (fresh.length <= maxTotalBytes) {

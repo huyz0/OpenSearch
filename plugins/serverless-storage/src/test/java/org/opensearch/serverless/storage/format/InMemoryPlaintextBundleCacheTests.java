@@ -41,17 +41,17 @@ public class InMemoryPlaintextBundleCacheTests extends OpenSearchTestCase {
     }
 
     public void testConstructorRejectsNegativeMaxBytes() {
-        expectThrows(IllegalArgumentException.class, () -> new InMemoryPlaintextBundleCache(inMemoryReader(writeSampleBundle()), -1));
+        expectThrows(IllegalArgumentException.class, () -> new InMemoryPlaintextBundleCache(-1));
     }
 
     public void testSecondReadIsAHitAndDoesNotCallTheDelegateAgain() throws Exception {
         SegmentBundle bundle = writeSampleBundle();
         BundleFileEntry entry = bundle.entries().get("a.bin");
         CountingBundleFileReader counting = new CountingBundleFileReader(inMemoryReader(bundle));
-        InMemoryPlaintextBundleCache cache = new InMemoryPlaintextBundleCache(counting, 1024);
+        InMemoryPlaintextBundleCache cache = new InMemoryPlaintextBundleCache(1024);
 
-        byte[] first = cache.readFile("bundle-1", entry);
-        byte[] second = cache.readFile("bundle-1", entry);
+        byte[] first = cache.readFile("bundle-1", entry, counting);
+        byte[] second = cache.readFile("bundle-1", entry, counting);
 
         assertArrayEquals(first, second);
         assertEquals(1, counting.callCount.get());
@@ -69,22 +69,22 @@ public class InMemoryPlaintextBundleCacheTests extends OpenSearchTestCase {
         );
         CountingBundleFileReader counting = new CountingBundleFileReader(inMemoryReader(bundle));
         // Room for exactly 2 entries (10 bytes) -- the third eviction candidate.
-        InMemoryPlaintextBundleCache cache = new InMemoryPlaintextBundleCache(counting, 10);
+        InMemoryPlaintextBundleCache cache = new InMemoryPlaintextBundleCache(10);
 
-        cache.readFile("bundle-1", bundle.entries().get("a.bin"));
-        cache.readFile("bundle-1", bundle.entries().get("b.bin"));
+        cache.readFile("bundle-1", bundle.entries().get("a.bin"), counting);
+        cache.readFile("bundle-1", bundle.entries().get("b.bin"), counting);
         // touch a.bin again so b.bin becomes the least-recently-used of the two
-        cache.readFile("bundle-1", bundle.entries().get("a.bin"));
+        cache.readFile("bundle-1", bundle.entries().get("a.bin"), counting);
         assertEquals("a.bin should still be a hit here", 2, counting.callCount.get());
 
         // c.bin's insertion must evict b.bin (least recently used), not a.bin.
-        cache.readFile("bundle-1", bundle.entries().get("c.bin"));
+        cache.readFile("bundle-1", bundle.entries().get("c.bin"), counting);
         assertEquals(3, counting.callCount.get());
 
-        cache.readFile("bundle-1", bundle.entries().get("a.bin"));
+        cache.readFile("bundle-1", bundle.entries().get("a.bin"), counting);
         assertEquals("a.bin should still be cached", 3, counting.callCount.get());
 
-        cache.readFile("bundle-1", bundle.entries().get("b.bin"));
+        cache.readFile("bundle-1", bundle.entries().get("b.bin"), counting);
         assertEquals("b.bin should have been evicted and re-fetched", 4, counting.callCount.get());
     }
 
@@ -92,10 +92,10 @@ public class InMemoryPlaintextBundleCacheTests extends OpenSearchTestCase {
         SegmentBundle bundle = writeSampleBundle(); // "hello" == 5 bytes
         BundleFileEntry entry = bundle.entries().get("a.bin");
         CountingBundleFileReader counting = new CountingBundleFileReader(inMemoryReader(bundle));
-        InMemoryPlaintextBundleCache cache = new InMemoryPlaintextBundleCache(counting, 2);
+        InMemoryPlaintextBundleCache cache = new InMemoryPlaintextBundleCache(2);
 
-        byte[] first = cache.readFile("bundle-1", entry);
-        byte[] second = cache.readFile("bundle-1", entry);
+        byte[] first = cache.readFile("bundle-1", entry, counting);
+        byte[] second = cache.readFile("bundle-1", entry, counting);
 
         assertArrayEquals(first, second);
         assertEquals("an entry over the cap must always be a miss", 2, counting.callCount.get());
@@ -106,10 +106,10 @@ public class InMemoryPlaintextBundleCacheTests extends OpenSearchTestCase {
         SegmentBundle bundle = writeSampleBundle();
         BundleFileEntry entry = bundle.entries().get("a.bin");
         CountingBundleFileReader counting = new CountingBundleFileReader(inMemoryReader(bundle));
-        InMemoryPlaintextBundleCache cache = new InMemoryPlaintextBundleCache(counting, 0);
+        InMemoryPlaintextBundleCache cache = new InMemoryPlaintextBundleCache(0);
 
-        cache.readFile("bundle-1", entry);
-        cache.readFile("bundle-1", entry);
+        cache.readFile("bundle-1", entry, counting);
+        cache.readFile("bundle-1", entry, counting);
 
         assertEquals(2, counting.callCount.get());
     }
@@ -122,13 +122,34 @@ public class InMemoryPlaintextBundleCacheTests extends OpenSearchTestCase {
             )
         );
         CountingBundleFileReader counting = new CountingBundleFileReader(inMemoryReader(bundle));
-        InMemoryPlaintextBundleCache cache = new InMemoryPlaintextBundleCache(counting, 1024);
+        InMemoryPlaintextBundleCache cache = new InMemoryPlaintextBundleCache(1024);
 
-        byte[] a = cache.readFile("bundle-1", bundle.entries().get("a.bin"));
-        byte[] b = cache.readFile("bundle-1", bundle.entries().get("b.bin"));
+        byte[] a = cache.readFile("bundle-1", bundle.entries().get("a.bin"), counting);
+        byte[] b = cache.readFile("bundle-1", bundle.entries().get("b.bin"), counting);
 
         assertEquals("aaa", new String(a, StandardCharsets.UTF_8));
         assertEquals("bbbbb", new String(b, StandardCharsets.UTF_8));
         assertEquals(2, counting.callCount.get());
+    }
+
+    public void testDifferentShardsSharingOneCacheDoNotCollideEvenWithIdenticalBundleFileEntries() throws Exception {
+        // Bundle names already embed index/shard (ObjectStoreCommitPublisher), but this proves the
+        // cache key genuinely depends on bundleName, not just the entry -- two shards' identically
+        // shaped entries for a differently-named bundle must be tracked independently.
+        SegmentBundle bundleA = writeSampleBundle();
+        SegmentBundle bundleB = writeSampleBundle();
+        BundleFileEntry entryA = bundleA.entries().get("a.bin");
+        BundleFileEntry entryB = bundleB.entries().get("a.bin");
+        CountingBundleFileReader countingA = new CountingBundleFileReader(inMemoryReader(bundleA));
+        CountingBundleFileReader countingB = new CountingBundleFileReader(inMemoryReader(bundleB));
+        InMemoryPlaintextBundleCache cache = new InMemoryPlaintextBundleCache(1024);
+
+        cache.readFile("bundle-shard-A", entryA, countingA);
+        cache.readFile("bundle-shard-B", entryB, countingB);
+        cache.readFile("bundle-shard-A", entryA, countingA);
+        cache.readFile("bundle-shard-B", entryB, countingB);
+
+        assertEquals("shard A's entry must be a genuine hit on the second read", 1, countingA.callCount.get());
+        assertEquals("shard B's entry must be a genuine hit on the second read", 1, countingB.callCount.get());
     }
 }
