@@ -319,6 +319,34 @@ real `IndexShard` actually applies an engine-supplied extra operation on shard s
 existing `IndexShardTests`/`InternalEngineTests` suites (264 tests) unchanged and passing, confirming
 this additive seam doesn't disturb any existing engine's recovery path.
 
+**A real gap found and scoped while attempting the genuine crash-recovery test this section's own
+work enables, not yet closed: bundle materialization on writer activation.** WAL replay (everything
+above) only recovers operations *after* the last durable manifest -- it assumes local Lucene already
+reflects that manifest's own content, true on a same-node restart but not a genuine cross-node
+failover, where `ObjectStoreWriterEngine` activates against a completely empty local store. Nothing
+today materializes a manifest's bundle into local Lucene on writer activation (`ObjectStoreCommitMaterializer`
+does this today only for the *reader* engine, via `ObjectStoreReaderEngine#open`'s materialize-then-construct
+technique). A first attempt to close this by adding the same technique to `WriterEngineFactory#newReadWriteEngine`
+(materialize before constructing the engine) **failed a real test and was reverted**: for
+`RecoverySource.Type.EMPTY_STORE` (the actual recovery type used here), core's own
+`StoreRecovery#recoverEmptyStore` (`server/src/main/java/org/opensearch/index/shard/StoreRecovery.java:855`)
+already creates and associates a fresh local translog with the (trivial, empty) Lucene commit
+*before* any `EngineFactory` is ever invoked -- materializing a manifest's segment files afterward
+overwrites that commit with one carrying the *previous* writer's stale translog-UUID reference,
+which `InternalEngine`'s constructor correctly rejects as `TranslogCorruptedException`. The earlier-considered
+alternative, `IndexStorePlugin.DirectoryFactory` (which runs early enough, before `StoreRecovery`
+altogether), doesn't fix this either: `recoverEmptyStore` unconditionally calls `store.createEmpty()`
+regardless of what a `DirectoryFactory` already put there, wiping any pre-population. Closing this
+for real needs either a genuine new `RecoverySource.Type` (core change: new enum value, `IndexShard`
+recovery-type dispatch, `StoreRecovery` — the first place in this whole effort where the smallest
+viable fix is not a small additive seam) or a way to make `recoverEmptyStore` conditional on there
+being nothing to materialize, which is the same core surgery from the other direction. Tracked as
+open in &sect;16 Phase 2; not attempted further in this pass -- the honest current status is that
+this plugin's crash-recovery story is proven correct for same-node restarts (local disk survives)
+and unproven/unbuilt for genuine cross-node failover, despite every individual piece downstream of
+"local Lucene already has the right content" (fencing, fetch, filter, decode, apply) now being real
+and tested.
+
 **Why per-record fencing instead of per-shard path fencing (`RemoteFsTranslog`-style), considered
 and rejected on cost grounds.** Core OpenSearch's own remote-store translog fences the identical
 race for free, structurally: each shard uploads its own generations under a path keyed by primary
@@ -1030,10 +1058,15 @@ read/filter/decode side is implemented and tested against a real two-writer fail
 (`wal/WalReplayRecovery.java`, `ObjectStoreWriterEngine#replayWalOperations()`, &sect;6.4), **and the
 apply step is now wired end to end** through a new generic core seam (`Engine#engineRecoveryOperations()`,
 `IndexShard#openEngineAndRecoverFromTranslog()`, &sect;7.1) proven with a real `IndexShard` in
-`EngineRecoveryOperationsTests`. What the "no crash-survival integration test exists yet" note above
-is still waiting on is narrower now: an end-to-end test that actually kills a writer node and starts
-a fresh one, rather than proving each piece (fencing math, fetch/filter/decode, apply-to-shard)
-correct in isolation as this phase's work has done.
+`EngineRecoveryOperationsTests`. **What the "no crash-survival integration test exists yet" note
+above is still waiting on turned out to be a real, deeper gap, found and scoped (not yet closed)
+while attempting exactly that test**: bundle materialization on writer activation for a genuine
+cross-node failover needs a new `RecoverySource.Type` (real core surgery, unlike every other seam
+this phase added) since core's own `StoreRecovery#recoverEmptyStore` unconditionally wipes local
+storage before any plugin-reachable hook runs -- see &sect;6.4's own note on this for the full
+finding. Every piece downstream of "local Lucene already has the right content" (fencing math,
+fetch/filter/decode, apply-to-shard) is proven correct; getting local Lucene to that state on a
+genuinely empty node is not yet built.
 
 **Phase 3 — Reader engine (materializer and open-from-manifest done; refresh-to-newer-generation
 and notification wiring still open).** `ObjectStoreCommitMaterializer` fetches every file a
