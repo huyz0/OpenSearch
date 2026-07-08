@@ -44,6 +44,7 @@ import org.opensearch.serverless.storage.format.LocalDiskCachingBundleStore;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.readerengine.ObjectStoreCommitMaterializer;
 import org.opensearch.serverless.storage.readerengine.ReaderEngineFactory;
+import org.opensearch.serverless.storage.readerengine.ReaderShardAdmissionController;
 import org.opensearch.serverless.storage.retention.BlobContainerDurablePinRegistry;
 import org.opensearch.serverless.storage.retention.DurablePinRegistry;
 import org.opensearch.serverless.storage.retention.PitrRetentionConfig;
@@ -145,12 +146,25 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         Setting.Property.NodeScope
     );
 
+    /**
+     * A coarse cap on how many reader shards may be open at once on this node
+     * (rfc-serverless-opensearch.md &sect;18 risk #3) -- see {@link ReaderShardAdmissionController}'s
+     * javadoc for exactly what this does and does not protect against. Non-positive (the default)
+     * disables it entirely, same shape as every other optional-feature-off default in this plugin.
+     */
+    public static final Setting<Integer> SERVERLESS_STORAGE_MAX_CONCURRENT_READER_SHARDS_SETTING = Setting.intSetting(
+        "serverless_storage.max_concurrent_reader_shards",
+        -1,
+        Setting.Property.NodeScope
+    );
+
     private volatile Path basePath;
     private volatile Path localCacheRoot;
     private volatile EncryptionKeyProvider encryptionKeyProvider;
     private volatile String localNodeId = "unknown-node";
     private volatile InMemoryPlaintextBundleCache sharedBundleCache;
     private volatile long pitrWindowMillis = -1;
+    private volatile ReaderShardAdmissionController readerShardAdmissionController;
     // One node-local directory instance shared by every shard on this node -- matches the target
     // design's "one node block cache" shape (&sect;9) rather than a per-shard instance, and needs
     // no I/O to construct, so it's safe to build eagerly rather than threading through createComponents.
@@ -163,7 +177,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_BASE_PATH_SETTING,
             SERVERLESS_STORAGE_ENCRYPTION_KEY_SETTING,
             SERVERLESS_STORAGE_BUNDLE_CACHE_SIZE_SETTING,
-            SERVERLESS_STORAGE_PITR_WINDOW_SETTING
+            SERVERLESS_STORAGE_PITR_WINDOW_SETTING,
+            SERVERLESS_STORAGE_MAX_CONCURRENT_READER_SHARDS_SETTING
         );
     }
 
@@ -198,6 +213,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_BUNDLE_CACHE_SIZE_SETTING.get(environment.settings()).getBytes()
         );
         pitrWindowMillis = SERVERLESS_STORAGE_PITR_WINDOW_SETTING.get(environment.settings()).millis();
+        int maxConcurrentReaderShards = SERVERLESS_STORAGE_MAX_CONCURRENT_READER_SHARDS_SETTING.get(environment.settings());
+        readerShardAdmissionController = maxConcurrentReaderShards > 0
+            ? new ReaderShardAdmissionController(maxConcurrentReaderShards)
+            : null;
         try (SecureString encryptionKey = SERVERLESS_STORAGE_ENCRYPTION_KEY_SETTING.get(environment.settings())) {
             if (encryptionKey.length() > 0) {
                 byte[] rawKeyBytes = Base64.getDecoder().decode(new String(encryptionKey.getChars()));
@@ -267,7 +286,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                         manifestStore,
                         new ObjectStoreCommitMaterializer(readPath),
                         shardDirectory,
-                        localNodeId
+                        localNodeId,
+                        readerShardAdmissionController
                     )
                 );
             }

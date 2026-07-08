@@ -928,7 +928,20 @@ directions documented so serverless adoption is not a one-way door.
    cache hit rate; consider tiered "pinned working set" for latency-critical indices.
 3. **Reader heap under many shards.** Segment metadata heap cost per open reader bounds shard
    density. Admission control (§7.2) prevents OOM but caps density; needs measurement early
-   (Phase 3 gate).
+   (Phase 3 gate). **Status: a coarser stand-in implemented, not §7.2's actual target design.**
+   §7.2 describes per-*refresh* admission control weighed against a real heap/cache byte budget,
+   deferring a refresh that would exceed it while the shard keeps serving slightly stale data --
+   that needs the lazy, block-cache-backed remote `Directory` view §7.2 also describes, which
+   doesn't exist yet (today's `ObjectStoreReaderEngine` fully materializes a manifest up front, a
+   separately documented tradeoff). `ReaderShardAdmissionController` is a simpler mechanism
+   reachable without that prerequisite: a fixed cap on the *count* of concurrently open reader
+   engines on one node (`serverless_storage.max_concurrent_reader_shards`, disabled by default),
+   checked once at `ObjectStoreReaderEngine.open` time and released on `close()`. It bounds the
+   same underlying risk, just less precisely (an over-capacity open fails outright rather than
+   degrading to stale-but-serving) and without any actual memory measurement. Verified: acquiring
+   up to the configured limit succeeds, the next acquire beyond it throws without leaking a permit
+   from the failed attempt, and closing a previously-opened engine frees a permit for the next
+   open to succeed.
 4. **WAL multiplexing fairness.** One node-level WAL means one noisy shard can delay acks for
    others. Mitigation: per-shard budget within a chunk, overflow to dedicated chunks.
    **Status: implemented and tested.** `WalChunkService` now takes an optional

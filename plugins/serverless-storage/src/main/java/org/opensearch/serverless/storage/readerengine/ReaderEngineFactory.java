@@ -35,6 +35,7 @@ public final class ReaderEngineFactory implements EngineFactory {
     private final ObjectStoreCommitMaterializer materializer;
     private final ShardDirectory shardDirectory;
     private final String localNodeId;
+    private final ReaderShardAdmissionController admissionController;
 
     public ReaderEngineFactory(
         ShardStateStore shardStateStore,
@@ -43,11 +44,23 @@ public final class ReaderEngineFactory implements EngineFactory {
         ShardDirectory shardDirectory,
         String localNodeId
     ) {
+        this(shardStateStore, manifestStore, materializer, shardDirectory, localNodeId, null);
+    }
+
+    public ReaderEngineFactory(
+        ShardStateStore shardStateStore,
+        BlobContainerManifestStore manifestStore,
+        ObjectStoreCommitMaterializer materializer,
+        ShardDirectory shardDirectory,
+        String localNodeId,
+        ReaderShardAdmissionController admissionController
+    ) {
         this.shardStateStore = shardStateStore;
         this.manifestStore = manifestStore;
         this.materializer = materializer;
         this.shardDirectory = shardDirectory;
         this.localNodeId = localNodeId;
+        this.admissionController = admissionController;
     }
 
     @Override
@@ -66,7 +79,15 @@ public final class ReaderEngineFactory implements EngineFactory {
             // &sect;9 activation path step 3, &sect;13 risk #1 metastability mitigation) -- see its
             // javadoc. This is a hint, not a fact, so a report failure is never worth failing engine
             // construction over.
-            return ObjectStoreReaderEngine.open(config, manifest, materializer, shardHead.primaryTerm(), shardDirectory, localNodeId);
+            return ObjectStoreReaderEngine.open(
+                config,
+                manifest,
+                materializer,
+                shardHead.primaryTerm(),
+                shardDirectory,
+                localNodeId,
+                admissionController
+            );
         } catch (RuntimeException e) {
             throw e;
         } catch (Exception e) {

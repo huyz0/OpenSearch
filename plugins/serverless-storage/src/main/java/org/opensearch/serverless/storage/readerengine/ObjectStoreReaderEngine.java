@@ -48,6 +48,13 @@ import java.util.function.Function;
  * ObjectStoreWriterEngine} applies on the writer side: reporting once on activation and then again
  * on a fixed schedule for as long as the engine stays open, so this shard's directory entry doesn't
  * depend on traffic to stay fresh, and the refresh task is canceled cleanly on {@link #close()}.
+ *
+ * <p>If a {@link ReaderShardAdmissionController} is supplied, {@link #open} acquires a permit from
+ * it before materializing anything, and this engine releases that permit in {@link #close()} --
+ * see that class's javadoc for what this coarse cap does and does not protect against
+ * (rfc-serverless-opensearch.md &sect;18 risk #3). {@code null} disables it entirely, matching how
+ * every other optional feature in this plugin is threaded through as an absent value rather than a
+ * separate on/off flag.
  */
 public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
 
@@ -67,6 +74,7 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
     private final ShardDirectory shardDirectory;
     private final String localNodeId;
     private final Scheduler.Cancellable directoryRefreshTask;
+    private final ReaderShardAdmissionController admissionController;
 
     private ObjectStoreReaderEngine(
         EngineConfig config,
@@ -74,7 +82,8 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
         long primaryTerm,
         long manifestGeneration,
         ShardDirectory shardDirectory,
-        String localNodeId
+        String localNodeId,
+        ReaderShardAdmissionController admissionController
     ) {
         super(config, seqNoStats, new TranslogStats(), true, Function.identity(), false);
         this.indexUuid = config.getShardId().getIndex().getUUID();
@@ -83,6 +92,7 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
         this.manifestGeneration = manifestGeneration;
         this.shardDirectory = shardDirectory;
         this.localNodeId = localNodeId;
+        this.admissionController = admissionController;
         // Report once synchronously so the shard is discoverable immediately on activation, rather
         // than waiting out the first refresh interval; scheduleWithFixedDelay's first execution
         // only happens after DIRECTORY_REFRESH_INTERVAL elapses, not on registration.
@@ -108,6 +118,9 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
     @Override
     public void close() throws IOException {
         directoryRefreshTask.cancel();
+        if (admissionController != null) {
+            admissionController.release();
+        }
         super.close();
     }
 
@@ -128,12 +141,47 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
         ShardDirectory shardDirectory,
         String localNodeId
     ) throws IOException {
-        materializer.materialize(manifest, config.getStore().directory());
-        SeqNoStats seqNoStats = new SeqNoStats(
-            manifest.maxSeqNo(),
-            manifest.localCheckpoint(),
-            config.getGlobalCheckpointSupplier().getAsLong()
-        );
-        return new ObjectStoreReaderEngine(config, seqNoStats, primaryTerm, manifest.generation(), shardDirectory, localNodeId);
+        return open(config, manifest, materializer, primaryTerm, shardDirectory, localNodeId, null);
+    }
+
+    /** @param admissionController {@code null} to disable the admission cap entirely -- see its own javadoc. */
+    public static ObjectStoreReaderEngine open(
+        EngineConfig config,
+        CommitManifest manifest,
+        ObjectStoreCommitMaterializer materializer,
+        long primaryTerm,
+        ShardDirectory shardDirectory,
+        String localNodeId,
+        ReaderShardAdmissionController admissionController
+    ) throws IOException {
+        if (admissionController != null) {
+            // Acquire before any I/O: rejecting an over-capacity open should never pay for a
+            // materialization that's just going to be thrown away.
+            admissionController.acquire(config.getShardId());
+        }
+        try {
+            materializer.materialize(manifest, config.getStore().directory());
+            SeqNoStats seqNoStats = new SeqNoStats(
+                manifest.maxSeqNo(),
+                manifest.localCheckpoint(),
+                config.getGlobalCheckpointSupplier().getAsLong()
+            );
+            return new ObjectStoreReaderEngine(
+                config,
+                seqNoStats,
+                primaryTerm,
+                manifest.generation(),
+                shardDirectory,
+                localNodeId,
+                admissionController
+            );
+        } catch (Exception e) {
+            // The engine that would have owned releasing this permit in close() never got built --
+            // release it here instead, or a rejected/failed open would permanently leak a permit.
+            if (admissionController != null) {
+                admissionController.release();
+            }
+            throw e;
+        }
     }
 }

@@ -164,4 +164,79 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
             }
         }
     }
+
+    public void testAdmissionControllerRejectsOpeningBeyondItsCapacityThenAllowsAgainAfterClose() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ObjectStoreCommitPublisher publisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+
+        CommitManifest manifest;
+        try (Directory writerDirectory = new ByteBuffersDirectory()) {
+            IndexWriterConfig config = new IndexWriterConfig();
+            try (IndexWriter writer = new IndexWriter(writerDirectory, config)) {
+                Document doc = new Document();
+                doc.add(new StringField("id", "1", Field.Store.YES));
+                writer.addDocument(doc);
+                writer.commit();
+            }
+            SegmentInfos segmentInfos = SegmentInfos.readLatestCommit(writerDirectory);
+            manifest = publisher.publishCommit(
+                writerDirectory,
+                segmentInfos,
+                INDEX_UUID,
+                SHARD_ID,
+                1,
+                segmentInfos.getGeneration(),
+                0,
+                0,
+                new WalPosition("epoch-0", 0),
+                0,
+                PruningStats.empty()
+            );
+        }
+
+        ReaderShardAdmissionController admissionController = new ReaderShardAdmissionController(1);
+        ObjectStoreCommitMaterializer materializer = new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer));
+        ShardDirectory shardDirectory = new InMemoryShardDirectory();
+
+        try (Store firstStore = createStore()) {
+            EngineConfig firstConfig = config(defaultSettings, firstStore, createTempDir(), newMergePolicy(), null);
+            ObjectStoreReaderEngine first = ObjectStoreReaderEngine.open(
+                firstConfig,
+                manifest,
+                materializer,
+                PRIMARY_TERM,
+                shardDirectory,
+                LOCAL_NODE_ID,
+                admissionController
+            );
+            try {
+                assertEquals(0, admissionController.availablePermits());
+
+                try (Store secondStore = createStore()) {
+                    EngineConfig secondConfig = config(defaultSettings, secondStore, createTempDir(), newMergePolicy(), null);
+                    expectThrows(
+                        IllegalStateException.class,
+                        () -> ObjectStoreReaderEngine.open(
+                            secondConfig,
+                            manifest,
+                            materializer,
+                            PRIMARY_TERM,
+                            shardDirectory,
+                            LOCAL_NODE_ID,
+                            admissionController
+                        )
+                    );
+                    // A rejected open must not have leaked a permit or left any other side effect.
+                    assertEquals(0, admissionController.availablePermits());
+                }
+            } finally {
+                first.close();
+            }
+            assertEquals("closing the first engine must release its permit", 1, admissionController.availablePermits());
+        }
+    }
 }
