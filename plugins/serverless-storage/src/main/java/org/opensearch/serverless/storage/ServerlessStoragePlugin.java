@@ -230,8 +230,17 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         if (nodeEnvironment != null && nodeEnvironment.nodeDataPaths().length > 0) {
             localCacheRoot = nodeEnvironment.nodeDataPaths()[0].resolve("serverless_storage_cache");
         }
-        if (clusterService != null) {
-            localNodeId = clusterService.localNode().getId();
+        if (nodeEnvironment != null) {
+            // Deliberately not ClusterService#localNode(): that reads ClusterService#state(), which
+            // is both not yet available this early in node startup ("initial cluster state not set
+            // yet") *and* unsafe to call later too -- getEngineFactory runs from within
+            // IndicesClusterStateService's own cluster-state-applier callback (shard creation is a
+            // reaction to a newly applied cluster state), so calling ClusterService#state() there,
+            // even lazily, trips ClusterApplierService's own reentrancy assertion ("should not be
+            // called by a cluster state applier"). NodeEnvironment#nodeId() is this node's own
+            // persisted identity -- the same ID that becomes this node's DiscoveryNode#getId() once
+            // cluster state exists -- available immediately, with no cluster-state dependency at all.
+            localNodeId = nodeEnvironment.nodeId();
         }
         sharedBundleCache = new InMemoryPlaintextBundleCache(
             SERVERLESS_STORAGE_BUNDLE_CACHE_SIZE_SETTING.get(environment.settings()).getBytes()

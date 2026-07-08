@@ -6,6 +6,8 @@
  * compatible open source license.
  */
 
+apply plugin: 'opensearch.internal-cluster-test'
+
 opensearchplugin {
   description = 'Object-store-native storage format (segment bundles, commit manifests, GC) for the serverless data plane'
   classname = 'org.opensearch.serverless.storage.ServerlessStoragePlugin'

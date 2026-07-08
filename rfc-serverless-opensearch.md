@@ -729,11 +729,35 @@ ever published, `EXISTING_STORE` recovery still fails exactly as it always has. 
 Both halves of &sect;7.1.2 are now implemented and tested: allocation
 (`ServerlessStorageExistingShardsAllocator`, zero core changes) and store population
 (`EngineFactory#recoverMissingLocalStore`, one new default-`false` SPI method plus one conditional
-branch in `StoreRecovery`). What remains, tracked in &sect;16 Phase 2, is no longer a design gap:
-it's the residual, already-documented limitation on `activationWalPosition`'s atomicity (&sect;6.4)
-and an actual end-to-end test that kills a real writer node and starts a fresh one under a real
-cluster, rather than the unit-level proofs of each individual piece this effort has built and
-verified.
+branch in `StoreRecovery`).
+
+**The real multi-node integration test this whole effort was building toward is now written and
+passing too**: `ServerlessStorageWriterFailoverIT` (new `internalClusterTest` source set, added via
+`apply plugin: 'opensearch.internal-cluster-test'` in this plugin's `build.gradle` -- this plugin had
+none before). A real three-node cluster (one cluster-manager-only, two data), all sharing one
+`serverless_storage.base_path` directory standing in for the object store a real deployment's nodes
+would all share; a document indexed and explicitly flushed (durably published); the node actually
+holding the primary killed via `internalCluster().stopRandomNode(...)`; `ensureGreen` succeeding at
+all on the survivor (previously this would either never leave `UNASSIGNED` or throw
+`IndexShardRecoveryException` outright); and the document still searchable afterward.
+
+Building this surfaced one more real, previously-latent bug, caught only because this was the first
+test to exercise a genuine `Node`/`ClusterService` lifecycle rather than a hand-built `EngineConfig`:
+`ServerlessStoragePlugin#createComponents` resolved `localNodeId` via `clusterService.localNode()`,
+which reads `ClusterService#state()` -- unavailable this early in node startup (`"initial cluster
+state not set yet"`), and, once deferred lazily to `getEngineFactory` time, *still* unsafe: shard/engine
+creation runs from inside `IndicesClusterStateService`'s own cluster-state-applier callback, and
+`ClusterApplierService` asserts against exactly this kind of reentrant `state()` call (`"should not
+be called by a cluster state applier"`). Fixed by resolving the local node id from
+`NodeEnvironment#nodeId()` instead -- this node's own persisted identity (the same ID that becomes
+its `DiscoveryNode#getId()` once cluster state exists), available immediately at `createComponents`
+time with no cluster-state dependency at all.
+
+What remains, tracked in &sect;16 Phase 2, is no longer a design gap and no longer missing
+end-to-end proof: it's the residual, already-documented limitation on `activationWalPosition`'s
+atomicity (&sect;6.4) -- a metadata-plane term-authority migration, explicitly out of scope for this
+effort -- and broadening `ServerlessStorageWriterFailoverIT` itself (WAL-only, unflushed data;
+encryption enabled; more than one shard) rather than any further unproven piece.
 
 ### 7.2 Reader engine
 
@@ -1227,10 +1251,17 @@ Verified end-to-end through the real `IndexShard`/`StoreRecovery` path in
 `WriterEngineFactoryCrossNodeFailoverTests`: a second writer, same shard identity, completely fresh
 local `Store`, recovers under `RecoverySource.Type.EXISTING_STORE` where before this work it threw
 immediately. Every piece this crash-recovery story depends on -- fencing math, fetch/filter/decode,
-apply-to-shard, allocation, and now store population -- is implemented and tested. What remains is
-narrower than a design gap: the residual `activationWalPosition` atomicity limitation already
-documented in &sect;6.4, and an actual multi-node integration test that kills a real writer and
-starts a fresh one under a real cluster rather than the unit-level proofs this effort has built.
+apply-to-shard, allocation, and now store population -- is implemented and tested. **The multi-node
+integration test itself is done too**: `ServerlessStorageWriterFailoverIT` (new `internalClusterTest`
+source set) starts a real cluster, indexes and flushes a document, kills the node actually holding
+the primary, and confirms the document survives on the node it fails over to -- catching, in the
+process, one more real latent bug (`ServerlessStoragePlugin`'s local-node-id resolution crashing
+against `ClusterApplierService`'s reentrancy assertion, fixed via `NodeEnvironment#nodeId()`) that
+no earlier unit-level test could have found, since none of them exercised a real `Node`/`ClusterService`
+lifecycle. What remains is the residual `activationWalPosition` atomicity limitation already
+documented in &sect;6.4 (out of scope -- needs the metadata-plane term-authority migration) and
+broadening the IT itself (WAL-only unflushed data, encryption, multiple shards), not any further
+unproven piece of the crash-recovery story.
 
 **Phase 3 — Reader engine (materializer and open-from-manifest done; refresh-to-newer-generation
 and notification wiring still open).** `ObjectStoreCommitMaterializer` fetches every file a
