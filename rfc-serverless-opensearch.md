@@ -963,31 +963,51 @@ directions documented so serverless adoption is not a one-way door.
    model-checked (TLA+ or equivalent) before Phase 1 completes — this is the one component
    where a design bug destroys data. The model must cover cross-index bundle references from
    clones (§14) and compactor/writer publication races (§7.4), not just the single-writer case.
-   **Status**: a first TLA+ model of the core primitive underneath all of this —
-   `ShardHead`'s term/lease/generation state machine and its version-CAS guard — is written at
-   `plugins/serverless-storage/formal/ShardHead.tla` (with a companion `ShardHead.cfg`), stating
-   five properties: at most one valid lease holder at a time, term never decreases, generation
-   never regresses within a term, a new term always resets generation to 0, and — the one that
-   actually matters — a `Publish` action can only ever succeed when its actor is the *real*
-   current holder, not merely believes itself to be. **Now machine-checked with TLC** (TLC2
-   2.19, via `tla2tools.jar`): all five properties hold across the complete reachable state
-   space for the model's bound (3 nodes, term/generation up to 3) — 396,428 distinct states,
-   search depth 31, 0 states left on the queue, an exhaustive breadth-first search, not a
-   sampled one. Getting a first run to even execute caught a real, independent bug in the spec
-   itself, before any property was evaluated: `NoNode == CHOOSE v : v \notin Nodes` is an
-   unbounded CHOOSE, which TLC cannot evaluate at all (only bounded `CHOOSE x \in S : P(x)`
-   forms are supported) — fixed by declaring `NoNode` as its own `CONSTANT`/model value instead
-   of trying to derive it, exactly the kind of mistake that sits invisibly in an unchecked spec
-   forever. Still does not cover clones/cross-index references or the compactor-vs-writer rebase
-   race (§7.4) — this model has generic `Publish(n, g)` actors, not a distinct compactor action
-   computing its own generation independently of a writer's, which is precisely the shape of the
-   real bug this session separately found and fixed directly in
-   `ObjectStoreCommitHeadPublisher` (a writer's local generation landing below a generation a
-   compactor had already published under the same term -- see §16 Phase 4.5's status note).
-   Extending this model with a second, compactor-shaped action family, and a property asserting
-   the fix (a writer's `Publish` must fail once superseded, never silently report success), is
-   the natural next step and would have caught that bug by construction had it existed first —
-   not yet done here.
+   **Status**: a TLA+ model of the core primitive underneath all of this — `ShardHead`'s
+   term/lease/generation state machine and its version-CAS guard, now extended with the
+   compaction service as a distinct actor — is written at
+   `plugins/serverless-storage/formal/ShardHead.tla` (with companion `ShardHead.cfg` for the
+   real, fixed production code and `ShardHeadBuggy.cfg` for the pre-fix code, see below).
+   **Machine-checked with TLC** (TLC2 2.19, via `tla2tools.jar`) under two configurations:
+
+   - `ShardHead.cfg` (`Spec`, matching production as it is today): six properties -- at most one
+     valid lease holder at a time, term never decreases, generation never regresses within a
+     term, a new term always resets generation to 0, only the real current holder can ever
+     publish, and (`AuthorshipHonest`) a writer's publish attempt is never accepted unless the
+     head genuinely ends up authored by that writer -- all hold across the complete reachable
+     state space for the model's bound (3 nodes, term/generation up to 3): 3,029,216 distinct
+     states, search depth 25, 0 states left on the queue, an exhaustive, not sampled, search.
+   - `ShardHeadBuggy.cfg` (`SpecBuggy`, modeling the *pre-fix* production code via an added
+     `PublishBuggy` action): `AuthorshipHonest` is **violated**, with TLC reporting a concrete,
+     minimal counterexample -- a writer acquires the lease, a compactor independently advances
+     the live generation while the writer's cached view is stale, and the writer's publish
+     attempt at its own next generation is accepted as success even though the head is actually
+     authored by the compactor. This is a machine-verified demonstration that the bug found and
+     fixed this session in `ObjectStoreCommitHeadPublisher#publishCommitAsHead` (the
+     `manifest.generation() <= currentHead.latestManifestGeneration() => return true` shortcut)
+     was a genuine protocol-level violation, not merely an implementation nitpick -- and that the
+     fix closes it: every other property still holds under `SpecBuggy` too, consistent with the
+     bug never mutating `head` incorrectly, only lying to its caller about what happened.
+
+   Getting to a trustworthy result took three real mistakes, each caught only by running TLC and
+   noticing a result that didn't match hand-tracing a reachable counterexample, not by
+   inspection: (1) the original `NoNode == CHOOSE v : v \notin Nodes` is an unbounded CHOOSE,
+   which TLC cannot evaluate at all -- fixed by declaring `NoNode`/`Compactor` as their own
+   `CONSTANT` model values; (2) `AuthorshipHonest` was first written wrapped in `[...]_Vars`,
+   whose standard "or stutter" semantics made it vacuously true on exactly the transitions
+   (`PublishBuggy`, whose entire postcondition is `UNCHANGED Vars`) it existed to catch -- TLC
+   reported no violation where one was clearly reachable by hand; (3) the next attempt --
+   referencing the bare `PublishBuggy(n,g)` action formula directly inside a property -- made the
+   property fail even under the *correct* `Spec` (which never takes that action at all), because
+   TLA+ action formulas are checked structurally against any `(state, state')` pair regardless of
+   which actual `Next`-disjunct produced it; an idempotent `Read` that happened to leave every
+   variable's value unchanged satisfied `PublishBuggy`'s shape by coincidence. The robust fix,
+   used in the final spec: a dedicated ghost variable (`authorshipViolated`) that only
+   `PublishBuggy` itself ever sets, turning "did this specific action really fire" into an
+   observable fact checked as an ordinary state invariant, rather than reconstructed after the
+   fact from a value-comparison other actions can coincidentally also satisfy.
+
+   Still does not cover clones/cross-index references (§14).
 6. **Interplay with existing warm/composite work.** Writable warm solves an overlapping problem
    (disk smaller than data) with a different mechanism (composite local+remote directory under a
    writable engine). Decision needed: converge warm onto the reader-engine + bundle layout in
