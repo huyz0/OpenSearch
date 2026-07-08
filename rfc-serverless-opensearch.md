@@ -230,9 +230,32 @@ unconditional. Term-tagging says "written by whoever believed T1 was current," n
 T1 actually was current," and no term-only filter can distinguish those. Closing this needs either
 a real append-time fencing check (in tension with this service's reason for existing: cheap,
 unsynchronized buffering) or a cutoff tied to the actual moment of lease transfer rather than to
-term identity -- **not yet designed, let alone modeled or implemented**. Until it is, this filter
-and the WAL mirroring it supports are prerequisites for, not a safe substitute for, an actual
-WAL-replay recovery mechanism -- see &sect;16 Phase 2's "still open" note.
+term identity.
+
+**Now formally verified**, before any Java implementation, in
+`plugins/serverless-storage/formal/WalReplayFencing.tla` (a small, deliberately abstracted model of
+just this race -- it does not model shards, manifests, or the `ShardHead` CAS itself, since those
+are already covered by `ShardHead.tla`; it models the one thing that isn't: `WalChunkService#append`
+being unconditional). Two replay strategies checked side by side, same pattern as `ShardHead.tla`'s
+`Spec`/`SpecBuggy`:
+
+- `NaiveReplay` (the filter actually shipped, `filterByShardAndMinimumTerm`): **violated**, with a
+  minimal 4-state counterexample TLC finds immediately -- a term change, a stale writer appending
+  one record still tagged with its old belief, and a replay that wrongly includes it. This is a
+  machine-verified confirmation of the bug found by hand above, not merely a hypothesis.
+- `FixedReplay` (the proposed fix -- bound replay by *both* the term filter *and*
+  `leaseTransferWalPos`, the WAL length snapshotted at the exact moment the current term was
+  granted; anything appended after that snapshot is excluded regardless of tag): **holds**,
+  exhaustively, across the complete reachable state space for the model's bound (603,722 distinct
+  states, search depth 16, 0 states left on the queue).
+
+**Still not implemented in Java.** The verified fix requires `ShardHead` to record
+`leaseTransferWalPos` as part of the same CAS that grants a new term (whoever grants a lease would
+need to read the shared `WalChunkService`'s current WAL length at that moment and embed it in the
+new `ShardHead`), and an actual replay/recovery mechanism that filters by both term and this
+recorded position -- neither exists yet. `filterByShardAndMinimumTerm` and the WAL mirroring it
+supports remain prerequisites for, not a safe substitute for, that mechanism -- see &sect;16 Phase
+2's "still open" note.
 
 ### 6.5 Garbage collection and leases
 
