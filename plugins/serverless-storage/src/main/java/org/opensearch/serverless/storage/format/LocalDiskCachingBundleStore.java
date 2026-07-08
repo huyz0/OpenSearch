@@ -8,6 +8,9 @@
 
 package org.opensearch.serverless.storage.format;
 
+import org.opensearch.serverless.storage.security.AesGcmCipher;
+import org.opensearch.serverless.storage.security.EncryptionKeyProvider;
+
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -30,11 +33,24 @@ import java.util.zip.CRC32C;
  * concern (rfc-serverless-opensearch.md &sect;9.2's admission control) that needs real workload
  * data to tune sensibly, not a default guessed at here. This class is the correctness-and-hit-path
  * foundation an eviction policy would sit on top of.
+ *
+ * <p>If an {@link EncryptionKeyProvider} is supplied, every file this cache writes to local disk
+ * is encrypted first and decrypted on read back -- when {@code
+ * ServerlessStoragePlugin#SERVERLESS_STORAGE_ENCRYPTION_KEY_SETTING} is set, the delegate this
+ * class wraps has already decrypted the bytes on their way out of {@code EncryptingBlobContainer}
+ * (that's a separate, independent encryption boundary at the object-store seam -- see its
+ * javadoc), so without this, "encryption at rest" would be true of the object store but silently
+ * false of every reader node's local disk cache and the OS page cache backing it. This is why
+ * {@link org.opensearch.serverless.storage.format.InMemoryPlaintextBundleCache} exists as a
+ * companion, not a replacement: wrap this class in that one, and the decrypt cost this constructor
+ * adds is only paid on a disk-cache hit that missed the (bounded, in-memory, plaintext) layer in
+ * front of it, not on every read.
  */
 public final class LocalDiskCachingBundleStore implements BundleFileReader {
 
     private final BundleFileReader delegate;
     private final Path cacheDirectory;
+    private final EncryptionKeyProvider encryptionKeyProvider;
     // Guards the read-check-write-then-rename sequence for one cache key so concurrent readers of
     // the same file don't race to write the same temp file; different keys never contend.
     private final ConcurrentMap<String, Object> locksByKey = new ConcurrentHashMap<>();
@@ -42,8 +58,15 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
     private final AtomicLong missCount = new AtomicLong();
 
     public LocalDiskCachingBundleStore(BundleFileReader delegate, Path cacheDirectory) throws IOException {
+        this(delegate, cacheDirectory, null);
+    }
+
+    /** @param encryptionKeyProvider {@code null} to cache plaintext on disk, matching the no-arg constructor. */
+    public LocalDiskCachingBundleStore(BundleFileReader delegate, Path cacheDirectory, EncryptionKeyProvider encryptionKeyProvider)
+        throws IOException {
         this.delegate = delegate;
         this.cacheDirectory = cacheDirectory;
+        this.encryptionKeyProvider = encryptionKeyProvider;
         Files.createDirectories(cacheDirectory);
     }
 
@@ -52,8 +75,16 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
         Path cachedPath = cachePathFor(bundleName, entry);
         synchronized (lockFor(cachedPath)) {
             if (Files.exists(cachedPath)) {
-                byte[] cached = Files.readAllBytes(cachedPath);
-                if (cached.length == entry.length() && checksum(cached) == entry.checksum()) {
+                byte[] cached = null;
+                try {
+                    cached = decryptIfNeeded(Files.readAllBytes(cachedPath));
+                } catch (IOException e) {
+                    // A cache entry that fails to decrypt (corrupted/truncated on disk, or a
+                    // leftover plaintext file from before encryption was enabled) is exactly as
+                    // untrustworthy as one that fails its checksum below -- fall through and
+                    // re-fetch rather than propagate, same reasoning as the checksum-mismatch case.
+                }
+                if (cached != null && cached.length == entry.length() && checksum(cached) == entry.checksum()) {
                     hitCount.incrementAndGet();
                     return cached;
                 }
@@ -63,9 +94,17 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
             }
             missCount.incrementAndGet();
             byte[] fresh = delegate.readFile(bundleName, entry);
-            writeAtomically(cachedPath, fresh);
+            writeAtomically(cachedPath, encryptIfNeeded(fresh));
             return fresh;
         }
+    }
+
+    private byte[] encryptIfNeeded(byte[] plaintext) throws IOException {
+        return encryptionKeyProvider == null ? plaintext : AesGcmCipher.encrypt(plaintext, encryptionKeyProvider.currentKey());
+    }
+
+    private byte[] decryptIfNeeded(byte[] bytes) throws IOException {
+        return encryptionKeyProvider == null ? bytes : AesGcmCipher.decrypt(bytes, encryptionKeyProvider.currentKey());
     }
 
     public long hitCount() {

@@ -36,6 +36,7 @@ import org.opensearch.serverless.storage.directory.InMemoryShardDirectory;
 import org.opensearch.serverless.storage.directory.ShardDirectory;
 import org.opensearch.serverless.storage.format.BlobContainerBundleStore;
 import org.opensearch.serverless.storage.format.BundleFileReader;
+import org.opensearch.serverless.storage.format.InMemoryPlaintextBundleCache;
 import org.opensearch.serverless.storage.format.LocalDiskCachingBundleStore;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.readerengine.ObjectStoreCommitMaterializer;
@@ -104,6 +105,15 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         "serverless_storage.encryption_key",
         null
     );
+
+    /**
+     * Cap on the in-memory plaintext bundle-file cache in front of {@link LocalDiskCachingBundleStore}
+     * (per reader shard). Keeps the hot working set decrypted in heap so most reads skip both disk
+     * I/O and, when encryption is enabled, the decrypt the disk tier's ciphertext would otherwise
+     * cost on every hit -- see {@link InMemoryPlaintextBundleCache}'s javadoc. Not yet a node
+     * setting: a fixed default until real workload data justifies making it tunable.
+     */
+    private static final long IN_MEMORY_BUNDLE_CACHE_MAX_BYTES = 64L * 1024 * 1024;
 
     private volatile Path basePath;
     private volatile Path localCacheRoot;
@@ -199,7 +209,14 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                     // RFC &sect;8/&sect;9/&sect;11, `shardDirectory` below) -- this one caches
                     // bytes, that one caches "which node has this shard open."
                     Path shardCacheDir = localCacheRoot.resolve(indexUuid).resolve(String.valueOf(shardIdValue));
-                    readPath = new LocalDiskCachingBundleStore(bundleStore, shardCacheDir);
+                    // The disk tier holds ciphertext when encryption is enabled (encryptionKeyProvider
+                    // non-null), so a reader node's local disk/page cache never holds plaintext at
+                    // rest -- see LocalDiskCachingBundleStore's javadoc. The in-memory tier in front
+                    // of it is what keeps the actually-hot working set decrypted, so most reads never
+                    // pay that decrypt cost repeatedly; only a disk-cache hit that missed this layer
+                    // does.
+                    BundleFileReader diskCache = new LocalDiskCachingBundleStore(bundleStore, shardCacheDir, encryptionKeyProvider);
+                    readPath = new InMemoryPlaintextBundleCache(diskCache, IN_MEMORY_BUNDLE_CACHE_MAX_BYTES);
                 }
                 return Optional.of(
                     new ReaderEngineFactory(

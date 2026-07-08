@@ -8,9 +8,15 @@
 
 package org.opensearch.serverless.storage.format;
 
+import org.opensearch.serverless.storage.security.StaticEncryptionKeyProvider;
 import org.opensearch.test.OpenSearchTestCase;
 
+import javax.crypto.KeyGenerator;
+import javax.crypto.SecretKey;
+
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -123,5 +129,90 @@ public class LocalDiskCachingBundleStoreTests extends OpenSearchTestCase {
         }
 
         assertEquals("all concurrent readers of the same entry must share a single real fetch", 1, counting.callCount.get());
+    }
+
+    private static SecretKey newAesKey() throws Exception {
+        KeyGenerator keyGenerator = KeyGenerator.getInstance("AES");
+        keyGenerator.init(256);
+        return keyGenerator.generateKey();
+    }
+
+    public void testWithAnEncryptionKeyTheDiskFileDoesNotContainThePlaintext() throws Exception {
+        SegmentBundle bundle = writeSampleBundle();
+        BundleFileEntry entry = bundle.entries().get("a.bin");
+        Path cacheDir = createTempDir();
+        LocalDiskCachingBundleStore cache = new LocalDiskCachingBundleStore(
+            inMemoryReader(bundle),
+            cacheDir,
+            new StaticEncryptionKeyProvider(newAesKey())
+        );
+
+        byte[] result = cache.readFile("bundle-1", entry);
+        assertEquals("hello", new String(result, java.nio.charset.StandardCharsets.UTF_8));
+
+        try (var files = Files.list(cacheDir)) {
+            Path cachedFile = files.filter(p -> p.toString().endsWith(".tmp") == false).findFirst().orElseThrow();
+            byte[] onDisk = Files.readAllBytes(cachedFile);
+            assertFalse(
+                "the on-disk cache file must not contain the plaintext when encryption is enabled",
+                new String(onDisk, java.nio.charset.StandardCharsets.UTF_8).contains("hello")
+            );
+        }
+    }
+
+    public void testWithAnEncryptionKeyASecondReadDecryptsBackToTheOriginalBytes() throws Exception {
+        SegmentBundle bundle = writeSampleBundle();
+        BundleFileEntry entry = bundle.entries().get("a.bin");
+        CountingBundleFileReader counting = new CountingBundleFileReader(inMemoryReader(bundle));
+        LocalDiskCachingBundleStore cache = new LocalDiskCachingBundleStore(
+            counting,
+            createTempDir(),
+            new StaticEncryptionKeyProvider(newAesKey())
+        );
+
+        byte[] first = cache.readFile("bundle-1", entry);
+        byte[] second = cache.readFile("bundle-1", entry);
+
+        assertArrayEquals(first, second);
+        assertEquals("hello", new String(second, java.nio.charset.StandardCharsets.UTF_8));
+        assertEquals("second read must be a disk-cache hit, not a re-fetch", 1, counting.callCount.get());
+        assertEquals(1, cache.hitCount());
+    }
+
+    public void testACacheDirectoryEncryptedWithOneKeyIsNotReadableWithAnother() throws Exception {
+        SegmentBundle bundle = writeSampleBundle();
+        BundleFileEntry entry = bundle.entries().get("a.bin");
+        Path cacheDir = createTempDir();
+        CountingBundleFileReader counting = new CountingBundleFileReader(inMemoryReader(bundle));
+
+        LocalDiskCachingBundleStore writer = new LocalDiskCachingBundleStore(
+            counting,
+            cacheDir,
+            new StaticEncryptionKeyProvider(newAesKey())
+        );
+        writer.readFile("bundle-1", entry);
+        assertEquals(1, counting.callCount.get());
+
+        // A fresh instance with a different key can't decrypt what's on disk -- it must fall back
+        // to a real re-fetch rather than surface a decryption error or return garbage.
+        LocalDiskCachingBundleStore readerWithDifferentKey = new LocalDiskCachingBundleStore(
+            counting,
+            cacheDir,
+            new StaticEncryptionKeyProvider(newAesKey())
+        );
+        byte[] result = readerWithDifferentKey.readFile("bundle-1", entry);
+
+        assertEquals("hello", new String(result, java.nio.charset.StandardCharsets.UTF_8));
+        assertEquals("undecryptable cache entry must fall back to a real fetch", 2, counting.callCount.get());
+    }
+
+    public void testUnencryptedCacheStillWorksWithNoKeyProvider() throws Exception {
+        // The 2-arg constructor must remain equivalent to passing a null key provider.
+        SegmentBundle bundle = writeSampleBundle();
+        BundleFileEntry entry = bundle.entries().get("a.bin");
+        LocalDiskCachingBundleStore cache = new LocalDiskCachingBundleStore(inMemoryReader(bundle), createTempDir(), null);
+
+        byte[] result = cache.readFile("bundle-1", entry);
+        assertEquals("hello", new String(result, java.nio.charset.StandardCharsets.UTF_8));
     }
 }

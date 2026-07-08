@@ -370,6 +370,28 @@ node-shared single cache (one instance per shard, not one per node), no eviction
 all (unbounded -- a real deployment would fill its disk), and no warming/prefetch. This is the
 foundation such a cache would sit on top of, not a replacement for building it.
 
+**Encryption interaction, resolved.** When `EncryptingBlobContainer` is enabled, bytes reaching
+`LocalDiskCachingBundleStore` from its delegate are already plaintext (decrypted at the
+object-store seam) -- naively caching them meant every reader node's local disk, and the OS page
+cache backing it, silently held decrypted segment data at rest despite encryption being "on," with
+no equivalent protection to the object store's. `LocalDiskCachingBundleStore` now optionally takes
+the same `EncryptionKeyProvider`, encrypting each file before it's written to its cache directory
+and decrypting on read back (a corrupted or undecryptable cache entry -- including a leftover
+plaintext file from before encryption was enabled -- falls back to a real re-fetch, same as a
+checksum mismatch). That closes the gap but reintroduces a decrypt on every disk-cache hit, which
+is exactly the cost enabling the disk cache was meant to avoid paying repeatedly.
+`InMemoryPlaintextBundleCache` is the fix for that: a bounded, size-limited, in-process LRU cache
+of decrypted bytes sitting in front of the (now ciphertext-on-disk) disk cache, wired in for reader
+shards alongside it. The actually-hot working set stays decrypted in heap, so a repeated read of
+the same file -- the common case for a reader shard serving many queries against the same recent
+segments -- skips both the disk I/O and the decrypt; only a disk-cache hit that missed this
+in-memory layer pays either cost. Verified: the on-disk cache file genuinely does not contain the
+plaintext when encryption is enabled; a second read decrypts back to the exact original bytes; a
+cache directory encrypted with one key correctly falls back to a real fetch (not an error, not
+garbage) when read by an instance holding a different key; the in-memory LRU correctly evicts the
+least-recently-used entry once its byte budget is exceeded, and an entry larger than the entire
+budget is still served correctly, just never cached.
+
 ## 10. Allocation, Topology, and Autoscaling
 
 - **Node roles**: `ingest-compute` (hosts writer shards), `search-compute` (hosts reader
@@ -458,9 +480,12 @@ backward compatible: unset by default, every existing deployment of this plugin 
 **Known, explicit tradeoff**, not yet resolved: encryption is applied to the whole blob, so a
 ranged read still fetches and decrypts the entire blob before slicing in memory, rather than
 truly reading only the requested byte range off the wire -- true partial-range decryption needs a
-seekable cipher mode (AES-CTR) with block-offset bookkeeping, real additional work not done here;
-the directory tier (below) is what actually absorbs this cost once a bundle's plaintext is cached
-locally. **Now implemented**: the WAL-specific per-record envelope encryption design (bullet 1).
+seekable cipher mode (AES-CTR) with block-offset bookkeeping, real additional work not done here.
+The cache layer (&sect;9) is what actually absorbs this cost across repeated reads, and now does
+so without quietly undermining the encryption guarantee: see &sect;9's "Encryption interaction,
+resolved" for how the disk cache stays encrypted at rest while an in-memory tier in front of it
+still avoids paying a decrypt on every hit. **Now implemented**: the WAL-specific per-record
+envelope encryption design (bullet 1).
 `WalChunkService` is a node-level shared component that group-commits records from many shards
 (potentially many indices) into one chunk blob, so it can't just be routed through a per-shard
 `EncryptingBlobContainer` the way bundle/manifest/register containers are -- a single whole-blob
