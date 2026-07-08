@@ -262,4 +262,81 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
             IOUtils.close(engine, lastOpenedStore);
         }
     }
+
+    public void testTranslogDeletionPolicyIsWiredBeforeTheConstructorReturns() throws Exception {
+        // ObjectStoreWriterEngine#getTranslogDeletionPolicy is called by InternalEngine's own
+        // constructor from inside super(engineConfig) -- i.e. before this class's own field
+        // initializers would normally run. This is the proof that the deliberately-no-initializer
+        // field pattern documented on that field actually survives construction, not just that it
+        // compiles (see rfc-serverless-opensearch.md &sect;7.1.1).
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+
+        ObjectStoreWriterEngine engine = openWriterEngine(shardStateStore, commitPublisher);
+        try {
+            assertNotNull(
+                "the durability-driven translog deletion policy must be set during construction, not left null",
+                engine.translogDeletionPolicyForTesting()
+            );
+        } finally {
+            IOUtils.close(engine, lastOpenedStore);
+        }
+    }
+
+    public void testDurablePublicationAdvancesTheTranslogRetentionWatermarkAndTrimsOldGenerations() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+
+        ObjectStoreWriterEngine engine = openWriterEngine(shardStateStore, commitPublisher);
+        try {
+            index(engine, "1");
+            engine.flush(true, true);
+            assertEquals(
+                "the watermark must advance to the seq-no actually covered by the first durable publish",
+                0L,
+                engine.translogDeletionPolicyForTesting().durablyPublishedMaxSeqNo()
+            );
+
+            index(engine, "2");
+            index(engine, "3");
+            engine.flush(true, true);
+            assertEquals(
+                "the watermark must advance again after the second durable publish",
+                2L,
+                engine.translogDeletionPolicyForTesting().durablyPublishedMaxSeqNo()
+            );
+
+            // Translog#trimUnreferencedReaders combines this policy's floor with a second,
+            // still-untouched floor derived from CombinedDeletionPolicy's safe-commit tracking
+            // (core's own global-checkpoint-driven retention -- see
+            // TranslogDeletionPolicy#getLocalCheckpointOfSafeCommit). Rfc-serverless-opensearch.md
+            // &sect;7.1.1's design is explicitly two-part: this test only exercises the translog
+            // half (Part 1, done here); the commit-retention half (Part 2) needs a small additive
+            // core seam that doesn't exist yet, so the *combined* floor in this test is still
+            // bounded by whichever of the two is more conservative -- proving this policy's own
+            // contribution moved at all (past the very first generation) is what's actually
+            // achievable and correct to assert without Part 2.
+            Translog translog = org.opensearch.index.engine.EngineTestCase.getTranslog(engine);
+            assertTrue(
+                "durable publication must trim at least the earliest generation once it's fully covered",
+                translog.getMinFileGeneration() > 1
+            );
+            assertTrue(
+                "the retained generation range must never exceed the current generation",
+                translog.getMinFileGeneration() <= translog.currentFileGeneration()
+            );
+        } finally {
+            IOUtils.close(engine, lastOpenedStore);
+        }
+    }
 }

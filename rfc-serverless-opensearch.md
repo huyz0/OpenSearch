@@ -297,13 +297,30 @@ invariant). Given that:
 
 **Two-part mechanism, gated by what's actually pluggable today.**
 
-- **Translog retention is implementable now, no core changes.** `InternalEngine.getTranslogDeletionPolicy(EngineConfig)`
-  is already `protected` and overridable (`InternalEngine.java:989`) — the same seam
-  `ObjectStoreWriterEngine` already uses for `newMergeScheduler()`. A serverless
-  `TranslogDeletionPolicy` can implement condition 2 above directly: track the highest durably
-  published generation's covered seq-no (already known to `ObjectStoreWriterEngine`, since it's
-  the return value of its own publish calls) and floor `minTranslogGenRequired` there instead of
-  deferring to the safe-commit/retention-lease chain.
+- **Translog retention — implemented.** `InternalEngine.getTranslogDeletionPolicy(EngineConfig)`
+  was already `protected` and overridable (`InternalEngine.java:989`) — the same seam
+  `ObjectStoreWriterEngine` already uses for `newMergeScheduler()`, no core changes needed.
+  `ObjectStoreDurabilityTranslogDeletionPolicy` implements condition 2 above directly: a sticky
+  `AtomicLong` watermark, advanced only by `ObjectStoreWriterEngine#commitIndexWriter` after
+  `publishCommitAsHead` actually returns `true` (never on upload alone), floors
+  `minTranslogGenRequired` there instead of deferring to the safe-commit/retention-lease chain --
+  every reader generation whose ops are all covered by that watermark is deletable, subject only to
+  open retention locks (`getMinTranslogGenRequiredByLocks`), which are always still respected.
+  Wiring the object it returns back into a field required care: `getTranslogDeletionPolicy` is
+  called by `InternalEngine`'s own constructor from inside `super(engineConfig)`, i.e. before
+  `ObjectStoreWriterEngine`'s own field initializers would normally run — the field that caches it
+  is declared with no initializer expression specifically so the value assigned during `super()`
+  survives (an explicit `= null` would execute afterward and clobber it), verified directly by a
+  test that asserts the field is non-null immediately after construction, not just that the code
+  compiles. **Known current limitation, not yet closed**: `Translog#trimUnreferencedReaders`
+  combines this policy's floor with a *second*, still-untouched floor derived from
+  `CombinedDeletionPolicy`'s safe-commit tracking (core's own global-checkpoint-driven retention) --
+  so until local commit retention (below) is also implemented, the *combined* effective retention
+  is still bounded by whichever of the two is more conservative. Verified end-to-end against a real
+  `EngineTestCase`-provisioned engine: the durability watermark advances correctly after each
+  successful publish, and old translog generations are measurably trimmed as durability catches
+  up, but not yet all the way down to the current generation (that requires the commit-level half
+  too) -- the test asserts exactly this partial, honest result, not the full target state.
 - **Local commit retention needs one small, additive core seam first.** Unlike the translog
   policy, `CombinedDeletionPolicy` construction is hardcoded inline in `InternalEngine`'s
   constructor (`InternalEngine.java:288-293`) — there is no `newCombinedDeletionPolicy()` hook the
@@ -338,11 +355,13 @@ one call in this section that's a judgment about acceptable risk, not a derived 
 be made explicitly before implementation starts, not defaulted into by whichever margin is easiest
 to code.
 
-**Milestone** (not yet met, blocked on the open decision above): a serverless writer shard, under
-sustained indexing, holds local Lucene commits and translog generations proportional to one
-publish cycle's worth of data, not to index age or total data volume — verified by asserting an
-upper bound on local disk usage that does not grow with wall-clock time under constant write rate,
-the same shape of milestone §16 Phase 2 already states but currently cannot meet.
+**Milestone** (partially met): translog retention is now durability-driven and measurably trims
+old generations as publishes succeed (implemented and tested, see above). Not yet fully met: local
+Lucene commit retention is unchanged (still core's default, safe-commit-driven policy) until the
+core seam above lands, so the *combined* system-level disk-usage bound this milestone describes —
+proportional to one publish cycle's worth of data, not to index age or total data volume — is not
+yet reachable end-to-end. The open product/risk-tolerance decision above (Option A vs. B) still
+needs resolving before the commit-retention half is implemented, not just designed.
 
 ### 7.2 Reader engine
 
@@ -796,14 +815,16 @@ if this writer has been fenced out -- verified end-to-end via a real `EngineTest
 engine (`test:framework` already carries `EngineTestCase`, so this needed no new build plumbing):
 one test confirms a flush publishes a manifest onto the shard head, another confirms a writer
 already superseded by a higher term has its engine failed by the very next flush, including that
-subsequent writes are then also rejected. Still open: local Lucene commit/translog retention policy
-once object storage becomes the durability source of truth (right now local files are kept exactly
-as a normal `InternalEngine` would keep them, so this is belt-and-suspenders durability today rather
-than the disk-bandwidth savings &sect;5/&sect;6 target). **Design written up, not yet implemented**:
-see &sect;7.1.1 for the full safety argument, the two-part mechanism (translog retention
-implementable now via an already-overridable hook; local-commit retention needs one small additive
-core seam first, tracked in &sect;15), and the one open product/risk-tolerance decision (how
-aggressively to trim) that should be resolved before implementation starts. Milestone (not yet met): an index whose
+subsequent writes are then also rejected. **Local translog retention is now durability-driven, not
+age/size-based** (&sect;7.1.1): `ObjectStoreDurabilityTranslogDeletionPolicy` floors retention on a
+watermark advanced only after `publishCommitAsHead` actually returns `true`, verified end-to-end
+against a real engine (watermark advances correctly; old generations measurably trim as durability
+catches up). **Still open**: local Lucene commit retention (right now local commits are still kept
+exactly as a normal `InternalEngine` would keep them, via core's unchanged
+`CombinedDeletionPolicy`) — needs the small additive core seam &sect;7.1.1/&sect;15 describe
+(`newCombinedDeletionPolicy()`, mirroring the existing `newMergeScheduler()` pattern) before it can
+be implemented the same way. Until then the *combined* disk-usage bound below is only partially
+reachable. Milestone (partially met, see &sect;7.1.1): an index whose
 durability is object-store-only survives `kill -9` of its node with zero data loss (durable ack
 mode), recovering by manifest+WAL replay.
 

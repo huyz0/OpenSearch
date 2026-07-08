@@ -15,6 +15,7 @@ import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.EngineException;
 import org.opensearch.index.engine.InternalEngine;
 import org.opensearch.index.seqno.SequenceNumbers;
+import org.opensearch.index.translog.TranslogDeletionPolicy;
 import org.opensearch.serverless.storage.directory.ShardDirectory;
 import org.opensearch.serverless.storage.directory.ShardDirectoryEntry;
 import org.opensearch.serverless.storage.directory.ShardRole;
@@ -83,6 +84,13 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     private final Scheduler.Cancellable directoryRefreshTask;
     private final PitrRetentionSchedulerTask pitrRetentionTask;
 
+    // Deliberately has NO initializer expression. InternalEngine's own constructor calls
+    // getTranslogDeletionPolicy(EngineConfig) (overridden below) from inside super(engineConfig),
+    // i.e. before this class's own field initializers would normally run -- an explicit
+    // initializer here (even "= null") would execute afterward and clobber the value the override
+    // assigns during super(). See rfc-serverless-opensearch.md &sect;7.1.1.
+    private ObjectStoreDurabilityTranslogDeletionPolicy translogDeletionPolicy;
+
     public ObjectStoreWriterEngine(
         EngineConfig engineConfig,
         ObjectStoreCommitHeadPublisher headPublisher,
@@ -122,6 +130,22 @@ public class ObjectStoreWriterEngine extends InternalEngine {
                 pitrRetentionConfig.pinRegistry(),
                 pitrRetentionConfig.windowMillis()
             );
+    }
+
+    /**
+     * Overrides core's default age/size/total-files translog retention with one driven by
+     * object-store durability instead (rfc-serverless-opensearch.md &sect;7.1.1) -- see {@link
+     * ObjectStoreDurabilityTranslogDeletionPolicy}'s own javadoc for the full safety argument.
+     */
+    @Override
+    protected TranslogDeletionPolicy getTranslogDeletionPolicy(EngineConfig engineConfig) {
+        translogDeletionPolicy = new ObjectStoreDurabilityTranslogDeletionPolicy();
+        return translogDeletionPolicy;
+    }
+
+    /** The durability-driven translog deletion policy this engine constructed -- test-only visibility, not part of the plugin's contract. */
+    ObjectStoreDurabilityTranslogDeletionPolicy translogDeletionPolicyForTesting() {
+        return translogDeletionPolicy;
     }
 
     private void refreshDirectoryEntry() {
@@ -178,6 +202,10 @@ public class ObjectStoreWriterEngine extends InternalEngine {
                         + primaryTerm
                 );
             }
+            // Only now, after publishCommitAsHead has actually returned true (not merely
+            // uploaded -- see ObjectStoreCommitPublisher's own "never the reverse" invariant), is
+            // it safe to let local translog retention advance past these ops.
+            translogDeletionPolicy.recordDurablePublication(maxSeqNo);
         } catch (final EngineException ex) {
             failEngine("object-store commit publication fenced out", ex);
             throw ex;
