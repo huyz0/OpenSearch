@@ -87,10 +87,27 @@
 (*      the fact from a value-comparison that other actions can           *)
 (*      coincidentally also satisfy.                                      *)
 (*                                                                         *)
+(* Run 3 (ShardHeadDecoupled.cfg, SpecDecoupled -- a PROPOSED, not yet      *)
+(* implemented-in-Java redesign, run to de-risk it before touching the     *)
+(* hot-path writer-publish Java code): decouples a writer's generation      *)
+(* numbering from local Lucene state entirely -- PublishDecoupled always    *)
+(* computes its target live as head.generation + 1 and fences against the  *)
+(* live head.holder (not a cached localHead[n] belief), mirroring how       *)
+(* CompactorPublish already works. All properties hold across the complete *)
+(* reachable state space for the model's bound (2,742,008 distinct states, *)
+(* depth 22, 0 states left on queue -- exhaustive). One design flaw was     *)
+(* already caught and fixed by hand, before ever running TLC on this       *)
+(* variant: an earlier draft fenced on the writer's own stale cached       *)
+(* belief (localHead[n].holder = n) instead of the live head.holder = n,   *)
+(* which would have let a writer already fenced out by a newer term's      *)
+(* AcquireLease still slip a generation bump through under the new         *)
+(* holder's identity -- see PublishDecoupled's own comment.                 *)
+(*                                                                         *)
 (* Still not covered: clones/cross-index bundle references (ss14).        *)
 (*                                                                         *)
 (* Reproduce: `java -jar tla2tools.jar -config ShardHead.cfg ShardHead.tla`*)
 (* and        `java -jar tla2tools.jar -config ShardHeadBuggy.cfg ShardHead.tla`*)
+(* and        `java -jar tla2tools.jar -config ShardHeadDecoupled.cfg ShardHead.tla`*)
 (***************************************************************************)
 
 EXTENDS Integers
@@ -272,6 +289,39 @@ PublishBuggy(n, g) ==
     /\ UNCHANGED <<head, leaseExpired, version, localHead, localVersion>>
 
 (***************************************************************************)
+(* Models the PROPOSED redesign (not yet implemented in Java -- this is    *)
+(* the design verification the RFC's AuthorshipHonest section flags as    *)
+(* the real remaining fix, done here BEFORE touching production code):     *)
+(* a writer's generation target is no longer fixed ahead of time from      *)
+(* local Lucene state and then checked against a possibly-stale cached     *)
+(* head. Instead, exactly like CompactorPublish, it is always recomputed   *)
+(* live as `head.generation + 1` at the moment of the CAS attempt, and     *)
+(* the fencing check is against the LIVE `head.holder`, not a cached       *)
+(* `localHead[n]` -- collapsing "re-read, recompute, CAS" into one atomic  *)
+(* step, the same retry-loop abstraction CompactorPublish already uses.    *)
+(* This structurally cannot exhibit the AuthorshipHonest bug at all: there *)
+(* is no branch that reports success without actually mutating `head` to  *)
+(* match. What this action exists to check instead is a DIFFERENT risk a  *)
+(* naive version of this redesign can introduce: if the fencing check      *)
+(* were against a STALE local belief instead of the live value (an        *)
+(* earlier draft of this action did exactly that, checking                *)
+(* `localHead[n].holder = n`), a writer already fenced out by a newer      *)
+(* term's AcquireLease could still slip a generation bump through under    *)
+(* the NEW term/holder's identity, corrupting the legitimate new holder's  *)
+(* generation sequence and violating OnlyTheCurrentHolderCanPublishDecoupled*)
+(* below -- caught by hand-tracing before ever running TLC on it, exactly  *)
+(* the kind of mistake this whole exercise exists to catch before it       *)
+(* becomes a Java change.                                                  *)
+(***************************************************************************)
+PublishDecoupled(n) ==
+    /\ leaseExpired = FALSE
+    /\ head.holder = n
+    /\ head.generation < MaxGeneration
+    /\ head' = [head EXCEPT !.generation = @ + 1, !.publishedBy = n]
+    /\ version' = version + 1
+    /\ UNCHANGED <<leaseExpired, localHead, localVersion, authorshipViolated>>
+
+(***************************************************************************)
 (* Environment step: the current lease expires (its holder's node died,   *)
 (* or its lease timestamp simply elapsed). This never touches `head` or   *)
 (* `version` directly -- exactly like production, where lease expiry is   *)
@@ -295,10 +345,20 @@ NextBuggy ==
     \/ Next
     \/ \E n \in Nodes, g \in 0..MaxGeneration : PublishBuggy(n, g)
 
+(* The proposed redesign -- see PublishDecoupled's comment above. Replaces Publish(n,g)
+   entirely (a real writer would use one generation-numbering scheme, not both at once). *)
+NextDecoupled ==
+    \/ \E n \in Nodes : Read(n)
+    \/ \E n \in Nodes : AcquireLease(n)
+    \/ \E n \in Nodes : PublishDecoupled(n)
+    \/ CompactorPublish
+    \/ ExpireLease
+
 Vars == <<head, leaseExpired, version, localHead, localVersion, authorshipViolated>>
 
 Spec == Init /\ [][Next]_Vars /\ WF_Vars(Next)
 SpecBuggy == Init /\ [][NextBuggy]_Vars /\ WF_Vars(NextBuggy)
+SpecDecoupled == Init /\ [][NextDecoupled]_Vars /\ WF_Vars(NextDecoupled)
 
 -----------------------------------------------------------------------------
 (* Correctness properties. *)
@@ -371,5 +431,30 @@ GenerationResetsOnNewTerm ==
 (***************************************************************************)
 OnlyTheCurrentHolderCanPublish ==
     [][\A n \in Nodes, g \in 0..MaxGeneration : Publish(n, g) => head.holder = n]_Vars
+
+(***************************************************************************)
+(* The `PublishDecoupled`/`SpecDecoupled` analogue of Property 5, checked  *)
+(* under the proposed redesign. Unlike `OnlyTheCurrentHolderCanPublish`,   *)
+(* this one is expected to hold close to "by construction" -- the whole    *)
+(* point of the redesign is checking `head.holder = n` live, so a violation*)
+(* here would mean the guard itself is wrong, not that the interaction     *)
+(* with other actions is subtle. Checked anyway as a basic sanity          *)
+(* confirmation before trusting the more substantive properties below it   *)
+(* (TermNeverDecreases, GenerationMonotonicWithinTerm,                     *)
+(* GenerationResetsOnNewTerm, AtMostOneValidHolder -- all reused unchanged  *)
+(* under `SpecDecoupled`, since none of them reference `Publish` by name). *)
+(* Referencing `PublishDecoupled(n)` directly inside this property (rather *)
+(* than needing a ghost variable the way `AuthorshipHonest` did) is sound  *)
+(* here specifically because `PublishDecoupled`'s postcondition always      *)
+(* substantively changes `head` (generation strictly increases, publishedBy*)
+(* is set to `n` -- never `Compactor`, since `Compactor \notin Nodes`) in a *)
+(* way no other action in `NextDecoupled` can coincidentally produce --     *)
+(* checked by hand for each of Read/AcquireLease/CompactorPublish/         *)
+(* ExpireLease, the same class of mistake `AuthorshipHonest` fell into     *)
+(* with `PublishBuggy` (whose postcondition was `UNCHANGED` everything,    *)
+(* trivially coincidable with any other no-op-shaped transition).          *)
+(***************************************************************************)
+OnlyTheCurrentHolderCanPublishDecoupled ==
+    [][\A n \in Nodes : PublishDecoupled(n) => head.holder = n]_Vars
 
 =============================================================================

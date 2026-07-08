@@ -830,9 +830,11 @@ generation number," since `ShardHead` carries no manifest-identity field to chec
 call pattern (one publish attempt per local flush, never retried with the same manifest) can't
 trigger this, but a truly airtight fix means decoupling a writer's generation numbering from local
 Lucene state entirely -- always computing its target as `currentHead.latestManifestGeneration() + 1`
-read fresh under the retry loop, exactly like the compactor already does -- which is real, larger
-design work, not a hotfix, and is what the remaining lease-offload negotiation item below is
-actually about now that this immediate bug is closed.
+read fresh under the retry loop, exactly like the compactor already does. This redesign is now
+formally verified sound (see §18 risk #5, `ShardHeadDecoupled.cfg`/`SpecDecoupled`) and is what the
+remaining lease-offload negotiation item below is actually about now that this immediate bug is
+closed; implementing it in `ObjectStoreCommitHeadPublisher`/`ObjectStoreWriterEngine` is tracked as
+follow-up work, not yet done here.
 
 Still open: `_forcemerge` when no writer is active (the actual "no writer ever activating" case
 this service exists for), and the compactor role/lease-offload negotiation with an active writer
@@ -1006,6 +1008,21 @@ directions documented so serverless adoption is not a one-way door.
    `PublishBuggy` itself ever sets, turning "did this specific action really fire" into an
    observable fact checked as an ordinary state invariant, rather than reconstructed after the
    fact from a value-comparison other actions can coincidentally also satisfy.
+
+   A third configuration, `ShardHeadDecoupled.cfg` (`SpecDecoupled`), formally verifies the
+   *proposed* fix for the residual risk noted above (decoupling a writer's generation numbering
+   from local Lucene state entirely, always computing its target live as `head.generation + 1`
+   and fencing against the live `head.holder`, mirroring how the compactor's publish already
+   works) **before** implementing it in the hot-path Java code. All properties -- including a
+   dedicated `OnlyTheCurrentHolderCanPublishDecoupled` fencing property -- hold across the
+   complete reachable state space (2,742,008 distinct states, search depth 22, 0 states left on
+   the queue, exhaustive). One design flaw was caught and fixed by hand, before ever running TLC
+   on this variant: an earlier draft fenced on the writer's own stale cached belief
+   (`localHead[n].holder = n`) instead of the live `head.holder = n`, which would have let a
+   writer already fenced out by a newer term's lease acquisition still slip a generation bump
+   through under the new holder's identity. With the live-fencing version, the redesign is now
+   formally verified sound and ready to implement in `ObjectStoreCommitHeadPublisher` /
+   `ObjectStoreWriterEngine` without further protocol-level risk.
 
    Still does not cover clones/cross-index references (§14).
 6. **Interplay with existing warm/composite work.** Writable warm solves an overlapping problem
