@@ -987,6 +987,25 @@ public abstract class Engine implements LifecycleAware, Closeable {
         return null;
     }
 
+    /**
+     * Additional operations, beyond local translog, this engine needs replayed to reconstruct its
+     * state -- called by {@code IndexShard#openEngineAndRecoverFromTranslog()} once local translog
+     * recovery has completed, through the same {@code applyTranslogOperation} path (so mapping
+     * updates and version/seqno bookkeeping are handled identically to local translog recovery),
+     * before the shard proceeds toward being started. Empty by default: an engine whose durability
+     * is entirely local translog (every {@code InternalEngine} today) has nothing extra to supply.
+     * An engine backed by a durability mechanism beyond local disk (e.g. a write-ahead log mirrored
+     * to remote storage) overrides this to return whatever operations were durably written but not
+     * yet reflected in this shard's local state -- see this method's actual override and its own
+     * javadoc in {@code plugins/serverless-storage}'s {@code ObjectStoreWriterEngine}, and
+     * {@code plugins/serverless-storage/formal/WalReplayFencing.tla} for the correctness argument
+     * a real override needs to satisfy (a naive implementation can easily reintroduce a fencing
+     * bug that formal model exists to catch).
+     */
+    public List<Translog.Operation> engineRecoveryOperations() {
+        return List.of();
+    }
+
     protected TranslogDeletionPolicy getTranslogDeletionPolicy(EngineConfig engineConfig) {
         TranslogDeletionPolicy customTranslogDeletionPolicy = null;
         if (engineConfig.getCustomTranslogDeletionPolicyFactory() != null) {

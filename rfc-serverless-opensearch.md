@@ -290,17 +290,34 @@ further manifest, a second writer activates under a higher term against the same
 `WalChunkService`/manifest store -- and asserts replay returns exactly the unmanifested operations,
 no more and no less.
 
-**Still not implemented: applying the replayed operations.** `replayWalOperations()` returns a
-decoded, ordered, correctly-fenced `List<Translog.Operation>` -- and nothing yet calls it, and
-nothing yet applies what it returns to reconstruct local Lucene/translog state. That apply step
-needs an entry point above the `Engine` layer this plugin's classes sit at (the natural analogue is
-the already-public `IndexShard#applyTranslogOperation`, called once per operation the same way core's
-own translog recovery runner already does) -- this plugin has no `IndexShard`-level recovery seam
-yet, and building one is a distinct, larger piece of work than anything in this section: it needs to
-decide where in shard allocation/recovery this replay call happens, relative to `super(engineConfig)`
-already having recovered from local translog. `filterByShardAndMinimumTerm`, WAL mirroring,
-`activationWalPosition`, and now `WalReplayRecovery` are all prerequisites for, not a substitute for,
-that remaining step -- see &sect;16 Phase 2's "still open" note.
+**Applying the replayed operations is now implemented too, via a new, small, generic core seam --
+weighed against an Engine-only approach (accept a documented mapping-update limitation) first, and
+rejected because it couldn't reuse core's own mapping-aware apply logic without either duplicating it
+or silently degrading correctness.** `IndexShard`'s own `applyIndexOperation`/
+`applyDeleteOperation`/`markSeqNoAsNoop` (the methods behind `applyTranslogOperation`) are private to
+`IndexShard` because they need `MapperService`-based document parsing and mapping-update detection
+that a bare `Engine` subclass cannot do itself -- confirmed by reading `IndexShard.java` directly, not
+assumed. Reimplementing that logic inside `ObjectStoreWriterEngine` was rejected: it would mean
+either duplicating real chunks of `IndexShard` or silently skipping mapping-update handling, a
+correctness risk. Instead, `Engine#engineRecoveryOperations()` (server module,
+`Engine.java`, default `List.of()`) is a new overridable hook, and
+`IndexShard#openEngineAndRecoverFromTranslog()` calls it immediately after local translog recovery
+completes, unwrapping the shard's `Indexer` back to a concrete `Engine` via the existing
+`EngineBackedIndexer#getEngine()` accessor (the same unwrap-and-call idiom `IndexShard` already uses
+for `IngestionEngine#awaitWarmupComplete()`) and feeding whatever it returns through the *exact same*
+`runTranslogRecovery`/`applyTranslogOperation` path local translog recovery just used, via a small
+new list-backed `Translog.Snapshot` adapter (`IndexShard.ListBackedTranslogSnapshot`) -- so mapping
+updates and version/seqno bookkeeping are handled identically, not reimplemented. Every other
+`InternalEngine` in the codebase is unaffected (default empty list, zero behavior change).
+`ObjectStoreWriterEngine#engineRecoveryOperations()` overrides this and delegates straight to
+`replayWalOperations()`, surfacing a WAL fetch/decode failure as an `EngineException` rather than
+silently degrading to a recovery gap.
+
+Verified with a new, engine-agnostic core test (`server/src/test/java/.../EngineRecoveryOperationsTests.java`,
+deliberately not testing anything WAL-specific -- that stays this plugin's own concern) proving a
+real `IndexShard` actually applies an engine-supplied extra operation on shard start, plus the full
+existing `IndexShardTests`/`InternalEngineTests` suites (264 tests) unchanged and passing, confirming
+this additive seam doesn't disturb any existing engine's recovery path.
 
 **Why per-record fencing instead of per-shard path fencing (`RemoteFsTranslog`-style), considered
 and rejected on cost grounds.** Core OpenSearch's own remote-store translog fences the identical
@@ -1008,12 +1025,15 @@ whose durability is object-store-only survives `kill -9` of its node with zero d
 ack mode), recovering by manifest+WAL replay -- no crash-survival integration test exercising this
 exists yet; the retention work above makes local disk usage bounded, it doesn't by itself prove
 crash recovery. **WAL replay fencing is now formally verified** (`formal/WalReplayFencing.tla`,
-`FixedReplay` holds exhaustively; the naively-shipped term-only filter does not) **and the
+`FixedReplay` holds exhaustively; the naively-shipped term-only filter does not), **the
 read/filter/decode side is implemented and tested against a real two-writer failover**
-(`wal/WalReplayRecovery.java`, `ObjectStoreWriterEngine#replayWalOperations()`, &sect;6.4) -- what
-remains for real crash recovery is the apply step (feeding the returned operations into a fresh
-local Lucene index via an `IndexShard`-level seam this plugin doesn't have yet), which is what the
-"no crash-survival integration test exists yet" note above is still waiting on.
+(`wal/WalReplayRecovery.java`, `ObjectStoreWriterEngine#replayWalOperations()`, &sect;6.4), **and the
+apply step is now wired end to end** through a new generic core seam (`Engine#engineRecoveryOperations()`,
+`IndexShard#openEngineAndRecoverFromTranslog()`, &sect;7.1) proven with a real `IndexShard` in
+`EngineRecoveryOperationsTests`. What the "no crash-survival integration test exists yet" note above
+is still waiting on is narrower now: an end-to-end test that actually kills a writer node and starts
+a fresh one, rather than proving each piece (fencing math, fetch/filter/decode, apply-to-shard)
+correct in isolation as this phase's work has done.
 
 **Phase 3 — Reader engine (materializer and open-from-manifest done; refresh-to-newer-generation
 and notification wiring still open).** `ObjectStoreCommitMaterializer` fetches every file a

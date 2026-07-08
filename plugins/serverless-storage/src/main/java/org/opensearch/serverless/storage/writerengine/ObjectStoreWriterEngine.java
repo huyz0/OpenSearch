@@ -363,12 +363,10 @@ public class ObjectStoreWriterEngine extends InternalEngine {
      * this engine's only recovery mechanism in that configuration, same as any other {@code
      * InternalEngine}.
      *
-     * <p><b>Not yet wired to anything</b> -- nothing calls this method today. What it returns still
-     * needs to be applied to reconstruct local state, which needs an entry point above the
-     * {@code Engine} layer (an {@code IndexShard}-level seam, analogous to the already-public
-     * {@code IndexShard#applyTranslogOperation}) that this plugin does not yet have; see {@link
-     * org.opensearch.serverless.storage.wal.WalReplayRecovery}'s own javadoc for the exact boundary
-     * and rfc-serverless-opensearch.md &sect;16 Phase 2's "still open" note.
+     * <p>Wired to {@code IndexShard} via {@link #engineRecoveryOperations()} below, which is what
+     * {@code Engine}'s own javadoc for that method points to as the real override -- see there for
+     * why the actual apply step (mapping-aware document parsing, version/seqno bookkeeping) has to
+     * happen in {@code IndexShard}, not here.
      */
     List<Translog.Operation> replayWalOperations() throws IOException {
         if (walChunkService == null) {
@@ -386,6 +384,24 @@ public class ObjectStoreWriterEngine extends InternalEngine {
             lastDurableWalPosition,
             activationWalPosition
         );
+    }
+
+    /**
+     * {@code Engine}'s own additive core seam (server module, not this plugin) for exactly this
+     * purpose: {@code IndexShard#openEngineAndRecoverFromTranslog()} calls this once local translog
+     * recovery has completed, and replays whatever it returns through the identical
+     * {@code applyTranslogOperation} path local translog recovery just used -- see that method's
+     * own javadoc on {@code Engine} for the full contract. A failure fetching/decoding the WAL is
+     * surfaced as an {@link EngineException} (this engine cannot safely become usable with a
+     * recovery gap silently swallowed) rather than degrading to local-only recovery.
+     */
+    @Override
+    public List<Translog.Operation> engineRecoveryOperations() {
+        try {
+            return replayWalOperations();
+        } catch (IOException e) {
+            throw new EngineException(engineConfig.getShardId(), "failed to replay WAL operations for activation", e);
+        }
     }
 
     private void refreshDirectoryEntry() {

@@ -3133,6 +3133,60 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
 
         getIndexer().translogManager()
             .recoverFromTranslog(translogRecoveryRunner, getIndexer().getProcessedLocalCheckpoint(), Long.MAX_VALUE);
+
+        recoverAdditionalEngineOperations(translogRecoveryStats);
+    }
+
+    /**
+     * Replays whatever {@link Engine#engineRecoveryOperations()} returns -- empty for every engine
+     * whose durability is local translog alone (the default), non-empty only for an engine backed
+     * by an additional durability mechanism (e.g. a write-ahead log mirrored to remote storage)
+     * that overrides it. Runs through the identical {@link #runTranslogRecovery} /
+     * {@link #applyTranslogOperation} path local translog recovery just used immediately above, so
+     * mapping updates and version/seqno bookkeeping are handled exactly the same way -- this is the
+     * entire reason this runs here, in {@code IndexShard}, rather than inside the engine itself,
+     * which has no {@link org.opensearch.index.mapper.MapperService} access of its own.
+     */
+    private void recoverAdditionalEngineOperations(RecoveryState.Translog translogRecoveryStats) throws IOException {
+        Indexer indexer = getIndexer();
+        if (!(indexer instanceof EngineBackedIndexer)) {
+            return;
+        }
+        List<Translog.Operation> additionalOperations = ((EngineBackedIndexer) indexer).getEngine().engineRecoveryOperations();
+        if (additionalOperations.isEmpty()) {
+            return;
+        }
+        Translog.Snapshot snapshot = new ListBackedTranslogSnapshot(additionalOperations);
+        translogRecoveryStats.totalOperations(translogRecoveryStats.totalOperations() + snapshot.totalOperations());
+        runTranslogRecovery(
+            indexer,
+            snapshot,
+            Engine.Operation.Origin.LOCAL_TRANSLOG_RECOVERY,
+            translogRecoveryStats::incrementRecoveredOperations
+        );
+    }
+
+    /** A {@link Translog.Snapshot} over an already-in-memory, already-ordered list of operations -- what {@link #recoverAdditionalEngineOperations} needs to feed {@link #runTranslogRecovery} the same way a real translog file's snapshot would. */
+    private static final class ListBackedTranslogSnapshot implements Translog.Snapshot {
+        private final List<Translog.Operation> operations;
+        private int index = 0;
+
+        ListBackedTranslogSnapshot(List<Translog.Operation> operations) {
+            this.operations = operations;
+        }
+
+        @Override
+        public int totalOperations() {
+            return operations.size();
+        }
+
+        @Override
+        public Translog.Operation next() {
+            return index < operations.size() ? operations.get(index++) : null;
+        }
+
+        @Override
+        public void close() {}
     }
 
     /**
