@@ -278,6 +278,35 @@ replays them into a fresh local Lucene index. `filterByShardAndMinimumTerm`, WAL
 this snapshot are all prerequisites for, not a substitute for, that mechanism -- see &sect;16 Phase
 2's "still open" note.
 
+**Why per-record fencing instead of per-shard path fencing (`RemoteFsTranslog`-style), considered
+and rejected on cost grounds.** Core OpenSearch's own remote-store translog fences the identical
+race for free, structurally: each shard uploads its own generations under a path keyed by primary
+term, and recovery only ever lists the current term's path -- a stale writer's post-fencing uploads
+simply land somewhere recovery never reads, no per-record filter or position snapshot required. The
+reason this plugin can't just copy that is the same reason it went node-level in the first place:
+**PUT request cost dominates object-store spend for a WAL, by orders of magnitude, at the shard
+density this architecture targets.** A back-of-envelope check: per-shard independent uploads on even
+a modest 1 s flush interval, at 1,000 shards on one node (a realistic multi-tenant serverless
+density), is 1,000 PUT/s/node -- roughly 86M PUT/day/node, on the order of $400+/day/node at typical
+S3 PUT pricing. The node-level shared buffer this section already commits to collapses that to one
+PUT per flush interval regardless of shard count -- roughly three orders of magnitude cheaper, and
+the entire basis for this section's own cost-sanity check above.
+
+A natural-seeming compromise -- keep the shared buffer but namespace chunks by `(writerEpoch, term)`
+instead of bare `writerEpoch`, getting path-level fencing back "for free" -- does not survive
+contact with how terms actually vary: primary term is a *per-shard*, independently-incrementing
+counter, not a node-wide clock, so shards sharing one flush buffer can each be at a different term
+at the same instant. Grouping a shared flush by absolute term value does not collapse to one bucket
+per flush; it fragments into as many buckets as distinct terms currently held across the buffered
+shards, which degrades toward one chunk per shard in the worst case -- silently reintroducing the
+per-shard PUT cost this design exists to avoid. `RemoteFsTranslog` doesn't pay this cost because each
+shard already owns an independent upload stream; a shared buffer has no analogous place to absorb it
+for free. The per-record term filter plus `activationWalPosition` cutoff, despite the residual
+atomicity gap documented above, adds zero extra PUT-time cost (the cutoff is a comparison made at
+replay time, not a write-time concern) -- which is why it's the design being carried forward here
+rather than path-scoped fencing, and why closing the residual gap fully is a metadata-plane
+term-authority fix (&sect;7.1's "term authority bridge"), not a storage-layout one.
+
 ### 6.5 Garbage collection and leases
 
 Deletion is the hardest correctness problem in shared-storage designs. Rules:
