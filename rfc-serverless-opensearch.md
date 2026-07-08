@@ -506,15 +506,24 @@ matching "bundles and manifests are single-index by construction... encrypt bund
 the index data key" exactly (registers are the one deliberate exception -- passed through
 unencrypted, since they carry no document data, only node ids/terms/generations). Optional and
 backward compatible: unset by default, every existing deployment of this plugin is untouched.
-**Known, explicit tradeoff**, not yet resolved: encryption is applied to the whole blob, so a
-ranged read still fetches and decrypts the entire blob before slicing in memory, rather than
-truly reading only the requested byte range off the wire -- true partial-range decryption needs a
-seekable cipher mode (AES-CTR) with block-offset bookkeeping, real additional work not done here.
-The cache layer (&sect;9) is what actually absorbs this cost across repeated reads, and now does
-so without quietly undermining the encryption guarantee: see &sect;9's "Encryption interaction,
-resolved" for how the disk cache stays encrypted at rest while an in-memory tier in front of it
-still avoids paying a decrypt on every hit. **Now implemented**: the WAL-specific per-record
-envelope encryption design (bullet 1).
+**Now implemented**: true partial-range decryption, closing what was previously a known, explicit
+tradeoff (encryption applied to the whole blob, so a ranged read had to fetch and decrypt the
+entire blob before slicing in memory). `EncryptingBlobContainer`'s wire format changed from one
+whole-blob AES/GCM envelope to a fixed header (`BlockLayout`) followed by a sequence of
+independently-encrypted, independently-authenticated fixed-size blocks (default 64KiB); a ranged
+read fetches a small header, computes exactly which blocks overlap the requested range via pure
+offset arithmetic (`BlockLayout`, no I/O, unit-tested on its own), and issues exactly one
+additional ranged fetch to the delegate spanning only those blocks -- never the whole blob.
+Verified directly, not just inferred: a recording `BlobContainer` wrapper confirms a 3-byte read
+out of a 1000-byte, 100-block blob triggers exactly two delegate calls (the header, then one
+sub-100-byte block fetch), a read spanning multiple block boundaries returns the exact expected
+byte range, and -- a genuinely new guarantee the old whole-blob-envelope scheme didn't have -- a
+ranged read entirely within an uncorrupted block still succeeds even when a different block in
+the same blob has been corrupted, where the old scheme would have failed to decrypt *any* range
+once *any* byte anywhere in the blob was corrupted. The cache layer (&sect;9) still matters for
+repeated reads of the same file (a cache hit skips the fetch and decrypt entirely, which even a
+single-block partial fetch does not), see &sect;9's "Encryption interaction, resolved". **Also
+implemented**: the WAL-specific per-record envelope encryption design (bullet 1).
 `WalChunkService` is a node-level shared component that group-commits records from many shards
 (potentially many indices) into one chunk blob, so it can't just be routed through a per-shard
 `EncryptingBlobContainer` the way bundle/manifest/register containers are -- a single whole-blob
