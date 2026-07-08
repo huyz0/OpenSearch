@@ -336,16 +336,21 @@ overwrites that commit with one carrying the *previous* writer's stale translog-
 which `InternalEngine`'s constructor correctly rejects as `TranslogCorruptedException`. The earlier-considered
 alternative, `IndexStorePlugin.DirectoryFactory` (which runs early enough, before `StoreRecovery`
 altogether), doesn't fix this either: `recoverEmptyStore` unconditionally calls `store.createEmpty()`
-regardless of what a `DirectoryFactory` already put there, wiping any pre-population. Closing this
-for real needs either a genuine new `RecoverySource.Type` (core change: new enum value, `IndexShard`
-recovery-type dispatch, `StoreRecovery` — the first place in this whole effort where the smallest
-viable fix is not a small additive seam) or a way to make `recoverEmptyStore` conditional on there
-being nothing to materialize, which is the same core surgery from the other direction. Tracked as
-open in &sect;16 Phase 2; not attempted further in this pass -- the honest current status is that
-this plugin's crash-recovery story is proven correct for same-node restarts (local disk survives)
-and unproven/unbuilt for genuine cross-node failover, despite every individual piece downstream of
-"local Lucene already has the right content" (fencing, fetch, filter, decode, apply) now being real
-and tested.
+regardless of what a `DirectoryFactory` already put there, wiping any pre-population.
+
+**Design for closing this properly is now written up in &sect;7.1.2**, after further reading of core
+allocation/recovery code turned up that the fix is smaller than first feared on both counts: (1) a
+genuine cross-node failover of an already-written primary actually carries `RecoverySource.Type.EXISTING_STORE`,
+not `EMPTY_STORE` (the type the reverted attempt above tested was the wrong one to begin with) --
+`StoreRecovery#internalRecoverFromStore`'s `EXISTING_STORE` branch throws before any translog
+handling when local segments are missing, which is a much narrower, more surgical hook point than a
+whole new `RecoverySource.Type`; and (2) getting such a shard allocated at all (this plugin's "no
+peer recovery" shards look to core's default allocator like they can never have a valid copy
+anywhere, which -- confirmed by reading `PrimaryShardAllocator` directly -- leaves them unassigned
+indefinitely with no automatic timeout/fallback) has an existing, zero-core-change answer: the
+already-real `ExistingShardsAllocator` SPI, swappable per index via
+`ClusterPlugin#getExistingShardsAllocators()`, which this plugin already implements `ClusterPlugin`
+for (&sect;9). See &sect;7.1.2 for the full design and what's proven vs. still to be implemented.
 
 **Why per-record fencing instead of per-shard path fencing (`RemoteFsTranslog`-style), considered
 and rejected on cost grounds.** Core OpenSearch's own remote-store translog fences the identical
@@ -579,6 +584,104 @@ global checkpoint that, for a shard with no replicas, would otherwise never adva
 `InternalEngineTests`/`CombinedDeletionPolicyTests` (core's own regression suites) and this
 plugin's full test suite pass unchanged, confirming every other engine's default behavior is
 untouched.
+
+### 7.1.2 Cross-node writer failover: allocation and activation materialization (design, not yet implemented)
+
+**Status**: design only, written up here before any code, matching &sect;7.1.1's own "safety argument
+gets scrutiny first" discipline — this is a bigger, riskier piece of surface (it touches core
+allocation, not just an `Engine`/`IndexShard` seam) and deserves the same treatment.
+
+**The gap this closes.** &sect;6.4's WAL replay (fencing formally verified, fetch/filter/decode
+implemented, apply-to-shard wired through a real core seam) only recovers operations *after* the
+last durable manifest — it assumes local Lucene already reflects that manifest's own content, true
+on a same-node restart but not a genuine cross-node failover, where the new node's local store has
+never held this shard's data at all. Nothing today materializes a manifest's bundle into local
+Lucene on writer activation. A first attempt to close this (materializing inside
+`WriterEngineFactory#newReadWriteEngine`, mirroring how `ObjectStoreReaderEngine#open` already
+solves the identical problem for reader shards) **failed a real test and was reverted**: for
+`RecoverySource.Type.EMPTY_STORE`, core's `StoreRecovery#recoverEmptyStore` already creates and
+associates a fresh local translog with the (trivial, empty) Lucene commit *before* any plugin
+`EngineFactory` is ever invoked, so materializing a manifest's segment files afterward leaves the
+commit referencing the *previous* writer's stale translog UUID — `TranslogCorruptedException`.
+
+**Two separate problems, not one, discovered by reading core allocation code directly rather than
+assumed:**
+
+1. **Store population** — even with the right hook, how does a fresh local `Store` end up with the
+   right Lucene commit *and* a translog whose UUID actually matches it, before `InternalEngine`'s
+   constructor (inside `openEngineAndRecoverFromTranslog`) ever opens the directory?
+2. **Allocation** — this plugin's shards are "no peer recovery" by design (&sect;7.1): no node ever
+   holds a locally-persisted authoritative copy, the object store is the only durable copy. Core's
+   default primary allocator has no concept of this. Confirmed by reading
+   `PrimaryShardAllocator.getAllocationDecision`/`buildNodeShardsResult`
+   (`server/src/main/java/org/opensearch/gateway/PrimaryShardAllocator.java`) directly: when every
+   candidate node's `NodeGatewayStartedShards` response has a null allocation id (the "no local
+   data" signal), `orderedAllocationCandidates` is empty, and the shard gets
+   `AllocateUnassignedDecision.no(NO_VALID_SHARD_COPY, ...)` — **left unassigned indefinitely**, not
+   a one-time failure. Every reroute cycle repeats the same empty fetch and the same `NO` decision;
+   there is no timeout, delay setting, or automatic fallback anywhere in gateway/allocation code
+   that converts this into an automatic empty allocation — only an explicit operator command
+   (`AllocateEmptyPrimaryAllocationCommand`, requiring `acceptDataLoss=true`) escapes it today. A
+   plugin whose every shard activation looks exactly like this to core's allocator would deadlock on
+   every single failover without operator intervention, which is obviously unacceptable for a
+   system whose whole premise is unattended recovery.
+
+**Problem 2's resolution needs zero core changes** — confirmed by reading the actual SPI, not
+assumed from a passing familiarity with it. `ExistingShardsAllocator`
+(`server/src/main/java/org/opensearch/cluster/routing/allocation/ExistingShardsAllocator.java`) is
+already a swappable-per-index allocator: `index.allocation.existing_shards_allocator` (an
+`IndexScope` setting) names which registered allocator handles that index's unassigned shards, and
+`ClusterPlugin#getExistingShardsAllocators()` is exactly the seam a plugin uses to register its own
+— `ClusterModule.setExistingShardsAllocators` merges plugin-supplied allocators with the two
+built-ins by name, no core modification required. Critically, `ExistingShardsAllocator`'s contract
+(`allocateUnassigned(ShardRouting, RoutingAllocation, UnassignedAllocationHandler)`) never has to
+call `TransportNodesListGatewayStartedShards`/reason about local allocation ids at all — a plugin
+implementation can pick any `AllocationDeciders`-approved node and call
+`unassignedAllocationHandler.initialize(nodeId, allocationId, expectedSize, allocation)`
+immediately, because *this plugin's* recovery correctness never depended on which node has local
+data (there never is any) — it depends on manifest+WAL replay, which works identically regardless
+of which node gets picked. `ServerlessStoragePlugin` already `implements ClusterPlugin` (for
+`ReaderShardPlacementAllocationDecider`, &sect;9), so adding `getExistingShardsAllocators()` is
+additive to a seam already in use, not a new one. Estimated size: ~150-300 lines — `beforeAllocation`/
+`afterPrimariesBeforeReplicas`/`cleanCaches` are no-ops; `allocateUnassigned` runs the standard
+`AllocationDeciders.canAllocate` check across candidate nodes and initializes the first `YES`; the
+existing `ObjectStoreCommitHeadPublisher#publishCommitAsHead` term-fencing CAS (already implemented
+and formally verified as part of &sect;6.4/&sect;6.5's work) is what actually protects correctness
+if this allocator ever picked a node that shouldn't really hold the primary — allocation here is
+only "willingness to try," never final authority; a node that loses the fencing race simply fails
+its first publish attempt and is fenced out, exactly as already tested in
+`ObjectStoreCommitHeadPublisherTests`/`ObjectStoreWriterEngineTests`.
+
+**Problem 1 needs one small, narrow core change** — smaller than the `RecoverySource.Type` addition
+originally considered and rejected as too large. Reading `StoreRecovery#internalRecoverFromStore`
+directly (not `recoverEmptyStore`, which is `EMPTY_STORE`-only and irrelevant here): for
+`EXISTING_STORE` (the type a genuine failover of an already-written primary actually carries — the
+earlier, reverted attempt tested the wrong recovery type), when local segments are missing
+(`store.readLastCommittedSegmentsInfo()` throws, `si == null`), it throws
+`IndexShardRecoveryException("shard allocated for local recovery, should exist, but doesn't")`
+immediately — before any translog handling. That is precisely where a plugin-facing hook needs to
+be: given the chance to materialize *before* that throw (both the manifest's segment files *and* a
+freshly-created, correctly-associated local translog, in the right order — mirroring exactly what
+`recoverEmptyStore` already does for its own case, just plugin-driven instead of unconditional), core
+re-reads `si` (now non-null) and proceeds down the ordinary `indexShouldExists` branch unmodified.
+No new `RecoverySource.Type`, no allocation-dispatch changes, no BWC/serialization surface — one
+conditional branch in one method, gated behind a new small SPI method (shape still to be finalized:
+most likely an `IndexStorePlugin`-style hook, keyed the same way `IndexStorePlugin.DirectoryFactory`
+already is, called with the `IndexShard`/`Store` at exactly this point) that every existing engine's
+recovery path is entirely unaffected by when unimplemented (default: hook absent, current
+`IndexShardRecoveryException` behavior unchanged) — the same "additive, default no-op" shape every
+other core seam this effort has added (`Engine#engineRecoveryOperations()`,
+`Engine#globalCheckpointSupplierForCombinedDeletionPolicy`, `InternalEngine#getLocalCheckpointTracker`)
+already follows.
+
+**Not yet implemented.** This section is the design; &sect;16 Phase 2 tracks it as the next concrete
+increment. What's proven and doesn't need to be re-litigated: the term-fencing CAS that makes
+"any node can try" safe (&sect;6.4/&sect;6.5, formally verified), the WAL replay fencing and
+fetch/filter/decode/apply chain that runs once local Lucene is correct (&sect;6.4, formally verified
+and tested), and now — via direct reading of core allocator/recovery code rather than assumption —
+that neither open problem needs the large, risky core surgery (a new `RecoverySource.Type` with
+allocation-dispatch changes) originally feared; both are additive, small, and one of the two needs
+no core change at all.
 
 ### 7.2 Reader engine
 
@@ -1059,14 +1162,15 @@ read/filter/decode side is implemented and tested against a real two-writer fail
 apply step is now wired end to end** through a new generic core seam (`Engine#engineRecoveryOperations()`,
 `IndexShard#openEngineAndRecoverFromTranslog()`, &sect;7.1) proven with a real `IndexShard` in
 `EngineRecoveryOperationsTests`. **What the "no crash-survival integration test exists yet" note
-above is still waiting on turned out to be a real, deeper gap, found and scoped (not yet closed)
-while attempting exactly that test**: bundle materialization on writer activation for a genuine
-cross-node failover needs a new `RecoverySource.Type` (real core surgery, unlike every other seam
-this phase added) since core's own `StoreRecovery#recoverEmptyStore` unconditionally wipes local
-storage before any plugin-reachable hook runs -- see &sect;6.4's own note on this for the full
-finding. Every piece downstream of "local Lucene already has the right content" (fencing math,
-fetch/filter/decode, apply-to-shard) is proven correct; getting local Lucene to that state on a
-genuinely empty node is not yet built.
+above is still waiting on turned out to be two real, deeper gaps, both now found, scoped, and
+designed (not yet implemented) rather than the single `RecoverySource.Type` originally feared**:
+store population (a small, narrow `StoreRecovery` hook, no new `RecoverySource.Type` needed after
+all) and allocation (a plugin-supplied `ExistingShardsAllocator`, needing *zero* core changes) --
+full design in &sect;7.1.2, written up before code per this effort's own established discipline for
+anything touching core allocation. Every piece downstream of "local Lucene already has the right
+content" (fencing math, fetch/filter/decode, apply-to-shard) is proven correct; getting local Lucene
+to that state on a genuinely empty node, and getting such a shard allocated anywhere at all, are
+both designed and ready for implementation.
 
 **Phase 3 — Reader engine (materializer and open-from-manifest done; refresh-to-newer-generation
 and notification wiring still open).** `ObjectStoreCommitMaterializer` fetches every file a
