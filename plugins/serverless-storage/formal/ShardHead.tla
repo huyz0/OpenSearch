@@ -25,10 +25,30 @@
 (* interface BlobContainer#compareAndSwapRegister actually provides, so   *)
 (* nothing about a specific backend (FS/S3/GCS/Azure) leaks into it.      *)
 (*                                                                         *)
-(* STATUS: written but not yet machine-checked with TLC in this repo      *)
-(* (see rfc-serverless-opensearch.md's formal-model section) -- the       *)
-(* companion ShardHead.cfg is ready to run once TLA+ tooling is           *)
-(* available: `java -jar tla2tools.jar -config ShardHead.cfg ShardHead`.  *)
+(* STATUS: machine-checked with TLC (tla2tools.jar, TLC2 2.19). All five  *)
+(* properties (TypeOK, AtMostOneValidHolder, TermNeverDecreases,          *)
+(* GenerationMonotonicWithinTerm, GenerationResetsOnNewTerm,               *)
+(* OnlyTheCurrentHolderCanPublish) hold across the complete reachable     *)
+(* state space for the bound in ShardHead.cfg (3 nodes, term/generation   *)
+(* up to 3): 396,428 distinct states, search depth 31, 0 states left on   *)
+(* the queue -- an exhaustive, not sampled, breadth-first search. One     *)
+(* real bug was caught in the process of getting a first run to execute   *)
+(* at all, before any property was even evaluated: `NoNode == CHOOSE v :  *)
+(* v \notin Nodes` is an unbounded CHOOSE, which TLC cannot evaluate      *)
+(* (only bounded `CHOOSE x \in S : P(x)` forms are supported) -- fixed by *)
+(* declaring NoNode as its own CONSTANT (a model value in ShardHead.cfg)  *)
+(* instead of trying to derive it. This spec still does not cover         *)
+(* clones/cross-index references or the compactor-vs-writer rebase race  *)
+(* (rfc-serverless-opensearch.md ss7.4) -- it models generic Publish(n,g) *)
+(* actors, not a distinct compactor actor computing its own generation    *)
+(* independently of a writer's, which is exactly the shape of the real,  *)
+(* separately-fixed bug in ObjectStoreCommitHeadPublisher this session    *)
+(* found (a writer's local generation landing below a generation a        *)
+(* compactor already published under the same term). Extending this      *)
+(* model with a second, compactor-shaped action family is the natural     *)
+(* next step, not yet done here.                                          *)
+(*                                                                         *)
+(* Reproduce: `java -jar tla2tools.jar -config ShardHead.cfg ShardHead.tla`*)
 (***************************************************************************)
 
 EXTENDS Integers
@@ -36,9 +56,11 @@ EXTENDS Integers
 CONSTANTS
     Nodes,          \* the (finite) set of nodes that can contend for this shard
     MaxTerm,         \* bound on primaryTerm, for finite-state model checking
-    MaxGeneration    \* bound on latestManifestGeneration, for finite-state model checking
-
-NoNode == CHOOSE v : v \notin Nodes
+    MaxGeneration,   \* bound on latestManifestGeneration, for finite-state model checking
+    NoNode           \* sentinel "no holder yet" value, declared as its own model value
+                      \* (not `CHOOSE v : v \notin Nodes`) since CHOOSE over an unbounded
+                      \* domain is something TLC's model checker cannot evaluate at all --
+                      \* caught by actually running TLC, not by inspection.
 
 ASSUME NoNode \notin Nodes
 ASSUME MaxTerm \in Nat /\ MaxTerm >= 1

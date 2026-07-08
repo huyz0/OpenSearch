@@ -1,0 +1,2 @@
+# TLC's own scratch output directory from running tla2tools.jar -- reproducible from the spec, not source.
+states/

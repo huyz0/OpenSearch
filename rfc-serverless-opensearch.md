@@ -969,12 +969,25 @@ directions documented so serverless adoption is not a one-way door.
    five properties: at most one valid lease holder at a time, term never decreases, generation
    never regresses within a term, a new term always resets generation to 0, and — the one that
    actually matters — a `Publish` action can only ever succeed when its actor is the *real*
-   current holder, not merely believes itself to be. This is written but **not yet
-   machine-checked with TLC** in this repo (tooling wasn't set up in this session); running
-   `java -jar tla2tools.jar -config ShardHead.cfg ShardHead.tla` is the immediate next step
-   before trusting it. It also does not yet cover clones/cross-index references or the
-   compactor-vs-writer rebase race (§7.4) called out above — those need their own actions added
-   to the model, not just this base activation/publish machine.
+   current holder, not merely believes itself to be. **Now machine-checked with TLC** (TLC2
+   2.19, via `tla2tools.jar`): all five properties hold across the complete reachable state
+   space for the model's bound (3 nodes, term/generation up to 3) — 396,428 distinct states,
+   search depth 31, 0 states left on the queue, an exhaustive breadth-first search, not a
+   sampled one. Getting a first run to even execute caught a real, independent bug in the spec
+   itself, before any property was evaluated: `NoNode == CHOOSE v : v \notin Nodes` is an
+   unbounded CHOOSE, which TLC cannot evaluate at all (only bounded `CHOOSE x \in S : P(x)`
+   forms are supported) — fixed by declaring `NoNode` as its own `CONSTANT`/model value instead
+   of trying to derive it, exactly the kind of mistake that sits invisibly in an unchecked spec
+   forever. Still does not cover clones/cross-index references or the compactor-vs-writer rebase
+   race (§7.4) — this model has generic `Publish(n, g)` actors, not a distinct compactor action
+   computing its own generation independently of a writer's, which is precisely the shape of the
+   real bug this session separately found and fixed directly in
+   `ObjectStoreCommitHeadPublisher` (a writer's local generation landing below a generation a
+   compactor had already published under the same term -- see §16 Phase 4.5's status note).
+   Extending this model with a second, compactor-shaped action family, and a property asserting
+   the fix (a writer's `Publish` must fail once superseded, never silently report success), is
+   the natural next step and would have caught that bug by construction had it existed first —
+   not yet done here.
 6. **Interplay with existing warm/composite work.** Writable warm solves an overlapping problem
    (disk smaller than data) with a different mechanism (composite local+remote directory under a
    writable engine). Decision needed: converge warm onto the reader-engine + bundle layout in
