@@ -235,6 +235,115 @@ bump uses the existing cluster-coordination mechanism; once the metadata plane l
 authority migrates to CAS on the shard-head object (metadata-plane RFC §4/§12) — the engine
 code is agnostic, it consumes a term from a `ShardStateStore` interface either way.
 
+#### 7.1.1 Local retention once object storage is durable (design, not yet implemented)
+
+**Status**: design only, written up here before any code so the safety argument gets scrutiny
+first — see §16 Phase 2's own status note ("local files are kept exactly as a normal
+`InternalEngine` would keep them, so this is belt-and-suspenders durability today rather than the
+disk-bandwidth savings target"). This section is that redesign, worked through far enough to be
+implementable, plus the one open call that's a genuine product/risk-tolerance decision, not an
+engineering one.
+
+**Why today's retention is more conservative than this architecture needs.** Core OpenSearch
+already ties local commit and translog retention tightly to the global checkpoint, not to
+wall-clock time, even with zero replicas: `CombinedDeletionPolicy` deletes every local Lucene
+commit older than the "safe commit" (the newest commit whose `max_seq_no` is ≤ the persisted
+global checkpoint), and `SoftDeletesPolicy`/`TranslogDeletionPolicy` retain ops and translog
+generations back to the same boundary, driven by retention leases. Critically, a sole primary with
+no replicas still holds a **self-issued peer-recovery retention lease**
+(`ReplicationTracker#addPeerRecoveryRetentionLeaseForSolePrimary`), pinned at
+`globalCheckpoint + 1` and exempt from the normal 12h lease-expiry floor as long as the shard
+stays assigned — so this isn't a large excess in steady state, but it exists purely to protect a
+peer-recovery path that, by this plugin's design (§7.1: "No peer recovery, no segment copy"), can
+never happen. That lease, and the retention it drives, is dead weight for a serverless writer
+shard specifically.
+
+**The actual opportunity.** This plugin's failover path already recovers by manifest + WAL replay,
+never by replaying local translog or copying local segments (§7.1 above). Once that's true, local
+translog and local Lucene commits stop being *the* recovery mechanism and become a same-node
+fast-path optimization only: reusing local files on a routine restart is faster than a full
+manifest+WAL replay, but is never required for correctness, since the manifest+WAL path already
+has to be correct and tested for cross-node failover anyway. That reframing is what licenses much
+more aggressive local retention than core's global-checkpoint-driven default: a local commit or
+translog generation can be deleted as soon as **the data it holds is durably reconstructable from
+object storage**, not just when a global checkpoint or a lease says so.
+
+**Precise safety condition.** Define generation *g*'s content as durable once
+`ObjectStoreCommitHeadPublisher#publishCommitAsHead` has returned `true` for it (i.e. it's
+reflected in the shard head, not merely uploaded — an uploaded-but-unpublished manifest is not
+yet the shard's authoritative state, see `ObjectStoreCommitPublisher`'s own "never the reverse"
+invariant). Given that:
+
+1. **Local Lucene commits**: once generation *g*'s manifest is durable, every local commit older
+   than *g* may be deleted immediately — a strictly more aggressive version of "safe commit" than
+   `CombinedDeletionPolicy`'s, since it doesn't wait for the global checkpoint to catch up, only
+   for object-store durability. The current (newest) local commit is always kept regardless
+   (`IndexWriter` needs an open commit point to keep writing) — this is unconditional, not a
+   policy choice.
+2. **Local translog**: once every operation in translog generation *t* is covered by a durably
+   published manifest (i.e. *t*'s highest seq-no ≤ the durable generation's `max_seq_no`) *and*
+   every operation in *t* has itself been durably group-committed to a WAL chunk (already true by
+   construction — `WalMirroringTranslog` "retries a transient mirror failure before failing the
+   write", so WAL durability and local-translog-write are effectively synchronous with the
+   operation's ack), generation *t* may be deleted. In practice this means local translog beyond
+   the currently-open generation only needs to survive until the *next* flush/publish cycle
+   completes, not until a global checkpoint converges across replicas that don't exist.
+3. **What must still be respected regardless of durability**: any local commit currently
+   snapshotted (`CombinedDeletionPolicy#acquireIndexCommit`, e.g. a core-snapshot-repository
+   operation still pointed at this shard) is never deleted out from under it — this plugin's own
+   PITR/clone durability (§6.5, §14) is served from object storage, not local disk, so it never
+   needs a local-commit snapshot lock, but a operator-triggered legacy snapshot to a non-serverless
+   repository (if ever allowed on a serverless index, which is a separate open question) would.
+
+**Two-part mechanism, gated by what's actually pluggable today.**
+
+- **Translog retention is implementable now, no core changes.** `InternalEngine.getTranslogDeletionPolicy(EngineConfig)`
+  is already `protected` and overridable (`InternalEngine.java:989`) — the same seam
+  `ObjectStoreWriterEngine` already uses for `newMergeScheduler()`. A serverless
+  `TranslogDeletionPolicy` can implement condition 2 above directly: track the highest durably
+  published generation's covered seq-no (already known to `ObjectStoreWriterEngine`, since it's
+  the return value of its own publish calls) and floor `minTranslogGenRequired` there instead of
+  deferring to the safe-commit/retention-lease chain.
+- **Local commit retention needs one small, additive core seam first.** Unlike the translog
+  policy, `CombinedDeletionPolicy` construction is hardcoded inline in `InternalEngine`'s
+  constructor (`InternalEngine.java:288-293`) — there is no `newCombinedDeletionPolicy()` hook the
+  way there's a `newMergeScheduler()` one. §15's core-seams list already (incorrectly) marks
+  "protected deletion policy" as done under the same checkmark as the merge scheduler; it isn't,
+  for the commit-level policy specifically — corrected there. The needed seam is small and
+  additive (a `protected IndexDeletionPolicy newCombinedDeletionPolicy(...)` factory hook mirroring
+  the existing merge-scheduler pattern, defaulting to today's behavior for every non-overriding
+  engine), not a redesign of `CombinedDeletionPolicy` itself.
+
+**Open decision (product/risk-tolerance, not engineering) — how aggressive:**
+
+- **Option A — trim to the bare minimum immediately on durability confirmation**: one local
+  commit, translog back only to the last durable generation. Maximizes disk savings; fully
+  consistent with "No peer recovery, no segment copy" already being the stated design. A same-node
+  restart between publish cycles pays a manifest+WAL replay instead of a free local reopen for
+  whatever wasn't yet durable at crash time — bounded by publication frequency, same bound §7.1
+  already accepts for cross-node failover.
+- **Option B — retain a short bounded safety margin** (e.g. the last 2-3 commits / a few minutes
+  of translog) even past durability confirmation, decaying that margin over time rather than
+  collapsing it instantly. Costs a small, fixed amount of the disk savings back; buys a local
+  fast-path fallback if a subtle bug in `ObjectStoreCommitMaterializer` or manifest/WAL replay
+  ever made remote reconstruction wrong or unavailable at the exact moment a same-node restart
+  needed it — worth deciding with unusually low modeling confidence and no way to formally verify
+  a code path's absence of bugs, only its presence.
+
+This RFC's default recommendation is **Option A**, on the grounds that Option B's "safety margin"
+only helps if the manifest+WAL replay path has a bug *and* that bug specifically only manifests
+on a fresh reconstruction rather than during the original publish's own read-back — an unlikely
+combination — while Option A directly delivers the section's whole stated goal. But this is the
+one call in this section that's a judgment about acceptable risk, not a derived fact, and should
+be made explicitly before implementation starts, not defaulted into by whichever margin is easiest
+to code.
+
+**Milestone** (not yet met, blocked on the open decision above): a serverless writer shard, under
+sustained indexing, holds local Lucene commits and translog generations proportional to one
+publish cycle's worth of data, not to index age or total data volume — verified by asserting an
+upper bound on local disk usage that does not grow with wall-clock time under constant write rate,
+the same shape of milestone §16 Phase 2 already states but currently cannot meet.
+
 ### 7.2 Reader engine
 
 `ObjectStoreReaderEngine extends Engine` directly — a sibling of `ReadOnlyEngine`/`NoOpEngine`,
@@ -626,8 +735,12 @@ RFC claims them deliberately rather than leaving them implicit:
 **Core seams (small, generally useful, some already done on this branch):**
 
 1. ✅ Per-shard-role engine dispatch: `EnginePlugin.getEngineFactory(IndexSettings, ShardRouting)`.
-2. ✅ `InternalEngine` extensibility: protected merge scheduler/deletion policy/reader managers,
-   overridable `newMergeScheduler()`.
+2. ✅ `InternalEngine` extensibility: protected merge scheduler and reader managers, overridable
+   `newMergeScheduler()`; `TranslogDeletionPolicy` is also already overridable
+   (`getTranslogDeletionPolicy(EngineConfig)`). **Not yet true for the commit-level policy**:
+   `CombinedDeletionPolicy` construction is hardcoded inline in `InternalEngine`'s constructor
+   (no `newCombinedDeletionPolicy()` hook exists) — needed for §7.1.1's local-commit-retention
+   design, previously miscategorized here as already done.
 3. Flush/commit lifecycle hook: a post-commit callback carrying the commit + new-file set
    (needed by the writer engine's publication step; today reachable only via deletion-policy
    gymnastics).
@@ -686,7 +799,11 @@ already superseded by a higher term has its engine failed by the very next flush
 subsequent writes are then also rejected. Still open: local Lucene commit/translog retention policy
 once object storage becomes the durability source of truth (right now local files are kept exactly
 as a normal `InternalEngine` would keep them, so this is belt-and-suspenders durability today rather
-than the disk-bandwidth savings &sect;5/&sect;6 target). Milestone (not yet met): an index whose
+than the disk-bandwidth savings &sect;5/&sect;6 target). **Design written up, not yet implemented**:
+see &sect;7.1.1 for the full safety argument, the two-part mechanism (translog retention
+implementable now via an already-overridable hook; local-commit retention needs one small additive
+core seam first, tracked in &sect;15), and the one open product/risk-tolerance decision (how
+aggressively to trim) that should be resolved before implementation starts. Milestone (not yet met): an index whose
 durability is object-store-only survives `kill -9` of its node with zero data loss (durable ack
 mode), recovering by manifest+WAL replay.
 
