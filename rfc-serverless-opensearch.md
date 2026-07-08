@@ -316,20 +316,35 @@ invariant). Given that:
   combines this policy's floor with a *second*, still-untouched floor derived from
   `CombinedDeletionPolicy`'s safe-commit tracking (core's own global-checkpoint-driven retention) --
   so until local commit retention (below) is also implemented, the *combined* effective retention
-  is still bounded by whichever of the two is more conservative. Verified end-to-end against a real
-  `EngineTestCase`-provisioned engine: the durability watermark advances correctly after each
-  successful publish, and old translog generations are measurably trimmed as durability catches
-  up, but not yet all the way down to the current generation (that requires the commit-level half
-  too) -- the test asserts exactly this partial, honest result, not the full target state.
-- **Local commit retention needs one small, additive core seam first.** Unlike the translog
-  policy, `CombinedDeletionPolicy` construction is hardcoded inline in `InternalEngine`'s
-  constructor (`InternalEngine.java:288-293`) — there is no `newCombinedDeletionPolicy()` hook the
-  way there's a `newMergeScheduler()` one. §15's core-seams list already (incorrectly) marks
-  "protected deletion policy" as done under the same checkmark as the merge scheduler; it isn't,
-  for the commit-level policy specifically — corrected there. The needed seam is small and
-  additive (a `protected IndexDeletionPolicy newCombinedDeletionPolicy(...)` factory hook mirroring
-  the existing merge-scheduler pattern, defaulting to today's behavior for every non-overriding
-  engine), not a redesign of `CombinedDeletionPolicy` itself.
+  is still bounded by whichever of the two is more conservative.
+- **Local commit retention — implemented.** The actual core seam needed turned out smaller than
+  the `newCombinedDeletionPolicy()` factory hook originally proposed here: `CombinedDeletionPolicy`
+  itself doesn't need to be swappable, because its constructor already accepted a `LongSupplier`
+  for the global checkpoint as a plain argument (`InternalEngine.java`, the call site building
+  it) — that supplier is a pure "safe to delete at or below this seq-no" threshold, never a floor
+  that suppresses deletion, so widening it can only permit deleting *more*, never less, than core's
+  default. The seam added is `Engine#globalCheckpointSupplierForCombinedDeletionPolicy(TranslogManager)`,
+  `protected`, defaulting to exactly what `InternalEngine` always passed before this method existed
+  (`translogManagerRef::getLastSyncedGlobalCheckpoint`) for every engine that doesn't override it.
+  `ObjectStoreWriterEngine` overrides it to return `max(real global checkpoint, the same durability
+  watermark the translog policy above already tracks)`, reusing that single watermark as the one
+  source of truth for both halves rather than tracking a second one. §15's core-seams list
+  correction (below) reflects the seam that actually landed, not the originally-sketched one.
+
+  Verified end-to-end against a real `EngineTestCase`-provisioned engine, and against a real,
+  structural finding worth recording: retention cannot ever fully catch up to the very newest
+  local commit within the same flush that created it, because `CombinedDeletionPolicy#onCommit`
+  fires synchronously as part of the Lucene commit itself (via Lucene's own `IndexDeletionPolicy`
+  callback), which happens *before* `ObjectStoreWriterEngine`'s own durability watermark for that
+  same flush can be updated (durability can only be confirmed once `publishCommitAsHead` returns,
+  which requires the commit to already exist locally) — so retention is always exactly one flush
+  cycle behind, both for local commits (settles on "the previous flush's commit, plus the current
+  one, always" — 2 commits in steady state, not 1) and for translog generations (current
+  generation minus one, not the current generation itself). This is not a shortcoming to fix; it's
+  the same "proportional to one publish cycle" bound this section's own milestone already states,
+  now confirmed by a real, deterministic test rather than assumed. `InternalEngineTests` and
+  `CombinedDeletionPolicyTests` (core's own regression suites for exactly this machinery) pass
+  unchanged, confirming the default (non-overriding) behavior is untouched for every other engine.
 
 **Open decision (product/risk-tolerance, not engineering) — how aggressive:**
 
@@ -355,13 +370,15 @@ one call in this section that's a judgment about acceptable risk, not a derived 
 be made explicitly before implementation starts, not defaulted into by whichever margin is easiest
 to code.
 
-**Milestone** (partially met): translog retention is now durability-driven and measurably trims
-old generations as publishes succeed (implemented and tested, see above). Not yet fully met: local
-Lucene commit retention is unchanged (still core's default, safe-commit-driven policy) until the
-core seam above lands, so the *combined* system-level disk-usage bound this milestone describes —
-proportional to one publish cycle's worth of data, not to index age or total data volume — is not
-yet reachable end-to-end. The open product/risk-tolerance decision above (Option A vs. B) still
-needs resolving before the commit-retention half is implemented, not just designed.
+**Milestone — met** (Option A, as recommended): both translog and local Lucene commit retention are
+now durability-driven, implemented, and verified end-to-end against a real engine. A serverless
+writer shard's local disk footprint is proportional to one publish cycle's worth of data (in
+steady state: the previous flush's safe commit plus the current one, and translog back only to the
+previous flush's generation) — not to index age or total data volume, and not gated on a real
+global checkpoint that, for a shard with no replicas, would otherwise never advance on its own.
+`InternalEngineTests`/`CombinedDeletionPolicyTests` (core's own regression suites) and this
+plugin's full test suite pass unchanged, confirming every other engine's default behavior is
+untouched.
 
 ### 7.2 Reader engine
 
@@ -756,10 +773,14 @@ RFC claims them deliberately rather than leaving them implicit:
 1. ✅ Per-shard-role engine dispatch: `EnginePlugin.getEngineFactory(IndexSettings, ShardRouting)`.
 2. ✅ `InternalEngine` extensibility: protected merge scheduler and reader managers, overridable
    `newMergeScheduler()`; `TranslogDeletionPolicy` is also already overridable
-   (`getTranslogDeletionPolicy(EngineConfig)`). **Not yet true for the commit-level policy**:
-   `CombinedDeletionPolicy` construction is hardcoded inline in `InternalEngine`'s constructor
-   (no `newCombinedDeletionPolicy()` hook exists) — needed for §7.1.1's local-commit-retention
-   design, previously miscategorized here as already done.
+   (`getTranslogDeletionPolicy(EngineConfig)`). ✅ Commit-level retention is now also pluggable,
+   landed on this branch: `Engine#globalCheckpointSupplierForCombinedDeletionPolicy(TranslogManager)`,
+   a small `protected` hook wrapping the `LongSupplier` argument `InternalEngine` already passed
+   to `CombinedDeletionPolicy`'s constructor, defaulting to today's unchanged behavior for every
+   non-overriding engine. Smaller than the `newCombinedDeletionPolicy()` factory hook originally
+   sketched here — `CombinedDeletionPolicy` itself never needed to be swappable, only the threshold
+   value fed into it, since that value is a pure "safe to delete at or below" floor, never a
+   suppressor of deletion. See §7.1.1 for the full design and `ObjectStoreWriterEngine`'s use of it.
 3. Flush/commit lifecycle hook: a post-commit callback carrying the commit + new-file set
    (needed by the writer engine's publication step; today reachable only via deletion-policy
    gymnastics).
@@ -815,18 +836,23 @@ if this writer has been fenced out -- verified end-to-end via a real `EngineTest
 engine (`test:framework` already carries `EngineTestCase`, so this needed no new build plumbing):
 one test confirms a flush publishes a manifest onto the shard head, another confirms a writer
 already superseded by a higher term has its engine failed by the very next flush, including that
-subsequent writes are then also rejected. **Local translog retention is now durability-driven, not
-age/size-based** (&sect;7.1.1): `ObjectStoreDurabilityTranslogDeletionPolicy` floors retention on a
-watermark advanced only after `publishCommitAsHead` actually returns `true`, verified end-to-end
-against a real engine (watermark advances correctly; old generations measurably trim as durability
-catches up). **Still open**: local Lucene commit retention (right now local commits are still kept
-exactly as a normal `InternalEngine` would keep them, via core's unchanged
-`CombinedDeletionPolicy`) — needs the small additive core seam &sect;7.1.1/&sect;15 describe
-(`newCombinedDeletionPolicy()`, mirroring the existing `newMergeScheduler()` pattern) before it can
-be implemented the same way. Until then the *combined* disk-usage bound below is only partially
-reachable. Milestone (partially met, see &sect;7.1.1): an index whose
-durability is object-store-only survives `kill -9` of its node with zero data loss (durable ack
-mode), recovering by manifest+WAL replay.
+subsequent writes are then also rejected. **Local commit/translog retention is now durability-driven
+end to end** (&sect;7.1.1, both parts done): `ObjectStoreDurabilityTranslogDeletionPolicy` floors
+translog retention on a watermark advanced only after `publishCommitAsHead` actually returns
+`true`; `Engine#globalCheckpointSupplierForCombinedDeletionPolicy` (a small additive core seam,
+smaller than the `newCombinedDeletionPolicy()` originally sketched -- see &sect;15) lets
+`ObjectStoreWriterEngine` widen the same watermark into `CombinedDeletionPolicy`'s own safe-commit
+threshold, so local Lucene commits no longer wait on a real global checkpoint that a shard with no
+replicas would otherwise never advance. Verified end-to-end against a real engine, including the
+structural finding that retention is always exactly one flush cycle behind (not the literal newest
+commit) since `CombinedDeletionPolicy#onCommit` fires synchronously as part of the very commit it's
+evaluating -- matching this section's own "proportional to one publish cycle" milestone language,
+not a shortcoming. Core's own `InternalEngineTests`/`CombinedDeletionPolicyTests` pass unchanged. The disk-usage-bound
+half of &sect;7.1.1's own milestone is now met as a result. Separately, still not yet met: an index
+whose durability is object-store-only survives `kill -9` of its node with zero data loss (durable
+ack mode), recovering by manifest+WAL replay -- no crash-survival integration test exercising this
+exists yet; the retention work above makes local disk usage bounded, it doesn't by itself prove
+crash recovery.
 
 **Phase 3 — Reader engine (materializer and open-from-manifest done; refresh-to-newer-generation
 and notification wiring still open).** `ObjectStoreCommitMaterializer` fetches every file a

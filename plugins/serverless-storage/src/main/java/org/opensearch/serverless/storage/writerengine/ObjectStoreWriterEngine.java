@@ -16,6 +16,7 @@ import org.opensearch.index.engine.EngineException;
 import org.opensearch.index.engine.InternalEngine;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.translog.TranslogDeletionPolicy;
+import org.opensearch.index.translog.TranslogManager;
 import org.opensearch.serverless.storage.directory.ShardDirectory;
 import org.opensearch.serverless.storage.directory.ShardDirectoryEntry;
 import org.opensearch.serverless.storage.directory.ShardRole;
@@ -27,6 +28,7 @@ import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
+import java.util.function.LongSupplier;
 
 /**
  * An {@link InternalEngine} whose durability is object-store-native (rfc-serverless-opensearch.md
@@ -141,6 +143,26 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     protected TranslogDeletionPolicy getTranslogDeletionPolicy(EngineConfig engineConfig) {
         translogDeletionPolicy = new ObjectStoreDurabilityTranslogDeletionPolicy();
         return translogDeletionPolicy;
+    }
+
+    /**
+     * The other half of &sect;7.1.1's local retention design: widens the threshold {@link
+     * org.opensearch.index.engine.CombinedDeletionPolicy} uses to decide which local Lucene
+     * commits are safe to delete, from just the translog's last-synced global checkpoint to
+     * {@code max(that checkpoint, the same durability watermark the translog policy above already
+     * tracks)}. This can only permit deleting <em>more</em> than core's default would (see this
+     * hook's own javadoc on {@link org.opensearch.index.engine.Engine}) -- reusing {@link
+     * #translogDeletionPolicy}'s watermark rather than tracking a second one keeps "what's
+     * durable" a single source of truth shared by both halves of this design. Called from within
+     * {@code InternalEngine}'s constructor before this class's own field initializers would
+     * normally run, same as {@link #getTranslogDeletionPolicy}, but that's not a hazard here: the
+     * returned supplier only dereferences {@code translogDeletionPolicy} lazily, when actually
+     * invoked (well after construction completes), and by then it's already been assigned --
+     * {@link #getTranslogDeletionPolicy} runs earlier in the same constructor.
+     */
+    @Override
+    protected LongSupplier globalCheckpointSupplierForCombinedDeletionPolicy(TranslogManager translogManagerRef) {
+        return () -> Math.max(translogManagerRef.getLastSyncedGlobalCheckpoint(), translogDeletionPolicy.durablyPublishedMaxSeqNo());
     }
 
     /** The durability-driven translog deletion policy this engine constructed -- test-only visibility, not part of the plugin's contract. */

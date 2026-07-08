@@ -289,7 +289,7 @@ public class InternalEngine extends Engine {
                     logger,
                     translogDeletionPolicy,
                     softDeletesPolicy,
-                    translogManager::getLastSyncedGlobalCheckpoint
+                    globalCheckpointSupplierForCombinedDeletionPolicy(translogManagerRef)
                 );
                 this.localCheckpointTracker = createLocalCheckpointTracker(localCheckpointTrackerSupplier);
                 this.isContextAwareEnabled = engineConfig.getIndexSettings().isContextAwareEnabled();

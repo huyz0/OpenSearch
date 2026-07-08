@@ -316,24 +316,64 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
                 engine.translogDeletionPolicyForTesting().durablyPublishedMaxSeqNo()
             );
 
-            // Translog#trimUnreferencedReaders combines this policy's floor with a second,
-            // still-untouched floor derived from CombinedDeletionPolicy's safe-commit tracking
-            // (core's own global-checkpoint-driven retention -- see
-            // TranslogDeletionPolicy#getLocalCheckpointOfSafeCommit). Rfc-serverless-opensearch.md
-            // &sect;7.1.1's design is explicitly two-part: this test only exercises the translog
-            // half (Part 1, done here); the commit-retention half (Part 2) needs a small additive
-            // core seam that doesn't exist yet, so the *combined* floor in this test is still
-            // bounded by whichever of the two is more conservative -- proving this policy's own
-            // contribution moved at all (past the very first generation) is what's actually
-            // achievable and correct to assert without Part 2.
+            // Translog#trimUnreferencedReaders combines this policy's own floor with a second
+            // floor derived from CombinedDeletionPolicy's safe-commit tracking
+            // (TranslogDeletionPolicy#getLocalCheckpointOfSafeCommit), which -- even with
+            // &sect;7.1.1 Part 2's widened globalCheckpointSupplierForCombinedDeletionPolicy --
+            // is necessarily always exactly one flush cycle behind: CombinedDeletionPolicy#onCommit
+            // fires synchronously as part of the Lucene commit created by super.commitIndexWriter,
+            // which happens *before* this flush's own recordDurablePublication call (durability can
+            // only be confirmed after the commit whose content it covers already exists locally).
+            // So the achievable floor is "proportional to one publish cycle," exactly the shape
+            // &sect;7.1.1's milestone states -- not literally always the single newest generation.
             Translog translog = org.opensearch.index.engine.EngineTestCase.getTranslog(engine);
-            assertTrue(
-                "durable publication must trim at least the earliest generation once it's fully covered",
-                translog.getMinFileGeneration() > 1
+            assertEquals(
+                "retention should lag the current generation by exactly one flush cycle, not more",
+                translog.currentFileGeneration() - 1,
+                translog.getMinFileGeneration()
             );
-            assertTrue(
-                "the retained generation range must never exceed the current generation",
-                translog.getMinFileGeneration() <= translog.currentFileGeneration()
+        } finally {
+            IOUtils.close(engine, lastOpenedStore);
+        }
+    }
+
+    public void testDurablePublicationLetsOldLocalLuceneCommitsBeDeletedAheadOfTheGlobalCheckpoint() throws Exception {
+        // §7.1.1 Part 2: globalCheckpointSupplierForCombinedDeletionPolicy widens the safe-commit
+        // threshold CombinedDeletionPolicy uses with the same durability watermark the translog
+        // policy tracks -- so old local commits should be deletable even though nothing in this
+        // bare EngineTestCase-provisioned engine ever advances the *real* global checkpoint (there
+        // is no replica, and nothing here calls updateGlobalCheckpointOnReplica/markSeqNoAsPersisted
+        // paths a full IndexShard would). If retention still depended solely on the real global
+        // checkpoint, every one of these commits would remain forever.
+        //
+        // The achievable floor is 2, not 1: CombinedDeletionPolicy#onCommit fires synchronously as
+        // part of the very commit it's evaluating, before this flush's own recordDurablePublication
+        // call can mark that commit's content durable -- so the "safe" commit it settles on for
+        // this flush is always the *previous* flush's (by then durable), and the newest commit is
+        // always kept regardless (IndexWriter needs an open commit point to keep writing). Both are
+        // retained; nothing older than that survives, matching &sect;7.1.1's "one publish cycle" bound.
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+
+        ObjectStoreWriterEngine engine = openWriterEngine(shardStateStore, commitPublisher);
+        try {
+            index(engine, "1");
+            engine.flush(true, true);
+            index(engine, "2");
+            engine.flush(true, true);
+            index(engine, "3");
+            engine.flush(true, true);
+
+            int commitCount = DirectoryReader.listCommits(lastOpenedStore.directory()).size();
+            assertEquals(
+                "with every generation durably published, only the safe commit and the newest commit should remain",
+                2,
+                commitCount
             );
         } finally {
             IOUtils.close(engine, lastOpenedStore);
