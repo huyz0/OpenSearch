@@ -93,6 +93,32 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     private final PitrRetentionSchedulerTask pitrRetentionTask;
     private final WalChunkService walChunkService;
 
+    /**
+     * The fencing snapshot verified sound in {@code plugins/serverless-storage/formal/WalReplayFencing.tla}
+     * (its {@code leaseTransferWalPos}): an exclusive upper bound on WAL chunk sequences that
+     * existed at the moment this engine activated, captured as early as possible -- before {@code
+     * super(engineConfig)} even runs, ahead of any of this engine's own construction work including
+     * local translog recovery -- so it is as tight a bound on "chunks that existed before this
+     * writer took over" as this architecture can currently produce. Not yet consumed by anything:
+     * no WAL-replay recovery mechanism exists yet to use it as a filter bound (see
+     * rfc-serverless-opensearch.md &sect;16 Phase 2's "still open" note) -- this field exists so
+     * that mechanism, whenever it's built, has the value it needs already captured at the right
+     * moment, rather than needing engine-construction-timing changes of its own.
+     *
+     * <p><b>Honest limitation, not yet closed</b>: this narrows the race the TLA+ model's
+     * {@code AcquireLease} action captures atomically with the term change itself, but isn't
+     * perfectly equivalent to it -- by the time this engine's constructor runs, core's cluster
+     * coordination has already decided this node holds the new term (see &sect;7.1's "term
+     * authority bridge": term authority is still borrowed from core cluster coordination today, not
+     * yet a metadata-plane CAS event with its own natural place to capture this atomically). A
+     * fully atomic capture needs lease acquisition to migrate to the metadata plane, which is
+     * separately still-open future work, not something this snapshot alone closes.
+     *
+     * <p>{@code -1} when WAL mirroring is disabled ({@link #walChunkService} is {@code null}) --
+     * there is no WAL chunk stream to bound in that case.
+     */
+    private final long activationWalPosition;
+
     // Deliberately has NO initializer expression. InternalEngine's own constructor calls
     // getTranslogDeletionPolicy(EngineConfig) (overridden below) from inside super(engineConfig),
     // i.e. before this class's own field initializers would normally run -- an explicit
@@ -116,6 +142,9 @@ public class ObjectStoreWriterEngine extends InternalEngine {
      * across two unrelated engines' construction.
      */
     private static final ThreadLocal<WalChunkService> CONSTRUCTION_WAL_CHUNK_SERVICE = new ThreadLocal<>();
+
+    /** Bridges {@link #activationWalPosition} across {@code super(...)} the same way as {@link #CONSTRUCTION_WAL_CHUNK_SERVICE} above. */
+    private static final ThreadLocal<Long> CONSTRUCTION_ACTIVATION_WAL_POSITION = new ThreadLocal<>();
 
     public ObjectStoreWriterEngine(
         EngineConfig engineConfig,
@@ -168,6 +197,8 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     ) {
         super(engineConfig);
         CONSTRUCTION_WAL_CHUNK_SERVICE.remove();
+        this.activationWalPosition = CONSTRUCTION_ACTIVATION_WAL_POSITION.get();
+        CONSTRUCTION_ACTIVATION_WAL_POSITION.remove();
         this.headPublisher = headPublisher;
         this.indexUuid = engineConfig.getShardId().getIndex().getUUID();
         this.shardId = engineConfig.getShardId().getId();
@@ -204,9 +235,17 @@ public class ObjectStoreWriterEngine extends InternalEngine {
         return translogDeletionPolicy;
     }
 
-    /** Sets {@link #CONSTRUCTION_WAL_CHUNK_SERVICE}; returns {@code null} so it can be used as the last argument evaluated before {@code super(...)}. */
+    /**
+     * Sets {@link #CONSTRUCTION_WAL_CHUNK_SERVICE} and, before anything else about this engine's
+     * activation happens, snapshots {@link #activationWalPosition} into {@link
+     * #CONSTRUCTION_ACTIVATION_WAL_POSITION} -- capturing it here, ahead of {@code super(...)}, is
+     * what makes it as tight a bound as this architecture can currently produce (see {@link
+     * #activationWalPosition}'s own javadoc). Returns {@code null} so it can be used as the last
+     * argument evaluated before {@code super(...)}.
+     */
     private static Void beginConstruction(WalChunkService walChunkService) {
         CONSTRUCTION_WAL_CHUNK_SERVICE.set(walChunkService);
+        CONSTRUCTION_ACTIVATION_WAL_POSITION.set(walChunkService == null ? -1L : walChunkService.currentChunkSequenceUpperBound());
         return null;
     }
 
@@ -280,6 +319,11 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     /** The WAL-mirroring translog this engine constructed, or {@code null} if WAL mirroring is disabled -- test-only visibility. */
     WalMirroringTranslog walMirroringTranslogForTesting() {
         return walMirroringTranslog;
+    }
+
+    /** See {@link #activationWalPosition}'s own javadoc -- test-only visibility. */
+    long activationWalPositionForTesting() {
+        return activationWalPosition;
     }
 
     /**

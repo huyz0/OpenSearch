@@ -436,4 +436,90 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
             IOUtils.close(engine, lastOpenedStore);
         }
     }
+
+    public void testActivationWalPositionCapturesOnlyWhatExistedBeforeThisEngineActivated() throws Exception {
+        // The fencing snapshot verified sound in formal/WalReplayFencing.tla: chunks written
+        // before this engine activates must be captured; chunks written after must not be --
+        // proving the boundary, not just that some value gets set.
+        FsBlobStore walBlobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer walBlobContainer = new FsBlobContainer(walBlobStore, BlobPath.cleanPath(), walBlobStore.path());
+        org.opensearch.serverless.storage.wal.WalChunkService walChunkService = new org.opensearch.serverless.storage.wal.WalChunkService(
+            walBlobContainer,
+            "shared-epoch"
+        );
+
+        // Simulate a prior (possibly now-stale) writer having already appended chunks under the
+        // same shared epoch, before this engine ever activates.
+        walChunkService.append(
+            new org.opensearch.serverless.storage.wal.WalRecord("other-idx", 0, 1, 0, "pre-activation".getBytes("UTF-8"))
+        );
+        walChunkService.flush();
+        long chunksBeforeActivation = walChunkService.currentChunkSequenceUpperBound();
+        assertTrue("test setup should have produced at least one prior chunk", chunksBeforeActivation > 0);
+
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+
+        Store store = createStore();
+        lastOpenedStore = store;
+        store.createEmpty(defaultSettings.getIndexVersionCreated().luceneVersion);
+        java.nio.file.Path translogPath = createTempDir();
+        String translogUuid = Translog.createEmptyTranslog(translogPath, SequenceNumbers.NO_OPS_PERFORMED, shardId, primaryTerm.get());
+        store.associateIndexWithNewTranslog(translogUuid);
+        EngineConfig engineConfig = config(defaultSettings, store, translogPath, newMergePolicy(), null);
+
+        ObjectStoreWriterEngine engine = new ObjectStoreWriterEngine(
+            engineConfig,
+            new ObjectStoreCommitHeadPublisher(commitPublisher, shardStateStore),
+            shardDirectory,
+            LOCAL_NODE_ID,
+            null,
+            walChunkService
+        );
+        try {
+            assertEquals(
+                "the snapshot taken at activation must equal exactly what existed just before it, no more and no less",
+                chunksBeforeActivation,
+                engine.activationWalPositionForTesting()
+            );
+
+            // Chunks written after activation must not retroactively change the snapshot already taken.
+            engine.translogManager().recoverFromTranslog(translogHandler, engine.getProcessedLocalCheckpoint(), Long.MAX_VALUE);
+            index(engine, "1");
+            engine.flush(true, true);
+            assertTrue(
+                "activity after activation must have written further chunks (the WAL watermark test elsewhere already covers this directly)",
+                walChunkService.currentChunkSequenceUpperBound() > chunksBeforeActivation
+            );
+            assertEquals(
+                "the snapshot must stay fixed at its activation-time value regardless of subsequent WAL activity",
+                chunksBeforeActivation,
+                engine.activationWalPositionForTesting()
+            );
+        } finally {
+            IOUtils.close(engine, lastOpenedStore);
+        }
+    }
+
+    public void testActivationWalPositionIsMinusOneWhenWalMirroringIsDisabled() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+
+        ObjectStoreWriterEngine engine = openWriterEngine(shardStateStore, commitPublisher);
+        try {
+            assertEquals(-1L, engine.activationWalPositionForTesting());
+        } finally {
+            IOUtils.close(engine, lastOpenedStore);
+        }
+    }
 }

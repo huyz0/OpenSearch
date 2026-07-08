@@ -249,12 +249,33 @@ being unconditional). Two replay strategies checked side by side, same pattern a
   exhaustively, across the complete reachable state space for the model's bound (603,722 distinct
   states, search depth 16, 0 states left on the queue).
 
-**Still not implemented in Java.** The verified fix requires `ShardHead` to record
-`leaseTransferWalPos` as part of the same CAS that grants a new term (whoever grants a lease would
-need to read the shared `WalChunkService`'s current WAL length at that moment and embed it in the
-new `ShardHead`), and an actual replay/recovery mechanism that filters by both term and this
-recorded position -- neither exists yet. `filterByShardAndMinimumTerm` and the WAL mirroring it
-supports remain prerequisites for, not a safe substitute for, that mechanism -- see &sect;16 Phase
+**The fencing snapshot itself is now implemented** -- but not as originally sketched. `ShardHead`
+was not the right place for it: `ShardHead#withNewLease` has no caller anywhere in the codebase
+today (lease acquisition is not yet wired into any real activation/failover path; term authority is
+still borrowed from core cluster coordination, per &sect;7.1's own "term authority bridge" note).
+The real "this node just became the writer under a new term" event today is
+`ObjectStoreWriterEngine`'s own construction, not a not-yet-existing metadata-plane lease grant.
+`WalChunkService#currentChunkSequenceUpperBound()` exposes the real-world analogue of the model's
+`Len(wal)`, and `ObjectStoreWriterEngine#activationWalPosition` snapshots it as early as possible --
+before `super(engineConfig)` even runs, ahead of any of this engine's own construction work
+including local translog recovery -- via the same `ThreadLocal`-bridging pattern
+`createTranslogManager` already needed to cross the constructor-ordering boundary. Verified with
+tests proving the actual boundary, not just that a value gets set: chunks written before activation
+are captured, chunks written after are not, and the snapshot stays fixed regardless of subsequent
+WAL activity.
+
+**Honest limitation, stated in the field's own javadoc, not glossed over**: this narrows the race
+the TLA+ model's `AcquireLease` action captures atomically with the term change itself, but isn't
+perfectly equivalent to it -- by the time `ObjectStoreWriterEngine`'s constructor runs, core cluster
+coordination has *already* decided this node holds the new term, so there's a small residual gap
+between the true term change and this snapshot that a fully atomic metadata-plane lease-grant CAS
+(still future work, per &sect;7.1) would close but this cannot.
+
+**Still not implemented: the replay/recovery mechanism itself.** `activationWalPosition` is captured
+and ready, but nothing yet consumes it -- there is still no code path that reads a manifest, fetches
+the WAL chunks past its `WalPosition`, filters them by both term and this position bound, and
+replays them into a fresh local Lucene index. `filterByShardAndMinimumTerm`, WAL mirroring, and now
+this snapshot are all prerequisites for, not a substitute for, that mechanism -- see &sect;16 Phase
 2's "still open" note.
 
 ### 6.5 Garbage collection and leases

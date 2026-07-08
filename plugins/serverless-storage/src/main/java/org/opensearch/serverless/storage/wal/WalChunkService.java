@@ -127,6 +127,20 @@ public final class WalChunkService {
     }
 
     /**
+     * The chunk sequence that will be used <em>next</em>, under this epoch -- i.e. an exclusive
+     * upper bound on every chunk sequence written so far. This is the real-world analogue of
+     * {@code WalReplayFencing.tla}'s {@code Len(wal)}: a writer activating under a new term can
+     * snapshot this value as early as possible (see {@code ObjectStoreWriterEngine}'s own use of
+     * it) as a fencing bound for a future replay -- anything appended at or after this sequence is
+     * excluded regardless of what term it claims, closing the gap a term-only filter (see {@link
+     * WalChunkReader#filterByShardAndMinimumTerm}) leaves open on its own. See that model's own
+     * STATUS note for the full verification result and what's still not wired to consume this.
+     */
+    public synchronized long currentChunkSequenceUpperBound() {
+        return nextChunkSequence.get();
+    }
+
+    /**
      * Pulls every currently-buffered record belonging to {@code key} out of the shared buffer and
      * writes them into their own dedicated chunk immediately, leaving every other shard's buffered
      * records (and their own per-shard byte counters) untouched.
