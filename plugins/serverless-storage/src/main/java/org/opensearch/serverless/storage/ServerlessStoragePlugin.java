@@ -349,7 +349,12 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                     shardDirectory,
                     localNodeId,
                     pitrRetentionConfig,
-                    sharedWalChunkService
+                    sharedWalChunkService,
+                    // Cross-node failover materializes at most once per activation (rfc-serverless-opensearch.md
+                    // &sect;7.1.2), not per-query like a reader shard -- no caching layer needed,
+                    // straight to the bundle store, matching the "caching is wired in for reader
+                    // shards only" note on the reader path just above.
+                    new ObjectStoreCommitMaterializer(bundleStore)
                 )
             );
         } catch (IOException e) {

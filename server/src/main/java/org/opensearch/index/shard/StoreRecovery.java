@@ -58,6 +58,9 @@ import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.engine.Engine;
 import org.opensearch.index.engine.EngineException;
+import org.opensearch.index.engine.EngineFactory;
+import org.opensearch.index.engine.exec.EngineBackedIndexerFactory;
+import org.opensearch.index.engine.exec.IndexerFactory;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.remote.RemoteStorePathStrategy;
 import org.opensearch.index.remote.RemoteStoreUtils;
@@ -714,19 +717,28 @@ final class StoreRecovery {
                 try {
                     si = store.readLastCommittedSegmentsInfo();
                 } catch (Exception e) {
-                    String files = "_unknown_";
-                    try {
-                        files = Arrays.toString(store.directory().listAll());
-                    } catch (Exception inner) {
-                        inner.addSuppressed(e);
-                        files += " (failure=" + ExceptionsHelper.detailedMessage(inner) + ")";
-                    }
-                    if (indexShouldExists) {
-                        throw new IndexShardRecoveryException(
-                            shardId,
-                            "shard allocated for local recovery (post api), should exist, but doesn't, current files: " + files,
-                            e
-                        );
+                    if (indexShouldExists && recoverMissingLocalStoreFromEngine(indexShard, store)) {
+                        // The engine says it materialized this shard's last durable state from
+                        // elsewhere -- re-read rather than fail outright (rfc-serverless-opensearch.md
+                        // &sect;7.1.2's "no peer recovery" writer shards are the motivating case: no
+                        // node's local disk is ever the shard's authoritative copy, so finding
+                        // nothing here is the expected, not exceptional, starting state).
+                        si = store.readLastCommittedSegmentsInfo();
+                    } else {
+                        String files = "_unknown_";
+                        try {
+                            files = Arrays.toString(store.directory().listAll());
+                        } catch (Exception inner) {
+                            inner.addSuppressed(e);
+                            files += " (failure=" + ExceptionsHelper.detailedMessage(inner) + ")";
+                        }
+                        if (indexShouldExists) {
+                            throw new IndexShardRecoveryException(
+                                shardId,
+                                "shard allocated for local recovery (post api), should exist, but doesn't, current files: " + files,
+                                e
+                            );
+                        }
                     }
                 }
                 if (si != null && indexShouldExists == false) {
@@ -820,6 +832,27 @@ final class StoreRecovery {
             throw new IndexShardRecoveryException(shardId, "Failed to recover from gateway", e);
         } finally {
             store.decRef();
+        }
+    }
+
+    /**
+     * See {@link EngineFactory#recoverMissingLocalStore} for the full contract. Resolves {@code
+     * indexShard}'s engine factory through the same {@link EngineBackedIndexerFactory} wrapping
+     * every plugin-supplied {@link EngineFactory} is already reachable through -- {@code false} if
+     * this shard isn't using one (e.g. a composite/DFA engine, or any {@link IndexerFactory} that
+     * isn't engine-backed at all), same as {@code false} means for a plugin engine that simply
+     * doesn't override the method.
+     */
+    private boolean recoverMissingLocalStoreFromEngine(IndexShard indexShard, Store store) throws IndexShardRecoveryException {
+        IndexerFactory indexerFactory = indexShard.getIndexerFactory();
+        if (!(indexerFactory instanceof EngineBackedIndexerFactory)) {
+            return false;
+        }
+        EngineFactory engineFactory = ((EngineBackedIndexerFactory) indexerFactory).getEngineFactory();
+        try {
+            return engineFactory.recoverMissingLocalStore(indexShard, store);
+        } catch (IOException e) {
+            throw new IndexShardRecoveryException(shardId, "engine failed to recover missing local store", e);
         }
     }
 

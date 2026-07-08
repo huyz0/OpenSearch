@@ -585,12 +585,11 @@ global checkpoint that, for a shard with no replicas, would otherwise never adva
 plugin's full test suite pass unchanged, confirming every other engine's default behavior is
 untouched.
 
-### 7.1.2 Cross-node writer failover: allocation (implemented) and activation materialization (design, not yet implemented)
+### 7.1.2 Cross-node writer failover: allocation and activation materialization
 
-**Status**: design written up here before any code, matching &sect;7.1.1's own "safety argument gets
-scrutiny first" discipline — this is a bigger, riskier piece of surface (it touches core allocation,
-not just an `Engine`/`IndexShard` seam) and deserves the same treatment. The allocation half is now
-implemented (see below); the store-population half remains design only.
+**Status**: both halves implemented and tested. Design was written up before any code, matching
+&sect;7.1.1's own "safety argument gets scrutiny first" discipline, since this touches core
+allocation and recovery, not just an `Engine`/`IndexShard` seam.
 
 **The gap this closes.** &sect;6.4's WAL replay (fencing formally verified, fetch/filter/decode
 implemented, apply-to-shard wired through a real core seam) only recovers operations *after* the
@@ -694,16 +693,47 @@ decider says yes (the scenario that would deadlock `PrimaryShardAllocator` forev
 removes-and-ignores with `DECIDERS_NO` when every decider says no, and the explain-API path returns
 the matching `YES`/`NO` `AllocationDecision` in each case.
 
-**Store-population half — still design only.** The `StoreRecovery#internalRecoverFromStore` hook
-(materialize before the `si == null && indexShouldExists` throw) is not yet implemented; &sect;16
-Phase 2 tracks it as the next concrete increment. What's proven and doesn't need to be re-litigated:
-the term-fencing CAS that makes "any node can try" safe (&sect;6.4/&sect;6.5, formally verified), the
-WAL replay fencing and fetch/filter/decode/apply chain that runs once local Lucene is correct
-(&sect;6.4, formally verified and tested), and now the allocation half above, which turned out to
-need no core change at all. The remaining piece is the smaller of the two core-adjacent changes this
-section originally scoped, and is real core surgery (one conditional branch in one `StoreRecovery`
-method plus a new small SPI method) rather than a plugin-only addition — the allocation half's
-"zero core changes" result doesn't extend to it.
+**Store-population half — implemented.** `Engine#engineRecoveryOperations`-shaped precedent applied
+again: `EngineFactory#recoverMissingLocalStore(IndexShard, Store)` (server module,
+`EngineFactory.java`, default `false`, zero behavior change for every existing `EngineFactory`) is
+the new SPI method. `StoreRecovery#internalRecoverFromStore`'s `EXISTING_STORE` branch calls it
+exactly where it used to unconditionally throw "shard allocated for local recovery, should exist,
+but doesn't" -- `store.readLastCommittedSegmentsInfo()` throwing (no local commit at all) now tries
+`recoverMissingLocalStoreFromEngine` first (resolving the shard's `EngineFactory` through the same
+`EngineBackedIndexerFactory` wrapping every plugin engine is already reachable through) and only
+falls through to the original failure if that returns `false`. On `true`, the segments info is
+re-read and recovery proceeds completely normally from there — no other change to
+`internalRecoverFromStore`'s logic.
+
+`WriterEngineFactory#recoverMissingLocalStore` implements it: materializes the shard's latest
+manifest into the fresh `Store`'s directory via `ObjectStoreCommitMaterializer` (the same technique
+`ObjectStoreReaderEngine#open` already uses, now applied at the point that actually works instead of
+the `EngineFactory#newReadWriteEngine`-level attempt that failed and was reverted earlier), then
+bootstraps and associates a fresh local translog against that *now-populated* commit -- the ordering
+that avoids the translog-UUID mismatch which sank the earlier attempt. Deliberately does not call
+`store.bootstrapNewHistory()`: the manifest carries this shard's real prior history
+(`maxSeqNo`/`localCheckpoint`), which must be preserved, not reset. Returns `false` (unchanged core
+behavior) when there is no prior manifest at all -- a shard `EXISTING_STORE`-routed with nothing
+anywhere to recover from is still a genuine failure, not a first activation.
+
+Verified end-to-end through the real `IndexShard`/`StoreRecovery` path (not a hand-built `Engine`
+construction) in `WriterEngineFactoryCrossNodeFailoverTests`: a first writer indexes and publishes,
+a second writer -- same shard identity, completely fresh local `Store` (`newShard` always allocates
+a new path; nothing simulated) -- recovers under `RecoverySource.Type.EXISTING_STORE` and the
+document is visible, where before this change the exact same setup threw
+`IndexShardRecoveryException` immediately. A second test confirms the fallback: with no manifest
+ever published, `EXISTING_STORE` recovery still fails exactly as it always has. Full existing
+`StoreRecoveryTests`/`IndexShardTests`/`InternalEngineTests`/`EngineRecoveryOperationsTests` suites
+(269 tests) pass unchanged, confirming every other engine's recovery path is unaffected.
+
+Both halves of &sect;7.1.2 are now implemented and tested: allocation
+(`ServerlessStorageExistingShardsAllocator`, zero core changes) and store population
+(`EngineFactory#recoverMissingLocalStore`, one new default-`false` SPI method plus one conditional
+branch in `StoreRecovery`). What remains, tracked in &sect;16 Phase 2, is no longer a design gap:
+it's the residual, already-documented limitation on `activationWalPosition`'s atomicity (&sect;6.4)
+and an actual end-to-end test that kills a real writer node and starts a fresh one under a real
+cluster, rather than the unit-level proofs of each individual piece this effort has built and
+verified.
 
 ### 7.2 Reader engine
 
@@ -1184,18 +1214,23 @@ read/filter/decode side is implemented and tested against a real two-writer fail
 apply step is now wired end to end** through a new generic core seam (`Engine#engineRecoveryOperations()`,
 `IndexShard#openEngineAndRecoverFromTranslog()`, &sect;7.1) proven with a real `IndexShard` in
 `EngineRecoveryOperationsTests`. **What the "no crash-survival integration test exists yet" note
-above is still waiting on turned out to be two real, deeper gaps, found, scoped, and designed
-rather than the single `RecoverySource.Type` originally feared** (&sect;7.1.2): store population (a
-small, narrow `StoreRecovery` hook, no new `RecoverySource.Type` needed after all -- still design
-only) and allocation (a plugin-supplied `ExistingShardsAllocator`, needing *zero* core changes --
-**now implemented**: `ServerlessStorageExistingShardsAllocator` sidesteps
-`PrimaryShardAllocator`'s indefinite-unassignment deadlock entirely, `ServerlessStorageIndexSettingProvider`
-selects it automatically for every serverless-storage index, both tested with real
-`RoutingAllocation`/`AllocationDeciders` fixtures). Every piece downstream of "local Lucene already
-has the right content" (fencing math, fetch/filter/decode, apply-to-shard) is proven correct;
-getting such a shard allocated anywhere at all is now solved and tested; getting local Lucene to
-the right state on a genuinely empty node is the one remaining piece, designed and ready for
-implementation.
+above was waiting on turned out to be two real, deeper gaps -- both now found, scoped, designed,
+implemented, and tested, and both smaller than the single `RecoverySource.Type` originally feared**
+(&sect;7.1.2): allocation (`ServerlessStorageExistingShardsAllocator` sidesteps
+`PrimaryShardAllocator`'s indefinite-unassignment deadlock entirely, needing *zero* core changes;
+`ServerlessStorageIndexSettingProvider` selects it automatically for every serverless-storage index)
+and store population (`EngineFactory#recoverMissingLocalStore`, one new default-`false` SPI method
+plus one conditional branch in `StoreRecovery` -- `WriterEngineFactory`'s implementation
+materializes the last manifest and bootstraps a matching local translog, in the ordering that avoids
+the translog-UUID mismatch that sank the first, `EngineFactory#newReadWriteEngine`-level attempt).
+Verified end-to-end through the real `IndexShard`/`StoreRecovery` path in
+`WriterEngineFactoryCrossNodeFailoverTests`: a second writer, same shard identity, completely fresh
+local `Store`, recovers under `RecoverySource.Type.EXISTING_STORE` where before this work it threw
+immediately. Every piece this crash-recovery story depends on -- fencing math, fetch/filter/decode,
+apply-to-shard, allocation, and now store population -- is implemented and tested. What remains is
+narrower than a design gap: the residual `activationWalPosition` atomicity limitation already
+documented in &sect;6.4, and an actual multi-node integration test that kills a real writer and
+starts a fresh one under a real cluster rather than the unit-level proofs this effort has built.
 
 **Phase 3 — Reader engine (materializer and open-from-manifest done; refresh-to-newer-generation
 and notification wiring still open).** `ObjectStoreCommitMaterializer` fetches every file a
