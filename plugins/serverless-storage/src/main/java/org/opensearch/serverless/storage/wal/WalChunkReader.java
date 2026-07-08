@@ -53,6 +53,7 @@ public final class WalChunkReader {
                 String indexUuid = new String(indexUuidBytes, StandardCharsets.UTF_8);
 
                 int shardId = in.readInt();
+                long primaryTerm = in.readLong();
                 long seqNo = in.readLong();
 
                 int payloadLength = in.readInt();
@@ -62,7 +63,7 @@ public final class WalChunkReader {
                 byte[] payload = new byte[payloadLength];
                 in.readFully(payload);
 
-                records.add(new WalRecord(indexUuid, shardId, seqNo, payload));
+                records.add(new WalRecord(indexUuid, shardId, primaryTerm, seqNo, payload));
             }
 
             int bodyLength = chunkBytes.length - rawIn.available();
@@ -90,6 +91,24 @@ public final class WalChunkReader {
         List<WalRecord> filtered = new ArrayList<>();
         for (WalRecord record : records) {
             if (record.belongsTo(indexUuid, shardId)) {
+                filtered.add(record);
+            }
+        }
+        return filtered;
+    }
+
+    /**
+     * The fencing-aware filter replay actually needs: only records for this shard whose {@code
+     * primaryTerm} is at least {@code minPrimaryTerm} -- a record written under an older term is
+     * from a writer this shard's own term-fencing (via {@code ShardHead}) has already superseded,
+     * and must never be re-applied, no matter where in the (shared, node-level) chunk stream it
+     * happens to sit. See {@link WalRecord}'s own javadoc for why this is a per-record filter
+     * rather than a directory-level one.
+     */
+    public static List<WalRecord> filterByShardAndMinimumTerm(List<WalRecord> records, String indexUuid, int shardId, long minPrimaryTerm) {
+        List<WalRecord> filtered = new ArrayList<>();
+        for (WalRecord record : records) {
+            if (record.belongsTo(indexUuid, shardId) && record.primaryTerm() >= minPrimaryTerm) {
                 filtered.add(record);
             }
         }

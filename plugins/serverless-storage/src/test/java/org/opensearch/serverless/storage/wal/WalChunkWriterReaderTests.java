@@ -16,7 +16,7 @@ import java.util.List;
 public class WalChunkWriterReaderTests extends OpenSearchTestCase {
 
     public void testRoundTripSingleRecord() throws Exception {
-        WalRecord record = new WalRecord("index-a", 0, 1, randomByteArrayOfLength(128));
+        WalRecord record = new WalRecord("index-a", 0, 1, 1, randomByteArrayOfLength(128));
         byte[] chunk = WalChunkWriter.write(List.of(record));
 
         List<WalRecord> parsed = WalChunkReader.readRecords(chunk);
@@ -30,7 +30,7 @@ public class WalChunkWriterReaderTests extends OpenSearchTestCase {
         List<WalRecord> written = new ArrayList<>();
         for (int shard = 0; shard < 5; shard++) {
             for (int seq = 0; seq < 10; seq++) {
-                written.add(new WalRecord("index-" + (shard % 2), shard, seq, randomByteArrayOfLength(randomIntBetween(0, 256))));
+                written.add(new WalRecord("index-" + (shard % 2), shard, 1, seq, randomByteArrayOfLength(randomIntBetween(0, 256))));
             }
         }
 
@@ -47,7 +47,7 @@ public class WalChunkWriterReaderTests extends OpenSearchTestCase {
     }
 
     public void testEmptyPayloadRecordRoundTrips() throws Exception {
-        WalRecord record = new WalRecord("idx", 0, 0, new byte[0]);
+        WalRecord record = new WalRecord("idx", 0, 1, 0, new byte[0]);
         byte[] chunk = WalChunkWriter.write(List.of(record));
         List<WalRecord> parsed = WalChunkReader.readRecords(chunk);
         assertEquals(List.of(record), parsed);
@@ -63,7 +63,7 @@ public class WalChunkWriterReaderTests extends OpenSearchTestCase {
     // `catch (IOException e)` was re-caught by that generic clause and re-wrapped into an
     // unhelpful "failed to parse WAL chunk" message, destroying the specific diagnosis.
     public void testCorruptedChunkFailsChecksumVerificationWithSpecificMessage() {
-        WalRecord record = new WalRecord("idx", 0, 0, randomByteArrayOfLength(64));
+        WalRecord record = new WalRecord("idx", 0, 1, 0, randomByteArrayOfLength(64));
         byte[] chunk = WalChunkWriter.write(List.of(record));
         byte[] corrupted = chunk.clone();
         corrupted[20] ^= 0xFF; // last byte of the record's 4-byte shardId field, inside the header
@@ -73,7 +73,7 @@ public class WalChunkWriterReaderTests extends OpenSearchTestCase {
     }
 
     public void testTruncatedChunkIsRejectedWithSpecificMessage() {
-        WalRecord record = new WalRecord("idx", 0, 0, randomByteArrayOfLength(64));
+        WalRecord record = new WalRecord("idx", 0, 1, 0, randomByteArrayOfLength(64));
         byte[] chunk = WalChunkWriter.write(List.of(record));
         byte[] truncated = new byte[chunk.length - 10];
         System.arraycopy(chunk, 0, truncated, 0, truncated.length);

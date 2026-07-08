@@ -45,6 +45,10 @@ public class WalMirroringTranslog extends LocalTranslog {
     private final WalChunkService walChunkService;
     private final String indexUuid;
     private final int shardId;
+    private final LongSupplier primaryTermSupplier;
+
+    /** The chunk sequence, under this WAL service's shared epoch, most recently confirmed durably written -- see {@link #lastFlushedWalChunkSequence()}. */
+    private volatile long lastFlushedWalChunkSequence = -1;
 
     public WalMirroringTranslog(
         TranslogConfig config,
@@ -69,6 +73,7 @@ public class WalMirroringTranslog extends LocalTranslog {
         this.walChunkService = walChunkService;
         this.indexUuid = config.getShardId().getIndex().getUUID();
         this.shardId = config.getShardId().getId();
+        this.primaryTermSupplier = primaryTermSupplier;
     }
 
     @Override
@@ -77,7 +82,13 @@ public class WalMirroringTranslog extends LocalTranslog {
         BytesStreamOutput out = new BytesStreamOutput();
         Operation.writeOperation(out, operation);
         walChunkService.append(
-            new WalRecord(indexUuid, shardId, operation.seqNo(), org.opensearch.core.common.bytes.BytesReference.toBytes(out.bytes()))
+            new WalRecord(
+                indexUuid,
+                shardId,
+                primaryTermSupplier.getAsLong(),
+                operation.seqNo(),
+                org.opensearch.core.common.bytes.BytesReference.toBytes(out.bytes())
+            )
         );
         // Flushing per-operation gives the same per-write durability guarantee a local translog
         // fsync gives; a deployment that wants real cross-shard group-commit batching would flush
@@ -85,6 +96,22 @@ public class WalMirroringTranslog extends LocalTranslog {
         // of any single shard's Translog.
         flushWithRetry();
         return location;
+    }
+
+    /**
+     * The highest chunk sequence, under this WAL service's shared epoch, that a {@link
+     * #flushWithRetry} call from this translog has confirmed durably written -- {@code -1} if
+     * none yet. This is what {@code ObjectStoreCommitHeadPublisher#publishCommitAsHead}'s caller
+     * uses to build the manifest's real {@code WalPosition} instead of a placeholder, so recovery
+     * knows where to resume reading from (rfc-serverless-opensearch.md &sect;7.1's failover
+     * description). Because chunk sequences under a shared epoch are strictly increasing
+     * regardless of which shard's flush most recently advanced them, this value only ever needs
+     * to be a lower bound safe to resume scanning from -- replay's own per-record
+     * {@code (indexUuid, shardId, primaryTerm)} filter (see {@link WalRecord}'s javadoc) is what
+     * actually determines which records apply, not this position alone.
+     */
+    public long lastFlushedWalChunkSequence() {
+        return lastFlushedWalChunkSequence;
     }
 
     /**
@@ -97,7 +124,10 @@ public class WalMirroringTranslog extends LocalTranslog {
     private void flushWithRetry() throws IOException {
         for (int attempt = 1; attempt <= MAX_MIRROR_FLUSH_ATTEMPTS; attempt++) {
             try {
-                walChunkService.flush();
+                long chunkSequence = walChunkService.flush();
+                if (chunkSequence >= 0) {
+                    lastFlushedWalChunkSequence = chunkSequence;
+                }
                 return;
             } catch (IOException e) {
                 if (attempt == MAX_MIRROR_FLUSH_ATTEMPTS) {

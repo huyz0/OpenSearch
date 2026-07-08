@@ -37,13 +37,13 @@ public final class WalRecordCrypto {
     /** Returns a copy of {@code record} with its payload replaced by ciphertext. */
     public static WalRecord encrypt(WalRecord record, EncryptionKeyProvider keyProvider) throws IOException {
         byte[] ciphertext = AesGcmCipher.encrypt(record.payload(), keyProvider.currentKey());
-        return new WalRecord(record.indexUuid(), record.shardId(), record.seqNo(), ciphertext);
+        return new WalRecord(record.indexUuid(), record.shardId(), record.primaryTerm(), record.seqNo(), ciphertext);
     }
 
     /** Returns a copy of {@code record} with its payload replaced by the decrypted plaintext. */
     public static WalRecord decrypt(WalRecord record, EncryptionKeyProvider keyProvider) throws IOException {
         byte[] plaintext = AesGcmCipher.decrypt(record.payload(), keyProvider.currentKey());
-        return new WalRecord(record.indexUuid(), record.shardId(), record.seqNo(), plaintext);
+        return new WalRecord(record.indexUuid(), record.shardId(), record.primaryTerm(), record.seqNo(), plaintext);
     }
 
     /** {@link #decrypt} applied to every record in {@code records}, in order. */

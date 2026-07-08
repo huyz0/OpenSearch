@@ -25,12 +25,14 @@ import java.util.zip.CRC32C;
  * <p>Wire format (big-endian):
  * <pre>
  *   magic          4 bytes   = 'W','C','H','1'
- *   formatVersion  4 bytes   int, currently 1
+ *   formatVersion  4 bytes   int, currently 2
  *   recordCount    4 bytes   int
  *   record[0..n)             repeated recordCount times, in append order:
  *     indexUuidLen 2 bytes   unsigned short
  *     indexUuid    variable  UTF-8 bytes
  *     shardId      4 bytes   int
+ *     primaryTerm  8 bytes   long (added in format version 2, see WalRecord's own javadoc for why
+ *                            fencing needs this under a shared, node-level writer epoch)
  *     seqNo        8 bytes   long
  *     payloadLen   4 bytes   int
  *     payload      variable  raw bytes (opaque -- possibly per-record ciphertext)
@@ -40,7 +42,7 @@ import java.util.zip.CRC32C;
 public final class WalChunkWriter {
 
     static final byte[] MAGIC = { 'W', 'C', 'H', '1' };
-    static final int FORMAT_VERSION = 1;
+    static final int FORMAT_VERSION = 2;
 
     private WalChunkWriter() {}
 
@@ -61,6 +63,7 @@ public final class WalChunkWriter {
                 out.writeShort(indexUuidBytes.length);
                 out.write(indexUuidBytes);
                 out.writeInt(record.shardId());
+                out.writeLong(record.primaryTerm());
                 out.writeLong(record.seqNo());
                 out.writeInt(record.payload().length);
                 out.write(record.payload());

@@ -42,7 +42,7 @@ public class EncryptingWalChunkServiceTests extends OpenSearchTestCase {
         EncryptingWalChunkService encryptingService = new EncryptingWalChunkService(delegate, keyProvider);
 
         byte[] plaintext = "sensitive document body".getBytes(StandardCharsets.UTF_8);
-        encryptingService.append(new WalRecord("idx", 0, 0, plaintext));
+        encryptingService.append(new WalRecord("idx", 0, 1, 0, plaintext));
         assertEquals(0, encryptingService.flush());
 
         byte[] chunkBytes;
@@ -62,8 +62,8 @@ public class EncryptingWalChunkServiceTests extends OpenSearchTestCase {
 
         byte[] plaintextA = "operation A".getBytes(StandardCharsets.UTF_8);
         byte[] plaintextB = "operation B".getBytes(StandardCharsets.UTF_8);
-        encryptingService.append(new WalRecord("idx", 0, 0, plaintextA));
-        encryptingService.append(new WalRecord("idx", 1, 0, plaintextB));
+        encryptingService.append(new WalRecord("idx", 0, 1, 0, plaintextA));
+        encryptingService.append(new WalRecord("idx", 1, 1, 0, plaintextB));
         encryptingService.flush();
 
         byte[] chunkBytes;
@@ -87,7 +87,7 @@ public class EncryptingWalChunkServiceTests extends OpenSearchTestCase {
         EncryptingWalChunkService encryptingService = new EncryptingWalChunkService(delegate, new StaticEncryptionKeyProvider(newAesKey()));
 
         assertEquals(0, encryptingService.bufferedRecordCount());
-        encryptingService.append(new WalRecord("idx", 0, 0, "x".getBytes(StandardCharsets.UTF_8)));
+        encryptingService.append(new WalRecord("idx", 0, 1, 0, "x".getBytes(StandardCharsets.UTF_8)));
         assertEquals(1, encryptingService.bufferedRecordCount());
 
         assertEquals(0, encryptingService.flush());

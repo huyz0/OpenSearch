@@ -28,7 +28,7 @@ public class WalRecordCryptoTests extends OpenSearchTestCase {
 
     public void testEncryptThenDecryptRoundTripsThePayloadExactly() throws Exception {
         StaticEncryptionKeyProvider keyProvider = new StaticEncryptionKeyProvider(newAesKey());
-        WalRecord original = new WalRecord("idx", 3, 42, "the operation payload".getBytes(StandardCharsets.UTF_8));
+        WalRecord original = new WalRecord("idx", 3, 1, 42, "the operation payload".getBytes(StandardCharsets.UTF_8));
 
         WalRecord encrypted = WalRecordCrypto.encrypt(original, keyProvider);
         WalRecord decrypted = WalRecordCrypto.decrypt(encrypted, keyProvider);
@@ -40,7 +40,7 @@ public class WalRecordCryptoTests extends OpenSearchTestCase {
         // Routing metadata (WalChunkReader#filterByShard) must survive untouched -- only the
         // payload is meant to become opaque.
         StaticEncryptionKeyProvider keyProvider = new StaticEncryptionKeyProvider(newAesKey());
-        WalRecord original = new WalRecord("idx-a", 7, 99, "payload".getBytes(StandardCharsets.UTF_8));
+        WalRecord original = new WalRecord("idx-a", 7, 1, 99, "payload".getBytes(StandardCharsets.UTF_8));
 
         WalRecord encrypted = WalRecordCrypto.encrypt(original, keyProvider);
 
@@ -52,7 +52,7 @@ public class WalRecordCryptoTests extends OpenSearchTestCase {
     public void testEncryptedPayloadDiffersFromThePlaintext() throws Exception {
         StaticEncryptionKeyProvider keyProvider = new StaticEncryptionKeyProvider(newAesKey());
         byte[] plaintext = "not secret unless encrypted".getBytes(StandardCharsets.UTF_8);
-        WalRecord original = new WalRecord("idx", 0, 0, plaintext);
+        WalRecord original = new WalRecord("idx", 0, 1, 0, plaintext);
 
         WalRecord encrypted = WalRecordCrypto.encrypt(original, keyProvider);
 
@@ -60,7 +60,7 @@ public class WalRecordCryptoTests extends OpenSearchTestCase {
     }
 
     public void testDecryptingWithADifferentKeyFailsLoudly() throws Exception {
-        WalRecord original = new WalRecord("idx", 0, 0, "payload".getBytes(StandardCharsets.UTF_8));
+        WalRecord original = new WalRecord("idx", 0, 1, 0, "payload".getBytes(StandardCharsets.UTF_8));
         WalRecord encrypted = WalRecordCrypto.encrypt(original, new StaticEncryptionKeyProvider(newAesKey()));
 
         StaticEncryptionKeyProvider wrongKey = new StaticEncryptionKeyProvider(newAesKey());
@@ -70,9 +70,9 @@ public class WalRecordCryptoTests extends OpenSearchTestCase {
     public void testDecryptAllAppliesToEveryRecordInOrder() throws Exception {
         StaticEncryptionKeyProvider keyProvider = new StaticEncryptionKeyProvider(newAesKey());
         List<WalRecord> originals = List.of(
-            new WalRecord("idx", 0, 0, "a".getBytes(StandardCharsets.UTF_8)),
-            new WalRecord("idx", 0, 1, "b".getBytes(StandardCharsets.UTF_8)),
-            new WalRecord("idx", 1, 0, "c".getBytes(StandardCharsets.UTF_8))
+            new WalRecord("idx", 0, 1, 0, "a".getBytes(StandardCharsets.UTF_8)),
+            new WalRecord("idx", 0, 1, 1, "b".getBytes(StandardCharsets.UTF_8)),
+            new WalRecord("idx", 1, 1, 0, "c".getBytes(StandardCharsets.UTF_8))
         );
         List<WalRecord> encrypted = originals.stream().map(r -> {
             try {

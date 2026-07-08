@@ -43,13 +43,20 @@ import java.util.concurrent.atomic.AtomicLong;
  * noisy shard's records stop accumulating in (and delaying) the shared buffer other shards depend
  * on, without needing every shard to flush early just because one of them is busy.
  *
- * <p>The chunk sequence for a given {@code writerEpoch} resumes from whatever is already present
- * in the blob container rather than always starting at 0: a caller must pick a {@code
- * writerEpoch} that is unique to one actual writer lifetime (e.g. derived from the shard's
- * primary term, not reused verbatim across a plain process restart under the same term), but a
- * fresh {@link WalChunkService} instance constructed against a container that already holds
- * chunks for that epoch (e.g. after a process restart before the term changed) will not overwrite
- * them.
+ * <p>{@code writerEpoch} identifies this WAL service's own lifetime (this node's incarnation of
+ * it), not any one shard's -- corrected here after an earlier draft of this javadoc incorrectly
+ * described it as "unique to one actual writer lifetime, e.g. derived from the shard's primary
+ * term." That would be self-contradictory: this service buffers records from any number of
+ * writer shards on the node into shared chunks (see "Per-shard fairness" above), so its epoch
+ * cannot simultaneously be scoped to a single shard's term without abandoning the cross-shard
+ * batching that's the entire reason this is a node-level service rather than a per-shard one
+ * (rfc-serverless-opensearch.md &sect;6.4's cost-sanity argument). Fencing a superseded writer
+ * therefore cannot mean "discard its epoch directory" (that would fence every other shard sharing
+ * it); it is a per-record filter instead -- see {@link WalRecord}'s own javadoc. The chunk
+ * sequence for a given {@code writerEpoch} resumes from whatever is already present in the blob
+ * container rather than always starting at 0, so a fresh {@link WalChunkService} instance
+ * constructed against a container that already holds chunks for this node's epoch (e.g. after a
+ * process restart with the same node incarnation) will not overwrite them.
  */
 public final class WalChunkService {
 

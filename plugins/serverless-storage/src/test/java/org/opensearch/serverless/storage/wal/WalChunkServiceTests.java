@@ -38,8 +38,8 @@ public class WalChunkServiceTests extends OpenSearchTestCase {
         BlobContainer blobContainer = newBlobContainer();
         WalChunkService service = new WalChunkService(blobContainer, "epoch-0");
 
-        service.append(new WalRecord("idx", 0, 0, "a".getBytes("UTF-8")));
-        service.append(new WalRecord("idx", 1, 0, "b".getBytes("UTF-8")));
+        service.append(new WalRecord("idx", 0, 1, 0, "a".getBytes("UTF-8")));
+        service.append(new WalRecord("idx", 1, 1, 0, "b".getBytes("UTF-8")));
         assertEquals(2, service.bufferedRecordCount());
 
         long chunkSeq = service.flush();
@@ -56,24 +56,24 @@ public class WalChunkServiceTests extends OpenSearchTestCase {
 
     public void testSuccessiveFlushesGetIncreasingChunkSequences() throws Exception {
         WalChunkService service = new WalChunkService(newBlobContainer(), "epoch-0");
-        service.append(new WalRecord("idx", 0, 0, "a".getBytes("UTF-8")));
+        service.append(new WalRecord("idx", 0, 1, 0, "a".getBytes("UTF-8")));
         assertEquals(0, service.flush());
-        service.append(new WalRecord("idx", 0, 1, "b".getBytes("UTF-8")));
+        service.append(new WalRecord("idx", 0, 1, 1, "b".getBytes("UTF-8")));
         assertEquals(1, service.flush());
     }
 
     public void testResumesChunkSequenceFromExistingBlobsUnderTheSameEpoch() throws Exception {
         BlobContainer blobContainer = newBlobContainer();
         WalChunkService firstLifetime = new WalChunkService(blobContainer, "epoch-0");
-        firstLifetime.append(new WalRecord("idx", 0, 0, "a".getBytes("UTF-8")));
+        firstLifetime.append(new WalRecord("idx", 0, 1, 0, "a".getBytes("UTF-8")));
         assertEquals(0, firstLifetime.flush());
-        firstLifetime.append(new WalRecord("idx", 0, 1, "b".getBytes("UTF-8")));
+        firstLifetime.append(new WalRecord("idx", 0, 1, 1, "b".getBytes("UTF-8")));
         assertEquals(1, firstLifetime.flush());
 
         // A new instance against the same container/epoch (e.g. after a process restart) must
         // not restart the sequence at 0 and overwrite the chunks the prior instance wrote.
         WalChunkService secondLifetime = new WalChunkService(blobContainer, "epoch-0");
-        secondLifetime.append(new WalRecord("idx", 0, 2, "c".getBytes("UTF-8")));
+        secondLifetime.append(new WalRecord("idx", 0, 1, 2, "c".getBytes("UTF-8")));
         assertEquals(2, secondLifetime.flush());
 
         byte[] chunk0Bytes;
@@ -97,7 +97,7 @@ public class WalChunkServiceTests extends OpenSearchTestCase {
                 futures.add(executor.submit(() -> {
                     try {
                         startLine.await();
-                        service.append(new WalRecord("idx", 0, seqNo, ("v" + seqNo).getBytes("UTF-8")));
+                        service.append(new WalRecord("idx", 0, 1, seqNo, ("v" + seqNo).getBytes("UTF-8")));
                     } catch (Exception e) {
                         throw new RuntimeException(e);
                     }
@@ -125,7 +125,7 @@ public class WalChunkServiceTests extends OpenSearchTestCase {
         BlobContainer blobContainer = newBlobContainer();
         WalChunkService service = new WalChunkService(blobContainer, "epoch-0");
         for (int i = 0; i < 100; i++) {
-            service.append(new WalRecord("noisy-idx", 0, i, new byte[1000]));
+            service.append(new WalRecord("noisy-idx", 0, 1, i, new byte[1000]));
         }
         assertEquals("with no budget, everything just accumulates in the shared buffer", 100, service.bufferedRecordCount());
     }
@@ -134,10 +134,10 @@ public class WalChunkServiceTests extends OpenSearchTestCase {
         BlobContainer blobContainer = newBlobContainer();
         WalChunkService service = new WalChunkService(blobContainer, "epoch-0", 100);
 
-        service.append(new WalRecord("quiet-idx", 0, 0, "small".getBytes("UTF-8")));
+        service.append(new WalRecord("quiet-idx", 0, 1, 0, "small".getBytes("UTF-8")));
         // Crosses the 100-byte budget for this shard on this append -- must overflow immediately,
         // independent of any flush() call.
-        service.append(new WalRecord("noisy-idx", 0, 0, new byte[150]));
+        service.append(new WalRecord("noisy-idx", 0, 1, 0, new byte[150]));
 
         // The noisy shard's record was written out as its own dedicated chunk (sequence 0) without
         // any flush() call; only the quiet shard's record remains buffered.
@@ -168,10 +168,10 @@ public class WalChunkServiceTests extends OpenSearchTestCase {
         BlobContainer blobContainer = newBlobContainer();
         WalChunkService service = new WalChunkService(blobContainer, "epoch-0", 100);
 
-        service.append(new WalRecord("shard-a", 0, 0, new byte[40]));
-        service.append(new WalRecord("shard-b", 0, 0, new byte[40]));
+        service.append(new WalRecord("shard-a", 0, 1, 0, new byte[40]));
+        service.append(new WalRecord("shard-b", 0, 1, 0, new byte[40]));
         // Pushes shard-a's cumulative total to 40+70=110, over budget -- only shard-a overflows.
-        service.append(new WalRecord("shard-a", 0, 1, new byte[70]));
+        service.append(new WalRecord("shard-a", 0, 1, 1, new byte[70]));
 
         assertEquals("only shard-b's record should remain buffered", 1, service.bufferedRecordCount());
         service.flush();
@@ -188,8 +188,8 @@ public class WalChunkServiceTests extends OpenSearchTestCase {
         BlobContainer blobContainer = newBlobContainer();
         WalChunkService service = new WalChunkService(blobContainer, "epoch-0", 100);
 
-        service.append(new WalRecord("idx", 0, 0, new byte[150])); // overflow #1 -> chunk 0
-        service.append(new WalRecord("idx", 0, 1, new byte[150])); // overflow #2 -> chunk 1, not accumulated onto the first
+        service.append(new WalRecord("idx", 0, 1, 0, new byte[150])); // overflow #1 -> chunk 0
+        service.append(new WalRecord("idx", 0, 1, 1, new byte[150])); // overflow #2 -> chunk 1, not accumulated onto the first
 
         assertEquals(0, service.bufferedRecordCount());
         byte[] secondOverflowBytes;
@@ -203,11 +203,11 @@ public class WalChunkServiceTests extends OpenSearchTestCase {
         BlobContainer blobContainer = newBlobContainer();
         WalChunkService service = new WalChunkService(blobContainer, "epoch-0", 100);
 
-        service.append(new WalRecord("idx", 0, 0, new byte[60]));
+        service.append(new WalRecord("idx", 0, 1, 0, new byte[60]));
         service.flush();
         // If the per-shard counter weren't cleared on flush, this append (60 more bytes, 120
         // cumulative) would incorrectly trigger an overflow instead of just buffering normally.
-        service.append(new WalRecord("idx", 0, 1, new byte[60]));
+        service.append(new WalRecord("idx", 0, 1, 1, new byte[60]));
 
         assertEquals(1, service.bufferedRecordCount());
     }

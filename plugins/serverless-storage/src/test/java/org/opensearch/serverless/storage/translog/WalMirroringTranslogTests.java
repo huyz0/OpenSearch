@@ -88,8 +88,28 @@ public class WalMirroringTranslogTests extends OpenSearchTestCase {
         assertEquals(2, allRecords.size());
         assertEquals(INDEX_UUID, allRecords.get(0).indexUuid());
         assertEquals(0, allRecords.get(0).shardId());
+        assertEquals(1L, allRecords.get(0).primaryTerm());
         assertEquals(0L, allRecords.get(0).seqNo());
+        assertEquals(1L, allRecords.get(1).primaryTerm());
         assertEquals(1L, allRecords.get(1).seqNo());
+    }
+
+    public void testLastFlushedWalChunkSequenceAdvancesWithEachMirroredOperation() throws Exception {
+        Path path = createTempDir();
+        try (WalMirroringTranslog translog = newTranslog(path)) {
+            assertEquals("nothing mirrored yet", -1L, translog.lastFlushedWalChunkSequence());
+
+            translog.add(new Translog.Index("id-1", 0, 1, "{\"field\":1}".getBytes("UTF-8")));
+            long afterFirst = translog.lastFlushedWalChunkSequence();
+            assertTrue("the first mirrored operation must advance the watermark past -1", afterFirst >= 0);
+
+            translog.add(new Translog.Index("id-2", 1, 1, "{\"field\":2}".getBytes("UTF-8")));
+            long afterSecond = translog.lastFlushedWalChunkSequence();
+            assertTrue(
+                "each op flushes to its own chunk today (flush-per-op), so the sequence must strictly advance",
+                afterSecond > afterFirst
+            );
+        }
     }
 
     public void testLocalRecoveryStillWorksExactlyAsAPlainLocalTranslog() throws Exception {
