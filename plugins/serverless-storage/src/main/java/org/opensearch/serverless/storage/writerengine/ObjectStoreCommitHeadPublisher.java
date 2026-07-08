@@ -26,6 +26,20 @@ import java.util.Optional;
  * commit is allowed to become the shard's officially visible head (rfc-serverless-metadata-plane.md
  * &sect;4/&sect;7). This is the term-fencing check that keeps a writer that has been superseded (its
  * lease expired and another node took over) from publishing a generation after the fact.
+ *
+ * <p>The target generation is <b>not</b> supplied by the caller's local Lucene state. It is always
+ * computed live, inside the retry loop, as {@code currentHead.latestManifestGeneration() + 1} --
+ * mirroring exactly how the compaction service (LuceneMergeCompactionPublisher) already numbers its
+ * own publications. This closes a class of bug formally verified in
+ * {@code plugins/serverless-storage/formal/ShardHead.tla} (`PublishDecoupled`/`SpecDecoupled`,
+ * `ShardHeadDecoupled.cfg`): with a caller-supplied generation entangled with local Lucene state, a
+ * writer resuming after a compactor advanced the head could either be wrongly fenced out (see the
+ * git history of this class for the pre-decoupling version) or -- the narrower risk this decoupling
+ * additionally closes -- have its own generation number coincidentally collide with a different
+ * actor's, which the old caller-supplied-generation design could not distinguish since {@link
+ * ShardHead} carries no manifest-identity field. With live computation there is no external
+ * generation to collide: every successful publish, by construction, lands at the current head's
+ * generation plus exactly one.
  */
 public final class ObjectStoreCommitHeadPublisher {
 
@@ -38,12 +52,20 @@ public final class ObjectStoreCommitHeadPublisher {
     }
 
     /**
-     * Packages {@code segmentInfos} into a bundle+manifest via {@link ObjectStoreCommitPublisher},
-     * then attempts to publish it as the shard's new head under {@code primaryTerm}.
+     * Packages {@code segmentInfos} into a bundle+manifest via {@link ObjectStoreCommitPublisher} at
+     * a generation computed live from the shard's current head, then attempts to publish it as the
+     * shard's new head under {@code primaryTerm}. On a lost CAS race (another compaction or another
+     * publish attempt by this same writer winning first), the generation is recomputed from the
+     * freshly re-read head and the commit is packaged again at the new generation -- so more than
+     * one manifest/bundle pair may be written to object storage for a single call under contention.
+     * Every manifest not referenced by the head that ultimately wins the CAS is simply unreferenced
+     * garbage, eligible for the same GC path as any other orphaned bundle (see {@link
+     * ObjectStoreCommitPublisher}'s own class javadoc) -- never a correctness issue, since bundles
+     * and manifests are addressed only through a successfully published head.
      *
-     * @return {@code true} if this generation is now (or already was) reflected in the shard's
-     *         published head; {@code false} if a different term currently holds the head, meaning
-     *         this writer has been fenced out and must stop writing.
+     * @return {@code true} if this commit's content is now reflected in the shard's published head;
+     *         {@code false} if a different term currently holds the head, meaning this writer has
+     *         been fenced out and must stop writing.
      */
     public boolean publishCommitAsHead(
         Directory directory,
@@ -51,83 +73,63 @@ public final class ObjectStoreCommitHeadPublisher {
         String indexUuid,
         int shardId,
         long primaryTerm,
-        long generation,
         long maxSeqNo,
         long localCheckpoint,
         WalPosition walPosition,
         long mappingVersion,
         PruningStats pruningStats
     ) throws IOException {
-        CommitManifest manifest = commitPublisher.publishCommit(
-            directory,
-            segmentInfos,
-            indexUuid,
-            shardId,
-            primaryTerm,
-            generation,
-            maxSeqNo,
-            localCheckpoint,
-            walPosition,
-            mappingVersion,
-            pruningStats
-        );
-
         for (;;) {
             Optional<VersionedShardHead> current = shardStateStore.get(indexUuid, shardId);
+
+            long currentGeneration;
+            ShardHead currentHead;
+            Optional<Long> currentVersion;
             if (current.isEmpty()) {
-                ShardHead newHead = new ShardHead(primaryTerm, null, 0L, manifest.generation());
-                if (shardStateStore.compareAndSet(indexUuid, shardId, Optional.empty(), newHead) == CasResult.SUCCESS) {
-                    return true;
+                currentGeneration = 0L;
+                currentHead = null;
+                currentVersion = Optional.empty();
+            } else {
+                VersionedShardHead versioned = current.get();
+                currentHead = versioned.head();
+                if (currentHead.primaryTerm() != primaryTerm) {
+                    // A different term already holds the head -- this writer has been fenced out and
+                    // must not publish, regardless of whether that term is higher or (should be
+                    // impossible under correct lease handling) lower.
+                    return false;
                 }
-                continue;
+                currentGeneration = currentHead.latestManifestGeneration();
+                currentVersion = Optional.of(versioned.version());
             }
 
-            VersionedShardHead versioned = current.get();
-            ShardHead currentHead = versioned.head();
-            if (currentHead.primaryTerm() != primaryTerm) {
-                // A different term already holds the head -- this writer has been fenced out and
-                // must not publish, regardless of whether that term is higher or (should be
-                // impossible under correct lease handling) lower.
-                return false;
-            }
-            if (manifest.generation() < currentHead.latestManifestGeneration()) {
-                // Something else has already published a *strictly newer* generation under this
-                // same term. The primary-term check above can never catch this: the compaction
-                // service (LuceneMergeCompactionPublisher) computes its own next generation as
-                // currentHead.latestManifestGeneration() + 1, entirely independent of this
-                // writer's local Lucene generation counter -- so a compactor running several
-                // cycles while this writer was idle can push latestManifestGeneration ahead of
-                // whatever this writer's own next local commit computes. If that happens and this
-                // branch is skipped, the caller believes its write succeeded while the actual head
-                // content is the compactor's, not this commit's -- a genuine silent-data-loss bug,
-                // not a hypothetical. Treat it exactly like being fenced out: this writer's notion
-                // of "current state" is stale and it must stop, not keep publishing against
-                // assumptions that no longer hold.
-                return false;
-            }
-            if (manifest.generation() == currentHead.latestManifestGeneration()) {
-                // Already published at exactly this generation -- the intended case is a retried
-                // call after a prior attempt's CAS actually succeeded (see
-                // ObjectStoreCommitHeadPublisherTests#testRetriedPublicationOfAnAlreadyPublishedGenerationIsANoOpSuccess),
-                // which is genuinely safe: nothing in this class's own call pattern (one publish
-                // attempt per local flush, never retried with the same manifest after a failure)
-                // can trigger it any other way today. Known, narrower residual risk left
-                // unresolved: this equality check cannot distinguish "my own retried publish" from
-                // "a different actor coincidentally computed the same generation number for
-                // different content," since ShardHead carries no manifest-identity field to check
-                // against -- only reachable if a writer's local-Lucene-derived generation and a
-                // compactor's currentHead-derived generation land on the exact same integer, which
-                // requires the writer's generation numbering to stay entangled with local Lucene
-                // state at all, the deeper design issue &sect;16's still-open lease-offload
-                // negotiation item is really about.
-                return true;
-            }
+            // Always the next slot after the *live* head, exactly like the compactor -- never
+            // derived from this writer's own local Lucene generation counter, which is what let a
+            // stale writer either get wrongly fenced out or (narrower risk) collide with a different
+            // actor's generation number under the old design. See this class's own javadoc.
+            long targetGeneration = currentGeneration + 1;
 
-            ShardHead newHead = currentHead.withPublishedGeneration(manifest.generation());
-            if (shardStateStore.compareAndSet(indexUuid, shardId, Optional.of(versioned.version()), newHead) == CasResult.SUCCESS) {
+            CommitManifest manifest = commitPublisher.publishCommit(
+                directory,
+                segmentInfos,
+                indexUuid,
+                shardId,
+                primaryTerm,
+                targetGeneration,
+                maxSeqNo,
+                localCheckpoint,
+                walPosition,
+                mappingVersion,
+                pruningStats
+            );
+
+            ShardHead newHead = currentHead == null
+                ? new ShardHead(primaryTerm, null, 0L, manifest.generation())
+                : currentHead.withPublishedGeneration(manifest.generation());
+            if (shardStateStore.compareAndSet(indexUuid, shardId, currentVersion, newHead) == CasResult.SUCCESS) {
                 return true;
             }
-            // Lost the race (another compaction or the same writer's retry publishing concurrently) -- reread and retry.
+            // Lost the race (another compaction or another publish attempt winning first) -- reread
+            // the live head and retry with a freshly computed generation.
         }
     }
 }

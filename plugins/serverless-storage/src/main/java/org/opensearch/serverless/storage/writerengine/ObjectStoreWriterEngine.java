@@ -154,7 +154,6 @@ public class ObjectStoreWriterEngine extends InternalEngine {
         try {
             SegmentInfos segmentInfos = store.readLastCommittedSegmentsInfo();
             long primaryTerm = engineConfig.getPrimaryTermSupplier().getAsLong();
-            long generation = segmentInfos.getGeneration();
             long maxSeqNo = Long.parseLong(segmentInfos.userData.get(SequenceNumbers.MAX_SEQ_NO));
             long localCheckpoint = Long.parseLong(segmentInfos.userData.get(SequenceNumbers.LOCAL_CHECKPOINT_KEY));
 
@@ -164,7 +163,6 @@ public class ObjectStoreWriterEngine extends InternalEngine {
                 indexUuid,
                 shardId,
                 primaryTerm,
-                generation,
                 maxSeqNo,
                 localCheckpoint,
                 new WalPosition(String.valueOf(primaryTerm), 0),
@@ -174,7 +172,10 @@ public class ObjectStoreWriterEngine extends InternalEngine {
             if (published == false) {
                 throw new EngineException(
                     engineConfig.getShardId(),
-                    "fenced out publishing commit generation " + generation + " under term " + primaryTerm
+                    "fenced out publishing local commit (segments generation "
+                        + segmentInfos.getGeneration()
+                        + ") under term "
+                        + primaryTerm
                 );
             }
         } catch (final EngineException ex) {

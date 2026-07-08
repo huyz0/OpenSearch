@@ -830,11 +830,22 @@ generation number," since `ShardHead` carries no manifest-identity field to chec
 call pattern (one publish attempt per local flush, never retried with the same manifest) can't
 trigger this, but a truly airtight fix means decoupling a writer's generation numbering from local
 Lucene state entirely -- always computing its target as `currentHead.latestManifestGeneration() + 1`
-read fresh under the retry loop, exactly like the compactor already does. This redesign is now
-formally verified sound (see §18 risk #5, `ShardHeadDecoupled.cfg`/`SpecDecoupled`) and is what the
-remaining lease-offload negotiation item below is actually about now that this immediate bug is
-closed; implementing it in `ObjectStoreCommitHeadPublisher`/`ObjectStoreWriterEngine` is tracked as
-follow-up work, not yet done here.
+read fresh under the retry loop, exactly like the compactor already does. **Implemented**: this
+redesign was formally verified sound first (see §18 risk #5, `ShardHeadDecoupled.cfg`/
+`SpecDecoupled`), then landed in `ObjectStoreCommitHeadPublisher#publishCommitAsHead`, which no
+longer takes a caller-supplied `generation` at all -- it now computes the target live inside its own
+retry loop and repackages the commit at the freshly computed generation on every CAS-loss retry.
+`ObjectStoreWriterEngine` no longer threads `segmentInfos.getGeneration()` through to publication.
+One consequence: what was previously the fenced-out case "a compactor advanced the head past this
+writer's own next local generation" (`testPublicationSupersededByAConcurrentCompactionUnderTheSameTermFailsRatherThanFalselySucceeding`)
+is no longer a failure at all -- the writer just publishes at the live head's generation + 1, same
+as the compactor -- so that test was replaced with
+`testPublicationAfterAConcurrentCompactionUnderTheSameTermSucceedsAtTheNextLiveGeneration`, asserting
+the new (correct) behavior. Term-fencing (a different primary term already holding the head) is
+unchanged and still the only way `publishCommitAsHead` returns `false`. This closes both the
+silent-data-loss risk this session originally found and the narrower manifest-identity-collision
+risk noted above, since there is no longer an externally supplied generation number to collide with
+anything.
 
 Still open: `_forcemerge` when no writer is active (the actual "no writer ever activating" case
 this service exists for), and the compactor role/lease-offload negotiation with an active writer
@@ -1020,9 +1031,10 @@ directions documented so serverless adoption is not a one-way door.
    on this variant: an earlier draft fenced on the writer's own stale cached belief
    (`localHead[n].holder = n`) instead of the live `head.holder = n`, which would have let a
    writer already fenced out by a newer term's lease acquisition still slip a generation bump
-   through under the new holder's identity. With the live-fencing version, the redesign is now
-   formally verified sound and ready to implement in `ObjectStoreCommitHeadPublisher` /
-   `ObjectStoreWriterEngine` without further protocol-level risk.
+   through under the new holder's identity. With the live-fencing version, the redesign was
+   formally verified sound and has since been **implemented** in `ObjectStoreCommitHeadPublisher` /
+   `ObjectStoreWriterEngine` (see §16 Phase 4.5's risk note for the Java-side detail) without any
+   further protocol-level surprises during implementation.
 
    Still does not cover clones/cross-index references (§14).
 6. **Interplay with existing warm/composite work.** Writable warm solves an overlapping problem

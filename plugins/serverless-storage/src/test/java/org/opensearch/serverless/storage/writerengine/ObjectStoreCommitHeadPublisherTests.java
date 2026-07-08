@@ -66,7 +66,7 @@ public class ObjectStoreCommitHeadPublisherTests extends OpenSearchTestCase {
         return SegmentInfos.readLatestCommit(directory);
     }
 
-    public void testFirstEverPublicationActivatesTheShardHeadAtThatTerm() throws Exception {
+    public void testFirstEverPublicationActivatesTheShardHeadAtThatTermAtGenerationOne() throws Exception {
         try (Directory directory = new ByteBuffersDirectory()) {
             SegmentInfos segmentInfos = commitOneDocument(directory, "1");
 
@@ -76,7 +76,6 @@ public class ObjectStoreCommitHeadPublisherTests extends OpenSearchTestCase {
                 INDEX_UUID,
                 SHARD_ID,
                 3,
-                segmentInfos.getGeneration(),
                 0,
                 0,
                 new WalPosition("epoch-0", 0),
@@ -87,11 +86,15 @@ public class ObjectStoreCommitHeadPublisherTests extends OpenSearchTestCase {
             assertTrue(published);
             ShardHead head = shardStateStore.get(INDEX_UUID, SHARD_ID).orElseThrow().head();
             assertEquals(3, head.primaryTerm());
-            assertEquals(segmentInfos.getGeneration(), head.latestManifestGeneration());
+            // The generation is always the live head's + 1, never derived from local Lucene state --
+            // the very first publish under a fresh head (generation 0, i.e. ShardHead#initial()'s
+            // sentinel) always lands at generation 1, regardless of what segmentInfos.getGeneration()
+            // happens to be.
+            assertEquals(1, head.latestManifestGeneration());
         }
     }
 
-    public void testSecondPublicationUnderTheSameTermAdvancesTheGeneration() throws Exception {
+    public void testSecondPublicationUnderTheSameTermAdvancesTheGenerationByExactlyOne() throws Exception {
         try (Directory directory = new ByteBuffersDirectory()) {
             SegmentInfos first = commitOneDocument(directory, "1");
             assertTrue(
@@ -101,7 +104,6 @@ public class ObjectStoreCommitHeadPublisherTests extends OpenSearchTestCase {
                     INDEX_UUID,
                     SHARD_ID,
                     1,
-                    first.getGeneration(),
                     0,
                     0,
                     new WalPosition("epoch-0", 0),
@@ -109,9 +111,9 @@ public class ObjectStoreCommitHeadPublisherTests extends OpenSearchTestCase {
                     PruningStats.empty()
                 )
             );
+            assertEquals(1, shardStateStore.get(INDEX_UUID, SHARD_ID).orElseThrow().head().latestManifestGeneration());
 
             SegmentInfos second = commitOneDocument(directory, "2");
-            assertTrue(second.getGeneration() > first.getGeneration());
             assertTrue(
                 headPublisher.publishCommitAsHead(
                     directory,
@@ -119,7 +121,6 @@ public class ObjectStoreCommitHeadPublisherTests extends OpenSearchTestCase {
                     INDEX_UUID,
                     SHARD_ID,
                     1,
-                    second.getGeneration(),
                     1,
                     1,
                     new WalPosition("epoch-0", 1),
@@ -129,7 +130,7 @@ public class ObjectStoreCommitHeadPublisherTests extends OpenSearchTestCase {
             );
 
             ShardHead head = shardStateStore.get(INDEX_UUID, SHARD_ID).orElseThrow().head();
-            assertEquals(second.getGeneration(), head.latestManifestGeneration());
+            assertEquals(2, head.latestManifestGeneration());
         }
     }
 
@@ -150,7 +151,6 @@ public class ObjectStoreCommitHeadPublisherTests extends OpenSearchTestCase {
                 INDEX_UUID,
                 SHARD_ID,
                 1,
-                segmentInfos.getGeneration(),
                 0,
                 0,
                 new WalPosition("epoch-0", 0),
@@ -165,53 +165,13 @@ public class ObjectStoreCommitHeadPublisherTests extends OpenSearchTestCase {
         }
     }
 
-    public void testRetriedPublicationOfAnAlreadyPublishedGenerationIsANoOpSuccess() throws Exception {
-        try (Directory directory = new ByteBuffersDirectory()) {
-            SegmentInfos segmentInfos = commitOneDocument(directory, "1");
-
-            assertTrue(
-                headPublisher.publishCommitAsHead(
-                    directory,
-                    segmentInfos,
-                    INDEX_UUID,
-                    SHARD_ID,
-                    1,
-                    segmentInfos.getGeneration(),
-                    0,
-                    0,
-                    new WalPosition("epoch-0", 0),
-                    0,
-                    PruningStats.empty()
-                )
-            );
-
-            // A retry of the exact same publish call (e.g. the caller didn't see the first
-            // success) must not be treated as a conflict.
-            boolean retried = headPublisher.publishCommitAsHead(
-                directory,
-                segmentInfos,
-                INDEX_UUID,
-                SHARD_ID,
-                1,
-                segmentInfos.getGeneration(),
-                0,
-                0,
-                new WalPosition("epoch-0", 0),
-                0,
-                PruningStats.empty()
-            );
-            assertTrue(retried);
-        }
-    }
-
-    public void testPublicationSupersededByAConcurrentCompactionUnderTheSameTermFailsRatherThanFalselySucceeding() throws Exception {
-        // Reproduces a real, previously-latent bug: the compaction service computes its own next
-        // generation as currentHead.latestManifestGeneration() + 1, entirely independent of a
-        // writer's local Lucene generation counter. If a compactor advances the head past what
-        // this writer's own next local commit will compute, the writer's publish must not be
-        // treated as "already published, success" -- that content is the compactor's, not this
-        // commit's, and reporting success here would mean the caller believes a write succeeded
-        // that no reader will ever see.
+    public void testPublicationAfterAConcurrentCompactionUnderTheSameTermSucceedsAtTheNextLiveGeneration() throws Exception {
+        // With the writer's generation numbering decoupled from local Lucene state (formally
+        // verified in plugins/serverless-storage/formal/ShardHead.tla's PublishDecoupled/
+        // SpecDecoupled, ShardHeadDecoupled.cfg), a compactor advancing the head no longer fences the
+        // writer out: the writer simply computes its target as the live head's generation + 1, same
+        // as the compactor itself does, and lands its own content one slot after whatever the
+        // compactor last published.
         try (Directory directory = new ByteBuffersDirectory()) {
             SegmentInfos first = commitOneDocument(directory, "1");
             assertTrue(
@@ -221,7 +181,6 @@ public class ObjectStoreCommitHeadPublisherTests extends OpenSearchTestCase {
                     INDEX_UUID,
                     SHARD_ID,
                     1,
-                    first.getGeneration(),
                     0,
                     0,
                     new WalPosition("epoch-0", 0),
@@ -230,9 +189,9 @@ public class ObjectStoreCommitHeadPublisherTests extends OpenSearchTestCase {
                 )
             );
 
-            // Simulate a compactor advancing the head well past this writer's own next generation,
-            // under the same term (exactly what LuceneMergeCompactionPublisher's rebase-on-CAS
-            // publish does, independently of this writer's local commit history).
+            // Simulate a compactor advancing the head well past this writer's first publish, under
+            // the same term (exactly what LuceneMergeCompactionPublisher's rebase-on-CAS publish
+            // does, independently of this writer's local commit history).
             VersionedShardHead afterFirstPublish = shardStateStore.get(INDEX_UUID, SHARD_ID).orElseThrow();
             long compactedGeneration = afterFirstPublish.head().latestManifestGeneration() + 100;
             ShardHead compactedHead = afterFirstPublish.head().withPublishedGeneration(compactedGeneration);
@@ -241,19 +200,13 @@ public class ObjectStoreCommitHeadPublisherTests extends OpenSearchTestCase {
                 shardStateStore.compareAndSet(INDEX_UUID, SHARD_ID, Optional.of(afterFirstPublish.version()), compactedHead)
             );
 
-            // This writer's own next local commit computes a generation that lands below what the
-            // compactor just published -- exactly the scenario a writer resuming after a shard has
-            // been idle and compacted for a while would hit.
             SegmentInfos second = commitOneDocument(directory, "2");
-            assertTrue(second.getGeneration() < compactedGeneration);
-
             boolean published = headPublisher.publishCommitAsHead(
                 directory,
                 second,
                 INDEX_UUID,
                 SHARD_ID,
                 1,
-                second.getGeneration(),
                 1,
                 1,
                 new WalPosition("epoch-0", 1),
@@ -261,10 +214,9 @@ public class ObjectStoreCommitHeadPublisherTests extends OpenSearchTestCase {
                 PruningStats.empty()
             );
 
-            assertFalse("a writer superseded by a concurrent compaction must not be told it succeeded", published);
-            // The head must still be exactly the compactor's, untouched by the writer's failed attempt.
+            assertTrue("a writer resuming after a concurrent compaction must succeed at the next live generation", published);
             ShardHead head = shardStateStore.get(INDEX_UUID, SHARD_ID).orElseThrow().head();
-            assertEquals(compactedGeneration, head.latestManifestGeneration());
+            assertEquals(compactedGeneration + 1, head.latestManifestGeneration());
         }
     }
 }
