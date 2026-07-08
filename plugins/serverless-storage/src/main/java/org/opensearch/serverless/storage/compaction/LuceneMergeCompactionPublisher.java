@@ -42,13 +42,16 @@ import java.util.Optional;
  * oversized segment.
  *
  * <p>Every {@link #computeNewHead} call (including rebase retries after losing a CAS race) redoes
- * the full materialize-merge-publish sequence against whatever {@code currentHead} it's handed;
- * {@link CompactionRebaseExecutor}'s own documentation notes that a cheaper implementation could
- * cache the merged Lucene files and bundle across retries and only rebuild the small manifest
- * object each time (the merge result is generation-independent). This implementation doesn't do
- * that yet -- correct under retries (each attempt is a fresh, independent merge-and-publish), just
- * not maximally cheap under contention, which only matters for a shard hot enough to be racing
- * compaction attempts in the first place.
+ * the full materialize-merge-publish sequence against whatever {@code currentHead} it's handed.
+ * This is deliberate, not merely unoptimized: {@link CompactionRebaseExecutor} re-reads the live
+ * head fresh on every retry, and a CAS only ever fails because the head's content genuinely
+ * changed underneath it (a writer's publish, or another compactor's own merge landing first) --
+ * so the source manifest being merged is, in the case that actually matters, different on every
+ * retry, not merely renumbered. Caching the previous attempt's merged bundle and reusing it under
+ * a new generation would silently republish stale content and discard whatever the other party
+ * just wrote -- a correctness bug, not just a missed optimization. Redoing the full sequence each
+ * time is what keeps every attempt an independent, correct merge-and-publish against the actual
+ * current state.
  */
 public final class LuceneMergeCompactionPublisher implements CompactionPublisher {
 

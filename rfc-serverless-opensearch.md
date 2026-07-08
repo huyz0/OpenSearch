@@ -779,8 +779,8 @@ scale-to-zero/cold-start, balancer hysteresis. Milestone: idle index consumes ze
 first query after idle returns < 5 s p95 for a cached-manifest index.
 
 **Phase 4.5 — Compaction service (candidate selection, rebase protocol, real Lucene merge,
-size-tiered shaping, and a real concurrent-writer data-loss bug all done/fixed; lease-offload
-negotiation's remaining design work still open).** Its hard dependency,
+size-tiered shaping, background scheduling, and a real concurrent-writer data-loss bug all
+done/fixed; lease-offload negotiation's remaining design work still open).** Its hard dependency,
 shard-head CAS (metadata-plane RFC Phase 2.5), is done and generically `BlobContainer`-backed
 (`BlobContainerShardStateStore`). `CompactionPolicy` (candidate selection from
 segment-count/size/delete-ratio metrics, matching &sect;7.4's "readable without opening the
@@ -847,13 +847,26 @@ silent-data-loss risk this session originally found and the narrower manifest-id
 risk noted above, since there is no longer an externally supplied generation number to collide with
 anything.
 
-Still open: `_forcemerge` when no writer is active (the actual "no writer ever activating" case
-this service exists for), and the compactor role/lease-offload negotiation with an active writer
-(now precisely scoped above, not vague). Milestone (not yet met): a quiescent 40-segment shard is
-compacted to size-tiered shape with no writer ever activating, concurrently with a surprise writer
-re-activation (the rebase protocol, a real merge, and size-tiered shaping are now all tested
-together; only the "no writer ever activating" background-scheduling half of this milestone is
-not, since nothing yet decides *when* to run a compaction unprompted).
+**Background scheduling done**: `CompactionSchedulerTask` runs the `CompactionPolicy` decision on a
+fixed schedule per shard, so a quiescent shard with no active writer now gets compacted without a
+human or a writer ever triggering it -- the "no writer ever activating" case this service exists
+for. Each tick reads the live `ShardHead`; if the lease is currently held (an active writer is
+present, whose own local Lucene merges already handle this shard) or the shard was never activated
+or has never published anything, the tick is a no-op. Otherwise it reads the manifest at the current
+generation and evaluates `CompactionPolicy#shouldCompact` against `ManifestSegmentMetrics` --
+segment count and size derived straight from the manifest's file map via
+`IndexFileNames#parseSegmentName` (no bundle opened), matching &sect;7.4's "readable without opening
+the shard" requirement exactly. Delete ratio is not derivable this way (it lives inside a segment's
+doc-values data, not its file name or size) and is always reported as `0.0`; per
+`CompactionRebaseExecutor`'s own safety argument this only means the delete-reclaim trigger never
+fires from this estimator, a missed optimization rather than a correctness issue -- the
+segment-count/size triggers, which don't depend on it, are unaffected.
+
+Still open: the compactor role/lease-offload negotiation with an active writer (now precisely
+scoped above, not vague). Milestone (met): a quiescent 40-segment shard is compacted to size-tiered
+shape with no writer ever activating, concurrently with a surprise writer re-activation -- the
+rebase protocol, a real merge, size-tiered shaping, and now background scheduling are all
+implemented and tested together.
 
 **Phase 4.6 — Snapshots/clones/PITR (manifest pinning and PITR retention wiring done; clone not
 started).** Durable pins (§6.5) are implemented as `DurablePinRegistry`/`BlobContainerDurablePinRegistry`
