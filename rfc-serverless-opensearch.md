@@ -776,8 +776,9 @@ only for this RFC's purposes.
 scale-to-zero/cold-start, balancer hysteresis. Milestone: idle index consumes zero compute;
 first query after idle returns < 5 s p95 for a cached-manifest index.
 
-**Phase 4.5 — Compaction service (candidate selection, rebase protocol, real Lucene merge, and
-size-tiered shaping all done; lease-offload negotiation still open).** Its hard dependency,
+**Phase 4.5 — Compaction service (candidate selection, rebase protocol, real Lucene merge,
+size-tiered shaping, and a real concurrent-writer data-loss bug all done/fixed; lease-offload
+negotiation's remaining design work still open).** Its hard dependency,
 shard-head CAS (metadata-plane RFC Phase 2.5), is done and generically `BlobContainer`-backed
 (`BlobContainerShardStateStore`). `CompactionPolicy` (candidate selection from
 segment-count/size/delete-ratio metrics, matching &sect;7.4's "readable without opening the
@@ -802,9 +803,38 @@ redoes the full materialize-merge-publish sequence rather than caching the
 (generation-independent) merged bundle across retries -- correct, not maximally cheap under
 contention. `_forcemerge` while a writer is active is now verified, deliberately *not* via the
 redirect-to-compaction-service design &sect;7 originally called for -- see that section's status
-note for why. Still open: `_forcemerge` when no writer is active (the actual "no writer ever
-activating" case this service exists for), and the compactor role/lease-offload negotiation with
-an active writer. Milestone (not yet met): a quiescent 40-segment shard is
+note for why.
+
+**A real, previously-latent data-loss bug was found and fixed while investigating lease-offload
+negotiation, before it was ever built.** `ObjectStoreCommitHeadPublisher#publishCommitAsHead`'s
+"already published, treat as success" shortcut used `manifest.generation() <= currentHead.latestManifestGeneration()`.
+`LuceneMergeCompactionPublisher` computes its own next generation as
+`currentHead.latestManifestGeneration() + 1`, entirely independent of a writer's local Lucene
+generation counter -- so a compactor running several cycles while a writer was idle can push
+`latestManifestGeneration` ahead of whatever that writer's own next local commit computes. When
+such a writer resumes, its commit's generation can land *at or below* the compactor-advanced
+value, and the old `<=` check silently treated that as "my write succeeded" -- the caller (`commitIndexWriter`)
+never saw a failure, but the actually-visible head was the compactor's merged content, not the
+writer's newly committed documents. A genuinely reachable silent-data-loss bug, not a hypothetical
+edge case, and exactly what the "surprise writer re-activation" milestone below is meant to guard
+against. Fixed: the check is now strict (`<` fails/fences the writer, matching how a term mismatch
+already does; `==` is preserved as the narrow, still-safe idempotent-retry case). Verified with a
+new regression test that reproduces the exact scenario -- a compactor advancing the head, then a
+writer's own next commit landing below that -- and asserts the writer is correctly told it failed,
+with the head left exactly as the compactor published it. **Known, narrower residual risk, left
+open and documented in code**: the preserved `==` branch cannot distinguish "this writer's own
+retried publish" from "a different actor's different content that happens to compute the same
+generation number," since `ShardHead` carries no manifest-identity field to check against; today's
+call pattern (one publish attempt per local flush, never retried with the same manifest) can't
+trigger this, but a truly airtight fix means decoupling a writer's generation numbering from local
+Lucene state entirely -- always computing its target as `currentHead.latestManifestGeneration() + 1`
+read fresh under the retry loop, exactly like the compactor already does -- which is real, larger
+design work, not a hotfix, and is what the remaining lease-offload negotiation item below is
+actually about now that this immediate bug is closed.
+
+Still open: `_forcemerge` when no writer is active (the actual "no writer ever activating" case
+this service exists for), and the compactor role/lease-offload negotiation with an active writer
+(now precisely scoped above, not vague). Milestone (not yet met): a quiescent 40-segment shard is
 compacted to size-tiered shape with no writer ever activating, concurrently with a surprise writer
 re-activation (the rebase protocol, a real merge, and size-tiered shaping are now all tested
 together; only the "no writer ever activating" background-scheduling half of this milestone is

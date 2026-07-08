@@ -90,9 +90,36 @@ public final class ObjectStoreCommitHeadPublisher {
                 // impossible under correct lease handling) lower.
                 return false;
             }
-            if (manifest.generation() <= currentHead.latestManifestGeneration()) {
-                // Already published at or beyond this generation, e.g. a retried call after a
-                // prior attempt's CAS actually succeeded -- treat as success, not a conflict.
+            if (manifest.generation() < currentHead.latestManifestGeneration()) {
+                // Something else has already published a *strictly newer* generation under this
+                // same term. The primary-term check above can never catch this: the compaction
+                // service (LuceneMergeCompactionPublisher) computes its own next generation as
+                // currentHead.latestManifestGeneration() + 1, entirely independent of this
+                // writer's local Lucene generation counter -- so a compactor running several
+                // cycles while this writer was idle can push latestManifestGeneration ahead of
+                // whatever this writer's own next local commit computes. If that happens and this
+                // branch is skipped, the caller believes its write succeeded while the actual head
+                // content is the compactor's, not this commit's -- a genuine silent-data-loss bug,
+                // not a hypothetical. Treat it exactly like being fenced out: this writer's notion
+                // of "current state" is stale and it must stop, not keep publishing against
+                // assumptions that no longer hold.
+                return false;
+            }
+            if (manifest.generation() == currentHead.latestManifestGeneration()) {
+                // Already published at exactly this generation -- the intended case is a retried
+                // call after a prior attempt's CAS actually succeeded (see
+                // ObjectStoreCommitHeadPublisherTests#testRetriedPublicationOfAnAlreadyPublishedGenerationIsANoOpSuccess),
+                // which is genuinely safe: nothing in this class's own call pattern (one publish
+                // attempt per local flush, never retried with the same manifest after a failure)
+                // can trigger it any other way today. Known, narrower residual risk left
+                // unresolved: this equality check cannot distinguish "my own retried publish" from
+                // "a different actor coincidentally computed the same generation number for
+                // different content," since ShardHead carries no manifest-identity field to check
+                // against -- only reachable if a writer's local-Lucene-derived generation and a
+                // compactor's currentHead-derived generation land on the exact same integer, which
+                // requires the writer's generation numbering to stay entangled with local Lucene
+                // state at all, the deeper design issue &sect;16's still-open lease-offload
+                // negotiation item is really about.
                 return true;
             }
 

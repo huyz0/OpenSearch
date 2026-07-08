@@ -28,6 +28,7 @@ import org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore
 import org.opensearch.serverless.storage.shardstate.CasResult;
 import org.opensearch.serverless.storage.shardstate.ShardHead;
 import org.opensearch.serverless.storage.shardstate.ShardStateStore;
+import org.opensearch.serverless.storage.shardstate.VersionedShardHead;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;
@@ -200,6 +201,70 @@ public class ObjectStoreCommitHeadPublisherTests extends OpenSearchTestCase {
                 PruningStats.empty()
             );
             assertTrue(retried);
+        }
+    }
+
+    public void testPublicationSupersededByAConcurrentCompactionUnderTheSameTermFailsRatherThanFalselySucceeding() throws Exception {
+        // Reproduces a real, previously-latent bug: the compaction service computes its own next
+        // generation as currentHead.latestManifestGeneration() + 1, entirely independent of a
+        // writer's local Lucene generation counter. If a compactor advances the head past what
+        // this writer's own next local commit will compute, the writer's publish must not be
+        // treated as "already published, success" -- that content is the compactor's, not this
+        // commit's, and reporting success here would mean the caller believes a write succeeded
+        // that no reader will ever see.
+        try (Directory directory = new ByteBuffersDirectory()) {
+            SegmentInfos first = commitOneDocument(directory, "1");
+            assertTrue(
+                headPublisher.publishCommitAsHead(
+                    directory,
+                    first,
+                    INDEX_UUID,
+                    SHARD_ID,
+                    1,
+                    first.getGeneration(),
+                    0,
+                    0,
+                    new WalPosition("epoch-0", 0),
+                    0,
+                    PruningStats.empty()
+                )
+            );
+
+            // Simulate a compactor advancing the head well past this writer's own next generation,
+            // under the same term (exactly what LuceneMergeCompactionPublisher's rebase-on-CAS
+            // publish does, independently of this writer's local commit history).
+            VersionedShardHead afterFirstPublish = shardStateStore.get(INDEX_UUID, SHARD_ID).orElseThrow();
+            long compactedGeneration = afterFirstPublish.head().latestManifestGeneration() + 100;
+            ShardHead compactedHead = afterFirstPublish.head().withPublishedGeneration(compactedGeneration);
+            assertEquals(
+                CasResult.SUCCESS,
+                shardStateStore.compareAndSet(INDEX_UUID, SHARD_ID, Optional.of(afterFirstPublish.version()), compactedHead)
+            );
+
+            // This writer's own next local commit computes a generation that lands below what the
+            // compactor just published -- exactly the scenario a writer resuming after a shard has
+            // been idle and compacted for a while would hit.
+            SegmentInfos second = commitOneDocument(directory, "2");
+            assertTrue(second.getGeneration() < compactedGeneration);
+
+            boolean published = headPublisher.publishCommitAsHead(
+                directory,
+                second,
+                INDEX_UUID,
+                SHARD_ID,
+                1,
+                second.getGeneration(),
+                1,
+                1,
+                new WalPosition("epoch-0", 1),
+                0,
+                PruningStats.empty()
+            );
+
+            assertFalse("a writer superseded by a concurrent compaction must not be told it succeeded", published);
+            // The head must still be exactly the compactor's, untouched by the writer's failed attempt.
+            ShardHead head = shardStateStore.get(INDEX_UUID, SHARD_ID).orElseThrow().head();
+            assertEquals(compactedGeneration, head.latestManifestGeneration());
         }
     }
 }
