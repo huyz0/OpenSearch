@@ -113,6 +113,11 @@ public final class ObjectStoreCommitPublisher {
         return manifest;
     }
 
+    /** Reads back a previously published manifest by its exact (primaryTerm, generation) key. */
+    public CommitManifest readManifest(long primaryTerm, long generation) throws IOException {
+        return manifestStore.readManifest(primaryTerm, generation);
+    }
+
     private static byte[] readFile(Directory directory, String fileName) throws IOException {
         try (IndexInput input = directory.openInput(fileName, IOContext.READONCE)) {
             byte[] bytes = new byte[(int) input.length()];

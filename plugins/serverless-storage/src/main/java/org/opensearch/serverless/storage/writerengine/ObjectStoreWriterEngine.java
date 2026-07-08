@@ -16,6 +16,7 @@ import org.opensearch.index.engine.EngineException;
 import org.opensearch.index.engine.InternalEngine;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.translog.InternalTranslogManager;
+import org.opensearch.index.translog.Translog;
 import org.opensearch.index.translog.TranslogDeletionPolicy;
 import org.opensearch.index.translog.TranslogManager;
 import org.opensearch.index.translog.TranslogOperationHelper;
@@ -23,6 +24,7 @@ import org.opensearch.index.translog.listener.CompositeTranslogEventListener;
 import org.opensearch.serverless.storage.directory.ShardDirectory;
 import org.opensearch.serverless.storage.directory.ShardDirectoryEntry;
 import org.opensearch.serverless.storage.directory.ShardRole;
+import org.opensearch.serverless.storage.manifest.CommitManifest;
 import org.opensearch.serverless.storage.manifest.PruningStats;
 import org.opensearch.serverless.storage.manifest.WalPosition;
 import org.opensearch.serverless.storage.retention.PitrRetentionConfig;
@@ -30,10 +32,13 @@ import org.opensearch.serverless.storage.retention.PitrRetentionSchedulerTask;
 import org.opensearch.serverless.storage.translog.WalMirroringTranslog;
 import org.opensearch.serverless.storage.translog.WalMirroringTranslogFactory;
 import org.opensearch.serverless.storage.wal.WalChunkService;
+import org.opensearch.serverless.storage.wal.WalReplayRecovery;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
+import java.util.List;
+import java.util.Optional;
 import java.util.function.LongSupplier;
 
 /**
@@ -339,6 +344,48 @@ public class ObjectStoreWriterEngine extends InternalEngine {
             return new WalPosition(String.valueOf(engineConfig.getPrimaryTermSupplier().getAsLong()), 0);
         }
         return new WalPosition(walChunkService.writerEpoch(), walMirroringTranslog.lastFlushedWalChunkSequence());
+    }
+
+    /**
+     * Fetches, filters, and decodes the WAL operations this shard needs to catch up on between the
+     * last durably-published manifest and this writer's own {@link #activationWalPosition} --
+     * {@code plugins/serverless-storage/formal/WalReplayFencing.tla}'s verified {@code FixedReplay}
+     * design, via {@link WalReplayRecovery}. The term floor passed is one term back from what this
+     * writer is activating under ({@code WalReplayFencing.tla}'s {@code ReplayFloor}), so a
+     * predecessor's legitimately-durable-but-not-yet-manifested records are not wrongly excluded by
+     * term alone -- see {@link org.opensearch.serverless.storage.wal.WalChunkReader
+     * #filterByShardAndMinimumTerm}'s own javadoc for why that term filter needs the position
+     * cutoff alongside it.
+     *
+     * <p>Returns an empty list when WAL mirroring is disabled ({@link #walChunkService} is
+     * {@code null}) -- there is nothing durable in the WAL to replay from, and local recovery
+     * (already run inside {@code super(engineConfig)}, before this method could ever be called) is
+     * this engine's only recovery mechanism in that configuration, same as any other {@code
+     * InternalEngine}.
+     *
+     * <p><b>Not yet wired to anything</b> -- nothing calls this method today. What it returns still
+     * needs to be applied to reconstruct local state, which needs an entry point above the
+     * {@code Engine} layer (an {@code IndexShard}-level seam, analogous to the already-public
+     * {@code IndexShard#applyTranslogOperation}) that this plugin does not yet have; see {@link
+     * org.opensearch.serverless.storage.wal.WalReplayRecovery}'s own javadoc for the exact boundary
+     * and rfc-serverless-opensearch.md &sect;16 Phase 2's "still open" note.
+     */
+    List<Translog.Operation> replayWalOperations() throws IOException {
+        if (walChunkService == null) {
+            return List.of();
+        }
+        long currentTerm = engineConfig.getPrimaryTermSupplier().getAsLong();
+        long minPrimaryTerm = currentTerm - 1;
+        Optional<CommitManifest> latestManifest = headPublisher.readLatestManifest(indexUuid, shardId);
+        WalPosition lastDurableWalPosition = latestManifest.map(CommitManifest::walPosition).orElse(null);
+        return WalReplayRecovery.replayOperations(
+            walChunkService.blobContainer(),
+            indexUuid,
+            shardId,
+            minPrimaryTerm,
+            lastDurableWalPosition,
+            activationWalPosition
+        );
     }
 
     private void refreshDirectoryEntry() {

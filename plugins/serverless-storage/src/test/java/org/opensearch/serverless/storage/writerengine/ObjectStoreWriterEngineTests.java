@@ -522,4 +522,100 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
             IOUtils.close(engine, lastOpenedStore);
         }
     }
+
+    public void testReplayWalOperationsReturnsOperationsSinceTheLastManifestBoundedByActivation() throws Exception {
+        // End-to-end proof of WalReplayFencing.tla's verified FixedReplay design against a real
+        // failover: a first writer (term N) publishes a manifest, more operations land durably in
+        // the WAL afterward, and a second writer (term N+1) activating later must replay exactly
+        // those -- no more, no less.
+        FsBlobStore walBlobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer walBlobContainer = new FsBlobContainer(walBlobStore, BlobPath.cleanPath(), walBlobStore.path());
+        org.opensearch.serverless.storage.wal.WalChunkService walChunkService = new org.opensearch.serverless.storage.wal.WalChunkService(
+            walBlobContainer,
+            "shared-epoch"
+        );
+
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+
+        Store store1 = createStore();
+        store1.createEmpty(defaultSettings.getIndexVersionCreated().luceneVersion);
+        java.nio.file.Path translogPath1 = createTempDir();
+        String translogUuid1 = Translog.createEmptyTranslog(translogPath1, SequenceNumbers.NO_OPS_PERFORMED, shardId, primaryTerm.get());
+        store1.associateIndexWithNewTranslog(translogUuid1);
+        EngineConfig engineConfig1 = config(defaultSettings, store1, translogPath1, newMergePolicy(), null);
+        ObjectStoreWriterEngine engine1 = new ObjectStoreWriterEngine(
+            engineConfig1,
+            new ObjectStoreCommitHeadPublisher(commitPublisher, shardStateStore),
+            shardDirectory,
+            LOCAL_NODE_ID,
+            null,
+            walChunkService
+        );
+        engine1.translogManager().recoverFromTranslog(translogHandler, engine1.getProcessedLocalCheckpoint(), Long.MAX_VALUE);
+        index(engine1, "1");
+        engine1.flush(true, true);
+        IOUtils.close(engine1, store1);
+
+        // Durable in the WAL, but never covered by any published manifest -- exactly what replay
+        // must catch up on for the next writer.
+        Translog.Index extraOp = new Translog.Index("2", 1, primaryTerm.get(), "extra".getBytes("UTF-8"));
+        org.opensearch.common.io.stream.BytesStreamOutput out = new org.opensearch.common.io.stream.BytesStreamOutput();
+        Translog.Operation.writeOperation(out, extraOp);
+        walChunkService.append(
+            new org.opensearch.serverless.storage.wal.WalRecord(
+                shardId.getIndex().getUUID(),
+                shardId.getId(),
+                primaryTerm.get(),
+                1,
+                org.opensearch.core.common.bytes.BytesReference.toBytes(out.bytes())
+            )
+        );
+        walChunkService.flush();
+
+        primaryTerm.set(primaryTerm.get() + 1);
+        Store store2 = createStore();
+        store2.createEmpty(defaultSettings.getIndexVersionCreated().luceneVersion);
+        java.nio.file.Path translogPath2 = createTempDir();
+        String translogUuid2 = Translog.createEmptyTranslog(translogPath2, SequenceNumbers.NO_OPS_PERFORMED, shardId, primaryTerm.get());
+        store2.associateIndexWithNewTranslog(translogUuid2);
+        EngineConfig engineConfig2 = config(defaultSettings, store2, translogPath2, newMergePolicy(), null);
+        ObjectStoreWriterEngine engine2 = new ObjectStoreWriterEngine(
+            engineConfig2,
+            new ObjectStoreCommitHeadPublisher(commitPublisher, shardStateStore),
+            shardDirectory,
+            LOCAL_NODE_ID,
+            null,
+            walChunkService
+        );
+        try {
+            java.util.List<Translog.Operation> replayed = engine2.replayWalOperations();
+            assertEquals(1, replayed.size());
+            assertEquals(1L, replayed.get(0).seqNo());
+        } finally {
+            IOUtils.close(engine2, store2);
+        }
+    }
+
+    public void testReplayWalOperationsIsEmptyWhenWalMirroringIsDisabled() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+
+        ObjectStoreWriterEngine engine = openWriterEngine(shardStateStore, commitPublisher);
+        try {
+            assertTrue(engine.replayWalOperations().isEmpty());
+        } finally {
+            IOUtils.close(engine, lastOpenedStore);
+        }
+    }
 }

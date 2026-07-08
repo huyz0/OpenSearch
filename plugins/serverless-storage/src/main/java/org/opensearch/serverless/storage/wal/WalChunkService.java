@@ -127,6 +127,19 @@ public final class WalChunkService {
     }
 
     /**
+     * The underlying blob container every chunk under this epoch is written to -- what {@link
+     * org.opensearch.serverless.storage.wal.WalReplayRecovery} reads chunks back from during
+     * activation replay. Note this container is not itself scoped per-epoch on disk (see {@link
+     * WalChunkNaming}'s javadoc: {@code blobName} does not actually incorporate the epoch, only
+     * {@code blobPath} does, and only {@code blobName} is what {@link #writeChunk} uses) -- chunk
+     * sequence numbers are the real, globally-continuous ordering key this service and {@code
+     * WalReplayRecovery} both rely on, not the epoch string.
+     */
+    public BlobContainer blobContainer() {
+        return blobContainer;
+    }
+
+    /**
      * The chunk sequence that will be used <em>next</em>, under this epoch -- i.e. an exclusive
      * upper bound on every chunk sequence written so far. This is the real-world analogue of
      * {@code WalReplayFencing.tla}'s {@code Len(wal)}: a writer activating under a new term can

@@ -271,12 +271,36 @@ coordination has *already* decided this node holds the new term, so there's a sm
 between the true term change and this snapshot that a fully atomic metadata-plane lease-grant CAS
 (still future work, per &sect;7.1) would close but this cannot.
 
-**Still not implemented: the replay/recovery mechanism itself.** `activationWalPosition` is captured
-and ready, but nothing yet consumes it -- there is still no code path that reads a manifest, fetches
-the WAL chunks past its `WalPosition`, filters them by both term and this position bound, and
-replays them into a fresh local Lucene index. `filterByShardAndMinimumTerm`, WAL mirroring, and now
-this snapshot are all prerequisites for, not a substitute for, that mechanism -- see &sect;16 Phase
-2's "still open" note.
+**The read/filter/decode side of replay is now implemented and tested end-to-end against a real
+two-writer failover**, in `wal/WalReplayRecovery.java`: given the last durably-published manifest's
+`WalPosition` (or none, for a brand new shard) and a writer's own `activationWalPosition`, it lists
+the WAL chunks in that range, reads and decodes each one, filters by `(indexUuid, shardId,
+minPrimaryTerm)` exactly as `WalReplayFencing.tla`'s verified `FixedReplay` requires -- both the term
+floor *and* the position cutoff, never either alone -- and returns an ordered
+`List<Translog.Operation>` (payloads are exactly what `WalMirroringTranslog#add` serialized via
+`Translog.Operation.writeOperation`, decoded back via `Translog.Operation.readOperation`).
+`ObjectStoreWriterEngine#replayWalOperations()` wires this to a real activating engine: it reads the
+shard's latest manifest via a new `ObjectStoreCommitHeadPublisher#readLatestManifest` (added
+alongside a small `ObjectStoreCommitPublisher#readManifest` passthrough and a
+`WalChunkService#blobContainer()` getter, both trivial plumbing), computes the term floor as
+`ReplayFloor = currentTerm - 1` per the TLA+ model, and calls `WalReplayRecovery` with those and
+`activationWalPosition`. Tested with a real two-`ObjectStoreWriterEngine` scenario -- one writer
+indexes and publishes a manifest, more operations land durably in the WAL afterward but before any
+further manifest, a second writer activates under a higher term against the same shared
+`WalChunkService`/manifest store -- and asserts replay returns exactly the unmanifested operations,
+no more and no less.
+
+**Still not implemented: applying the replayed operations.** `replayWalOperations()` returns a
+decoded, ordered, correctly-fenced `List<Translog.Operation>` -- and nothing yet calls it, and
+nothing yet applies what it returns to reconstruct local Lucene/translog state. That apply step
+needs an entry point above the `Engine` layer this plugin's classes sit at (the natural analogue is
+the already-public `IndexShard#applyTranslogOperation`, called once per operation the same way core's
+own translog recovery runner already does) -- this plugin has no `IndexShard`-level recovery seam
+yet, and building one is a distinct, larger piece of work than anything in this section: it needs to
+decide where in shard allocation/recovery this replay call happens, relative to `super(engineConfig)`
+already having recovered from local translog. `filterByShardAndMinimumTerm`, WAL mirroring,
+`activationWalPosition`, and now `WalReplayRecovery` are all prerequisites for, not a substitute for,
+that remaining step -- see &sect;16 Phase 2's "still open" note.
 
 **Why per-record fencing instead of per-shard path fencing (`RemoteFsTranslog`-style), considered
 and rejected on cost grounds.** Core OpenSearch's own remote-store translog fences the identical
@@ -983,7 +1007,13 @@ half of &sect;7.1.1's own milestone is now met as a result. Separately, still no
 whose durability is object-store-only survives `kill -9` of its node with zero data loss (durable
 ack mode), recovering by manifest+WAL replay -- no crash-survival integration test exercising this
 exists yet; the retention work above makes local disk usage bounded, it doesn't by itself prove
-crash recovery.
+crash recovery. **WAL replay fencing is now formally verified** (`formal/WalReplayFencing.tla`,
+`FixedReplay` holds exhaustively; the naively-shipped term-only filter does not) **and the
+read/filter/decode side is implemented and tested against a real two-writer failover**
+(`wal/WalReplayRecovery.java`, `ObjectStoreWriterEngine#replayWalOperations()`, &sect;6.4) -- what
+remains for real crash recovery is the apply step (feeding the returned operations into a fresh
+local Lucene index via an `IndexShard`-level seam this plugin doesn't have yet), which is what the
+"no crash-survival integration test exists yet" note above is still waiting on.
 
 **Phase 3 — Reader engine (materializer and open-from-manifest done; refresh-to-newer-generation
 and notification wiring still open).** `ObjectStoreCommitMaterializer` fetches every file a

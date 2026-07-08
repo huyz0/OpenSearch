@@ -132,4 +132,20 @@ public final class ObjectStoreCommitHeadPublisher {
             // the live head and retry with a freshly computed generation.
         }
     }
+
+    /**
+     * The latest durably-published manifest for this shard, if any -- what a writer activating
+     * (under a new or resumed term) reads to determine where WAL replay must resume from (the
+     * manifest's own {@link WalPosition}) and what Lucene generation local recovery should already
+     * reflect. Empty only when this shard has never published a manifest at all (a brand new
+     * shard, nothing yet to catch up on beyond the whole WAL from the start).
+     */
+    public Optional<CommitManifest> readLatestManifest(String indexUuid, int shardId) throws IOException {
+        Optional<VersionedShardHead> current = shardStateStore.get(indexUuid, shardId);
+        if (current.isEmpty()) {
+            return Optional.empty();
+        }
+        ShardHead head = current.get().head();
+        return Optional.of(commitPublisher.readManifest(head.primaryTerm(), head.latestManifestGeneration()));
+    }
 }
