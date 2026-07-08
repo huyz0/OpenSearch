@@ -931,6 +931,21 @@ directions documented so serverless adoption is not a one-way door.
    (Phase 3 gate).
 4. **WAL multiplexing fairness.** One node-level WAL means one noisy shard can delay acks for
    others. Mitigation: per-shard budget within a chunk, overflow to dedicated chunks.
+   **Status: implemented and tested.** `WalChunkService` now takes an optional
+   `perShardBudgetBytes`; a shard whose own cumulative buffered payload bytes since its last
+   flush crosses that budget is immediately siphoned out of the shared buffer into its own
+   dedicated chunk -- written right away, independent of the caller's own flush timer/threshold --
+   leaving every other shard's buffered records and byte counters untouched. Disabled by default
+   (`<= 0`, matching every other optional-feature-off default in this plugin) so existing callers
+   are unaffected. Verified: a noisy shard crossing budget overflows immediately without a
+   `flush()` call; a quiet shard sharing the buffer is undisturbed by another shard's overflow; the
+   overflowed shard's byte counter resets so it can accumulate again rather than overflowing on
+   every subsequent append; an ordinary `flush()` clears every shard's counter too, not just the
+   buffer. `WalMirroringTranslog`'s one current caller flushes after every single append already
+   (per-operation durability), so it never actually accumulates a multi-shard buffer today and
+   doesn't yet pass a budget -- this mitigation is real infrastructure for the node-level,
+   genuinely-batched caller `WalChunkService`'s own class javadoc already describes as the
+   component's actual target use, not yet exercised by a real multi-shard-batching caller.
 5. **Coordination-free GC** is the subtlest correctness surface. The lease/TTL design must be
    model-checked (TLA+ or equivalent) before Phase 1 completes — this is the one component
    where a design bug destroys data. The model must cover cross-index bundle references from

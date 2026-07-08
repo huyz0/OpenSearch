@@ -120,4 +120,95 @@ public class WalChunkServiceTests extends OpenSearchTestCase {
         }
         assertEquals(recordCount, WalChunkReader.readRecords(chunkBytes).size());
     }
+
+    public void testWithNoBudgetConfiguredANoisyShardDoesNotOverflowEarly() throws Exception {
+        BlobContainer blobContainer = newBlobContainer();
+        WalChunkService service = new WalChunkService(blobContainer, "epoch-0");
+        for (int i = 0; i < 100; i++) {
+            service.append(new WalRecord("noisy-idx", 0, i, new byte[1000]));
+        }
+        assertEquals("with no budget, everything just accumulates in the shared buffer", 100, service.bufferedRecordCount());
+    }
+
+    public void testANoisyShardOverBudgetIsSiphonedIntoItsOwnDedicatedChunkImmediately() throws Exception {
+        BlobContainer blobContainer = newBlobContainer();
+        WalChunkService service = new WalChunkService(blobContainer, "epoch-0", 100);
+
+        service.append(new WalRecord("quiet-idx", 0, 0, "small".getBytes("UTF-8")));
+        // Crosses the 100-byte budget for this shard on this append -- must overflow immediately,
+        // independent of any flush() call.
+        service.append(new WalRecord("noisy-idx", 0, 0, new byte[150]));
+
+        // The noisy shard's record was written out as its own dedicated chunk (sequence 0) without
+        // any flush() call; only the quiet shard's record remains buffered.
+        assertEquals(1, service.bufferedRecordCount());
+
+        byte[] overflowChunkBytes;
+        try (InputStream in = blobContainer.readBlob(WalChunkNaming.blobName("epoch-0", 0))) {
+            overflowChunkBytes = in.readAllBytes();
+        }
+        List<WalRecord> overflowRecords = WalChunkReader.readRecords(overflowChunkBytes);
+        assertEquals(1, overflowRecords.size());
+        assertEquals("noisy-idx", overflowRecords.get(0).indexUuid());
+
+        // The quiet shard's record is still in the normal shared buffer, unaffected, and the next
+        // flush() gets the next chunk sequence after the overflow chunk's.
+        long chunkSeq = service.flush();
+        assertEquals(1, chunkSeq);
+        byte[] normalChunkBytes;
+        try (InputStream in = blobContainer.readBlob(WalChunkNaming.blobName("epoch-0", 1))) {
+            normalChunkBytes = in.readAllBytes();
+        }
+        List<WalRecord> normalRecords = WalChunkReader.readRecords(normalChunkBytes);
+        assertEquals(1, normalRecords.size());
+        assertEquals("quiet-idx", normalRecords.get(0).indexUuid());
+    }
+
+    public void testOverflowingOneShardDoesNotDisturbAnotherShardsAlreadyBufferedRecords() throws Exception {
+        BlobContainer blobContainer = newBlobContainer();
+        WalChunkService service = new WalChunkService(blobContainer, "epoch-0", 100);
+
+        service.append(new WalRecord("shard-a", 0, 0, new byte[40]));
+        service.append(new WalRecord("shard-b", 0, 0, new byte[40]));
+        // Pushes shard-a's cumulative total to 40+70=110, over budget -- only shard-a overflows.
+        service.append(new WalRecord("shard-a", 0, 1, new byte[70]));
+
+        assertEquals("only shard-b's record should remain buffered", 1, service.bufferedRecordCount());
+        service.flush();
+        byte[] chunkBytes;
+        try (InputStream in = blobContainer.readBlob(WalChunkNaming.blobName("epoch-0", 1))) {
+            chunkBytes = in.readAllBytes();
+        }
+        List<WalRecord> records = WalChunkReader.readRecords(chunkBytes);
+        assertEquals(1, records.size());
+        assertEquals("shard-b", records.get(0).indexUuid());
+    }
+
+    public void testAfterOverflowTheShardsByteCounterResetsSoItCanAccumulateAgain() throws Exception {
+        BlobContainer blobContainer = newBlobContainer();
+        WalChunkService service = new WalChunkService(blobContainer, "epoch-0", 100);
+
+        service.append(new WalRecord("idx", 0, 0, new byte[150])); // overflow #1 -> chunk 0
+        service.append(new WalRecord("idx", 0, 1, new byte[150])); // overflow #2 -> chunk 1, not accumulated onto the first
+
+        assertEquals(0, service.bufferedRecordCount());
+        byte[] secondOverflowBytes;
+        try (InputStream in = blobContainer.readBlob(WalChunkNaming.blobName("epoch-0", 1))) {
+            secondOverflowBytes = in.readAllBytes();
+        }
+        assertEquals(1, WalChunkReader.readRecords(secondOverflowBytes).size());
+    }
+
+    public void testFlushClearsPerShardByteCountersToo() throws Exception {
+        BlobContainer blobContainer = newBlobContainer();
+        WalChunkService service = new WalChunkService(blobContainer, "epoch-0", 100);
+
+        service.append(new WalRecord("idx", 0, 0, new byte[60]));
+        service.flush();
+        // If the per-shard counter weren't cleared on flush, this append (60 more bytes, 120
+        // cumulative) would incorrectly trigger an overflow instead of just buffering normally.
+        service.append(new WalRecord("idx", 0, 1, new byte[60]));
+
+        assertEquals(1, service.bufferedRecordCount());
+    }
 }

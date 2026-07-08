@@ -14,7 +14,11 @@ import org.opensearch.core.common.bytes.BytesArray;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -29,6 +33,16 @@ import java.util.concurrent.atomic.AtomicLong;
  * local translog does) should flush after every append; a caller wanting real group-commit
  * batching across shards should flush on a timer or size threshold instead.
  *
+ * <p><b>Per-shard fairness</b> (rfc-serverless-opensearch.md &sect;18 risk #4, "WAL multiplexing
+ * fairness"): one node-level chunk mixing many shards' records means one noisy shard's writes
+ * could otherwise bloat the shared buffer and delay every other shard's flush/ack indefinitely,
+ * since {@link #flush} only fires on the caller's own timer/size trigger, not per shard. If a
+ * positive {@code perShardBudgetBytes} is configured, a shard whose own buffered payload bytes
+ * (since its last flush) crosses that budget is immediately siphoned into its own dedicated chunk
+ * -- written right away, independent of whatever the caller's own flush trigger is doing -- so a
+ * noisy shard's records stop accumulating in (and delaying) the shared buffer other shards depend
+ * on, without needing every shard to flush early just because one of them is busy.
+ *
  * <p>The chunk sequence for a given {@code writerEpoch} resumes from whatever is already present
  * in the blob container rather than always starting at 0: a caller must pick a {@code
  * writerEpoch} that is unique to one actual writer lifetime (e.g. derived from the shard's
@@ -41,12 +55,20 @@ public final class WalChunkService {
 
     private final BlobContainer blobContainer;
     private final String writerEpoch;
+    private final long perShardBudgetBytes;
     private final AtomicLong nextChunkSequence;
     private final List<WalRecord> buffered = new ArrayList<>();
+    private final Map<ShardKey, Long> bufferedBytesByShard = new HashMap<>();
 
     public WalChunkService(BlobContainer blobContainer, String writerEpoch) throws IOException {
+        this(blobContainer, writerEpoch, -1);
+    }
+
+    /** @param perShardBudgetBytes see the class javadoc's "Per-shard fairness" section; {@code <= 0} disables the budget entirely. */
+    public WalChunkService(BlobContainer blobContainer, String writerEpoch, long perShardBudgetBytes) throws IOException {
         this.blobContainer = blobContainer;
         this.writerEpoch = writerEpoch;
+        this.perShardBudgetBytes = perShardBudgetBytes;
         this.nextChunkSequence = new AtomicLong(firstUnusedChunkSequence(blobContainer, writerEpoch));
     }
 
@@ -61,8 +83,15 @@ public final class WalChunkService {
         return maxExisting + 1;
     }
 
-    public synchronized void append(WalRecord record) {
+    public synchronized void append(WalRecord record) throws IOException {
         buffered.add(record);
+        if (perShardBudgetBytes > 0) {
+            ShardKey key = new ShardKey(record.indexUuid(), record.shardId());
+            long newTotal = bufferedBytesByShard.merge(key, (long) record.payload().length, Long::sum);
+            if (newTotal >= perShardBudgetBytes) {
+                overflowShardToDedicatedChunk(key);
+            }
+        }
     }
 
     /**
@@ -75,15 +104,69 @@ public final class WalChunkService {
         if (buffered.isEmpty()) {
             return -1;
         }
-        long chunkSequence = nextChunkSequence.getAndIncrement();
-        byte[] chunkBytes = WalChunkWriter.write(buffered);
-        String blobName = WalChunkNaming.blobName(writerEpoch, chunkSequence);
-        blobContainer.writeBlob(blobName, new BytesArray(chunkBytes).streamInput(), chunkBytes.length, false);
+        long chunkSequence = writeChunk(buffered);
         buffered.clear();
+        bufferedBytesByShard.clear();
         return chunkSequence;
     }
 
     public synchronized int bufferedRecordCount() {
         return buffered.size();
+    }
+
+    /**
+     * Pulls every currently-buffered record belonging to {@code key} out of the shared buffer and
+     * writes them into their own dedicated chunk immediately, leaving every other shard's buffered
+     * records (and their own per-shard byte counters) untouched.
+     */
+    private void overflowShardToDedicatedChunk(ShardKey key) throws IOException {
+        List<WalRecord> shardRecords = new ArrayList<>();
+        Iterator<WalRecord> iterator = buffered.iterator();
+        while (iterator.hasNext()) {
+            WalRecord record = iterator.next();
+            if (key.matches(record)) {
+                shardRecords.add(record);
+                iterator.remove();
+            }
+        }
+        bufferedBytesByShard.remove(key);
+        if (shardRecords.isEmpty() == false) {
+            writeChunk(shardRecords);
+        }
+    }
+
+    private long writeChunk(List<WalRecord> records) throws IOException {
+        long chunkSequence = nextChunkSequence.getAndIncrement();
+        byte[] chunkBytes = WalChunkWriter.write(records);
+        String blobName = WalChunkNaming.blobName(writerEpoch, chunkSequence);
+        blobContainer.writeBlob(blobName, new BytesArray(chunkBytes).streamInput(), chunkBytes.length, false);
+        return chunkSequence;
+    }
+
+    private static final class ShardKey {
+        private final String indexUuid;
+        private final int shardId;
+
+        ShardKey(String indexUuid, int shardId) {
+            this.indexUuid = indexUuid;
+            this.shardId = shardId;
+        }
+
+        boolean matches(WalRecord record) {
+            return record.belongsTo(indexUuid, shardId);
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (!(o instanceof ShardKey)) return false;
+            ShardKey shardKey = (ShardKey) o;
+            return shardId == shardKey.shardId && indexUuid.equals(shardKey.indexUuid);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(indexUuid, shardId);
+        }
     }
 }
