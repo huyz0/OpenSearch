@@ -16,6 +16,8 @@ import org.opensearch.core.common.io.stream.StreamInput;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Persists and retrieves {@link CommitManifest}s against a real {@link BlobContainer}, using each
@@ -54,5 +56,23 @@ public final class BlobContainerManifestStore {
     /** Whether a manifest for this (primaryTerm, generation) has already been written. */
     public boolean manifestExists(long primaryTerm, long generation) throws IOException {
         return blobContainer.blobExists(CommitManifest.manifestName(primaryTerm, generation));
+    }
+
+    /**
+     * Every manifest ever written to this shard's container, read and deserialized in full. This
+     * is the one operation in this class that legitimately enumerates storage wholesale -- every
+     * other method here is a targeted read/write by exact name -- so it is expected to be slow and
+     * called rarely (retention-policy evaluation, not any request path), the same tradeoff {@link
+     * org.opensearch.serverless.storage.directory.DirectoryRebuildService} already makes for the
+     * same reason.
+     */
+    public List<CommitManifest> listManifests() throws IOException {
+        List<CommitManifest> manifests = new ArrayList<>();
+        for (String blobName : blobContainer.listBlobsByPrefix(CommitManifest.NAME_PREFIX).keySet()) {
+            try (InputStream in = blobContainer.readBlob(blobName)) {
+                manifests.add(new CommitManifest(StreamInput.wrap(in.readAllBytes())));
+            }
+        }
+        return manifests;
     }
 }

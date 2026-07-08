@@ -14,7 +14,10 @@ import org.opensearch.common.blobstore.fs.FsBlobContainer;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 public class BlobContainerManifestStoreTests extends OpenSearchTestCase {
 
@@ -68,5 +71,54 @@ public class BlobContainerManifestStoreTests extends OpenSearchTestCase {
         store.writeManifest(manifest);
 
         assertTrue(blobContainer.blobExists("manifest-7-42"));
+    }
+
+    private static CommitManifest manifest(long term, long generation) {
+        return new CommitManifest(
+            "idx",
+            0,
+            term,
+            generation,
+            "segments_" + generation,
+            Map.of("segments_" + generation, new FileReference("bundle-" + term + "-" + generation, 0, 10, 1L)),
+            0,
+            0,
+            null,
+            0,
+            PruningStats.empty(),
+            generation * 1000L
+        );
+    }
+
+    public void testListManifestsOnAnEmptyContainerReturnsNothing() throws Exception {
+        BlobContainerManifestStore store = new BlobContainerManifestStore(newFsBlobContainer());
+        assertEquals(List.of(), store.listManifests());
+    }
+
+    public void testListManifestsReturnsEveryWrittenManifest() throws Exception {
+        BlobContainerManifestStore store = new BlobContainerManifestStore(newFsBlobContainer());
+        CommitManifest gen0 = manifest(1, 0);
+        CommitManifest gen1 = manifest(1, 1);
+        CommitManifest gen2 = manifest(1, 2);
+        store.writeManifest(gen0);
+        store.writeManifest(gen1);
+        store.writeManifest(gen2);
+
+        List<CommitManifest> listed = store.listManifests();
+
+        assertEquals(3, listed.size());
+        assertEquals(Set.of(gen0, gen1, gen2), listed.stream().collect(Collectors.toSet()));
+    }
+
+    public void testListManifestsAcrossMultipleTermsReturnsAllOfThem() throws Exception {
+        BlobContainerManifestStore store = new BlobContainerManifestStore(newFsBlobContainer());
+        CommitManifest term1Gen0 = manifest(1, 0);
+        CommitManifest term2Gen0 = manifest(2, 0); // same generation, different term -- distinct blob name
+        store.writeManifest(term1Gen0);
+        store.writeManifest(term2Gen0);
+
+        List<CommitManifest> listed = store.listManifests();
+
+        assertEquals(Set.of(term1Gen0, term2Gen0), listed.stream().collect(Collectors.toSet()));
     }
 }

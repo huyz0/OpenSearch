@@ -839,9 +839,25 @@ silently deleted every other in-window PITR pin too. Added `removePin(String, in
 matching on the full pin (reason + term + generation) so one generation's pin can be removed
 without touching any other generation's pin under the same reason; `removePin(String, int,
 String)`'s original all-matching-reason behavior is unchanged and still used for snapshots. Not
-yet done: zero-copy clone with cross-index bundle refcounts, actually invoking
-`PitrRetentionReconciler` on a schedule per shard (it exists and is correct; nothing yet calls it
-periodically), and the extended GC model check this phase is gated on.
+yet done: zero-copy clone with cross-index bundle refcounts, and the extended GC model check this
+phase is gated on.
+
+**PITR reconciliation is now actually invoked, not just correct in isolation.**
+`PitrRetentionSchedulerTask` runs `PitrRetentionReconciler` for one shard on a fixed schedule (5
+minutes -- deliberately much longer than the directory-tier refresh, since reconciliation
+enumerates and reads every manifest the shard has ever written via the new
+`BlobContainerManifestStore#listManifests`, real I/O the lightweight directory refresh doesn't
+do). `ObjectStoreWriterEngine` owns one for as long as it stays open, the same lifecycle shape as
+its directory-refresh task, canceled cleanly on `close()`. Configured via a new
+`serverless_storage.pitr_window` node setting; a non-positive value (the default) disables PITR
+retention entirely -- no `"pitr"` pins are ever added -- matching how `encryptionKeyProvider`
+being absent means "encryption is off" elsewhere in this plugin. A failed reconciliation attempt
+is swallowed and retried on the next tick rather than failing the shard's engine: it can only ever
+leave pins stale, never delete anything, so a transient failure is never worse than the status quo.
+Verified: constructing/closing the engine with PITR configured doesn't throw (the scheduling
+internals themselves -- real background ticks, real pin add/remove, cancellation on close -- are
+exhaustively covered directly in `PitrRetentionSchedulerTaskTests` against a short, configurable
+interval, since the engine's real 5-minute interval is far too long to observe in a test).
 
 **Phase 5 — Hardening (ongoing).** Chaos suite (§17) including full object-store outage modes
 (§13), performance tuning of bundle/WAL batch parameters, API gating audit, autoscaling signal

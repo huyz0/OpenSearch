@@ -160,13 +160,16 @@ public final class CommitManifest implements Writeable {
         return createdAtMillis;
     }
 
+    /** Every manifest blob name starts with this -- the prefix {@link org.opensearch.serverless.storage.manifest.BlobContainerManifestStore#listManifests} lists by. */
+    public static final String NAME_PREFIX = "manifest-";
+
     /** The canonical object name for this manifest, per rfc-serverless-opensearch.md &sect;6.3. */
     public String manifestName() {
         return manifestName(primaryTerm, generation);
     }
 
     public static String manifestName(long primaryTerm, long generation) {
-        return "manifest-" + primaryTerm + "-" + generation;
+        return NAME_PREFIX + primaryTerm + "-" + generation;
     }
 
     /**

@@ -33,6 +33,9 @@ import org.opensearch.serverless.storage.format.BlobContainerBundleStore;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.manifest.CommitManifest;
 import org.opensearch.serverless.storage.readerengine.ObjectStoreCommitMaterializer;
+import org.opensearch.serverless.storage.retention.BlobContainerDurablePinRegistry;
+import org.opensearch.serverless.storage.retention.DurablePinRegistry;
+import org.opensearch.serverless.storage.retention.PitrRetentionConfig;
 import org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore;
 import org.opensearch.serverless.storage.shardstate.ShardHead;
 import org.opensearch.serverless.storage.shardstate.ShardStateStore;
@@ -138,6 +141,44 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
         } finally {
             IOUtils.close(engine, lastOpenedStore);
         }
+    }
+
+    public void testOpeningAndClosingWithPitrRetentionConfiguredDoesNotThrow() throws Exception {
+        // PitrRetentionSchedulerTask's own scheduling/reconciliation behavior is verified directly
+        // and exhaustively in PitrRetentionSchedulerTaskTests (real background ticks, real pin
+        // add/remove, cancellation on close) against a configurable short interval -- this engine
+        // hardcodes a 5-minute interval, far too long to observe a real tick in a test. What this
+        // test proves instead is the wiring itself: constructing and closing the engine with a
+        // PitrRetentionConfig must not throw, i.e. the plumbing from engine constructor through to
+        // PitrRetentionSchedulerTask's own constructor (and back through close()) is correct.
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            manifestStore
+        );
+        DurablePinRegistry pinRegistry = new BlobContainerDurablePinRegistry(blobContainer);
+        PitrRetentionConfig pitrRetentionConfig = new PitrRetentionConfig(manifestStore, pinRegistry, 60_000L);
+
+        Store store = createStore();
+        lastOpenedStore = store;
+        store.createEmpty(defaultSettings.getIndexVersionCreated().luceneVersion);
+        java.nio.file.Path translogPath = createTempDir();
+        String translogUuid = Translog.createEmptyTranslog(translogPath, SequenceNumbers.NO_OPS_PERFORMED, shardId, primaryTerm.get());
+        store.associateIndexWithNewTranslog(translogUuid);
+        EngineConfig engineConfig = config(defaultSettings, store, translogPath, newMergePolicy(), null);
+
+        ObjectStoreWriterEngine engine = new ObjectStoreWriterEngine(
+            engineConfig,
+            new ObjectStoreCommitHeadPublisher(commitPublisher, shardStateStore),
+            shardDirectory,
+            LOCAL_NODE_ID,
+            pitrRetentionConfig
+        );
+        engine.translogManager().recoverFromTranslog(translogHandler, engine.getProcessedLocalCheckpoint(), Long.MAX_VALUE);
+        IOUtils.close(engine, lastOpenedStore);
     }
 
     public void testForceMergePublishesAGenuinelyMergedManifestPreservingAllDocuments() throws Exception {

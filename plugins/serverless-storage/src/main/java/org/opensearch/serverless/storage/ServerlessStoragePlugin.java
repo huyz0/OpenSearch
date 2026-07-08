@@ -19,6 +19,7 @@ import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.SecureSetting;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.common.settings.SecureString;
 import org.opensearch.core.common.unit.ByteSizeValue;
@@ -43,6 +44,9 @@ import org.opensearch.serverless.storage.format.LocalDiskCachingBundleStore;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.readerengine.ObjectStoreCommitMaterializer;
 import org.opensearch.serverless.storage.readerengine.ReaderEngineFactory;
+import org.opensearch.serverless.storage.retention.BlobContainerDurablePinRegistry;
+import org.opensearch.serverless.storage.retention.DurablePinRegistry;
+import org.opensearch.serverless.storage.retention.PitrRetentionConfig;
 import org.opensearch.serverless.storage.security.EncryptingBlobContainer;
 import org.opensearch.serverless.storage.security.EncryptionKeyProvider;
 import org.opensearch.serverless.storage.security.StaticEncryptionKeyProvider;
@@ -128,11 +132,25 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         Setting.Property.NodeScope
     );
 
+    /**
+     * How far back point-in-time recovery must be possible (rfc-serverless-opensearch.md &sect;16
+     * Phase 4.6). A non-positive value (the default) disables PITR retention entirely for every
+     * index -- no {@code "pitr"} pins are ever added, matching how {@code
+     * encryptionKeyProvider}/{@code PitrRetentionConfig} being absent means "this feature is off"
+     * elsewhere in this plugin, not a missing configuration error.
+     */
+    public static final Setting<TimeValue> SERVERLESS_STORAGE_PITR_WINDOW_SETTING = Setting.timeSetting(
+        "serverless_storage.pitr_window",
+        TimeValue.MINUS_ONE,
+        Setting.Property.NodeScope
+    );
+
     private volatile Path basePath;
     private volatile Path localCacheRoot;
     private volatile EncryptionKeyProvider encryptionKeyProvider;
     private volatile String localNodeId = "unknown-node";
     private volatile InMemoryPlaintextBundleCache sharedBundleCache;
+    private volatile long pitrWindowMillis = -1;
     // One node-local directory instance shared by every shard on this node -- matches the target
     // design's "one node block cache" shape (&sect;9) rather than a per-shard instance, and needs
     // no I/O to construct, so it's safe to build eagerly rather than threading through createComponents.
@@ -144,7 +162,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_ENABLED_SETTING,
             SERVERLESS_STORAGE_BASE_PATH_SETTING,
             SERVERLESS_STORAGE_ENCRYPTION_KEY_SETTING,
-            SERVERLESS_STORAGE_BUNDLE_CACHE_SIZE_SETTING
+            SERVERLESS_STORAGE_BUNDLE_CACHE_SIZE_SETTING,
+            SERVERLESS_STORAGE_PITR_WINDOW_SETTING
         );
     }
 
@@ -178,6 +197,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         sharedBundleCache = new InMemoryPlaintextBundleCache(
             SERVERLESS_STORAGE_BUNDLE_CACHE_SIZE_SETTING.get(environment.settings()).getBytes()
         );
+        pitrWindowMillis = SERVERLESS_STORAGE_PITR_WINDOW_SETTING.get(environment.settings()).millis();
         try (SecureString encryptionKey = SERVERLESS_STORAGE_ENCRYPTION_KEY_SETTING.get(environment.settings())) {
             if (encryptionKey.length() > 0) {
                 byte[] rawKeyBytes = Base64.getDecoder().decode(new String(encryptionKey.getChars()));
@@ -252,8 +272,22 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 );
             }
             ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(bundleStore, manifestStore);
+            PitrRetentionConfig pitrRetentionConfig = null;
+            if (pitrWindowMillis > 0) {
+                // Same blob container every other per-shard store here is scoped to -- a durable
+                // pin lives alongside the shard's manifests/registers, not in some separate
+                // namespace, matching how BlobContainerShardStateStore/BlobContainerManifestStore
+                // are wired above.
+                DurablePinRegistry pinRegistry = new BlobContainerDurablePinRegistry(blobContainer);
+                pitrRetentionConfig = new PitrRetentionConfig(manifestStore, pinRegistry, pitrWindowMillis);
+            }
             return Optional.of(
-                new WriterEngineFactory(new ObjectStoreCommitHeadPublisher(commitPublisher, shardStateStore), shardDirectory, localNodeId)
+                new WriterEngineFactory(
+                    new ObjectStoreCommitHeadPublisher(commitPublisher, shardStateStore),
+                    shardDirectory,
+                    localNodeId,
+                    pitrRetentionConfig
+                )
             );
         } catch (IOException e) {
             throw new UncheckedIOException(e);

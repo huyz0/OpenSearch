@@ -20,6 +20,8 @@ import org.opensearch.serverless.storage.directory.ShardDirectoryEntry;
 import org.opensearch.serverless.storage.directory.ShardRole;
 import org.opensearch.serverless.storage.manifest.PruningStats;
 import org.opensearch.serverless.storage.manifest.WalPosition;
+import org.opensearch.serverless.storage.retention.PitrRetentionConfig;
+import org.opensearch.serverless.storage.retention.PitrRetentionSchedulerTask;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 
@@ -47,6 +49,13 @@ import java.io.IOException;
  * before the entry's TTL elapses keeps the entry's staleness bounded by the refresh interval
  * instead of by traffic patterns, and spreads the read load out over time instead of clumping it at
  * expiry.
+ *
+ * <p>If a {@link PitrRetentionConfig} is supplied, this engine also owns a {@link
+ * PitrRetentionSchedulerTask} for as long as it stays open, keeping the shard's {@code "pitr"}
+ * durable pins in line with the configured retention window (rfc-serverless-opensearch.md
+ * &sect;16 Phase 4.6) -- {@code null} disables PITR retention for this shard entirely, matching
+ * how {@code encryptionKeyProvider} being {@code null} means "encryption is off" elsewhere in
+ * this plugin.
  */
 public class ObjectStoreWriterEngine extends InternalEngine {
 
@@ -59,18 +68,36 @@ public class ObjectStoreWriterEngine extends InternalEngine {
      */
     private static final TimeValue DIRECTORY_REFRESH_INTERVAL = TimeValue.timeValueMillis(DIRECTORY_ENTRY_TTL_MILLIS / 3);
 
+    /**
+     * PITR reconciliation lists and reads every manifest the shard has ever written -- far heavier
+     * than the directory refresh -- and the retention window moves far more slowly than a
+     * directory entry's TTL, so this runs on its own, much longer interval.
+     */
+    private static final TimeValue PITR_RECONCILE_INTERVAL = TimeValue.timeValueMinutes(5);
+
     private final ObjectStoreCommitHeadPublisher headPublisher;
     private final String indexUuid;
     private final int shardId;
     private final ShardDirectory shardDirectory;
     private final String localNodeId;
     private final Scheduler.Cancellable directoryRefreshTask;
+    private final PitrRetentionSchedulerTask pitrRetentionTask;
 
     public ObjectStoreWriterEngine(
         EngineConfig engineConfig,
         ObjectStoreCommitHeadPublisher headPublisher,
         ShardDirectory shardDirectory,
         String localNodeId
+    ) {
+        this(engineConfig, headPublisher, shardDirectory, localNodeId, null);
+    }
+
+    public ObjectStoreWriterEngine(
+        EngineConfig engineConfig,
+        ObjectStoreCommitHeadPublisher headPublisher,
+        ShardDirectory shardDirectory,
+        String localNodeId,
+        PitrRetentionConfig pitrRetentionConfig
     ) {
         super(engineConfig);
         this.headPublisher = headPublisher;
@@ -84,6 +111,17 @@ public class ObjectStoreWriterEngine extends InternalEngine {
         refreshDirectoryEntry();
         this.directoryRefreshTask = engineConfig.getThreadPool()
             .scheduleWithFixedDelay(this::refreshDirectoryEntry, DIRECTORY_REFRESH_INTERVAL, ThreadPool.Names.GENERIC);
+        this.pitrRetentionTask = pitrRetentionConfig == null
+            ? null
+            : new PitrRetentionSchedulerTask(
+                engineConfig.getThreadPool(),
+                PITR_RECONCILE_INTERVAL,
+                indexUuid,
+                shardId,
+                pitrRetentionConfig.manifestStore(),
+                pitrRetentionConfig.pinRegistry(),
+                pitrRetentionConfig.windowMillis()
+            );
     }
 
     private void refreshDirectoryEntry() {
@@ -103,6 +141,9 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     @Override
     public void close() throws IOException {
         directoryRefreshTask.cancel();
+        if (pitrRetentionTask != null) {
+            pitrRetentionTask.close();
+        }
         super.close();
     }
 
