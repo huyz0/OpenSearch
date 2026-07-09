@@ -57,6 +57,15 @@ public final class WalGcSchedulerTask implements Closeable {
     private final BiFunction<String, Integer, BlobContainer> shardContainerResolver;
     private final Scheduler.Cancellable task;
 
+    /**
+     * Starts the scheduled sweep.
+     *
+     * @param threadPool schedules {@link #sweep()} on a fixed delay.
+     * @param interval how often to sweep.
+     * @param walBlobContainer the shared WAL container chunks are deleted from.
+     * @param registry every shard known to use {@code walBlobContainer}.
+     * @param shardContainerResolver given a shard's {@code (indexUuid, shardId)}, returns that shard's own {@link BlobContainer}.
+     */
     public WalGcSchedulerTask(
         ThreadPool threadPool,
         TimeValue interval,
@@ -121,6 +130,7 @@ public final class WalGcSchedulerTask implements Closeable {
         sweep();
     }
 
+    /** Cancels the scheduled sweep; does not touch any already-written chunk or the registry itself. */
     @Override
     public void close() {
         task.cancel();

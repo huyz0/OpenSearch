@@ -19,7 +19,9 @@ import org.opensearch.action.ActionType;
  */
 public class ShardCloneAction extends ActionType<ShardCloneResponse> {
 
+    /** The single shared instance -- {@link ActionType}s are stateless, so one instance serves every request. */
     public static final ShardCloneAction INSTANCE = new ShardCloneAction();
+    /** The transport action name this action is registered under. */
     public static final String NAME = "cluster:admin/serverless/storage/shard/clone";
 
     private ShardCloneAction() {

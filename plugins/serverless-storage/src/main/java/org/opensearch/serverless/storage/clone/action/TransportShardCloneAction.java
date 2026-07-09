@@ -45,6 +45,14 @@ public class TransportShardCloneAction extends HandledTransportAction<ShardClone
     private final ServerlessStoragePlugin plugin;
     private final ThreadPool threadPool;
 
+    /**
+     * Creates the transport action.
+     *
+     * @param transportService used by {@link HandledTransportAction} to register this action.
+     * @param actionFilters applied by {@link HandledTransportAction} around every request.
+     * @param plugin resolves each request's source/target {@link BlobContainer}s.
+     * @param threadPool dispatches the actual clone work off the transport thread.
+     */
     @Inject
     public TransportShardCloneAction(
         TransportService transportService,
@@ -57,6 +65,11 @@ public class TransportShardCloneAction extends HandledTransportAction<ShardClone
         this.threadPool = threadPool;
     }
 
+    /**
+     * @param task the task tracking this request, unused.
+     * @param request names the source and target shard to clone.
+     * @param listener notified with the result once the clone (dispatched off-thread) completes.
+     */
     @Override
     protected void doExecute(Task task, ShardCloneRequest request, ActionListener<ShardCloneResponse> listener) {
         threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {

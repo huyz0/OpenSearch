@@ -25,6 +25,14 @@ public class ShardCloneRequest extends ActionRequest {
     private final String targetIndexUuid;
     private final int targetShardId;
 
+    /**
+     * Creates a request.
+     *
+     * @param sourceIndexUuid the index being cloned from.
+     * @param sourceShardId the shard number within {@code sourceIndexUuid}.
+     * @param targetIndexUuid the brand-new index the clone creates.
+     * @param targetShardId the shard number within {@code targetIndexUuid}.
+     */
     public ShardCloneRequest(String sourceIndexUuid, int sourceShardId, String targetIndexUuid, int targetShardId) {
         this.sourceIndexUuid = sourceIndexUuid;
         this.sourceShardId = sourceShardId;
@@ -32,6 +40,11 @@ public class ShardCloneRequest extends ActionRequest {
         this.targetShardId = targetShardId;
     }
 
+    /**
+     * Deserializes a request.
+     *
+     * @param in stream positioned at a previously-{@link #writeTo}-written {@link ShardCloneRequest}.
+     */
     public ShardCloneRequest(StreamInput in) throws IOException {
         super(in);
         this.sourceIndexUuid = in.readString();
@@ -40,6 +53,7 @@ public class ShardCloneRequest extends ActionRequest {
         this.targetShardId = in.readVInt();
     }
 
+    /** @param out stream to write this request's fields to. */
     @Override
     public void writeTo(StreamOutput out) throws IOException {
         super.writeTo(out);
@@ -49,6 +63,7 @@ public class ShardCloneRequest extends ActionRequest {
         out.writeVInt(targetShardId);
     }
 
+    /** @return validation errors, or {@code null} if the request is well-formed. */
     @Override
     public ActionRequestValidationException validate() {
         ActionRequestValidationException validationException = null;
@@ -67,18 +82,22 @@ public class ShardCloneRequest extends ActionRequest {
         return validationException;
     }
 
+    /** The index being cloned from. */
     public String sourceIndexUuid() {
         return sourceIndexUuid;
     }
 
+    /** The shard number within {@link #sourceIndexUuid()}. */
     public int sourceShardId() {
         return sourceShardId;
     }
 
+    /** The brand-new index the clone creates. */
     public String targetIndexUuid() {
         return targetIndexUuid;
     }
 
+    /** The shard number within {@link #targetIndexUuid()}. */
     public int targetShardId() {
         return targetShardId;
     }

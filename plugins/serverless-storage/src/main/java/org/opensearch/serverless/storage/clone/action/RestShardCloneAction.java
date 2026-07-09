@@ -28,16 +28,25 @@ import static org.opensearch.rest.RestRequest.Method.POST;
  */
 public class RestShardCloneAction extends BaseRestHandler {
 
+    /** Creates the handler; stateless, so no configuration is needed. */
+    public RestShardCloneAction() {}
+
+    /** This handler's registered name, for logging/metrics. */
     @Override
     public String getName() {
         return "serverless_storage_shard_clone";
     }
 
+    /** The single route this handler serves. */
     @Override
     public List<Route> routes() {
         return singletonList(new Route(POST, "/_plugins/_serverless/storage/_clone"));
     }
 
+    /**
+     * @param request the incoming REST request, whose body names a source and target shard.
+     * @param client used to dispatch the parsed {@link ShardCloneRequest} locally.
+     */
     @Override
     @SuppressWarnings("unchecked")
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {

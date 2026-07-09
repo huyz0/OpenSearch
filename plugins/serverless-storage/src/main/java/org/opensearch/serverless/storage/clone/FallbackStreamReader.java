@@ -30,11 +30,22 @@ public final class FallbackStreamReader implements TransferManager.StreamReader 
     private final TransferManager.StreamReader primary;
     private final TransferManager.StreamReader fallback;
 
+    /**
+     * Wraps a primary reader with a source fallback.
+     *
+     * @param primary the cloned shard's own reader, tried first.
+     * @param fallback the clone source's reader, tried only when {@code primary} reports the blob missing.
+     */
     public FallbackStreamReader(TransferManager.StreamReader primary, TransferManager.StreamReader fallback) {
         this.primary = primary;
         this.fallback = fallback;
     }
 
+    /**
+     * @param name the blob to read from.
+     * @param position the starting offset within the blob.
+     * @param length how many bytes to read.
+     */
     @Override
     public InputStream read(String name, long position, long length) throws IOException {
         try {

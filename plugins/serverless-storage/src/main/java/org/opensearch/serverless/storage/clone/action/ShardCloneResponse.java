@@ -16,28 +16,45 @@ import org.opensearch.core.xcontent.XContentBuilder;
 
 import java.io.IOException;
 
+/** The result of a {@link ShardCloneAction} request. */
 public class ShardCloneResponse extends ActionResponse implements ToXContentObject {
 
     private final boolean acknowledged;
 
+    /**
+     * Creates a response.
+     *
+     * @param acknowledged whether the clone completed successfully.
+     */
     public ShardCloneResponse(boolean acknowledged) {
         this.acknowledged = acknowledged;
     }
 
+    /**
+     * Deserializes a response.
+     *
+     * @param in stream positioned at a previously-{@link #writeTo}-written {@link ShardCloneResponse}.
+     */
     public ShardCloneResponse(StreamInput in) throws IOException {
         super(in);
         this.acknowledged = in.readBoolean();
     }
 
+    /** @param out stream to write {@link #acknowledged()} to. */
     @Override
     public void writeTo(StreamOutput out) throws IOException {
         out.writeBoolean(acknowledged);
     }
 
+    /** Whether the clone completed successfully. */
     public boolean acknowledged() {
         return acknowledged;
     }
 
+    /**
+     * @param builder the builder to append this response's fields to.
+     * @param params unused.
+     */
     @Override
     public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
         return builder.startObject().field("acknowledged", acknowledged).endObject();

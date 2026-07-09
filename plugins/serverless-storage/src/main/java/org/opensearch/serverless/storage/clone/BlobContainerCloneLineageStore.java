@@ -32,10 +32,20 @@ public final class BlobContainerCloneLineageStore {
 
     private final BlobContainer blobContainer;
 
+    /**
+     * Wraps a shard's own container.
+     *
+     * @param blobContainer the shard's own container -- the same one its manifests/head live in.
+     */
     public BlobContainerCloneLineageStore(BlobContainer blobContainer) {
         this.blobContainer = blobContainer;
     }
 
+    /**
+     * Durably records this shard's clone lineage.
+     *
+     * @param lineage the source shard this cloned shard was created from.
+     */
     public void writeLineage(CloneLineage lineage) throws IOException {
         BytesStreamOutput out = new BytesStreamOutput();
         lineage.writeTo(out);

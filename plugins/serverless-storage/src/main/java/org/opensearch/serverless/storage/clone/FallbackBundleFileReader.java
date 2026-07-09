@@ -36,11 +36,21 @@ public final class FallbackBundleFileReader implements BundleFileReader {
     private final BundleFileReader primary;
     private final BundleFileReader fallback;
 
+    /**
+     * Wraps a primary reader with a source fallback.
+     *
+     * @param primary the cloned shard's own reader, tried first.
+     * @param fallback the clone source's reader, tried only when {@code primary} reports the bundle missing.
+     */
     public FallbackBundleFileReader(BundleFileReader primary, BundleFileReader fallback) {
         this.primary = primary;
         this.fallback = fallback;
     }
 
+    /**
+     * @param bundleName the bundle to read from.
+     * @param entry the file's location within that bundle.
+     */
     @Override
     public byte[] readFile(String bundleName, BundleFileEntry entry) throws IOException {
         try {

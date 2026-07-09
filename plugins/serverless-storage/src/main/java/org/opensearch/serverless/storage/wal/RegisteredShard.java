@@ -24,29 +24,44 @@ public final class RegisteredShard implements Writeable {
     private final String indexUuid;
     private final int shardId;
 
+    /**
+     * Identifies one shard.
+     *
+     * @param indexUuid the shard's owning index UUID.
+     * @param shardId the shard number within that index.
+     */
     public RegisteredShard(String indexUuid, int shardId) {
         this.indexUuid = Objects.requireNonNull(indexUuid, "indexUuid");
         this.shardId = shardId;
     }
 
+    /**
+     * Deserializes a shard identity.
+     *
+     * @param in stream positioned at a previously-{@link #writeTo}-written {@link RegisteredShard}.
+     */
     public RegisteredShard(StreamInput in) throws IOException {
         this(in.readString(), in.readVInt());
     }
 
+    /** @param out stream to write this shard's {@code (indexUuid, shardId)} pair to. */
     @Override
     public void writeTo(StreamOutput out) throws IOException {
         out.writeString(indexUuid);
         out.writeVInt(shardId);
     }
 
+    /** The shard's owning index UUID. */
     public String indexUuid() {
         return indexUuid;
     }
 
+    /** The shard number within {@link #indexUuid()}. */
     public int shardId() {
         return shardId;
     }
 
+    /** @param o the object to compare against. */
     @Override
     public boolean equals(Object o) {
         if (this == o) return true;
@@ -55,11 +70,13 @@ public final class RegisteredShard implements Writeable {
         return shardId == that.shardId && indexUuid.equals(that.indexUuid);
     }
 
+    /** Consistent with {@link #equals}. */
     @Override
     public int hashCode() {
         return Objects.hash(indexUuid, shardId);
     }
 
+    /** {@code indexUuid/shardId}. */
     @Override
     public String toString() {
         return indexUuid + "/" + shardId;

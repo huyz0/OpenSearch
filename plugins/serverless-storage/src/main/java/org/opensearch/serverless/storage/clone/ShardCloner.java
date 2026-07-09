@@ -74,11 +74,21 @@ public final class ShardCloner {
     private ShardCloner() {}
 
     /**
+     * Clones a source shard's current published manifest into a brand-new target shard identity.
+     *
      * @param sourceIndexUuid the index being cloned from; must already have a published manifest.
+     * @param sourceShardId the shard number within {@code sourceIndexUuid}.
+     * @param sourceManifestStore where the source shard's manifests live.
+     * @param sourceShardStateStore where the source shard's head lives.
+     * @param sourcePinRegistry the source shard's durable pin registry, protected via this call.
      * @param targetIndexUuid the brand-new index the clone creates; must not already have a
      *                        published head -- cloning onto an already-active shard is refused,
      *                        the same put-if-absent contract {@link ShardStateStore#compareAndSet}
      *                        already gives every first activation.
+     * @param targetShardId the shard number within {@code targetIndexUuid}.
+     * @param targetManifestStore where the target shard's new manifest is written.
+     * @param targetShardStateStore where the target shard's new head is published.
+     * @param targetLineageStore where the target shard's {@link CloneLineage} is recorded.
      * @param nowMillis the target manifest's {@link CommitManifest#createdAtMillis()} -- passed in
      *                  rather than read internally so this class stays trivially deterministic to
      *                  test.
@@ -160,6 +170,9 @@ public final class ShardCloner {
      * on its source -- stable and derivable from the target's identity alone, so {@link
      * #deleteClone} can remove exactly this pin without needing anything separate recorded on the
      * target beyond {@link CloneLineage} itself.
+     *
+     * @param targetIndexUuid the clone's index.
+     * @param targetShardId the shard number within {@code targetIndexUuid}.
      */
     public static String clonePinId(String targetIndexUuid, int targetShardId) {
         return "clone:" + targetIndexUuid + ":" + targetShardId;
@@ -177,6 +190,9 @@ public final class ShardCloner {
      * source-side pin and the lineage record that pointed to it. Deliberately not wired to any
      * automatic index-deletion hook yet -- see this class's own javadoc.
      *
+     * @param targetIndexUuid the (possibly former) clone's index.
+     * @param targetShardId the shard number within {@code targetIndexUuid}.
+     * @param targetLineageStore where {@code targetIndexUuid}/{@code targetShardId}'s {@link CloneLineage} would be recorded, if any.
      * @param sourcePinRegistryResolver given the lineage's {@code (sourceIndexUuid, sourceShardId)},
      *                                  returns that source shard's own {@link DurablePinRegistry}
      *                                  -- a resolver rather than a direct parameter because, unlike

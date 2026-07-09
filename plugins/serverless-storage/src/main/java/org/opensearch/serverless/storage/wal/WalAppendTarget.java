@@ -23,9 +23,20 @@ import java.io.IOException;
  */
 public interface WalAppendTarget {
 
+    /**
+     * Buffers {@code record} in memory; does not itself durably write anything -- see {@link #flush}.
+     *
+     * @param record the operation to buffer.
+     */
     void append(WalRecord record) throws IOException;
 
+    /**
+     * Durably writes every currently-buffered record into one new chunk and clears the buffer.
+     *
+     * @return the chunk sequence number written, or a negative value if there was nothing to flush.
+     */
     long flush() throws IOException;
 
+    /** How many records are currently buffered, not yet durably written by a {@link #flush} call. */
     int bufferedRecordCount();
 }

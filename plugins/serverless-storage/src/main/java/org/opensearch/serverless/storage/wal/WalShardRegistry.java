@@ -43,6 +43,11 @@ public final class WalShardRegistry {
 
     private final BlobContainer blobContainer;
 
+    /**
+     * Wraps a shared WAL container.
+     *
+     * @param blobContainer the shared WAL container this registry tracks shards against.
+     */
     public WalShardRegistry(BlobContainer blobContainer) {
         this.blobContainer = blobContainer;
     }
@@ -56,6 +61,9 @@ public final class WalShardRegistry {
      * Idempotently records that {@code indexUuid}/{@code shardId} has mirrored into this
      * container. Safe, and expected, to call more than once for the same shard (e.g. once per
      * writer engine activation, not once ever) -- a no-op once already registered.
+     *
+     * @param indexUuid the shard's owning index UUID.
+     * @param shardId the shard number within {@code indexUuid}.
      */
     public void register(String indexUuid, int shardId) throws IOException {
         RegisteredShard shard = new RegisteredShard(indexUuid, shardId);
@@ -75,6 +83,9 @@ public final class WalShardRegistry {
      * proof is "its index was just deleted": see {@code ServerlessStoragePlugin}'s clone-pin
      * deletion listener for the established pattern this follows). A no-op if the shard was never
      * registered, or already removed.
+     *
+     * @param indexUuid the shard's owning index UUID.
+     * @param shardId the shard number within {@code indexUuid}.
      */
     public void deregister(String indexUuid, int shardId) throws IOException {
         RegisteredShard shard = new RegisteredShard(indexUuid, shardId);
