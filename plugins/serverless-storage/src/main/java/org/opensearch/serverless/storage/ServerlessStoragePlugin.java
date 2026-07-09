@@ -830,4 +830,9 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     org.opensearch.serverless.storage.wal.WalGcSchedulerTask walGcSchedulerTaskForTesting() {
         return walGcSchedulerTask;
     }
+
+    /** The reader-shard admission controller {@link #createComponents} built, or {@code null} if disabled -- test-only visibility. */
+    ReaderShardAdmissionController readerShardAdmissionControllerForTesting() {
+        return readerShardAdmissionController;
+    }
 }

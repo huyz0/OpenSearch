@@ -231,6 +231,33 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
         assertEquals(512L * 1024, plugin.sharedWalChunkServiceForTesting().perShardBudgetBytesForTesting());
     }
 
+    public void testReaderShardAdmissionControllerIsNotConstructedByDefault() {
+        ServerlessStoragePlugin plugin = newPlugin(createTempDir());
+        assertNull(
+            "the admission controller must stay off by default (max_concurrent_reader_shards <= 0), "
+                + "matching every other optional-feature-off default in this plugin",
+            plugin.readerShardAdmissionControllerForTesting()
+        );
+    }
+
+    public void testReaderShardAdmissionControllerSettingConstructsARealController() {
+        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin();
+        Path basePath = createTempDir();
+        Settings nodeSettings = Settings.builder()
+            .put("path.home", createTempDir().toString())
+            .putList("path.repo", basePath.toString())
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey(), basePath.toString())
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_MAX_CONCURRENT_READER_SHARDS_SETTING.getKey(), 5)
+            .build();
+        Environment environment = TestEnvironment.newEnvironment(nodeSettings);
+        plugin.createComponents(null, null, null, null, null, null, environment, null, null, null, null);
+
+        assertNotNull(
+            "an explicit positive max_concurrent_reader_shards must construct a real controller",
+            plugin.readerShardAdmissionControllerForTesting()
+        );
+    }
+
     public void testWalGcSchedulerTaskIsNotConstructedByDefault() {
         ServerlessStoragePlugin plugin = new ServerlessStoragePlugin();
         Path basePath = createTempDir();
