@@ -10,6 +10,7 @@ package org.opensearch.serverless.storage;
 
 import org.opensearch.cluster.routing.allocation.ExistingShardsAllocator;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.index.IndexModule;
 import org.opensearch.index.shard.IndexSettingProvider;
 import org.opensearch.serverless.storage.allocation.ServerlessStorageExistingShardsAllocator;
 
@@ -22,6 +23,13 @@ import org.opensearch.serverless.storage.allocation.ServerlessStorageExistingSha
  * which forbids setting it directly on index creation -- {@link IndexSettingProvider} is precisely
  * the seam for injecting a private, managed default in response to another (public) setting the
  * request already carries, the same shape core itself uses this interface for.
+ *
+ * <p>Also translates {@link ServerlessStoragePlugin#SERVERLESS_STORAGE_LAZY_DIRECTORY_ENABLED_SETTING}
+ * into {@code index.store.type} = {@link ServerlessStoragePlugin#LAZY_DIRECTORY_STORE_TYPE} --
+ * same indirection, different underlying mechanism: {@code index.store.type} isn't a private
+ * setting, but hiding the raw store-type string behind this plugin's own on/off setting keeps
+ * operators from needing to know the store-type value at all, consistent with how every other
+ * optional feature in this plugin is a single boolean/config knob, not raw core plumbing.
  */
 public final class ServerlessStorageIndexSettingProvider implements IndexSettingProvider {
 
@@ -30,8 +38,11 @@ public final class ServerlessStorageIndexSettingProvider implements IndexSetting
         if (ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.get(templateAndRequestSettings) == false) {
             return Settings.EMPTY;
         }
-        return Settings.builder()
-            .put(ExistingShardsAllocator.EXISTING_SHARDS_ALLOCATOR_SETTING.getKey(), ServerlessStorageExistingShardsAllocator.NAME)
-            .build();
+        Settings.Builder settings = Settings.builder()
+            .put(ExistingShardsAllocator.EXISTING_SHARDS_ALLOCATOR_SETTING.getKey(), ServerlessStorageExistingShardsAllocator.NAME);
+        if (ServerlessStoragePlugin.SERVERLESS_STORAGE_LAZY_DIRECTORY_ENABLED_SETTING.get(templateAndRequestSettings)) {
+            settings.put(IndexModule.INDEX_STORE_TYPE_SETTING.getKey(), ServerlessStoragePlugin.LAZY_DIRECTORY_STORE_TYPE);
+        }
+        return settings.build();
     }
 }

@@ -1015,36 +1015,73 @@ blocked, not merely unstarted -- worth recording precisely, not just "still open
 `ReadOnlyEngine`/`Store` FSDirectory-assumption question above was checked directly and came back
 clean: `ReadOnlyEngine`'s constructor, `Store`'s constructor (`Directory directory` typed
 parameter, no `FSDirectory` cast anywhere on this path), and `SegmentInfos.readCommit` are all
-generic-`Directory`-based; nothing here would reject `LazyBundleDirectory`. The actual blocker is
+generic-`Directory`-based; nothing here would reject `LazyBundleDirectory`. The actual blocker was
 narrower and more structural: swapping the `Directory` a reader shard's `EngineConfig`/`Store`
 already wrap requires either (a) rebuilding `EngineConfig` with just its `Store` field replaced, or
-(b) an earlier, core-registered seam that constructs the `Store`/`Directory` from the start.
-Neither is available as a contained plugin-only change:
+(b) an earlier, core-registered seam that constructs the `Store`/`Directory` from the start. (a)
+stayed blocked (`EngineConfig` genuinely has no copy-with/rebuild mechanism); (b) existed as
+`IndexStorePlugin.DirectoryFactory` but was selected per-*index*, not per-shard-*copy*, so using it
+directly would have forced writer shards onto the same read-only directory as reader shards on the
+same index.
 
-- (a) is blocked because `EngineConfig` has no copy-with/rebuild mechanism -- it's built once via
-  an internal `Builder` from roughly thirty fields, several of which (`codecService`,
-  `checksumStrategies`, ...) have no getter that maps back to the corresponding builder input, so
-  a plugin holding an already-built `EngineConfig` cannot faithfully reconstruct an equivalent one
-  with a single field swapped.
-- (b) exists as `IndexStorePlugin.DirectoryFactory` (core's real seam for supplying a custom
-  `Directory` from index-shard construction time), but it is selected per-*index* via
-  `index.store.type`, not per-shard-*copy* the way `EnginePlugin.getEngineFactory(IndexSettings,
-  ShardRouting)` already is for this plugin's writer/reader split --
-  `DirectoryFactory#newDirectory(IndexSettings, ShardPath)` takes no `ShardRouting`. Selecting it
-  would force every writer-shard copy on the same index onto the same read-only lazy directory as
-  its reader copies, breaking writes outright; there is no way to ask for "this directory factory
-  for search-only copies, the normal one for the primary" through this seam as it exists today.
+**Resolved with a small, targeted core change -- (b) made `ShardRouting`-aware, mirroring a pattern
+core already has for exactly this problem.** `EnginePlugin.getEngineFactory(IndexSettings,
+ShardRouting)` already lets a plugin pick a different *engine* per shard copy; `DirectoryFactory`
+had no equivalent for the *directory*. Before writing this, every existing implementor of
+`DirectoryFactory` across the whole tree was enumerated (four direct implementors, two subclasses,
+four plugin registration points) and the actual call site was traced (`IndexService#createShard`,
+which already has the shard's `ShardRouting` in scope as its own first parameter -- no plumbing
+needed) to confirm this was genuinely a small, safe, backward-compatible addition before touching
+core at all:
 
-This is the same shape of surprise as &sect;7's `_forcemerge`/`Indexer` SPI investigation earlier
-in this phase's history: buildable-looking from the outside, a real architectural wall once actually
-attempted, not a small follow-up. Closing it for real needs either a `ShardRouting`-aware
-`DirectoryFactory` selection seam in core (mirroring `EnginePlugin`'s own per-copy split, itself a
-core change, not a plugin one) or a different integration strategy not yet found. Left genuinely
-open, not attempted further this session. Also still open, independent of this blocker: growing the
-cache keying from whole-file to real 1 MB block-granular regions per &sect;9's target (today's slice
-inherits `AbstractBlockIndexInput`'s default 8 MiB blocks, not yet tuned), and real
-heap-budget-aware admission control replacing `ReaderShardAdmissionController`'s coarse per-node
-count cap -- both meaningful only once the directory-swap blocker above is resolved.
+- `IndexStorePlugin.DirectoryFactory` gained one new *default* method,
+  `newDirectory(IndexSettings, ShardPath, @Nullable ShardRouting)`, delegating to the existing
+  two-argument overload -- every existing implementor's behavior is completely unchanged unless it
+  explicitly opts in by overriding the new overload, the same non-breaking shape
+  `EnginePlugin.getEngineFactory`'s own two-argument-to-three-argument addition already used in
+  this codebase.
+- `IndexService#createShard`'s one call site now passes the already-in-scope `routing` through.
+
+**`ServerlessStorageLazyDirectoryFactory`, this plugin's own implementation, closes the loop.**
+Registered under a new store type, `serverless_storage_lazy` (opted into per-index via a new
+`index.serverless_storage.lazy_directory.enabled` setting, translated to `index.store.type` by
+`ServerlessStorageIndexSettingProvider` the same way that class already hides
+`index.allocation.existing_shards_allocator` behind a plugin-level setting). Its `newDirectory`
+override branches on the passed `ShardRouting`: a search-only copy gets a real `LazyBundleDirectory`
+(resolving the shard's current manifest the same way `ReaderEngineFactory` does, since this runs
+*before* engine construction); anything else (a writer/primary, or the fallback when the lazy
+directory feature is off) gets a completely normal `FsDirectoryFactory`-built directory via
+delegation -- a writer shard on an index with the lazy directory enabled is entirely unaffected.
+Reads `ServerlessStoragePlugin`'s own fields (`threadPool`, the shared `FileCache`) lazily at
+`newDirectory`-call time rather than at construction time, since `getDirectoryFactories()` is
+invoked by core during node startup *before* `createComponents` runs (confirmed by tracing `Node`'s
+own constructor) -- capturing those fields eagerly would have captured them uninitialized.
+
+`ObjectStoreReaderEngine` itself needed one small adaptation: `applyManifestToDirectory` now
+branches on whether `FilterDirectory.unwrap(config.getStore().directory())` is a
+`LazyBundleDirectory` (the same unwrap idiom `ReadOnlyEngine`'s own constructor already uses to
+detect a `RemoteSnapshotDirectory`) -- a lazy directory gets `LazyBundleDirectory#advanceToManifest`
+(a plain in-memory map merge, no I/O), everything else still gets
+`ObjectStoreCommitMaterializer#materialize` exactly as before. `LazyBundleDirectory` itself gained
+`advanceToManifest` (additive, same semantics as the eager materializer's own additive writes) and
+now owns and closes its own per-shard on-disk block-cache directory (constructed fresh by the
+factory specifically for it, unlike the shared node-wide `FileCache`/`TransferManager`, which
+outlive any one shard and are not this class's to close).
+
+Verified with a new end-to-end test, `LazyDirectoryReaderEngineTests`, that goes one level deeper
+than the standalone `LazyBundleDirectoryTests`: a real `Store` built around a real
+`LazyBundleDirectory` (exactly what the factory would hand core), a real `EngineConfig` built
+around that `Store`, and a real `ObjectStoreReaderEngine.open()`/search against it -- with the
+materializer passed a `BundleFileReader` that throws if ever invoked, proving the lazy branch is
+what actually ran, not merely that both code paths compile. Full unit suite, the new lazy-directory
+tests (stable across 3 repeated runs), multi-node internal cluster tests, and core's own
+`IndexService`/`IndexStorePlugin`/`IndicesService` test suites all green after the core change.
+
+Still open, independent of this now-closed blocker: growing the cache keying from whole-file to
+real 1 MB block-granular regions per &sect;9's target (today's slice inherits
+`AbstractBlockIndexInput`'s default 8 MiB blocks, not yet tuned), and real heap-budget-aware
+admission control replacing `ReaderShardAdmissionController`'s coarse per-node count cap -- both
+now meaningfully buildable, since the directory-swap blocker that made them premature is gone.
 
 ## 10. Allocation, Topology, and Autoscaling
 

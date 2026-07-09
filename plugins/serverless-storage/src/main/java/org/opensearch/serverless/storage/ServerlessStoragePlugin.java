@@ -31,8 +31,11 @@ import org.opensearch.env.NodeEnvironment;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.shard.IndexSettingProvider;
+import org.opensearch.index.store.remote.filecache.FileCache;
+import org.opensearch.index.store.remote.filecache.FileCacheFactory;
 import org.opensearch.plugins.ClusterPlugin;
 import org.opensearch.plugins.EnginePlugin;
+import org.opensearch.plugins.IndexStorePlugin;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.script.ScriptService;
@@ -53,6 +56,7 @@ import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.readerengine.ObjectStoreCommitMaterializer;
 import org.opensearch.serverless.storage.readerengine.ReaderEngineFactory;
 import org.opensearch.serverless.storage.readerengine.ReaderShardAdmissionController;
+import org.opensearch.serverless.storage.readerengine.lazydirectory.ServerlessStorageLazyDirectoryFactory;
 import org.opensearch.serverless.storage.retention.BlobContainerDurablePinRegistry;
 import org.opensearch.serverless.storage.retention.DurablePinRegistry;
 import org.opensearch.serverless.storage.retention.PitrRetentionConfig;
@@ -98,7 +102,18 @@ import java.util.function.Supplier;
  * itself. Swapping in a real repository-backed container only touches {@link #blobContainerFor};
  * nothing else in this class or the engine/factory classes it wires together is FS-specific.
  */
-public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, ClusterPlugin {
+public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, ClusterPlugin, IndexStorePlugin {
+
+    /**
+     * The {@code index.store.type} value that opts a reader (search-only) shard copy into a
+     * {@code LazyBundleDirectory} instead of a normal local {@code FSDirectory}
+     * (rfc-serverless-opensearch.md &sect;7.2/&sect;9) -- see {@link ServerlessStorageLazyDirectoryFactory}'s
+     * own javadoc for how this closes the directory-swap gap that section's status note left open.
+     * A writer/primary copy on the same index is completely unaffected by this store type being
+     * selected -- {@link ServerlessStorageLazyDirectoryFactory} only substitutes the lazy directory
+     * for a {@code ShardRouting} that {@link ShardRouting#isSearchOnly()}.
+     */
+    public static final String LAZY_DIRECTORY_STORE_TYPE = "serverless_storage_lazy";
 
     public static final Setting<Boolean> SERVERLESS_STORAGE_ENABLED_SETTING = Setting.boolSetting(
         "index.serverless_storage.enabled",
@@ -228,8 +243,42 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         Setting.Property.NodeScope
     );
 
+    /**
+     * Budget for the one node-shared {@link FileCache} backing every reader shard opted into
+     * {@link #LAZY_DIRECTORY_STORE_TYPE} (rfc-serverless-opensearch.md &sect;9's "one node block
+     * cache" target) -- reused directly from core's own searchable-snapshots feature, not a new
+     * cache built for this plugin. Zero (the default) disables the lazy directory feature entirely:
+     * {@link ServerlessStorageLazyDirectoryFactory} falls back to a normal {@code FSDirectory} for
+     * every shard copy when no {@link FileCache} exists, matching how every other new-and-unproven
+     * feature in this plugin defaults off.
+     */
+    public static final Setting<ByteSizeValue> SERVERLESS_STORAGE_LAZY_DIRECTORY_CACHE_SIZE_SETTING = Setting.byteSizeSetting(
+        "serverless_storage.lazy_directory.cache_size",
+        ByteSizeValue.ZERO,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * Per-index opt-in into {@link #LAZY_DIRECTORY_STORE_TYPE} for that index's reader shard
+     * copies, mirroring how {@link #SERVERLESS_STORAGE_ENABLED_SETTING} itself is an index-scoped
+     * opt-in rather than a blanket node-wide default. Has no effect unless {@link
+     * #SERVERLESS_STORAGE_LAZY_DIRECTORY_CACHE_SIZE_SETTING} is also configured on the node --
+     * {@link ServerlessStorageIndexSettingProvider} is what actually translates this into {@code
+     * index.store.type} at index-creation time, the same indirection already used for {@link
+     * org.opensearch.serverless.storage.allocation.ServerlessStorageExistingShardsAllocator}'s own
+     * selection.
+     */
+    public static final Setting<Boolean> SERVERLESS_STORAGE_LAZY_DIRECTORY_ENABLED_SETTING = Setting.boolSetting(
+        "index.serverless_storage.lazy_directory.enabled",
+        false,
+        Setting.Property.IndexScope,
+        Setting.Property.Final
+    );
+
     private volatile Path basePath;
     private volatile Path localCacheRoot;
+    private volatile ThreadPool threadPool;
+    private volatile FileCache lazyDirectoryFileCache;
     private volatile EncryptionKeyProvider encryptionKeyProvider;
     private volatile String localNodeId = "unknown-node";
     private volatile InMemoryPlaintextBundleCache sharedBundleCache;
@@ -256,8 +305,39 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING,
             SERVERLESS_STORAGE_COMPACTION_INTERVAL_SETTING,
             SERVERLESS_STORAGE_GC_INTERVAL_SETTING,
-            SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING
+            SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING,
+            SERVERLESS_STORAGE_LAZY_DIRECTORY_CACHE_SIZE_SETTING,
+            SERVERLESS_STORAGE_LAZY_DIRECTORY_ENABLED_SETTING
         );
+    }
+
+    @Override
+    public Map<String, IndexStorePlugin.DirectoryFactory> getDirectoryFactories() {
+        return Map.of(LAZY_DIRECTORY_STORE_TYPE, new ServerlessStorageLazyDirectoryFactory(this));
+    }
+
+    /**
+     * The shared {@link FileCache} {@link ServerlessStorageLazyDirectoryFactory} needs, or {@code
+     * null} if the lazy directory feature is disabled on this node -- see {@link
+     * #SERVERLESS_STORAGE_LAZY_DIRECTORY_CACHE_SIZE_SETTING}. Test-only-shaped visibility
+     * (package-external, but not part of this plugin's own public contract) purely because {@link
+     * ServerlessStorageLazyDirectoryFactory} lives in a different package and {@code
+     * getDirectoryFactories()} above constructs it before {@link #createComponents} has populated
+     * this field -- see that factory's own javadoc for why it must read this lazily instead of
+     * capturing it at construction time.
+     */
+    public FileCache lazyDirectoryFileCacheForDirectoryFactory() {
+        return lazyDirectoryFileCache;
+    }
+
+    /** See {@link #lazyDirectoryFileCacheForDirectoryFactory()}'s own javadoc for why this exists and why it's read lazily. */
+    public ThreadPool threadPoolForDirectoryFactory() {
+        return threadPool;
+    }
+
+    /** See {@link #lazyDirectoryFileCacheForDirectoryFactory()}'s own javadoc -- same lazy-read shape, reusing {@link #blobContainerFor}. */
+    public BlobContainer blobContainerForDirectoryFactory(String indexUuid, int shardId) throws IOException {
+        return resolveBlobContainer(indexUuid, shardId);
     }
 
     @Override
@@ -274,6 +354,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         IndexNameExpressionResolver indexNameExpressionResolver,
         Supplier<RepositoriesService> repositoriesServiceSupplier
     ) {
+        this.threadPool = threadPool;
         String configuredBasePath = SERVERLESS_STORAGE_BASE_PATH_SETTING.get(environment.settings());
         if (configuredBasePath.isEmpty() == false) {
             // Environment#resolveRepoFile is the same sanctioned path-resolution seam
@@ -305,6 +386,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         TimeValue configuredGcInterval = SERVERLESS_STORAGE_GC_INTERVAL_SETTING.get(environment.settings());
         gcInterval = configuredGcInterval.millis() > 0 ? configuredGcInterval : null;
         gcRetentionWindowMillis = SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING.get(environment.settings()).millis();
+        long lazyDirectoryCacheSizeBytes = SERVERLESS_STORAGE_LAZY_DIRECTORY_CACHE_SIZE_SETTING.get(environment.settings()).getBytes();
+        lazyDirectoryFileCache = lazyDirectoryCacheSizeBytes > 0
+            ? FileCacheFactory.createConcurrentLRUFileCache(lazyDirectoryCacheSizeBytes)
+            : null;
         int maxConcurrentReaderShards = SERVERLESS_STORAGE_MAX_CONCURRENT_READER_SHARDS_SETTING.get(environment.settings());
         readerShardAdmissionController = maxConcurrentReaderShards > 0
             ? new ReaderShardAdmissionController(maxConcurrentReaderShards)
@@ -336,35 +421,47 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         return Collections.emptyList();
     }
 
-    @Override
-    public Optional<EngineFactory> getEngineFactory(IndexSettings indexSettings, ShardRouting shardRouting) {
-        if (SERVERLESS_STORAGE_ENABLED_SETTING.get(indexSettings.getSettings()) == false) {
-            return Optional.empty();
-        }
+    /**
+     * Resolves this shard's own {@link BlobContainer} (index-UUID/shard-scoped, encryption-wrapped
+     * if configured) -- shared by {@link #getEngineFactory} and {@link
+     * #blobContainerForDirectoryFactory}, which both need exactly this same resolution.
+     */
+    private BlobContainer resolveBlobContainer(String indexUuid, int shardId) throws IOException {
         if (basePath == null) {
             throw new IllegalStateException(
-                "index ["
-                    + indexSettings.getIndex().getName()
+                "shard ["
+                    + indexUuid
+                    + "]["
+                    + shardId
                     + "] has serverless storage enabled but no ["
                     + SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey()
                     + "] node setting was configured (or it did not resolve to an allowed path)"
             );
         }
+        // Each shard gets its own child container (rfc-serverless-opensearch.md &sect;6.1's
+        // indices/<index-uuid>/<shard>/ layout): CommitManifest#manifestName() is intentionally
+        // just <term>-<generation> with no index/shard component, since it assumes the
+        // container it lives in is already shard-scoped.
+        BlobContainer blobContainer = blobContainerFor(basePath, indexUuid, shardId);
+        if (encryptionKeyProvider != null) {
+            // Wrapping here, at the one seam every downstream class already depends on
+            // abstractly (BlobContainer), is the entire integration -- see
+            // EncryptingBlobContainer's javadoc for the ranged-read tradeoff this implies.
+            blobContainer = new EncryptingBlobContainer(blobContainer, encryptionKeyProvider);
+        }
+        return blobContainer;
+    }
+
+    @Override
+    public Optional<EngineFactory> getEngineFactory(IndexSettings indexSettings, ShardRouting shardRouting) {
+        if (SERVERLESS_STORAGE_ENABLED_SETTING.get(indexSettings.getSettings()) == false) {
+            return Optional.empty();
+        }
 
         try {
             String indexUuid = indexSettings.getIndex().getUUID();
             int shardIdValue = shardRouting != null ? shardRouting.shardId().getId() : 0;
-            // Each shard gets its own child container (rfc-serverless-opensearch.md &sect;6.1's
-            // indices/<index-uuid>/<shard>/ layout): CommitManifest#manifestName() is intentionally
-            // just <term>-<generation> with no index/shard component, since it assumes the
-            // container it lives in is already shard-scoped.
-            BlobContainer blobContainer = blobContainerFor(basePath, indexUuid, shardIdValue);
-            if (encryptionKeyProvider != null) {
-                // Wrapping here, at the one seam every downstream class already depends on
-                // abstractly (BlobContainer), is the entire integration -- see
-                // EncryptingBlobContainer's javadoc for the ranged-read tradeoff this implies.
-                blobContainer = new EncryptingBlobContainer(blobContainer, encryptionKeyProvider);
-            }
+            BlobContainer blobContainer = resolveBlobContainer(indexUuid, shardIdValue);
             ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
             BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(blobContainer);
             BlobContainerBundleStore bundleStore = new BlobContainerBundleStore(blobContainer);

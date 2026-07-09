@@ -176,6 +176,34 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
             : new GcSchedulerTask(config.getThreadPool(), gcConfig.interval(), indexUuid, shardId, gcConfig);
     }
 
+    /**
+     * Applies {@code manifest}'s files to {@code directory}, however that directory actually needs
+     * it done: a {@link org.opensearch.serverless.storage.readerengine.lazydirectory.LazyBundleDirectory}
+     * (rfc-serverless-opensearch.md &sect;7.2/&sect;9, built by {@code
+     * ServerlessStorageLazyDirectoryFactory} when this shard opted into {@code
+     * ServerlessStoragePlugin#LAZY_DIRECTORY_STORE_TYPE}) already knows how to resolve any file
+     * lazily and just needs its file map advanced -- no I/O at all, {@code
+     * LazyBundleDirectory#advanceToManifest} is a plain in-memory map merge. Every other directory
+     * (a normal local {@code FSDirectory}, the common case) still needs the original eager,
+     * full-fetch {@link ObjectStoreCommitMaterializer#materialize}. {@link
+     * org.apache.lucene.store.FilterDirectory#unwrap} is needed because {@code Store} always wraps
+     * whatever directory it's given in its own {@code FilterDirectory} layers (see {@code Store}'s
+     * own constructor) -- the same unwrap {@code ReadOnlyEngine}'s own constructor already does to
+     * detect a {@code RemoteSnapshotDirectory}.
+     */
+    private static void applyManifestToDirectory(
+        org.apache.lucene.store.Directory directory,
+        CommitManifest manifest,
+        ObjectStoreCommitMaterializer materializer
+    ) throws IOException {
+        org.apache.lucene.store.Directory unwrapped = org.apache.lucene.store.FilterDirectory.unwrap(directory);
+        if (unwrapped instanceof org.opensearch.serverless.storage.readerengine.lazydirectory.LazyBundleDirectory) {
+            ((org.opensearch.serverless.storage.readerengine.lazydirectory.LazyBundleDirectory) unwrapped).advanceToManifest(manifest);
+        } else {
+            materializer.materialize(manifest, directory);
+        }
+    }
+
     private void refreshDirectoryEntry() {
         shardDirectory.report(
             indexUuid,
@@ -208,7 +236,7 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
                 return;
             }
             CommitManifest manifest = manifestStore.readManifest(shardHead.primaryTerm(), shardHead.latestManifestGeneration());
-            materializer.materialize(manifest, engineConfig.getStore().directory());
+            applyManifestToDirectory(engineConfig.getStore().directory(), manifest, materializer);
             maybeRefresh("manifest-generation-advance");
             currentManifestGeneration.set(manifest.generation());
             currentPrimaryTerm.set(shardHead.primaryTerm());
@@ -344,7 +372,7 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
             admissionController.acquire(config.getShardId());
         }
         try {
-            materializer.materialize(manifest, config.getStore().directory());
+            applyManifestToDirectory(config.getStore().directory(), manifest, materializer);
             SeqNoStats seqNoStats = new SeqNoStats(
                 manifest.maxSeqNo(),
                 manifest.localCheckpoint(),

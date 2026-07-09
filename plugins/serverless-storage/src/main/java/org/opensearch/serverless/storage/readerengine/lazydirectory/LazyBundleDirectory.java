@@ -23,6 +23,7 @@ import java.io.IOException;
 import java.util.Collection;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * A read-only Lucene {@link Directory} whose "files" are {@code (bundle, offset, length)} ranges
@@ -33,13 +34,18 @@ import java.util.Set;
  * every referenced file in full before a directory becomes usable; this class defers every fetch
  * until Lucene actually asks for the bytes, and only for the specific blocks it asks for.
  *
- * <p>Standalone first slice, not yet wired into {@code ObjectStoreReaderEngine}'s {@code open()}
- * path (which still fully materializes) -- see rfc-serverless-opensearch.md &sect;7.2's status
- * note. Every read genuinely defers to and is cached by core's own searchable-snapshots
+ * <p>Every read genuinely defers to and is cached by core's own searchable-snapshots
  * {@link org.opensearch.index.store.remote.filecache.FileCache}/{@link TransferManager}/{@link
  * org.opensearch.index.store.remote.file.AbstractBlockIndexInput} machinery -- reused directly,
  * not reimplemented, since it already solves exactly this "lazy block-cached remote file" problem
  * for a different caller (searchable snapshots' own {@code RemoteSnapshotDirectory}).
+ *
+ * <p>{@link #advanceToManifest} lets this directory's file map grow additively as newer manifest
+ * generations are published, the same additive semantics {@code ObjectStoreCommitMaterializer}
+ * already has for the eager, fully-materialized directory this class is an alternative to -- a
+ * file already listed is never removed or replaced (immutable manifests/bundles mean an existing
+ * {@link FileReference} entry is always still correct), only new entries are added, so an
+ * in-flight {@code IndexInput} reading an older file is never disturbed by a concurrent advance.
  */
 public final class LazyBundleDirectory extends Directory {
 
@@ -49,9 +55,21 @@ public final class LazyBundleDirectory extends Directory {
     private final Lock noOpLock = NoLockFactory.INSTANCE.obtainLock(null, null);
 
     public LazyBundleDirectory(CommitManifest manifest, FSDirectory cacheDirectory, TransferManager transferManager) {
-        this.filesByName = manifest.files();
+        this.filesByName = new ConcurrentHashMap<>(manifest.files());
         this.cacheDirectory = cacheDirectory;
         this.transferManager = transferManager;
+    }
+
+    /**
+     * Adds every file referenced by {@code manifest} that isn't already known to this directory's
+     * file map -- see this class's own javadoc for why this is safe to call concurrently with
+     * in-flight reads of already-known files. Callers still need to trigger a real Lucene reader
+     * reopen ({@code DirectoryReader#openIfChanged}, exactly as the eager materialization path's
+     * refresh already does) for a newly-added {@code segments_N} file to actually become visible
+     * to search -- adding the entry here alone does not do that.
+     */
+    public void advanceToManifest(CommitManifest manifest) {
+        filesByName.putAll(manifest.files());
     }
 
     private FileReference resolve(String name) throws IOException {
@@ -97,10 +115,16 @@ public final class LazyBundleDirectory extends Directory {
     }
 
     @Override
-    public void close() {
-        // Nothing local to this directory owns closeable resources -- the shared FileCache and
-        // TransferManager outlive any single LazyBundleDirectory and are closed by whoever
-        // constructed them, not by this class.
+    public void close() throws IOException {
+        // The shared node-wide FileCache backing transferManager outlives any single
+        // LazyBundleDirectory and is closed by whoever constructed it, not by this class. But
+        // cacheDirectory -- the local on-disk location TransferManager writes fetched blocks
+        // into -- is constructed fresh per shard specifically for this directory (see
+        // ServerlessStorageLazyDirectoryFactory), so this class is what owns and must close it;
+        // nothing else ever will. Lucene's own FSDirectory#close is idempotent, so a caller that
+        // also happens to hold and close the same cacheDirectory instance separately (e.g. a test)
+        // is safe.
+        cacheDirectory.close();
     }
 
     @Override
