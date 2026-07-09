@@ -112,8 +112,21 @@ public final class BlobContainerBundleStore implements BundleFileReader {
         if (length > Integer.MAX_VALUE) {
             throw new IOException("range too large to read in one call: " + length + " bytes");
         }
-        try (InputStream in = blobContainer.readBlob(bundleName, position, length)) {
+        try (InputStream in = openRange(bundleName, position, length)) {
             return in.readAllBytes();
         }
+    }
+
+    /**
+     * Opens exactly the given byte range of a bundle, unbuffered and with no checksum
+     * verification (unlike {@link #readFile}, which verifies a whole logical file's checksum in
+     * one shot -- this format has no sub-file checksum, so a caller reading an arbitrary block
+     * range, such as {@code org.opensearch.serverless.storage.readerengine.LazyBundleIndexInput},
+     * cannot verify per-block). Signature deliberately matches {@code
+     * org.opensearch.index.store.remote.utils.TransferManager.StreamReader} exactly, so a method
+     * reference to this can be passed directly as one.
+     */
+    public InputStream openRange(String bundleName, long position, long length) throws IOException {
+        return blobContainer.readBlob(bundleName, position, length);
     }
 }

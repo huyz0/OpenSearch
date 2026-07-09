@@ -981,6 +981,43 @@ buffer forcibly freed while another reader still holds a reference is a use-afte
 a bug. Revisit once the build's JDK floor moves to 22+, or a proper reference-counted off-heap
 allocator (e.g. a Netty-`ByteBuf`-style pool) is worth taking on as a dependency.
 
+**A real lazy, block-cached remote `Directory` now exists, standalone -- not yet wired into
+`ObjectStoreReaderEngine`'s `open()` path, which still fully materializes.** This is the piece
+&sect;7.2 describes ("a read-only Lucene `Directory` whose 'files' are `(bundle, offset, length)`
+ranges resolved through the block cache -- `createOutput`/`deleteFile` throw") and &sect;18 risk #3
+names as the missing prerequisite for real heap-budget admission control. Built by reusing, not
+reimplementing, core's own searchable-snapshots machinery -- confirmed to be exactly the same
+problem (lazy, block-granular, cached remote file reads) before writing anything: `LazyBundleIndexInput`
+extends core's `org.opensearch.index.store.remote.file.AbstractBlockIndexInput` directly (the same
+base class `RemoteSnapshotDirectory`'s own `OnDemandBlockSnapshotIndexInput` uses), and
+`LazyBundleDirectory`'s `openInput` wires it to a `TransferManager`/`FileCache` pair -- both
+`@PublicApi`/stable-enough core classes, not reimplemented. Simpler than the snapshot version in one
+respect: this plugin's bundle format never splits one logical file across more than one blob, so
+`fetchBlock` issues a single-part `BlobFetchRequest` per block, not the snapshot version's
+multi-part chunking logic. `BlobContainerBundleStore` gained one new method, `openRange`, whose
+signature was deliberately made to match `TransferManager.StreamReader` exactly so a method
+reference passes directly as one -- no adapter class needed.
+
+**Known, documented limitation of this first slice**: no per-block checksum verification.
+`BlobContainerBundleStore#readFile` verifies a whole logical file's checksum in one shot, but this
+bundle format has no sub-file checksum an arbitrary block range can be verified against -- a real
+gap this slice does not close, distinct from (and smaller than) the block-granularity/node-sharing/
+eviction-policy gaps `LocalDiskCachingBundleStore` above still has.
+
+Verified with three tests (`LazyBundleDirectoryTests`) against a real object store (no mocks): a
+real Lucene `DirectoryReader`/`IndexSearcher` opened directly against a `LazyBundleDirectory`
+returns correct search results with zero upfront materialization; `listAll()`/`fileLength()` are
+answerable purely from the manifest's own file map with no fetch at all; every write operation
+(`createOutput`/`deleteFile`/`rename`) is rejected, matching &sect;7.2's read-only contract exactly.
+
+Still open: wiring this into `ObjectStoreReaderEngine.open()` in place of
+`ObjectStoreCommitMaterializer`'s eager full-manifest fetch (needs confirming `ReadOnlyEngine`/
+`Store` make no `FSDirectory`-specific assumptions this `Directory` would violate -- not yet
+checked); growing the cache keying from whole-file to real 1 MB block-granular regions per &sect;9's
+target (today's slice inherits `AbstractBlockIndexInput`'s default 8 MiB blocks, not yet tuned);
+and real heap-budget-aware admission control replacing `ReaderShardAdmissionController`'s coarse
+per-node count cap, now that the lazy `Directory` this needs actually exists.
+
 ## 10. Allocation, Topology, and Autoscaling
 
 - **Node roles**: `ingest-compute` (hosts writer shards), `search-compute` (hosts reader
