@@ -1434,9 +1434,9 @@ only for this RFC's purposes.
 scale-to-zero/cold-start, balancer hysteresis. Milestone: idle index consumes zero compute;
 first query after idle returns < 5 s p95 for a cached-manifest index.
 
-**Phase 4.5 — Compaction service (candidate selection, rebase protocol, real Lucene merge,
-size-tiered shaping, background scheduling, a real concurrent-writer data-loss bug, and real lease
-acquisition/renewal all done/fixed; explicit offload-handoff negotiation still open).** Its hard dependency,
+**Phase 4.5 — Compaction service, fully done.** Candidate selection, rebase protocol, real Lucene
+merge, size-tiered shaping, background scheduling, a real concurrent-writer data-loss bug, real
+lease acquisition/renewal, and busy-writer offload are all implemented and tested. Its hard dependency,
 shard-head CAS (metadata-plane RFC Phase 2.5), is done and generically `BlobContainer`-backed
 (`BlobContainerShardStateStore`). `CompactionPolicy` (candidate selection from
 segment-count/size/delete-ratio metrics, matching &sect;7.4's "readable without opening the
@@ -1632,21 +1632,51 @@ though already superseded and unpinned), plus a new end-to-end reader-engine tes
 real scheduled path (not a direct method call) the same way the compaction wiring test does. Full
 unit suite and multi-node internal cluster tests green, stable across repeated runs with fresh seeds.
 
-Still open: the compactor role/lease-offload negotiation with an active writer -- now smaller in
-scope than before this increment, since the lease itself is real and renewed; what remains is only
-the "or accepts explicit offload handoffs from busy writers" half of §7.4's original design (a
-writer proactively yielding compactor rights for one cycle), not the whole mechanism. Separately,
-triggering an immediate compaction pass on demand (rather than waiting out the scheduler's interval)
-was considered via redirecting core's `_forcemerge` action, but that path was scoped and rejected
-this session -- see §7's status note for why (it would require building against the
-experimental, actively-changing `Indexer`/`IndexerFactory` SPI, and still needs a real local `Store`
-underneath regardless, since `StoreRecovery` requires one ahead of any `Indexer` construction). A
-plugin-owned on-demand-compaction action, reusing this scheduler's exact tick logic directly (no
-core changes, no experimental SPI), remains a smaller, safer alternative if the on-demand case turns
-out to matter in practice. Milestone (met): a quiescent 40-segment shard is compacted to size-tiered
-shape with no writer ever activating, concurrently with a surprise writer re-activation -- the
-rebase protocol, a real merge, size-tiered shaping, real lease acquisition/renewal, and now actually-
-running background scheduling are all implemented, wired into the plugin, and tested together.
+**Writer-side compaction offload, closing Phase 4.5's last open item -- smaller than it looked once
+verified, not a new mechanism.** The remaining "or accepts explicit offload handoffs from busy
+writers" half of §7.4's original design was framed as still-open, correctness-sensitive negotiation
+work. Before designing anything, the actual remaining risk was checked directly against the code
+rather than assumed: `ObjectStoreCommitHeadPublisher#publishCommitAsHead` and
+`LuceneMergeCompactionPublisher#computeNewHead` both already always recompute their target
+generation live from the current head inside a CAS-retry loop, never from a caller-supplied or
+locally-cached value -- the exact fix that closed the data-loss bug this whole "still open" note was
+originally worried about (see this phase's own history above). That protocol is already proven safe
+under real concurrent, continuous contention
+(`CompactionRebaseExecutorTests#testConcurrentRebaseExecutorsNeverLoseAnUpdate`, 8 threads hammering
+the same shard-head CAS with a strict no-lost-updates assertion) and formally verified
+(`SpecDecoupled`/`ShardHeadDecoupled.cfg`). So a writer and this task racing continuously was never
+actually unsafe -- `CompactionSchedulerTask`'s blanket "skip if lease held" gate was a *conservative
+efficiency choice* ("don't bother, the writer's own local merges already handle this"), not a
+correctness requirement, and its own code comment read more cautious than the already-proven safety
+of the protocol underneath it actually supported.
+
+Fixed by simply removing that gate: `maybeCompact` no longer checks `isLeaseHeldAt` at all --
+`CompactionPolicy#shouldCompact`'s own segment-count/size/delete-ratio thresholds are what decide
+whether a shard is worth touching, lease or no lease. A healthy, actively-merging writer naturally
+stays under those thresholds (its own local merges keep segment count low) and is left alone exactly
+as before; a *busy* writer -- accumulating small segments faster than its own merges clear them -- is
+exactly the case those thresholds are tuned to catch, which is what "accepts offload handoffs from
+busy writers" meant all along. No new field on `ShardHead`, no handshake protocol, no writer-side
+code change at all was needed. Verified by rewriting the test that previously asserted the old
+behavior (`testDoesNotCompactWhileAnActiveWriterHoldsTheLease`) into
+`testCompactsAFragmentedShardEvenWhileAnActiveWriterHoldsTheLease`, proving both that compaction now
+proceeds and succeeds with an active lease held, and that the lease itself (who holds it, until when)
+is left completely untouched by the publish. Full unit suite and multi-node internal cluster tests
+green, stable across repeated runs with fresh seeds.
+
+Phase 4.5 is now fully closed. Milestone (met): a quiescent 40-segment shard is compacted to
+size-tiered shape with no writer ever activating, concurrently with a surprise writer re-activation,
+*and* a fragmented shard is compacted while its writer stays continuously active throughout -- the
+rebase protocol, a real merge, size-tiered shaping, real lease acquisition/renewal, actually-running
+background scheduling, and now busy-writer offload are all implemented, wired into the plugin, and
+tested together. Separately (not a Phase 4.5 correctness gap): triggering an immediate compaction
+pass on demand, rather than waiting out the scheduler's interval, was considered via redirecting
+core's `_forcemerge` action and rejected this session -- see §7's status note for why (it would
+require building against the experimental, actively-changing `Indexer`/`IndexerFactory` SPI, and
+still needs a real local `Store` underneath regardless, since `StoreRecovery` requires one ahead of
+any `Indexer` construction). A plugin-owned on-demand-compaction action, reusing this scheduler's
+exact tick logic directly (no core changes, no experimental SPI), remains a smaller, safer
+alternative if the on-demand case turns out to matter in practice.
 
 **Phase 4.6 — Snapshots/clones/PITR (manifest pinning and PITR retention wiring done; clone not
 started).** Durable pins (§6.5) are implemented as `DurablePinRegistry`/`BlobContainerDurablePinRegistry`

@@ -131,8 +131,14 @@ public class CompactionSchedulerTaskTests extends OpenSearchTestCase {
         }
     }
 
-    public void testDoesNotCompactWhileAnActiveWriterHoldsTheLease() throws Exception {
+    public void testCompactsAFragmentedShardEvenWhileAnActiveWriterHoldsTheLease() throws Exception {
+        // The "busy writer accepts an offload handoff" case (rfc-serverless-opensearch.md &sect;16
+        // Phase 4.5): the publish protocol both a writer and this task use always recomputes the
+        // target generation live from the current head inside a CAS-retry loop, so there is nothing
+        // unsafe about this task and an active writer both touching the same shard -- lease presence
+        // is no longer a reason to skip, only CompactionPolicy#shouldCompact's own thresholds are.
         try (Directory directory = new ByteBuffersDirectory()) {
+            // CompactionPolicy.withDefaults() triggers at 10+ segments.
             SegmentInfos infos = commitSeparateSegments(directory, 12);
             CommitManifest manifest = commitPublisher.publishCommit(
                 directory,
@@ -147,8 +153,8 @@ public class CompactionSchedulerTaskTests extends OpenSearchTestCase {
                 0,
                 PruningStats.empty()
             );
-            // Lease held far into the future -- an active writer, whose own local merges are
-            // responsible for this shard, not the compaction service.
+            // Lease held far into the future -- an active writer -- unlike the old version of this
+            // test, this must no longer prevent compaction from running.
             ShardHead activeHead = new ShardHead(1, "node-1", Long.MAX_VALUE, manifest.generation());
             assertEquals(CasResult.SUCCESS, shardStateStore.compareAndSet(INDEX_UUID, SHARD_ID, Optional.empty(), activeHead));
 
@@ -165,14 +171,17 @@ public class CompactionSchedulerTaskTests extends OpenSearchTestCase {
                 new CompactionRebaseExecutor(shardStateStore, 10)
             );
             try {
-                // Give it several ticks' worth of time to (wrongly) fire before asserting it never did.
-                Thread.sleep(200);
-                ShardHead head = shardStateStore.get(INDEX_UUID, SHARD_ID).orElseThrow().head();
-                assertEquals(
-                    "a shard with an actively-held lease must never be compacted by this task",
-                    manifest.generation(),
-                    head.latestManifestGeneration()
-                );
+                assertBusy(() -> {
+                    ShardHead head = shardStateStore.get(INDEX_UUID, SHARD_ID).orElseThrow().head();
+                    assertTrue(
+                        "an over-threshold shard must eventually get compacted even with an active writer's lease held",
+                        head.latestManifestGeneration() > manifest.generation()
+                    );
+                    // The lease itself (this test's simulated writer holding it) must be left
+                    // completely untouched -- compaction publishing a new generation never disturbs
+                    // who holds the lease, only ShardHead#latestManifestGeneration.
+                    assertEquals("node-1", head.leaseHolderNodeId());
+                });
             } finally {
                 task.close();
             }

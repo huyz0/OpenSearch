@@ -27,16 +27,20 @@ import java.util.Optional;
  * Runs the compaction service on a fixed schedule for one shard -- the piece
  * rfc-serverless-opensearch.md &sect;16 Phase 4.5 flagged as still missing: {@link
  * CompactionPolicy}, {@link CompactionRebaseExecutor}, and {@link LuceneMergeCompactionPublisher}
- * all existed and were correct, but nothing decided *when* to invoke them for a quiescent shard
- * with no active writer (the actual "no writer ever activating" case this service exists for --
- * a shard with an active writer merges via that writer's own local Lucene merge policy already).
+ * all existed and were correct, but nothing decided *when* to invoke them, for either the
+ * "quiescent shard with no active writer" case this service originally targeted, or (since the
+ * publish protocol both a writer and this task use was proven safe under real concurrent,
+ * continuous contention -- see {@link #maybeCompact()}'s own javadoc) the "busy writer accepts an
+ * offload handoff" case &sect;16 Phase 4.5 separately called out.
  *
- * <p>Every tick: read the live {@link ShardHead}; skip entirely (no compaction attempt) if the
- * shard has never been activated, or its lease is currently held by an active writer -- compaction
- * is for shards nobody is actively writing to, not a competitor to a writer's own merges. Otherwise
- * read the manifest at the current published generation, derive {@link CompactionPolicy}'s inputs
- * from it via {@link ManifestSegmentMetrics} (no bundle needs to be opened), and run one {@link
- * CompactionRebaseExecutor#publish} attempt if the policy says the shard is a candidate.
+ * <p>Every tick: read the live {@link ShardHead}; skip entirely (no compaction attempt) only if the
+ * shard has never been activated or has never published anything. Otherwise read the manifest at
+ * the current published generation, derive {@link CompactionPolicy}'s inputs from it via {@link
+ * ManifestSegmentMetrics} (no bundle needs to be opened), and run one {@link
+ * CompactionRebaseExecutor#publish} attempt if the policy says the shard is a candidate --
+ * regardless of whether a writer's lease is currently held, since {@link CompactionPolicy#shouldCompact}'s
+ * own thresholds are what actually decide whether this shard's segments are fragmented enough to be
+ * worth touching, not lease presence.
  *
  * <p>Per {@link CompactionRebaseExecutor}'s own safety argument, a tick that skips, fails, or loses
  * every rebase attempt is never worse than a no-op: nothing is deleted or corrupted, and the next
@@ -94,9 +98,21 @@ public final class CompactionSchedulerTask implements Closeable {
         }
 
         ShardHead head = current.get().head();
-        if (head.isLeaseHeldAt(System.currentTimeMillis())) {
-            return; // an active writer holds the lease -- its own local merges already handle this
-        }
+        // Deliberately does NOT skip just because a writer's lease is held (rfc-serverless-opensearch.md
+        // &sect;16 Phase 4.5's "offload handoffs from busy writers" note): the publish protocol both
+        // sides use -- always recomputing the target generation live from the current head inside a
+        // CAS-retry loop, never a caller-supplied or locally-cached generation number -- was proven
+        // safe under real concurrent, continuous contention before this method's gate was ever
+        // relaxed (see CompactionRebaseExecutorTests#testConcurrentRebaseExecutorsNeverLoseAnUpdate
+        // and the formally-verified SpecDecoupled/ShardHeadDecoupled.cfg). A lost CAS race here is
+        // never worse than wasted work: rebase-and-retry (already tested) or exhaust attempts and
+        // walk away leaving the writer's own publish exactly as it was (also already tested). The
+        // real gate against pointlessly competing with a healthy, actively-merging writer is
+        // CompactionPolicy#shouldCompact's own segment-count/size/delete-ratio thresholds below,
+        // which a writer whose own local merges are keeping up naturally stays under -- an
+        // explicitly *busy* writer (accumulating small segments faster than its own merges clear
+        // them) is exactly the case those thresholds are meant to catch regardless of who holds the
+        // lease.
         if (head.latestManifestGeneration() == 0) {
             return; // ShardHead#initial()'s sentinel -- nothing has ever been published yet
         }
