@@ -1855,13 +1855,25 @@ generation matches what was cloned from.
 This closes the GC-safety question `BundleReferenceCounter`'s own javadoc had flagged (see that
 class's updated javadoc) without needing the cross-index manifest scan it originally called for:
 pinning the exact cloned generation on the source is precise and needs zero change to
-`GcSchedulerTask`. **Deliberately out of scope for this slice** (see `ShardCloner`'s own class
-javadoc): removing a clone's pin when the clone is later deleted (currently permanent -- an
-accepted, documented leak until a "delete clone" lifecycle exists), the lazy-directory (reader
-shard) read path for a cloned shard (`TransferManager`/`LazyBundleIndexInput` resolve reads
-differently than `BundleFileReader` does, and aren't wired to fall back yet), and any REST/transport
-exposure -- `ShardCloner` is an internal component today, not a user-facing action. The extended GC
-model check &sect;18.5 anticipates is still open.
+`GcSchedulerTask`.
+
+**The pin no longer has to be permanent, either.** `CloneLineage`/`BlobContainerCloneLineageStore`
+record, once, in the target's own container at clone time, exactly which source shard it was
+cloned from (written after the pin but before the head CAS that makes the clone visible, so a
+visible clone is always guaranteed to already have both). `ShardCloner.deleteClone` uses that
+lineage to find its way back to the source's registry and release exactly the pin this clone placed
+-- idempotent (a no-op if the lineage is already gone or was never there), and it touches nothing
+about the target's own manifest/head, only the source-side pin and the lineage record itself.
+Verified: the pin and lineage are both released together, a never-cloned shard's `deleteClone` is a
+harmless no-op, and calling it twice in a row is safe.
+
+**Deliberately out of scope for this slice** (see `ShardCloner`'s own class javadoc): wiring
+`deleteClone` to fire automatically when a clone's index is itself deleted (no
+`IndexEventListener`/lifecycle hook exists yet -- it must be called explicitly today), the
+lazy-directory (reader shard) read path for a cloned shard (`TransferManager`/`LazyBundleIndexInput`
+resolve reads differently than `BundleFileReader` does, and aren't wired to fall back yet), and any
+REST/transport exposure -- `ShardCloner` is an internal component today, not a user-facing action.
+The extended GC model check &sect;18.5 anticipates is still open.
 
 **PITR reconciliation is now actually invoked, not just correct in isolation.**
 `PitrRetentionSchedulerTask` runs `PitrRetentionReconciler` for one shard on a fixed schedule (5

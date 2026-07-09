@@ -59,6 +59,7 @@ public class ShardClonerTests extends OpenSearchTestCase {
     private ShardStateStore sourceShardStateStore;
     private ShardStateStore targetShardStateStore;
     private DurablePinRegistry sourcePinRegistry;
+    private BlobContainerCloneLineageStore targetLineageStore;
 
     @Override
     public void setUp() throws Exception {
@@ -75,6 +76,7 @@ public class ShardClonerTests extends OpenSearchTestCase {
         sourceShardStateStore = new BlobContainerShardStateStore(sourceContainer);
         targetShardStateStore = new BlobContainerShardStateStore(targetContainer);
         sourcePinRegistry = new BlobContainerDurablePinRegistry(sourceContainer);
+        targetLineageStore = new BlobContainerCloneLineageStore(targetContainer);
     }
 
     /** Real IndexWriter -> real ObjectStoreCommitPublisher -> real published head, exactly what a live writer shard would have produced. */
@@ -131,6 +133,7 @@ public class ShardClonerTests extends OpenSearchTestCase {
                 SHARD_ID,
                 targetManifestStore,
                 targetShardStateStore,
+                targetLineageStore,
                 1L
             )
         );
@@ -154,6 +157,7 @@ public class ShardClonerTests extends OpenSearchTestCase {
                 SHARD_ID,
                 targetManifestStore,
                 targetShardStateStore,
+                targetLineageStore,
                 1L
             )
         );
@@ -171,6 +175,7 @@ public class ShardClonerTests extends OpenSearchTestCase {
             SHARD_ID,
             targetManifestStore,
             targetShardStateStore,
+            targetLineageStore,
             System.currentTimeMillis()
         );
         Set<PinRecord> pins = sourcePinRegistry.getPins(SOURCE_INDEX_UUID, SHARD_ID);
@@ -194,6 +199,7 @@ public class ShardClonerTests extends OpenSearchTestCase {
             SHARD_ID,
             targetManifestStore,
             targetShardStateStore,
+            targetLineageStore,
             cloneTimeMillis
         );
 
@@ -228,6 +234,70 @@ public class ShardClonerTests extends OpenSearchTestCase {
                 assertEquals(1, hits.totalHits.value());
             }
         }
+    }
+
+    public void testDeleteCloneRemovesExactlyThisClonesPinAndLineage() throws Exception {
+        publishSourceCommit();
+        ShardCloner.clone(
+            SOURCE_INDEX_UUID,
+            SHARD_ID,
+            sourceManifestStore,
+            sourceShardStateStore,
+            sourcePinRegistry,
+            TARGET_INDEX_UUID,
+            SHARD_ID,
+            targetManifestStore,
+            targetShardStateStore,
+            targetLineageStore,
+            System.currentTimeMillis()
+        );
+        assertEquals(1, sourcePinRegistry.getPins(SOURCE_INDEX_UUID, SHARD_ID).size());
+        assertTrue(targetLineageStore.readLineage().isPresent());
+
+        ShardCloner.deleteClone(TARGET_INDEX_UUID, SHARD_ID, targetLineageStore, (indexUuid, shardId) -> {
+            assertEquals(SOURCE_INDEX_UUID, indexUuid);
+            assertEquals(Integer.valueOf(SHARD_ID), shardId);
+            return sourcePinRegistry;
+        });
+
+        assertTrue(
+            "deleteClone must release the pin it protected the source generation with",
+            sourcePinRegistry.getPins(SOURCE_INDEX_UUID, SHARD_ID).isEmpty()
+        );
+        assertTrue(
+            "deleteClone must remove the lineage record once the pin it points at is gone",
+            targetLineageStore.readLineage().isEmpty()
+        );
+    }
+
+    public void testDeleteCloneOnANeverClonedShardIsANoOp() throws Exception {
+        // targetLineageStore's container has no lineage blob at all -- deleteClone must not throw
+        // or invoke the resolver, since there is nothing to resolve a source for.
+        ShardCloner.deleteClone(TARGET_INDEX_UUID, SHARD_ID, targetLineageStore, (indexUuid, shardId) -> {
+            throw new AssertionError("resolver must not be invoked when there is no lineage to act on");
+        });
+    }
+
+    public void testDeleteCloneIsIdempotent() throws Exception {
+        publishSourceCommit();
+        ShardCloner.clone(
+            SOURCE_INDEX_UUID,
+            SHARD_ID,
+            sourceManifestStore,
+            sourceShardStateStore,
+            sourcePinRegistry,
+            TARGET_INDEX_UUID,
+            SHARD_ID,
+            targetManifestStore,
+            targetShardStateStore,
+            targetLineageStore,
+            System.currentTimeMillis()
+        );
+        ShardCloner.deleteClone(TARGET_INDEX_UUID, SHARD_ID, targetLineageStore, (indexUuid, shardId) -> sourcePinRegistry);
+        // Second call: lineage is already gone, so this must be a harmless no-op, not a failure.
+        ShardCloner.deleteClone(TARGET_INDEX_UUID, SHARD_ID, targetLineageStore, (indexUuid, shardId) -> {
+            throw new AssertionError("resolver must not be invoked once lineage is already gone");
+        });
     }
 
 }

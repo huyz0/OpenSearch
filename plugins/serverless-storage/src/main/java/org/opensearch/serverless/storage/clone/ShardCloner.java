@@ -43,10 +43,16 @@ import java.util.Optional;
  * <em>source</em> shard already consults {@link DurablePinRegistry#getPinnedManifestIds} on every
  * tick.
  *
- * <p><b>Deliberately out of scope for this first slice</b>: removing the pin when a clone is later
- * deleted (today a clone pin is permanent once created -- an accepted, documented leak until a
- * "delete clone" lifecycle exists), and the lazy-directory (reader-shard) read path, which resolves
- * bundle reads through {@code TransferManager}/{@code LazyBundleIndexInput}, not {@link
+ * <p>{@link #clone} also records a {@link CloneLineage} in the target's own container so a later
+ * {@link #deleteClone} can find its way back to the source's pin without anything else needing to
+ * remember the relationship -- see {@link #deleteClone}'s own javadoc for what it does and does
+ * not do.
+ *
+ * <p><b>Deliberately out of scope for this first slice</b>: automatically invoking {@link
+ * #deleteClone} when a clone's index is itself deleted (no {@code IndexEventListener}/lifecycle
+ * hook exists yet -- {@link #deleteClone} must be called explicitly today), and the lazy-directory
+ * (reader-shard) read path, which resolves bundle reads through {@code
+ * TransferManager}/{@code LazyBundleIndexInput}, not {@link
  * org.opensearch.serverless.storage.format.BundleFileReader} -- only the eager materializer path
  * (via {@link FallbackBundleFileReader}) is wired for a cloned shard today.
  */
@@ -80,6 +86,7 @@ public final class ShardCloner {
         int targetShardId,
         BlobContainerManifestStore targetManifestStore,
         ShardStateStore targetShardStateStore,
+        BlobContainerCloneLineageStore targetLineageStore,
         long nowMillis
     ) throws IOException {
         Optional<VersionedShardHead> sourceHead = sourceShardStateStore.get(sourceIndexUuid, sourceShardId);
@@ -97,6 +104,9 @@ public final class ShardCloner {
             sourceShardId,
             new PinRecord(clonePinId(targetIndexUuid, targetShardId), sourceManifest.primaryTerm(), sourceManifest.generation())
         );
+        // Lineage before the head CAS below makes the clone visible/active -- so whenever a clone
+        // is visible, deleteClone can already find its way back to the pin it must remove.
+        targetLineageStore.writeLineage(new CloneLineage(sourceIndexUuid, sourceShardId));
 
         CommitManifest targetManifest = new CommitManifest(
             targetIndexUuid,
@@ -129,11 +139,53 @@ public final class ShardCloner {
 
     /**
      * The {@link PinRecord#pinId()} a clone of {@code (targetIndexUuid, targetShardId)} registers
-     * on its source -- stable and derivable from the target's identity alone, so a caller can look
-     * up or (once a "delete clone" lifecycle exists) remove exactly this pin without needing to
-     * have recorded it separately.
+     * on its source -- stable and derivable from the target's identity alone, so {@link
+     * #deleteClone} can remove exactly this pin without needing anything separate recorded on the
+     * target beyond {@link CloneLineage} itself.
      */
     public static String clonePinId(String targetIndexUuid, int targetShardId) {
         return "clone:" + targetIndexUuid + ":" + targetShardId;
+    }
+
+    /**
+     * Releases exactly the pin {@link #clone} placed on the source shard for this clone, using
+     * {@code targetIndexUuid}/{@code targetShardId}'s own {@link CloneLineage} to find the source
+     * without the caller needing to already know it. A no-op if {@code targetLineageStore} has no
+     * lineage recorded (the target was never a clone, or its lineage was already deleted by a
+     * previous call) -- idempotent, safe to call more than once or speculatively.
+     *
+     * <p>Does not touch the target's own manifest or head -- deleting <em>those</em> (the actual
+     * index deletion) is the caller's separate responsibility; this method only ever releases the
+     * source-side pin and the lineage record that pointed to it. Deliberately not wired to any
+     * automatic index-deletion hook yet -- see this class's own javadoc.
+     *
+     * @param sourcePinRegistryResolver given the lineage's {@code (sourceIndexUuid, sourceShardId)},
+     *                                  returns that source shard's own {@link DurablePinRegistry}
+     *                                  -- a resolver rather than a direct parameter because, unlike
+     *                                  {@link #clone} (where the caller already has the source
+     *                                  shard open), a caller invoking this later, out of band, only
+     *                                  knows the target and must construct the source's registry
+     *                                  from whatever lineage turns out to say.
+     */
+    public static void deleteClone(
+        String targetIndexUuid,
+        int targetShardId,
+        BlobContainerCloneLineageStore targetLineageStore,
+        java.util.function.BiFunction<String, Integer, DurablePinRegistry> sourcePinRegistryResolver
+    ) throws IOException {
+        Optional<CloneLineage> lineage = targetLineageStore.readLineage();
+        if (lineage.isEmpty()) {
+            return;
+        }
+        DurablePinRegistry sourcePinRegistry = sourcePinRegistryResolver.apply(
+            lineage.get().sourceIndexUuid(),
+            lineage.get().sourceShardId()
+        );
+        sourcePinRegistry.removePin(
+            lineage.get().sourceIndexUuid(),
+            lineage.get().sourceShardId(),
+            clonePinId(targetIndexUuid, targetShardId)
+        );
+        targetLineageStore.deleteLineage();
     }
 }
