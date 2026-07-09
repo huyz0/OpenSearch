@@ -2313,6 +2313,26 @@ directions documented so serverless adoption is not a one-way door.
    when segment data is cold — building global ordinals on a cache-miss storm is a latency
    cliff. Mitigation candidates: ordinal structures included in boot sets, or eager ordinal
    builds pinned behind the admission controller (§7.2). Needs Phase 3 measurement.
+10. **Reader-shard creation itself has never been exercised end to end, and depends on a core
+    gate this plugin has not yet verified compatibility with.** Every piece of this plugin's
+    reader-engine path (`ObjectStoreReaderEngine`, the lazy directory, admission control) is
+    unit- and component-tested against a hand-built `ShardRouting` with `isSearchOnly()` forced
+    `true` -- but nothing in this plugin has ever created a *real* search-only shard copy in a
+    running cluster and observed which engine it actually gets. That matters because
+    `isSearchOnly()` is core's existing search-replica flag (§4's own "what exists today" table),
+    set via `index.number_of_search_replicas`, and `MetadataCreateIndexService#validateSearchOnlyReplicasSettings`
+    currently requires `index.remote_store.enabled: true` before that setting is even accepted --
+    a completely different remote-storage abstraction, with its own directory/repository model,
+    that this plugin has never tested alongside its own `IndexStorePlugin.DirectoryFactory`-based
+    storage. Whether the two coexist without conflict (e.g. both trying to own the shard's
+    directory/repository configuration) or need an explicit compatibility decision is genuinely
+    unknown -- found while investigating why no internal-cluster test exercises the lazy directory
+    or reader engine against a real search-only shard, not by attempting the integration and
+    hitting a failure. Needs a real experiment (a serverless-storage index with
+    `index.remote_store.enabled: true` and `index.number_of_search_replicas: 1`, observing what
+    engine and directory the resulting search-only shard copy actually receives) before the
+    reader-shard story can be considered proven beyond the synthetic-routing level it's tested at
+    today.
 
 ## 19. Summary
 
