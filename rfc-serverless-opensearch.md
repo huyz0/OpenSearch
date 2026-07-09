@@ -2069,7 +2069,24 @@ directions documented so serverless adoption is not a one-way door.
    `ObjectStoreWriterEngine` (see §16 Phase 4.5's risk note for the Java-side detail) without any
    further protocol-level surprises during implementation.
 
-   Still does not cover clones/cross-index references (§14).
+   **Clone's pin/GC interaction is now covered too, in a separate small model** (`formal/CloneGc.tla`,
+   deliberately not folded into `ShardHead.tla` -- it checks a different mechanism, the durable
+   pin/sweep interaction from §14, not the term/lease/generation state machine): given the same
+   Spec/SpecBuggy-style comparison via two ghost variables checked in one TLC run, it demonstrates
+   that `ShardCloner.clone`'s originally-shipped ordering -- read the source manifest (succeeds
+   only while the generation is still live), *then* add the durable pin -- has a genuine TOCTOU
+   race with `GcSchedulerTask`'s independent sweep: `NoCloneEverReferencesADeletedGenerationBuggy`
+   is VIOLATED with a concrete 5-state counterexample (a commit supersedes the just-read
+   generation, a sweep deletes it before the pin lands, and the pin that arrives moments later
+   protects bundles that are already gone). The fix -- add the pin first, using the generation
+   number already known from the `ShardHead` read itself, and only then read the manifest --
+   is verified sound: `NoCloneEverReferencesADeletedGenerationFixed` HOLDS across the complete
+   reachable state space (1,556 distinct states, search depth 17, 0 states left on the queue,
+   exhaustive). **Fixed in `ShardCloner.clone` in the same session this model was written**, closing
+   a real bug the pin-based clone design (see that class's own javadoc) had shipped with, not a
+   hypothetical one -- caught by modeling the mechanism, not by code review or testing (the
+   existing unit/integration test suite passed unchanged both before and after the fix, since
+   nothing in it exercised the narrow interleaving window the model surfaces).
 6. **Interplay with existing warm/composite work.** Writable warm solves an overlapping problem
    (disk smaller than data) with a different mechanism (composite local+remote directory under a
    writable engine). Decision needed: converge warm onto the reader-engine + bundle layout in

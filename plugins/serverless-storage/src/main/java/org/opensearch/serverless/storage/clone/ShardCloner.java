@@ -52,6 +52,16 @@ import java.util.Optional;
  * TransferManager}/{@code LazyBundleIndexInput} counterpart of {@link FallbackBundleFileReader}'s
  * support for the eager materializer path; both read paths are wired for a cloned shard today.
  *
+ * <p><b>Pin ordering is load-bearing, formally verified</b> (rfc-serverless-opensearch.md
+ * &sect;18.5's "coordination-free GC" correctness surface): {@link #clone} adds the pin using the
+ * generation number from the {@link ShardHead} read alone, <em>before</em> ever calling {@link
+ * BlobContainerManifestStore#readManifest}, not after. An earlier pin-after-read ordering had a
+ * genuine TOCTOU race with {@code GcSchedulerTask}'s independent sweep -- see {@code
+ * formal/CloneGc.tla}, whose {@code NoCloneEverReferencesADeletedGenerationBuggy} property is
+ * VIOLATED with a concrete counterexample for that ordering (a newer commit supersedes the
+ * just-read generation, a sweep deletes it, and the pin that arrives moments later protects
+ * bundles already gone) and whose {@code ...Fixed} property HOLDS exhaustively for this ordering.
+ *
  * <p>{@link #deleteClone} also now fires automatically: {@code
  * ServerlessStoragePlugin#onIndexModule} registers an {@code IndexEventListener} that calls it on
  * {@code afterIndexRemoved(..., IndexRemovalReason.DELETED)} -- see that method's own javadoc for
@@ -97,16 +107,21 @@ public final class ShardCloner {
             throw new IOException("source shard " + sourceIndexUuid + "/" + sourceShardId + " has no published manifest to clone from");
         }
         ShardHead head = sourceHead.get().head();
-        CommitManifest sourceManifest = sourceManifestStore.readManifest(head.primaryTerm(), head.latestManifestGeneration());
 
-        // Pin before publishing anything that could ever be read as referencing it -- a crash or
-        // failure after this line just leaves an unused pin (see class javadoc), never a published
-        // reference to an unprotected generation.
+        // Pin BEFORE reading the manifest, using the generation number already known from the
+        // ShardHead read above -- not after, and not derived from the manifest read below. A
+        // pin-after-read ordering has a genuine TOCTOU race: GcSchedulerTask's sweep could delete
+        // this exact generation in the window between the manifest read succeeding and the pin
+        // landing, if a newer commit had meanwhile superseded it, leaving the pin protecting
+        // bundles that are already gone. Formally verified in formal/CloneGc.tla -- the pin-after-
+        // read ordering is shown VIOLATED with a concrete counterexample, this pin-before-read
+        // ordering is shown to hold across the complete reachable state space for that model.
         sourcePinRegistry.addPin(
             sourceIndexUuid,
             sourceShardId,
-            new PinRecord(clonePinId(targetIndexUuid, targetShardId), sourceManifest.primaryTerm(), sourceManifest.generation())
+            new PinRecord(clonePinId(targetIndexUuid, targetShardId), head.primaryTerm(), head.latestManifestGeneration())
         );
+        CommitManifest sourceManifest = sourceManifestStore.readManifest(head.primaryTerm(), head.latestManifestGeneration());
         // Lineage before the head CAS below makes the clone visible/active -- so whenever a clone
         // is visible, deleteClone can already find its way back to the pin it must remove.
         targetLineageStore.writeLineage(new CloneLineage(sourceIndexUuid, sourceShardId));
