@@ -1479,11 +1479,16 @@ structural finding that retention is always exactly one flush cycle behind (not 
 commit) since `CombinedDeletionPolicy#onCommit` fires synchronously as part of the very commit it's
 evaluating -- matching this section's own "proportional to one publish cycle" milestone language,
 not a shortcoming. Core's own `InternalEngineTests`/`CombinedDeletionPolicyTests` pass unchanged. The disk-usage-bound
-half of &sect;7.1.1's own milestone is now met as a result. Separately, still not yet met: an index
-whose durability is object-store-only survives `kill -9` of its node with zero data loss (durable
-ack mode), recovering by manifest+WAL replay -- no crash-survival integration test exercising this
-exists yet; the retention work above makes local disk usage bounded, it doesn't by itself prove
-crash recovery. **WAL replay fencing is now formally verified** (`formal/WalReplayFencing.tla`,
+half of &sect;7.1.1's own milestone is now met as a result. **The crash-survival claim itself is
+now proven too, closing what this paragraph originally flagged as still missing**:
+`ServerlessStorageWriterFailoverIT#testWriterShardSurvivesItsNodeBeingKilled` is a real multi-node
+integration test that indexes one flushed (manifest-durable) and one unflushed (WAL-only-durable)
+document, kills the node actually holding the primary (found via the real routing table, not
+assumed to be a fixed node), and asserts both documents are still searchable once the surviving
+node picks the shard back up with a completely empty local `Store` -- proving the full chain
+(allocation onto a data-less node, manifest materialization, and WAL replay past
+`activationWalPosition`) under a real `kill -9`-equivalent node death, not just each piece in
+isolation. **WAL replay fencing is now formally verified** (`formal/WalReplayFencing.tla`,
 `FixedReplay` holds exhaustively; the naively-shipped term-only filter does not), **the
 read/filter/decode side is implemented and tested against a real two-writer failover**
 (`wal/WalReplayRecovery.java`, `ObjectStoreWriterEngine#replayWalOperations()`, &sect;6.4), **and the
