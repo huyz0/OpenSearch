@@ -187,6 +187,44 @@ single shard's own, since the WAL is shared -- before writing the Java). Tracked
 it isn't lost track of as a "someday" item: this is the next real correctness-bearing gap in this
 area, not a cosmetic one.
 
+**A more urgent, actively-exploitable sibling bug, found and verified while investigating the gap
+above: two nodes with WAL mirroring enabled against the same shared `serverless_storage.base_path`
+can silently overwrite each other's WAL chunks today, right now, under completely normal
+concurrent operation -- not a rare race, an unrecoverable data-loss bug real production use of this
+feature (more than one writer-hosting node) would hit continuously.** Root cause:
+`WalChunkService`'s chunk sequence numbers are assigned by a purely local `AtomicLong`, seeded once
+at construction from `firstUnusedChunkSequence` (a listing of whatever the shared container already
+contains) and incremented independently thereafter, with zero cross-instance coordination -- yet
+every node's `WalChunkService` writes into the exact same physical `<base_path>/wal/` container
+(`ServerlessStoragePlugin#createComponents` derives it from the one shared `basePath` every node in
+a cluster uses, per `ServerlessStorageWriterFailoverIT`'s own setup), and `writeChunk` calls
+`BlobContainer#writeBlob` with `failIfAlreadyExists=false` -- a silent overwrite, not a thrown
+error, when two nodes' independently-numbered sequences collide. **Verified, not just reasoned
+about**: a new regression test, `WalChunkServiceTests#testTwoInstancesSharingOneContainerCanSilentlyOverwriteEachOthersChunks`,
+constructs two `WalChunkService` instances (distinct epochs, as two real node incarnations would
+have) against one shared container and shows the second's chunk 0 write genuinely destroys the
+first's -- the first node's mirrored operation is unrecoverably gone, confirmed by reading the
+surviving blob back and finding only the second write's content.
+
+Deliberately not fixed in the same pass as finding and verifying it, for the same reason as the
+deletion gap above, but more so: a correct fix needs real cross-node-safe sequence allocation (the
+natural candidate is the same `BlobContainer#compareAndSwapRegister` primitive `ShardStateStore`
+already uses, since a register's own `generation()` is already "monotonically increasing with each
+successful write" -- exactly a distributed atomic counter for free), and the one place that
+currently reads a chunk-sequence-derived value with no `IOException` in its signature at all,
+`WalChunkService#currentChunkSequenceUpperBound()`, would need to become a live, non-cacheable read
+of that same register for its own fencing guarantee (`ObjectStoreWriterEngine#activationWalPosition`)
+to stay sound -- caching it locally would let a stale, too-low snapshot silently under-cover
+replay, the exact failure mode `WalReplayFencing.tla` exists to rule out. Threading that
+`IOException` through the `ThreadLocal`-bridged, `super()`-ordering-constrained construction path
+`beginConstruction`/`CONSTRUCTION_WAL_CHUNK_SERVICE` already navigate carefully is real, correctness-
+adjacent work, not a mechanical edit -- exactly the kind of change this session's own discipline
+says warrants its own careful pass (ideally with a `CloneGc.tla`-style model of the claim/fence
+interaction) rather than a rushed fix appended to an unrelated investigation. **This is the single
+most urgent known gap in this plugin today** -- more urgent than the deletion gap above, since it
+actively destroys data under normal multi-node operation rather than merely growing storage
+unboundedly.
+
 **Integration point, corrected**: this section originally assumed `TranslogFactory`'s per-shard
 `BiFunction<IndexSettings, ShardRouting, TranslogFactory>` resolution (`IndicesService`) was a
 plugin-extensible seam the WAL-backed translog adapter could slot into without core changes. It
