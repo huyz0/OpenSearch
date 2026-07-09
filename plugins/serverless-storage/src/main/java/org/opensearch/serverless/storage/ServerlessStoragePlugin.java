@@ -605,6 +605,75 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         return Collections.singletonList(new ServerlessStorageIndexSettingProvider());
     }
 
+    /**
+     * Registers the listener that releases a clone's source-side GC pin when the clone's own index
+     * is actually deleted (rfc-serverless-opensearch.md &sect;14) -- {@code ShardCloner.deleteClone}
+     * itself has existed since the clone feature landed, but nothing called it automatically until
+     * this. Uses {@code afterIndexRemoved} gated on {@code IndexRemovalReason.DELETED}, not the
+     * shard-level {@code afterIndexShardDeleted}: that one fires whenever a shard's local copy is
+     * physically wiped from a node's disk, including plain relocation or a node simply no longer
+     * hosting a copy, not just real index deletion -- using it here would call {@code deleteClone}
+     * spuriously on every relocation. {@code afterIndexRemoved} fires once per node that had the
+     * index open, which for a multi-node cluster still means potentially several nodes independently
+     * calling {@code deleteClone} for the same clone -- safe only because {@code deleteClone} is
+     * already idempotent under concurrent/redundant calls (see its own javadoc): whichever call
+     * loses the race just finds the lineage already gone and no-ops.
+     */
+    @Override
+    public void onIndexModule(org.opensearch.index.IndexModule indexModule) {
+        indexModule.addIndexEventListener(new org.opensearch.index.shard.IndexEventListener() {
+            @Override
+            public void afterIndexRemoved(
+                org.opensearch.core.index.Index index,
+                IndexSettings indexSettings,
+                org.opensearch.indices.cluster.IndicesClusterStateService.AllocatedIndices.IndexRemovalReason reason
+            ) {
+                if (reason != org.opensearch.indices.cluster.IndicesClusterStateService.AllocatedIndices.IndexRemovalReason.DELETED) {
+                    return;
+                }
+                releaseCloneLineageForDeletedIndex(index.getUUID(), indexSettings.getNumberOfShards());
+            }
+        });
+    }
+
+    /**
+     * Best-effort, like every other background cleanup in this plugin ({@code
+     * CompactionSchedulerTask}, {@code GcSchedulerTask}): a shard that was never a clone costs one
+     * cheap single-blob miss per shard and is otherwise untouched; a genuine failure here (e.g. the
+     * object store being briefly unreachable) is swallowed rather than blocking index deletion
+     * itself, which must proceed regardless -- see {@code ShardCloner.deleteClone}'s own
+     * idempotency for why simply not running to completion here is safe to leave for a later retry
+     * rather than needing one.
+     */
+    private void releaseCloneLineageForDeletedIndex(String indexUuid, int numberOfShards) {
+        if (basePath == null) {
+            return;
+        }
+        for (int shardId = 0; shardId < numberOfShards; shardId++) {
+            try {
+                BlobContainer targetContainer = resolveBlobContainer(indexUuid, shardId);
+                org.opensearch.serverless.storage.clone.BlobContainerCloneLineageStore lineageStore =
+                    new org.opensearch.serverless.storage.clone.BlobContainerCloneLineageStore(targetContainer);
+                org.opensearch.serverless.storage.clone.ShardCloner.deleteClone(
+                    indexUuid,
+                    shardId,
+                    lineageStore,
+                    (sourceIndexUuid, sourceShardId) -> {
+                        try {
+                            return new org.opensearch.serverless.storage.retention.BlobContainerDurablePinRegistry(
+                                resolveBlobContainer(sourceIndexUuid, sourceShardId)
+                            );
+                        } catch (IOException e) {
+                            throw new UncheckedIOException(e);
+                        }
+                    }
+                );
+            } catch (Exception e) {
+                // See this method's own javadoc: logged-and-swallowed, not fatal to index deletion.
+            }
+        }
+    }
+
     /** The node-shared bundle cache {@link #createComponents} built -- test-only visibility, not part of the plugin's contract. */
     InMemoryPlaintextBundleCache sharedBundleCacheForTesting() {
         return sharedBundleCache;

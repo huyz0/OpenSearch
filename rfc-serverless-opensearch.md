@@ -1880,11 +1880,26 @@ Verified end-to-end: a real `LazyBundleDirectory`, opened over a cloned shard's 
 by a `FallbackStreamReader`-wrapped `TransferManager`, genuinely fetches and searches source bundle
 bytes it never copied.
 
-**Deliberately out of scope for this slice** (see `ShardCloner`'s own class javadoc): wiring
-`deleteClone` to fire automatically when a clone's index is itself deleted (no
-`IndexEventListener`/lifecycle hook exists yet -- it must be called explicitly today), and any
-REST/transport exposure -- `ShardCloner` is an internal component today, not a user-facing action.
-The extended GC model check &sect;18.5 anticipates is still open.
+**`deleteClone` now fires automatically on real index deletion, closing the last lifecycle gap.**
+`ServerlessStoragePlugin#onIndexModule` registers an `IndexEventListener` that calls it from
+`afterIndexRemoved(..., IndexRemovalReason.DELETED)` -- deliberately not the shard-level
+`afterIndexShardDeleted`, which fires whenever a shard's local copy is physically wiped from a
+node's disk (including plain relocation or a node simply losing a copy), not only on real index
+deletion; using it would have released clone pins spuriously on every relocation.
+`afterIndexRemoved` still fires once per node that had the index open, so in a multi-node cluster
+more than one node can independently call `deleteClone` for the same clone -- safe only because
+`deleteClone` was already idempotent under redundant/concurrent calls, an assumption that was now
+actually load-bearing rather than just a nicety. Best-effort like every other background cleanup in
+this plugin: a shard that was never a clone costs one cheap single-blob miss and is otherwise
+untouched, and a genuine failure (the object store briefly unreachable) is swallowed rather than
+blocking index deletion itself. Verified end to end in a real cluster: a synthetic source shard is
+cloned into a real index's real UUID, the clone's pin and lineage are confirmed present, the real
+index is deleted through the normal delete API, and both the pin and lineage are confirmed gone
+without any explicit `deleteClone` call.
+
+**Still deliberately out of scope**: any REST/transport exposure -- `ShardCloner` is an internal
+component today, not a user-facing action. The extended GC model check &sect;18.5 anticipates is
+still open.
 
 **PITR reconciliation is now actually invoked, not just correct in isolation.**
 `PitrRetentionSchedulerTask` runs `PitrRetentionReconciler` for one shard on a fixed schedule (5

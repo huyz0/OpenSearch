@@ -52,9 +52,12 @@ import java.util.Optional;
  * TransferManager}/{@code LazyBundleIndexInput} counterpart of {@link FallbackBundleFileReader}'s
  * support for the eager materializer path; both read paths are wired for a cloned shard today.
  *
- * <p><b>Deliberately out of scope for this first slice</b>: automatically invoking {@link
- * #deleteClone} when a clone's index is itself deleted -- no {@code IndexEventListener}/lifecycle
- * hook exists yet, so {@link #deleteClone} must be called explicitly today.
+ * <p>{@link #deleteClone} also now fires automatically: {@code
+ * ServerlessStoragePlugin#onIndexModule} registers an {@code IndexEventListener} that calls it on
+ * {@code afterIndexRemoved(..., IndexRemovalReason.DELETED)} -- see that method's own javadoc for
+ * why that hook, not the shard-level {@code afterIndexShardDeleted} (which also fires on plain
+ * relocation), and for why {@link #deleteClone}'s idempotency under redundant/concurrent calls is
+ * load-bearing there, not just a nicety.
  */
 public final class ShardCloner {
 
