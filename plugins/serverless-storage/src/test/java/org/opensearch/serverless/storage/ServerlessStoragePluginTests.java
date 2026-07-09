@@ -333,4 +333,23 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
             registeredSettingKeys
         );
     }
+
+    public void testEveryActionHasAMatchingRestHandlerAndViceVersa() {
+        // A transport action registered via getActions() with no corresponding REST route in
+        // getRestHandlers() (or vice versa) is only reachable from Java code within the plugin --
+        // exactly the state ShardCloneAction and CompactionTriggerAction were both meant to escape.
+        // This doesn't inspect each handler's actual route target (RestHandler exposes no
+        // machine-readable "which action does this dispatch to" surface), but the count itself is
+        // still a real, cheap signal: it catches the exact mistake of adding one without the other.
+        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin();
+        int actionCount = plugin.getActions().size();
+        int restHandlerCount = plugin.getRestHandlers(null, null, null, null, null, null, null).size();
+        assertEquals(
+            "getActions() and getRestHandlers() must register the same number of entries -- "
+                + "every transport action this plugin exposes must have a REST route, and vice versa",
+            actionCount,
+            restHandlerCount
+        );
+        assertTrue("expected at least one action to sanity-check this comparison itself", actionCount > 0);
+    }
 }
