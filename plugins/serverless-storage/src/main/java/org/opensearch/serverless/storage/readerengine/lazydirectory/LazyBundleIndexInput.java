@@ -47,6 +47,15 @@ public class LazyBundleIndexInput extends AbstractBlockIndexInput {
     /** The full (unsliced) length of this logical file -- needed to size the last block correctly. */
     private final long originalFileSize;
 
+    /**
+     * &sect;9's target block granularity: {@code 1 << 20} = 1 MiB regions, not
+     * {@link AbstractBlockIndexInput.Builder#DEFAULT_BLOCK_SIZE_SHIFT}'s 8 MiB default (tuned for
+     * whole snapshot files, much larger than typical individual Lucene per-segment files this
+     * plugin's bundles hold) -- a smaller region means less wasted fetch/cache footprint per file
+     * for the same working set, at the cost of more distinct cache entries for a large file.
+     */
+    static final int BLOCK_SIZE_SHIFT = 20;
+
     public LazyBundleIndexInput(
         String resourceDescription,
         String bundleName,
@@ -57,7 +66,12 @@ public class LazyBundleIndexInput extends AbstractBlockIndexInput {
         TransferManager transferManager
     ) {
         this(
-            AbstractBlockIndexInput.builder().resourceDescription(resourceDescription).isClone(false).offset(0L).length(originalFileSize),
+            AbstractBlockIndexInput.builder()
+                .resourceDescription(resourceDescription)
+                .isClone(false)
+                .offset(0L)
+                .length(originalFileSize)
+                .blockSizeShift(BLOCK_SIZE_SHIFT),
             bundleName,
             fileName,
             bundleFileOffset,

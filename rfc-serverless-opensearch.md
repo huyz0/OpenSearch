@@ -1077,11 +1077,21 @@ what actually ran, not merely that both code paths compile. Full unit suite, the
 tests (stable across 3 repeated runs), multi-node internal cluster tests, and core's own
 `IndexService`/`IndexStorePlugin`/`IndicesService` test suites all green after the core change.
 
-Still open, independent of this now-closed blocker: growing the cache keying from whole-file to
-real 1 MB block-granular regions per &sect;9's target (today's slice inherits
-`AbstractBlockIndexInput`'s default 8 MiB blocks, not yet tuned), and real heap-budget-aware
-admission control replacing `ReaderShardAdmissionController`'s coarse per-node count cap -- both
-now meaningfully buildable, since the directory-swap blocker that made them premature is gone.
+**Block granularity tuned to &sect;9's real target.** `LazyBundleIndexInput` inherited
+`AbstractBlockIndexInput.Builder`'s own default (8 MiB, tuned for whole snapshot files) rather than
+&sect;9's stated "default 1 MB region granularity" -- a one-line fix
+(`LazyBundleIndexInput.BLOCK_SIZE_SHIFT = 20`, threaded through the root `IndexInput`'s builder;
+slices/clones already inherited `blockSizeShift` correctly). Verified with a real multi-block fetch,
+not just a parameter-value assertion: a 2.5 MiB file read end to end through the lazy path produces
+exactly 3 distinct block-cache entries (`AbstractBlockIndexInput#isBlockFilename` over the on-disk
+cache directory's listing) and the bytes read back match exactly what was written -- this test also
+caught a real test-authoring bug on its first run (a hand-built `FileReference` with offset 0
+instead of the bundle's real post-header offset, causing a genuine content mismatch), a reminder
+that even a test fixture needs the same "verify by testing" discipline as production code.
+
+Still open, independent of the directory-swap blocker closed above: real heap-budget-aware
+admission control replacing `ReaderShardAdmissionController`'s coarse per-node count cap -- now
+meaningfully buildable, since the directory-swap blocker that made it premature is gone.
 
 ## 10. Allocation, Topology, and Autoscaling
 

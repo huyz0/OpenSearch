@@ -23,18 +23,22 @@ import org.apache.lucene.search.TermQuery;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.MMapDirectory;
 import org.apache.lucene.store.SimpleFSLockFactory;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.fs.FsBlobContainer;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
+import org.opensearch.index.store.remote.file.AbstractBlockIndexInput;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.filecache.FileCacheFactory;
 import org.opensearch.index.store.remote.utils.TransferManager;
 import org.opensearch.serverless.storage.format.BlobContainerBundleStore;
+import org.opensearch.serverless.storage.format.BundleFileContent;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.manifest.CommitManifest;
+import org.opensearch.serverless.storage.manifest.FileReference;
 import org.opensearch.serverless.storage.manifest.PruningStats;
 import org.opensearch.serverless.storage.manifest.WalPosition;
 import org.opensearch.serverless.storage.writerengine.ObjectStoreCommitPublisher;
@@ -42,6 +46,8 @@ import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.threadpool.TestThreadPool;
 import org.opensearch.threadpool.ThreadPool;
 
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 @ThreadLeakFilters(filters = CleanerDaemonThreadLeakFilter.class)
@@ -211,6 +217,68 @@ public class LazyBundleDirectoryTests extends OpenSearchTestCase {
                 expectThrows(java.io.IOException.class, () -> lazyDirectory.deleteFile(lazyDirectory.listAll()[0]));
                 expectThrows(java.io.IOException.class, () -> lazyDirectory.rename(lazyDirectory.listAll()[0], "renamed"));
             }
+        } finally {
+            fileCache.clear();
+        }
+    }
+
+    public void testLargeFileIsFetchedInReal1MegabyteBlocksNotOneWholeFileFetch() throws Exception {
+        // rfc-serverless-opensearch.md &sect;9's target block granularity is 1 MiB regions, not
+        // AbstractBlockIndexInput's own 8 MiB default (tuned for whole snapshot files) --
+        // LazyBundleIndexInput.BLOCK_SIZE_SHIFT overrides it. A file spanning several blocks must
+        // genuinely produce several distinct block-cache entries, not one fetch for the whole file.
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        BlobContainerBundleStore bundleStore = new BlobContainerBundleStore(blobContainer);
+
+        int oneMebibyte = 1 << 20;
+        int fileLength = (int) (2.5 * oneMebibyte); // spans 3 blocks: [0,1MiB), [1MiB,2MiB), [2MiB,2.5MiB)
+        byte[] content = new byte[fileLength];
+        random().nextBytes(content);
+        String fileName = "segments_1";
+        String bundleName = "bundle-large-file-test";
+        var bundle = bundleStore.writeBundle(bundleName, List.of(new BundleFileContent(fileName, content)));
+        var entry = bundle.entries().get(fileName);
+
+        CommitManifest manifest = new CommitManifest(
+            INDEX_UUID,
+            SHARD_ID,
+            1,
+            1,
+            fileName,
+            Map.of(fileName, new FileReference(bundleName, entry.offset(), entry.length(), entry.checksum())),
+            0,
+            0,
+            null,
+            0,
+            PruningStats.empty(),
+            System.currentTimeMillis()
+        );
+
+        FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(64L * 1024 * 1024, 1);
+        // Not a try-with-resources: LazyBundleDirectory now owns and closes cacheDirectory itself
+        // (see its own close() javadoc), so this test must inspect cacheDirectory's contents before
+        // lazyDirectory closes, not after -- closing it a second time afterward is still safe
+        // (Lucene's own FSDirectory#close is idempotent) but reading from it afterward is not.
+        MMapDirectory cacheDirectory = new MMapDirectory(createTempDir(), SimpleFSLockFactory.INSTANCE);
+        try {
+            TransferManager transferManager = new TransferManager(bundleStore::openRange, fileCache, threadPool);
+            long blockCacheEntries;
+            try (LazyBundleDirectory lazyDirectory = new LazyBundleDirectory(manifest, cacheDirectory, transferManager)) {
+                try (IndexInput input = lazyDirectory.openInput(fileName, null)) {
+                    byte[] readBack = new byte[fileLength];
+                    input.readBytes(readBack, 0, fileLength);
+                    assertArrayEquals("bytes read back through the lazy path must match exactly what was written", content, readBack);
+                }
+                blockCacheEntries = java.util.Arrays.stream(cacheDirectory.listAll())
+                    .filter(AbstractBlockIndexInput::isBlockFilename)
+                    .count();
+            }
+            assertEquals(
+                "a 2.5 MiB file at 1 MiB block granularity must produce exactly 3 distinct block-cache entries, not one whole-file fetch",
+                3,
+                blockCacheEntries
+            );
         } finally {
             fileCache.clear();
         }
