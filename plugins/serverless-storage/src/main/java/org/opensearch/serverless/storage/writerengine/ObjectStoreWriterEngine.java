@@ -255,6 +255,22 @@ public class ObjectStoreWriterEngine extends InternalEngine {
         this.localNodeId = localNodeId;
         this.walChunkService = walChunkService;
         this.encryptionKeyProvider = encryptionKeyProvider;
+        if (walChunkService != null) {
+            // Once per activation, not per append -- see WalShardRegistry's own javadoc for why a
+            // grow-only registry only needs to know "has this shard ever used this container," not
+            // continuous confirmation. Best-effort like refreshDirectoryEntry/renewLease below: this
+            // is bookkeeping for a future retention sweep, not yet load-bearing for anything this
+            // engine's own correctness depends on, so a transient failure here must never block
+            // activation.
+            try {
+                new org.opensearch.serverless.storage.wal.WalShardRegistry(walChunkService.blobContainer()).register(
+                    engineConfig.getShardId().getIndex().getUUID(),
+                    engineConfig.getShardId().getId()
+                );
+            } catch (Exception e) {
+                logger.warn("failed to register this shard in the WAL shard registry, will not retry until next activation", e);
+            }
+        }
         // Acquired synchronously, before this engine is usable, so CompactionSchedulerTask's
         // isLeaseHeldAt guard can actually observe this writer as active (see
         // acquireOrRenewLease's javadoc -- fencing correctness itself lives entirely in

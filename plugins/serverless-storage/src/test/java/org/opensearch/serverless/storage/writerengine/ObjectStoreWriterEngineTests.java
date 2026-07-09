@@ -42,6 +42,7 @@ import org.opensearch.serverless.storage.shardstate.ShardStateStore;
 import org.opensearch.serverless.storage.shardstate.VersionedShardHead;
 
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * Exercises {@link ObjectStoreWriterEngine} through a real {@link EngineTestCase}-provisioned
@@ -429,6 +430,55 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
             assertTrue(
                 "the published WalPosition must reflect a real flushed chunk sequence, not the old (String.valueOf(primaryTerm), 0) placeholder",
                 manifest.walPosition().offset() >= 0
+            );
+        } finally {
+            IOUtils.close(engine, lastOpenedStore);
+        }
+    }
+
+    public void testActivatingAWriterEngineRegistersItsShardInTheWalShardRegistry() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+
+        FsBlobStore walBlobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer walBlobContainer = new FsBlobContainer(walBlobStore, BlobPath.cleanPath(), walBlobStore.path());
+        org.opensearch.serverless.storage.wal.WalChunkService walChunkService = new org.opensearch.serverless.storage.wal.WalChunkService(
+            walBlobContainer,
+            "node-epoch-0"
+        );
+
+        // Not registered before any writer engine for this shard has ever activated against this container.
+        org.opensearch.serverless.storage.wal.WalShardRegistry registry = new org.opensearch.serverless.storage.wal.WalShardRegistry(
+            walBlobContainer
+        );
+        assertTrue(registry.registeredShards().isEmpty());
+
+        Store store = createStore();
+        lastOpenedStore = store;
+        store.createEmpty(defaultSettings.getIndexVersionCreated().luceneVersion);
+        java.nio.file.Path translogPath = createTempDir();
+        String translogUuid = Translog.createEmptyTranslog(translogPath, SequenceNumbers.NO_OPS_PERFORMED, shardId, primaryTerm.get());
+        store.associateIndexWithNewTranslog(translogUuid);
+        EngineConfig engineConfig = config(defaultSettings, store, translogPath, newMergePolicy(), null);
+
+        ObjectStoreWriterEngine engine = new ObjectStoreWriterEngine(
+            engineConfig,
+            new ObjectStoreCommitHeadPublisher(commitPublisher, shardStateStore),
+            shardDirectory,
+            LOCAL_NODE_ID,
+            null,
+            walChunkService
+        );
+        try {
+            // Registered on activation alone -- no indexing/flush needed.
+            assertEquals(
+                Set.of(new org.opensearch.serverless.storage.wal.RegisteredShard(shardId.getIndex().getUUID(), shardId.getId())),
+                registry.registeredShards()
             );
         } finally {
             IOUtils.close(engine, lastOpenedStore);
