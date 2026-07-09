@@ -184,6 +184,23 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * The fraction of the lazy-directory block cache's byte capacity above which
+     * {@link ReaderShardAdmissionController} refuses to open another reader shard on this node,
+     * even if {@link #SERVERLESS_STORAGE_MAX_CONCURRENT_READER_SHARDS_SETTING}'s count cap still
+     * has headroom -- see that controller's own javadoc for why this, not just a shard count, is
+     * now a real, checkable budget once {@link #SERVERLESS_STORAGE_LAZY_DIRECTORY_CACHE_SIZE_SETTING}
+     * configures a shared {@link FileCache}. Only takes effect when both that cache and the count
+     * cap above are configured; ignored otherwise.
+     */
+    public static final Setting<Double> SERVERLESS_STORAGE_MAX_FILE_CACHE_USAGE_RATIO_SETTING = Setting.doubleSetting(
+        "serverless_storage.reader_admission.max_file_cache_usage_ratio",
+        0.9,
+        Math.nextUp(0.0),
+        1.0,
+        Setting.Property.NodeScope
+    );
+
+    /**
      * Enables the node-level WAL service (rfc-serverless-opensearch.md &sect;6.4): every writer
      * shard's translog additionally mirrors each operation into a shared, node-scoped WAL chunk
      * stream, durable ahead of the next commit/publish. One {@link WalChunkService} instance is
@@ -302,6 +319,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_BUNDLE_CACHE_SIZE_SETTING,
             SERVERLESS_STORAGE_PITR_WINDOW_SETTING,
             SERVERLESS_STORAGE_MAX_CONCURRENT_READER_SHARDS_SETTING,
+            SERVERLESS_STORAGE_MAX_FILE_CACHE_USAGE_RATIO_SETTING,
             SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING,
             SERVERLESS_STORAGE_COMPACTION_INTERVAL_SETTING,
             SERVERLESS_STORAGE_GC_INTERVAL_SETTING,
@@ -391,8 +409,9 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             ? FileCacheFactory.createConcurrentLRUFileCache(lazyDirectoryCacheSizeBytes)
             : null;
         int maxConcurrentReaderShards = SERVERLESS_STORAGE_MAX_CONCURRENT_READER_SHARDS_SETTING.get(environment.settings());
+        double maxFileCacheUsageRatio = SERVERLESS_STORAGE_MAX_FILE_CACHE_USAGE_RATIO_SETTING.get(environment.settings());
         readerShardAdmissionController = maxConcurrentReaderShards > 0
-            ? new ReaderShardAdmissionController(maxConcurrentReaderShards)
+            ? new ReaderShardAdmissionController(maxConcurrentReaderShards, lazyDirectoryFileCache, maxFileCacheUsageRatio)
             : null;
         try (SecureString encryptionKey = SERVERLESS_STORAGE_ENCRYPTION_KEY_SETTING.get(environment.settings())) {
             if (encryptionKey.length() > 0) {

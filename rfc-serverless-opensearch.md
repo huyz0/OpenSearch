@@ -1089,9 +1089,20 @@ caught a real test-authoring bug on its first run (a hand-built `FileReference` 
 instead of the bundle's real post-header offset, causing a genuine content mismatch), a reminder
 that even a test fixture needs the same "verify by testing" discipline as production code.
 
-Still open, independent of the directory-swap blocker closed above: real heap-budget-aware
-admission control replacing `ReaderShardAdmissionController`'s coarse per-node count cap -- now
-meaningfully buildable, since the directory-swap blocker that made it premature is gone.
+**Admission control now weighs a real byte budget, not just shard count.**
+`ReaderShardAdmissionController` gained an optional `FileCache`-backed check: given the node's
+shared lazy-directory block cache and a configured usage-ratio threshold
+(`serverless_storage.reader_admission.max_file_cache_usage_ratio`, default 0.9), `acquire()` now
+refuses to open another reader shard once that cache's `usage()` crosses the configured fraction of
+its `capacity()` -- even if the fixed shard-count cap
+(`serverless_storage.max_concurrent_reader_shards`) still has headroom. `ServerlessStoragePlugin`
+wires its own `lazyDirectoryFileCache` straight into the controller it already owned; when no lazy
+directory cache is configured (or the count cap itself is off), this degrades back to the original
+count-only check, unchanged. This is still not &sect;7's full target design -- that describes
+per-*refresh* admission control, deferring a refresh that would exceed budget while the shard keeps
+serving slightly stale data, rather than this controller's coarser open-time-only, fail-outright
+check -- but it closes the gap this section's own status note previously called out: the check is
+now against the node's actual measured cache usage, not merely a guessed-at shard count.
 
 ## 10. Allocation, Topology, and Autoscaling
 
@@ -1422,11 +1433,13 @@ opening a full `ReadOnlyEngine` against one via `ObjectStoreReaderEngine.open`. 
 `ReadOnlyEngine` rather than writing a new `Engine` subclass: once materialization has populated
 the store's directory, `ReadOnlyEngine` already implements the entire read-only surface (search,
 get, completion stats, refusing writes) against exactly that, so the object-store-specific work
-stays confined to materialization itself. Still open: block cache unification, admission control
-(admission control's coarse cap is separately implemented, see `ReaderShardAdmissionController`
-above -- the fuller heap-budget-aware version this milestone eventually wants is not). Milestone:
-search-only shards serve queries with no local index, freshness lag p99 < 15 s under sustained
-ingest.
+stays confined to materialization itself. Still open: block cache unification (the lazy directory's
+`FileCache` and the eager materializer's own cache are two separate caches on the same node, not
+one unified view). Admission control is no longer purely coarse -- `ReaderShardAdmissionController`
+now weighs the lazy directory's real `FileCache` usage against a configured byte-budget ratio, not
+just a fixed shard count (see &sect;9 above); still not &sect;7's fuller per-*refresh* version.
+Milestone: search-only shards serve queries with no local index, freshness lag p99 < 15 s under
+sustained ingest.
 
 **Refresh-to-newer-generation: implemented, and turned out to need much less than the design first
 written up here concluded.** That first pass (based on reading `ReadOnlyEngine`'s *fields*: `private
@@ -1876,20 +1889,24 @@ directions documented so serverless adoption is not a one-way door.
    cache hit rate; consider tiered "pinned working set" for latency-critical indices.
 3. **Reader heap under many shards.** Segment metadata heap cost per open reader bounds shard
    density. Admission control (§7.2) prevents OOM but caps density; needs measurement early
-   (Phase 3 gate). **Status: a coarser stand-in implemented, not §7.2's actual target design.**
-   §7.2 describes per-*refresh* admission control weighed against a real heap/cache byte budget,
-   deferring a refresh that would exceed it while the shard keeps serving slightly stale data --
-   that needs the lazy, block-cache-backed remote `Directory` view §7.2 also describes, which
-   doesn't exist yet (today's `ObjectStoreReaderEngine` fully materializes a manifest up front, a
-   separately documented tradeoff). `ReaderShardAdmissionController` is a simpler mechanism
-   reachable without that prerequisite: a fixed cap on the *count* of concurrently open reader
-   engines on one node (`serverless_storage.max_concurrent_reader_shards`, disabled by default),
-   checked once at `ObjectStoreReaderEngine.open` time and released on `close()`. It bounds the
-   same underlying risk, just less precisely (an over-capacity open fails outright rather than
-   degrading to stale-but-serving) and without any actual memory measurement. Verified: acquiring
-   up to the configured limit succeeds, the next acquire beyond it throws without leaking a permit
-   from the failed attempt, and closing a previously-opened engine frees a permit for the next
-   open to succeed.
+   (Phase 3 gate). **Status: a real byte-budget check now implemented alongside the count cap, not
+   yet §7.2's full per-refresh target design.** §7.2 describes per-*refresh* admission control
+   weighed against a real heap/cache byte budget, deferring a refresh that would exceed it while
+   the shard keeps serving slightly stale data -- `ReaderShardAdmissionController` still only gates
+   shard *open*, not each subsequent refresh, and an over-budget open fails outright rather than
+   degrading to stale-but-serving. But the byte-budget half of that gap is closed: with the lazy,
+   block-cache-backed remote `Directory` (§9) now wired in, the controller checks the node's shared
+   `FileCache`'s actual `usage()` against a configured fraction of its `capacity()`
+   (`serverless_storage.reader_admission.max_file_cache_usage_ratio`, default 0.9) on every
+   `acquire()`, in addition to the original fixed cap on the *count* of concurrently open reader
+   engines (`serverless_storage.max_concurrent_reader_shards`, disabled by default) -- either check
+   can refuse an open. When no lazy directory cache is configured, this degrades back to the
+   original count-only check. Verified: acquiring up to the configured count limit succeeds, the
+   next acquire beyond it throws without leaking a permit from the failed attempt, closing a
+   previously-opened engine frees a permit for the next open to succeed, and separately -- with a
+   real `FileCache` supplied -- an acquire is refused once cache usage crosses the configured ratio
+   even while the count cap still has headroom, without consuming a count permit on the rejected
+   attempt.
 4. **WAL multiplexing fairness.** One node-level WAL means one noisy shard can delay acks for
    others. Mitigation: per-shard budget within a chunk, overflow to dedicated chunks.
    **Status: implemented and tested.** `WalChunkService` now takes an optional
