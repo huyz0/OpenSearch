@@ -231,6 +231,32 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
         assertEquals(512L * 1024, plugin.sharedWalChunkServiceForTesting().perShardBudgetBytesForTesting());
     }
 
+    public void testLazyDirectoryFileCacheIsNotConstructedByDefault() {
+        ServerlessStoragePlugin plugin = newPlugin(createTempDir());
+        assertNull(
+            "the lazy-directory file cache must stay off by default, matching every other " + "optional-feature-off default in this plugin",
+            plugin.lazyDirectoryFileCacheForDirectoryFactory()
+        );
+    }
+
+    public void testLazyDirectoryCacheSizeSettingConstructsARealCache() {
+        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin();
+        Path basePath = createTempDir();
+        Settings nodeSettings = Settings.builder()
+            .put("path.home", createTempDir().toString())
+            .putList("path.repo", basePath.toString())
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey(), basePath.toString())
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_LAZY_DIRECTORY_CACHE_SIZE_SETTING.getKey(), "16mb")
+            .build();
+        Environment environment = TestEnvironment.newEnvironment(nodeSettings);
+        plugin.createComponents(null, null, null, null, null, null, environment, null, null, null, null);
+
+        assertNotNull(
+            "an explicit positive cache size must construct a real FileCache",
+            plugin.lazyDirectoryFileCacheForDirectoryFactory()
+        );
+    }
+
     public void testReaderShardAdmissionControllerIsNotConstructedByDefault() {
         ServerlessStoragePlugin plugin = newPlugin(createTempDir());
         assertNull(
