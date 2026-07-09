@@ -51,14 +51,14 @@ public class FallbackBundleFileReaderTests extends OpenSearchTestCase {
         assertArrayEquals("fallback".getBytes("UTF-8"), reader.readFile("inherited-bundle", ENTRY));
     }
 
-    public void testPropagatesNonMissingIOExceptionsFromPrimaryWithoutFallingBack() {
+    public void testPropagatesNonMissingIOExceptionsFromPrimaryWithoutFallingBack() throws Exception {
         BundleFileReader primary = new BundleFileReader() {
             @Override
             public byte[] readFile(String bundleName, BundleFileEntry entry) throws IOException {
                 throw new IOException("simulated transient failure, not a missing-file condition");
             }
         };
-        BundleFileReader fallback = new MapBundleFileReader(Map.of("bundle", "fallback".getBytes()));
+        BundleFileReader fallback = new MapBundleFileReader(Map.of("bundle", "fallback".getBytes("UTF-8")));
         FallbackBundleFileReader reader = new FallbackBundleFileReader(primary, fallback);
         expectThrows(IOException.class, () -> reader.readFile("bundle", ENTRY));
     }

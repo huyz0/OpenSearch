@@ -2122,9 +2122,11 @@ public class InternalEngine extends Engine {
         return new EngineMergeScheduler(shardId, indexSettings, mergedSegmentTransferTracker);
     }
 
-    // Not final: subclasses that need custom merge behavior (e.g. warming a remote-storage cache around a merge)
-    // can extend this class and override beforeMerge/afterMerge/etc., then hand back their own instance from
-    // newMergeScheduler() below instead of reimplementing the throttling bookkeeping done here.
+    /**
+     * Not final: subclasses that need custom merge behavior (e.g. warming a remote-storage cache around a merge)
+     * can extend this class and override beforeMerge/afterMerge/etc., then hand back their own instance from
+     * {@link #newMergeScheduler} instead of reimplementing the throttling bookkeeping done here.
+     */
     protected class EngineMergeScheduler extends OpenSearchConcurrentMergeScheduler {
         private final AtomicInteger numMergesInFlight = new AtomicInteger(0);
         private final AtomicBoolean isThrottling = new AtomicBoolean();
