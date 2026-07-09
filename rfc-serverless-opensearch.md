@@ -825,7 +825,17 @@ document is visible, where before this change the exact same setup threw
 `IndexShardRecoveryException` immediately. A second test confirms the fallback: with no manifest
 ever published, `EXISTING_STORE` recovery still fails exactly as it always has. Full existing
 `StoreRecoveryTests`/`IndexShardTests`/`InternalEngineTests`/`EngineRecoveryOperationsTests` suites
-(269 tests) pass unchanged, confirming every other engine's recovery path is unaffected.
+(269 tests) pass unchanged, confirming every other engine's recovery path is unaffected. **The seam
+itself also now has its own engine-agnostic core-level test**, `RecoverMissingLocalStoreTests`
+(server module, sibling to `EngineRecoveryOperationsTests`, same generic-not-plugin-specific
+shape): a bare `EngineFactory` override that materializes an empty commit + translog via
+`Store#createEmpty`/`Translog#createEmptyTranslog` (mirroring what `StoreRecovery#recoverEmptyStore`
+already does for its own unconditional case) proves the conditional branch genuinely re-reads the
+store and lets recovery proceed on `true`, and a companion test with the plain default
+`InternalEngineFactory` proves the original "shard allocated for local recovery, should exist, but
+doesn't" failure is completely unchanged when the hook isn't overridden at all -- generic
+regression coverage for the seam itself, independent of `WriterEngineFactoryCrossNodeFailoverTests`
+already covering this plugin's own specific manifest-materializing implementation.
 
 Both halves of &sect;7.1.2 are now implemented and tested: allocation
 (`ServerlessStorageExistingShardsAllocator`, zero core changes) and store population
