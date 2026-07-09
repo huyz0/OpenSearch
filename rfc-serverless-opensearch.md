@@ -1803,8 +1803,8 @@ any `Indexer` construction). A plugin-owned on-demand-compaction action, reusing
 exact tick logic directly (no core changes, no experimental SPI), remains a smaller, safer
 alternative if the on-demand case turns out to matter in practice.
 
-**Phase 4.6 — Snapshots/clones/PITR (manifest pinning and PITR retention wiring done; clone not
-started).** Durable pins (§6.5) are implemented as `DurablePinRegistry`/`BlobContainerDurablePinRegistry`
+**Phase 4.6 — Snapshots/clones/PITR (manifest pinning and PITR retention wiring done; a first,
+scoped slice of clone landed too -- see below).** Durable pins (§6.5) are implemented as `DurablePinRegistry`/`BlobContainerDurablePinRegistry`
 — same generic `BlobContainer.compareAndSwapRegister`-backed pattern as the shard-head store, so a
 snapshot pin survives independently of any node's lease. `PinRecord` names *why* a generation is
 pinned (snapshot id, `"pitr"`, ...) so independent retention reasons on one shard never clobber
@@ -1831,9 +1831,37 @@ single-generation reason like a snapshot but wrong for PITR, where many generati
 silently deleted every other in-window PITR pin too. Added `removePin(String, int, PinRecord)`,
 matching on the full pin (reason + term + generation) so one generation's pin can be removed
 without touching any other generation's pin under the same reason; `removePin(String, int,
-String)`'s original all-matching-reason behavior is unchanged and still used for snapshots. Not
-yet done: zero-copy clone with cross-index bundle refcounts, and the extended GC model check this
-phase is gated on.
+String)`'s original all-matching-reason behavior is unchanged and still used for snapshots.
+
+**Zero-copy clone: a first, scoped slice landed.** `ShardCloner.clone` (new
+`clone` package) is the control-plane half: given a source shard with a published manifest and a
+target index/shard with no head yet, it durably pins the exact source generation being cloned from
+in the source's own `DurablePinRegistry` (pinId `"clone:<targetIndexUuid>:<targetShardId>"`,
+written before anything else so a crash mid-clone only ever leaves a harmless unused pin, never a
+published reference to an unprotected generation), then writes a brand-new manifest under the
+target's own identity referencing the source's existing `FileReference`s verbatim -- no bundle
+bytes copied, no `BundleWriter` invoked -- and CASes it onto the target's head with put-if-absent
+semantics (refusing to clone onto an already-active shard). `FallbackBundleFileReader` closes the
+read-path half: a cloned shard's own `BlobContainer` is scoped to its own sub-path, so an inherited
+`FileReference` naming a bundle that physically lives under the source's sub-path would otherwise
+be unreadable; this reader tries the shard's own bundle store first and falls back to the source's
+only on `NoSuchFileException`, which also correctly handles a clone's future once it starts writing
+its own commits (a mix of inherited and own-written bundles in the same manifest). Verified
+end-to-end: a real `IndexWriter`-produced commit is published, cloned, and then genuinely searched
+through `ObjectStoreCommitMaterializer` wired with the fallback reader -- against a target bundle
+container proven empty (nothing copied) -- while a separate test confirms the exact pinned
+generation matches what was cloned from.
+
+This closes the GC-safety question `BundleReferenceCounter`'s own javadoc had flagged (see that
+class's updated javadoc) without needing the cross-index manifest scan it originally called for:
+pinning the exact cloned generation on the source is precise and needs zero change to
+`GcSchedulerTask`. **Deliberately out of scope for this slice** (see `ShardCloner`'s own class
+javadoc): removing a clone's pin when the clone is later deleted (currently permanent -- an
+accepted, documented leak until a "delete clone" lifecycle exists), the lazy-directory (reader
+shard) read path for a cloned shard (`TransferManager`/`LazyBundleIndexInput` resolve reads
+differently than `BundleFileReader` does, and aren't wired to fall back yet), and any REST/transport
+exposure -- `ShardCloner` is an internal component today, not a user-facing action. The extended GC
+model check &sect;18.5 anticipates is still open.
 
 **PITR reconciliation is now actually invoked, not just correct in isolation.**
 `PitrRetentionSchedulerTask` runs `PitrRetentionReconciler` for one shard on a fixed schedule (5
