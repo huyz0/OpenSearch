@@ -27,13 +27,16 @@ import java.util.List;
  * <em>and</em> a chunk-sequence cutoff, never by either alone.
  *
  * <p>This class only reads, filters, and decodes -- it returns an ordered {@code
- * List<Translog.Operation>} and does not apply anything to any engine or index. Actually replaying
- * that list into a fresh local Lucene index is a separate, not-yet-built step: it needs an
- * {@code IndexShard}-level entry point (the natural place is something analogous to {@code
- * IndexShard#applyTranslogOperation}, which is public but lives above the {@code Engine} layer this
- * plugin's classes sit at) that this plugin does not yet have a seam into -- see
- * rfc-serverless-opensearch.md &sect;7.1's failover description and &sect;16 Phase 2's "still open"
- * note for what remains.
+ * List<Translog.Operation>} and does not apply anything to any engine or index itself. Actually
+ * replaying that list into a fresh local Lucene index is a separate step, now wired end to end via
+ * {@code Engine#engineRecoveryOperations()} (a small additive core seam) and
+ * {@code IndexShard#openEngineAndRecoverFromTranslog()}, which calls it once local translog
+ * recovery has completed and replays whatever it returns through the same
+ * {@code applyTranslogOperation} path local recovery just used -- see
+ * {@code ObjectStoreWriterEngine#replayWalOperations()}/{@code #engineRecoveryOperations()} for
+ * this plugin's own wiring, and rfc-serverless-opensearch.md &sect;7.1/&sect;16 Phase 2 for the
+ * full, now-closed picture (including {@code ServerlessStorageWriterFailoverIT}'s real-cluster,
+ * real-kill proof).
  */
 public final class WalReplayRecovery {
 

@@ -1329,8 +1329,8 @@ against a real filesystem blob store with no mocks. JMH microbenchmarks establis
 throughput for both formats. Remaining for this phase: one real cloud-object-store integration
 test (currently FS/mock only, per the original scope note above).
 
-**Phase 2 — Writer engine (WAL format, translog adapter, commit publishing, and head CAS wiring
-done; local-disk retention policy once object storage is authoritative still open).** WAL chunk
+**Phase 2 — Writer engine (WAL format, translog adapter, commit publishing, head CAS wiring,
+durability-driven local-disk retention, and crash recovery via WAL replay all done).** WAL chunk
 format (`WalChunkWriter`/`WalChunkReader`/`WalRecord`, &sect;6.4) is implemented and tested,
 including a multi-shard group-commit/per-shard-replay-filter test. The WAL-backed translog adapter
 (`WalMirroringTranslogFactory`/`WalMirroringTranslog`) plugs into the existing
