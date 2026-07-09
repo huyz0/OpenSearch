@@ -171,6 +171,22 @@ translog as the durability mechanism between commits:
   per hour; the design goal is that WAL request cost stays two orders of magnitude below the
   compute cost of the node producing it.
 
+**Status: WAL chunk deletion (the fourth bullet above) is designed but not implemented -- a real,
+previously-unflagged gap, found while auditing this section rather than while building something
+else.** `WalChunkService` writes chunks and never deletes any; grepping the entire `wal` package
+turns up no delete/trim/retention method anywhere. Nothing today bounds how much WAL chunk storage
+a node accumulates over its lifetime -- unlike the manifest/bundle GC sweep (§6.5,
+`GcSchedulerTask`), which is real and scheduled, there is no WAL analogue at all. Deliberately not
+attempted as a quick fix in the same pass as finding it: unlike a superseded bundle (where deleting
+early merely breaks a clone or a slow reader, both already guarded by durable pins), a WAL chunk
+deleted before every writer shard on the node has actually published a manifest covering it is
+unrecoverable data loss on the next failover -- the exact class of risk &sect;18.5 flags as
+warranting model-checking before implementation (`CloneGc.tla` is the precedent this would follow:
+model the sweep against the *node-level, cross-shard* minimum covered `WalPosition` -- not any
+single shard's own, since the WAL is shared -- before writing the Java). Tracked here explicitly so
+it isn't lost track of as a "someday" item: this is the next real correctness-bearing gap in this
+area, not a cosmetic one.
+
 **Integration point, corrected**: this section originally assumed `TranslogFactory`'s per-shard
 `BiFunction<IndexSettings, ShardRouting, TranslogFactory>` resolution (`IndicesService`) was a
 plugin-extensible seam the WAL-backed translog adapter could slot into without core changes. It
