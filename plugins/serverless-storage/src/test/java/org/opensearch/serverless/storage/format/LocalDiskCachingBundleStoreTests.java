@@ -151,7 +151,15 @@ public class LocalDiskCachingBundleStoreTests extends OpenSearchTestCase {
         assertEquals("hello", new String(result, java.nio.charset.StandardCharsets.UTF_8));
 
         try (var files = Files.list(cacheDir)) {
-            Path cachedFile = files.filter(p -> p.toString().endsWith(".tmp") == false).findFirst().orElseThrow();
+            // Not endsWith(".tmp"): LocalDiskCachingBundleStore's actual temp-file naming is
+            // "<key>.tmp-<threadId>" (see #writeAtomically), which never ends in bare ".tmp" -- that
+            // check never excluded anything. Filter on isRegularFile too: Lucene's randomized
+            // createTempDir() can inject extra junk subdirectories into the same temp dir, and
+            // Files.readAllBytes on a directory throws "Is a directory" instead of a clear failure.
+            Path cachedFile = files.filter(Files::isRegularFile)
+                .filter(p -> p.getFileName().toString().contains(".tmp") == false)
+                .findFirst()
+                .orElseThrow();
             byte[] onDisk = Files.readAllBytes(cachedFile);
             assertFalse(
                 "the on-disk cache file must not contain the plaintext when encryption is enabled",

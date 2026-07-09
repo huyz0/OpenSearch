@@ -41,10 +41,19 @@ public class ServerlessStorageWriterFailoverIT extends OpenSearchIntegTestCase {
         return Collections.singletonList(ServerlessStoragePlugin.class);
     }
 
+    @Override
+    protected boolean addMockInternalEngine() {
+        // OpenSearchIntegTestCase randomly injects its own MockEngineFactory otherwise, which
+        // collides with WriterEngineFactory ("multiple engine factories provided for [...]") --
+        // this plugin's own EngineFactory is the whole point of the test.
+        return false;
+    }
+
     private Settings sharedNodeSettings(Path basePath) {
         return Settings.builder()
             .putList("path.repo", basePath.toString())
             .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey(), basePath.toString())
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING.getKey(), true)
             .build();
     }
 
@@ -53,7 +62,7 @@ public class ServerlessStorageWriterFailoverIT extends OpenSearchIntegTestCase {
         Settings nodeSettings = sharedNodeSettings(sharedBasePath);
 
         internalCluster().startClusterManagerOnlyNode(nodeSettings);
-        String node1 = internalCluster().startDataOnlyNode(nodeSettings);
+        internalCluster().startDataOnlyNode(nodeSettings);
         internalCluster().startDataOnlyNode(nodeSettings);
 
         createIndex(
@@ -69,15 +78,23 @@ public class ServerlessStorageWriterFailoverIT extends OpenSearchIntegTestCase {
         client().prepareIndex(INDEX_NAME).setId("1").setSource("field", "value1").get();
         // Publishing (rfc-serverless-opensearch.md &sect;7.1) only happens on flush, not on refresh
         // -- an explicit flush is what makes this document durable in a manifest the survivor node
-        // can actually recover from, rather than relying on WAL replay to catch up something that
-        // was never published at all.
+        // can actually recover from independent of WAL replay at all.
         client().admin().indices().prepareFlush(INDEX_NAME).get();
+
+        // Doc 2 is never flushed -- durable only in the WAL (WalMirroringTranslog#add flushes each
+        // operation's WAL chunk synchronously, so this write is already WAL-durable by the time
+        // .get() returns) and in the dying node's own local translog, which the survivor never sees.
+        // Recovering it is WalReplayRecovery's job, not manifest materialization's -- this is the
+        // gap the RFC's own &sect;16 status note flagged as still needing IT coverage, not unit
+        // tests alone.
+        client().prepareIndex(INDEX_NAME).setId("2").setSource("field", "value2").get();
+
         refresh(INDEX_NAME);
-        assertHitCount(client().prepareSearch(INDEX_NAME).setSize(0).get(), 1);
+        assertHitCount(client().prepareSearch(INDEX_NAME).setSize(0).get(), 2);
 
         // Whichever node actually holds the primary is the one that must die -- not necessarily
-        // node1, since ServerlessStorageExistingShardsAllocator (like any allocator) is free to have
-        // placed it on either data node.
+        // the first data node started, since ServerlessStorageExistingShardsAllocator (like any
+        // allocator) is free to have placed it on either data node.
         ShardRouting primaryShard = internalCluster().clusterService().state().routingTable().index(INDEX_NAME).shard(0).primaryShard();
         String primaryNodeId = primaryShard.currentNodeId();
         String primaryNodeName = internalCluster().clusterService().state().nodes().get(primaryNodeId).getName();
@@ -93,7 +110,11 @@ public class ServerlessStorageWriterFailoverIT extends OpenSearchIntegTestCase {
         ensureGreen(INDEX_NAME);
 
         refresh(INDEX_NAME);
+        // Doc 1 (materialized from the manifest) and doc 2 (recovered via WAL replay past
+        // activationWalPosition, ObjectStoreWriterEngine#engineRecoveryOperations) must both be
+        // present -- proving the full chain (fencing, fetch/filter/decode, apply-to-shard) under a
+        // real cluster, not just the manifest-materialization half.
         SearchResponse response = client().prepareSearch(INDEX_NAME).setSize(0).get();
-        assertHitCount(response, 1);
+        assertHitCount(response, 2);
     }
 }

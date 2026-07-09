@@ -1258,10 +1258,37 @@ the primary, and confirms the document survives on the node it fails over to -- 
 process, one more real latent bug (`ServerlessStoragePlugin`'s local-node-id resolution crashing
 against `ClusterApplierService`'s reentrancy assertion, fixed via `NodeEnvironment#nodeId()`) that
 no earlier unit-level test could have found, since none of them exercised a real `Node`/`ClusterService`
-lifecycle. What remains is the residual `activationWalPosition` atomicity limitation already
-documented in &sect;6.4 (out of scope -- needs the metadata-plane term-authority migration) and
-broadening the IT itself (WAL-only unflushed data, encryption, multiple shards), not any further
-unproven piece of the crash-recovery story.
+lifecycle.
+
+**The WAL-only half is done too, closing this section's own previously-flagged gap.** The same test
+now also indexes a second document *without* flushing it (`WalMirroringTranslog#add` flushes each
+operation's WAL chunk synchronously, so it's already WAL-durable by the time the client call
+returns, but never becomes part of any manifest) before killing the primary's node. Both documents
+survive: the first via manifest materialization, the second via `WalReplayRecovery`/
+`ObjectStoreWriterEngine#engineRecoveryOperations()` replaying past `activationWalPosition` -- the
+first time the *entire* chain (fencing, fetch/filter/decode, apply-to-shard, allocation, store
+population) has been exercised together under a real cluster rather than piece by piece.
+Required `serverless_storage.wal_mirroring.enabled=true` on the test's nodes and
+`addMockInternalEngine() = false` (`OpenSearchIntegTestCase`'s own randomized mock-engine injection
+otherwise collides with `WriterEngineFactory` -- "multiple engine factories provided" -- an
+IT-only-visible gotcha, unrelated to any bug in this plugin itself).
+
+**A second, unrelated latent bug found and fixed while getting this stable**: a pre-existing test,
+`LocalDiskCachingBundleStoreTests#testWithAnEncryptionKeyTheDiskFileDoesNotContainThePlaintext`,
+was intermittently flaky (`java.io.IOException: Is a directory`) under specific random seeds. Root
+cause: the test's own directory-listing filter checked `endsWith(".tmp")`, but
+`LocalDiskCachingBundleStore`'s actual temp-file naming is `<key>.tmp-<threadId>` (see
+`#writeAtomically`) -- never a bare `.tmp` suffix, so the filter never excluded anything; combined
+with Lucene's randomized `createTempDir()` occasionally injecting extra junk subdirectories into the
+same temp directory, `Files.readAllBytes` would occasionally pick up a directory instead of the
+cache file. Fixed by filtering on `Files::isRegularFile` and a `contains(".tmp")` check instead --
+verified stable across 5 runs with fresh random seeds after the fix, including the exact
+previously-failing seed.
+
+What remains is the residual `activationWalPosition` atomicity limitation already documented in
+&sect;6.4 (out of scope -- needs the metadata-plane term-authority migration) and further broadening
+the IT (encryption enabled, multiple shards), not any further unproven piece of the crash-recovery
+story.
 
 **Phase 3 — Reader engine (materializer and open-from-manifest done; refresh-to-newer-generation
 and notification wiring still open).** `ObjectStoreCommitMaterializer` fetches every file a
