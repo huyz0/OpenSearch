@@ -14,6 +14,7 @@ import org.opensearch.common.blobstore.fs.FsBlobContainer;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.io.IOException;
 import java.io.InputStream;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -327,6 +328,40 @@ public class WalChunkServiceTests extends OpenSearchTestCase {
             }
         } finally {
             executor.shutdown();
+        }
+    }
+
+    public void testClaimingAChunkSequenceFailsLoudlyAfterExhaustingItsCasRetryBudgetRatherThanSpinningForever() throws Exception {
+        WalChunkService service = new WalChunkService(new AlwaysConflictingBlobContainer(newBlobContainer()), "epoch-0");
+        service.append(new WalRecord("idx", 0, 1, 0, "a".getBytes("UTF-8")));
+        IOException e = expectThrows(IOException.class, service::flush);
+        assertTrue(e.getMessage().contains("CAS attempts"));
+    }
+
+    /** Every {@code compareAndSwapRegister} attempt reports a conflict, forcing {@code claimNextChunkSequence} to exhaust its retry budget. */
+    private static final class AlwaysConflictingBlobContainer extends org.opensearch.common.blobstore.support.FilterBlobContainer {
+
+        AlwaysConflictingBlobContainer(BlobContainer delegate) {
+            super(delegate);
+        }
+
+        @Override
+        protected BlobContainer wrapChild(BlobContainer child) {
+            return new AlwaysConflictingBlobContainer(child);
+        }
+
+        @Override
+        public java.util.Optional<org.opensearch.common.blobstore.BlobRegister> readRegister(String blobName) {
+            return java.util.Optional.empty();
+        }
+
+        @Override
+        public org.opensearch.common.blobstore.BlobRegisterCasResult compareAndSwapRegister(
+            String blobName,
+            long expectedGeneration,
+            org.opensearch.core.common.bytes.BytesReference newValue
+        ) {
+            return org.opensearch.common.blobstore.BlobRegisterCasResult.conflict(expectedGeneration);
         }
     }
 }

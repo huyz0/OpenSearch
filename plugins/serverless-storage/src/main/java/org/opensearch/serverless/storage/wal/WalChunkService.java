@@ -97,6 +97,17 @@ public final class WalChunkService implements WalAppendTarget {
     }
 
     /**
+     * A bounded retry budget for {@link #claimNextChunkSequence}, matching the same
+     * bounded-not-unbounded shape {@link org.opensearch.serverless.storage.retention.BlobContainerDurablePinRegistry#mutate}
+     * already established for CAS retries in this plugin: an unbounded {@code while (true)} loop
+     * would let sustained contention (many nodes flushing at once) spin indefinitely rather than
+     * failing loudly, which {@link org.opensearch.serverless.storage.translog.WalMirroringTranslog
+     * #flushWithRetry}'s own outer retry-with-backoff is already set up to handle gracefully as an
+     * ordinary transient failure.
+     */
+    private static final int MAX_CAS_ATTEMPTS = 50;
+
+    /**
      * Atomically claims the next chunk sequence number, safe under any number of concurrent {@link
      * WalChunkService} instances (any number of nodes) sharing {@link #blobContainer}: retries the
      * compare-and-swap against whatever the register's current generation actually is until one
@@ -104,13 +115,16 @@ public final class WalChunkService implements WalAppendTarget {
      * (which, under real concurrent writers, it frequently won't be -- that assumption was
      * precisely this class's earlier bug, see the class javadoc). The register's own value is
      * never read for content, only its generation; {@link org.opensearch.core.common.bytes.BytesArray#EMPTY}
-     * is written every time.
+     * is written every time. Only the very first attempt needs a separate {@link
+     * BlobContainer#readRegister} call -- a failed {@link BlobContainer#compareAndSwapRegister}
+     * already reports the generation that beat it, in {@link BlobRegisterCasResult#currentGeneration()},
+     * so every retry after the first can use that directly instead of paying for another read.
      */
     private long claimNextChunkSequence() throws IOException {
-        while (true) {
-            long expectedGeneration = blobContainer.readRegister(SEQUENCE_REGISTER_NAME)
-                .map(BlobRegister::generation)
-                .orElse(BlobRegister.ABSENT_GENERATION);
+        long expectedGeneration = blobContainer.readRegister(SEQUENCE_REGISTER_NAME)
+            .map(BlobRegister::generation)
+            .orElse(BlobRegister.ABSENT_GENERATION);
+        for (int attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {
             BlobRegisterCasResult result = blobContainer.compareAndSwapRegister(
                 SEQUENCE_REGISTER_NAME,
                 expectedGeneration,
@@ -122,8 +136,13 @@ public final class WalChunkService implements WalAppendTarget {
                 return result.currentGeneration() - 1;
             }
             // Lost the race -- another instance (this node or another) claimed a sequence between
-            // our read and our CAS attempt. Re-read and retry rather than guessing.
+            // our read and our CAS attempt. The conflict result already reports what the register
+            // actually is now; retry against that directly rather than re-reading.
+            expectedGeneration = result.currentGeneration();
         }
+        throw new IOException(
+            "failed to claim a WAL chunk sequence under writer epoch " + writerEpoch + " after " + MAX_CAS_ATTEMPTS + " CAS attempts"
+        );
     }
 
     @Override
