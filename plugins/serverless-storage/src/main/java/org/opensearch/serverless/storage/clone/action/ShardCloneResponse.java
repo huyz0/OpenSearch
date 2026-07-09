@@ -25,6 +25,7 @@ public class ShardCloneResponse extends ActionResponse implements ToXContentObje
     }
 
     public ShardCloneResponse(StreamInput in) throws IOException {
+        super(in);
         this.acknowledged = in.readBoolean();
     }
 

@@ -320,7 +320,9 @@ existing `IndexShardTests`/`InternalEngineTests` suites (264 tests) unchanged an
 this additive seam doesn't disturb any existing engine's recovery path.
 
 **A real gap found and scoped while attempting the genuine crash-recovery test this section's own
-work enables, not yet closed: bundle materialization on writer activation.** WAL replay (everything
+work enables -- since closed, see &sect;7.1.2 and this same section's own later "store population"
+paragraph below for the actual fix and its end-to-end proof: bundle materialization on writer
+activation.** WAL replay (everything
 above) only recovers operations *after* the last durable manifest -- it assumes local Lucene already
 reflects that manifest's own content, true on a same-node restart but not a genuine cross-node
 failover, where `ObjectStoreWriterEngine` activates against a completely empty local store. Nothing
@@ -981,8 +983,9 @@ buffer forcibly freed while another reader still holds a reference is a use-afte
 a bug. Revisit once the build's JDK floor moves to 22+, or a proper reference-counted off-heap
 allocator (e.g. a Netty-`ByteBuf`-style pool) is worth taking on as a dependency.
 
-**A real lazy, block-cached remote `Directory` now exists, standalone -- not yet wired into
-`ObjectStoreReaderEngine`'s `open()` path, which still fully materializes.** This is the piece
+**A real lazy, block-cached remote `Directory` now exists, standalone -- built first, then wired
+into `ObjectStoreReaderEngine`'s `open()` path once the blocker below was resolved (see "Resolved
+with a small, targeted core change" further down this section).** This is the piece
 &sect;7.2 describes ("a read-only Lucene `Directory` whose 'files' are `(bundle, offset, length)`
 ranges resolved through the block cache -- `createOutput`/`deleteFile` throw") and &sect;18 risk #3
 names as the missing prerequisite for real heap-budget admission control. Built by reusing, not
