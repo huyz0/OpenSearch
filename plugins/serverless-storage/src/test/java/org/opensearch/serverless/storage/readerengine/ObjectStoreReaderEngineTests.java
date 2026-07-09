@@ -146,6 +146,8 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
                     manifest,
                     materializer,
                     PRIMARY_TERM,
+                    new org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore(blobContainer),
+                    new BlobContainerManifestStore(blobContainer),
                     shardDirectory,
                     LOCAL_NODE_ID
                 )
@@ -202,6 +204,10 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
         ObjectStoreCommitMaterializer materializer = new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer));
         ShardDirectory shardDirectory = new InMemoryShardDirectory();
 
+        org.opensearch.serverless.storage.shardstate.ShardStateStore shardStateStore =
+            new org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore(blobContainer);
+        BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(blobContainer);
+
         try (Store firstStore = createStore()) {
             EngineConfig firstConfig = config(defaultSettings, firstStore, createTempDir(), newMergePolicy(), null);
             ObjectStoreReaderEngine first = ObjectStoreReaderEngine.open(
@@ -209,6 +215,8 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
                 manifest,
                 materializer,
                 PRIMARY_TERM,
+                shardStateStore,
+                manifestStore,
                 shardDirectory,
                 LOCAL_NODE_ID,
                 admissionController
@@ -225,6 +233,8 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
                             manifest,
                             materializer,
                             PRIMARY_TERM,
+                            shardStateStore,
+                            manifestStore,
                             shardDirectory,
                             LOCAL_NODE_ID,
                             admissionController
@@ -237,6 +247,148 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
                 first.close();
             }
             assertEquals("closing the first engine must release its permit", 1, admissionController.availablePermits());
+        }
+    }
+
+    public void testEngineAdvancesToANewerManifestGenerationOncePublished() throws Exception {
+        // The scenario rfc-serverless-opensearch.md &sect;16 Phase 3's own "refresh-to-newer-generation"
+        // note was tracking: a writer publishes a second manifest after this reader has already
+        // opened the first one, and the reader must pick it up without a full engine reopen.
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ObjectStoreCommitPublisher publisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+        org.opensearch.serverless.storage.shardstate.ShardStateStore shardStateStore =
+            new org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore(blobContainer);
+        BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(blobContainer);
+        ObjectStoreCommitMaterializer materializer = new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer));
+        ShardDirectory shardDirectory = new InMemoryShardDirectory();
+
+        // Both manifests are published from the SAME continuing IndexWriter/Directory, exactly like
+        // a real writer's successive flushes -- Lucene's own generation/file-naming counter keeps
+        // advancing across commits, so the two manifests' segment files never collide by name. Two
+        // independent fresh IndexWriters (each restarting Lucene's own naming from scratch) would
+        // collide instead -- a test-construction pitfall, not anything real production hits, since a
+        // shard's Lucene commit history is always one continuous sequence.
+        Directory writerDirectory = new ByteBuffersDirectory();
+        IndexWriter writer = new IndexWriter(writerDirectory, new IndexWriterConfig());
+
+        try (Store store = createStore()) {
+            EngineConfig engineConfig = config(defaultSettings, store, createTempDir(), newMergePolicy(), null);
+            // Publishing/CAS calls below must key on this engine's own real shard identity, not
+            // this test class's INDEX_UUID/SHARD_ID constants -- ObjectStoreReaderEngine polls
+            // ShardStateStore using config.getShardId(), and EngineTestCase's own fixture shard id
+            // does not actually equal those constants (a mismatch here silently makes every poll a
+            // same-as-empty no-op, since shardStateStore.get(...) just finds nothing under the
+            // wrong key -- no exception, no warning, exactly the bug this comment now prevents
+            // regressing).
+            String indexUuid = engineConfig.getShardId().getIndex().getUUID();
+            int shardId = engineConfig.getShardId().getId();
+
+            CommitManifest firstManifest;
+            {
+                Document doc = new Document();
+                doc.add(new StringField("id", "1", Field.Store.YES));
+                writer.addDocument(doc);
+                writer.commit();
+                SegmentInfos segmentInfos = SegmentInfos.readLatestCommit(writerDirectory);
+                firstManifest = publisher.publishCommit(
+                    writerDirectory,
+                    segmentInfos,
+                    indexUuid,
+                    shardId,
+                    PRIMARY_TERM,
+                    1,
+                    0,
+                    0,
+                    new WalPosition("epoch-0", 0),
+                    0,
+                    PruningStats.empty()
+                );
+            }
+            assertEquals(
+                org.opensearch.serverless.storage.shardstate.CasResult.SUCCESS,
+                shardStateStore.compareAndSet(
+                    indexUuid,
+                    shardId,
+                    java.util.Optional.empty(),
+                    new org.opensearch.serverless.storage.shardstate.ShardHead(PRIMARY_TERM, null, 0L, firstManifest.generation())
+                )
+            );
+
+            try (
+                ObjectStoreReaderEngine readerEngine = ObjectStoreReaderEngine.open(
+                    engineConfig,
+                    firstManifest,
+                    materializer,
+                    PRIMARY_TERM,
+                    shardStateStore,
+                    manifestStore,
+                    shardDirectory,
+                    LOCAL_NODE_ID
+                )
+            ) {
+                try (Engine.Searcher searcher = readerEngine.acquireSearcher("test")) {
+                    assertEquals(1, searcher.search(new TermQuery(new Term("id", "1")), 10).totalHits.value());
+                    assertEquals(0, searcher.search(new TermQuery(new Term("id", "2")), 10).totalHits.value());
+                }
+                assertEquals(1L, readerEngine.currentManifestGenerationForTesting());
+
+                // A second document is published as a new manifest generation -- simulating the
+                // writer's own next flush, from the same continuing writer -- and the shard head is
+                // advanced to point at it.
+                CommitManifest secondManifest;
+                {
+                    Document doc2 = new Document();
+                    doc2.add(new StringField("id", "2", Field.Store.YES));
+                    writer.addDocument(doc2);
+                    writer.commit();
+                    SegmentInfos segmentInfos = SegmentInfos.readLatestCommit(writerDirectory);
+                    secondManifest = publisher.publishCommit(
+                        writerDirectory,
+                        segmentInfos,
+                        indexUuid,
+                        shardId,
+                        PRIMARY_TERM,
+                        2,
+                        1,
+                        1,
+                        new WalPosition("epoch-0", 0),
+                        0,
+                        PruningStats.empty()
+                    );
+                }
+                long currentVersion = shardStateStore.get(indexUuid, shardId).orElseThrow().version();
+                assertEquals(
+                    org.opensearch.serverless.storage.shardstate.CasResult.SUCCESS,
+                    shardStateStore.compareAndSet(
+                        indexUuid,
+                        shardId,
+                        java.util.Optional.of(currentVersion),
+                        new org.opensearch.serverless.storage.shardstate.ShardHead(PRIMARY_TERM, null, 0L, secondManifest.generation())
+                    )
+                );
+
+                readerEngine.pollForNewerManifestForTesting();
+
+                assertEquals(
+                    "the engine must have advanced to the newer manifest generation",
+                    2L,
+                    readerEngine.currentManifestGenerationForTesting()
+                );
+                try (Engine.Searcher searcher = readerEngine.acquireSearcher("test")) {
+                    assertEquals(
+                        "doc 2, only present in the newer generation, must now be visible without a full engine reopen",
+                        1,
+                        searcher.search(new TermQuery(new Term("id", "2")), 10).totalHits.value()
+                    );
+                }
+            }
+        } finally {
+            writer.close();
+            writerDirectory.close();
         }
     }
 }

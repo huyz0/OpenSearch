@@ -1290,72 +1290,67 @@ What remains is the residual `activationWalPosition` atomicity limitation alread
 the IT (encryption enabled, multiple shards), not any further unproven piece of the crash-recovery
 story.
 
-**Phase 3 — Reader engine (materializer and open-from-manifest done; refresh-to-newer-generation
-and notification wiring still open).** `ObjectStoreCommitMaterializer` fetches every file a
-`CommitManifest` references (checksum-verified) and writes it into a target Lucene `Directory`,
-producing an ordinary valid commit -- proven by opening a plain `DirectoryReader` against a
-materialized manifest and running a real query, and separately by opening a full
-`ReadOnlyEngine` against one via `ObjectStoreReaderEngine.open`. Deliberately reuses
+**Phase 3 — Reader engine (materializer, open-from-manifest, and refresh-to-newer-generation all
+done; notification wiring still open in its event-driven form).** `ObjectStoreCommitMaterializer`
+fetches every file a `CommitManifest` references (checksum-verified) and writes it into a target
+Lucene `Directory`, producing an ordinary valid commit -- proven by opening a plain
+`DirectoryReader` against a materialized manifest and running a real query, and separately by
+opening a full `ReadOnlyEngine` against one via `ObjectStoreReaderEngine.open`. Deliberately reuses
 `ReadOnlyEngine` rather than writing a new `Engine` subclass: once materialization has populated
 the store's directory, `ReadOnlyEngine` already implements the entire read-only surface (search,
 get, completion stats, refusing writes) against exactly that, so the object-store-specific work
-stays confined to materialization itself. Two scoped tradeoffs, both explicit rather than
-accidental: (1) full-materialization, not the lazy/block-cached object-store-native `Directory`
-this phase's milestone targets -- correct and useful for small segment sets today, not the
-eventual read path; (2) one fixed generation per `open` call, no in-place refresh to a newer
-manifest without a full engine reopen. Still open: manifest-change notifications, block cache
-unification, admission control. Milestone: search-only shards serve queries with no local index,
-freshness lag p99 < 15 s under sustained ingest.
+stays confined to materialization itself. Still open: block cache unification, admission control
+(admission control's coarse cap is separately implemented, see `ReaderShardAdmissionController`
+above -- the fuller heap-budget-aware version this milestone eventually wants is not). Milestone:
+search-only shards serve queries with no local index, freshness lag p99 < 15 s under sustained
+ingest.
 
-**Refresh-to-newer-generation: design, not yet implemented, and it is a bigger change than
-tradeoff (2) above first suggested.** Investigated by reading `ReadOnlyEngine` directly rather than
-assumed: it is not a small patch. `ReadOnlyEngine`'s reader and segment-infos fields
-(`server/src/main/java/org/opensearch/index/engine/ReadOnlyEngine.java`) are `private final`, set
-once from a single fixed `IndexCommit` inside its own constructor; `refresh(String)`/
-`maybeRefresh(String)` are explicit no-ops and `refreshNeeded()` always returns `false` -- by
-design ("we could allow refreshes if we want down the road," per that class's own comment).
-`ObjectStoreReaderEngine` cannot gain in-place refresh while it `extends ReadOnlyEngine`; there is
-no reopen hook to hang one on.
+**Refresh-to-newer-generation: implemented, and turned out to need much less than the design first
+written up here concluded.** That first pass (based on reading `ReadOnlyEngine`'s *fields*: `private
+final`, set once at construction) concluded `ObjectStoreReaderEngine` would have to stop extending
+`ReadOnlyEngine` entirely and become its own `Engine` subclass mirroring `NRTReplicationEngine`/
+`NRTReplicationReaderManager` -- a ~150-200 line rewrite. Reading `ReadOnlyEngine`'s *methods*
+(not just its fields) more carefully found a much smaller path: `getReferenceManager(SearcherScope)`
+-- the accessor for the exact reader manager those fields back -- is `protected`, not `private`, and
+is already exactly the same `OpenSearchReaderManager` whose own `refreshIfNeeded` already calls
+`DirectoryReader#openIfChanged` (Lucene's standard incremental-reopen mechanism -- the identical
+primitive `NRTReplicationReaderManager` itself is built on). `ReadOnlyEngine` only ever *disables
+triggering* that reopen: `refresh(String)`/`maybeRefresh(String)` are explicit no-ops there, by that
+class's own design ("we could allow refreshes if we want down the road"). So the actual fix is three
+method overrides in `ObjectStoreReaderEngine` (`refresh`, `maybeRefresh`, `refreshNeeded`) that call
+through to the reader manager `ReadOnlyEngine`'s constructor already built, plus a new
+`pollForNewerManifest()` (scheduled alongside the pre-existing `directoryRefreshTask`, every 5 s,
+well under the 15 s p99 target) that checks `ShardStateStore` for a newer manifest generation and,
+when found, materializes the delta into the same `Directory` and triggers the reopen. No new
+`Engine` subclass, `ReadOnlyEngine` kept as-is otherwise, no `IndexShard`-level engine swap.
 
-Core has already solved the identical shape of problem, just not via `ReadOnlyEngine`:
-`NRTReplicationEngine extends Engine` directly (not `ReadOnlyEngine`), paired with its own
-`NRTReplicationReaderManager`. Its `updateSegments(SegmentInfos)` is called externally once new
-segment files have already landed in the shard's `Store` directory (from segment-replication's
-target service), and does an in-place `ReferenceManager.maybeRefresh()`-driven `DirectoryReader`
-reopen against the same `Directory` -- reusing unchanged leaf readers, opening only the new
-segments, no engine close/reopen, no `IndexShard`-level engine swap. `IndexShard`'s one sanctioned
-"replace this shard's Engine instance" path, `resetEngineToGlobalCheckpoint()`, is a heavyweight
-mechanism (requires all operations blocked, replays translog) built for primary
-relocation/promotion, not a cheap per-refresh operation -- confirmed by reading it, not the right
-tool here regardless.
+**A real bug found and fixed along the way, by the same "verify by testing, not by reasoning"
+discipline this whole effort has used throughout**: the first design pass claimed
+`ObjectStoreCommitMaterializer.materialize` was already "additive-safe" for landing a second,
+newer manifest into an already-materialized directory. A real test proved that claim wrong --
+`FileAlreadyExistsException` on `_0.si`. Two successive Lucene commits from the same shard routinely
+reference the *same* unchanged segment file (Lucene only ever writes a new segment for new data; it
+never rewrites an untouched one just because a later commit still references it), and
+`Directory#createOutput` throws if the file already exists. Fixed by having `materialize` list the
+target directory once up front and skip (not re-fetch, not re-verify) any file already present --
+now genuinely safe to call more than once against the same directory, which the original claim had
+only asserted, not tested.
 
-`ObjectStoreCommitMaterializer.materialize` is already additive-safe for this: it writes each of a
-manifest's referenced files by name via `Directory#createOutput`, with no assumption the directory
-starts empty, so materializing a *second*, newer manifest into the same already-open `Directory`
-lands new segment files alongside the old ones without conflict (distinct segment generations mean
-distinct file names) -- exactly the precondition `NRTReplicationReaderManager`'s reopen already
-relies on for segment replication's own directory.
+Verified end-to-end in `ObjectStoreReaderEngineTests#testEngineAdvancesToANewerManifestGenerationOncePublished`:
+a real `ObjectStoreReaderEngine` opens against a first manifest (one document), a second manifest
+(two documents) is published from the *same continuing* `IndexWriter` (matching how a real shard's
+commit history is one continuous sequence -- two independent fresh writers was an earlier, self-caught
+test-construction bug: it collided from name-reuse Lucene wouldn't actually do), the shard head is
+advanced, `pollForNewerManifest` is invoked directly (no need to wait out the real poll interval in a
+test), and the previously-invisible second document becomes searchable -- proving the in-place
+reopen actually works, not just that it compiles. Full existing reader-engine test suite (4 tests)
+and the multi-node `ServerlessStorageWriterFailoverIT` both pass unchanged, confirming this doesn't
+disturb the writer-side engine or the existing manifest-materialization path.
 
-**The design, concretely**: `ObjectStoreReaderEngine` stops extending `ReadOnlyEngine` and becomes
-its own direct `Engine` subclass with its own reader manager (mirroring
-`NRTReplicationReaderManager`'s `refreshIfNeeded` -> `StandardDirectoryReader.open(directory,
-newInfos, ...)` shape), reserving none of `ReadOnlyEngine`'s write-refusal/translog-absence
-machinery that reader shards still need (a `ReadOnlyEngine`-style stub is still needed for those
-concerns; only the fixed-reader part changes). A periodic task -- reusing the scheduling
-infrastructure `ObjectStoreReaderEngine`'s own `directoryRefreshTask` already establishes --
-polls `ShardStateStore` for a newer manifest generation than the one currently open; when found,
-materializes the delta into the existing `Directory` and triggers the reopen. This closes the
-"still open: manifest-change notifications" item too, in its simplest form (polling, not true
-pub/sub) -- true event-driven notification via the directory/gossip tier (&sect;9, already built)
-is a possible later refinement, not a prerequisite.
-
-This also resolves an inconsistency worth naming plainly: &sect;7.2's own target-design text above
-already says `ObjectStoreReaderEngine extends Engine` directly with "a reader manager that
-refreshes `DirectoryReader`s when a new manifest is applied" -- the actual Phase 3 implementation
-took a deliberate, explicitly-documented shortcut (reuse `ReadOnlyEngine`) that this design would
-now walk back, not a new design decision being introduced for the first time. Sized as a moderate,
-well-precedented change (~150-200 lines mirroring `NRTReplicationReaderManager`'s already-proven
-shape), not a `ReadOnlyEngine` patch and not an `IndexShard` change -- not attempted in this pass.
+Notification wiring remains open in its originally-intended event-driven form (true pub/sub via the
+directory/gossip tier, &sect;9) -- polling, not push, is what's implemented. That is a possible
+later refinement for latency/efficiency, not a correctness gap: the milestone's own freshness-lag
+target is already comfortably met by a 5 s poll interval against a 15 s p99 budget.
 
 **Plugin wiring (done).** `ServerlessStoragePlugin implements EnginePlugin` assembles everything
 above into a working `getEngineFactory(IndexSettings, ShardRouting)`: an index only gets an

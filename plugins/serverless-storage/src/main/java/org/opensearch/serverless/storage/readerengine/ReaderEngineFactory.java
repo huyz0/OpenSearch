@@ -84,6 +84,8 @@ public final class ReaderEngineFactory implements EngineFactory {
                 manifest,
                 materializer,
                 shardHead.primaryTerm(),
+                shardStateStore,
+                manifestStore,
                 shardDirectory,
                 localNodeId,
                 admissionController
