@@ -1200,11 +1200,14 @@ its `capacity()` -- even if the fixed shard-count cap
 (`serverless_storage.max_concurrent_reader_shards`) still has headroom. `ServerlessStoragePlugin`
 wires its own `lazyDirectoryFileCache` straight into the controller it already owned; when no lazy
 directory cache is configured (or the count cap itself is off), this degrades back to the original
-count-only check, unchanged. This is still not &sect;7's full target design -- that describes
-per-*refresh* admission control, deferring a refresh that would exceed budget while the shard keeps
-serving slightly stale data, rather than this controller's coarser open-time-only, fail-outright
-check -- but it closes the gap this section's own status note previously called out: the check is
-now against the node's actual measured cache usage, not merely a guessed-at shard count.
+count-only check, unchanged. This closes the gap this section's own status note previously called
+out: the check is now against the node's actual measured cache usage, not merely a guessed-at
+shard count. **The per-refresh half of §7's target design -- deferring a refresh that would exceed
+budget while the shard keeps serving slightly stale data, rather than only failing outright at
+open -- is closed too** (see §18 risk #3): `ObjectStoreReaderEngine`'s background manifest poll
+now checks `ReaderShardAdmissionController#isOverBudgetForRefresh` before materializing a newer
+generation, skipping an over-budget tick entirely rather than pulling more segment bytes into an
+already-over-budget cache; the next poll tick retries automatically once pressure eases.
 
 ## 10. Allocation, Topology, and Autoscaling
 
@@ -1560,7 +1563,8 @@ stays confined to materialization itself. Still open: block cache unification (t
 `FileCache` and the eager materializer's own cache are two separate caches on the same node, not
 one unified view). Admission control is no longer purely coarse -- `ReaderShardAdmissionController`
 now weighs the lazy directory's real `FileCache` usage against a configured byte-budget ratio, not
-just a fixed shard count (see &sect;9 above); still not &sect;7's fuller per-*refresh* version.
+just a fixed shard count, and (see &sect;9/&sect;18 risk #3 above) also applies that check
+per-*refresh*, deferring rather than only gating at open.
 Milestone: search-only shards serve queries with no local index, freshness lag p99 < 15 s under
 sustained ingest.
 
