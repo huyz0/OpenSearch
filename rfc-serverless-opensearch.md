@@ -217,6 +217,18 @@ the one call site inside `ObjectStoreWriterEngine#beginConstruction` -- the `Thr
 `super()`-ordering-constrained static helper that snapshots `activationWalPosition` before this
 engine's own fields are reachable -- caught and rewrapped as `UncheckedIOException` there rather
 than threading a new checked-exception signature through that already-delicate constructor chain.
+
+**Known, accepted cost of this fix**: `claimNextChunkSequence` now does a real register
+read-then-CAS round trip (on `FsBlobContainer`, backed by `FileChannel#lock()`) on every chunk
+write, where the old (unsafe) design was a free in-memory `AtomicLong` increment.
+`WalMirroringTranslog#add` calls `flushWithRetry()` -- and therefore this -- once per indexed
+operation under the default per-operation-durability configuration, so this is a real per-write
+latency/throughput cost, not a one-time or background cost. Correctness took priority over
+preserving that free-increment performance, consistent with this section's own "durable ack costs
+up to one flush interval of latency" framing already accepting real durability-driven cost --
+worth measuring under real load if WAL mirroring throughput becomes a concern, but not treated as
+blocking this fix.
+
 The regression test above now proves the fix instead of the bug: two concurrently-writing instances
 against one shared container get genuinely distinct chunk sequences, and a second instance's
 `currentChunkSequenceUpperBound()` reflects a first instance's write live, not from a stale cache.
