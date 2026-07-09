@@ -13,6 +13,7 @@ import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.ShardRoutingState;
 import org.opensearch.cluster.routing.TestShardRouting;
 import org.opensearch.common.settings.MockSecureSettings;
+import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
@@ -301,5 +302,35 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
         assertArrayEquals(shardAPayload, secondA);
         assertEquals("second shard-a read must be a cache hit, not a re-fetch", 1, callsA.get());
         assertEquals(1, callsB.get());
+    }
+
+    public void testEveryDeclaredSettingFieldIsRegisteredInGetSettings() throws IllegalAccessException {
+        // Regression guard: a new `public static final Setting<?>` field added to this class (as
+        // SERVERLESS_STORAGE_WAL_PER_SHARD_BUDGET_SETTING once was) is only ever actually usable if
+        // it's also added to getSettings() -- core silently ignores any setting a plugin doesn't
+        // register there, so a missed registration fails silently (the setting compiles, has a
+        // default, and is even read via `SETTING.get(environment.settings())`, but a real operator
+        // can never actually configure it). This walks the class's own declared fields via
+        // reflection so a future omission fails this test immediately, not months later.
+        java.util.Set<String> declaredSettingKeys = new java.util.HashSet<>();
+        for (java.lang.reflect.Field field : ServerlessStoragePlugin.class.getFields()) {
+            if (field.getDeclaringClass() == ServerlessStoragePlugin.class && Setting.class.isAssignableFrom(field.getType())) {
+                Setting<?> setting = (Setting<?>) field.get(null);
+                declaredSettingKeys.add(setting.getKey());
+            }
+        }
+        assertFalse("expected at least one declared Setting field to sanity-check the reflection itself", declaredSettingKeys.isEmpty());
+
+        java.util.Set<String> registeredSettingKeys = new ServerlessStoragePlugin().getSettings()
+            .stream()
+            .map(Setting::getKey)
+            .collect(java.util.stream.Collectors.toSet());
+
+        assertEquals(
+            "every public static Setting field on this class must be registered in getSettings(), "
+                + "or it silently can never be configured by an operator",
+            declaredSettingKeys,
+            registeredSettingKeys
+        );
     }
 }
