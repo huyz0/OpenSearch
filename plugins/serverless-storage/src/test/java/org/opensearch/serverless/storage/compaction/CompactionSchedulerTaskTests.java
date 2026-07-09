@@ -188,6 +188,105 @@ public class CompactionSchedulerTaskTests extends OpenSearchTestCase {
         }
     }
 
+    public void testMaybeCompactReturnsTrueWhenTheShardIsACompactionCandidate() throws Exception {
+        // Direct coverage of the static maybeCompact(...) method itself -- factored out of the
+        // instance so both this task's own recurring schedule and the on-demand compaction trigger
+        // action share exactly one implementation. The scheduled-task tests above only observe the
+        // eventual side effect (a newer generation gets published); this test observes the method's
+        // own return-value contract directly, with no scheduler or timing involved.
+        try (Directory directory = new ByteBuffersDirectory()) {
+            SegmentInfos infos = commitSeparateSegments(directory, 12);
+            CommitManifest manifest = commitPublisher.publishCommit(
+                directory,
+                infos,
+                INDEX_UUID,
+                SHARD_ID,
+                1,
+                infos.getGeneration(),
+                11,
+                11,
+                new WalPosition("epoch-0", 0),
+                0,
+                PruningStats.empty()
+            );
+            ShardHead head = new ShardHead(1, "node-1", 1L, manifest.generation());
+            assertEquals(CasResult.SUCCESS, shardStateStore.compareAndSet(INDEX_UUID, SHARD_ID, Optional.empty(), head));
+
+            boolean attempted = CompactionSchedulerTask.maybeCompact(
+                INDEX_UUID,
+                SHARD_ID,
+                shardStateStore,
+                manifestStore,
+                new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer)),
+                commitPublisher,
+                CompactionPolicy.withDefaults(),
+                new CompactionRebaseExecutor(shardStateStore, 10)
+            );
+
+            assertTrue("a 12-segment shard is over the default 10-segment threshold and must be a candidate", attempted);
+            ShardHead afterCompaction = shardStateStore.get(INDEX_UUID, SHARD_ID).orElseThrow().head();
+            assertTrue(
+                "the attempt reported as made must have actually published a newer generation",
+                afterCompaction.latestManifestGeneration() > manifest.generation()
+            );
+        }
+    }
+
+    public void testMaybeCompactReturnsFalseWhenTheShardIsUnderThreshold() throws Exception {
+        try (Directory directory = new ByteBuffersDirectory()) {
+            // Well under CompactionPolicy.withDefaults()'s 10-segment threshold.
+            SegmentInfos infos = commitSeparateSegments(directory, 2);
+            CommitManifest manifest = commitPublisher.publishCommit(
+                directory,
+                infos,
+                INDEX_UUID,
+                SHARD_ID,
+                1,
+                infos.getGeneration(),
+                1,
+                1,
+                new WalPosition("epoch-0", 0),
+                0,
+                PruningStats.empty()
+            );
+            ShardHead head = new ShardHead(1, "node-1", 1L, manifest.generation());
+            assertEquals(CasResult.SUCCESS, shardStateStore.compareAndSet(INDEX_UUID, SHARD_ID, Optional.empty(), head));
+
+            boolean attempted = CompactionSchedulerTask.maybeCompact(
+                INDEX_UUID,
+                SHARD_ID,
+                shardStateStore,
+                manifestStore,
+                new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer)),
+                commitPublisher,
+                CompactionPolicy.withDefaults(),
+                new CompactionRebaseExecutor(shardStateStore, 10)
+            );
+
+            assertFalse("a 2-segment shard is well under threshold and must not be a candidate", attempted);
+            ShardHead afterCall = shardStateStore.get(INDEX_UUID, SHARD_ID).orElseThrow().head();
+            assertEquals(
+                "no publish attempt must have been made, so the generation must be unchanged",
+                manifest.generation(),
+                afterCall.latestManifestGeneration()
+            );
+        }
+    }
+
+    public void testMaybeCompactReturnsFalseForAShardThatHasNeverBeenActivated() throws Exception {
+        boolean attempted = CompactionSchedulerTask.maybeCompact(
+            INDEX_UUID,
+            SHARD_ID,
+            shardStateStore,
+            manifestStore,
+            new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer)),
+            commitPublisher,
+            CompactionPolicy.withDefaults(),
+            new CompactionRebaseExecutor(shardStateStore, 10)
+        );
+        assertFalse("a shard with no published head at all must be a safe no-op", attempted);
+    }
+
     public void testDoesNothingForAShardThatHasNeverBeenActivated() throws Exception {
         CompactionSchedulerTask task = new CompactionSchedulerTask(
             threadPool,
