@@ -187,11 +187,11 @@ single shard's own, since the WAL is shared -- before writing the Java). Tracked
 it isn't lost track of as a "someday" item: this is the next real correctness-bearing gap in this
 area, not a cosmetic one.
 
-**A more urgent, actively-exploitable sibling bug, found, verified, and now fixed in the same
-session it was found: two nodes with WAL mirroring enabled against the same shared
-`serverless_storage.base_path` could silently overwrite each other's WAL chunks -- not a rare race,
-an unrecoverable data-loss bug real production use of this feature (more than one writer-hosting
-node) would have hit continuously.** Root cause: `WalChunkService`'s chunk sequence numbers used to
+**A separate, more severe sibling bug was also found while investigating the gap above -- and,
+unlike the deletion gap, verified and fixed in the same session: two nodes with WAL mirroring
+enabled against the same shared `serverless_storage.base_path` could silently overwrite each
+other's WAL chunks -- not a rare race, an unrecoverable data-loss bug real production use of this
+feature (more than one writer-hosting node) would have hit continuously.** Root cause: `WalChunkService`'s chunk sequence numbers used to
 be assigned by a purely local `AtomicLong`, seeded once at construction from
 `firstUnusedChunkSequence` (a listing of whatever the shared container already contains) and
 incremented independently thereafter, with zero cross-instance coordination -- yet every node's
@@ -220,8 +220,16 @@ than threading a new checked-exception signature through that already-delicate c
 The regression test above now proves the fix instead of the bug: two concurrently-writing instances
 against one shared container get genuinely distinct chunk sequences, and a second instance's
 `currentChunkSequenceUpperBound()` reflects a first instance's write live, not from a stale cache.
-Full plugin unit suite and multi-node internal cluster tests (including the real WAL-mirroring
-crash-failover IT) green, stable across repeated runs with fresh seeds.
+A follow-up stress test raises this from two sequential instances to 20 genuinely concurrent ones
+(real thread contention on the CAS retry loop itself, not just sequential calls), asserting every
+claimed sequence is globally unique and every chunk independently recoverable. Full plugin unit
+suite and multi-node internal cluster tests (including the real WAL-mirroring crash-failover IT)
+green, stable across repeated runs with fresh seeds. A follow-up audit of every other
+`BlobContainer#writeBlob`/`writeBlobAtomic` call site in this plugin found no sibling instance of
+this bug pattern: bundle writes already use `writeBlobAtomic(..., failIfAlreadyExists=true)` keyed
+by a CAS-protected `(primaryTerm, generation)` pair, so a colliding write fails loudly instead of
+silently overwriting -- this WAL chunk service was the only place in the plugin using
+`failIfAlreadyExists=false` against a name that wasn't already guaranteed unique some other way.
 
 **Integration point, corrected**: this section originally assumed `TranslogFactory`'s per-shard
 `BiFunction<IndexSettings, ShardRouting, TranslogFactory>` resolution (`IndicesService`) was a
