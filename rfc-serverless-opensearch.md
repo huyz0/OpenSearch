@@ -1010,13 +1010,41 @@ returns correct search results with zero upfront materialization; `listAll()`/`f
 answerable purely from the manifest's own file map with no fetch at all; every write operation
 (`createOutput`/`deleteFile`/`rename`) is rejected, matching &sect;7.2's read-only contract exactly.
 
-Still open: wiring this into `ObjectStoreReaderEngine.open()` in place of
-`ObjectStoreCommitMaterializer`'s eager full-manifest fetch (needs confirming `ReadOnlyEngine`/
-`Store` make no `FSDirectory`-specific assumptions this `Directory` would violate -- not yet
-checked); growing the cache keying from whole-file to real 1 MB block-granular regions per &sect;9's
-target (today's slice inherits `AbstractBlockIndexInput`'s default 8 MiB blocks, not yet tuned);
-and real heap-budget-aware admission control replacing `ReaderShardAdmissionController`'s coarse
-per-node count cap, now that the lazy `Directory` this needs actually exists.
+**Wiring this into `ObjectStoreReaderEngine.open()` was attempted next and found to be genuinely
+blocked, not merely unstarted -- worth recording precisely, not just "still open."** The
+`ReadOnlyEngine`/`Store` FSDirectory-assumption question above was checked directly and came back
+clean: `ReadOnlyEngine`'s constructor, `Store`'s constructor (`Directory directory` typed
+parameter, no `FSDirectory` cast anywhere on this path), and `SegmentInfos.readCommit` are all
+generic-`Directory`-based; nothing here would reject `LazyBundleDirectory`. The actual blocker is
+narrower and more structural: swapping the `Directory` a reader shard's `EngineConfig`/`Store`
+already wrap requires either (a) rebuilding `EngineConfig` with just its `Store` field replaced, or
+(b) an earlier, core-registered seam that constructs the `Store`/`Directory` from the start.
+Neither is available as a contained plugin-only change:
+
+- (a) is blocked because `EngineConfig` has no copy-with/rebuild mechanism -- it's built once via
+  an internal `Builder` from roughly thirty fields, several of which (`codecService`,
+  `checksumStrategies`, ...) have no getter that maps back to the corresponding builder input, so
+  a plugin holding an already-built `EngineConfig` cannot faithfully reconstruct an equivalent one
+  with a single field swapped.
+- (b) exists as `IndexStorePlugin.DirectoryFactory` (core's real seam for supplying a custom
+  `Directory` from index-shard construction time), but it is selected per-*index* via
+  `index.store.type`, not per-shard-*copy* the way `EnginePlugin.getEngineFactory(IndexSettings,
+  ShardRouting)` already is for this plugin's writer/reader split --
+  `DirectoryFactory#newDirectory(IndexSettings, ShardPath)` takes no `ShardRouting`. Selecting it
+  would force every writer-shard copy on the same index onto the same read-only lazy directory as
+  its reader copies, breaking writes outright; there is no way to ask for "this directory factory
+  for search-only copies, the normal one for the primary" through this seam as it exists today.
+
+This is the same shape of surprise as &sect;7's `_forcemerge`/`Indexer` SPI investigation earlier
+in this phase's history: buildable-looking from the outside, a real architectural wall once actually
+attempted, not a small follow-up. Closing it for real needs either a `ShardRouting`-aware
+`DirectoryFactory` selection seam in core (mirroring `EnginePlugin`'s own per-copy split, itself a
+core change, not a plugin one) or a different integration strategy not yet found. Left genuinely
+open, not attempted further this session. Also still open, independent of this blocker: growing the
+cache keying from whole-file to real 1 MB block-granular regions per &sect;9's target (today's slice
+inherits `AbstractBlockIndexInput`'s default 8 MiB blocks, not yet tuned), and real
+heap-budget-aware admission control replacing `ReaderShardAdmissionController`'s coarse per-node
+count cap -- both meaningful only once the directory-swap blocker above is resolved.
 
 ## 10. Allocation, Topology, and Autoscaling
 
