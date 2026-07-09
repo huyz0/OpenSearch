@@ -13,6 +13,7 @@ import org.opensearch.index.translog.TranslogConfig;
 import org.opensearch.index.translog.TranslogDeletionPolicy;
 import org.opensearch.index.translog.TranslogFactory;
 import org.opensearch.index.translog.TranslogOperationHelper;
+import org.opensearch.serverless.storage.wal.WalAppendTarget;
 import org.opensearch.serverless.storage.wal.WalChunkService;
 
 import java.io.IOException;
@@ -28,9 +29,9 @@ import java.util.function.LongSupplier;
  */
 public final class WalMirroringTranslogFactory implements TranslogFactory {
 
-    private final WalChunkService walChunkService;
+    private final WalAppendTarget walChunkService;
 
-    public WalMirroringTranslogFactory(WalChunkService walChunkService) {
+    public WalMirroringTranslogFactory(WalAppendTarget walChunkService) {
         this.walChunkService = walChunkService;
     }
 

@@ -1226,12 +1226,28 @@ loudly rather than returning garbage. **Known, explicit limitation**: today's
 `EncryptionKeyProvider` only ever supplies one key regardless of index, so this doesn't yet buy
 real per-index key isolation for WAL data the way whole-blob encryption does for bundles --
 the record-level design means it will, the moment a per-index-aware key provider exists, without
-any WAL wire-format or wiring change; and `WalChunkService`/`EncryptingWalChunkService` are not
-yet wired into the plugin at all (no `TranslogFactory` hook constructs one), matching this phase's
-pre-existing "notification wiring still open" status -- this is a real, tested component waiting
-for that integration, not integrated into a running engine yet. **Not implemented**: credential
-scoping per tier (bullet 3), which needs IAM/role-assumption wiring per cloud backend, not just a
-core primitive like the ones built so far.
+any WAL wire-format or wiring change.
+
+**`EncryptingWalChunkService` is now actually wired in, closing what had been a real, silent gap**:
+this component was fully built and tested but never once invoked by a running engine --
+`ObjectStoreWriterEngine`'s own `WalChunkService` field flowed straight into `WalMirroringTranslogFactory`
+unwrapped regardless of whether encryption was configured, meaning a deployment with an encryption
+key set got encrypted bundles and manifests but *plaintext* WAL chunks, silently. `WalAppendTarget`
+(new interface: `append`/`flush`/`bufferedRecordCount`) is what closes it without a larger rewrite:
+`WalChunkService` and `EncryptingWalChunkService` both implement it, and `WalMirroringTranslog`/
+`WalMirroringTranslogFactory` depend on the interface instead of `WalChunkService` concretely, so
+`ObjectStoreWriterEngine#createTranslogManager` can wrap the configured `WalChunkService` in an
+`EncryptingWalChunkService` (threaded through via the same `ThreadLocal`-across-`super()` bridge
+`walChunkService`/`activationWalPosition` already use, since this decision has to be made before
+this class's own instance fields are reachable) whenever an `EncryptionKeyProvider` is configured,
+completely transparent to `WalMirroringTranslog` itself. Verified end to end, not just at the
+component level (`EncryptingWalChunkServiceTests`/`WalRecordCryptoTests` already covered that): a
+real indexed document, mirrored through a real `ObjectStoreWriterEngine` configured with a key
+provider, produces a WAL chunk blob whose raw payload does not deserialize as a valid
+`Translog.Operation` (genuine ciphertext on disk, not unasserted plaintext) and which decrypts back
+to the exact original operation with the right key. **Not implemented**: credential scoping per
+tier (bullet 3), which needs IAM/role-assumption wiring per cloud backend, not just a core
+primitive like the ones built so far.
 
 ## 13. Degraded Modes: Object-Store Brownouts
 

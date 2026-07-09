@@ -574,7 +574,12 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                     // &sect;7.1.2), not per-query like a reader shard -- no caching layer needed,
                     // straight to the bundle store, matching the "caching is wired in for reader
                     // shards only" note on the reader path just above.
-                    new ObjectStoreCommitMaterializer(bundleStore)
+                    new ObjectStoreCommitMaterializer(bundleStore),
+                    // WAL-mirrored records get the same at-rest protection bundles/manifests already
+                    // have when this is configured (&sect;12 bullet 1) -- null (the default) leaves
+                    // WAL mirroring's own on/off switch (sharedWalChunkService being non-null) as the
+                    // only thing this depends on, unaffected by encryption being off.
+                    encryptionKeyProvider
                 )
             );
         } catch (IOException e) {

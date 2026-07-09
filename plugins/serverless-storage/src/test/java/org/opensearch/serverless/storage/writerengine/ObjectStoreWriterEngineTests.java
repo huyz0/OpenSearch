@@ -616,4 +616,84 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
             IOUtils.close(engine, lastOpenedStore);
         }
     }
+
+    /**
+     * Proves the wiring from an {@code EncryptionKeyProvider} through {@code ObjectStoreWriterEngine}
+     * to a real, mirrored WAL chunk -- not just {@code EncryptingWalChunkService}/{@code
+     * WalRecordCrypto} in isolation, which {@code EncryptingWalChunkServiceTests}/{@code
+     * WalRecordCryptoTests} already cover.
+     */
+    public void testWalMirroredRecordsAreEncryptedAtRestWhenAnEncryptionKeyProviderIsConfigured() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+
+        FsBlobStore walBlobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer walBlobContainer = new FsBlobContainer(walBlobStore, BlobPath.cleanPath(), walBlobStore.path());
+        org.opensearch.serverless.storage.wal.WalChunkService walChunkService = new org.opensearch.serverless.storage.wal.WalChunkService(
+            walBlobContainer,
+            "node-epoch-encrypted"
+        );
+        org.opensearch.serverless.storage.security.EncryptionKeyProvider keyProvider =
+            org.opensearch.serverless.storage.security.StaticEncryptionKeyProvider.fromRawKeyBytes(new byte[32]);
+
+        Store store = createStore();
+        lastOpenedStore = store;
+        store.createEmpty(defaultSettings.getIndexVersionCreated().luceneVersion);
+        java.nio.file.Path translogPath = createTempDir();
+        String translogUuid = Translog.createEmptyTranslog(translogPath, SequenceNumbers.NO_OPS_PERFORMED, shardId, primaryTerm.get());
+        store.associateIndexWithNewTranslog(translogUuid);
+        EngineConfig engineConfig = config(defaultSettings, store, translogPath, newMergePolicy(), null);
+
+        ObjectStoreWriterEngine engine = new ObjectStoreWriterEngine(
+            engineConfig,
+            new ObjectStoreCommitHeadPublisher(commitPublisher, shardStateStore),
+            shardDirectory,
+            LOCAL_NODE_ID,
+            null,
+            walChunkService,
+            keyProvider
+        );
+        try {
+            engine.translogManager().recoverFromTranslog(translogHandler, engine.getProcessedLocalCheckpoint(), Long.MAX_VALUE);
+            index(engine, "1");
+            engine.flush(true, true);
+
+            // Every log-* blob's records, not just the first found -- per-operation flushing can
+            // legitimately produce more than one chunk, and blob listing order isn't guaranteed to
+            // match chunk sequence order.
+            java.util.List<org.opensearch.serverless.storage.wal.WalRecord> rawRecords = new java.util.ArrayList<>();
+            java.util.Map<String, ?> chunkBlobs = walBlobContainer.listBlobsByPrefix(
+                org.opensearch.serverless.storage.wal.WalChunkNaming.LOG_BLOB_PREFIX
+            );
+            for (String chunkBlobName : chunkBlobs.keySet()) {
+                byte[] chunkBytes;
+                try (java.io.InputStream in = walBlobContainer.readBlob(chunkBlobName)) {
+                    chunkBytes = in.readAllBytes();
+                }
+                rawRecords.addAll(org.opensearch.serverless.storage.wal.WalChunkReader.readRecords(chunkBytes));
+            }
+            assertEquals(1, rawRecords.size());
+
+            // The raw, still-encrypted payload must not deserialize as a valid Translog.Operation --
+            // proof this is genuinely ciphertext on disk, not plaintext that merely wasn't asserted on.
+            expectThrows(
+                Exception.class,
+                () -> Translog.Operation.readOperation(org.opensearch.core.common.io.stream.StreamInput.wrap(rawRecords.get(0).payload()))
+            );
+
+            java.util.List<org.opensearch.serverless.storage.wal.WalRecord> decrypted =
+                org.opensearch.serverless.storage.wal.WalRecordCrypto.decryptAll(rawRecords, keyProvider);
+            Translog.Operation decryptedOp = Translog.Operation.readOperation(
+                org.opensearch.core.common.io.stream.StreamInput.wrap(decrypted.get(0).payload())
+            );
+            assertEquals(0L, decryptedOp.seqNo());
+        } finally {
+            IOUtils.close(engine, lastOpenedStore);
+        }
+    }
 }

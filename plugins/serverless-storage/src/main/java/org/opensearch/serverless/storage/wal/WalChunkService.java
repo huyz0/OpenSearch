@@ -58,7 +58,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * constructed against a container that already holds chunks for this node's epoch (e.g. after a
  * process restart with the same node incarnation) will not overwrite them.
  */
-public final class WalChunkService {
+public final class WalChunkService implements WalAppendTarget {
 
     private final BlobContainer blobContainer;
     private final String writerEpoch;
@@ -90,6 +90,7 @@ public final class WalChunkService {
         return maxExisting + 1;
     }
 
+    @Override
     public synchronized void append(WalRecord record) throws IOException {
         buffered.add(record);
         if (perShardBudgetBytes > 0) {
@@ -107,6 +108,7 @@ public final class WalChunkService {
      *
      * @return the chunk sequence number written, or -1 if there was nothing to flush
      */
+    @Override
     public synchronized long flush() throws IOException {
         if (buffered.isEmpty()) {
             return -1;
@@ -117,6 +119,7 @@ public final class WalChunkService {
         return chunkSequence;
     }
 
+    @Override
     public synchronized int bufferedRecordCount() {
         return buffered.size();
     }

@@ -14,6 +14,7 @@ import org.opensearch.index.translog.Translog;
 import org.opensearch.index.translog.TranslogConfig;
 import org.opensearch.index.translog.TranslogDeletionPolicy;
 import org.opensearch.index.translog.TranslogOperationHelper;
+import org.opensearch.serverless.storage.wal.WalAppendTarget;
 import org.opensearch.serverless.storage.wal.WalChunkService;
 import org.opensearch.serverless.storage.wal.WalRecord;
 
@@ -42,7 +43,7 @@ public class WalMirroringTranslog extends LocalTranslog {
     static final int MAX_MIRROR_FLUSH_ATTEMPTS = 3;
     static final long RETRY_BASE_DELAY_MILLIS = 10;
 
-    private final WalChunkService walChunkService;
+    private final WalAppendTarget walChunkService;
     private final String indexUuid;
     private final int shardId;
     private final LongSupplier primaryTermSupplier;
@@ -58,7 +59,7 @@ public class WalMirroringTranslog extends LocalTranslog {
         LongSupplier primaryTermSupplier,
         LongConsumer persistedSequenceNumberConsumer,
         TranslogOperationHelper translogOperationHelper,
-        WalChunkService walChunkService
+        WalAppendTarget walChunkService
     ) throws IOException {
         super(
             config,

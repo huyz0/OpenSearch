@@ -111,6 +111,7 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     private final Scheduler.Cancellable leaseRenewalTask;
     private final PitrRetentionSchedulerTask pitrRetentionTask;
     private final WalChunkService walChunkService;
+    private final org.opensearch.serverless.storage.security.EncryptionKeyProvider encryptionKeyProvider;
 
     /**
      * The fencing snapshot verified sound in {@code plugins/serverless-storage/formal/WalReplayFencing.tla}
@@ -165,6 +166,10 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     /** Bridges {@link #activationWalPosition} across {@code super(...)} the same way as {@link #CONSTRUCTION_WAL_CHUNK_SERVICE} above. */
     private static final ThreadLocal<Long> CONSTRUCTION_ACTIVATION_WAL_POSITION = new ThreadLocal<>();
 
+    /** Bridges {@link #encryptionKeyProvider} across {@code super(...)} the same way as {@link #CONSTRUCTION_WAL_CHUNK_SERVICE} above -- {@link #createTranslogManager} needs it too, to decide whether to wrap {@link #walChunkService} in an {@code EncryptingWalChunkService} before mirroring into it. */
+    private static final ThreadLocal<
+        org.opensearch.serverless.storage.security.EncryptionKeyProvider> CONSTRUCTION_ENCRYPTION_KEY_PROVIDER = new ThreadLocal<>();
+
     public ObjectStoreWriterEngine(
         EngineConfig engineConfig,
         ObjectStoreCommitHeadPublisher headPublisher,
@@ -193,6 +198,27 @@ public class ObjectStoreWriterEngine extends InternalEngine {
         PitrRetentionConfig pitrRetentionConfig,
         WalChunkService walChunkService
     ) {
+        this(engineConfig, headPublisher, shardDirectory, localNodeId, pitrRetentionConfig, walChunkService, null);
+    }
+
+    /**
+     * @param encryptionKeyProvider {@code null} leaves WAL-mirrored records unencrypted (matching
+     *                              every prior caller's behavior); non-null wraps {@code
+     *                              walChunkService} in an {@code EncryptingWalChunkService} so
+     *                              records mirrored into it are encrypted the same way bundles and
+     *                              manifests already are when this is configured (rfc-serverless-opensearch.md
+     *                              &sect;12 bullet 1 -- see that section's own note on this
+     *                              previously being built-but-unwired).
+     */
+    public ObjectStoreWriterEngine(
+        EngineConfig engineConfig,
+        ObjectStoreCommitHeadPublisher headPublisher,
+        ShardDirectory shardDirectory,
+        String localNodeId,
+        PitrRetentionConfig pitrRetentionConfig,
+        WalChunkService walChunkService,
+        org.opensearch.serverless.storage.security.EncryptionKeyProvider encryptionKeyProvider
+    ) {
         this(
             engineConfig,
             headPublisher,
@@ -200,7 +226,8 @@ public class ObjectStoreWriterEngine extends InternalEngine {
             localNodeId,
             pitrRetentionConfig,
             walChunkService,
-            beginConstruction(walChunkService)
+            encryptionKeyProvider,
+            beginConstruction(walChunkService, encryptionKeyProvider)
         );
     }
 
@@ -212,10 +239,12 @@ public class ObjectStoreWriterEngine extends InternalEngine {
         String localNodeId,
         PitrRetentionConfig pitrRetentionConfig,
         WalChunkService walChunkService,
+        org.opensearch.serverless.storage.security.EncryptionKeyProvider encryptionKeyProvider,
         Void ignored
     ) {
         super(engineConfig);
         CONSTRUCTION_WAL_CHUNK_SERVICE.remove();
+        CONSTRUCTION_ENCRYPTION_KEY_PROVIDER.remove();
         this.activationWalPosition = CONSTRUCTION_ACTIVATION_WAL_POSITION.get();
         CONSTRUCTION_ACTIVATION_WAL_POSITION.remove();
         this.headPublisher = headPublisher;
@@ -224,6 +253,7 @@ public class ObjectStoreWriterEngine extends InternalEngine {
         this.shardDirectory = shardDirectory;
         this.localNodeId = localNodeId;
         this.walChunkService = walChunkService;
+        this.encryptionKeyProvider = encryptionKeyProvider;
         // Acquired synchronously, before this engine is usable, so CompactionSchedulerTask's
         // isLeaseHeldAt guard can actually observe this writer as active (see
         // acquireOrRenewLease's javadoc -- fencing correctness itself lives entirely in
@@ -294,8 +324,12 @@ public class ObjectStoreWriterEngine extends InternalEngine {
      * #activationWalPosition}'s own javadoc). Returns {@code null} so it can be used as the last
      * argument evaluated before {@code super(...)}.
      */
-    private static Void beginConstruction(WalChunkService walChunkService) {
+    private static Void beginConstruction(
+        WalChunkService walChunkService,
+        org.opensearch.serverless.storage.security.EncryptionKeyProvider encryptionKeyProvider
+    ) {
         CONSTRUCTION_WAL_CHUNK_SERVICE.set(walChunkService);
+        CONSTRUCTION_ENCRYPTION_KEY_PROVIDER.set(encryptionKeyProvider);
         CONSTRUCTION_ACTIVATION_WAL_POSITION.set(walChunkService == null ? -1L : walChunkService.currentChunkSequenceUpperBound());
         return null;
     }
@@ -323,6 +357,14 @@ public class ObjectStoreWriterEngine extends InternalEngine {
         if (configuredWalChunkService == null) {
             return super.createTranslogManager(translogUUID, translogDeletionPolicy, translogEventListener);
         }
+        org.opensearch.serverless.storage.security.EncryptionKeyProvider configuredEncryptionKeyProvider =
+            CONSTRUCTION_ENCRYPTION_KEY_PROVIDER.get();
+        org.opensearch.serverless.storage.wal.WalAppendTarget walAppendTarget = configuredEncryptionKeyProvider == null
+            ? configuredWalChunkService
+            : new org.opensearch.serverless.storage.wal.EncryptingWalChunkService(
+                configuredWalChunkService,
+                configuredEncryptionKeyProvider
+            );
         InternalTranslogManager manager = new InternalTranslogManager(
             engineConfig.getTranslogConfig(),
             engineConfig.getPrimaryTermSupplier(),
@@ -334,7 +376,7 @@ public class ObjectStoreWriterEngine extends InternalEngine {
             translogUUID,
             translogEventListener,
             this::ensureOpen,
-            new WalMirroringTranslogFactory(configuredWalChunkService),
+            new WalMirroringTranslogFactory(walAppendTarget),
             engineConfig.getStartedPrimarySupplier(),
             TranslogOperationHelper.create(engineConfig)
         );

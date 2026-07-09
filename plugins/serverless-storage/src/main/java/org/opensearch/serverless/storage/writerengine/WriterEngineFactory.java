@@ -34,6 +34,7 @@ public final class WriterEngineFactory implements EngineFactory {
     private final PitrRetentionConfig pitrRetentionConfig;
     private final WalChunkService walChunkService;
     private final ObjectStoreCommitMaterializer materializer;
+    private final org.opensearch.serverless.storage.security.EncryptionKeyProvider encryptionKeyProvider;
 
     public WriterEngineFactory(ObjectStoreCommitHeadPublisher headPublisher, ShardDirectory shardDirectory, String localNodeId) {
         this(headPublisher, shardDirectory, localNodeId, null, null);
@@ -56,7 +57,7 @@ public final class WriterEngineFactory implements EngineFactory {
         PitrRetentionConfig pitrRetentionConfig,
         WalChunkService walChunkService
     ) {
-        this(headPublisher, shardDirectory, localNodeId, pitrRetentionConfig, walChunkService, null);
+        this(headPublisher, shardDirectory, localNodeId, pitrRetentionConfig, walChunkService, null, null);
     }
 
     /**
@@ -72,12 +73,30 @@ public final class WriterEngineFactory implements EngineFactory {
         WalChunkService walChunkService,
         ObjectStoreCommitMaterializer materializer
     ) {
+        this(headPublisher, shardDirectory, localNodeId, pitrRetentionConfig, walChunkService, materializer, null);
+    }
+
+    /**
+     * @param encryptionKeyProvider {@code null} leaves WAL-mirrored records unencrypted, same shape
+     *                              as every other optional feature in this plugin -- see {@link
+     *                              ObjectStoreWriterEngine}'s own matching constructor javadoc.
+     */
+    public WriterEngineFactory(
+        ObjectStoreCommitHeadPublisher headPublisher,
+        ShardDirectory shardDirectory,
+        String localNodeId,
+        PitrRetentionConfig pitrRetentionConfig,
+        WalChunkService walChunkService,
+        ObjectStoreCommitMaterializer materializer,
+        org.opensearch.serverless.storage.security.EncryptionKeyProvider encryptionKeyProvider
+    ) {
         this.headPublisher = headPublisher;
         this.shardDirectory = shardDirectory;
         this.localNodeId = localNodeId;
         this.pitrRetentionConfig = pitrRetentionConfig;
         this.walChunkService = walChunkService;
         this.materializer = materializer;
+        this.encryptionKeyProvider = encryptionKeyProvider;
     }
 
     @Override
@@ -90,7 +109,15 @@ public final class WriterEngineFactory implements EngineFactory {
             // construction over. It also owns PITR retention reconciliation when pitrRetentionConfig
             // is configured (null disables it, same shape as encryption), and WAL mirroring when
             // walChunkService is configured (null disables it the same way).
-            return new ObjectStoreWriterEngine(config, headPublisher, shardDirectory, localNodeId, pitrRetentionConfig, walChunkService);
+            return new ObjectStoreWriterEngine(
+                config,
+                headPublisher,
+                shardDirectory,
+                localNodeId,
+                pitrRetentionConfig,
+                walChunkService,
+                encryptionKeyProvider
+            );
         } catch (RuntimeException e) {
             throw e;
         } catch (Exception e) {

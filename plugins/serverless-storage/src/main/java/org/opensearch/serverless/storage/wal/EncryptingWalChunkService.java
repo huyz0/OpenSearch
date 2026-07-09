@@ -30,7 +30,7 @@ import java.io.IOException;
  * two call sites (append, and chunk replay) don't share enough shape to make a matching read-side
  * wrapper worth it, unlike write-time encryption which every append benefits from uniformly.
  */
-public final class EncryptingWalChunkService {
+public final class EncryptingWalChunkService implements WalAppendTarget {
 
     private final WalChunkService delegate;
     private final EncryptionKeyProvider keyProvider;
@@ -40,14 +40,17 @@ public final class EncryptingWalChunkService {
         this.keyProvider = keyProvider;
     }
 
+    @Override
     public void append(WalRecord record) throws IOException {
         delegate.append(WalRecordCrypto.encrypt(record, keyProvider));
     }
 
+    @Override
     public long flush() throws IOException {
         return delegate.flush();
     }
 
+    @Override
     public int bufferedRecordCount() {
         return delegate.bufferedRecordCount();
     }
