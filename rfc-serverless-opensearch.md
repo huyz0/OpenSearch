@@ -855,10 +855,20 @@ is open, not two. Verified directly: indexing across three separate flushes (thr
 segments), then `forceMerge(maxNumSegments=1)`, publishes a strictly newer generation whose
 materialized manifest is genuinely one segment with all three documents intact. What §7 actually
 proposed -- routing `_forcemerge` through this service so it "works on indices that have no
-writer at all" -- remains unbuilt and is still the right target for *that* case specifically; it
-needs either a real check that no writer is currently active before redirecting, or a fencing
-protocol between the compactor and a writer that might activate mid-compaction, neither of which
-exists yet. That case is exactly the "no writer ever activating" milestone below, still open.
+writer at all" -- remains unbuilt as an *API*, though the underlying capability it was chasing is
+now delivered a different way: `CompactionSchedulerTask`'s background scheduling (Phase 4.5 below)
+already compacts a writer-less shard on its own fixed schedule, with no `_forcemerge` call needed
+at all -- the "no writer ever activating" milestone this section originally pointed at is done, see
+below. What's still genuinely missing is narrower than originally scoped: wiring the `_forcemerge`
+*API call itself* to redirect to this service when no writer is active, so a caller doesn't have to
+wait out the background schedule. That redirect needs real core transport-layer work beyond this
+plugin -- `_forcemerge`'s REST/transport chain, as noted above, only ever reaches an engine while a
+writer is live, so there is currently no route for it to reach a writer-less shard at all; the
+compaction-safety half of the original concern (a fencing protocol against a writer racing
+mid-compaction) is no longer an open question, since the rebase protocol used by both the
+already-shipped background scheduler and this hypothetical redirect already handles exactly that
+race, and real writer lease acquisition/renewal (Phase 4.5 below) now gives an accurate,
+non-dead-code "is a writer currently active" check to gate the redirect on.
 
 ## 8. Publication and Consistency
 
