@@ -642,8 +642,34 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                     return;
                 }
                 releaseCloneLineageForDeletedIndex(index.getUUID(), indexSettings.getNumberOfShards());
+                deregisterFromWalShardRegistryForDeletedIndex(index.getUUID(), indexSettings.getNumberOfShards());
             }
         });
+    }
+
+    /**
+     * The one case {@link org.opensearch.serverless.storage.wal.WalShardRegistry}'s own javadoc
+     * names as safe to actually remove an entry for: a real index deletion is independent proof
+     * this shard will never mirror into this container again, unlike mere staleness or inactivity.
+     * Best-effort, same shape and same swallowed-failure tolerance as {@link
+     * #releaseCloneLineageForDeletedIndex} right above -- a registry entry surviving a failed
+     * deregistration attempt is not a correctness problem (see that registry's own grow-only-is-
+     * safe argument), only a missed opportunity for a future sweep to reclaim more.
+     */
+    private void deregisterFromWalShardRegistryForDeletedIndex(String indexUuid, int numberOfShards) {
+        if (sharedWalChunkService == null) {
+            return;
+        }
+        org.opensearch.serverless.storage.wal.WalShardRegistry registry = new org.opensearch.serverless.storage.wal.WalShardRegistry(
+            sharedWalChunkService.blobContainer()
+        );
+        for (int shardId = 0; shardId < numberOfShards; shardId++) {
+            try {
+                registry.deregister(indexUuid, shardId);
+            } catch (Exception e) {
+                // See this method's own javadoc: logged-and-swallowed, not fatal to index deletion.
+            }
+        }
     }
 
     /**
