@@ -224,9 +224,23 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
      * failure here (a transient object-store error, a torn read) is logged and left for the next
      * poll tick to retry -- never worth failing an already-open, still-serving engine over, exactly
      * the same tolerance {@link #refreshDirectoryEntry} already has for its own reporting.
+     *
+     * <p>Also the per-refresh half of admission control (rfc-serverless-opensearch.md &sect;18
+     * risk #3): if the node's lazy-directory block cache is over its configured budget, this tick
+     * is skipped entirely -- the shard keeps serving its current, slightly stale generation rather
+     * than pulling more segment bytes into an already-over-budget cache. The next poll tick tries
+     * again, so the shard catches up automatically once cache pressure eases (e.g. another shard
+     * closes or its own cache entries get evicted).
      */
     private void pollForNewerManifest() {
         try {
+            if (admissionController != null && admissionController.isOverBudgetForRefresh()) {
+                logger.debug(
+                    "skipping manifest poll: node's reader-shard admission budget is currently exceeded, staying on generation {}",
+                    currentManifestGeneration.get()
+                );
+                return;
+            }
             Optional<VersionedShardHead> head = shardStateStore.get(indexUuid, shardId);
             if (head.isEmpty()) {
                 return;

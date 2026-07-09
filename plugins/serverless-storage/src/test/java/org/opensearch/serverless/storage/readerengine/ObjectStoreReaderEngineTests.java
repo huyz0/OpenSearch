@@ -396,6 +396,163 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
         }
     }
 
+    public void testEngineSkipsAPollTickWhileOverBudgetAndCatchesUpOnceBudgetEases() throws Exception {
+        // rfc-serverless-opensearch.md &sect;18 risk #3's per-refresh admission control: a poll
+        // tick found while the node's file cache is over budget must NOT materialize the newer
+        // generation -- the shard keeps serving its current, stale generation instead. Once the
+        // cache eases back under budget, the very next poll tick catches up normally.
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ObjectStoreCommitPublisher publisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+        org.opensearch.serverless.storage.shardstate.ShardStateStore shardStateStore =
+            new org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore(blobContainer);
+        BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(blobContainer);
+        ObjectStoreCommitMaterializer materializer = new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer));
+        ShardDirectory shardDirectory = new InMemoryShardDirectory();
+
+        org.opensearch.index.store.remote.filecache.FileCache fileCache = org.opensearch.index.store.remote.filecache.FileCacheFactory
+            .createConcurrentLRUFileCache(1024L, 1);
+        ReaderShardAdmissionController admissionController = new ReaderShardAdmissionController(10, fileCache, 0.5);
+
+        Directory writerDirectory = new ByteBuffersDirectory();
+        IndexWriter writer = new IndexWriter(writerDirectory, new IndexWriterConfig());
+
+        try (Store store = createStore()) {
+            EngineConfig engineConfig = config(defaultSettings, store, createTempDir(), newMergePolicy(), null);
+            String indexUuid = engineConfig.getShardId().getIndex().getUUID();
+            int shardId = engineConfig.getShardId().getId();
+
+            CommitManifest firstManifest;
+            {
+                Document doc = new Document();
+                doc.add(new StringField("id", "1", Field.Store.YES));
+                writer.addDocument(doc);
+                writer.commit();
+                SegmentInfos segmentInfos = SegmentInfos.readLatestCommit(writerDirectory);
+                firstManifest = publisher.publishCommit(
+                    writerDirectory,
+                    segmentInfos,
+                    indexUuid,
+                    shardId,
+                    PRIMARY_TERM,
+                    1,
+                    0,
+                    0,
+                    new WalPosition("epoch-0", 0),
+                    0,
+                    PruningStats.empty()
+                );
+            }
+            assertEquals(
+                org.opensearch.serverless.storage.shardstate.CasResult.SUCCESS,
+                shardStateStore.compareAndSet(
+                    indexUuid,
+                    shardId,
+                    java.util.Optional.empty(),
+                    new org.opensearch.serverless.storage.shardstate.ShardHead(PRIMARY_TERM, null, 0L, firstManifest.generation())
+                )
+            );
+
+            // Opened while the cache is still empty (well under budget), so admission succeeds.
+            try (
+                ObjectStoreReaderEngine readerEngine = ObjectStoreReaderEngine.open(
+                    engineConfig,
+                    firstManifest,
+                    materializer,
+                    PRIMARY_TERM,
+                    shardStateStore,
+                    manifestStore,
+                    shardDirectory,
+                    LOCAL_NODE_ID,
+                    admissionController,
+                    null,
+                    null
+                )
+            ) {
+                assertEquals(1L, readerEngine.currentManifestGenerationForTesting());
+
+                CommitManifest secondManifest;
+                {
+                    Document doc2 = new Document();
+                    doc2.add(new StringField("id", "2", Field.Store.YES));
+                    writer.addDocument(doc2);
+                    writer.commit();
+                    SegmentInfos segmentInfos = SegmentInfos.readLatestCommit(writerDirectory);
+                    secondManifest = publisher.publishCommit(
+                        writerDirectory,
+                        segmentInfos,
+                        indexUuid,
+                        shardId,
+                        PRIMARY_TERM,
+                        2,
+                        1,
+                        1,
+                        new WalPosition("epoch-0", 0),
+                        0,
+                        PruningStats.empty()
+                    );
+                }
+                long currentVersion = shardStateStore.get(indexUuid, shardId).orElseThrow().version();
+                assertEquals(
+                    org.opensearch.serverless.storage.shardstate.CasResult.SUCCESS,
+                    shardStateStore.compareAndSet(
+                        indexUuid,
+                        shardId,
+                        java.util.Optional.of(currentVersion),
+                        new org.opensearch.serverless.storage.shardstate.ShardHead(PRIMARY_TERM, null, 0L, secondManifest.generation())
+                    )
+                );
+
+                // Push the shared cache over its configured 50% budget before the next poll tick.
+                fileCache.put(createTempDir().resolve("over-budget"), new org.opensearch.index.store.remote.filecache.CachedIndexInput() {
+                    @Override
+                    public org.apache.lucene.store.IndexInput getIndexInput() {
+                        throw new UnsupportedOperationException("not needed for admission-control tests");
+                    }
+
+                    @Override
+                    public long length() {
+                        return 600L;
+                    }
+
+                    @Override
+                    public boolean isClosed() {
+                        return false;
+                    }
+
+                    @Override
+                    public void close() {}
+                });
+                assertTrue(admissionController.isOverBudgetForRefresh());
+
+                readerEngine.pollForNewerManifestForTesting();
+                assertEquals(
+                    "an over-budget poll tick must not materialize the newer generation",
+                    1L,
+                    readerEngine.currentManifestGenerationForTesting()
+                );
+
+                // Budget eases back (e.g. the over-budget entry is evicted) -- the very next poll
+                // tick must catch up normally, with no other state having been disturbed.
+                fileCache.clear();
+                assertFalse(admissionController.isOverBudgetForRefresh());
+
+                readerEngine.pollForNewerManifestForTesting();
+                assertEquals(
+                    "the engine must catch up to the newer generation once budget eases",
+                    2L,
+                    readerEngine.currentManifestGenerationForTesting()
+                );
+            }
+        } finally {
+            writer.close();
+            writerDirectory.close();
+        }
+    }
+
     public void testReaderEnginesOwnBackgroundSchedulerCompactsAQuiescentShardWithNoWriterEverActivating() throws Exception {
         // The gap found while wiring this up: CompactionSchedulerTask was fully implemented and
         // tested in isolation, but nothing in ServerlessStoragePlugin ever actually constructed one

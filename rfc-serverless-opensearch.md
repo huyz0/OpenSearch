@@ -2088,14 +2088,12 @@ directions documented so serverless adoption is not a one-way door.
    cache hit rate; consider tiered "pinned working set" for latency-critical indices.
 3. **Reader heap under many shards.** Segment metadata heap cost per open reader bounds shard
    density. Admission control (§7.2) prevents OOM but caps density; needs measurement early
-   (Phase 3 gate). **Status: a real byte-budget check now implemented alongside the count cap, not
-   yet §7.2's full per-refresh target design.** §7.2 describes per-*refresh* admission control
-   weighed against a real heap/cache byte budget, deferring a refresh that would exceed it while
-   the shard keeps serving slightly stale data -- `ReaderShardAdmissionController` still only gates
-   shard *open*, not each subsequent refresh, and an over-budget open fails outright rather than
-   degrading to stale-but-serving. But the byte-budget half of that gap is closed: with the lazy,
-   block-cache-backed remote `Directory` (§9) now wired in, the controller checks the node's shared
-   `FileCache`'s actual `usage()` against a configured fraction of its `capacity()`
+   (Phase 3 gate). **Status: both halves of §7.2's target design are now implemented.** §7.2
+   describes two things: (a) a byte-budget check, not just a raw shard-count cap, and (b) applying
+   that check per-*refresh*, not just at open, deferring a refresh that would exceed budget while
+   the shard keeps serving slightly stale data rather than failing outright. With the lazy,
+   block-cache-backed remote `Directory` (§9) wired in, `ReaderShardAdmissionController` checks the
+   node's shared `FileCache`'s actual `usage()` against a configured fraction of its `capacity()`
    (`serverless_storage.reader_admission.max_file_cache_usage_ratio`, default 0.9) on every
    `acquire()`, in addition to the original fixed cap on the *count* of concurrently open reader
    engines (`serverless_storage.max_concurrent_reader_shards`, disabled by default) -- either check
@@ -2106,6 +2104,21 @@ directions documented so serverless adoption is not a one-way door.
    real `FileCache` supplied -- an acquire is refused once cache usage crosses the configured ratio
    even while the count cap still has headroom, without consuming a count permit on the rejected
    attempt.
+
+   The per-refresh half is now closed too: `ObjectStoreReaderEngine#pollForNewerManifest` (the
+   background poll that notices a writer/compactor published a newer generation and materializes
+   it into the shard's directory) now checks
+   `ReaderShardAdmissionController#isOverBudgetForRefresh` -- a non-throwing, count-permit-free
+   variant of the open-time check, since an already-open shard's refresh doesn't need a new count
+   permit, only the byte-budget question -- before pulling any new segment bytes in. An over-budget
+   tick is skipped entirely (the shard keeps serving its current generation), and the very next
+   poll tick retries automatically, so the shard catches up on its own once cache pressure eases
+   (another shard closes, or its own cache entries get evicted), with no operator action or retry
+   logic needed beyond the existing poll loop. Verified: a poll tick found while the cache is over
+   budget does not materialize the newer generation (the engine's current generation is unchanged
+   and the newer generation's documents remain invisible to search), and once the cache eases back
+   under budget the very next tick catches up to the newer generation normally, with no other
+   engine state disturbed by the skipped tick.
 4. **WAL multiplexing fairness.** One node-level WAL means one noisy shard can delay acks for
    others. Mitigation: per-shard budget within a chunk, overflow to dedicated chunks.
    **Status: implemented and tested.** `WalChunkService` now takes an optional

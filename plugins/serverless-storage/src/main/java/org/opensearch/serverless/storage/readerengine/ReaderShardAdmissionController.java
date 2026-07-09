@@ -119,6 +119,20 @@ public final class ReaderShardAdmissionController {
         return fileCache.usage() >= Math.round(capacity * maxFileCacheUsageRatio);
     }
 
+    /**
+     * Non-throwing budget check for an already-open shard's periodic refresh, not a new shard
+     * open: an over-budget refresh should defer and keep serving the shard's current, slightly
+     * stale generation (rfc-serverless-opensearch.md &sect;18 risk #3's per-refresh target), not
+     * fail the shard the way {@link #acquire} fails a rejected open. Never consults the
+     * shard-count permits -- an already-open shard doesn't need one to keep refreshing. Always
+     * {@code false} when no {@link FileCache} was supplied.
+     *
+     * @return whether the node's lazy-directory block cache is currently over its admission budget.
+     */
+    public boolean isOverBudgetForRefresh() {
+        return fileCache != null && isFileCacheOverBudget();
+    }
+
     /** Releases the permit acquired by a matching {@link #acquire}, once that reader shard's engine closes. */
     public void release() {
         permits.release();

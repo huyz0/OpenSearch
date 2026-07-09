@@ -100,4 +100,32 @@ public class ReaderShardAdmissionControllerTests extends OpenSearchTestCase {
         controller.acquire(SHARD_ID);
         assertEquals(0, controller.availablePermits());
     }
+
+    public void testIsOverBudgetForRefreshIsFalseWithNoFileCacheConfigured() {
+        ReaderShardAdmissionController controller = new ReaderShardAdmissionController(10);
+        assertFalse(controller.isOverBudgetForRefresh());
+    }
+
+    public void testIsOverBudgetForRefreshIsFalseWhenUnderBudget() {
+        FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(1024L, 1);
+        fileCache.put(Path.of("under-budget"), new FakeCachedIndexInput(100L));
+        ReaderShardAdmissionController controller = new ReaderShardAdmissionController(10, fileCache, 0.5);
+        assertFalse(controller.isOverBudgetForRefresh());
+    }
+
+    public void testIsOverBudgetForRefreshIsTrueWhenOverBudget() {
+        FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(1024L, 1);
+        fileCache.put(Path.of("over-budget"), new FakeCachedIndexInput(600L));
+        ReaderShardAdmissionController controller = new ReaderShardAdmissionController(10, fileCache, 0.5);
+        assertTrue(controller.isOverBudgetForRefresh());
+    }
+
+    public void testIsOverBudgetForRefreshDoesNotConsumeACountPermit() {
+        FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(1024L, 1);
+        fileCache.put(Path.of("over-budget"), new FakeCachedIndexInput(600L));
+        ReaderShardAdmissionController controller = new ReaderShardAdmissionController(10, fileCache, 0.5);
+        controller.isOverBudgetForRefresh();
+        controller.isOverBudgetForRefresh();
+        assertEquals("a refresh-time budget check must never touch the count permits", 10, controller.availablePermits());
+    }
 }
