@@ -262,6 +262,21 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * How often the node-level {@code WalGcSchedulerTask} sweeps for WAL chunks safe to delete
+     * (rfc-serverless-opensearch.md &sect;6.4's own status note on this gap). Unlike {@link
+     * #SERVERLESS_STORAGE_GC_INTERVAL_SETTING}'s sweep, this one needs no separate time-based
+     * retention window setting -- see that task's own javadoc for why the minimum covered {@code
+     * WalPosition} across every {@code WalShardRegistry}-known shard is already an airtight bound
+     * on its own. Non-positive (the default) disables it, and only takes effect when WAL mirroring
+     * itself is also enabled -- there is nothing to sweep otherwise.
+     */
+    public static final Setting<TimeValue> SERVERLESS_STORAGE_WAL_GC_INTERVAL_SETTING = Setting.timeSetting(
+        "serverless_storage.wal_gc.interval",
+        TimeValue.MINUS_ONE,
+        Setting.Property.NodeScope
+    );
+
+    /**
      * Budget for the one node-shared {@link FileCache} backing every reader shard opted into
      * {@link #LAZY_DIRECTORY_STORE_TYPE} (rfc-serverless-opensearch.md &sect;9's "one node block
      * cache" target) -- reused directly from core's own searchable-snapshots feature, not a new
@@ -303,6 +318,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     private volatile long pitrWindowMillis = -1;
     private volatile ReaderShardAdmissionController readerShardAdmissionController;
     private volatile WalChunkService sharedWalChunkService;
+    private volatile org.opensearch.serverless.storage.wal.WalGcSchedulerTask walGcSchedulerTask;
     private volatile TimeValue compactionInterval;
     private volatile TimeValue gcInterval;
     private volatile long gcRetentionWindowMillis;
@@ -325,6 +341,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_COMPACTION_INTERVAL_SETTING,
             SERVERLESS_STORAGE_GC_INTERVAL_SETTING,
             SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING,
+            SERVERLESS_STORAGE_WAL_GC_INTERVAL_SETTING,
             SERVERLESS_STORAGE_LAZY_DIRECTORY_CACHE_SIZE_SETTING,
             SERVERLESS_STORAGE_LAZY_DIRECTORY_ENABLED_SETTING
         );
@@ -434,6 +451,23 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 // restarts; it only needs to be unique enough that this process's chunk sequence
                 // numbering never collides with a prior incarnation's.
                 sharedWalChunkService = new WalChunkService(walBlobContainer, UUIDs.base64UUID());
+
+                TimeValue configuredWalGcInterval = SERVERLESS_STORAGE_WAL_GC_INTERVAL_SETTING.get(environment.settings());
+                if (configuredWalGcInterval.millis() > 0) {
+                    walGcSchedulerTask = new org.opensearch.serverless.storage.wal.WalGcSchedulerTask(
+                        threadPool,
+                        configuredWalGcInterval,
+                        walBlobContainer,
+                        new org.opensearch.serverless.storage.wal.WalShardRegistry(walBlobContainer),
+                        (indexUuid, shardId) -> {
+                            try {
+                                return resolveBlobContainer(indexUuid, shardId);
+                            } catch (IOException e) {
+                                throw new UncheckedIOException(e);
+                            }
+                        }
+                    );
+                }
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
             }

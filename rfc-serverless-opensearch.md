@@ -171,37 +171,45 @@ translog as the durability mechanism between commits:
   per hour; the design goal is that WAL request cost stays two orders of magnitude below the
   compute cost of the node producing it.
 
-**Status: WAL chunk deletion (the fourth bullet above) is designed but not implemented -- a real,
-previously-unflagged gap, found while auditing this section rather than while building something
-else.** `WalChunkService` writes chunks and never deletes any; grepping the entire `wal` package
-turns up no delete/trim/retention method anywhere. Nothing today bounds how much WAL chunk storage
-a node accumulates over its lifetime -- unlike the manifest/bundle GC sweep (§6.5,
-`GcSchedulerTask`), which is real and scheduled, there is no WAL analogue at all. Deliberately not
-attempted as a quick fix in the same pass as finding it: unlike a superseded bundle (where deleting
-early merely breaks a clone or a slow reader, both already guarded by durable pins), a WAL chunk
-deleted before every writer shard on the node has actually published a manifest covering it is
-unrecoverable data loss on the next failover -- the exact class of risk &sect;18.5 flags as
-warranting model-checking before implementation (`CloneGc.tla` is the precedent this would follow:
-model the sweep against the *node-level, cross-shard* minimum covered `WalPosition` -- not any
-single shard's own, since the WAL is shared -- before writing the Java). Tracked here explicitly so
-it isn't lost track of as a "someday" item: this is the next real correctness-bearing gap in this
-area, not a cosmetic one.
+**Status: WAL chunk deletion (the fourth bullet above) is now implemented, closing a real,
+previously-unflagged gap found while auditing this section rather than while building something
+else.** `WalChunkService` used to write chunks and never delete any -- unlike the manifest/bundle
+GC sweep (§6.5, `GcSchedulerTask`), there was no WAL analogue at all. The design question that
+first looked like it needed formal model-checking (`CloneGc.tla`-style) turned out to dissolve once
+chunk sequence numbers became a single, globally-continuous space shared by every node (the
+collision fix below): "which epoch a shard's latest manifest references" is not actually a physical
+retention boundary in this design -- there is only ever one shared WAL container, so the real
+question reduces to "has every shard that could still need a chunk sequence already published past
+it," independent of epoch entirely.
 
-**The actual hard part of this design, found while scoping it further (not yet resolved): safe
-*deregistration*, not the sweep itself.** A GC sweep that deletes chunks below the minimum covered
-`WalPosition` across every shard known to use this epoch is safe by construction as long as that
-"known to use this epoch" set only ever grows -- exactly the same shape `CloneGc.tla`'s `Fixed`
-variant already proves sound for a different mechanism (pin before read, never remove early). But a
-set that only grows never actually bounds storage for the common case that motivates this feature
-at all: a shard relocates away from this node and will never write to this epoch again, yet nothing
-safe currently exists to *remove* it from the covering set, so it would silently keep the sweep's
-minimum pinned at wherever that shard's last publish left off, forever -- solving nothing for the
-node it left. Determining "this shard will genuinely never need this epoch's chunks again" cleanly
-is real, unsolved design work (it depends on knowing whether some *later* writer for that shard, on
-any node, has advanced past every chunk this epoch could still hold, not just on the shard being
-gone from this node) -- this is the actual open question a `CloneGc.tla`-style model needs to
-answer before the sweep itself is worth implementing, not the sweep's own delete condition, which
-is already the easy, already-solved part.
+`WalShardRegistry` (new) is a durable, CAS-backed, deliberately grow-only registry of every
+(indexUuid, shardId) known to have mirrored into the shared container -- `ObjectStoreWriterEngine`
+registers its own shard once per activation. Growing-only is safe by construction, the same shape
+`CloneGc.tla`'s `Fixed` variant already proves sound for a different mechanism (pin before read,
+never remove early); the one case actually safe to *remove* an entry for is a real index deletion
+(independent proof that shard will never publish again), wired as a sibling to the existing
+clone-pin deletion listener in `ServerlessStoragePlugin#onIndexModule`. A shard merely relocating to
+a different node is not a removal case at all: it keeps publishing (now via a different writer, a
+different epoch, the *same* shared container) and its own `WalPosition` keeps legitimately
+advancing, so the registry's min-covered-position computation is never stuck on it -- only a
+genuinely dead (deleted) shard, or one that stops publishing forever without its index ever being
+deleted, would freeze the bound; the latter is an accepted, documented limitation, not a
+data-loss risk (the failure mode is "deletes less than it could," never "deletes something still
+needed").
+
+`WalGcSchedulerTask` (new, node-level, gated behind `serverless_storage.wal_gc.interval`, off by
+default) sweeps on a fixed schedule: reads every registered shard's latest published manifest,
+takes the minimum `WalPosition#offset()` across all of them, and deletes every chunk sequence at or
+below that bound. Deliberately conservative when information is incomplete -- a registered shard
+with no published manifest yet, or a latest manifest carrying no real `WalPosition`, blocks the
+*entire* sweep for that tick rather than computing a bound that could be unsafe. No separate
+time-based retention window is needed the way `GcSchedulerTask`'s own sweep uses one: once every
+known shard's latest manifest covers a chunk sequence, nothing will ever legitimately replay from
+at or below it again (replay only ever reads forward from a shard's own last-covered position).
+Verified with real multi-shard scenarios: a sweep respects the *slowest* of several registered
+shards' coverage, not just one; a shard that's registered but has never published blocks the whole
+sweep rather than being silently skipped; and end-to-end in a real cluster, a writer shard registers
+on activation and is deregistered when its index is genuinely deleted.
 
 **A separate, more severe sibling bug was also found while investigating the gap above -- and,
 unlike the deletion gap, verified and fixed in the same session: two nodes with WAL mirroring
