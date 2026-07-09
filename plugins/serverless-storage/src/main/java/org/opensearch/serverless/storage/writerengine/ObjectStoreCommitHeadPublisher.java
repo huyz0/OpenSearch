@@ -92,12 +92,18 @@ public final class ObjectStoreCommitHeadPublisher {
             } else {
                 VersionedShardHead versioned = current.get();
                 currentHead = versioned.head();
-                if (currentHead.primaryTerm() != primaryTerm) {
-                    // A different term already holds the head -- this writer has been fenced out and
-                    // must not publish, regardless of whether that term is higher or (should be
-                    // impossible under correct lease handling) lower.
+                if (currentHead.primaryTerm() > primaryTerm) {
+                    // A newer term already holds the head -- this writer has been superseded and
+                    // must not publish.
                     return false;
                 }
+                // currentHead.primaryTerm() <= primaryTerm: either this writer is continuing under
+                // the term already on the head, or it is the first commit of a newly-activated
+                // writer under a term nothing has published under yet (see
+                // acquireOrRenewLease's javadoc for why lease acquisition alone does not already
+                // advance the head's term) -- either way this publish is what legitimately moves the
+                // head's term forward to primaryTerm, via withPublishedGeneration(primaryTerm, ...)
+                // below.
                 currentGeneration = currentHead.latestManifestGeneration();
                 currentVersion = Optional.of(versioned.version());
             }
@@ -124,7 +130,7 @@ public final class ObjectStoreCommitHeadPublisher {
 
             ShardHead newHead = currentHead == null
                 ? new ShardHead(primaryTerm, null, 0L, manifest.generation())
-                : currentHead.withPublishedGeneration(manifest.generation());
+                : currentHead.withPublishedGeneration(primaryTerm, manifest.generation());
             if (shardStateStore.compareAndSet(indexUuid, shardId, currentVersion, newHead) == CasResult.SUCCESS) {
                 return true;
             }
@@ -134,11 +140,52 @@ public final class ObjectStoreCommitHeadPublisher {
     }
 
     /**
+     * Acquires or renews this shard's writer lease (rfc-serverless-opensearch.md &sect;16 Phase
+     * 4.5): without this, {@link ShardHead#leaseHolderNodeId()} is never set, so {@code
+     * CompactionSchedulerTask}'s {@code isLeaseHeldAt} guard can never actually observe an active
+     * writer and always treats the shard as available.
+     *
+     * <p>Deliberately does <b>not</b> write {@code primaryTerm} into the head -- only {@link
+     * #publishCommitAsHead} legitimately advances the head's term, since that is the one place
+     * {@code (primaryTerm, latestManifestGeneration)} is kept in sync as a valid pointer to the last
+     * real manifest (see {@link ShardHead#withRenewedLease}'s javadoc). This means a writer that has
+     * just activated under a newly bumped term but has not yet published anything can still call
+     * this and have it succeed against the head's still-old term -- that is fine, since fencing
+     * correctness itself lives entirely in {@link #publishCommitAsHead}, not here.
+     *
+     * <p>Retries on a lost CAS race by rereading the live head and retrying, same shape as {@link
+     * #publishCommitAsHead}. Returns {@code false} (never retries past this) only when the live head
+     * already reflects a term newer than {@code primaryTerm} -- real evidence (a publication) that
+     * this node has been superseded, and it must not go on renewing as this shard's writer.
+     */
+    public boolean acquireOrRenewLease(String indexUuid, int shardId, long primaryTerm, String nodeId, long leaseExpiryMillis)
+        throws IOException {
+        for (;;) {
+            Optional<VersionedShardHead> current = shardStateStore.get(indexUuid, shardId);
+            ShardHead currentHead = current.map(VersionedShardHead::head).orElse(null);
+            if (currentHead != null && currentHead.primaryTerm() > primaryTerm) {
+                return false;
+            }
+            ShardHead newHead = currentHead == null
+                ? new ShardHead(primaryTerm, nodeId, leaseExpiryMillis, 0)
+                : currentHead.withRenewedLease(nodeId, leaseExpiryMillis);
+            Optional<Long> expectedVersion = current.map(VersionedShardHead::version);
+            if (shardStateStore.compareAndSet(indexUuid, shardId, expectedVersion, newHead) == CasResult.SUCCESS) {
+                return true;
+            }
+            // Lost the race -- reread the live head and retry.
+        }
+    }
+
+    /**
      * The latest durably-published manifest for this shard, if any -- what a writer activating
      * (under a new or resumed term) reads to determine where WAL replay must resume from (the
      * manifest's own {@link WalPosition}) and what Lucene generation local recovery should already
-     * reflect. Empty only when this shard has never published a manifest at all (a brand new
-     * shard, nothing yet to catch up on beyond the whole WAL from the start).
+     * reflect. Empty both when this shard has never had a head at all, and when a head exists but
+     * {@code latestManifestGeneration() == 0} -- the same "nothing published yet" sentinel {@link
+     * ShardHead#initial()} and {@code CompactionSchedulerTask} already treat that way, which since
+     * {@link #acquireOrRenewLease} can now put-if-absent a lease-only head with generation 0 ahead of
+     * any real publish, is no longer implied by head presence alone.
      */
     public Optional<CommitManifest> readLatestManifest(String indexUuid, int shardId) throws IOException {
         Optional<VersionedShardHead> current = shardStateStore.get(indexUuid, shardId);
@@ -146,6 +193,9 @@ public final class ObjectStoreCommitHeadPublisher {
             return Optional.empty();
         }
         ShardHead head = current.get().head();
+        if (head.latestManifestGeneration() == 0) {
+            return Optional.empty();
+        }
         return Optional.of(commitPublisher.readManifest(head.primaryTerm(), head.latestManifestGeneration()));
     }
 }

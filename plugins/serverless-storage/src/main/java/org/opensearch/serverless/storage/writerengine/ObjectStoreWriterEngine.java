@@ -10,6 +10,7 @@ package org.opensearch.serverless.storage.writerengine;
 
 import org.apache.lucene.index.SegmentInfos;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.index.engine.DocumentIndexWriter;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.EngineException;
@@ -83,6 +84,18 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     private static final TimeValue DIRECTORY_REFRESH_INTERVAL = TimeValue.timeValueMillis(DIRECTORY_ENTRY_TTL_MILLIS / 3);
 
     /**
+     * How long this writer's lease on {@code ShardHead} is trusted before {@code
+     * CompactionSchedulerTask} may treat the shard as available (rfc-serverless-opensearch.md
+     * &sect;16 Phase 4.5). Deliberately much shorter than {@link #DIRECTORY_ENTRY_TTL_MILLIS}: the
+     * directory entry only affects discoverability, while a stale lease is what lets a compactor
+     * start touching a shard a writer still considers its own, so it is bounded tightly.
+     */
+    private static final long LEASE_TTL_MILLIS = 30_000L;
+
+    /** Same well-inside-the-TTL rationale as {@link #DIRECTORY_REFRESH_INTERVAL}. */
+    private static final TimeValue LEASE_RENEWAL_INTERVAL = TimeValue.timeValueMillis(LEASE_TTL_MILLIS / 3);
+
+    /**
      * PITR reconciliation lists and reads every manifest the shard has ever written -- far heavier
      * than the directory refresh -- and the retention window moves far more slowly than a
      * directory entry's TTL, so this runs on its own, much longer interval.
@@ -95,6 +108,7 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     private final ShardDirectory shardDirectory;
     private final String localNodeId;
     private final Scheduler.Cancellable directoryRefreshTask;
+    private final Scheduler.Cancellable leaseRenewalTask;
     private final PitrRetentionSchedulerTask pitrRetentionTask;
     private final WalChunkService walChunkService;
 
@@ -210,12 +224,44 @@ public class ObjectStoreWriterEngine extends InternalEngine {
         this.shardDirectory = shardDirectory;
         this.localNodeId = localNodeId;
         this.walChunkService = walChunkService;
+        // Acquired synchronously, before this engine is usable, so CompactionSchedulerTask's
+        // isLeaseHeldAt guard can actually observe this writer as active (see
+        // acquireOrRenewLease's javadoc -- fencing correctness itself lives entirely in
+        // publishCommitAsHead, not here). A failure here means real evidence (a publication) that
+        // this node's term assignment is already stale -- it must not come up as this shard's
+        // writer at all. super(engineConfig) above has already opened the local translog/store, so
+        // those must be closed before rethrowing -- this constructor cannot rely on close() being
+        // called for it, since a constructor that throws never produces an object for a caller to
+        // close.
+        try {
+            boolean acquired = headPublisher.acquireOrRenewLease(
+                indexUuid,
+                shardId,
+                engineConfig.getPrimaryTermSupplier().getAsLong(),
+                localNodeId,
+                System.currentTimeMillis() + LEASE_TTL_MILLIS
+            );
+            if (acquired == false) {
+                throw new EngineException(
+                    engineConfig.getShardId(),
+                    "failed to acquire writer lease: a newer primary term already holds this shard's head"
+                );
+            }
+        } catch (EngineException e) {
+            IOUtils.closeWhileHandlingException(super::close);
+            throw e;
+        } catch (IOException e) {
+            IOUtils.closeWhileHandlingException(super::close);
+            throw new EngineException(engineConfig.getShardId(), "failed to acquire writer lease", e);
+        }
         // Report once synchronously so the shard is discoverable immediately on activation, rather
         // than waiting out the first refresh interval; scheduleWithFixedDelay's first execution
         // only happens after DIRECTORY_REFRESH_INTERVAL elapses, not on registration.
         refreshDirectoryEntry();
         this.directoryRefreshTask = engineConfig.getThreadPool()
             .scheduleWithFixedDelay(this::refreshDirectoryEntry, DIRECTORY_REFRESH_INTERVAL, ThreadPool.Names.GENERIC);
+        this.leaseRenewalTask = engineConfig.getThreadPool()
+            .scheduleWithFixedDelay(this::renewLease, LEASE_RENEWAL_INTERVAL, ThreadPool.Names.GENERIC);
         this.pitrRetentionTask = pitrRetentionConfig == null
             ? null
             : new PitrRetentionSchedulerTask(
@@ -418,9 +464,34 @@ public class ObjectStoreWriterEngine extends InternalEngine {
         );
     }
 
+    /**
+     * Best-effort, like {@link #refreshDirectoryEntry}: a transient failure here is logged and
+     * retried next tick rather than failing the engine, since the lease's own {@link
+     * #LEASE_TTL_MILLIS} margin -- renewed well before expiry, same rationale as {@link
+     * #DIRECTORY_REFRESH_INTERVAL} -- already bounds how stale a missed renewal can leave things.
+     * If renewals keep failing until the lease actually lapses, {@code CompactionSchedulerTask} may
+     * start treating this shard as available -- an efficiency question (a compactor briefly racing
+     * this still-live writer's own local merges), not a correctness one: publication remains
+     * protected by {@code ShardHead}'s own CAS, so nothing is lost or corrupted either way.
+     */
+    private void renewLease() {
+        try {
+            headPublisher.acquireOrRenewLease(
+                indexUuid,
+                shardId,
+                engineConfig.getPrimaryTermSupplier().getAsLong(),
+                localNodeId,
+                System.currentTimeMillis() + LEASE_TTL_MILLIS
+            );
+        } catch (Exception e) {
+            logger.warn("failed to renew writer lease, will retry next tick", e);
+        }
+    }
+
     @Override
     public void close() throws IOException {
         directoryRefreshTask.cancel();
+        leaseRenewalTask.cancel();
         if (pitrRetentionTask != null) {
             pitrRetentionTask.close();
         }

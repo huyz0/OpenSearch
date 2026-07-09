@@ -1424,8 +1424,8 @@ scale-to-zero/cold-start, balancer hysteresis. Milestone: idle index consumes ze
 first query after idle returns < 5 s p95 for a cached-manifest index.
 
 **Phase 4.5 — Compaction service (candidate selection, rebase protocol, real Lucene merge,
-size-tiered shaping, background scheduling, and a real concurrent-writer data-loss bug all
-done/fixed; lease-offload negotiation's remaining design work still open).** Its hard dependency,
+size-tiered shaping, background scheduling, a real concurrent-writer data-loss bug, and real lease
+acquisition/renewal all done/fixed; explicit offload-handoff negotiation still open).** Its hard dependency,
 shard-head CAS (metadata-plane RFC Phase 2.5), is done and generically `BlobContainer`-backed
 (`BlobContainerShardStateStore`). `CompactionPolicy` (candidate selection from
 segment-count/size/delete-ratio metrics, matching &sect;7.4's "readable without opening the
@@ -1507,10 +1507,63 @@ doc-values data, not its file name or size) and is always reported as `0.0`; per
 fires from this estimator, a missed optimization rather than a correctness issue -- the
 segment-count/size triggers, which don't depend on it, are unaffected.
 
-Still open: the compactor role/lease-offload negotiation with an active writer (now precisely
-scoped above, not vague). Milestone (met): a quiescent 40-segment shard is compacted to size-tiered
-shape with no writer ever activating, concurrently with a surprise writer re-activation -- the
-rebase protocol, a real merge, size-tiered shaping, and now background scheduling are all
+**Real lease acquisition/renewal, closing a dormant fencing bug found while investigating this**:
+`ShardHead.leaseHolderNodeId`/`leaseExpiryMillis` existed from the start, but nothing ever wrote
+them -- `ShardHead#withNewLease` (the only method that touched them) had zero callers anywhere in
+this plugin's main code, confirmed by grep before writing a single line here. Two consequences,
+one cosmetic and one a real correctness gap:
+
+1. `CompactionSchedulerTask`'s `isLeaseHeldAt` guard was dead code in practice -- the lease was
+   never held, so the "skip if an active writer holds the lease" branch could never actually fire,
+   silently defeating the whole point of that check.
+2. The more serious one: `ObjectStoreCommitHeadPublisher#publishCommitAsHead`'s original fencing
+   check was `currentHead.primaryTerm() != primaryTerm`, fencing out *any* mismatch, higher or
+   lower. Since nothing ever advanced `ShardHead.primaryTerm()` ahead of an actual publish, a
+   writer activating under a legitimately bumped primary term (a real failover) would find the head
+   still at the old term and be fenced out on its own very first commit -- a dormant failover bug
+   that only tests happening to use term 1 throughout (matching `ShardHead.initial()`'s coincidental
+   term 1) had ever avoided exercising.
+
+Fixed with two separable changes, kept deliberately independent so acquiring/renewing a lease can
+never corrupt manifest addressing:
+
+- `ObjectStoreWriterEngine` now acquires the lease synchronously during construction (so a
+  superseded activation attempt fails fast rather than accepting writes it can never publish) and
+  renews it on its own schedule (`LEASE_TTL_MILLIS` = 30s, renewed every 10s -- the same
+  well-inside-the-TTL rationale as the existing directory-entry refresh) via
+  `ObjectStoreCommitHeadPublisher#acquireOrRenewLease`, a CAS-retry loop mirroring
+  `publishCommitAsHead`'s own shape.
+- `acquireOrRenewLease` deliberately never writes `primaryTerm`: only `publishCommitAsHead` may
+  legitimately advance it (via the new `ShardHead#withPublishedGeneration(primaryTerm, generation)`
+  overload), fixing the fencing check itself to `currentHead.primaryTerm() > primaryTerm` (fence
+  only a writer genuinely superseded by evidence of a newer publish, not merely an older-but-not-yet-
+  superseded term). This was the real design trap in an earlier draft of this fix: writing
+  `primaryTerm` eagerly during lease acquisition, ahead of any publish, looked appealing but broke
+  `readLatestManifest`'s "the head's `(primaryTerm, latestManifestGeneration)` pair always points at
+  the last real manifest" invariant, since a lease-only head could point at a `(term, 0)` manifest
+  that was never written -- caught by `ObjectStoreWriterEngineTests`' own WAL-replay-across-failover
+  test failing with a real `NoSuchFileException`, not reasoned out in advance.
+- A second-order consequence of the same root cause, also caught by tests rather than assumed: a
+  brand-new shard's very first lease acquisition now put-if-absents a `ShardHead` with generation 0
+  *before* anything is published, which broke every caller that had assumed "a head exists" implied
+  "something was published" (`readLatestManifest`, `ReaderEngineFactory`). Both now additionally
+  check `latestManifestGeneration() == 0` as the "nothing published yet" sentinel,
+  matching the convention `CompactionSchedulerTask` already used for the same reason. Caught first by
+  `ServerlessStorageWriterFailoverIT` failing a brand-new shard's very first allocation (not a
+  failover at all) with a manifest-not-found error -- a reminder that a multi-node IT can catch a
+  regression a unit-level CAS test's narrower fixture won't.
+
+Verified: full reader/writer/compaction/shardstate unit suites (stable across 3 repeated runs with
+fresh seeds), and `ServerlessStorageWriterFailoverIT` (real multi-node kill-and-recover, not a
+simulation) green again after the fix above.
+
+Still open: the compactor role/lease-offload negotiation with an active writer -- now smaller in
+scope than before this increment, since the lease itself is real and renewed; what remains is only
+the "or accepts explicit offload handoffs from busy writers" half of §7.4's original design (a
+writer proactively yielding compactor rights for one cycle), not the whole mechanism. Milestone
+(met): a quiescent 40-segment shard is compacted to size-tiered shape with no writer ever
+activating, concurrently with a surprise writer re-activation -- the rebase protocol, a real merge,
+size-tiered shaping, background scheduling, and now real lease acquisition/renewal are all
 implemented and tested together.
 
 **Phase 4.6 — Snapshots/clones/PITR (manifest pinning and PITR retention wiring done; clone not

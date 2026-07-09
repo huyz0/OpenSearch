@@ -233,7 +233,7 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
         }
     }
 
-    public void testFlushFailsTheEngineWhenAlreadyFencedOutByAHigherTerm() throws Exception {
+    public void testConstructionFailsWhenAlreadyFencedOutByAHigherTerm() throws Exception {
         FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
         BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
         ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
@@ -242,8 +242,11 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
             new BlobContainerManifestStore(blobContainer)
         );
 
-        // Another node already activated the shard at a higher term before this engine flushes --
-        // this writer has been fenced out even though it doesn't know it yet.
+        // Another node already activated the shard at a higher term before this engine even
+        // constructs -- lease acquisition (done synchronously during construction, see
+        // ObjectStoreWriterEngine's own javadoc) now catches this immediately, rather than letting a
+        // doomed writer accept writes it could never publish until its first flush discovers the
+        // fencing.
         shardStateStore.compareAndSet(
             shardId.getIndex().getUUID(),
             shardId.getId(),
@@ -251,15 +254,10 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
             new ShardHead(primaryTerm.get() + 1, "other-node", 0L, 0L)
         );
 
-        ObjectStoreWriterEngine engine = openWriterEngine(shardStateStore, commitPublisher);
         try {
-            index(engine, "1");
-            expectThrows(Exception.class, () -> engine.flush(true, true));
-            // A fenced-out writer's engine is failed, not just this one call: any further use
-            // must also fail rather than silently continuing to accept writes.
-            expectThrows(Exception.class, () -> index(engine, "2"));
+            expectThrows(Exception.class, () -> openWriterEngine(shardStateStore, commitPublisher));
         } finally {
-            IOUtils.close(engine, lastOpenedStore);
+            IOUtils.close(lastOpenedStore);
         }
     }
 

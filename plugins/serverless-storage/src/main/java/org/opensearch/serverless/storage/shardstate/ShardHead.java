@@ -78,15 +78,50 @@ public final class ShardHead implements Writeable {
         return leaseHolderNodeId != null && nowMillis < leaseExpiryMillis;
     }
 
-    /** The head after this node wins activation: term bumped (on failover) or held, new lease, generation reset for a new term. */
-    public ShardHead withNewLease(String nodeId, long leaseExpiryMillis, boolean isNewTerm) {
-        long newTerm = isNewTerm ? primaryTerm + 1 : primaryTerm;
-        long newGeneration = isNewTerm ? 0 : latestManifestGeneration;
-        return new ShardHead(newTerm, nodeId, leaseExpiryMillis, newGeneration);
+    /**
+     * The head after a writer acquires or renews the lease (rfc-serverless-opensearch.md &sect;16
+     * Phase 4.5's lease-acquisition note), leaving {@code primaryTerm} and {@code
+     * latestManifestGeneration} completely untouched. Term advancement is deliberately not this
+     * method's job -- only a real publication (see {@link #withPublishedGeneration(long, long)})
+     * changes {@code primaryTerm}, so the head's {@code (primaryTerm, latestManifestGeneration)}
+     * pair always stays a valid pointer to the last real manifest ({@code
+     * ObjectStoreCommitHeadPublisher#readLatestManifest} depends on this): if lease acquisition
+     * instead wrote a newly-activating writer's not-yet-published term into the head, that pointer
+     * would dangle at a manifest that does not exist yet.
+     */
+    public ShardHead withRenewedLease(String nodeId, long leaseExpiryMillis) {
+        return new ShardHead(primaryTerm, nodeId, leaseExpiryMillis, latestManifestGeneration);
     }
 
     /** The head after a publication advances the manifest generation under the current term/lease. */
     public ShardHead withPublishedGeneration(long generation) {
+        if (generation <= latestManifestGeneration) {
+            throw new IllegalArgumentException(
+                "new generation " + generation + " must be > current generation " + latestManifestGeneration
+            );
+        }
+        return new ShardHead(primaryTerm, leaseHolderNodeId, leaseExpiryMillis, generation);
+    }
+
+    /**
+     * The head after a publication advances both the manifest generation and (if the publishing
+     * writer's term is newer) the lease term itself -- the one legitimate way {@code primaryTerm}
+     * ever moves forward (rfc-serverless-opensearch.md &sect;16 Phase 4.5): a writer activating
+     * under a newly bumped term is fenced out of publishing anything until its own first commit
+     * proves it live, at which point the head should reflect that new term from then on. See {@link
+     * #withPublishedGeneration(long)} for the same-term case, which this delegates to after
+     * validating the term.
+     *
+     * @throws IllegalArgumentException if {@code primaryTerm} is older than this head's current
+     *         term -- publishing under a term older than one already recorded here would mean a
+     *         stale writer is publishing after being superseded, which must never happen.
+     */
+    public ShardHead withPublishedGeneration(long primaryTerm, long generation) {
+        if (primaryTerm < this.primaryTerm) {
+            throw new IllegalArgumentException(
+                "cannot publish under stale primaryTerm " + primaryTerm + " < current term " + this.primaryTerm
+            );
+        }
         if (generation <= latestManifestGeneration) {
             throw new IllegalArgumentException(
                 "new generation " + generation + " must be > current generation " + latestManifestGeneration

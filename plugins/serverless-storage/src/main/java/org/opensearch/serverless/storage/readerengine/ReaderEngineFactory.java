@@ -69,7 +69,11 @@ public final class ReaderEngineFactory implements EngineFactory {
             String indexUuid = config.getShardId().getIndex().getUUID();
             int shardId = config.getShardId().getId();
             Optional<VersionedShardHead> head = shardStateStore.get(indexUuid, shardId);
-            if (head.isEmpty()) {
+            // generation 0 means a head exists (e.g. a writer's lease acquisition put one there
+            // ahead of any commit, see ObjectStoreCommitHeadPublisher#acquireOrRenewLease) but
+            // nothing has actually been published yet -- same "nothing for a reader to open" case
+            // as no head at all.
+            if (head.isEmpty() || head.get().head().latestManifestGeneration() == 0) {
                 throw new IllegalStateException("no published head for shard " + config.getShardId() + "; nothing for a reader to open");
             }
             ShardHead shardHead = head.get().head();
