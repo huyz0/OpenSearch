@@ -187,6 +187,22 @@ single shard's own, since the WAL is shared -- before writing the Java). Tracked
 it isn't lost track of as a "someday" item: this is the next real correctness-bearing gap in this
 area, not a cosmetic one.
 
+**The actual hard part of this design, found while scoping it further (not yet resolved): safe
+*deregistration*, not the sweep itself.** A GC sweep that deletes chunks below the minimum covered
+`WalPosition` across every shard known to use this epoch is safe by construction as long as that
+"known to use this epoch" set only ever grows -- exactly the same shape `CloneGc.tla`'s `Fixed`
+variant already proves sound for a different mechanism (pin before read, never remove early). But a
+set that only grows never actually bounds storage for the common case that motivates this feature
+at all: a shard relocates away from this node and will never write to this epoch again, yet nothing
+safe currently exists to *remove* it from the covering set, so it would silently keep the sweep's
+minimum pinned at wherever that shard's last publish left off, forever -- solving nothing for the
+node it left. Determining "this shard will genuinely never need this epoch's chunks again" cleanly
+is real, unsolved design work (it depends on knowing whether some *later* writer for that shard, on
+any node, has advanced past every chunk this epoch could still hold, not just on the shard being
+gone from this node) -- this is the actual open question a `CloneGc.tla`-style model needs to
+answer before the sweep itself is worth implementing, not the sweep's own delete condition, which
+is already the easy, already-solved part.
+
 **A separate, more severe sibling bug was also found while investigating the gap above -- and,
 unlike the deletion gap, verified and fixed in the same session: two nodes with WAL mirroring
 enabled against the same shared `serverless_storage.base_path` could silently overwrite each
