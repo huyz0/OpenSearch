@@ -757,18 +757,25 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     }
 
     /**
-     * The first user-facing REST/transport surface this plugin exposes
-     * (rfc-serverless-opensearch.md &sect;14): {@code ShardCloner} itself has existed since the
-     * clone feature landed, reachable only from Java code within the plugin until now.
+     * The user-facing REST/transport surface this plugin exposes: zero-copy clone
+     * (rfc-serverless-opensearch.md &sect;14, {@code ShardCloner} itself existed since the clone
+     * feature landed but was reachable only from Java code within the plugin until now) and an
+     * on-demand compaction trigger (&sect;7.4, &sect;16 Phase 4.5's "narrower than originally
+     * scoped" gap -- {@code CompactionSchedulerTask}'s own background schedule already existed;
+     * this adds a way to trigger the same check immediately rather than waiting it out).
      */
     @Override
     public
         java.util.List<ActionHandler<? extends org.opensearch.action.ActionRequest, ? extends org.opensearch.core.action.ActionResponse>>
         getActions() {
-        return Collections.singletonList(
+        return java.util.List.of(
             new ActionHandler<>(
                 org.opensearch.serverless.storage.clone.action.ShardCloneAction.INSTANCE,
                 org.opensearch.serverless.storage.clone.action.TransportShardCloneAction.class
+            ),
+            new ActionHandler<>(
+                org.opensearch.serverless.storage.compaction.action.CompactionTriggerAction.INSTANCE,
+                org.opensearch.serverless.storage.compaction.action.TransportCompactionTriggerAction.class
             )
         );
     }
@@ -783,7 +790,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         IndexNameExpressionResolver indexNameExpressionResolver,
         java.util.function.Supplier<org.opensearch.cluster.node.DiscoveryNodes> nodesInCluster
     ) {
-        return Collections.singletonList(new org.opensearch.serverless.storage.clone.action.RestShardCloneAction());
+        return java.util.List.of(
+            new org.opensearch.serverless.storage.clone.action.RestShardCloneAction(),
+            new org.opensearch.serverless.storage.compaction.action.RestCompactionTriggerAction()
+        );
     }
 
     /** The node-shared bundle cache {@link #createComponents} built -- test-only visibility, not part of the plugin's contract. */

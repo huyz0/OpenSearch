@@ -971,6 +971,25 @@ already-shipped background scheduler and this hypothetical redirect already hand
 race, and real writer lease acquisition/renewal (Phase 4.5 below) now gives an accurate,
 non-dead-code "is a writer currently active" check to gate the redirect on.
 
+**A caller no longer has to wait out the background schedule -- via this plugin's own namespace,
+not a `_forcemerge` redirect.** `POST /_plugins/_serverless/storage/_compact` (body:
+`{"index_uuid", "shard_id"}`) triggers one immediate compaction-candidacy check and, if the shard
+is a candidate, one publish attempt, without touching core's `_forcemerge` machinery or needing
+the core transport-layer work that redirect would require. `CompactionSchedulerTask`'s own
+per-tick decision logic was factored into a `public static maybeCompact(...)` so the scheduled
+task and this on-demand trigger share exactly one implementation, never two copies that could
+drift; `TransportCompactionTriggerAction` builds the same shape of stores the scheduled task
+already needs from `ServerlessStoragePlugin#blobContainerForDirectoryFactory` (the same resolution
+seam the clone action already established) and requires no routing to a specific data node, since
+the attempt operates purely against the shared object store and the shard's CAS-guarded head, not
+any node-local state -- not even a live writer's lease, matching `CompactionSchedulerTask`'s own
+deliberate "does not skip just because a writer's lease is held" behavior. Verified end to end
+over the real transport layer in a running cluster: a real shard with ten genuinely separate
+flushed segments (`NoMergePolicy` on the writer, so Lucene's own auto-merge never interferes) is
+recognized as a compaction candidate and merged down to one segment via
+`client().execute(CompactionTriggerAction.INSTANCE, ...)`, and a shard that was never activated
+returns a safe `attempted: false` rather than an error.
+
 ## 8. Publication and Consistency
 
 - After each manifest upload, the writer sends a small **publication notification**
