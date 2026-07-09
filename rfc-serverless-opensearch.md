@@ -2328,11 +2328,29 @@ directions documented so serverless adoption is not a one-way door.
     directory/repository configuration) or need an explicit compatibility decision is genuinely
     unknown -- found while investigating why no internal-cluster test exercises the lazy directory
     or reader engine against a real search-only shard, not by attempting the integration and
-    hitting a failure. Needs a real experiment (a serverless-storage index with
-    `index.remote_store.enabled: true` and `index.number_of_search_replicas: 1`, observing what
-    engine and directory the resulting search-only shard copy actually receives) before the
-    reader-shard story can be considered proven beyond the synthetic-routing level it's tested at
-    today.
+    hitting a failure.
+
+    Tracing `IndexService#createShard` (not yet verified by running it) suggests the two are
+    *structurally* independent, not directly conflicting: when `targetNode.isRemoteSegmentStoreNode()`,
+    core builds a separate `remoteStore`/`remoteDirectory` pair (for its own remote segment-store
+    upload machinery) entirely apart from this plugin's own local `directory =
+    directoryFactory.newDirectory(this.indexSettings, path, routing)` call, which runs unconditionally
+    either way and is what `ObjectStoreWriterEngine`/`ObjectStoreReaderEngine` actually use --
+    neither engine ever references `remoteStore`. So a serverless-storage index with
+    `remote_store.enabled: true` would likely *not* crash outright, but would likely run core's own
+    remote segment-store upload machinery pointlessly in the background alongside this plugin's own
+    manifest/bundle publication -- the same "two competing durability mechanisms for one shard"
+    concern already identified and rejected for explicit `SEGMENT` replication type (§18 risk #7),
+    just via a different setting this plugin's validation doesn't currently know to reject. If that
+    reasoning holds, the real design question sharpens from "does it conflict" to "does
+    `ServerlessStorageIndexSettingProvider` need to reject `remote_store.enabled` too, and if so,
+    how does this plugin ever create a reader shard at all, since `index.number_of_search_replicas`
+    currently requires it" -- a genuine unresolved tension between §18 risk #7's own reasoning and
+    the reader-shard story, not just an unverified compatibility question. Needs a real experiment
+    (a serverless-storage index with `index.remote_store.enabled: true` and
+    `index.number_of_search_replicas: 1`, observing what engine and directory the resulting
+    search-only shard copy actually receives, and whether remote segment uploads actually fire) to
+    move from code-reading inference to a verified answer.
 
 ## 19. Summary
 
