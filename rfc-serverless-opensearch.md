@@ -2225,7 +2225,15 @@ directions documented so serverless adoption is not a one-way door.
    (§5, principle 1) — but only after Phase 3 proves the reader path.
 7. **Segment replication compatibility.** Serverless mode supersedes segrep (publication *is*
    segment replication via storage). Indices can't mix modes; enforce at index-settings
-   validation.
+   validation. **Status: implemented and tested.** `ServerlessStorageIndexSettingProvider` now
+   rejects index creation outright when both `index.serverless_storage.enabled: true` and an
+   explicit `index.replication.type: SEGMENT` are requested together, with a message explaining
+   that manifest publication already is this shard's segment replication mechanism. The default
+   (no explicit `index.replication.type`) and an explicit `DOCUMENT` are both still accepted --
+   only an explicit request for core's own `SEGMENT` replication conflicts, since that is the one
+   value that would configure a second, competing segment-distribution mechanism for the same
+   shard. An ordinary (non-serverless-storage) index requesting `SEGMENT` replication is
+   completely unaffected, as this validation only ever fires when serverless storage is enabled.
 8. **Vector/kNN workloads.** HNSW graph traversal is random-access over large structures —
    nearly the worst case for a 1 MB-block LRU cache. Vector-heavy indices likely need a
    distinct cache class (pin whole graphs while a shard is query-active) and possibly
