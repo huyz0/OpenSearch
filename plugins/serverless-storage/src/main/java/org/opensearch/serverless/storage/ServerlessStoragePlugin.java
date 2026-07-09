@@ -282,6 +282,21 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * Per-shard fairness budget for the one node-shared {@code WalChunkService}
+     * (rfc-serverless-opensearch.md &sect;18 risk #4, "WAL multiplexing fairness") -- a shard whose
+     * own buffered payload bytes since its last flush cross this budget is immediately siphoned
+     * into its own dedicated chunk, so one noisy shard sharing the buffer can never delay acks for
+     * every other shard indefinitely. Non-positive (the default) disables the budget entirely,
+     * matching how every other optional-feature-off default in this plugin is expressed -- see
+     * {@code WalChunkService}'s own javadoc for the full mechanism.
+     */
+    public static final Setting<ByteSizeValue> SERVERLESS_STORAGE_WAL_PER_SHARD_BUDGET_SETTING = Setting.byteSizeSetting(
+        "serverless_storage.wal_per_shard_budget",
+        ByteSizeValue.ZERO,
+        Setting.Property.NodeScope
+    );
+
+    /**
      * Budget for the one node-shared {@link FileCache} backing every reader shard opted into
      * {@link #LAZY_DIRECTORY_STORE_TYPE} (rfc-serverless-opensearch.md &sect;9's "one node block
      * cache" target) -- reused directly from core's own searchable-snapshots feature, not a new
@@ -347,6 +362,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_GC_INTERVAL_SETTING,
             SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING,
             SERVERLESS_STORAGE_WAL_GC_INTERVAL_SETTING,
+            SERVERLESS_STORAGE_WAL_PER_SHARD_BUDGET_SETTING,
             SERVERLESS_STORAGE_LAZY_DIRECTORY_CACHE_SIZE_SETTING,
             SERVERLESS_STORAGE_LAZY_DIRECTORY_ENABLED_SETTING
         );
@@ -460,7 +476,11 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 // an epoch-directory one, so nothing depends on this value being stable across
                 // restarts; it only needs to be unique enough that this process's chunk sequence
                 // numbering never collides with a prior incarnation's.
-                sharedWalChunkService = new WalChunkService(walBlobContainer, UUIDs.base64UUID());
+                sharedWalChunkService = new WalChunkService(
+                    walBlobContainer,
+                    UUIDs.base64UUID(),
+                    SERVERLESS_STORAGE_WAL_PER_SHARD_BUDGET_SETTING.get(environment.settings()).getBytes()
+                );
 
                 TimeValue configuredWalGcInterval = SERVERLESS_STORAGE_WAL_GC_INTERVAL_SETTING.get(environment.settings());
                 if (configuredWalGcInterval.millis() > 0) {
@@ -799,5 +819,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     /** The node-shared bundle cache {@link #createComponents} built -- test-only visibility, not part of the plugin's contract. */
     InMemoryPlaintextBundleCache sharedBundleCacheForTesting() {
         return sharedBundleCache;
+    }
+
+    /** The node-shared WAL chunk service {@link #createComponents} built, or {@code null} if WAL mirroring is off -- test-only visibility. */
+    WalChunkService sharedWalChunkServiceForTesting() {
+        return sharedWalChunkService;
     }
 }

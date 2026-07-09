@@ -2164,10 +2164,16 @@ directions documented so serverless adoption is not a one-way door.
    overflowed shard's byte counter resets so it can accumulate again rather than overflowing on
    every subsequent append; an ordinary `flush()` clears every shard's counter too, not just the
    buffer. `WalMirroringTranslog`'s one current caller flushes after every single append already
-   (per-operation durability), so it never actually accumulates a multi-shard buffer today and
-   doesn't yet pass a budget -- this mitigation is real infrastructure for the node-level,
-   genuinely-batched caller `WalChunkService`'s own class javadoc already describes as the
-   component's actual target use, not yet exercised by a real multi-shard-batching caller.
+   (per-operation durability), so it never actually accumulates a multi-shard buffer today --
+   this mitigation is real infrastructure for the node-level, genuinely-batched caller
+   `WalChunkService`'s own class javadoc already describes as the component's actual target use.
+   **The budget is now a real, configurable node setting, closing what was previously a
+   construction-time-only capability with no way to actually set it**: `sharedWalChunkService` is
+   now built from `serverless_storage.wal_per_shard_budget` (a `ByteSizeValue`, zero/disabled by
+   default, matching every other optional-feature-off default in this plugin) instead of always
+   passing the 2-argument, budget-disabled constructor overload. Verified: the default setting
+   still constructs a disabled (`<= 0`) budget, and an explicit `512kb` value is threaded through
+   to the constructed `WalChunkService` unchanged.
 5. **Coordination-free GC** is the subtlest correctness surface. The lease/TTL design must be
    model-checked (TLA+ or equivalent) before Phase 1 completes — this is the one component
    where a design bug destroys data. The model must cover cross-index bundle references from

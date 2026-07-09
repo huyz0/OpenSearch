@@ -108,6 +108,11 @@ public final class WalChunkService implements WalAppendTarget {
         this.perShardBudgetBytes = perShardBudgetBytes;
     }
 
+    /** The configured per-shard fairness budget, exposed for tests confirming node-setting wiring; not part of the read/write API. */
+    public long perShardBudgetBytesForTesting() {
+        return perShardBudgetBytes;
+    }
+
     /**
      * A bounded retry budget for {@link #claimNextChunkSequence}, matching the same
      * bounded-not-unbounded shape {@link org.opensearch.serverless.storage.retention.BlobContainerDurablePinRegistry#mutate}

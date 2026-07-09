@@ -199,6 +199,37 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
         assertTrue(factory.get() instanceof WriterEngineFactory);
     }
 
+    public void testWalPerShardBudgetSettingDefaultsToDisabled() {
+        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin();
+        Path basePath = createTempDir();
+        Settings nodeSettings = Settings.builder()
+            .put("path.home", createTempDir().toString())
+            .putList("path.repo", basePath.toString())
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey(), basePath.toString())
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING.getKey(), true)
+            .build();
+        Environment environment = TestEnvironment.newEnvironment(nodeSettings);
+        plugin.createComponents(null, null, null, null, null, null, environment, null, null, null, null);
+
+        assertEquals(0L, plugin.sharedWalChunkServiceForTesting().perShardBudgetBytesForTesting());
+    }
+
+    public void testWalPerShardBudgetSettingIsThreadedIntoTheSharedWalChunkService() {
+        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin();
+        Path basePath = createTempDir();
+        Settings nodeSettings = Settings.builder()
+            .put("path.home", createTempDir().toString())
+            .putList("path.repo", basePath.toString())
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey(), basePath.toString())
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING.getKey(), true)
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_WAL_PER_SHARD_BUDGET_SETTING.getKey(), "512kb")
+            .build();
+        Environment environment = TestEnvironment.newEnvironment(nodeSettings);
+        plugin.createComponents(null, null, null, null, null, null, environment, null, null, null, null);
+
+        assertEquals(512L * 1024, plugin.sharedWalChunkServiceForTesting().perShardBudgetBytesForTesting());
+    }
+
     public void testWalMirroringDisabledByDefaultStillConstructsAWriterEngineFactory() {
         // The default-off setting must never be a hard requirement: every existing deployment of
         // this plugin (and every other test in this class) constructs a WriterEngineFactory with
