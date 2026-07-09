@@ -38,6 +38,9 @@ import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.script.ScriptService;
 import org.opensearch.serverless.storage.allocation.ReaderShardPlacementAllocationDecider;
 import org.opensearch.serverless.storage.allocation.ServerlessStorageExistingShardsAllocator;
+import org.opensearch.serverless.storage.compaction.CompactionPolicy;
+import org.opensearch.serverless.storage.compaction.CompactionRebaseExecutor;
+import org.opensearch.serverless.storage.compaction.CompactionSchedulerConfig;
 import org.opensearch.serverless.storage.directory.InMemoryShardDirectory;
 import org.opensearch.serverless.storage.directory.ShardDirectory;
 import org.opensearch.serverless.storage.format.BlobContainerBundleStore;
@@ -180,6 +183,23 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         Setting.Property.NodeScope
     );
 
+    /**
+     * How often a reader shard's own background {@code CompactionSchedulerTask} evaluates whether
+     * its shard is worth compacting (rfc-serverless-opensearch.md &sect;16 Phase 4.5). A reader
+     * shard is this scheduler's home rather than a writer shard: a writer's own lease is always
+     * held while that writer is open, so a scheduler attached to the writer itself would always see
+     * its own lease as held and never do anything -- see {@code ObjectStoreReaderEngine}'s own
+     * javadoc. Non-positive (the default) disables background compaction scheduling entirely, same
+     * shape as every other optional-feature-off default in this plugin -- a quiescent shard's
+     * segments then only shrink via {@code _forcemerge} while a writer happens to be active, exactly
+     * today's (pre-this-feature) behavior.
+     */
+    public static final Setting<TimeValue> SERVERLESS_STORAGE_COMPACTION_INTERVAL_SETTING = Setting.timeSetting(
+        "serverless_storage.compaction.interval",
+        TimeValue.MINUS_ONE,
+        Setting.Property.NodeScope
+    );
+
     private volatile Path basePath;
     private volatile Path localCacheRoot;
     private volatile EncryptionKeyProvider encryptionKeyProvider;
@@ -188,6 +208,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     private volatile long pitrWindowMillis = -1;
     private volatile ReaderShardAdmissionController readerShardAdmissionController;
     private volatile WalChunkService sharedWalChunkService;
+    private volatile TimeValue compactionInterval;
     // One node-local directory instance shared by every shard on this node -- matches the target
     // design's "one node block cache" shape (&sect;9) rather than a per-shard instance, and needs
     // no I/O to construct, so it's safe to build eagerly rather than threading through createComponents.
@@ -202,7 +223,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_BUNDLE_CACHE_SIZE_SETTING,
             SERVERLESS_STORAGE_PITR_WINDOW_SETTING,
             SERVERLESS_STORAGE_MAX_CONCURRENT_READER_SHARDS_SETTING,
-            SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING
+            SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING,
+            SERVERLESS_STORAGE_COMPACTION_INTERVAL_SETTING
         );
     }
 
@@ -246,6 +268,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_BUNDLE_CACHE_SIZE_SETTING.get(environment.settings()).getBytes()
         );
         pitrWindowMillis = SERVERLESS_STORAGE_PITR_WINDOW_SETTING.get(environment.settings()).millis();
+        TimeValue configuredCompactionInterval = SERVERLESS_STORAGE_COMPACTION_INTERVAL_SETTING.get(environment.settings());
+        compactionInterval = configuredCompactionInterval.millis() > 0 ? configuredCompactionInterval : null;
         int maxConcurrentReaderShards = SERVERLESS_STORAGE_MAX_CONCURRENT_READER_SHARDS_SETTING.get(environment.settings());
         readerShardAdmissionController = maxConcurrentReaderShards > 0
             ? new ReaderShardAdmissionController(maxConcurrentReaderShards)
@@ -309,6 +333,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
             BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(blobContainer);
             BlobContainerBundleStore bundleStore = new BlobContainerBundleStore(blobContainer);
+            // Shared by both roles below: the reader branch's own background CompactionSchedulerTask
+            // needs one just as much as the writer branch's ordinary commit-publish path does --
+            // cheap and stateless to construct once here rather than duplicating it in each branch.
+            ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(bundleStore, manifestStore);
 
             boolean isReaderShard = shardRouting != null && shardRouting.isSearchOnly();
             if (isReaderShard) {
@@ -331,6 +359,20 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                     BundleFileReader diskCache = new LocalDiskCachingBundleStore(bundleStore, shardCacheDir, encryptionKeyProvider);
                     readPath = new CachingBundleFileReader(sharedBundleCache, diskCache);
                 }
+                CompactionSchedulerConfig compactionConfig = compactionInterval == null
+                    ? null
+                    : new CompactionSchedulerConfig(
+                        compactionInterval,
+                        manifestStore,
+                        // Straight to the raw bundle store, not the (possibly cache-wrapped) readPath
+                        // above -- a merge reads every input segment file exactly once, so there's no
+                        // hot-rereading benefit a cache would give, matching WriterEngineFactory's own
+                        // "no caching layer needed" choice for its own materializer.
+                        new ObjectStoreCommitMaterializer(bundleStore),
+                        commitPublisher,
+                        CompactionPolicy.withDefaults(),
+                        new CompactionRebaseExecutor(shardStateStore, 5)
+                    );
                 return Optional.of(
                     new ReaderEngineFactory(
                         shardStateStore,
@@ -338,11 +380,11 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                         new ObjectStoreCommitMaterializer(readPath),
                         shardDirectory,
                         localNodeId,
-                        readerShardAdmissionController
+                        readerShardAdmissionController,
+                        compactionConfig
                     )
                 );
             }
-            ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(bundleStore, manifestStore);
             PitrRetentionConfig pitrRetentionConfig = null;
             if (pitrWindowMillis > 0) {
                 // Same blob container every other per-shard store here is scoped to -- a durable

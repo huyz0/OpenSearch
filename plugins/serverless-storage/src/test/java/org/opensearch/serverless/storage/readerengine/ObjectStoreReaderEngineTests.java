@@ -219,7 +219,8 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
                 manifestStore,
                 shardDirectory,
                 LOCAL_NODE_ID,
-                admissionController
+                admissionController,
+                null
             );
             try {
                 assertEquals(0, admissionController.availablePermits());
@@ -237,7 +238,8 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
                             manifestStore,
                             shardDirectory,
                             LOCAL_NODE_ID,
-                            admissionController
+                            admissionController,
+                            null
                         )
                     );
                     // A rejected open must not have leaked a permit or left any other side effect.
@@ -385,6 +387,124 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
                         searcher.search(new TermQuery(new Term("id", "2")), 10).totalHits.value()
                     );
                 }
+            }
+        } finally {
+            writer.close();
+            writerDirectory.close();
+        }
+    }
+
+    public void testReaderEnginesOwnBackgroundSchedulerCompactsAQuiescentShardWithNoWriterEverActivating() throws Exception {
+        // The gap found while wiring this up: CompactionSchedulerTask was fully implemented and
+        // tested in isolation, but nothing in ServerlessStoragePlugin ever actually constructed one
+        // -- background compaction was real in tests only, never in a running node. This proves the
+        // real wiring: a reader engine's own scheduler compacts a multi-segment, writer-less shard
+        // on its own, with no test-only direct method call the way testEngineAdvancesToANewerManifestGenerationOncePublished
+        // above exercises pollForNewerManifest.
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ObjectStoreCommitPublisher publisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+        org.opensearch.serverless.storage.shardstate.ShardStateStore shardStateStore =
+            new org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore(blobContainer);
+        BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(blobContainer);
+        ObjectStoreCommitMaterializer materializer = new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer));
+        ShardDirectory shardDirectory = new InMemoryShardDirectory();
+
+        Directory writerDirectory = new ByteBuffersDirectory();
+        // No merges of its own: every commit below must land as a genuinely separate segment, so
+        // there is real multi-segment work for the compactor to do.
+        IndexWriter writer = new IndexWriter(
+            writerDirectory,
+            new IndexWriterConfig().setMergePolicy(org.apache.lucene.index.NoMergePolicy.INSTANCE)
+        );
+
+        try (Store store = createStore()) {
+            EngineConfig engineConfig = config(defaultSettings, store, createTempDir(), newMergePolicy(), null);
+            String indexUuid = engineConfig.getShardId().getIndex().getUUID();
+            int shardId = engineConfig.getShardId().getId();
+
+            CommitManifest manifest = null;
+            for (int generation = 1; generation <= 3; generation++) {
+                Document doc = new Document();
+                doc.add(new StringField("id", String.valueOf(generation), Field.Store.YES));
+                writer.addDocument(doc);
+                writer.commit();
+                SegmentInfos segmentInfos = SegmentInfos.readLatestCommit(writerDirectory);
+                manifest = publisher.publishCommit(
+                    writerDirectory,
+                    segmentInfos,
+                    indexUuid,
+                    shardId,
+                    PRIMARY_TERM,
+                    generation,
+                    generation - 1,
+                    generation - 1,
+                    new WalPosition("epoch-0", 0),
+                    0,
+                    PruningStats.empty()
+                );
+            }
+            // No lease held -- exactly the "no writer ever activating" case the scheduler exists
+            // for; the manifest's own segment count (3, one per commit above, no local merging) is
+            // what CompactionPolicy below is tuned to treat as a candidate.
+            assertEquals(
+                org.opensearch.serverless.storage.shardstate.CasResult.SUCCESS,
+                shardStateStore.compareAndSet(
+                    indexUuid,
+                    shardId,
+                    java.util.Optional.empty(),
+                    new org.opensearch.serverless.storage.shardstate.ShardHead(PRIMARY_TERM, null, 0L, manifest.generation())
+                )
+            );
+
+            org.opensearch.serverless.storage.compaction.CompactionSchedulerConfig compactionConfig =
+                new org.opensearch.serverless.storage.compaction.CompactionSchedulerConfig(
+                    org.opensearch.common.unit.TimeValue.timeValueMillis(20),
+                    manifestStore,
+                    new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer)),
+                    publisher,
+                    new org.opensearch.serverless.storage.compaction.CompactionPolicy(2, 5L * 1024 * 1024 * 1024, 0.99),
+                    new org.opensearch.serverless.storage.compaction.CompactionRebaseExecutor(shardStateStore, 5)
+                );
+
+            try (
+                ObjectStoreReaderEngine readerEngine = ObjectStoreReaderEngine.open(
+                    engineConfig,
+                    manifest,
+                    materializer,
+                    PRIMARY_TERM,
+                    shardStateStore,
+                    manifestStore,
+                    shardDirectory,
+                    LOCAL_NODE_ID,
+                    null,
+                    compactionConfig
+                )
+            ) {
+                long generationBeforeCompaction = manifest.generation();
+                assertBusy(() -> {
+                    org.opensearch.serverless.storage.shardstate.VersionedShardHead current = shardStateStore.get(indexUuid, shardId)
+                        .orElseThrow();
+                    assertTrue(
+                        "the background scheduler must have published a newer, compacted manifest generation on its own",
+                        current.head().latestManifestGeneration() > generationBeforeCompaction
+                    );
+                    CommitManifest compacted = manifestStore.readManifest(PRIMARY_TERM, current.head().latestManifestGeneration());
+                    // The whole point of compaction: fewer Lucene segments than the 3 uncompacted
+                    // commits above produced (each with its own multi-file footprint -- .si, .cfs,
+                    // etc. -- so comparing files().size() directly would be counting the wrong
+                    // thing), with no writer ever activating to do it itself.
+                    int compactedSegmentCount = org.opensearch.serverless.storage.compaction.ManifestSegmentMetrics.from(
+                        compacted
+                    ).segmentCount;
+                    assertTrue(
+                        "the compacted manifest must have fewer segments than the uncompacted one, got " + compactedSegmentCount,
+                        compactedSegmentCount < 3
+                    );
+                });
             }
         } finally {
             writer.close();

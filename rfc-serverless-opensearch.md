@@ -1567,14 +1567,45 @@ Verified: full reader/writer/compaction/shardstate unit suites (stable across 3 
 fresh seeds), and `ServerlessStorageWriterFailoverIT` (real multi-node kill-and-recover, not a
 simulation) green again after the fix above.
 
+**Background scheduling was real in tests only, never in a running node, until now.** Investigating
+the `_forcemerge`-redirect idea below turned up that `CompactionSchedulerTask` -- fully implemented
+and tested since the "background scheduling done" note above was written -- was never actually
+instantiated anywhere in `ServerlessStoragePlugin`'s runtime wiring (confirmed by grep: only its own
+class file and test file referenced it). "A quiescent shard now gets compacted without a human or a
+writer ever triggering it" was true of the class in isolation, not of the plugin a node actually
+runs. Fixed: a reader shard's own engine now owns a `CompactionSchedulerTask` for its shard
+(`CompactionSchedulerConfig`, the same nullable-bundle-of-config-object shape as
+`PitrRetentionConfig`, threaded through `ReaderEngineFactory`/`ObjectStoreReaderEngine`, gated on a
+new node setting `serverless_storage.compaction.interval` -- non-positive, the default, disables it
+entirely). Deliberately *not* attached to the writer engine as well: a writer's own lease is always
+held while that writer is open, so a scheduler instance living there would always see its own lease
+as held and never fire -- a reader shard is the only sensible home, since it exists independently of
+whether any writer is currently active, including the "writer scaled to zero" case a writer-attached
+instance would structurally miss. Running redundantly across multiple reader copies of the same
+shard is safe, at worst wasted work, per `CompactionRebaseExecutor`'s own already-documented
+rebase-on-conflict safety argument. Verified with a new end-to-end test,
+`testReaderEnginesOwnBackgroundSchedulerCompactsAQuiescentShardWithNoWriterEverActivating`: three
+real, unmerged Lucene commits published with no lease ever held, a reader engine opened with a short
+scheduler interval, and `assertBusy` confirming the live head advances to a new, genuinely
+fewer-segment manifest with no test-only direct method call forcing the tick (unlike the
+generation-advance test above, which does call its poll method directly) -- this is the first test
+in this area that exercises the *scheduled* path end to end rather than a hand-invoked one.
+
 Still open: the compactor role/lease-offload negotiation with an active writer -- now smaller in
 scope than before this increment, since the lease itself is real and renewed; what remains is only
 the "or accepts explicit offload handoffs from busy writers" half of §7.4's original design (a
-writer proactively yielding compactor rights for one cycle), not the whole mechanism. Milestone
-(met): a quiescent 40-segment shard is compacted to size-tiered shape with no writer ever
-activating, concurrently with a surprise writer re-activation -- the rebase protocol, a real merge,
-size-tiered shaping, background scheduling, and now real lease acquisition/renewal are all
-implemented and tested together.
+writer proactively yielding compactor rights for one cycle), not the whole mechanism. Separately,
+triggering an immediate compaction pass on demand (rather than waiting out the scheduler's interval)
+was considered via redirecting core's `_forcemerge` action, but that path was scoped and rejected
+this session -- see §7's status note for why (it would require building against the
+experimental, actively-changing `Indexer`/`IndexerFactory` SPI, and still needs a real local `Store`
+underneath regardless, since `StoreRecovery` requires one ahead of any `Indexer` construction). A
+plugin-owned on-demand-compaction action, reusing this scheduler's exact tick logic directly (no
+core changes, no experimental SPI), remains a smaller, safer alternative if the on-demand case turns
+out to matter in practice. Milestone (met): a quiescent 40-segment shard is compacted to size-tiered
+shape with no writer ever activating, concurrently with a surprise writer re-activation -- the
+rebase protocol, a real merge, size-tiered shaping, real lease acquisition/renewal, and now actually-
+running background scheduling are all implemented, wired into the plugin, and tested together.
 
 **Phase 4.6 — Snapshots/clones/PITR (manifest pinning and PITR retention wiring done; clone not
 started).** Durable pins (§6.5) are implemented as `DurablePinRegistry`/`BlobContainerDurablePinRegistry`

@@ -15,6 +15,8 @@ import org.opensearch.index.engine.EngineException;
 import org.opensearch.index.engine.ReadOnlyEngine;
 import org.opensearch.index.seqno.SeqNoStats;
 import org.opensearch.index.translog.TranslogStats;
+import org.opensearch.serverless.storage.compaction.CompactionSchedulerConfig;
+import org.opensearch.serverless.storage.compaction.CompactionSchedulerTask;
 import org.opensearch.serverless.storage.directory.ShardDirectory;
 import org.opensearch.serverless.storage.directory.ShardDirectoryEntry;
 import org.opensearch.serverless.storage.directory.ShardRole;
@@ -108,6 +110,7 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
     private final Scheduler.Cancellable directoryRefreshTask;
     private final Scheduler.Cancellable manifestPollTask;
     private final ReaderShardAdmissionController admissionController;
+    private final CompactionSchedulerTask compactionSchedulerTask;
 
     private ObjectStoreReaderEngine(
         EngineConfig config,
@@ -119,7 +122,8 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
         ObjectStoreCommitMaterializer materializer,
         ShardDirectory shardDirectory,
         String localNodeId,
-        ReaderShardAdmissionController admissionController
+        ReaderShardAdmissionController admissionController,
+        CompactionSchedulerConfig compactionConfig
     ) {
         super(config, seqNoStats, new TranslogStats(), true, Function.identity(), false);
         this.indexUuid = config.getShardId().getIndex().getUUID();
@@ -140,6 +144,26 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
             .scheduleWithFixedDelay(this::refreshDirectoryEntry, DIRECTORY_REFRESH_INTERVAL, ThreadPool.Names.GENERIC);
         this.manifestPollTask = config.getThreadPool()
             .scheduleWithFixedDelay(this::pollForNewerManifest, MANIFEST_POLL_INTERVAL, ThreadPool.Names.GENERIC);
+        // A reader shard is a natural home for this: it exists for as long as the shard is
+        // searchable at all, including the "writer scaled to zero" case a writer-only scheduler
+        // instance would miss entirely (rfc-serverless-opensearch.md &sect;16 Phase 4.5). Running
+        // redundantly alongside a writer-attached instance (see ObjectStoreWriterEngine) or another
+        // reader copy's is safe, at worst wasted work -- CompactionRebaseExecutor's own rebase-on-
+        // conflict protocol already tolerates concurrent compactors.
+        this.compactionSchedulerTask = compactionConfig == null
+            ? null
+            : new CompactionSchedulerTask(
+                config.getThreadPool(),
+                compactionConfig.interval(),
+                indexUuid,
+                shardId,
+                shardStateStore,
+                compactionConfig.manifestStore(),
+                compactionConfig.materializer(),
+                compactionConfig.commitPublisher(),
+                compactionConfig.policy(),
+                compactionConfig.rebaseExecutor()
+            );
     }
 
     private void refreshDirectoryEntry() {
@@ -238,6 +262,9 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
     public void close() throws IOException {
         manifestPollTask.cancel();
         directoryRefreshTask.cancel();
+        if (compactionSchedulerTask != null) {
+            compactionSchedulerTask.close();
+        }
         if (admissionController != null) {
             admissionController.release();
         }
@@ -263,10 +290,14 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
         ShardDirectory shardDirectory,
         String localNodeId
     ) throws IOException {
-        return open(config, manifest, materializer, primaryTerm, shardStateStore, manifestStore, shardDirectory, localNodeId, null);
+        return open(config, manifest, materializer, primaryTerm, shardStateStore, manifestStore, shardDirectory, localNodeId, null, null);
     }
 
-    /** @param admissionController {@code null} to disable the admission cap entirely -- see its own javadoc. */
+    /**
+     * @param admissionController {@code null} to disable the admission cap entirely -- see its own javadoc.
+     * @param compactionConfig {@code null} to disable this reader's own background compaction
+     *        scheduler entirely -- see {@link CompactionSchedulerConfig}'s own javadoc.
+     */
     public static ObjectStoreReaderEngine open(
         EngineConfig config,
         CommitManifest manifest,
@@ -276,7 +307,8 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
         BlobContainerManifestStore manifestStore,
         ShardDirectory shardDirectory,
         String localNodeId,
-        ReaderShardAdmissionController admissionController
+        ReaderShardAdmissionController admissionController,
+        CompactionSchedulerConfig compactionConfig
     ) throws IOException {
         if (admissionController != null) {
             // Acquire before any I/O: rejecting an over-capacity open should never pay for a
@@ -300,7 +332,8 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
                 materializer,
                 shardDirectory,
                 localNodeId,
-                admissionController
+                admissionController,
+                compactionConfig
             );
         } catch (Exception e) {
             // The engine that would have owned releasing this permit in close() never got built --

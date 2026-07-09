@@ -12,6 +12,7 @@ import org.opensearch.index.engine.Engine;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.EngineCreationFailureException;
 import org.opensearch.index.engine.EngineFactory;
+import org.opensearch.serverless.storage.compaction.CompactionSchedulerConfig;
 import org.opensearch.serverless.storage.directory.ShardDirectory;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.manifest.CommitManifest;
@@ -36,6 +37,7 @@ public final class ReaderEngineFactory implements EngineFactory {
     private final ShardDirectory shardDirectory;
     private final String localNodeId;
     private final ReaderShardAdmissionController admissionController;
+    private final CompactionSchedulerConfig compactionConfig;
 
     public ReaderEngineFactory(
         ShardStateStore shardStateStore,
@@ -44,7 +46,7 @@ public final class ReaderEngineFactory implements EngineFactory {
         ShardDirectory shardDirectory,
         String localNodeId
     ) {
-        this(shardStateStore, manifestStore, materializer, shardDirectory, localNodeId, null);
+        this(shardStateStore, manifestStore, materializer, shardDirectory, localNodeId, null, null);
     }
 
     public ReaderEngineFactory(
@@ -55,12 +57,26 @@ public final class ReaderEngineFactory implements EngineFactory {
         String localNodeId,
         ReaderShardAdmissionController admissionController
     ) {
+        this(shardStateStore, manifestStore, materializer, shardDirectory, localNodeId, admissionController, null);
+    }
+
+    /** @param compactionConfig {@code null} disables this reader's own background compaction scheduler -- see its own javadoc. */
+    public ReaderEngineFactory(
+        ShardStateStore shardStateStore,
+        BlobContainerManifestStore manifestStore,
+        ObjectStoreCommitMaterializer materializer,
+        ShardDirectory shardDirectory,
+        String localNodeId,
+        ReaderShardAdmissionController admissionController,
+        CompactionSchedulerConfig compactionConfig
+    ) {
         this.shardStateStore = shardStateStore;
         this.manifestStore = manifestStore;
         this.materializer = materializer;
         this.shardDirectory = shardDirectory;
         this.localNodeId = localNodeId;
         this.admissionController = admissionController;
+        this.compactionConfig = compactionConfig;
     }
 
     @Override
@@ -92,7 +108,8 @@ public final class ReaderEngineFactory implements EngineFactory {
                 manifestStore,
                 shardDirectory,
                 localNodeId,
-                admissionController
+                admissionController,
+                compactionConfig
             );
         } catch (RuntimeException e) {
             throw e;
