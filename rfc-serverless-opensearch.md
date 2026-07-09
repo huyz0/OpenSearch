@@ -1198,7 +1198,8 @@ extensibility). Core seams 3–7 remain open as individual small PRs.
 `plugins/serverless-storage` on the same branch: `BundleWriter`/`BundleReader` (segment bundles,
 &sect;6.2), `CommitManifest`/`FileReference`/`PruningStats`/`WalPosition` (manifest schema,
 &sect;6.3), `ManifestRetentionPolicy`/`BundleReferenceCounter` (GC rules, &sect;6.5, including
-the cross-index-clone reference-counting case), and `BlobContainerBundleStore`/
+the cross-index-clone reference-counting case -- now actually invoked by `GcSchedulerTask`, Phase
+4.5 below; this phase's own "not yet wired" framing predates that), and `BlobContainerBundleStore`/
 `BlobContainerManifestStore` (real I/O against `BlobContainer`, FS-tested). An end-to-end test
 (`ServerlessStorageEndToEndTests`) exercises the full write&rarr;publish&rarr;read&rarr;GC cycle
 against a real filesystem blob store with no mocks. JMH microbenchmarks establish baseline
@@ -1590,6 +1591,46 @@ scheduler interval, and `assertBusy` confirming the live head advances to a new,
 fewer-segment manifest with no test-only direct method call forcing the tick (unlike the
 generation-advance test above, which does call its poll method directly) -- this is the first test
 in this area that exercises the *scheduled* path end to end rather than a hand-invoked one.
+
+**GC (`ManifestRetentionPolicy`/`BundleReferenceCounter`, §6.5) had the exact same gap, found while
+auditing for others after fixing `CompactionSchedulerTask`'s.** Both were implemented and tested
+since Phase 1 (see that phase's own status note), but nothing in `ServerlessStoragePlugin` ever
+constructed anything that called them -- no manifest or bundle this plugin ever wrote was reachable
+by anything that deletes it, so storage grows without bound today. Fixed the same way: a new
+`GcSchedulerTask`, attached to a reader shard's engine (`GcSchedulerConfig`, gated on a new
+`serverless_storage.gc.interval` node setting), same reader-not-writer-shard home as
+`CompactionSchedulerTask` and for the identical reason.
+
+**Deletion is destructive, so its safety design got more scrutiny than compaction's did.**
+`ManifestRetentionPolicy#computeDeletableManifests` takes both a lease-pin set and a durable-pin
+set; this task always passes an *empty* lease-pin set, deliberately never derived from
+`ShardDirectory` -- that tier is explicitly documented as node-local, in-memory "hints" (one
+instance per node, not a real cluster-wide gossip store yet, per `ShardDirectoryEntry`'s own
+javadoc and `ServerlessStoragePlugin`'s field comment), so deriving a delete-safety signal from it
+would silently miss every reader open on any *other* node -- worse than not checking at all, since
+it looks like a check. The two real safety mechanisms relied on instead: a generous, purely
+time-based retention window (`serverless_storage.gc.retention_window`, default 30 minutes,
+comfortably longer than any legitimate reader's own manifest-generation lag, bounded by
+`ObjectStoreReaderEngine`'s 5 s poll interval) and durable pins (`DurablePinRegistry`, real and
+CAS-backed, correct cluster-wide regardless of which node evaluates it). Bundles are always deleted
+before the manifests that stopped referencing them, never the reverse, so a crash mid-sweep leaves
+at worst a still-listed but already-deletable manifest pointing at already-gone bundles (retried
+correctly next sweep), never an orphaned bundle no future sweep would revisit.
+
+**A real, previously-unexercised race was found by a genuinely concurrent test, not reasoned out in
+advance**: `BlobContainerManifestStore#listManifests` lists blob names, then reads each one --
+harmless when nothing ever deleted concurrently, but once a real background sweep exists, a manifest
+present in the initial listing can vanish before its own read completes, throwing
+`NoSuchFileException`. Fixed by treating that specific exception as "concurrently swept, correctly
+omit it" inside `listManifests` itself, rather than failing the whole listing over a manifest GC had
+already legitimately deleted.
+
+Verified: two dedicated `GcSchedulerTaskTests` (a full sweep proving exactly the superseded/unpinned
+manifest and its now-orphaned bundle are deleted while a durably-pinned one and the current latest
+both survive; a second proving nothing is deleted while still within the retention window even
+though already superseded and unpinned), plus a new end-to-end reader-engine test exercising the
+real scheduled path (not a direct method call) the same way the compaction wiring test does. Full
+unit suite and multi-node internal cluster tests green, stable across repeated runs with fresh seeds.
 
 Still open: the compactor role/lease-offload negotiation with an active writer -- now smaller in
 scope than before this increment, since the lease itself is real and renewed; what remains is only

@@ -220,6 +220,7 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
                 shardDirectory,
                 LOCAL_NODE_ID,
                 admissionController,
+                null,
                 null
             );
             try {
@@ -239,6 +240,7 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
                             shardDirectory,
                             LOCAL_NODE_ID,
                             admissionController,
+                            null,
                             null
                         )
                     );
@@ -481,7 +483,8 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
                     shardDirectory,
                     LOCAL_NODE_ID,
                     null,
-                    compactionConfig
+                    compactionConfig,
+                    null
                 )
             ) {
                 long generationBeforeCompaction = manifest.generation();
@@ -504,6 +507,136 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
                         "the compacted manifest must have fewer segments than the uncompacted one, got " + compactedSegmentCount,
                         compactedSegmentCount < 3
                     );
+                });
+            }
+        } finally {
+            writer.close();
+            writerDirectory.close();
+        }
+    }
+
+    public void testReaderEnginesOwnBackgroundSchedulerSweepsASupersededUnpinnedManifestAndItsBundle() throws Exception {
+        // Same "implemented and tested in isolation, never actually wired into a running node" gap
+        // as CompactionSchedulerTask above, found for GcSchedulerTask/BundleReferenceCounter/
+        // ManifestRetentionPolicy while wiring the compaction scheduler in: nothing ever deleted a
+        // superseded manifest or its now-unreferenced bundle. See GcSchedulerTaskTests for the
+        // retention-window/pin-safety unit coverage; this proves the real scheduled wiring.
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ObjectStoreCommitPublisher publisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+        org.opensearch.serverless.storage.shardstate.ShardStateStore shardStateStore =
+            new org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore(blobContainer);
+        BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(blobContainer);
+        BlobContainerBundleStore bundleStore = new BlobContainerBundleStore(blobContainer);
+        ObjectStoreCommitMaterializer materializer = new ObjectStoreCommitMaterializer(bundleStore);
+        org.opensearch.serverless.storage.retention.DurablePinRegistry pinRegistry =
+            new org.opensearch.serverless.storage.retention.BlobContainerDurablePinRegistry(blobContainer);
+        ShardDirectory shardDirectory = new InMemoryShardDirectory();
+
+        Directory writerDirectory = new ByteBuffersDirectory();
+        IndexWriter writer = new IndexWriter(
+            writerDirectory,
+            new IndexWriterConfig().setMergePolicy(org.apache.lucene.index.NoMergePolicy.INSTANCE)
+        );
+
+        try (Store store = createStore()) {
+            EngineConfig engineConfig = config(defaultSettings, store, createTempDir(), newMergePolicy(), null);
+            String indexUuid = engineConfig.getShardId().getIndex().getUUID();
+            int shardId = engineConfig.getShardId().getId();
+
+            CommitManifest gen1;
+            {
+                Document doc = new Document();
+                doc.add(new StringField("id", "1", Field.Store.YES));
+                writer.addDocument(doc);
+                writer.commit();
+                gen1 = publisher.publishCommit(
+                    writerDirectory,
+                    SegmentInfos.readLatestCommit(writerDirectory),
+                    indexUuid,
+                    shardId,
+                    PRIMARY_TERM,
+                    1,
+                    0,
+                    0,
+                    new WalPosition("epoch-0", 0),
+                    0,
+                    PruningStats.empty()
+                );
+            }
+            CommitManifest gen2;
+            {
+                Document doc = new Document();
+                doc.add(new StringField("id", "2", Field.Store.YES));
+                writer.addDocument(doc);
+                writer.commit();
+                gen2 = publisher.publishCommit(
+                    writerDirectory,
+                    SegmentInfos.readLatestCommit(writerDirectory),
+                    indexUuid,
+                    shardId,
+                    PRIMARY_TERM,
+                    2,
+                    1,
+                    1,
+                    new WalPosition("epoch-0", 0),
+                    0,
+                    PruningStats.empty()
+                );
+            }
+            // No lease held, gen 2 is the published latest -- gen 1 is superseded and unpinned, so
+            // once past the (deliberately tiny, for this test) retention window it must be swept.
+            assertEquals(
+                org.opensearch.serverless.storage.shardstate.CasResult.SUCCESS,
+                shardStateStore.compareAndSet(
+                    indexUuid,
+                    shardId,
+                    java.util.Optional.empty(),
+                    new org.opensearch.serverless.storage.shardstate.ShardHead(PRIMARY_TERM, null, 0L, gen2.generation())
+                )
+            );
+
+            org.opensearch.serverless.storage.gc.GcSchedulerConfig gcConfig = new org.opensearch.serverless.storage.gc.GcSchedulerConfig(
+                org.opensearch.common.unit.TimeValue.timeValueMillis(20),
+                1L, // effectively no retention delay -- the point here is the wiring, not the window
+                manifestStore,
+                bundleStore,
+                pinRegistry
+            );
+
+            try (
+                ObjectStoreReaderEngine readerEngine = ObjectStoreReaderEngine.open(
+                    engineConfig,
+                    gen2,
+                    materializer,
+                    PRIMARY_TERM,
+                    shardStateStore,
+                    manifestStore,
+                    shardDirectory,
+                    LOCAL_NODE_ID,
+                    null,
+                    null,
+                    gcConfig
+                )
+            ) {
+                String gen1Bundle = gen1.referencedBundles().iterator().next();
+                String gen2Bundle = gen2.referencedBundles().iterator().next();
+                assertBusy(() -> {
+                    java.util.List<CommitManifest> remaining = manifestStore.listManifests();
+                    assertFalse(
+                        "gen 1 is superseded and unpinned -- the background scheduler must have swept it on its own",
+                        remaining.stream().anyMatch(m -> m.generation() == gen1.generation())
+                    );
+                    assertTrue(
+                        "gen 2 is the current latest -- it must never be swept",
+                        remaining.stream().anyMatch(m -> m.generation() == gen2.generation())
+                    );
+                    java.util.Set<String> remainingBundles = bundleStore.listBundleNames();
+                    assertFalse("gen 1's now-orphaned bundle must have been deleted too", remainingBundles.contains(gen1Bundle));
+                    assertTrue("gen 2's bundle must survive", remainingBundles.contains(gen2Bundle));
                 });
             }
         } finally {

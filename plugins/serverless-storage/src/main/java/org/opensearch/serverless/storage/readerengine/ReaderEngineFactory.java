@@ -14,6 +14,7 @@ import org.opensearch.index.engine.EngineCreationFailureException;
 import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.serverless.storage.compaction.CompactionSchedulerConfig;
 import org.opensearch.serverless.storage.directory.ShardDirectory;
+import org.opensearch.serverless.storage.gc.GcSchedulerConfig;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.manifest.CommitManifest;
 import org.opensearch.serverless.storage.shardstate.ShardHead;
@@ -38,6 +39,7 @@ public final class ReaderEngineFactory implements EngineFactory {
     private final String localNodeId;
     private final ReaderShardAdmissionController admissionController;
     private final CompactionSchedulerConfig compactionConfig;
+    private final GcSchedulerConfig gcConfig;
 
     public ReaderEngineFactory(
         ShardStateStore shardStateStore,
@@ -46,7 +48,7 @@ public final class ReaderEngineFactory implements EngineFactory {
         ShardDirectory shardDirectory,
         String localNodeId
     ) {
-        this(shardStateStore, manifestStore, materializer, shardDirectory, localNodeId, null, null);
+        this(shardStateStore, manifestStore, materializer, shardDirectory, localNodeId, null, null, null);
     }
 
     public ReaderEngineFactory(
@@ -57,7 +59,7 @@ public final class ReaderEngineFactory implements EngineFactory {
         String localNodeId,
         ReaderShardAdmissionController admissionController
     ) {
-        this(shardStateStore, manifestStore, materializer, shardDirectory, localNodeId, admissionController, null);
+        this(shardStateStore, manifestStore, materializer, shardDirectory, localNodeId, admissionController, null, null);
     }
 
     /** @param compactionConfig {@code null} disables this reader's own background compaction scheduler -- see its own javadoc. */
@@ -70,6 +72,20 @@ public final class ReaderEngineFactory implements EngineFactory {
         ReaderShardAdmissionController admissionController,
         CompactionSchedulerConfig compactionConfig
     ) {
+        this(shardStateStore, manifestStore, materializer, shardDirectory, localNodeId, admissionController, compactionConfig, null);
+    }
+
+    /** @param gcConfig {@code null} disables this reader's own background GC sweep -- see its own javadoc. */
+    public ReaderEngineFactory(
+        ShardStateStore shardStateStore,
+        BlobContainerManifestStore manifestStore,
+        ObjectStoreCommitMaterializer materializer,
+        ShardDirectory shardDirectory,
+        String localNodeId,
+        ReaderShardAdmissionController admissionController,
+        CompactionSchedulerConfig compactionConfig,
+        GcSchedulerConfig gcConfig
+    ) {
         this.shardStateStore = shardStateStore;
         this.manifestStore = manifestStore;
         this.materializer = materializer;
@@ -77,6 +93,7 @@ public final class ReaderEngineFactory implements EngineFactory {
         this.localNodeId = localNodeId;
         this.admissionController = admissionController;
         this.compactionConfig = compactionConfig;
+        this.gcConfig = gcConfig;
     }
 
     @Override
@@ -109,7 +126,8 @@ public final class ReaderEngineFactory implements EngineFactory {
                 shardDirectory,
                 localNodeId,
                 admissionController,
-                compactionConfig
+                compactionConfig,
+                gcConfig
             );
         } catch (RuntimeException e) {
             throw e;

@@ -13,7 +13,9 @@ import org.opensearch.common.blobstore.BlobContainer;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.Collection;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Persists and retrieves {@link SegmentBundle}s against a real {@link BlobContainer}
@@ -23,6 +25,9 @@ import java.util.List;
  * in memory, while this class carries the I/O.
  */
 public final class BlobContainerBundleStore implements BundleFileReader {
+
+    /** Every bundle this store writes is named with this prefix -- see {@link #writeBundle}'s callers. */
+    public static final String NAME_PREFIX = "bundle-";
 
     private final BlobContainer blobContainer;
 
@@ -77,6 +82,30 @@ public final class BlobContainerBundleStore implements BundleFileReader {
         // given; since we ranged-fetched exactly [offset, offset+length), rebase the entry to 0.
         BundleFileEntry rebased = new BundleFileEntry(entry.name(), 0, entry.length(), entry.checksum());
         return BundleReader.extractFile(raw, rebased);
+    }
+
+    /**
+     * Every bundle name currently present in this shard's container -- the "all known bundles"
+     * input {@link org.opensearch.serverless.storage.gc.BundleReferenceCounter#computeDeletableBundles}
+     * needs, listed by the {@link #NAME_PREFIX} every bundle this class writes shares, the same
+     * listing idiom {@code BlobContainerManifestStore#listManifests} already uses for manifests.
+     */
+    public Set<String> listBundleNames() throws IOException {
+        return blobContainer.listBlobsByPrefix(NAME_PREFIX).keySet();
+    }
+
+    /**
+     * Deletes exactly the named bundles, ignoring any that are already absent (a retried or
+     * partially-completed prior sweep must not fail on that account) -- see {@code
+     * BlobContainer#deleteBlobsIgnoringIfNotExists}. Callers are responsible for having already
+     * proven these bundles are unreferenced by any retained manifest (rfc-serverless-opensearch.md
+     * &sect;6.5); this class has no opinion on that decision, only on how the delete is issued.
+     */
+    public void deleteBundles(Collection<String> bundleNames) throws IOException {
+        if (bundleNames.isEmpty()) {
+            return;
+        }
+        blobContainer.deleteBlobsIgnoringIfNotExists(List.copyOf(bundleNames));
     }
 
     private byte[] readRange(String bundleName, long position, long length) throws IOException {

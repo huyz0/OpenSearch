@@ -16,7 +16,9 @@ import org.opensearch.core.common.io.stream.StreamInput;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.NoSuchFileException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 
 /**
@@ -65,14 +67,49 @@ public final class BlobContainerManifestStore {
      * called rarely (retention-policy evaluation, not any request path), the same tradeoff {@link
      * org.opensearch.serverless.storage.directory.DirectoryRebuildService} already makes for the
      * same reason.
+     *
+     * <p>A best-effort snapshot, not a transaction: a manifest present in the initial listing can
+     * legitimately vanish before its own read completes if {@code GcSchedulerTask}'s deletion sweep
+     * races this call (found by a real concurrent-sweep test throwing {@code NoSuchFileException}
+     * here, not assumed) -- silently skipped rather than failing the whole listing, since a manifest
+     * that GC has already deleted was, by definition, already both superseded and safe to omit from
+     * any caller's view. {@code NoSuchFileException} specifically because {@code FsBlobContainer} is
+     * this plugin's only backend today (see {@code ServerlessStoragePlugin}'s own class javadoc); a
+     * future non-FS backend would need its own equivalent "blob vanished mid-list" exception handled
+     * here too.
      */
     public List<CommitManifest> listManifests() throws IOException {
         List<CommitManifest> manifests = new ArrayList<>();
         for (String blobName : blobContainer.listBlobsByPrefix(CommitManifest.NAME_PREFIX).keySet()) {
             try (InputStream in = blobContainer.readBlob(blobName)) {
                 manifests.add(new CommitManifest(StreamInput.wrap(in.readAllBytes())));
+            } catch (NoSuchFileException e) {
+                // Concurrently deleted by a GC sweep between the listing above and this read --
+                // see this method's own javadoc.
             }
         }
         return manifests;
+    }
+
+    /**
+     * Deletes exactly the given manifests, ignoring any already absent. Callers must have already
+     * proven each one is safe to delete (rfc-serverless-opensearch.md &sect;6.5:
+     * {@link org.opensearch.serverless.storage.gc.ManifestRetentionPolicy}) -- this class has no
+     * opinion on that decision. Deleting a manifest does not touch the bundles it referenced; a
+     * caller sweeping both must delete bundles first (see {@code
+     * BlobContainerBundleStore#deleteBundles}'s own ordering note), so that a crash between the two
+     * steps leaves, at worst, a still-listed manifest pointing at already-gone bundles -- itself
+     * still correctly classified deletable and retried by the very next sweep -- rather than an
+     * orphaned bundle no future sweep would ever revisit.
+     */
+    public void deleteManifests(Collection<CommitManifest> manifests) throws IOException {
+        if (manifests.isEmpty()) {
+            return;
+        }
+        List<String> names = new ArrayList<>(manifests.size());
+        for (CommitManifest manifest : manifests) {
+            names.add(manifest.manifestName());
+        }
+        blobContainer.deleteBlobsIgnoringIfNotExists(names);
     }
 }

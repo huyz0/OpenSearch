@@ -48,6 +48,7 @@ import org.opensearch.serverless.storage.format.BundleFileReader;
 import org.opensearch.serverless.storage.format.CachingBundleFileReader;
 import org.opensearch.serverless.storage.format.InMemoryPlaintextBundleCache;
 import org.opensearch.serverless.storage.format.LocalDiskCachingBundleStore;
+import org.opensearch.serverless.storage.gc.GcSchedulerConfig;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.readerengine.ObjectStoreCommitMaterializer;
 import org.opensearch.serverless.storage.readerengine.ReaderEngineFactory;
@@ -200,6 +201,33 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         Setting.Property.NodeScope
     );
 
+    /**
+     * How often a reader shard's own background {@code GcSchedulerTask} sweeps for deletable
+     * manifests/bundles (rfc-serverless-opensearch.md &sect;6.5). Same reader-shard-is-the-home
+     * rationale as {@link #SERVERLESS_STORAGE_COMPACTION_INTERVAL_SETTING}. Non-positive (the
+     * default) disables background GC entirely -- storage then only ever grows, exactly today's
+     * (pre-this-feature) behavior, which is safe (nothing correctness-bearing depends on GC ever
+     * running) but not sustainable to leave off indefinitely in a real deployment.
+     */
+    public static final Setting<TimeValue> SERVERLESS_STORAGE_GC_INTERVAL_SETTING = Setting.timeSetting(
+        "serverless_storage.gc.interval",
+        TimeValue.MINUS_ONE,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * The sole time-based safety margin the GC sweep relies on -- see {@code GcSchedulerTask}'s own
+     * javadoc for why this, not a lease-pin signal, is the real protection against deleting a
+     * manifest some reader still has open. Deliberately generous by default (30 minutes): comfortably
+     * longer than any legitimate reader's own manifest-generation lag, bounded by {@code
+     * ObjectStoreReaderEngine}'s 5 s poll interval.
+     */
+    public static final Setting<TimeValue> SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING = Setting.timeSetting(
+        "serverless_storage.gc.retention_window",
+        TimeValue.timeValueMinutes(30),
+        Setting.Property.NodeScope
+    );
+
     private volatile Path basePath;
     private volatile Path localCacheRoot;
     private volatile EncryptionKeyProvider encryptionKeyProvider;
@@ -209,6 +237,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     private volatile ReaderShardAdmissionController readerShardAdmissionController;
     private volatile WalChunkService sharedWalChunkService;
     private volatile TimeValue compactionInterval;
+    private volatile TimeValue gcInterval;
+    private volatile long gcRetentionWindowMillis;
     // One node-local directory instance shared by every shard on this node -- matches the target
     // design's "one node block cache" shape (&sect;9) rather than a per-shard instance, and needs
     // no I/O to construct, so it's safe to build eagerly rather than threading through createComponents.
@@ -224,7 +254,9 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_PITR_WINDOW_SETTING,
             SERVERLESS_STORAGE_MAX_CONCURRENT_READER_SHARDS_SETTING,
             SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING,
-            SERVERLESS_STORAGE_COMPACTION_INTERVAL_SETTING
+            SERVERLESS_STORAGE_COMPACTION_INTERVAL_SETTING,
+            SERVERLESS_STORAGE_GC_INTERVAL_SETTING,
+            SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING
         );
     }
 
@@ -270,6 +302,9 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         pitrWindowMillis = SERVERLESS_STORAGE_PITR_WINDOW_SETTING.get(environment.settings()).millis();
         TimeValue configuredCompactionInterval = SERVERLESS_STORAGE_COMPACTION_INTERVAL_SETTING.get(environment.settings());
         compactionInterval = configuredCompactionInterval.millis() > 0 ? configuredCompactionInterval : null;
+        TimeValue configuredGcInterval = SERVERLESS_STORAGE_GC_INTERVAL_SETTING.get(environment.settings());
+        gcInterval = configuredGcInterval.millis() > 0 ? configuredGcInterval : null;
+        gcRetentionWindowMillis = SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING.get(environment.settings()).millis();
         int maxConcurrentReaderShards = SERVERLESS_STORAGE_MAX_CONCURRENT_READER_SHARDS_SETTING.get(environment.settings());
         readerShardAdmissionController = maxConcurrentReaderShards > 0
             ? new ReaderShardAdmissionController(maxConcurrentReaderShards)
@@ -337,6 +372,12 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             // needs one just as much as the writer branch's ordinary commit-publish path does --
             // cheap and stateless to construct once here rather than duplicating it in each branch.
             ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(bundleStore, manifestStore);
+            // Same blob container every other per-shard store here is scoped to -- a durable pin
+            // lives alongside the shard's manifests/registers, not in some separate namespace.
+            // Always constructed, not gated on PITR being enabled: a snapshot can pin a manifest
+            // independent of PITR, and the reader branch's own background GcSchedulerTask needs a
+            // real registry to check regardless of whether PITR retention is configured on this node.
+            DurablePinRegistry pinRegistry = new BlobContainerDurablePinRegistry(blobContainer);
 
             boolean isReaderShard = shardRouting != null && shardRouting.isSearchOnly();
             if (isReaderShard) {
@@ -373,6 +414,18 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                         CompactionPolicy.withDefaults(),
                         new CompactionRebaseExecutor(shardStateStore, 5)
                     );
+                GcSchedulerConfig gcConfig = gcInterval == null
+                    ? null
+                    : new GcSchedulerConfig(
+                        gcInterval,
+                        gcRetentionWindowMillis,
+                        manifestStore,
+                        // Raw bundle store, same "no hot-rereading benefit from a cache" reasoning as
+                        // the compaction config just above -- a sweep lists/deletes bundle names, it
+                        // never reads their contents at all.
+                        bundleStore,
+                        pinRegistry
+                    );
                 return Optional.of(
                     new ReaderEngineFactory(
                         shardStateStore,
@@ -381,19 +434,14 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                         shardDirectory,
                         localNodeId,
                         readerShardAdmissionController,
-                        compactionConfig
+                        compactionConfig,
+                        gcConfig
                     )
                 );
             }
-            PitrRetentionConfig pitrRetentionConfig = null;
-            if (pitrWindowMillis > 0) {
-                // Same blob container every other per-shard store here is scoped to -- a durable
-                // pin lives alongside the shard's manifests/registers, not in some separate
-                // namespace, matching how BlobContainerShardStateStore/BlobContainerManifestStore
-                // are wired above.
-                DurablePinRegistry pinRegistry = new BlobContainerDurablePinRegistry(blobContainer);
-                pitrRetentionConfig = new PitrRetentionConfig(manifestStore, pinRegistry, pitrWindowMillis);
-            }
+            PitrRetentionConfig pitrRetentionConfig = pitrWindowMillis > 0
+                ? new PitrRetentionConfig(manifestStore, pinRegistry, pitrWindowMillis)
+                : null;
             return Optional.of(
                 new WriterEngineFactory(
                     new ObjectStoreCommitHeadPublisher(commitPublisher, shardStateStore),

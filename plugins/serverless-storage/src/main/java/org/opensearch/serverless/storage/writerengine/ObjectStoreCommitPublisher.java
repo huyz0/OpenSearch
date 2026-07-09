@@ -88,7 +88,7 @@ public final class ObjectStoreCommitPublisher {
             contents.add(new BundleFileContent(fileName, readFile(directory, fileName)));
         }
 
-        String bundleName = "bundle-" + indexUuid + "-" + shardId + "-" + primaryTerm + "-" + generation;
+        String bundleName = BlobContainerBundleStore.NAME_PREFIX + indexUuid + "-" + shardId + "-" + primaryTerm + "-" + generation;
         SegmentBundle bundle = bundleStore.writeBundle(bundleName, contents);
 
         Map<String, FileReference> files = new LinkedHashMap<>();

@@ -20,6 +20,8 @@ import org.opensearch.serverless.storage.compaction.CompactionSchedulerTask;
 import org.opensearch.serverless.storage.directory.ShardDirectory;
 import org.opensearch.serverless.storage.directory.ShardDirectoryEntry;
 import org.opensearch.serverless.storage.directory.ShardRole;
+import org.opensearch.serverless.storage.gc.GcSchedulerConfig;
+import org.opensearch.serverless.storage.gc.GcSchedulerTask;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.manifest.CommitManifest;
 import org.opensearch.serverless.storage.shardstate.ShardHead;
@@ -111,6 +113,7 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
     private final Scheduler.Cancellable manifestPollTask;
     private final ReaderShardAdmissionController admissionController;
     private final CompactionSchedulerTask compactionSchedulerTask;
+    private final GcSchedulerTask gcSchedulerTask;
 
     private ObjectStoreReaderEngine(
         EngineConfig config,
@@ -123,7 +126,8 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
         ShardDirectory shardDirectory,
         String localNodeId,
         ReaderShardAdmissionController admissionController,
-        CompactionSchedulerConfig compactionConfig
+        CompactionSchedulerConfig compactionConfig,
+        GcSchedulerConfig gcConfig
     ) {
         super(config, seqNoStats, new TranslogStats(), true, Function.identity(), false);
         this.indexUuid = config.getShardId().getIndex().getUUID();
@@ -164,6 +168,12 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
                 compactionConfig.policy(),
                 compactionConfig.rebaseExecutor()
             );
+        // Same reasoning and same redundancy-is-safe argument as compactionSchedulerTask above --
+        // see GcSchedulerTask's own javadoc for its own, separate safety design (retention window +
+        // durable pins only, deliberately not a ShardDirectory-derived lease pin).
+        this.gcSchedulerTask = gcConfig == null
+            ? null
+            : new GcSchedulerTask(config.getThreadPool(), gcConfig.interval(), indexUuid, shardId, gcConfig);
     }
 
     private void refreshDirectoryEntry() {
@@ -265,6 +275,9 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
         if (compactionSchedulerTask != null) {
             compactionSchedulerTask.close();
         }
+        if (gcSchedulerTask != null) {
+            gcSchedulerTask.close();
+        }
         if (admissionController != null) {
             admissionController.release();
         }
@@ -290,13 +303,27 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
         ShardDirectory shardDirectory,
         String localNodeId
     ) throws IOException {
-        return open(config, manifest, materializer, primaryTerm, shardStateStore, manifestStore, shardDirectory, localNodeId, null, null);
+        return open(
+            config,
+            manifest,
+            materializer,
+            primaryTerm,
+            shardStateStore,
+            manifestStore,
+            shardDirectory,
+            localNodeId,
+            null,
+            null,
+            null
+        );
     }
 
     /**
      * @param admissionController {@code null} to disable the admission cap entirely -- see its own javadoc.
      * @param compactionConfig {@code null} to disable this reader's own background compaction
      *        scheduler entirely -- see {@link CompactionSchedulerConfig}'s own javadoc.
+     * @param gcConfig {@code null} to disable this reader's own background GC sweep entirely --
+     *        see {@link GcSchedulerConfig}'s own javadoc.
      */
     public static ObjectStoreReaderEngine open(
         EngineConfig config,
@@ -308,7 +335,8 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
         ShardDirectory shardDirectory,
         String localNodeId,
         ReaderShardAdmissionController admissionController,
-        CompactionSchedulerConfig compactionConfig
+        CompactionSchedulerConfig compactionConfig,
+        GcSchedulerConfig gcConfig
     ) throws IOException {
         if (admissionController != null) {
             // Acquire before any I/O: rejecting an over-capacity open should never pay for a
@@ -333,7 +361,8 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
                 shardDirectory,
                 localNodeId,
                 admissionController,
-                compactionConfig
+                compactionConfig,
+                gcConfig
             );
         } catch (Exception e) {
             // The engine that would have owned releasing this permit in close() never got built --
