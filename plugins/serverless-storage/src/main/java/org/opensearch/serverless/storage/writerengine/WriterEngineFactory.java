@@ -99,6 +99,11 @@ public final class WriterEngineFactory implements EngineFactory {
         this.encryptionKeyProvider = encryptionKeyProvider;
     }
 
+    /** Exposed for tests (including from other packages, e.g. {@code ServerlessStoragePluginTests}) -- not part of this class's public contract. */
+    public org.opensearch.serverless.storage.security.EncryptionKeyProvider encryptionKeyProviderForTesting() {
+        return encryptionKeyProvider;
+    }
+
     @Override
     public Engine newReadWriteEngine(EngineConfig config) {
         try {

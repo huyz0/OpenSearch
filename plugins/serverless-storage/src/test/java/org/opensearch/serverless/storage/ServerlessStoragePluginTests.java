@@ -136,6 +136,48 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
         assertTrue(factory.get() instanceof WriterEngineFactory);
     }
 
+    /**
+     * Proves the plugin actually threads its own {@code encryptionKeyProvider} into {@link
+     * WriterEngineFactory} when both encryption and WAL mirroring are configured together -- the
+     * specific wiring point {@code getEngineFactory} gained when {@code EncryptingWalChunkService}
+     * was wired into the real writer engine. Neither {@link #testEncryptionKeyConfiguredDoesNotBreakEngineFactoryConstruction}
+     * nor {@link #testWalMirroringEnabledDoesNotBreakEngineFactoryConstruction} alone exercises this
+     * combination or inspects anything beyond the factory's type.
+     */
+    public void testEncryptionAndWalMirroringTogetherWireTheEncryptionKeyProviderIntoTheWriterEngineFactory() throws Exception {
+        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin();
+        Path basePath = createTempDir();
+
+        MockSecureSettings secureSettings = new MockSecureSettings();
+        byte[] rawKeyBytes = new byte[32];
+        random().nextBytes(rawKeyBytes);
+        secureSettings.setString(
+            ServerlessStoragePlugin.SERVERLESS_STORAGE_ENCRYPTION_KEY_SETTING.getKey(),
+            Base64.getEncoder().encodeToString(rawKeyBytes)
+        );
+        Settings nodeSettings = Settings.builder()
+            .put("path.home", createTempDir().toString())
+            .putList("path.repo", basePath.toString())
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey(), basePath.toString())
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING.getKey(), true)
+            .setSecureSettings(secureSettings)
+            .build();
+        Environment environment = TestEnvironment.newEnvironment(nodeSettings);
+        plugin.createComponents(null, null, null, null, null, null, environment, null, null, null, null);
+
+        IndexSettings settings = indexSettings(true);
+        ShardId shardId = new ShardId(settings.getIndex(), 0);
+        ShardRouting primaryRouting = TestShardRouting.newShardRouting(shardId, "node-1", true, ShardRoutingState.STARTED);
+
+        Optional<EngineFactory> factory = plugin.getEngineFactory(settings, primaryRouting);
+        assertTrue(factory.isPresent());
+        WriterEngineFactory writerEngineFactory = (WriterEngineFactory) factory.get();
+        assertNotNull(
+            "the plugin's own encryptionKeyProvider must reach WriterEngineFactory so WAL-mirrored records get encrypted",
+            writerEngineFactory.encryptionKeyProviderForTesting()
+        );
+    }
+
     public void testWalMirroringEnabledDoesNotBreakEngineFactoryConstruction() {
         ServerlessStoragePlugin plugin = new ServerlessStoragePlugin();
         Path basePath = createTempDir();
