@@ -279,4 +279,54 @@ public class WalChunkServiceTests extends OpenSearchTestCase {
         // a locally cached value would wrongly still report 0 here.
         assertEquals(1L, serviceA.currentChunkSequenceUpperBound());
     }
+
+    /**
+     * The stress-test counterpart of {@link #testTwoInstancesSharingOneContainerGetDistinctChunkSequencesNotOverwritingEachOther}:
+     * many distinct {@link WalChunkService} instances (simulating many nodes) hammering the
+     * CAS-based chunk sequence claim concurrently against one shared container, not just two
+     * sequential calls. Every claimed sequence must be globally unique and every chunk
+     * independently recoverable -- the real-world shape of the bug this class used to have, under
+     * real thread contention on the CAS retry loop itself.
+     */
+    public void testManyConcurrentInstancesNeverCollideOnAChunkSequenceUnderRealContention() throws Exception {
+        BlobContainer sharedContainer = newBlobContainer();
+        int instanceCount = 20;
+        ExecutorService executor = Executors.newFixedThreadPool(instanceCount);
+        CountDownLatch startLine = new CountDownLatch(1);
+        try {
+            List<Future<Long>> futures = new java.util.ArrayList<>();
+            for (int i = 0; i < instanceCount; i++) {
+                final int nodeIndex = i;
+                futures.add(executor.submit(() -> {
+                    startLine.await();
+                    WalChunkService service = new WalChunkService(sharedContainer, "node-" + nodeIndex + "-epoch");
+                    service.append(new WalRecord("idx", 0, 1, 0, ("from-node-" + nodeIndex).getBytes("UTF-8")));
+                    return service.flush();
+                }));
+            }
+            startLine.countDown();
+
+            java.util.Set<Long> claimedSequences = new java.util.HashSet<>();
+            for (Future<Long> future : futures) {
+                Long sequence = future.get(30, TimeUnit.SECONDS);
+                assertTrue("chunk sequence " + sequence + " was claimed by more than one instance", claimedSequences.add(sequence));
+            }
+            assertEquals(instanceCount, claimedSequences.size());
+
+            // Every claimed chunk must independently exist and be readable -- none overwritten.
+            // Blob names don't actually incorporate the epoch string (see WalChunkNaming's own
+            // javadoc), so each distinct sequence number maps to exactly one blob regardless of
+            // which instance claimed it.
+            for (long sequence : claimedSequences) {
+                byte[] chunkBytes;
+                try (InputStream in = sharedContainer.readBlob(WalChunkNaming.blobName("irrelevant-epoch", sequence))) {
+                    chunkBytes = in.readAllBytes();
+                }
+                List<WalRecord> records = WalChunkReader.readRecords(chunkBytes);
+                assertEquals(1, records.size());
+            }
+        } finally {
+            executor.shutdown();
+        }
+    }
 }
