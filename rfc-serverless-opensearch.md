@@ -1867,11 +1867,22 @@ about the target's own manifest/head, only the source-side pin and the lineage r
 Verified: the pin and lineage are both released together, a never-cloned shard's `deleteClone` is a
 harmless no-op, and calling it twice in a row is safe.
 
+**The lazy-directory (reader shard) read path is wired too, not just the eager one.**
+`FallbackStreamReader` is `FallbackBundleFileReader`'s counterpart for
+`TransferManager`/`LazyBundleIndexInput`, which resolve reads through a single {@code StreamReader}
+function rather than a `BundleFileReader` object.
+`ServerlessStorageLazyDirectoryFactory#resolveStreamReader` checks the shard's own
+`BlobContainerCloneLineageStore` (a cheap single-blob read/miss, harmless for the overwhelming
+majority of shards that were never cloned) and, only when it really is a clone, wraps the shard's
+normal reader with a fallback to the clone source's own container -- so a cloned shard's
+search-only reader copy, not just its eager materializer path, can resolve inherited bundles.
+Verified end-to-end: a real `LazyBundleDirectory`, opened over a cloned shard's manifest and backed
+by a `FallbackStreamReader`-wrapped `TransferManager`, genuinely fetches and searches source bundle
+bytes it never copied.
+
 **Deliberately out of scope for this slice** (see `ShardCloner`'s own class javadoc): wiring
 `deleteClone` to fire automatically when a clone's index is itself deleted (no
-`IndexEventListener`/lifecycle hook exists yet -- it must be called explicitly today), the
-lazy-directory (reader shard) read path for a cloned shard (`TransferManager`/`LazyBundleIndexInput`
-resolve reads differently than `BundleFileReader` does, and aren't wired to fall back yet), and any
+`IndexEventListener`/lifecycle hook exists yet -- it must be called explicitly today), and any
 REST/transport exposure -- `ShardCloner` is an internal component today, not a user-facing action.
 The extended GC model check &sect;18.5 anticipates is still open.
 

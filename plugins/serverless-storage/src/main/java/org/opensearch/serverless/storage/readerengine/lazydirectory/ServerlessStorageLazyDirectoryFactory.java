@@ -21,6 +21,9 @@ import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.utils.TransferManager;
 import org.opensearch.plugins.IndexStorePlugin;
 import org.opensearch.serverless.storage.ServerlessStoragePlugin;
+import org.opensearch.serverless.storage.clone.BlobContainerCloneLineageStore;
+import org.opensearch.serverless.storage.clone.CloneLineage;
+import org.opensearch.serverless.storage.clone.FallbackStreamReader;
 import org.opensearch.serverless.storage.format.BlobContainerBundleStore;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.manifest.CommitManifest;
@@ -51,6 +54,12 @@ import java.util.Optional;
  * createComponents} builds (the shared {@link FileCache}, {@code threadPool}) must be read through
  * the still-being-initialized plugin reference, not captured eagerly -- by the time a real shard is
  * actually created, {@code createComponents} has long since run.
+ *
+ * <p>Also transparently supports a cloned shard's reader (rfc-serverless-opensearch.md &sect;14):
+ * {@link #resolveStreamReader} checks the shard's {@link BlobContainerCloneLineageStore} and, only
+ * when it really is a clone, wraps the normal {@link TransferManager.StreamReader} with a {@link
+ * FallbackStreamReader} that falls back to the clone source's own container -- the lazy-directory
+ * counterpart of {@code FallbackBundleFileReader}'s support for the eager materializer path.
  */
 public final class ServerlessStorageLazyDirectoryFactory implements IndexStorePlugin.DirectoryFactory {
 
@@ -103,8 +112,39 @@ public final class ServerlessStorageLazyDirectoryFactory implements IndexStorePl
         // mistaken for a real local commit. Owned and closed by the LazyBundleDirectory built
         // around it (see that class's own close() javadoc), not by this factory.
         FSDirectory cacheDirectory = new MMapDirectory(shardPath.resolve("lazy_directory_cache"), SimpleFSLockFactory.INSTANCE);
-        TransferManager transferManager = new TransferManager(bundleStore::openRange, fileCache, plugin.threadPoolForDirectoryFactory());
+        TransferManager transferManager = new TransferManager(
+            resolveStreamReader(blobContainer, bundleStore, indexUuid, shardId),
+            fileCache,
+            plugin.threadPoolForDirectoryFactory()
+        );
         return new LazyBundleDirectory(manifest, cacheDirectory, transferManager);
+    }
+
+    /**
+     * A cloned shard's own {@code blobContainer} cannot see bundles that still physically live in
+     * its clone source's container (rfc-serverless-opensearch.md &sect;14) -- the same reason
+     * {@code ObjectStoreCommitMaterializer}'s eager path needs {@code FallbackBundleFileReader}.
+     * Checks {@link BlobContainerCloneLineageStore} (a cheap single-blob read/miss, harmless for
+     * the overwhelming majority of shards that were never cloned) and, only when this shard really
+     * is a clone, wraps the normal reader with a {@link FallbackStreamReader} that falls back to
+     * the source shard's own container.
+     */
+    private TransferManager.StreamReader resolveStreamReader(
+        BlobContainer blobContainer,
+        BlobContainerBundleStore bundleStore,
+        String indexUuid,
+        int shardId
+    ) throws IOException {
+        Optional<CloneLineage> lineage = new BlobContainerCloneLineageStore(blobContainer).readLineage();
+        if (lineage.isEmpty()) {
+            return bundleStore::openRange;
+        }
+        BlobContainer sourceContainer = plugin.blobContainerForDirectoryFactory(
+            lineage.get().sourceIndexUuid(),
+            lineage.get().sourceShardId()
+        );
+        BlobContainerBundleStore sourceBundleStore = new BlobContainerBundleStore(sourceContainer);
+        return new FallbackStreamReader(bundleStore::openRange, sourceBundleStore::openRange);
     }
 
     @Override

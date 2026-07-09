@@ -46,15 +46,15 @@ import java.util.Optional;
  * <p>{@link #clone} also records a {@link CloneLineage} in the target's own container so a later
  * {@link #deleteClone} can find its way back to the source's pin without anything else needing to
  * remember the relationship -- see {@link #deleteClone}'s own javadoc for what it does and does
- * not do.
+ * not do. That same {@link CloneLineage} record is also what lets a cloned shard's reader-only
+ * lazy directory resolve inherited bundles, via {@code ServerlessStorageLazyDirectoryFactory
+ * #resolveStreamReader} and {@link FallbackStreamReader} -- the {@code
+ * TransferManager}/{@code LazyBundleIndexInput} counterpart of {@link FallbackBundleFileReader}'s
+ * support for the eager materializer path; both read paths are wired for a cloned shard today.
  *
  * <p><b>Deliberately out of scope for this first slice</b>: automatically invoking {@link
- * #deleteClone} when a clone's index is itself deleted (no {@code IndexEventListener}/lifecycle
- * hook exists yet -- {@link #deleteClone} must be called explicitly today), and the lazy-directory
- * (reader-shard) read path, which resolves bundle reads through {@code
- * TransferManager}/{@code LazyBundleIndexInput}, not {@link
- * org.opensearch.serverless.storage.format.BundleFileReader} -- only the eager materializer path
- * (via {@link FallbackBundleFileReader}) is wired for a cloned shard today.
+ * #deleteClone} when a clone's index is itself deleted -- no {@code IndexEventListener}/lifecycle
+ * hook exists yet, so {@link #deleteClone} must be called explicitly today.
  */
 public final class ShardCloner {
 
