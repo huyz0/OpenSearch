@@ -23,6 +23,15 @@ public final class CompactionPolicy {
     private final long maxTargetBundleSizeBytes;
     private final double minDeleteRatioToCompact;
 
+    /**
+     * Creates a policy with the given thresholds.
+     *
+     * @param minSegmentCountToCompact number of segments a shard must have, at minimum, before segment-count-driven
+     *                                 compaction kicks in (must be &gt;= 2)
+     * @param maxTargetBundleSizeBytes size a merged segment should stay under (must be &gt; 0)
+     * @param minDeleteRatioToCompact  fraction of soft-deleted docs, at or above which compaction is triggered
+     *                                 regardless of segment count (must be in [0,1])
+     */
     public CompactionPolicy(int minSegmentCountToCompact, long maxTargetBundleSizeBytes, double minDeleteRatioToCompact) {
         if (minSegmentCountToCompact < 2) {
             throw new IllegalArgumentException("minSegmentCountToCompact must be >= 2, got " + minSegmentCountToCompact);
@@ -44,6 +53,8 @@ public final class CompactionPolicy {
     }
 
     /**
+     * Decides whether a shard is a compaction candidate right now, based on manifest-derivable metrics alone.
+     *
      * @param segmentCount           number of Lucene segments currently making up the shard
      * @param totalBytes             total size, across all segments, of the data eligible for merging
      * @param largestSingleSegmentBytes the size of the single largest segment (a shard already
@@ -70,6 +81,8 @@ public final class CompactionPolicy {
      * so the result is size-tiered (each resulting segment under {@code maxTargetBundleSizeBytes})
      * rather than always one giant segment regardless of how much data that segment would hold.
      * Never fewer than 1: a compaction that runs at all always merges to at least one segment.
+     *
+     * @param totalBytes total size, across all segments, of the data being merged
      */
     public int targetSegmentCount(long totalBytes) {
         if (totalBytes <= 0) {

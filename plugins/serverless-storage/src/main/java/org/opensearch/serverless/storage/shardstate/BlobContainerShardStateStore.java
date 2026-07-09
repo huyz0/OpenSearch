@@ -29,6 +29,12 @@ public final class BlobContainerShardStateStore implements ShardStateStore {
 
     private final BlobContainer blobContainer;
 
+    /**
+     * Constructs a store that reads and CAS-writes shard heads through the given blob container's register primitive.
+     *
+     * @param blobContainer the blob container to back this store; must implement
+     *        {@link BlobContainer#compareAndSwapRegister} and {@link BlobContainer#readRegister}
+     */
     public BlobContainerShardStateStore(BlobContainer blobContainer) {
         this.blobContainer = blobContainer;
     }

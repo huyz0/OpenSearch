@@ -41,6 +41,23 @@ public final class CommitManifest implements Writeable {
     private final PruningStats pruningStats;
     private final long createdAtMillis;
 
+    /**
+     * Creates a manifest for one immutable Lucene commit.
+     *
+     * @param indexUuid the UUID of the index this shard belongs to
+     * @param shardId the shard number
+     * @param primaryTerm the primary term this commit was written under
+     * @param generation the generation of this commit, unique within {@code primaryTerm}
+     * @param segmentsFileName the name of the Lucene segments file for this commit, which must be
+     *                         a key of {@code files}
+     * @param files the manifest's file map, keyed by file name
+     * @param maxSeqNo the maximum sequence number included in this commit
+     * @param localCheckpoint the local checkpoint at this commit
+     * @param walPosition the write-ahead log position folded into this commit, or {@code null}
+     * @param mappingVersion the mapping version in effect at this commit
+     * @param pruningStats summary statistics used to decide whether this shard can be pruned
+     * @param createdAtMillis the wall-clock time this manifest was created, in epoch millis
+     */
     public CommitManifest(
         String indexUuid,
         int shardId,
@@ -81,6 +98,11 @@ public final class CommitManifest implements Writeable {
         this.createdAtMillis = createdAtMillis;
     }
 
+    /**
+     * Deserializes a manifest previously written by {@link #writeTo}.
+     *
+     * @param in the stream to read from
+     */
     public CommitManifest(StreamInput in) throws IOException {
         this.indexUuid = in.readString();
         this.shardId = in.readVInt();
@@ -112,50 +134,62 @@ public final class CommitManifest implements Writeable {
         out.writeVLong(createdAtMillis);
     }
 
+    /** The UUID of the index this shard belongs to. */
     public String indexUuid() {
         return indexUuid;
     }
 
+    /** The shard number. */
     public int shardId() {
         return shardId;
     }
 
+    /** The primary term this commit was written under. */
     public long primaryTerm() {
         return primaryTerm;
     }
 
+    /** The generation of this commit, unique within {@link #primaryTerm()}. */
     public long generation() {
         return generation;
     }
 
+    /** The name of the Lucene segments file for this commit. */
     public String segmentsFileName() {
         return segmentsFileName;
     }
 
+    /** The manifest's file map, keyed by file name. */
     public Map<String, FileReference> files() {
         return files;
     }
 
+    /** The maximum sequence number included in this commit. */
     public long maxSeqNo() {
         return maxSeqNo;
     }
 
+    /** The local checkpoint at this commit. */
     public long localCheckpoint() {
         return localCheckpoint;
     }
 
+    /** The write-ahead log position folded into this commit, or {@code null}. */
     public WalPosition walPosition() {
         return walPosition;
     }
 
+    /** The mapping version in effect at this commit. */
     public long mappingVersion() {
         return mappingVersion;
     }
 
+    /** Summary statistics used to decide whether this shard can be pruned. */
     public PruningStats pruningStats() {
         return pruningStats;
     }
 
+    /** The wall-clock time this manifest was created, in epoch millis. */
     public long createdAtMillis() {
         return createdAtMillis;
     }
@@ -168,6 +202,14 @@ public final class CommitManifest implements Writeable {
         return manifestName(primaryTerm, generation);
     }
 
+    /**
+     * The canonical object name for the manifest identified by {@code (primaryTerm, generation)},
+     * per rfc-serverless-opensearch.md &sect;6.3.
+     *
+     * @param primaryTerm the primary term of the manifest
+     * @param generation the generation of the manifest
+     * @return the canonical blob name
+     */
     public static String manifestName(long primaryTerm, long generation) {
         return NAME_PREFIX + primaryTerm + "-" + generation;
     }
@@ -176,6 +218,9 @@ public final class CommitManifest implements Writeable {
      * Whether {@code this} is strictly newer than {@code other} under the total order
      * (primaryTerm, generation) &mdash; term dominates, so a higher generation under an older
      * (stale) term is still older overall (rfc-serverless-opensearch.md &sect;6.3 fencing).
+     *
+     * @param other the manifest to compare against
+     * @return {@code true} if {@code this} is strictly newer than {@code other}
      */
     public boolean isNewerThan(CommitManifest other) {
         if (this.primaryTerm != other.primaryTerm) {

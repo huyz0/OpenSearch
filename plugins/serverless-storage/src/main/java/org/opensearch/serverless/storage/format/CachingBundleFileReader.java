@@ -22,6 +22,12 @@ public final class CachingBundleFileReader implements BundleFileReader {
     private final InMemoryPlaintextBundleCache sharedCache;
     private final BundleFileReader missDelegate;
 
+    /**
+     * Wires a shard's miss path behind a node-shared cache.
+     *
+     * @param sharedCache the node-shared cache to consult first.
+     * @param missDelegate the underlying reader to fall back to on a cache miss.
+     */
     public CachingBundleFileReader(InMemoryPlaintextBundleCache sharedCache, BundleFileReader missDelegate) {
         this.sharedCache = sharedCache;
         this.missDelegate = missDelegate;

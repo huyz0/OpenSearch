@@ -31,6 +31,11 @@ public final class WalMirroringTranslogFactory implements TranslogFactory {
 
     private final WalAppendTarget walChunkService;
 
+    /**
+     * Creates a factory that produces {@link WalMirroringTranslog} instances backed by the given WAL chunk service.
+     *
+     * @param walChunkService the WAL chunk service every produced translog mirrors its operations into
+     */
     public WalMirroringTranslogFactory(WalAppendTarget walChunkService) {
         this.walChunkService = walChunkService;
     }

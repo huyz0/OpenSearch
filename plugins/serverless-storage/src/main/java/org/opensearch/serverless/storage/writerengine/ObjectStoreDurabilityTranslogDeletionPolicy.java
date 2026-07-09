@@ -41,9 +41,19 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public final class ObjectStoreDurabilityTranslogDeletionPolicy extends TranslogDeletionPolicy {
 
+    /**
+     * Creates a policy with no durability watermark recorded yet, so no translog generation is
+     * initially eligible for deletion on durability grounds alone.
+     */
+    public ObjectStoreDurabilityTranslogDeletionPolicy() {}
+
     private final AtomicLong durablyPublishedMaxSeqNo = new AtomicLong(SequenceNumbers.NO_OPS_PERFORMED);
 
-    /** Monotonic: a call with a lower {@code maxSeqNo} than already recorded is a no-op, never a regression. */
+    /**
+     * Monotonic: a call with a lower {@code maxSeqNo} than already recorded is a no-op, never a regression.
+     *
+     * @param maxSeqNo the maximum sequence number now known to be durably published
+     */
     public void recordDurablePublication(long maxSeqNo) {
         durablyPublishedMaxSeqNo.accumulateAndGet(maxSeqNo, Math::max);
     }
@@ -71,15 +81,27 @@ public final class ObjectStoreDurabilityTranslogDeletionPolicy extends TranslogD
         return Math.min(minByDurability, minByLocks);
     }
 
-    /** Durability-driven, not size-driven -- see class javadoc. Retained only for interface compatibility. */
+    /**
+     * Durability-driven, not size-driven -- see class javadoc. Retained only for interface compatibility.
+     *
+     * @param bytes ignored
+     */
     @Override
     public void setRetentionSizeInBytes(long bytes) {}
 
-    /** Durability-driven, not age-driven -- see class javadoc. Retained only for interface compatibility. */
+    /**
+     * Durability-driven, not age-driven -- see class javadoc. Retained only for interface compatibility.
+     *
+     * @param ageInMillis ignored
+     */
     @Override
     public void setRetentionAgeInMillis(long ageInMillis) {}
 
-    /** Durability-driven, not file-count-driven -- see class javadoc. Retained only for interface compatibility. */
+    /**
+     * Durability-driven, not file-count-driven -- see class javadoc. Retained only for interface compatibility.
+     *
+     * @param retentionTotalFiles ignored
+     */
     @Override
     protected void setRetentionTotalFiles(int retentionTotalFiles) {}
 }

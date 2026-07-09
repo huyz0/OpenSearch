@@ -39,11 +39,20 @@ public final class ReaderShardAdmissionController {
     private final FileCache fileCache;
     private final double maxFileCacheUsageRatio;
 
+    /**
+     * Creates a count-only admission controller, with no file-cache byte-budget check.
+     *
+     * @param maxConcurrentReaderShards the maximum number of reader shards this node will admit at once
+     */
     public ReaderShardAdmissionController(int maxConcurrentReaderShards) {
         this(maxConcurrentReaderShards, null, 1.0);
     }
 
     /**
+     * Creates an admission controller with an optional file-cache byte-budget check in addition to
+     * the fixed shard-count cap.
+     *
+     * @param maxConcurrentReaderShards the maximum number of reader shards this node will admit at once
      * @param fileCache {@code null} to disable the byte-budget check entirely (count-only, as
      *                  before); otherwise the node's shared lazy-directory block cache to check
      *                  usage against on every {@link #acquire}.
@@ -71,6 +80,8 @@ public final class ReaderShardAdmissionController {
      * fraction of that cache's byte capacity. Every successful call must be matched by exactly one
      * {@link #release()} once that shard's engine closes -- {@link ObjectStoreReaderEngine} owns
      * that pairing, not callers of this method directly.
+     *
+     * @param shardId the shard being opened, used only to build the rejection message
      */
     public void acquire(ShardId shardId) {
         if (permits.tryAcquire() == false) {
@@ -108,6 +119,7 @@ public final class ReaderShardAdmissionController {
         return fileCache.usage() >= Math.round(capacity * maxFileCacheUsageRatio);
     }
 
+    /** Releases the permit acquired by a matching {@link #acquire}, once that reader shard's engine closes. */
     public void release() {
         permits.release();
     }

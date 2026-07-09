@@ -61,6 +61,10 @@ import java.util.List;
  */
 public final class ServerlessStorageExistingShardsAllocator implements ExistingShardsAllocator {
 
+    /** Creates an allocator with no state, since this class caches nothing (see the class-level javadoc). */
+    public ServerlessStorageExistingShardsAllocator() {}
+
+    /** The allocator name registered via {@code ServerlessStorageIndexSettingProvider} for every serverless-storage index. */
     public static final String NAME = "serverless_storage";
 
     @Override

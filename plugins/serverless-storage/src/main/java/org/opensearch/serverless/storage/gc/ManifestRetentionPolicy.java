@@ -26,6 +26,8 @@ public final class ManifestRetentionPolicy {
     private ManifestRetentionPolicy() {}
 
     /**
+     * Computes which manifests of one shard must be retained under the four-condition rule (see class javadoc).
+     *
      * @param manifestsForOneShard all known manifests belonging to exactly one (index, shard) &mdash;
      *                             mixing shards is a caller bug and rejected defensively.
      * @param retentionCutoffMillis manifests created strictly before this instant have passed
@@ -59,7 +61,15 @@ public final class ManifestRetentionPolicy {
         return retained;
     }
 
-    /** The complement of {@link #computeRetainedManifests}: manifests safe to delete right now. */
+    /**
+     * The complement of {@link #computeRetainedManifests}: manifests safe to delete right now.
+     *
+     * @param manifestsForOneShard every known manifest for exactly one shard; mixing shards is a caller bug and rejected defensively.
+     * @param retentionCutoffMillis manifests created strictly before this instant have passed their retention window.
+     * @param leasePinnedManifests manifests pinned by a live lease.
+     * @param durablyPinnedManifests manifests pinned by an explicit retention record.
+     * @return the manifests safe to delete right now.
+     */
     public static List<CommitManifest> computeDeletableManifests(
         List<CommitManifest> manifestsForOneShard,
         long retentionCutoffMillis,

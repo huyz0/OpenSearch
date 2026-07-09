@@ -60,6 +60,20 @@ public final class CompactionSchedulerTask implements Closeable {
     private final ObjectStoreCommitPublisher commitPublisher;
     private final Scheduler.Cancellable task;
 
+    /**
+     * Schedules background compaction for one shard, ticking on the given interval.
+     *
+     * @param threadPool      thread pool used to schedule the recurring compaction check
+     * @param interval        delay between successive compaction ticks
+     * @param indexUuid       UUID of the index the shard belongs to
+     * @param shardId         id of the shard within the index
+     * @param shardStateStore store used to read the shard's live head
+     * @param manifestStore   store used to read the manifest at the shard's currently published generation
+     * @param materializer    materializes a commit manifest's segments into a real Lucene directory
+     * @param commitPublisher publishes a merged commit as a new manifest
+     * @param policy          decides whether the shard is a compaction candidate, and how many segments to merge to
+     * @param rebaseExecutor  runs the rebase-on-conflict publish attempt once the policy says the shard is a candidate
+     */
     public CompactionSchedulerTask(
         ThreadPool threadPool,
         TimeValue interval,

@@ -49,6 +49,11 @@ public final class ObjectStoreCommitMaterializer {
 
     private final BundleFileReader bundleStore;
 
+    /**
+     * Creates a materializer backed by {@code bundleStore}.
+     *
+     * @param bundleStore reads and checksum-verifies files out of object storage
+     */
     public ObjectStoreCommitMaterializer(BundleFileReader bundleStore) {
         this.bundleStore = bundleStore;
     }
@@ -60,6 +65,10 @@ public final class ObjectStoreCommitMaterializer {
      * file's bytes are verified against the checksum recorded in the manifest as they're fetched, so
      * a corrupt or truncated transfer fails loudly here rather than surfacing as a confusing
      * Lucene-level error later.
+     *
+     * @param manifest the commit manifest whose files should be present in {@code targetDirectory}
+     * @param targetDirectory the Lucene directory to write missing files into
+     * @throws IOException if fetching or writing a file fails, or a checksum mismatches
      */
     public void materialize(CommitManifest manifest, Directory targetDirectory) throws IOException {
         Set<String> alreadyPresent = new HashSet<>(Arrays.asList(targetDirectory.listAll()));

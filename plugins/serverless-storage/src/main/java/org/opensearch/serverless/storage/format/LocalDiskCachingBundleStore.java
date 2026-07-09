@@ -57,11 +57,23 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
     private final AtomicLong hitCount = new AtomicLong();
     private final AtomicLong missCount = new AtomicLong();
 
+    /**
+     * Wraps a delegate reader with a plaintext-on-disk cache.
+     *
+     * @param delegate the underlying reader to consult on a cache miss.
+     * @param cacheDirectory the local directory to cache files in.
+     */
     public LocalDiskCachingBundleStore(BundleFileReader delegate, Path cacheDirectory) throws IOException {
         this(delegate, cacheDirectory, null);
     }
 
-    /** @param encryptionKeyProvider {@code null} to cache plaintext on disk, matching the no-arg constructor. */
+    /**
+     * Wraps a delegate reader with a disk cache, optionally encrypting cached files at rest.
+     *
+     * @param delegate the underlying reader to consult on a cache miss.
+     * @param cacheDirectory the local directory to cache files in.
+     * @param encryptionKeyProvider {@code null} to cache plaintext on disk, matching the no-arg constructor.
+     */
     public LocalDiskCachingBundleStore(BundleFileReader delegate, Path cacheDirectory, EncryptionKeyProvider encryptionKeyProvider)
         throws IOException {
         this.delegate = delegate;
@@ -107,10 +119,12 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
         return encryptionKeyProvider == null ? bytes : AesGcmCipher.decrypt(bytes, encryptionKeyProvider.currentKey());
     }
 
+    /** Number of reads served from the local disk cache. */
     public long hitCount() {
         return hitCount.get();
     }
 
+    /** Number of reads that missed the local disk cache and fell through to the delegate. */
     public long missCount() {
         return missCount.get();
     }

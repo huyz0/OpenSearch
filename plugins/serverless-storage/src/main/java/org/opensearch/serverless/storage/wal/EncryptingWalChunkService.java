@@ -35,6 +35,12 @@ public final class EncryptingWalChunkService implements WalAppendTarget {
     private final WalChunkService delegate;
     private final EncryptionKeyProvider keyProvider;
 
+    /**
+     * Wraps {@code delegate} so every appended record is encrypted first.
+     *
+     * @param delegate the underlying WAL chunk service records are ultimately appended to
+     * @param keyProvider supplies the encryption key used to encrypt each record's payload
+     */
     public EncryptingWalChunkService(WalChunkService delegate, EncryptionKeyProvider keyProvider) {
         this.delegate = delegate;
         this.keyProvider = keyProvider;

@@ -29,6 +29,11 @@ public interface ShardStateStore {
      * has never been written to (rfc-serverless-metadata-plane.md &sect;4: "heads are created
      * lazily") &mdash; callers activating a shard for the first time should
      * {@link #compareAndSet} with {@code expectedVersion} absent (i.e. put-if-absent semantics).
+     *
+     * @param indexUuid the UUID of the index the shard belongs to
+     * @param shardId the shard's numeric id within the index
+     * @return the shard's current versioned head, or empty if the shard has never been activated
+     * @throws IOException if reading the underlying store fails
      */
     Optional<VersionedShardHead> get(String indexUuid, int shardId) throws IOException;
 
@@ -37,10 +42,15 @@ public interface ShardStateStore {
      * "the head must not exist yet" (first-ever activation, via put-if-absent); pass it non-empty
      * to mean "the head must currently be at exactly this version" (a normal CAS-based update).
      *
+     * @param indexUuid the UUID of the index the shard belongs to
+     * @param shardId the shard's numeric id within the index
+     * @param expectedVersion the version the head is expected to currently be at, or empty to require the head not exist yet
+     * @param newHead the head to write if the expected version matches
      * @return {@link CasResult#SUCCESS} if the write was applied, or
      *         {@link CasResult#VERSION_CONFLICT} if another actor won the race first &mdash;
      *         callers must {@link #get} again and retry against the new state, never blindly retry
      *         the same write.
+     * @throws IOException if reading or writing the underlying store fails
      */
     CasResult compareAndSet(String indexUuid, int shardId, Optional<Long> expectedVersion, ShardHead newHead) throws IOException;
 }

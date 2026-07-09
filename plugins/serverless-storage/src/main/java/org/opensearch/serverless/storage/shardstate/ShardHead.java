@@ -28,6 +28,14 @@ public final class ShardHead implements Writeable {
     private final long leaseExpiryMillis;
     private final long latestManifestGeneration;
 
+    /**
+     * Constructs a shard head from its four component fields directly.
+     *
+     * @param primaryTerm the current primary term; must be &gt;= 1
+     * @param leaseHolderNodeId the node id currently holding the writer/compactor lease, or {@code null} if no lease is held
+     * @param leaseExpiryMillis the epoch millis at which the current lease (if any) expires
+     * @param latestManifestGeneration the generation of the latest published commit manifest; must be &gt;= 0
+     */
     public ShardHead(long primaryTerm, String leaseHolderNodeId, long leaseExpiryMillis, long latestManifestGeneration) {
         if (primaryTerm < 1) {
             throw new IllegalArgumentException("primaryTerm must be >= 1, got " + primaryTerm);
@@ -46,6 +54,12 @@ public final class ShardHead implements Writeable {
         return new ShardHead(1, null, 0L, 0L);
     }
 
+    /**
+     * Deserializes a shard head previously written by {@link #writeTo}.
+     *
+     * @param in the stream to read the head's fields from
+     * @throws IOException if reading from the stream fails
+     */
     public ShardHead(StreamInput in) throws IOException {
         this(in.readVLong(), in.readOptionalString(), in.readVLong(), in.readVLong());
     }
@@ -58,22 +72,32 @@ public final class ShardHead implements Writeable {
         out.writeVLong(latestManifestGeneration);
     }
 
+    /** The current primary term recorded on this head. */
     public long primaryTerm() {
         return primaryTerm;
     }
 
+    /** The node id currently holding the writer/compactor lease, or {@code null} if no lease is held. */
     public String leaseHolderNodeId() {
         return leaseHolderNodeId;
     }
 
+    /** The epoch millis at which the current lease (if any) expires. */
     public long leaseExpiryMillis() {
         return leaseExpiryMillis;
     }
 
+    /** The generation of the latest published commit manifest recorded on this head. */
     public long latestManifestGeneration() {
         return latestManifestGeneration;
     }
 
+    /**
+     * Whether {@link #leaseHolderNodeId} is non-null and its lease has not yet expired as of {@code nowMillis}.
+     *
+     * @param nowMillis the current time in epoch millis to check the lease expiry against
+     * @return {@code true} if a lease is held and still valid at {@code nowMillis}, {@code false} otherwise
+     */
     public boolean isLeaseHeldAt(long nowMillis) {
         return leaseHolderNodeId != null && nowMillis < leaseExpiryMillis;
     }
@@ -88,12 +112,21 @@ public final class ShardHead implements Writeable {
      * ObjectStoreCommitHeadPublisher#readLatestManifest} depends on this): if lease acquisition
      * instead wrote a newly-activating writer's not-yet-published term into the head, that pointer
      * would dangle at a manifest that does not exist yet.
+     *
+     * @param nodeId the node id acquiring or renewing the writer/compactor lease
+     * @param leaseExpiryMillis the epoch millis at which the renewed lease expires
+     * @return a new head with the lease fields updated and {@code primaryTerm}/{@code latestManifestGeneration} unchanged
      */
     public ShardHead withRenewedLease(String nodeId, long leaseExpiryMillis) {
         return new ShardHead(primaryTerm, nodeId, leaseExpiryMillis, latestManifestGeneration);
     }
 
-    /** The head after a publication advances the manifest generation under the current term/lease. */
+    /**
+     * The head after a publication advances the manifest generation under the current term/lease.
+     *
+     * @param generation the new manifest generation; must be strictly greater than the current {@link #latestManifestGeneration}
+     * @return a new head with {@code latestManifestGeneration} updated and all other fields unchanged
+     */
     public ShardHead withPublishedGeneration(long generation) {
         if (generation <= latestManifestGeneration) {
             throw new IllegalArgumentException(
@@ -112,6 +145,9 @@ public final class ShardHead implements Writeable {
      * #withPublishedGeneration(long)} for the same-term case, which this delegates to after
      * validating the term.
      *
+     * @param primaryTerm the publishing writer's primary term; must be &gt;= this head's current term
+     * @param generation the new manifest generation; must be strictly greater than the current {@link #latestManifestGeneration}
+     * @return a new head with {@code primaryTerm} and {@code latestManifestGeneration} updated and the lease fields unchanged
      * @throws IllegalArgumentException if {@code primaryTerm} is older than this head's current
      *         term -- publishing under a term older than one already recorded here would mean a
      *         stale writer is publishing after being superseded, which must never happen.

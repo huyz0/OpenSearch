@@ -252,6 +252,8 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
      * mechanism this class needs: the manager's own {@code refreshIfNeeded} already does a real
      * {@code DirectoryReader#openIfChanged} against the directory {@link #pollForNewerManifest} just
      * wrote a newer manifest's files into.
+     *
+     * @param source a description of why the refresh was triggered, for logging/diagnostics
      */
     @Override
     public void refresh(String source) throws EngineException {
@@ -320,6 +322,17 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
      * directly from the manifest rather than read back out of the materialized commit or (as {@link
      * ReadOnlyEngine} would otherwise try) an actual local translog -- a reader shard has no local
      * translog at all, so this avoids requiring one to exist just to report stats.
+     *
+     * @param config the engine configuration, whose {@link EngineConfig#getStore()} directory is materialized into
+     * @param manifest the commit manifest to open the engine against
+     * @param materializer applies the manifest's files to the engine's store directory
+     * @param primaryTerm the primary term the manifest was published under
+     * @param shardStateStore used to poll for a newer published head
+     * @param manifestStore used to read newer manifest generations found via polling
+     * @param shardDirectory the shard-directory-tier client this engine reports its entry to
+     * @param localNodeId this node's id, reported as part of the shard directory entry
+     * @return an open reader engine, with directory-tier reporting and manifest polling running
+     * @throws IOException if materializing the manifest into the store directory fails
      */
     public static ObjectStoreReaderEngine open(
         EngineConfig config,
@@ -347,11 +360,25 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
     }
 
     /**
+     * Same as {@link #open(EngineConfig, CommitManifest, ObjectStoreCommitMaterializer, long,
+     * ShardStateStore, BlobContainerManifestStore, ShardDirectory, String)}, with optional
+     * admission control and background schedulers.
+     *
+     * @param config the engine configuration, whose {@link EngineConfig#getStore()} directory is materialized into
+     * @param manifest the commit manifest to open the engine against
+     * @param materializer applies the manifest's files to the engine's store directory
+     * @param primaryTerm the primary term the manifest was published under
+     * @param shardStateStore used to poll for a newer published head
+     * @param manifestStore used to read newer manifest generations found via polling
+     * @param shardDirectory the shard-directory-tier client this engine reports its entry to
+     * @param localNodeId this node's id, reported as part of the shard directory entry
      * @param admissionController {@code null} to disable the admission cap entirely -- see its own javadoc.
      * @param compactionConfig {@code null} to disable this reader's own background compaction
      *        scheduler entirely -- see {@link CompactionSchedulerConfig}'s own javadoc.
      * @param gcConfig {@code null} to disable this reader's own background GC sweep entirely --
      *        see {@link GcSchedulerConfig}'s own javadoc.
+     * @return an open reader engine, with directory-tier reporting and manifest polling running
+     * @throws IOException if materializing the manifest into the store directory fails
      */
     public static ObjectStoreReaderEngine open(
         EngineConfig config,

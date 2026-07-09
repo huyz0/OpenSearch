@@ -30,12 +30,24 @@ public final class PinRecord implements Writeable {
     private final long primaryTerm;
     private final long generation;
 
+    /**
+     * Creates a pin on a specific manifest generation.
+     *
+     * @param pinId       identifies why the generation is pinned (e.g. a snapshot name, or {@code "pitr"}).
+     * @param primaryTerm the primary term of the pinned manifest generation.
+     * @param generation  the pinned manifest generation.
+     */
     public PinRecord(String pinId, long primaryTerm, long generation) {
         this.pinId = Objects.requireNonNull(pinId, "pinId");
         this.primaryTerm = primaryTerm;
         this.generation = generation;
     }
 
+    /**
+     * Deserializes a pin record previously written by {@link #writeTo}.
+     *
+     * @param in the stream to read the pin record from.
+     */
     public PinRecord(StreamInput in) throws IOException {
         this(in.readString(), in.readVLong(), in.readVLong());
     }
@@ -47,18 +59,22 @@ public final class PinRecord implements Writeable {
         out.writeVLong(generation);
     }
 
+    /** Why the generation is pinned (e.g. a snapshot name, or {@code "pitr"}). */
     public String pinId() {
         return pinId;
     }
 
+    /** The primary term of the pinned manifest generation. */
     public long primaryTerm() {
         return primaryTerm;
     }
 
+    /** The pinned manifest generation. */
     public long generation() {
         return generation;
     }
 
+    /** Converts this pin to the {@link ManifestId} of the manifest generation it pins. */
     public ManifestId toManifestId() {
         return new ManifestId(primaryTerm, generation);
     }

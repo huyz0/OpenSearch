@@ -17,10 +17,21 @@ import java.io.IOException;
  */
 public class BundleFormatException extends IOException {
 
+    /**
+     * Signals bundle corruption or malformation with no underlying cause.
+     *
+     * @param message description of the malformation detected.
+     */
     public BundleFormatException(String message) {
         super(message);
     }
 
+    /**
+     * Signals bundle corruption or malformation caused by an underlying failure.
+     *
+     * @param message description of the malformation detected.
+     * @param cause the underlying failure that caused the malformation to be detected.
+     */
     public BundleFormatException(String message, Throwable cause) {
         super(message, cause);
     }

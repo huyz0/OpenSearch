@@ -47,6 +47,13 @@ public final class ObjectStoreCommitPublisher {
     private final BlobContainerBundleStore bundleStore;
     private final BlobContainerManifestStore manifestStore;
 
+    /**
+     * Creates a publisher that packages commits into bundles via {@code bundleStore} and describes
+     * them in manifests via {@code manifestStore}.
+     *
+     * @param bundleStore where packaged segment bundles are uploaded
+     * @param manifestStore where commit manifests are written and read back
+     */
     public ObjectStoreCommitPublisher(BlobContainerBundleStore bundleStore, BlobContainerManifestStore manifestStore) {
         this.bundleStore = bundleStore;
         this.manifestStore = manifestStore;
@@ -64,6 +71,19 @@ public final class ObjectStoreCommitPublisher {
      * commit, so if a manifest for it was already published (e.g. the caller timed out waiting for
      * a first call that actually succeeded), this returns that existing manifest unchanged rather
      * than re-uploading and overwriting the bundle.
+     *
+     * @param directory the local Lucene {@link Directory} holding the files referenced by {@code segmentInfos}
+     * @param segmentInfos the local Lucene commit to package
+     * @param indexUuid the index this shard belongs to
+     * @param shardId the shard this commit belongs to
+     * @param primaryTerm the primary term this commit is published under
+     * @param generation the manifest generation this commit is published at
+     * @param maxSeqNo the maximum sequence number covered by this commit
+     * @param localCheckpoint the local checkpoint covered by this commit
+     * @param walPosition the WAL position this commit's manifest should record
+     * @param mappingVersion the mapping version in effect for this commit
+     * @param pruningStats pruning statistics to record in the manifest
+     * @return the manifest describing the packaged commit
      */
     public CommitManifest publishCommit(
         Directory directory,
@@ -113,7 +133,13 @@ public final class ObjectStoreCommitPublisher {
         return manifest;
     }
 
-    /** Reads back a previously published manifest by its exact (primaryTerm, generation) key. */
+    /**
+     * Reads back a previously published manifest by its exact (primaryTerm, generation) key.
+     *
+     * @param primaryTerm the primary term the manifest was published under
+     * @param generation the manifest generation to read
+     * @return the manifest published at that (primaryTerm, generation)
+     */
     public CommitManifest readManifest(long primaryTerm, long generation) throws IOException {
         return manifestStore.readManifest(primaryTerm, generation);
     }

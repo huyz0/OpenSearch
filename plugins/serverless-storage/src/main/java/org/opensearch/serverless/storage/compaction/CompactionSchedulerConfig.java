@@ -24,4 +24,53 @@ import org.opensearch.serverless.storage.writerengine.ObjectStoreCommitPublisher
 public record CompactionSchedulerConfig(TimeValue interval, BlobContainerManifestStore manifestStore,
     ObjectStoreCommitMaterializer materializer, ObjectStoreCommitPublisher commitPublisher, CompactionPolicy policy,
     CompactionRebaseExecutor rebaseExecutor) {
+
+    /**
+     * Creates a config bundling everything needed to schedule background compaction for one shard.
+     *
+     * @param interval        delay between successive compaction ticks
+     * @param manifestStore   store used to read the manifest at the shard's currently published generation
+     * @param materializer    materializes a commit manifest's segments into a real Lucene directory
+     * @param commitPublisher publishes a merged commit as a new manifest
+     * @param policy          decides whether the shard is a compaction candidate, and how many segments to merge to
+     * @param rebaseExecutor  runs the rebase-on-conflict publish attempt once the policy says the shard is a candidate
+     */
+    public CompactionSchedulerConfig {
+    }
+
+    /** Delay between successive compaction ticks. */
+    @Override
+    public TimeValue interval() {
+        return interval;
+    }
+
+    /** Store used to read the manifest at the shard's currently published generation. */
+    @Override
+    public BlobContainerManifestStore manifestStore() {
+        return manifestStore;
+    }
+
+    /** Materializes a commit manifest's segments into a real Lucene directory. */
+    @Override
+    public ObjectStoreCommitMaterializer materializer() {
+        return materializer;
+    }
+
+    /** Publishes a merged commit as a new manifest. */
+    @Override
+    public ObjectStoreCommitPublisher commitPublisher() {
+        return commitPublisher;
+    }
+
+    /** Decides whether the shard is a compaction candidate, and how many segments to merge to. */
+    @Override
+    public CompactionPolicy policy() {
+        return policy;
+    }
+
+    /** Runs the rebase-on-conflict publish attempt once the policy says the shard is a candidate. */
+    @Override
+    public CompactionRebaseExecutor rebaseExecutor() {
+        return rebaseExecutor;
+    }
 }

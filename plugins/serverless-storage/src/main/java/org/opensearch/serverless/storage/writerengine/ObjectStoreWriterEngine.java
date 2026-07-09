@@ -171,6 +171,15 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     private static final ThreadLocal<
         org.opensearch.serverless.storage.security.EncryptionKeyProvider> CONSTRUCTION_ENCRYPTION_KEY_PROVIDER = new ThreadLocal<>();
 
+    /**
+     * Creates a writer engine with neither PITR retention nor WAL mirroring configured, delegating
+     * to the fuller constructor with both left {@code null}.
+     *
+     * @param engineConfig the core engine configuration for this shard
+     * @param headPublisher publishes commits and manages lease acquisition/renewal for this shard's head
+     * @param shardDirectory the shard's directory-registry entry, refreshed periodically while this engine is active
+     * @param localNodeId the id of the node this engine is activating on
+     */
     public ObjectStoreWriterEngine(
         EngineConfig engineConfig,
         ObjectStoreCommitHeadPublisher headPublisher,
@@ -180,6 +189,16 @@ public class ObjectStoreWriterEngine extends InternalEngine {
         this(engineConfig, headPublisher, shardDirectory, localNodeId, null, null);
     }
 
+    /**
+     * Creates a writer engine with WAL mirroring left disabled, delegating to the fuller constructor
+     * with {@code walChunkService} set to {@code null}.
+     *
+     * @param engineConfig the core engine configuration for this shard
+     * @param headPublisher publishes commits and manages lease acquisition/renewal for this shard's head
+     * @param shardDirectory the shard's directory-registry entry, refreshed periodically while this engine is active
+     * @param localNodeId the id of the node this engine is activating on
+     * @param pitrRetentionConfig {@code null} disables the periodic PITR retention reconciliation task; non-null schedules it
+     */
     public ObjectStoreWriterEngine(
         EngineConfig engineConfig,
         ObjectStoreCommitHeadPublisher headPublisher,
@@ -190,7 +209,17 @@ public class ObjectStoreWriterEngine extends InternalEngine {
         this(engineConfig, headPublisher, shardDirectory, localNodeId, pitrRetentionConfig, null);
     }
 
-    /** @param walChunkService {@code null} disables WAL mirroring entirely, same shape as every other optional feature in this plugin. */
+    /**
+     * Creates a writer engine with WAL records left unencrypted, delegating to the fuller
+     * constructor with {@code encryptionKeyProvider} set to {@code null}.
+     *
+     * @param engineConfig the core engine configuration for this shard
+     * @param headPublisher publishes commits and manages lease acquisition/renewal for this shard's head
+     * @param shardDirectory the shard's directory-registry entry, refreshed periodically while this engine is active
+     * @param localNodeId the id of the node this engine is activating on
+     * @param pitrRetentionConfig {@code null} disables the periodic PITR retention reconciliation task; non-null schedules it
+     * @param walChunkService {@code null} disables WAL mirroring entirely, same shape as every other optional feature in this plugin.
+     */
     public ObjectStoreWriterEngine(
         EngineConfig engineConfig,
         ObjectStoreCommitHeadPublisher headPublisher,
@@ -203,6 +232,17 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     }
 
     /**
+     * Creates a fully-configured writer engine: acquires this shard's writer lease, wires WAL
+     * mirroring and, if configured, WAL encryption and PITR retention, then delegates to the
+     * private constructor that actually runs {@code super(engineConfig)} after priming the
+     * thread-locals {@link #createTranslogManager} needs.
+     *
+     * @param engineConfig the core engine configuration for this shard
+     * @param headPublisher publishes commits and manages lease acquisition/renewal for this shard's head
+     * @param shardDirectory the shard's directory-registry entry, refreshed periodically while this engine is active
+     * @param localNodeId the id of the node this engine is activating on
+     * @param pitrRetentionConfig {@code null} disables the periodic PITR retention reconciliation task; non-null schedules it
+     * @param walChunkService {@code null} disables WAL mirroring entirely, same shape as every other optional feature in this plugin.
      * @param encryptionKeyProvider {@code null} leaves WAL-mirrored records unencrypted (matching
      *                              every prior caller's behavior); non-null wraps {@code
      *                              walChunkService} in an {@code EncryptingWalChunkService} so
@@ -326,6 +366,9 @@ public class ObjectStoreWriterEngine extends InternalEngine {
      * Overrides core's default age/size/total-files translog retention with one driven by
      * object-store durability instead (rfc-serverless-opensearch.md &sect;7.1.1) -- see {@link
      * ObjectStoreDurabilityTranslogDeletionPolicy}'s own javadoc for the full safety argument.
+     *
+     * @param engineConfig the core engine configuration for this shard
+     * @return the durability-driven translog deletion policy this engine retains for later use
      */
     @Override
     protected TranslogDeletionPolicy getTranslogDeletionPolicy(EngineConfig engineConfig) {
@@ -373,6 +416,11 @@ public class ObjectStoreWriterEngine extends InternalEngine {
      * this method and substituting a {@link WalMirroringTranslogFactory} directly is the actual
      * available seam, matching {@code getTranslogDeletionPolicy} and
      * {@code globalCheckpointSupplierForCombinedDeletionPolicy} above.
+     *
+     * @param translogUUID the UUID of the translog being opened or created for this shard
+     * @param translogDeletionPolicy the deletion policy to associate with the translog manager
+     * @param translogEventListener the listener to notify of translog lifecycle events
+     * @return the translog manager for this engine, with WAL mirroring wired in when configured
      */
     @Override
     protected TranslogManager createTranslogManager(
@@ -425,6 +473,9 @@ public class ObjectStoreWriterEngine extends InternalEngine {
      * returned supplier only dereferences {@code translogDeletionPolicy} lazily, when actually
      * invoked (well after construction completes), and by then it's already been assigned --
      * {@link #getTranslogDeletionPolicy} runs earlier in the same constructor.
+     *
+     * @param translogManagerRef the translog manager whose last-synced global checkpoint feeds the returned supplier
+     * @return a supplier of the more permissive of the translog's synced checkpoint and the durability watermark
      */
     @Override
     protected LongSupplier globalCheckpointSupplierForCombinedDeletionPolicy(TranslogManager translogManagerRef) {

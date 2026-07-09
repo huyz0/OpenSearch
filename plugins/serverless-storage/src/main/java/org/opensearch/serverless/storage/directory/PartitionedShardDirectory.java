@@ -35,6 +35,11 @@ public final class PartitionedShardDirectory implements ShardDirectory {
     private final List<ShardDirectory> partitions;
     private final ConsistentHashRing ring;
 
+    /**
+     * Creates a directory that fans shards out across the given partitions by consistent hashing.
+     *
+     * @param partitions the backing directory partitions, must be non-empty
+     */
     public PartitionedShardDirectory(List<ShardDirectory> partitions) {
         if (partitions.isEmpty()) {
             throw new IllegalArgumentException("must have at least one partition");

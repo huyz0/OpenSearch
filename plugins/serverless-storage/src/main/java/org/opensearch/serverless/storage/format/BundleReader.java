@@ -28,6 +28,10 @@ public final class BundleReader {
     /**
      * Parses the header at the start of {@code bundleBytes}. The array may be the full bundle or
      * just a prefix, as long as it contains at least the whole header.
+     *
+     * @param bundleBytes the bundle bytes, or a prefix containing at least the whole header.
+     * @return the parsed header, with its file-entry map and total header length.
+     * @throws BundleFormatException if the header is truncated, malformed, or fails checksum verification.
      */
     public static BundleHeader parseHeader(byte[] bundleBytes) throws BundleFormatException {
         try {
@@ -103,6 +107,9 @@ public final class BundleReader {
     /**
      * Extracts and checksum-verifies one file's content from the full bundle bytes.
      *
+     * @param bundleBytes the full bundle bytes.
+     * @param entry the file's location and expected checksum within the bundle.
+     * @return the file's raw bytes, verified against {@code entry}'s checksum.
      * @throws BundleFormatException if the entry's byte range falls outside the array, or the
      *                                extracted bytes do not match the entry's stored checksum.
      */

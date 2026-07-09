@@ -25,11 +25,22 @@ public final class WalPosition implements Writeable {
     private final String writerEpoch;
     private final long offset;
 
+    /**
+     * Creates a write-ahead-log position.
+     *
+     * @param writerEpoch the epoch identifying which writer produced this position
+     * @param offset the byte offset within {@code writerEpoch}
+     */
     public WalPosition(String writerEpoch, long offset) {
         this.writerEpoch = Objects.requireNonNull(writerEpoch, "writerEpoch");
         this.offset = offset;
     }
 
+    /**
+     * Deserializes a WAL position previously written by {@link #writeTo}.
+     *
+     * @param in the stream to read from
+     */
     public WalPosition(StreamInput in) throws IOException {
         this(in.readString(), in.readVLong());
     }
@@ -40,10 +51,12 @@ public final class WalPosition implements Writeable {
         out.writeVLong(offset);
     }
 
+    /** The epoch identifying which writer produced this position. */
     public String writerEpoch() {
         return writerEpoch;
     }
 
+    /** The byte offset within {@link #writerEpoch()}. */
     public long offset() {
         return offset;
     }

@@ -54,6 +54,13 @@ public final class LazyBundleDirectory extends Directory {
     private final TransferManager transferManager;
     private final Lock noOpLock = NoLockFactory.INSTANCE.obtainLock(null, null);
 
+    /**
+     * Builds a directory whose file map starts from {@code manifest}'s files.
+     *
+     * @param manifest the commit manifest whose files seed this directory's file map
+     * @param cacheDirectory local on-disk directory {@link TransferManager} writes fetched blocks into
+     * @param transferManager fetches and caches blocks on demand
+     */
     public LazyBundleDirectory(CommitManifest manifest, FSDirectory cacheDirectory, TransferManager transferManager) {
         this.filesByName = new ConcurrentHashMap<>(manifest.files());
         this.cacheDirectory = cacheDirectory;
@@ -67,6 +74,8 @@ public final class LazyBundleDirectory extends Directory {
      * reopen ({@code DirectoryReader#openIfChanged}, exactly as the eager materialization path's
      * refresh already does) for a newly-added {@code segments_N} file to actually become visible
      * to search -- adding the entry here alone does not do that.
+     *
+     * @param manifest the newer manifest generation whose files should be merged into this directory
      */
     public void advanceToManifest(CommitManifest manifest) {
         filesByName.putAll(manifest.files());

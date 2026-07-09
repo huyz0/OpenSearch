@@ -51,6 +51,9 @@ public final class WalReplayRecovery {
      * writer's own activation -- see {@code ObjectStoreWriterEngine#activationWalPosition}'s own
      * javadoc for what it captures and its documented residual limitation).
      *
+     * @param walBlobContainer the shared blob container every node's WAL chunks are written into
+     * @param indexUuid the UUID of the index this shard belongs to, used to filter records
+     * @param shardId the shard replaying, used to filter records
      * @param minPrimaryTerm the term floor per {@code WalReplayFencing.tla}'s {@code ReplayFloor}
      *                       (one term back from the term this writer is activating under, so a
      *                       predecessor's legitimately-durable-but-not-yet-manifested records are
@@ -58,6 +61,8 @@ public final class WalReplayRecovery {
      *                       WalChunkReader#filterByShardAndMinimumTerm} for why this term filter is
      *                       necessary but, on its own, insufficient; {@code activationWalPosition}
      *                       is what closes the gap it leaves open.
+     * @param lastDurableWalPosition the previous writer's last durably-published {@link WalPosition},
+     *                               or {@code null} for a shard with no prior manifest at all
      * @param activationWalPosition {@code < 0} (WAL mirroring was disabled when this writer
      *                              activated) short-circuits to an empty list -- there is nothing
      *                              durable in the WAL to replay from.

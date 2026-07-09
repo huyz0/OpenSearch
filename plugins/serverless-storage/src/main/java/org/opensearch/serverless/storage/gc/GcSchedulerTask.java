@@ -63,6 +63,15 @@ public final class GcSchedulerTask implements Closeable {
     private final long retentionWindowMillis;
     private final Scheduler.Cancellable task;
 
+    /**
+     * Schedules a recurring GC sweep for one shard.
+     *
+     * @param threadPool the node's thread pool, used to schedule the recurring sweep.
+     * @param interval how often to run the sweep.
+     * @param indexUuid the UUID of the index the shard belongs to.
+     * @param shardId the shard's numeric id within the index.
+     * @param config the shard's manifest/bundle stores, pin registry, and retention window.
+     */
     public GcSchedulerTask(ThreadPool threadPool, TimeValue interval, String indexUuid, int shardId, GcSchedulerConfig config) {
         this.indexUuid = indexUuid;
         this.shardId = shardId;

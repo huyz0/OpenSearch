@@ -26,9 +26,49 @@ import org.opensearch.serverless.storage.retention.DurablePinRegistry;
  */
 public record GcSchedulerConfig(TimeValue interval, long retentionWindowMillis, BlobContainerManifestStore manifestStore,
     BlobContainerBundleStore bundleStore, DurablePinRegistry pinRegistry) {
+
+    /**
+     * Validates the configured retention window.
+     *
+     * @param interval how often {@link GcSchedulerTask} runs its sweep.
+     * @param retentionWindowMillis the time-based safety margin before a superseded, unpinned manifest becomes deletable.
+     * @param manifestStore the shard's manifest store, to list and delete superseded manifests.
+     * @param bundleStore the shard's bundle store, to list and delete unreferenced bundles.
+     * @param pinRegistry the shard's durable pin registry, to exclude pinned manifests from deletion.
+     */
     public GcSchedulerConfig {
         if (retentionWindowMillis <= 0) {
             throw new IllegalArgumentException("retentionWindowMillis must be > 0, got " + retentionWindowMillis);
         }
+    }
+
+    /** How often {@link GcSchedulerTask} runs its sweep. */
+    @Override
+    public TimeValue interval() {
+        return interval;
+    }
+
+    /** The time-based safety margin before a superseded, unpinned manifest becomes deletable. */
+    @Override
+    public long retentionWindowMillis() {
+        return retentionWindowMillis;
+    }
+
+    /** The shard's manifest store, to list and delete superseded manifests. */
+    @Override
+    public BlobContainerManifestStore manifestStore() {
+        return manifestStore;
+    }
+
+    /** The shard's bundle store, to list and delete unreferenced bundles. */
+    @Override
+    public BlobContainerBundleStore bundleStore() {
+        return bundleStore;
+    }
+
+    /** The shard's durable pin registry, to exclude pinned manifests from deletion. */
+    @Override
+    public DurablePinRegistry pinRegistry() {
+        return pinRegistry;
     }
 }

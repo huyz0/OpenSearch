@@ -22,6 +22,14 @@ public final class WalChunkReader {
 
     private WalChunkReader() {}
 
+    /**
+     * Parses a chunk's raw bytes back into its ordered list of records, validating the magic
+     * header, format version, and trailing checksum.
+     *
+     * @param chunkBytes the raw bytes of a chunk previously produced by {@link WalChunkWriter#write}
+     * @return the chunk's records, in original append order
+     * @throws WalFormatException if the chunk is malformed, truncated, or fails checksum verification
+     */
     public static List<WalRecord> readRecords(byte[] chunkBytes) throws WalFormatException {
         try {
             ByteArrayInputStream rawIn = new ByteArrayInputStream(chunkBytes);
@@ -86,7 +94,14 @@ public final class WalChunkReader {
         }
     }
 
-    /** Convenience filter for a reader/writer engine replaying only the operations for its own shard. */
+    /**
+     * Convenience filter for a reader/writer engine replaying only the operations for its own shard.
+     *
+     * @param records the records to filter
+     * @param indexUuid the UUID of the index to keep records for
+     * @param shardId the shard to keep records for
+     * @return the records belonging to {@code (indexUuid, shardId)}, in their original relative order
+     */
     public static List<WalRecord> filterByShard(List<WalRecord> records, String indexUuid, int shardId) {
         List<WalRecord> filtered = new ArrayList<>();
         for (WalRecord record : records) {
@@ -113,6 +128,13 @@ public final class WalChunkReader {
      * lease transfer rather than to term identity. Do not treat this method as a complete fencing
      * mechanism until that's resolved -- rfc-serverless-opensearch.md &sect;16 Phase 2 tracks this
      * as still open.
+     *
+     * @param records the records to filter
+     * @param indexUuid the UUID of the index to keep records for
+     * @param shardId the shard to keep records for
+     * @param minPrimaryTerm the inclusive minimum primary term a record must carry to be kept
+     * @return the records belonging to {@code (indexUuid, shardId)} with {@code primaryTerm >= minPrimaryTerm},
+     *         in their original relative order
      */
     public static List<WalRecord> filterByShardAndMinimumTerm(List<WalRecord> records, String indexUuid, int shardId, long minPrimaryTerm) {
         List<WalRecord> filtered = new ArrayList<>();

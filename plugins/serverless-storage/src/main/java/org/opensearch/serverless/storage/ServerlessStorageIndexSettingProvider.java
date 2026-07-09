@@ -33,6 +33,9 @@ import org.opensearch.serverless.storage.allocation.ServerlessStorageExistingSha
  */
 public final class ServerlessStorageIndexSettingProvider implements IndexSettingProvider {
 
+    /** Creates a provider with no configuration state; all decisions are derived from the settings passed to it. */
+    public ServerlessStorageIndexSettingProvider() {}
+
     @Override
     public Settings getAdditionalIndexSettings(String indexName, boolean isDataStreamIndex, Settings templateAndRequestSettings) {
         if (ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.get(templateAndRequestSettings) == false) {

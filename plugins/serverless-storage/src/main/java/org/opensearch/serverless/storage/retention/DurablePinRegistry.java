@@ -21,12 +21,20 @@ import java.util.Set;
  */
 public interface DurablePinRegistry {
 
-    /** All pins currently held on a shard, from every pinning reason (every snapshot, PITR, ...). */
+    /**
+     * All pins currently held on a shard, from every pinning reason (every snapshot, PITR, ...).
+     *
+     * @param indexUuid the UUID of the index the shard belongs to.
+     * @param shardId   the shard to look up pins for.
+     */
     Set<PinRecord> getPins(String indexUuid, int shardId) throws IOException;
 
     /**
      * Convenience projection for feeding directly into
      * {@link org.opensearch.serverless.storage.gc.ManifestRetentionPolicy#computeDeletableManifests}.
+     *
+     * @param indexUuid the UUID of the index the shard belongs to.
+     * @param shardId   the shard to look up pinned manifest IDs for.
      */
     default Set<ManifestId> getPinnedManifestIds(String indexUuid, int shardId) throws IOException {
         Set<PinRecord> pins = getPins(indexUuid, shardId);
@@ -41,6 +49,10 @@ public interface DurablePinRegistry {
      * Adds a pin, idempotently: adding the same {@code pinId} again (e.g. a retried snapshot
      * request) is a no-op rather than an error. Safe under concurrent pin additions/removals from
      * other reasons on the same shard.
+     *
+     * @param indexUuid the UUID of the index the shard belongs to.
+     * @param shardId   the shard to add the pin to.
+     * @param pin       the pin to add.
      */
     void addPin(String indexUuid, int shardId, PinRecord pin) throws IOException;
 
@@ -54,6 +66,10 @@ public interface DurablePinRegistry {
      * once under the same {@code pinId} -- PITR does exactly this, one pin per manifest inside the
      * retention window -- must use {@link #removePin(String, int, PinRecord)} instead to remove one
      * generation's pin without wiping out every other generation sharing that reason.
+     *
+     * @param indexUuid the UUID of the index the shard belongs to.
+     * @param shardId   the shard to remove the pin from.
+     * @param pinId     the pin ID whose pins should all be removed.
      */
     void removePin(String indexUuid, int shardId, String pinId) throws IOException;
 
@@ -63,6 +79,10 @@ public interface DurablePinRegistry {
      * untouched. A no-op if that exact pin was never present. Safe under concurrent pin
      * additions/removals from other reasons, or other generations of the same reason, on the same
      * shard.
+     *
+     * @param indexUuid the UUID of the index the shard belongs to.
+     * @param shardId   the shard to remove the pin from.
+     * @param pin       the exact pin to remove.
      */
     void removePin(String indexUuid, int shardId, PinRecord pin) throws IOException;
 }

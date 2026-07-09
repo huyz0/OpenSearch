@@ -27,6 +27,15 @@ public final class ShardDirectoryEntry {
     private final long generation;
     private final long expiresAtMillis;
 
+    /**
+     * Creates a routing hint.
+     *
+     * @param nodeId the node the shard was open on
+     * @param role the role the shard was open under on that node
+     * @param primaryTerm the primary term the shard was open at
+     * @param generation the manifest generation the shard was open at
+     * @param expiresAtMillis the epoch millis after which this hint should no longer be trusted
+     */
     public ShardDirectoryEntry(String nodeId, ShardRole role, long primaryTerm, long generation, long expiresAtMillis) {
         this.nodeId = Objects.requireNonNull(nodeId, "nodeId");
         this.role = Objects.requireNonNull(role, "role");
@@ -35,26 +44,37 @@ public final class ShardDirectoryEntry {
         this.expiresAtMillis = expiresAtMillis;
     }
 
+    /** The node the shard was open on. */
     public String nodeId() {
         return nodeId;
     }
 
+    /** The role the shard was open under on {@link #nodeId()}. */
     public ShardRole role() {
         return role;
     }
 
+    /** The primary term the shard was open at. */
     public long primaryTerm() {
         return primaryTerm;
     }
 
+    /** The manifest generation the shard was open at. */
     public long generation() {
         return generation;
     }
 
+    /** The epoch millis after which this hint should no longer be trusted. */
     public long expiresAtMillis() {
         return expiresAtMillis;
     }
 
+    /**
+     * Whether this hint is no longer fresh as of {@code nowMillis}.
+     *
+     * @param nowMillis the current time in epoch millis
+     * @return true if this entry has expired as of {@code nowMillis}
+     */
     public boolean isExpired(long nowMillis) {
         return nowMillis >= expiresAtMillis;
     }

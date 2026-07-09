@@ -21,15 +21,23 @@ public final class VersionedShardHead {
     private final ShardHead head;
     private final long version;
 
+    /**
+     * Pairs a shard head with the version token it was read at.
+     *
+     * @param head the shard head's field values
+     * @param version the store-defined version token identifying this exact head state
+     */
     public VersionedShardHead(ShardHead head, long version) {
         this.head = Objects.requireNonNull(head, "head");
         this.version = version;
     }
 
+    /** The shard head's field values. */
     public ShardHead head() {
         return head;
     }
 
+    /** The store-defined version token identifying this exact head state. */
     public long version() {
         return version;
     }

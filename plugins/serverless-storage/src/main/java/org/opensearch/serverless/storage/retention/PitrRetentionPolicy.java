@@ -38,11 +38,14 @@ import java.util.Set;
  */
 public final class PitrRetentionPolicy {
 
+    /** The {@link PinRecord#pinId()} used for every pin this class computes. */
     public static final String PITR_PIN_ID = "pitr";
 
     private PitrRetentionPolicy() {}
 
     /**
+     * Computes every manifest that must currently carry a {@value #PITR_PIN_ID} pin.
+     *
      * @param manifestsForOneShard all known manifests belonging to exactly one (index, shard).
      * @param nowMillis            the instant to evaluate the window against.
      * @param windowMillis         how far back point-in-time recovery must be possible; must be > 0.
@@ -69,7 +72,12 @@ public final class PitrRetentionPolicy {
         return required;
     }
 
-    /** Pins that must be added to bring {@code currentPitrPins} in line with {@code requiredPins}. */
+    /**
+     * Pins that must be added to bring {@code currentPitrPins} in line with {@code requiredPins}.
+     *
+     * @param requiredPins     every manifest ID that must currently carry a {@value #PITR_PIN_ID} pin.
+     * @param currentPitrPins  the {@value #PITR_PIN_ID} pins currently held on the shard.
+     */
     public static List<PinRecord> pinsToAdd(Set<ManifestId> requiredPins, Set<PinRecord> currentPitrPins) {
         Set<ManifestId> alreadyPinned = new HashSet<>();
         for (PinRecord pin : currentPitrPins) {
@@ -84,7 +92,12 @@ public final class PitrRetentionPolicy {
         return toAdd;
     }
 
-    /** Pins that must be removed because the window has rolled past them. */
+    /**
+     * Pins that must be removed because the window has rolled past them.
+     *
+     * @param requiredPins     every manifest ID that must currently carry a {@value #PITR_PIN_ID} pin.
+     * @param currentPitrPins  the {@value #PITR_PIN_ID} pins currently held on the shard.
+     */
     public static List<PinRecord> pinsToRemove(Set<ManifestId> requiredPins, Set<PinRecord> currentPitrPins) {
         List<PinRecord> toRemove = new ArrayList<>();
         for (PinRecord pin : currentPitrPins) {

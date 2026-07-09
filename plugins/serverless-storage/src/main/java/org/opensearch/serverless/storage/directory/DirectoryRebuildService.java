@@ -49,6 +49,12 @@ public final class DirectoryRebuildService {
     private final LongSupplier nowMillisSupplier;
     private final long directoryEntryTtlMillis;
 
+    /**
+     * Creates a rebuild service that reports recovered entries into {@code shardDirectory}.
+     *
+     * @param shardDirectory the directory to populate with recovered writer hints
+     * @param directoryEntryTtlMillis the TTL to assign to each recovered entry
+     */
     public DirectoryRebuildService(ShardDirectory shardDirectory, long directoryEntryTtlMillis) {
         this(shardDirectory, directoryEntryTtlMillis, System::currentTimeMillis);
     }
@@ -66,6 +72,11 @@ public final class DirectoryRebuildService {
      * recovered. A shard whose head can't be read (corrupt register, transient I/O error) is
      * skipped rather than aborting the whole walk -- one bad shard shouldn't block recovering
      * every other one.
+     *
+     * @param rootContainer a blob container rooted above the per-shard split, with index-uuid
+     *                      then shard-id children to walk
+     * @return the number of entries recovered
+     * @throws IOException if listing the root container's children fails
      */
     public int rebuildFrom(BlobContainer rootContainer) throws IOException {
         int recovered = 0;

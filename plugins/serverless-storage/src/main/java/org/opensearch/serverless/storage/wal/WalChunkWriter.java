@@ -46,6 +46,12 @@ public final class WalChunkWriter {
 
     private WalChunkWriter() {}
 
+    /**
+     * Serializes {@code records} into a single chunk blob's bytes, per this class's wire format.
+     *
+     * @param records the records to serialize, in append order
+     * @return the serialized chunk bytes, including header, records, and trailing checksum
+     */
     public static byte[] write(List<WalRecord> records) {
         try {
             ByteArrayOutputStream buf = new ByteArrayOutputStream();

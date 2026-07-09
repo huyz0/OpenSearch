@@ -46,6 +46,12 @@ public final class BundleWriter {
 
     private BundleWriter() {}
 
+    /**
+     * Packs the given files into a single immutable bundle blob.
+     *
+     * @param files the files to pack, in the order they should appear in the bundle.
+     * @return the packed bundle, with its parsed file-entry map.
+     */
     public static SegmentBundle write(List<BundleFileContent> files) {
         try {
             ByteArrayOutputStream headerBuf = new ByteArrayOutputStream();
@@ -95,12 +101,26 @@ public final class BundleWriter {
         }
     }
 
+    /**
+     * Computes the CRC32C checksum of an entire byte array.
+     *
+     * @param data the bytes to checksum.
+     * @return the CRC32C checksum, as an unsigned 32-bit value.
+     */
     static long checksum(byte[] data) {
         CRC32C crc = new CRC32C();
         crc.update(data);
         return crc.getValue();
     }
 
+    /**
+     * Computes the CRC32C checksum of a byte range.
+     *
+     * @param data the array containing the bytes to checksum.
+     * @param offset the start offset of the range within {@code data}.
+     * @param length the length in bytes of the range.
+     * @return the CRC32C checksum, as an unsigned 32-bit value.
+     */
     static long checksum(byte[] data, int offset, int length) {
         CRC32C crc = new CRC32C();
         crc.update(data, offset, length);

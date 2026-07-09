@@ -34,19 +34,37 @@ public final class WalRecordCrypto {
 
     private WalRecordCrypto() {}
 
-    /** Returns a copy of {@code record} with its payload replaced by ciphertext. */
+    /**
+     * Returns a copy of {@code record} with its payload replaced by ciphertext.
+     *
+     * @param record the record whose plaintext payload should be encrypted
+     * @param keyProvider supplies the key used to encrypt the payload
+     * @return a copy of {@code record} with its payload replaced by ciphertext
+     */
     public static WalRecord encrypt(WalRecord record, EncryptionKeyProvider keyProvider) throws IOException {
         byte[] ciphertext = AesGcmCipher.encrypt(record.payload(), keyProvider.currentKey());
         return new WalRecord(record.indexUuid(), record.shardId(), record.primaryTerm(), record.seqNo(), ciphertext);
     }
 
-    /** Returns a copy of {@code record} with its payload replaced by the decrypted plaintext. */
+    /**
+     * Returns a copy of {@code record} with its payload replaced by the decrypted plaintext.
+     *
+     * @param record the record whose ciphertext payload should be decrypted
+     * @param keyProvider supplies the key used to decrypt the payload
+     * @return a copy of {@code record} with its payload replaced by plaintext
+     */
     public static WalRecord decrypt(WalRecord record, EncryptionKeyProvider keyProvider) throws IOException {
         byte[] plaintext = AesGcmCipher.decrypt(record.payload(), keyProvider.currentKey());
         return new WalRecord(record.indexUuid(), record.shardId(), record.primaryTerm(), record.seqNo(), plaintext);
     }
 
-    /** {@link #decrypt} applied to every record in {@code records}, in order. */
+    /**
+     * {@link #decrypt} applied to every record in {@code records}, in order.
+     *
+     * @param records the records whose ciphertext payloads should be decrypted
+     * @param keyProvider supplies the key used to decrypt each payload
+     * @return the decrypted records, in the same order as {@code records}
+     */
     public static List<WalRecord> decryptAll(List<WalRecord> records, EncryptionKeyProvider keyProvider) throws IOException {
         List<WalRecord> decrypted = new ArrayList<>(records.size());
         for (WalRecord record : records) {

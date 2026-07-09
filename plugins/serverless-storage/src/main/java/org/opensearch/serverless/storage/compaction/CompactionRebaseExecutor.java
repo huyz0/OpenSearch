@@ -34,6 +34,12 @@ public final class CompactionRebaseExecutor {
     private final ShardStateStore shardStateStore;
     private final int maxAttempts;
 
+    /**
+     * Creates an executor that rebases against the given store, up to a bounded number of attempts.
+     *
+     * @param shardStateStore store used to read and CAS the shard's live head
+     * @param maxAttempts     maximum number of rebase-and-retry attempts before giving up (must be &gt;= 1)
+     */
     public CompactionRebaseExecutor(ShardStateStore shardStateStore, int maxAttempts) {
         if (maxAttempts < 1) {
             throw new IllegalArgumentException("maxAttempts must be >= 1, got " + maxAttempts);
@@ -42,6 +48,17 @@ public final class CompactionRebaseExecutor {
         this.maxAttempts = maxAttempts;
     }
 
+    /**
+     * Runs the rebase-on-conflict publish protocol: computes a new head via {@code publisher} and attempts to
+     * CAS it onto the shard's live head, retrying against the freshly-read head on every conflict until either
+     * the CAS succeeds, the publisher abandons, or {@code maxAttempts} is exhausted.
+     *
+     * @param indexUuid UUID of the index the shard belongs to
+     * @param shardId   id of the shard within the index
+     * @param publisher computes the new head to attempt to publish, given the shard's actual current head
+     * @return the outcome of the publish attempt: published, abandoned by the publisher, or exhausted retries
+     * @throws IOException if reading the shard's live head or manifest fails
+     */
     public RebaseResult publish(String indexUuid, int shardId, CompactionPublisher publisher) throws IOException {
         int attempts = 0;
         while (attempts < maxAttempts) {

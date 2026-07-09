@@ -28,12 +28,29 @@ import java.util.Optional;
  */
 public interface ShardDirectory {
 
-    /** The current best-known hint for where shard {@code (indexUuid, shardId)} is open, if any. */
+    /**
+     * The current best-known hint for where shard {@code (indexUuid, shardId)} is open, if any.
+     *
+     * @param indexUuid the index the shard belongs to
+     * @param shardId the shard id within the index
+     * @return the best-known hint, or empty if none is held (or it has expired)
+     */
     Optional<ShardDirectoryEntry> lookup(String indexUuid, int shardId);
 
-    /** Record (or refresh) a hint: this shard is open in {@code entry.role()} on {@code entry.nodeId()}. */
+    /**
+     * Record (or refresh) a hint: this shard is open in {@code entry.role()} on {@code entry.nodeId()}.
+     *
+     * @param indexUuid the index the shard belongs to
+     * @param shardId the shard id within the index
+     * @param entry the hint to record
+     */
     void report(String indexUuid, int shardId, ShardDirectoryEntry entry);
 
-    /** Remove any hint for this shard, e.g. because it was just closed/idled-out on the reporting node. */
+    /**
+     * Remove any hint for this shard, e.g. because it was just closed/idled-out on the reporting node.
+     *
+     * @param indexUuid the index the shard belongs to
+     * @param shardId the shard id within the index
+     */
     void drop(String indexUuid, int shardId);
 }

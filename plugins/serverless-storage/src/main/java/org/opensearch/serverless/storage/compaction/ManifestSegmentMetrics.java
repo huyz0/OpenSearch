@@ -35,9 +35,13 @@ import java.util.Map;
  */
 public final class ManifestSegmentMetrics {
 
+    /** Number of distinct Lucene segments found in the manifest's file map. */
     public final int segmentCount;
+    /** Total size, across all files in the manifest (including the top-level "segments_N" file). */
     public final long totalBytes;
+    /** Size of the single largest segment, 0 if there are no segments. */
     public final long largestSingleSegmentBytes;
+    /** Always {@code 0.0} -- soft-delete ratio cannot be derived from manifest file metadata alone. */
     public final double estimatedDeleteRatio;
 
     private ManifestSegmentMetrics(int segmentCount, long totalBytes, long largestSingleSegmentBytes, double estimatedDeleteRatio) {
@@ -47,6 +51,12 @@ public final class ManifestSegmentMetrics {
         this.estimatedDeleteRatio = estimatedDeleteRatio;
     }
 
+    /**
+     * Derives segment-level metrics from a manifest's file map alone, without opening any segment.
+     *
+     * @param manifest the commit manifest to derive metrics from
+     * @return the derived metrics, with {@code estimatedDeleteRatio} always {@code 0.0}
+     */
     public static ManifestSegmentMetrics from(CommitManifest manifest) {
         Map<String, Long> bytesBySegment = new HashMap<>();
         long totalBytes = 0;

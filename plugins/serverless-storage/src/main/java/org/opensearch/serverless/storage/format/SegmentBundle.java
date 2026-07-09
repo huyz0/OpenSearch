@@ -22,6 +22,12 @@ public final class SegmentBundle {
     private final byte[] bytes;
     private final Map<String, BundleFileEntry> entriesByName;
 
+    /**
+     * Wraps an already-packed bundle.
+     *
+     * @param bytes the full bundle contents (header + concatenated file bodies).
+     * @param entriesByName location metadata for every packed file, keyed by logical file name.
+     */
     SegmentBundle(byte[] bytes, Map<String, BundleFileEntry> entriesByName) {
         this.bytes = bytes;
         this.entriesByName = entriesByName;
@@ -32,6 +38,7 @@ public final class SegmentBundle {
         return bytes;
     }
 
+    /** The full bundle length in bytes, equal to {@code bytes().length}. */
     public long length() {
         return bytes.length;
     }
@@ -41,6 +48,7 @@ public final class SegmentBundle {
         return entriesByName;
     }
 
+    /** Location metadata for every packed file, in bundle order. */
     public List<BundleFileEntry> entryList() {
         return List.copyOf(entriesByName.values());
     }

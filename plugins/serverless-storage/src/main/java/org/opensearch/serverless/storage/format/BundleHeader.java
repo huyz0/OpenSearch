@@ -16,6 +16,12 @@ public final class BundleHeader {
     private final int headerLength;
     private final Map<String, BundleFileEntry> entries;
 
+    /**
+     * Wraps an already-parsed bundle header.
+     *
+     * @param headerLength number of bytes the header occupies at the start of the bundle blob.
+     * @param entries the file map described by the header, keyed by file name.
+     */
     BundleHeader(int headerLength, Map<String, BundleFileEntry> entries) {
         this.headerLength = headerLength;
         this.entries = entries;
@@ -26,6 +32,7 @@ public final class BundleHeader {
         return headerLength;
     }
 
+    /** The file map described by the header, keyed by file name. */
     public Map<String, BundleFileEntry> entries() {
         return entries;
     }

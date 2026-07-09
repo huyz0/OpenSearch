@@ -22,10 +22,21 @@ public final class StaticEncryptionKeyProvider implements EncryptionKeyProvider 
 
     private final SecretKey key;
 
+    /**
+     * Wraps a fixed key.
+     *
+     * @param key the key to return from every {@link #currentKey()} call.
+     */
     public StaticEncryptionKeyProvider(SecretKey key) {
         this.key = key;
     }
 
+    /**
+     * Builds a provider from raw AES key bytes.
+     *
+     * @param rawKeyBytes the raw AES key bytes (16/24/32 bytes for AES-128/192/256).
+     * @return a provider wrapping the decoded key.
+     */
     public static StaticEncryptionKeyProvider fromRawKeyBytes(byte[] rawKeyBytes) {
         return new StaticEncryptionKeyProvider(new SecretKeySpec(rawKeyBytes, "AES"));
     }

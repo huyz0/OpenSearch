@@ -24,6 +24,8 @@ import java.util.Optional;
 public interface CompactionPublisher {
 
     /**
+     * Computes the new head this compaction should attempt to publish, given the shard's actual current head.
+     *
      * @param currentHead the shard's actual current head, as of this rebase attempt
      * @return the new head to attempt to publish, or empty to abandon this compaction (e.g. the
      *         shard has moved on far enough that the merge result is no longer worth publishing)

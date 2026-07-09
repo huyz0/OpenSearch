@@ -23,19 +23,33 @@ public final class ManifestId {
     private final long primaryTerm;
     private final long generation;
 
+    /**
+     * Identifies a manifest by its term and generation.
+     *
+     * @param primaryTerm the primary term the manifest was published under.
+     * @param generation the manifest's generation number within that term.
+     */
     public ManifestId(long primaryTerm, long generation) {
         this.primaryTerm = primaryTerm;
         this.generation = generation;
     }
 
+    /**
+     * Extracts the identity of an already-published manifest.
+     *
+     * @param manifest the manifest to identify.
+     * @return the manifest's (primaryTerm, generation) identity.
+     */
     public static ManifestId of(CommitManifest manifest) {
         return new ManifestId(manifest.primaryTerm(), manifest.generation());
     }
 
+    /** The primary term the manifest was published under. */
     public long primaryTerm() {
         return primaryTerm;
     }
 
+    /** The manifest's generation number within its primary term. */
     public long generation() {
         return generation;
     }

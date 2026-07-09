@@ -38,7 +38,12 @@ public final class BundleReferenceCounter {
 
     private BundleReferenceCounter() {}
 
-    /** The union of every bundle name referenced by any of the given (already-filtered-to-live) manifests. */
+    /**
+     * The union of every bundle name referenced by any of the given (already-filtered-to-live) manifests.
+     *
+     * @param liveManifests the manifests considered live, already filtered by the caller.
+     * @return the union of bundle names referenced by any of them.
+     */
     public static Set<String> computeLiveBundles(Collection<CommitManifest> liveManifests) {
         Set<String> live = new HashSet<>();
         for (CommitManifest manifest : liveManifests) {
@@ -52,6 +57,10 @@ public final class BundleReferenceCounter {
      * {@code liveBundles} &mdash; i.e. safe to delete. Callers are expected to additionally apply
      * a safety delay before actually issuing deletes (rfc-serverless-opensearch.md &sect;6.5:
      * "asynchronous, batched, and delayed by a safety window").
+     *
+     * @param allKnownBundles every bundle name known to exist in the object store.
+     * @param liveBundles the bundle names still referenced by a live manifest.
+     * @return the subset of {@code allKnownBundles} referenced by none of {@code liveBundles}.
      */
     public static Set<String> computeDeletableBundles(Collection<String> allKnownBundles, Set<String> liveBundles) {
         Set<String> deletable = new HashSet<>();

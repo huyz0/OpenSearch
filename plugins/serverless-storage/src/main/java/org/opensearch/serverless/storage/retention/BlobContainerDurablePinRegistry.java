@@ -34,6 +34,12 @@ public final class BlobContainerDurablePinRegistry implements DurablePinRegistry
 
     private final BlobContainer blobContainer;
 
+    /**
+     * Creates a registry backed by the given blob container.
+     *
+     * @param blobContainer the container holding the per-shard pin register blobs; must support
+     *                      {@link BlobContainer#compareAndSwapRegister}.
+     */
     public BlobContainerDurablePinRegistry(BlobContainer blobContainer) {
         this.blobContainer = blobContainer;
     }

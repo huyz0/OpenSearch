@@ -51,6 +51,19 @@ public class WalMirroringTranslog extends LocalTranslog {
     /** The chunk sequence, under this WAL service's shared epoch, most recently confirmed durably written -- see {@link #lastFlushedWalChunkSequence()}. */
     private volatile long lastFlushedWalChunkSequence = -1;
 
+    /**
+     * Creates a local translog that additionally mirrors every appended operation into {@code walChunkService}.
+     *
+     * @param config the translog configuration, forwarded to {@link LocalTranslog}
+     * @param translogUUID the translog UUID, forwarded to {@link LocalTranslog}
+     * @param deletionPolicy the deletion policy, forwarded to {@link LocalTranslog}
+     * @param globalCheckpointSupplier supplies the current global checkpoint, forwarded to {@link LocalTranslog}
+     * @param primaryTermSupplier supplies the current primary term, used both by {@link LocalTranslog}
+     *                            and to tag each mirrored {@link WalRecord}
+     * @param persistedSequenceNumberConsumer notified of persisted sequence numbers, forwarded to {@link LocalTranslog}
+     * @param translogOperationHelper helper used to read/write operations, forwarded to {@link LocalTranslog}
+     * @param walChunkService the node-level WAL chunk service every appended operation is mirrored into
+     */
     public WalMirroringTranslog(
         TranslogConfig config,
         String translogUUID,

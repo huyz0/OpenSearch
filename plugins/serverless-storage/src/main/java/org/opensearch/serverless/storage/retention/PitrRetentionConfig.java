@@ -20,9 +20,34 @@ import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
  */
 public record PitrRetentionConfig(BlobContainerManifestStore manifestStore, DurablePinRegistry pinRegistry, long windowMillis) {
 
+    /**
+     * Validates the PITR retention configuration.
+     *
+     * @param manifestStore the store used to list a shard's manifests during reconciliation.
+     * @param pinRegistry   the registry PITR pins are added to/removed from.
+     * @param windowMillis  how far back point-in-time recovery must be possible; must be > 0.
+     */
     public PitrRetentionConfig {
         if (windowMillis <= 0) {
             throw new IllegalArgumentException("windowMillis must be > 0, got " + windowMillis);
         }
+    }
+
+    /** The store used to list a shard's manifests during reconciliation. */
+    @Override
+    public BlobContainerManifestStore manifestStore() {
+        return manifestStore;
+    }
+
+    /** The registry PITR pins are added to/removed from. */
+    @Override
+    public DurablePinRegistry pinRegistry() {
+        return pinRegistry;
+    }
+
+    /** How far back point-in-time recovery must be possible. */
+    @Override
+    public long windowMillis() {
+        return windowMillis;
     }
 }

@@ -56,6 +56,17 @@ public class LazyBundleIndexInput extends AbstractBlockIndexInput {
      */
     static final int BLOCK_SIZE_SHIFT = 20;
 
+    /**
+     * Creates a top-level (non-slice) input covering the whole logical file.
+     *
+     * @param resourceDescription human-readable description used in error messages
+     * @param bundleName the blob this logical file's bytes live inside
+     * @param fileName the logical Lucene file name
+     * @param bundleFileOffset where this file's bytes begin inside {@code bundleName}'s blob
+     * @param originalFileSize the full (unsliced) length of this logical file
+     * @param cacheDirectory local on-disk directory {@link TransferManager} writes fetched blocks into
+     * @param transferManager fetches and caches blocks on demand
+     */
     public LazyBundleIndexInput(
         String resourceDescription,
         String bundleName,

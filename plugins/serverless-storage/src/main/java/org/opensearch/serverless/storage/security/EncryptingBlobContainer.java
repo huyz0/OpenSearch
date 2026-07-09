@@ -61,11 +61,23 @@ public final class EncryptingBlobContainer extends FilterBlobContainer {
     private final EncryptionKeyProvider keyProvider;
     private final int blockSizeBytes;
 
+    /**
+     * Wraps a delegate container with block-level AES/GCM encryption at the default block size.
+     *
+     * @param delegate the underlying blob container to encrypt reads/writes against.
+     * @param keyProvider supplies the key used for every encrypt/decrypt call.
+     */
     public EncryptingBlobContainer(BlobContainer delegate, EncryptionKeyProvider keyProvider) {
         this(delegate, keyProvider, DEFAULT_BLOCK_SIZE_BYTES);
     }
 
-    /** @param blockSizeBytes plaintext bytes per block; package-visible so tests can use a small value to exercise multi-block logic cheaply. */
+    /**
+     * Wraps a delegate container with block-level AES/GCM encryption at a given block size.
+     *
+     * @param delegate the underlying blob container to encrypt reads/writes against.
+     * @param keyProvider supplies the key used for every encrypt/decrypt call.
+     * @param blockSizeBytes plaintext bytes per block; package-visible so tests can use a small value to exercise multi-block logic cheaply.
+     */
     EncryptingBlobContainer(BlobContainer delegate, EncryptionKeyProvider keyProvider, int blockSizeBytes) {
         super(delegate);
         this.delegate = delegate;

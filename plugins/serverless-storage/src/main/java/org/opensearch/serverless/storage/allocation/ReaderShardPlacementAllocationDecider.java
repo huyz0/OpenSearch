@@ -42,6 +42,10 @@ import org.opensearch.serverless.storage.ServerlessStoragePlugin;
  */
 public class ReaderShardPlacementAllocationDecider extends AllocationDecider {
 
+    /** Creates a decider with no state; every decision is derived from cluster/routing state passed to it per call. */
+    public ReaderShardPlacementAllocationDecider() {}
+
+    /** The decider name this class is registered under. */
     public static final String NAME = "serverless_storage_reader_placement";
 
     /** A node carrying this attribute set to {@code "true"} may host reader shard copies -- and only reader shard copies. */

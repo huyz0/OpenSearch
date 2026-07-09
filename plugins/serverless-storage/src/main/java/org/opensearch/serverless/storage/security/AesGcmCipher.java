@@ -35,6 +35,13 @@ public final class AesGcmCipher {
 
     private AesGcmCipher() {}
 
+    /**
+     * Encrypts with a fresh random IV prepended to the ciphertext.
+     *
+     * @param plaintext the bytes to encrypt.
+     * @param key the AES key to encrypt with.
+     * @return {@code <12-byte IV><AES/GCM ciphertext+16-byte tag>}.
+     */
     public static byte[] encrypt(byte[] plaintext, SecretKey key) throws IOException {
         byte[] iv = new byte[GCM_IV_LENGTH_BYTES];
         RANDOM.nextBytes(iv);
@@ -51,6 +58,13 @@ public final class AesGcmCipher {
         }
     }
 
+    /**
+     * Decrypts and authenticates the output of {@link #encrypt}.
+     *
+     * @param ivAndCiphertext {@code <12-byte IV><AES/GCM ciphertext+16-byte tag>}.
+     * @param key the AES key to decrypt with; must match the key {@code encrypt} used.
+     * @return the original plaintext.
+     */
     public static byte[] decrypt(byte[] ivAndCiphertext, SecretKey key) throws IOException {
         if (ivAndCiphertext.length < GCM_IV_LENGTH_BYTES) {
             throw new IOException("ciphertext too short to contain an IV: " + ivAndCiphertext.length + " bytes");

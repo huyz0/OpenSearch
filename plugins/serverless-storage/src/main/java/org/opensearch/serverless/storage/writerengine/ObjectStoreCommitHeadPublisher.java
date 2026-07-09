@@ -46,6 +46,13 @@ public final class ObjectStoreCommitHeadPublisher {
     private final ObjectStoreCommitPublisher commitPublisher;
     private final ShardStateStore shardStateStore;
 
+    /**
+     * Creates a publisher that packages commits via {@code commitPublisher} and races to install
+     * them as the shard's new head via CAS on {@code shardStateStore}.
+     *
+     * @param commitPublisher packages a local Lucene commit into a bundle/manifest pair
+     * @param shardStateStore the CAS-backed store holding this shard's published head
+     */
     public ObjectStoreCommitHeadPublisher(ObjectStoreCommitPublisher commitPublisher, ShardStateStore shardStateStore) {
         this.commitPublisher = commitPublisher;
         this.shardStateStore = shardStateStore;
@@ -63,6 +70,16 @@ public final class ObjectStoreCommitHeadPublisher {
      * ObjectStoreCommitPublisher}'s own class javadoc) -- never a correctness issue, since bundles
      * and manifests are addressed only through a successfully published head.
      *
+     * @param directory the local Lucene {@link Directory} holding the files referenced by {@code segmentInfos}
+     * @param segmentInfos the local Lucene commit to package and attempt to publish
+     * @param indexUuid the index this shard belongs to
+     * @param shardId the shard being published
+     * @param primaryTerm the primary term this writer believes it is currently active under
+     * @param maxSeqNo the maximum sequence number covered by this commit
+     * @param localCheckpoint the local checkpoint covered by this commit
+     * @param walPosition the WAL position this commit's manifest should record
+     * @param mappingVersion the mapping version in effect for this commit
+     * @param pruningStats pruning statistics to record in the manifest
      * @return {@code true} if this commit's content is now reflected in the shard's published head;
      *         {@code false} if a different term currently holds the head, meaning this writer has
      *         been fenced out and must stop writing.
@@ -157,6 +174,14 @@ public final class ObjectStoreCommitHeadPublisher {
      * #publishCommitAsHead}. Returns {@code false} (never retries past this) only when the live head
      * already reflects a term newer than {@code primaryTerm} -- real evidence (a publication) that
      * this node has been superseded, and it must not go on renewing as this shard's writer.
+     *
+     * @param indexUuid the index this shard belongs to
+     * @param shardId the shard whose lease is being acquired or renewed
+     * @param primaryTerm the primary term this writer believes it is currently active under
+     * @param nodeId the id of the node acquiring or renewing the lease
+     * @param leaseExpiryMillis the epoch millis at which this lease expires unless renewed again
+     * @return {@code true} if the lease was successfully acquired or renewed; {@code false} if the
+     *         live head already reflects a newer term, meaning this writer has been superseded
      */
     public boolean acquireOrRenewLease(String indexUuid, int shardId, long primaryTerm, String nodeId, long leaseExpiryMillis)
         throws IOException {
@@ -186,6 +211,10 @@ public final class ObjectStoreCommitHeadPublisher {
      * ShardHead#initial()} and {@code CompactionSchedulerTask} already treat that way, which since
      * {@link #acquireOrRenewLease} can now put-if-absent a lease-only head with generation 0 ahead of
      * any real publish, is no longer implied by head presence alone.
+     *
+     * @param indexUuid the index this shard belongs to
+     * @param shardId the shard whose latest published manifest is being read
+     * @return the latest published manifest, or empty if nothing has been published yet
      */
     public Optional<CommitManifest> readLatestManifest(String indexUuid, int shardId) throws IOException {
         Optional<VersionedShardHead> current = shardStateStore.get(indexUuid, shardId);

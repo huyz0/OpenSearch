@@ -17,10 +17,21 @@ import java.io.IOException;
  */
 public class WalFormatException extends IOException {
 
+    /**
+     * Signals a malformed, truncated, or checksum-failing WAL chunk with no underlying cause.
+     *
+     * @param message description.
+     */
     public WalFormatException(String message) {
         super(message);
     }
 
+    /**
+     * Signals a malformed, truncated, or checksum-failing WAL chunk caused by an underlying failure.
+     *
+     * @param message description.
+     * @param cause description.
+     */
     public WalFormatException(String message, Throwable cause) {
         super(message, cause);
     }

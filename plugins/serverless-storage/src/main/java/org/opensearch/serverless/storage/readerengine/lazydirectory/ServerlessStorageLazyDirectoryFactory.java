@@ -66,6 +66,13 @@ public final class ServerlessStorageLazyDirectoryFactory implements IndexStorePl
     private final ServerlessStoragePlugin plugin;
     private final FsDirectoryFactory fallback = new FsDirectoryFactory();
 
+    /**
+     * Creates a factory that reads the plugin's shared file cache, blob containers, and thread
+     * pool lazily at {@link #newDirectory} call time.
+     *
+     * @param plugin the owning plugin instance, whose fields are read lazily since this factory is
+     *               constructed before {@code createComponents} runs
+     */
     public ServerlessStorageLazyDirectoryFactory(ServerlessStoragePlugin plugin) {
         this.plugin = plugin;
     }

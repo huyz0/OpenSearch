@@ -62,6 +62,16 @@ public final class LuceneMergeCompactionPublisher implements CompactionPublisher
     private final ObjectStoreCommitPublisher commitPublisher;
     private final CompactionPolicy policy;
 
+    /**
+     * Creates a publisher that materializes, merges, and republishes the given shard's current commit.
+     *
+     * @param indexUuid       UUID of the index the shard belongs to
+     * @param shardId         id of the shard within the index
+     * @param manifestStore   store used to read the source commit manifest
+     * @param materializer    materializes a commit manifest's segments into a real Lucene directory
+     * @param commitPublisher publishes the merged result as a new commit manifest
+     * @param policy          used to compute the target segment count for the merge
+     */
     public LuceneMergeCompactionPublisher(
         String indexUuid,
         int shardId,

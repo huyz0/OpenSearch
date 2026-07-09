@@ -41,6 +41,15 @@ public final class WalRecord {
     private final long seqNo;
     private final byte[] payload;
 
+    /**
+     * Creates a WAL record for one buffered operation.
+     *
+     * @param indexUuid the UUID of the index the operation belongs to
+     * @param shardId the shard the operation belongs to
+     * @param primaryTerm the primary term the writer believed was current when this record was appended
+     * @param seqNo the operation's sequence number
+     * @param payload the opaque operation bytes, possibly per-record ciphertext
+     */
     public WalRecord(String indexUuid, int shardId, long primaryTerm, long seqNo, byte[] payload) {
         this.indexUuid = Objects.requireNonNull(indexUuid, "indexUuid");
         this.shardId = shardId;
@@ -49,26 +58,37 @@ public final class WalRecord {
         this.payload = Objects.requireNonNull(payload, "payload");
     }
 
+    /** Returns the UUID of the index this record's operation belongs to. */
     public String indexUuid() {
         return indexUuid;
     }
 
+    /** Returns the shard this record's operation belongs to. */
     public int shardId() {
         return shardId;
     }
 
+    /** Returns the primary term the writer believed was current when this record was appended. */
     public long primaryTerm() {
         return primaryTerm;
     }
 
+    /** Returns this record's operation sequence number. */
     public long seqNo() {
         return seqNo;
     }
 
+    /** Returns the opaque operation bytes, possibly per-record ciphertext. */
     public byte[] payload() {
         return payload;
     }
 
+    /**
+     * Returns whether this record was appended for the given index UUID and shard.
+     *
+     * @param indexUuid the index UUID to compare against
+     * @param shardId the shard to compare against
+     */
     public boolean belongsTo(String indexUuid, int shardId) {
         return this.indexUuid.equals(indexUuid) && this.shardId == shardId;
     }

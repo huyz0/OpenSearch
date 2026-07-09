@@ -105,6 +105,9 @@ import java.util.function.Supplier;
  */
 public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, ClusterPlugin, IndexStorePlugin, ActionPlugin {
 
+    /** Creates the plugin; all real wiring happens in {@link #createComponents} once node services are available. */
+    public ServerlessStoragePlugin() {}
+
     /**
      * The {@code index.store.type} value that opts a reader (search-only) shard copy into a
      * {@code LazyBundleDirectory} instead of a normal local {@code FSDirectory}
@@ -116,6 +119,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      */
     public static final String LAZY_DIRECTORY_STORE_TYPE = "serverless_storage_lazy";
 
+    /** Per-index opt-in switch for serverless storage; final once set, since switching modes on a live index is unsupported. */
     public static final Setting<Boolean> SERVERLESS_STORAGE_ENABLED_SETTING = Setting.boolSetting(
         "index.serverless_storage.enabled",
         false,
@@ -123,6 +127,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         Setting.Property.Final
     );
 
+    /** Node-level root path of the local-filesystem blob container backing every opted-in index on this node. */
     public static final Setting<String> SERVERLESS_STORAGE_BASE_PATH_SETTING = Setting.simpleString(
         "serverless_storage.base_path",
         Setting.Property.NodeScope
@@ -371,7 +376,12 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         return threadPool;
     }
 
-    /** See {@link #lazyDirectoryFileCacheForDirectoryFactory()}'s own javadoc -- same lazy-read shape, reusing {@link #blobContainerFor}. */
+    /**
+     * See {@link #lazyDirectoryFileCacheForDirectoryFactory()}'s own javadoc -- same lazy-read shape, reusing {@link #blobContainerFor}.
+     *
+     * @param indexUuid the UUID of the index the shard belongs to.
+     * @param shardId the shard's numeric id within the index.
+     */
     public BlobContainer blobContainerForDirectoryFactory(String indexUuid, int shardId) throws IOException {
         return resolveBlobContainer(indexUuid, shardId);
     }
@@ -662,6 +672,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      * calling {@code deleteClone} for the same clone -- safe only because {@code deleteClone} is
      * already idempotent under concurrent/redundant calls (see its own javadoc): whichever call
      * loses the race just finds the lineage already gone and no-ops.
+     *
+     * @param indexModule the index module being set up, whose event listeners this registers against.
      */
     @Override
     public void onIndexModule(org.opensearch.index.IndexModule indexModule) {

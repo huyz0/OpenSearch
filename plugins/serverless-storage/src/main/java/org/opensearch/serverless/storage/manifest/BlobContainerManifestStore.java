@@ -30,6 +30,11 @@ public final class BlobContainerManifestStore {
 
     private final BlobContainer blobContainer;
 
+    /**
+     * Creates a manifest store backed by the given blob container.
+     *
+     * @param blobContainer the blob container to persist manifests in
+     */
     public BlobContainerManifestStore(BlobContainer blobContainer) {
         this.blobContainer = blobContainer;
     }
@@ -38,6 +43,8 @@ public final class BlobContainerManifestStore {
      * Writes {@code manifest} under its canonical name. Manifests are immutable, so this always
      * writes a brand new blob. Uses {@link BlobContainer#writeBlobAtomic} rather than plain
      * {@code writeBlob}: a reader must never observe a partially-written manifest.
+     *
+     * @param manifest the manifest to write
      */
     public void writeManifest(CommitManifest manifest) throws IOException {
         BytesStreamOutput out = new BytesStreamOutput();
@@ -48,6 +55,13 @@ public final class BlobContainerManifestStore {
         }
     }
 
+    /**
+     * Reads and deserializes the manifest identified by {@code (primaryTerm, generation)}.
+     *
+     * @param primaryTerm the primary term of the manifest to read
+     * @param generation the generation of the manifest to read
+     * @return the deserialized manifest
+     */
     public CommitManifest readManifest(long primaryTerm, long generation) throws IOException {
         String name = CommitManifest.manifestName(primaryTerm, generation);
         try (InputStream in = blobContainer.readBlob(name)) {
@@ -55,7 +69,13 @@ public final class BlobContainerManifestStore {
         }
     }
 
-    /** Whether a manifest for this (primaryTerm, generation) has already been written. */
+    /**
+     * Whether a manifest for this (primaryTerm, generation) has already been written.
+     *
+     * @param primaryTerm the primary term to check
+     * @param generation the generation to check
+     * @return {@code true} if a manifest already exists for this (primaryTerm, generation)
+     */
     public boolean manifestExists(long primaryTerm, long generation) throws IOException {
         return blobContainer.blobExists(CommitManifest.manifestName(primaryTerm, generation));
     }
@@ -101,6 +121,8 @@ public final class BlobContainerManifestStore {
      * steps leaves, at worst, a still-listed manifest pointing at already-gone bundles -- itself
      * still correctly classified deletable and retried by the very next sweep -- rather than an
      * orphaned bundle no future sweep would ever revisit.
+     *
+     * @param manifests the manifests to delete
      */
     public void deleteManifests(Collection<CommitManifest> manifests) throws IOException {
         if (manifests.isEmpty()) {

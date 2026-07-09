@@ -31,14 +31,50 @@ public final class PitrRetentionReconciler {
 
     private final DurablePinRegistry pinRegistry;
 
+    /**
+     * Creates a reconciler that applies PITR pin diffs to the given registry.
+     *
+     * @param pinRegistry the registry PITR pins are added to/removed from.
+     */
     public PitrRetentionReconciler(DurablePinRegistry pinRegistry) {
         this.pinRegistry = pinRegistry;
     }
 
     /** How many pins were added/removed, so callers/tests can observe what happened without re-reading the registry. */
     public record ReconcileResult(int added, int removed) {
+        /**
+         * Records the outcome of one reconciliation pass.
+         *
+         * @param added   the number of pins that were added.
+         * @param removed the number of pins that were removed.
+         */
+        public ReconcileResult {
+        }
+
+        /** The number of pins that were added. */
+        @Override
+        public int added() {
+            return added;
+        }
+
+        /** The number of pins that were removed. */
+        @Override
+        public int removed() {
+            return removed;
+        }
     }
 
+    /**
+     * Diffs the shard's current {@value PitrRetentionPolicy#PITR_PIN_ID} pins against what {@link PitrRetentionPolicy}
+     * requires right now, and applies the difference to the registry.
+     *
+     * @param indexUuid           the UUID of the index the shard belongs to.
+     * @param shardId             the shard to reconcile PITR pins for.
+     * @param manifestsForShard   all known manifests belonging to this shard.
+     * @param nowMillis           the instant to evaluate the retention window against.
+     * @param windowMillis        how far back point-in-time recovery must be possible; must be > 0.
+     * @return how many pins were added and removed.
+     */
     public ReconcileResult reconcile(
         String indexUuid,
         int shardId,

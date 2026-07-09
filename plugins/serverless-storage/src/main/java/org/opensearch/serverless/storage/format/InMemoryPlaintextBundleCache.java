@@ -47,6 +47,11 @@ public final class InMemoryPlaintextBundleCache {
     private final AtomicLong hitCount = new AtomicLong();
     private final AtomicLong missCount = new AtomicLong();
 
+    /**
+     * Creates a node-wide cache bounded by total bytes held.
+     *
+     * @param maxTotalBytes the maximum total bytes of cached entries before LRU eviction kicks in.
+     */
     public InMemoryPlaintextBundleCache(long maxTotalBytes) {
         if (maxTotalBytes < 0) {
             throw new IllegalArgumentException("maxTotalBytes must be >= 0, got " + maxTotalBytes);
@@ -60,6 +65,11 @@ public final class InMemoryPlaintextBundleCache {
     /**
      * Returns the cached bytes for {@code (bundleName, entry)} if present, otherwise fetches them
      * from {@code onMiss}, caches the result (subject to the byte budget), and returns it.
+     *
+     * @param bundleName the name of the bundle containing the file.
+     * @param entry the file's location and expected checksum within the bundle.
+     * @param onMiss the reader to fetch from on a cache miss.
+     * @return the file's raw bytes.
      */
     public byte[] readFile(String bundleName, BundleFileEntry entry, BundleFileReader onMiss) throws IOException {
         String key = cacheKey(bundleName, entry);
@@ -93,10 +103,12 @@ public final class InMemoryPlaintextBundleCache {
         }
     }
 
+    /** Number of reads served from the in-memory cache. */
     public long hitCount() {
         return hitCount.get();
     }
 
+    /** Number of reads that missed the in-memory cache and fell through to the miss-path reader. */
     public long missCount() {
         return missCount.get();
     }

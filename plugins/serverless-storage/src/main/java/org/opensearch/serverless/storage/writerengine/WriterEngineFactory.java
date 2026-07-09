@@ -36,10 +36,27 @@ public final class WriterEngineFactory implements EngineFactory {
     private final ObjectStoreCommitMaterializer materializer;
     private final org.opensearch.serverless.storage.security.EncryptionKeyProvider encryptionKeyProvider;
 
+    /**
+     * Creates a factory with neither PITR retention nor WAL mirroring configured, delegating to the
+     * fuller constructor with both left {@code null}.
+     *
+     * @param headPublisher publishes commits and manages lease acquisition/renewal for produced engines
+     * @param shardDirectory the directory-registry entry produced engines report themselves into
+     * @param localNodeId the id of the node produced engines activate on
+     */
     public WriterEngineFactory(ObjectStoreCommitHeadPublisher headPublisher, ShardDirectory shardDirectory, String localNodeId) {
         this(headPublisher, shardDirectory, localNodeId, null, null);
     }
 
+    /**
+     * Creates a factory with WAL mirroring left disabled, delegating to the fuller constructor with
+     * {@code walChunkService} set to {@code null}.
+     *
+     * @param headPublisher publishes commits and manages lease acquisition/renewal for produced engines
+     * @param shardDirectory the directory-registry entry produced engines report themselves into
+     * @param localNodeId the id of the node produced engines activate on
+     * @param pitrRetentionConfig {@code null} disables PITR retention reconciliation on produced engines; non-null enables it
+     */
     public WriterEngineFactory(
         ObjectStoreCommitHeadPublisher headPublisher,
         ShardDirectory shardDirectory,
@@ -49,7 +66,16 @@ public final class WriterEngineFactory implements EngineFactory {
         this(headPublisher, shardDirectory, localNodeId, pitrRetentionConfig, null);
     }
 
-    /** @param walChunkService {@code null} disables WAL mirroring entirely, same shape as every other optional feature in this plugin. */
+    /**
+     * Creates a factory with missing-local-store recovery left disabled, delegating to the fuller
+     * constructor with {@code materializer} set to {@code null}.
+     *
+     * @param headPublisher publishes commits and manages lease acquisition/renewal for produced engines
+     * @param shardDirectory the directory-registry entry produced engines report themselves into
+     * @param localNodeId the id of the node produced engines activate on
+     * @param pitrRetentionConfig {@code null} disables PITR retention reconciliation on produced engines; non-null enables it
+     * @param walChunkService {@code null} disables WAL mirroring entirely, same shape as every other optional feature in this plugin.
+     */
     public WriterEngineFactory(
         ObjectStoreCommitHeadPublisher headPublisher,
         ShardDirectory shardDirectory,
@@ -61,6 +87,14 @@ public final class WriterEngineFactory implements EngineFactory {
     }
 
     /**
+     * Creates a factory with WAL-mirrored records left unencrypted, delegating to the fuller
+     * constructor with {@code encryptionKeyProvider} set to {@code null}.
+     *
+     * @param headPublisher publishes commits and manages lease acquisition/renewal for produced engines
+     * @param shardDirectory the directory-registry entry produced engines report themselves into
+     * @param localNodeId the id of the node produced engines activate on
+     * @param pitrRetentionConfig {@code null} disables PITR retention reconciliation on produced engines; non-null enables it
+     * @param walChunkService {@code null} disables WAL mirroring entirely, same shape as every other optional feature in this plugin.
      * @param materializer {@code null} disables missing-local-store recovery entirely (same shape
      *                     as every other optional feature in this plugin) -- see {@link
      *                     #recoverMissingLocalStore} for what it's for.
@@ -77,6 +111,17 @@ public final class WriterEngineFactory implements EngineFactory {
     }
 
     /**
+     * Creates a fully-configured factory, storing every dependency for engines it will later
+     * produce via {@link #newReadWriteEngine}.
+     *
+     * @param headPublisher publishes commits and manages lease acquisition/renewal for produced engines
+     * @param shardDirectory the directory-registry entry produced engines report themselves into
+     * @param localNodeId the id of the node produced engines activate on
+     * @param pitrRetentionConfig {@code null} disables PITR retention reconciliation on produced engines; non-null enables it
+     * @param walChunkService {@code null} disables WAL mirroring entirely, same shape as every other optional feature in this plugin.
+     * @param materializer {@code null} disables missing-local-store recovery entirely (same shape
+     *                     as every other optional feature in this plugin) -- see {@link
+     *                     #recoverMissingLocalStore} for what it's for.
      * @param encryptionKeyProvider {@code null} leaves WAL-mirrored records unencrypted, same shape
      *                              as every other optional feature in this plugin -- see {@link
      *                              ObjectStoreWriterEngine}'s own matching constructor javadoc.
@@ -151,6 +196,11 @@ public final class WriterEngineFactory implements EngineFactory {
      * correct: after the manifest's real segment files are in place (so the new translog is
      * associated with the actual recovered commit, not a stale or trivial one) but before {@code
      * StoreRecovery} does anything else that would assume translog files were already there.
+     *
+     * @param indexShard the shard whose local store is missing and being recovered from the shard's last durable manifest
+     * @param store the (empty) local store to materialize the shard's last durable manifest into
+     * @return {@code true} if the store was materialized and a new local translog bootstrapped; {@code false} if
+     *         no materializer is configured or no durable manifest exists yet to recover from
      * Deliberately does <em>not</em> call {@code store.bootstrapNewHistory()}: the manifest carries
      * this shard's real prior history (its own {@code maxSeqNo}/{@code localCheckpoint}), which
      * must be preserved, not reset -- {@code bootstrapNewHistory} is for a genuinely fresh index

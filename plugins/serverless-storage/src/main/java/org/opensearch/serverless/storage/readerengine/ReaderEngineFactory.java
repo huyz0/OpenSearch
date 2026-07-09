@@ -41,6 +41,15 @@ public final class ReaderEngineFactory implements EngineFactory {
     private final CompactionSchedulerConfig compactionConfig;
     private final GcSchedulerConfig gcConfig;
 
+    /**
+     * Creates a factory with no admission controller, compaction, or GC scheduling.
+     *
+     * @param shardStateStore resolves the shard's currently-published head
+     * @param manifestStore reads the commit manifest for a resolved head
+     * @param materializer applies a manifest's files to the engine's store directory
+     * @param shardDirectory the shard-directory-tier client the opened engine reports its entry to
+     * @param localNodeId this node's id, reported as part of the shard directory entry
+     */
     public ReaderEngineFactory(
         ShardStateStore shardStateStore,
         BlobContainerManifestStore manifestStore,
@@ -51,6 +60,16 @@ public final class ReaderEngineFactory implements EngineFactory {
         this(shardStateStore, manifestStore, materializer, shardDirectory, localNodeId, null, null, null);
     }
 
+    /**
+     * Creates a factory with no compaction or GC scheduling.
+     *
+     * @param shardStateStore resolves the shard's currently-published head
+     * @param manifestStore reads the commit manifest for a resolved head
+     * @param materializer applies a manifest's files to the engine's store directory
+     * @param shardDirectory the shard-directory-tier client the opened engine reports its entry to
+     * @param localNodeId this node's id, reported as part of the shard directory entry
+     * @param admissionController {@code null} to disable the admission cap entirely -- see its own javadoc.
+     */
     public ReaderEngineFactory(
         ShardStateStore shardStateStore,
         BlobContainerManifestStore manifestStore,
@@ -62,7 +81,17 @@ public final class ReaderEngineFactory implements EngineFactory {
         this(shardStateStore, manifestStore, materializer, shardDirectory, localNodeId, admissionController, null, null);
     }
 
-    /** @param compactionConfig {@code null} disables this reader's own background compaction scheduler -- see its own javadoc. */
+    /**
+     * Creates a factory with no GC scheduling.
+     *
+     * @param shardStateStore resolves the shard's currently-published head
+     * @param manifestStore reads the commit manifest for a resolved head
+     * @param materializer applies a manifest's files to the engine's store directory
+     * @param shardDirectory the shard-directory-tier client the opened engine reports its entry to
+     * @param localNodeId this node's id, reported as part of the shard directory entry
+     * @param admissionController {@code null} to disable the admission cap entirely -- see its own javadoc.
+     * @param compactionConfig {@code null} disables this reader's own background compaction scheduler -- see its own javadoc.
+     */
     public ReaderEngineFactory(
         ShardStateStore shardStateStore,
         BlobContainerManifestStore manifestStore,
@@ -75,7 +104,18 @@ public final class ReaderEngineFactory implements EngineFactory {
         this(shardStateStore, manifestStore, materializer, shardDirectory, localNodeId, admissionController, compactionConfig, null);
     }
 
-    /** @param gcConfig {@code null} disables this reader's own background GC sweep -- see its own javadoc. */
+    /**
+     * Creates a factory with all optional features configurable.
+     *
+     * @param shardStateStore resolves the shard's currently-published head
+     * @param manifestStore reads the commit manifest for a resolved head
+     * @param materializer applies a manifest's files to the engine's store directory
+     * @param shardDirectory the shard-directory-tier client the opened engine reports its entry to
+     * @param localNodeId this node's id, reported as part of the shard directory entry
+     * @param admissionController {@code null} to disable the admission cap entirely -- see its own javadoc.
+     * @param compactionConfig {@code null} disables this reader's own background compaction scheduler -- see its own javadoc.
+     * @param gcConfig {@code null} disables this reader's own background GC sweep -- see its own javadoc.
+     */
     public ReaderEngineFactory(
         ShardStateStore shardStateStore,
         BlobContainerManifestStore manifestStore,

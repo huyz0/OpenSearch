@@ -85,11 +85,23 @@ public final class WalChunkService implements WalAppendTarget {
     private final List<WalRecord> buffered = new ArrayList<>();
     private final Map<ShardKey, Long> bufferedBytesByShard = new HashMap<>();
 
+    /**
+     * Creates a WAL chunk service with per-shard fairness budgeting disabled.
+     *
+     * @param blobContainer the shared blob container chunks are written to
+     * @param writerEpoch the writer epoch every chunk this service writes is keyed under
+     */
     public WalChunkService(BlobContainer blobContainer, String writerEpoch) throws IOException {
         this(blobContainer, writerEpoch, -1);
     }
 
-    /** @param perShardBudgetBytes see the class javadoc's "Per-shard fairness" section; {@code <= 0} disables the budget entirely. */
+    /**
+     * Creates a WAL chunk service.
+     *
+     * @param blobContainer the shared blob container chunks are written to
+     * @param writerEpoch the writer epoch every chunk this service writes is keyed under
+     * @param perShardBudgetBytes see the class javadoc's "Per-shard fairness" section; {@code <= 0} disables the budget entirely.
+     */
     public WalChunkService(BlobContainer blobContainer, String writerEpoch, long perShardBudgetBytes) throws IOException {
         this.blobContainer = blobContainer;
         this.writerEpoch = writerEpoch;

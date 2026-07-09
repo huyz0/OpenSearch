@@ -20,5 +20,13 @@ import java.io.IOException;
  */
 public interface BundleFileReader {
 
+    /**
+     * Fetches one file's checksum-verified bytes out of a named bundle.
+     *
+     * @param bundleName the name of the bundle blob containing the file.
+     * @param entry the file's location and expected checksum within that bundle.
+     * @return the file's raw bytes, verified against {@code entry}'s checksum.
+     * @throws IOException if the bundle cannot be read or the checksum does not match.
+     */
     byte[] readFile(String bundleName, BundleFileEntry entry) throws IOException;
 }

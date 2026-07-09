@@ -35,6 +35,7 @@ public final class InMemoryShardDirectory implements ShardDirectory {
     private final ConcurrentMap<Key, ShardDirectoryEntry> entriesByKey = new ConcurrentHashMap<>();
     private final LongSupplier nowMillisSupplier;
 
+    /** Creates a directory whose entries are timed against the system clock. */
     public InMemoryShardDirectory() {
         this(System::currentTimeMillis);
     }

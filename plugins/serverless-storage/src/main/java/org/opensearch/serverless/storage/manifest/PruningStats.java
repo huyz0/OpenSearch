@@ -29,6 +29,14 @@ public final class PruningStats implements Writeable {
     private final Long maxTimestampMillis;
     private final Map<String, FieldRange> fieldRanges;
 
+    /**
+     * Creates pruning stats for a shard.
+     *
+     * @param documentCount the number of documents contributing to these stats
+     * @param minTimestampMillis the minimum observed timestamp, or {@code null} if unknown
+     * @param maxTimestampMillis the maximum observed timestamp, or {@code null} if unknown
+     * @param fieldRanges per-field numeric ranges, keyed by field name
+     */
     public PruningStats(long documentCount, Long minTimestampMillis, Long maxTimestampMillis, Map<String, FieldRange> fieldRanges) {
         if (documentCount < 0) {
             throw new IllegalArgumentException("documentCount must be >= 0, got " + documentCount);
@@ -44,10 +52,20 @@ public final class PruningStats implements Writeable {
         this.fieldRanges = Map.copyOf(Objects.requireNonNull(fieldRanges, "fieldRanges"));
     }
 
+    /**
+     * A pruning stats instance carrying no information, used when no stats have been collected yet.
+     *
+     * @return an empty {@link PruningStats}
+     */
     public static PruningStats empty() {
         return new PruningStats(0, null, null, Map.of());
     }
 
+    /**
+     * Deserializes pruning stats previously written by {@link #writeTo}.
+     *
+     * @param in the stream to read from
+     */
     public PruningStats(StreamInput in) throws IOException {
         this.documentCount = in.readVLong();
         this.minTimestampMillis = in.readOptionalLong();
@@ -63,18 +81,22 @@ public final class PruningStats implements Writeable {
         out.writeMap(fieldRanges, StreamOutput::writeString, (o, v) -> v.writeTo(o));
     }
 
+    /** The number of documents contributing to these stats. */
     public long documentCount() {
         return documentCount;
     }
 
+    /** The minimum observed timestamp, or {@code null} if unknown. */
     public Long minTimestampMillis() {
         return minTimestampMillis;
     }
 
+    /** The maximum observed timestamp, or {@code null} if unknown. */
     public Long maxTimestampMillis() {
         return maxTimestampMillis;
     }
 
+    /** Per-field numeric ranges, keyed by field name. */
     public Map<String, FieldRange> fieldRanges() {
         return fieldRanges;
     }
@@ -85,6 +107,10 @@ public final class PruningStats implements Writeable {
      * when this shard carries no timestamp stats at all &mdash; the safe default per the
      * pruning-safety invariant: a stale or absent digest may only cause a false activation,
      * never a false skip.
+     *
+     * @param queryFromMillis the lower bound of the query time range, inclusive
+     * @param queryToMillis the upper bound of the query time range, inclusive
+     * @return {@code true} if the ranges might overlap, or if this shard has no timestamp stats
      */
     public boolean mightOverlapTimeRange(long queryFromMillis, long queryToMillis) {
         if (minTimestampMillis == null || maxTimestampMillis == null) {
@@ -127,6 +153,12 @@ public final class PruningStats implements Writeable {
         private final long min;
         private final long max;
 
+        /**
+         * Creates a field range spanning {@code [min, max]}.
+         *
+         * @param min the minimum observed value
+         * @param max the maximum observed value
+         */
         public FieldRange(long min, long max) {
             if (min > max) {
                 throw new IllegalArgumentException("min (" + min + ") must be <= max (" + max + ")");
@@ -135,6 +167,11 @@ public final class PruningStats implements Writeable {
             this.max = max;
         }
 
+        /**
+         * Deserializes a field range previously written by {@link #writeTo}.
+         *
+         * @param in the stream to read from
+         */
         public FieldRange(StreamInput in) throws IOException {
             this(in.readLong(), in.readLong());
         }
@@ -145,14 +182,24 @@ public final class PruningStats implements Writeable {
             out.writeLong(max);
         }
 
+        /** The minimum observed value. */
         public long min() {
             return min;
         }
 
+        /** The maximum observed value. */
         public long max() {
             return max;
         }
 
+        /**
+         * Whether the query range {@code [queryMin, queryMax]} could possibly overlap this
+         * field's observed range.
+         *
+         * @param queryMin the lower bound of the query range
+         * @param queryMax the upper bound of the query range
+         * @return {@code true} if the ranges might overlap
+         */
         public boolean mightOverlap(long queryMin, long queryMax) {
             return min <= queryMax && max >= queryMin;
         }
@@ -176,7 +223,12 @@ public final class PruningStats implements Writeable {
         }
     }
 
-    /** Builder-free helper to keep field-range maps deterministically ordered for tests/logging. */
+    /**
+     * Builder-free helper to keep field-range maps deterministically ordered for tests/logging.
+     *
+     * @param ranges the field ranges to order
+     * @return a new map containing the same entries, sorted by field name
+     */
     public static Map<String, FieldRange> orderedFieldRanges(Map<String, FieldRange> ranges) {
         return new TreeMap<>(ranges);
     }

@@ -41,6 +41,17 @@ public final class PitrRetentionSchedulerTask implements Closeable {
     private final long windowMillis;
     private final Scheduler.Cancellable task;
 
+    /**
+     * Creates and immediately schedules a recurring PITR reconciliation task for one shard.
+     *
+     * @param threadPool     the thread pool used to schedule the recurring task.
+     * @param interval       how often to run reconciliation.
+     * @param indexUuid      the UUID of the index the shard belongs to.
+     * @param shardId        the shard to reconcile PITR pins for.
+     * @param manifestStore  the store used to list the shard's manifests on each reconciliation.
+     * @param pinRegistry    the registry the reconciler adds/removes PITR pins on.
+     * @param windowMillis   how far back point-in-time recovery must be possible; must be > 0.
+     */
     public PitrRetentionSchedulerTask(
         ThreadPool threadPool,
         TimeValue interval,
