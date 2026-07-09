@@ -11,6 +11,7 @@ package org.opensearch.serverless.storage;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.routing.allocation.ExistingShardsAllocator;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.index.IndexModule;
 import org.opensearch.indices.replication.common.ReplicationType;
 import org.opensearch.serverless.storage.allocation.ServerlessStorageExistingShardsAllocator;
 import org.opensearch.test.OpenSearchTestCase;
@@ -88,5 +89,29 @@ public class ServerlessStorageIndexSettingProviderTests extends OpenSearchTestCa
         Settings additional = new ServerlessStorageIndexSettingProvider().getAdditionalIndexSettings("my-index", false, requestSettings);
 
         assertTrue("an index that never opted into serverless storage must never be rejected on this basis", additional.isEmpty());
+    }
+
+    public void testTranslatesLazyDirectoryEnabledIntoIndexStoreType() {
+        Settings requestSettings = Settings.builder()
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey(), true)
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_LAZY_DIRECTORY_ENABLED_SETTING.getKey(), true)
+            .build();
+
+        Settings additional = new ServerlessStorageIndexSettingProvider().getAdditionalIndexSettings("my-index", false, requestSettings);
+
+        assertEquals(ServerlessStoragePlugin.LAZY_DIRECTORY_STORE_TYPE, additional.get(IndexModule.INDEX_STORE_TYPE_SETTING.getKey()));
+    }
+
+    public void testDoesNotSetIndexStoreTypeWhenLazyDirectoryIsNotEnabled() {
+        Settings requestSettings = Settings.builder()
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey(), true)
+            .build();
+
+        Settings additional = new ServerlessStorageIndexSettingProvider().getAdditionalIndexSettings("my-index", false, requestSettings);
+
+        assertNull(
+            "index.store.type must stay unset (normal FSDirectory) unless the lazy directory feature is explicitly enabled",
+            additional.get(IndexModule.INDEX_STORE_TYPE_SETTING.getKey())
+        );
     }
 }
