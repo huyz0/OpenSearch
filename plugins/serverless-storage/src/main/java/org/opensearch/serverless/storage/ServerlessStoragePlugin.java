@@ -825,4 +825,9 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     WalChunkService sharedWalChunkServiceForTesting() {
         return sharedWalChunkService;
     }
+
+    /** The WAL GC scheduler task {@link #createComponents} built, or {@code null} if disabled -- test-only visibility. */
+    org.opensearch.serverless.storage.wal.WalGcSchedulerTask walGcSchedulerTaskForTesting() {
+        return walGcSchedulerTask;
+    }
 }
