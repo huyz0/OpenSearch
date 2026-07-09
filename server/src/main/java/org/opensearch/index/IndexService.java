@@ -845,7 +845,7 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
                         threadPool
                     );
                 } else if (this.indexSettings.isPluggableDataFormatEnabled() == false) {
-                    directory = directoryFactory.newDirectory(this.indexSettings, path);
+                    directory = directoryFactory.newDirectory(this.indexSettings, path, routing);
                 } else {
                     // Will be enabled in case of formatAware indices.
                     directory = createDataFormatAwareStoreDirectory(shardId, path, checksumStrategies);
