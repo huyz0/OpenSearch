@@ -538,14 +538,15 @@ bump uses the existing cluster-coordination mechanism; once the metadata plane l
 authority migrates to CAS on the shard-head object (metadata-plane RFC §4/§12) — the engine
 code is agnostic, it consumes a term from a `ShardStateStore` interface either way.
 
-#### 7.1.1 Local retention once object storage is durable (design, not yet implemented)
+#### 7.1.1 Local retention once object storage is durable (implemented)
 
-**Status**: design only, written up here before any code so the safety argument gets scrutiny
-first — see §16 Phase 2's own status note ("local files are kept exactly as a normal
-`InternalEngine` would keep them, so this is belt-and-suspenders durability today rather than the
-disk-bandwidth savings target"). This section is that redesign, worked through far enough to be
-implementable, plus the one open call that's a genuine product/risk-tolerance decision, not an
-engineering one.
+**Status**: originally written up here as design-only, before any code, so the safety argument
+would get scrutiny first — since implemented and verified end to end (see §16 Phase 2's own status
+note, "Local commit/translog retention is now durability-driven end to end (§7.1.1, both parts
+done)"). This section is that design, worked through far enough to have been implementable, plus
+the one open call that was a genuine product/risk-tolerance decision, not an engineering one --
+left in place below as the record of the reasoning the implementation follows, not as a
+still-pending proposal.
 
 **Why today's retention is more conservative than this architecture needs.** Core OpenSearch
 already ties local commit and translog retention tightly to the global checkpoint, not to
@@ -615,11 +616,13 @@ invariant). Given that:
   is declared with no initializer expression specifically so the value assigned during `super()`
   survives (an explicit `= null` would execute afterward and clobber it), verified directly by a
   test that asserts the field is non-null immediately after construction, not just that the code
-  compiles. **Known current limitation, not yet closed**: `Translog#trimUnreferencedReaders`
-  combines this policy's floor with a *second*, still-untouched floor derived from
-  `CombinedDeletionPolicy`'s safe-commit tracking (core's own global-checkpoint-driven retention) --
-  so until local commit retention (below) is also implemented, the *combined* effective retention
-  is still bounded by whichever of the two is more conservative.
+  compiles. **A structural note, not an open gap**: `Translog#trimUnreferencedReaders` combines
+  this policy's floor with a *second* floor derived from `CombinedDeletionPolicy`'s safe-commit
+  tracking (core's own global-checkpoint-driven retention) -- so the *combined* effective retention
+  is always bounded by whichever of the two is more conservative. This was the reason local commit
+  retention (below) needed its own fix too, not just translog retention alone; both are now
+  implemented, so this combination no longer leaves excess retention on the table the way it would
+  have with only one side fixed.
 - **Local commit retention — implemented.** The actual core seam needed turned out smaller than
   the `newCombinedDeletionPolicy()` factory hook originally proposed here: `CombinedDeletionPolicy`
   itself doesn't need to be swappable, because its constructor already accepted a `LongSupplier`
