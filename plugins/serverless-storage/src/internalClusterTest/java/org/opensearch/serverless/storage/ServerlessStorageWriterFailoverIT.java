@@ -203,4 +203,99 @@ public class ServerlessStorageWriterFailoverIT extends OpenSearchIntegTestCase {
         SearchResponse response = client().prepareSearch(INDEX_NAME).setSize(0).get();
         assertHitCount(response, 2);
     }
+
+    /**
+     * Closes the remaining half of &sect;16 Phase 2's own "further broadening the IT" note: every
+     * other crash-recovery test in this class covers exactly one shard's worth of recovery, which
+     * leaves open the question of whether killing one node correctly recovers only the shard(s)
+     * whose primary actually lived there, while a shard whose primary survived is left completely
+     * undisturbed -- not just "did the whole index still respond." A 3-shard, 3-data-node cluster
+     * with a real writer-shard-aware allocator (unlike a plain even-split assumption) makes no
+     * guarantee about which node hosts how many primaries, so this test kills whichever node hosts
+     * shard 0's primary specifically (deterministic, unlike "some node") and separately asserts
+     * shard 0's own document survives, not merely that the index-wide total is still correct (which
+     * a bug that silently dropped a healthy, undisturbed shard's data could still coincidentally
+     * satisfy if it happened to also lose the same number of documents elsewhere).
+     */
+    public void testMultipleShardsEachIndependentlySurviveTheirOwnPrimarysNodeBeingKilled() throws Exception {
+        Path sharedBasePath = createTempDir("serverless-storage-shared-multi-shard");
+        Settings nodeSettings = sharedNodeSettings(sharedBasePath);
+
+        internalCluster().startClusterManagerOnlyNode(nodeSettings);
+        internalCluster().startDataOnlyNode(nodeSettings);
+        internalCluster().startDataOnlyNode(nodeSettings);
+        internalCluster().startDataOnlyNode(nodeSettings);
+
+        int numberOfShards = 3;
+        createIndex(
+            INDEX_NAME,
+            Settings.builder()
+                .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, numberOfShards)
+                .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+                .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey(), true)
+                .build()
+        );
+        ensureGreen(INDEX_NAME);
+
+        // "routing" pins each doc to a specific shard via the standard hash-of-routing-value
+        // mechanism -- deterministic and portable across OpenSearch versions, unlike depending on
+        // the id-hash default distribution. shard0Routing is confirmed below to actually land on
+        // shard 0 before it's relied on for the rest of the test.
+        String shard0Routing = findRoutingValueForShard(numberOfShards, 0);
+        String shard1Routing = findRoutingValueForShard(numberOfShards, 1);
+
+        client().prepareIndex(INDEX_NAME).setId("shard0-doc1").setSource("field", "value1").setRouting(shard0Routing).get();
+        client().admin().indices().prepareFlush(INDEX_NAME).get();
+        // WAL-only durable on shard 0, and a completely untouched shard 1 doc, both flushed AND
+        // WAL-durable so shard 1's recovery path (which never loses its primary) is exercised too,
+        // just via the normal in-place-open path rather than crash recovery.
+        client().prepareIndex(INDEX_NAME).setId("shard0-doc2").setSource("field", "value2").setRouting(shard0Routing).get();
+        client().prepareIndex(INDEX_NAME).setId("shard1-doc1").setSource("field", "value1").setRouting(shard1Routing).get();
+        client().admin().indices().prepareFlush(INDEX_NAME).get();
+
+        refresh(INDEX_NAME);
+        assertHitCount(client().prepareSearch(INDEX_NAME).setSize(0).get(), 3);
+
+        ShardRouting shard0Primary = internalCluster().clusterService().state().routingTable().index(INDEX_NAME).shard(0).primaryShard();
+        String shard0PrimaryNodeId = shard0Primary.currentNodeId();
+        String shard0PrimaryNodeName = internalCluster().clusterService().state().nodes().get(shard0PrimaryNodeId).getName();
+
+        internalCluster().stopRandomNode(settings -> shard0PrimaryNodeName.equals(settings.get("node.name")));
+
+        ensureGreen(INDEX_NAME);
+        refresh(INDEX_NAME);
+
+        // The index-wide total proves nothing was silently lost anywhere...
+        assertHitCount(client().prepareSearch(INDEX_NAME).setSize(0).get(), 3);
+        // ...and these two per-shard-routed gets prove specifically that shard 0's own two
+        // documents (one manifest-durable, one WAL-only-durable) both survived its primary's node
+        // being killed, while shard 1's document -- whose primary was never touched -- was of
+        // course also never at risk, but is checked anyway so a bug that accidentally routed both
+        // docs onto the same shard would not silently pass this test.
+        assertHitCount(client().prepareSearch(INDEX_NAME).setRouting(shard0Routing).setSize(0).get(), 2);
+        assertHitCount(client().prepareSearch(INDEX_NAME).setRouting(shard1Routing).setSize(0).get(), 1);
+    }
+
+    /**
+     * Brute-forces a routing value that {@code OperationRouting}'s standard hash-of-routing-value
+     * mechanism maps to {@code targetShardId} for an index with {@code numberOfShards} shards --
+     * simpler and more portable than depending on the hashing algorithm's exact internals, and
+     * self-verifying: if no candidate in the search space maps to the target shard (should never
+     * happen for a reasonable shard count), this fails loudly rather than silently testing the
+     * wrong shard.
+     */
+    private String findRoutingValueForShard(int numberOfShards, int targetShardId) {
+        for (int candidate = 0; candidate < 10_000; candidate++) {
+            String routingValue = "route-" + candidate;
+            int shardId = internalCluster().clusterService()
+                .operationRouting()
+                .indexShards(internalCluster().clusterService().state(), INDEX_NAME, null, routingValue)
+                .shardId()
+                .id();
+            if (shardId == targetShardId) {
+                return routingValue;
+            }
+        }
+        throw new AssertionError("could not find a routing value mapping to shard " + targetShardId + " within the search space");
+    }
 }

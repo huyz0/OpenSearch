@@ -1576,7 +1576,20 @@ fix along the way: secure settings can only ever be attached once per `Settings`
 key has to be threaded in via an overridden `nodeSettings(int)` -- the one place that builds each
 node's settings from scratch -- rather than pre-built and passed to `startClusterManagerOnlyNode`/
 `startDataOnlyNode` directly, which throws on the second, already-secure-settings-bearing merge.)
-The multiple-shards half remains open.
+
+**The multiple-shards half is done too, closing "further broadening the IT" completely.**
+`ServerlessStorageWriterFailoverIT#testMultipleShardsEachIndependentlySurviveTheirOwnPrimarysNodeBeingKilled`
+runs a 3-shard index across a 4-node cluster (one cluster-manager, three data nodes), kills
+specifically the node hosting shard 0's primary (found via routing table lookup, not assumed),
+and asserts shard 0's own two documents (one manifest-durable, one WAL-only-durable) both survive
+-- checked via a routing-pinned search against shard 0 specifically, not just the index-wide
+total, since a bug that silently dropped a healthy shard's data while also losing the same count
+elsewhere could otherwise coincidentally pass an index-wide-only check. Shard 1's document (whose
+primary was never touched) is checked the same way, proving the recovery is scoped to exactly the
+shard whose primary actually died, not the whole index indiscriminately. Routing values are found
+by brute-force search against the real `OperationRouting#indexShards` hashing rather than assumed,
+so the test is self-verifying against whatever shard-count/hash-function combination is actually
+in effect.
 
 **Phase 3 — Reader engine (materializer, open-from-manifest, and refresh-to-newer-generation all
 done; notification wiring still open in its event-driven form).** `ObjectStoreCommitMaterializer`
