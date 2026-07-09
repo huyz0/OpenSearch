@@ -11,11 +11,13 @@ package org.opensearch.serverless.storage;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.routing.ShardRouting;
+import org.opensearch.common.settings.MockSecureSettings;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.test.OpenSearchIntegTestCase;
 
 import java.nio.file.Path;
+import java.util.Base64;
 import java.util.Collection;
 import java.util.Collections;
 
@@ -36,6 +38,17 @@ public class ServerlessStorageWriterFailoverIT extends OpenSearchIntegTestCase {
 
     private static final String INDEX_NAME = "serverless-failover-idx";
 
+    /**
+     * Set by {@link #testWriterShardSurvivesItsNodeBeingKilledWithEncryptionEnabled} before
+     * starting any node, and merged into every node's settings by {@link #nodeSettings}. Secure
+     * settings can only ever be attached once per {@link Settings} object -- composing two
+     * already-secure-settings-bearing {@link Settings} via {@code Settings.Builder#put(Settings)}
+     * throws -- so this has to be threaded in at the one place ({@link #nodeSettings}) that already
+     * owns building each node's final settings from scratch, rather than pre-built and passed to
+     * {@code startClusterManagerOnlyNode}/{@code startDataOnlyNode} directly.
+     */
+    private volatile MockSecureSettings encryptionSecureSettingsOverride;
+
     @Override
     protected Collection<Class<? extends Plugin>> nodePlugins() {
         return Collections.singletonList(ServerlessStoragePlugin.class);
@@ -47,6 +60,18 @@ public class ServerlessStorageWriterFailoverIT extends OpenSearchIntegTestCase {
         // collides with WriterEngineFactory ("multiple engine factories provided for [...]") --
         // this plugin's own EngineFactory is the whole point of the test.
         return false;
+    }
+
+    @Override
+    protected Settings nodeSettings(int nodeOrdinal) {
+        Settings.Builder builder = Settings.builder().put(super.nodeSettings(nodeOrdinal));
+        if (encryptionSecureSettingsOverride != null) {
+            // Each node gets its own clone -- MockSecureSettings is consumed per Settings build,
+            // and this same override is reused across every node (cluster-manager + both data
+            // nodes) in the encrypted test.
+            builder.setSecureSettings((MockSecureSettings) encryptionSecureSettingsOverride.clone());
+        }
+        return builder.build();
     }
 
     private Settings sharedNodeSettings(Path basePath) {
@@ -114,6 +139,67 @@ public class ServerlessStorageWriterFailoverIT extends OpenSearchIntegTestCase {
         // activationWalPosition, ObjectStoreWriterEngine#engineRecoveryOperations) must both be
         // present -- proving the full chain (fencing, fetch/filter/decode, apply-to-shard) under a
         // real cluster, not just the manifest-materialization half.
+        SearchResponse response = client().prepareSearch(INDEX_NAME).setSize(0).get();
+        assertHitCount(response, 2);
+    }
+
+    /**
+     * Same crash-recovery proof as {@link #testWriterShardSurvivesItsNodeBeingKilled}, but with
+     * encryption enabled on every node (rfc-serverless-opensearch.md &sect;16 Phase 2's own status
+     * note: "further broadening the IT (encryption enabled, multiple shards)" was the one
+     * documented remaining gap once the base crash-recovery scenario was proven). Every store this
+     * plugin writes -- bundles, manifests, shard-state registers, and WAL chunks -- is encrypted
+     * with the same shared key every node in the cluster is configured with, so the survivor node
+     * genuinely has to decrypt the dying node's data to recover it, not merely re-read plaintext
+     * that happened to already be readable.
+     */
+    public void testWriterShardSurvivesItsNodeBeingKilledWithEncryptionEnabled() throws Exception {
+        Path sharedBasePath = createTempDir("serverless-storage-shared-encrypted");
+        byte[] rawKeyBytes = new byte[32];
+        random().nextBytes(rawKeyBytes);
+        MockSecureSettings secureSettings = new MockSecureSettings();
+        secureSettings.setString(
+            ServerlessStoragePlugin.SERVERLESS_STORAGE_ENCRYPTION_KEY_SETTING.getKey(),
+            Base64.getEncoder().encodeToString(rawKeyBytes)
+        );
+        encryptionSecureSettingsOverride = secureSettings;
+        Settings nodeSettings = sharedNodeSettings(sharedBasePath);
+
+        internalCluster().startClusterManagerOnlyNode(nodeSettings);
+        internalCluster().startDataOnlyNode(nodeSettings);
+        internalCluster().startDataOnlyNode(nodeSettings);
+
+        createIndex(
+            INDEX_NAME,
+            Settings.builder()
+                .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+                .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+                .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey(), true)
+                .build()
+        );
+        ensureGreen(INDEX_NAME);
+
+        client().prepareIndex(INDEX_NAME).setId("1").setSource("field", "value1").get();
+        client().admin().indices().prepareFlush(INDEX_NAME).get();
+        client().prepareIndex(INDEX_NAME).setId("2").setSource("field", "value2").get();
+
+        refresh(INDEX_NAME);
+        assertHitCount(client().prepareSearch(INDEX_NAME).setSize(0).get(), 2);
+
+        ShardRouting primaryShard = internalCluster().clusterService().state().routingTable().index(INDEX_NAME).shard(0).primaryShard();
+        String primaryNodeId = primaryShard.currentNodeId();
+        String primaryNodeName = internalCluster().clusterService().state().nodes().get(primaryNodeId).getName();
+
+        internalCluster().stopRandomNode(settings -> primaryNodeName.equals(settings.get("node.name")));
+
+        // The survivor node was started with the SAME shared key -- if this ever regresses to each
+        // node generating its own key, or the key not actually being applied to every store this
+        // plugin writes, this recovery would fail loudly (decrypt failure) rather than silently
+        // succeed with corrupted data, per EncryptingBlobContainer/WalRecordCrypto's own
+        // fail-loudly-on-tamper-or-wrong-key design.
+        ensureGreen(INDEX_NAME);
+
+        refresh(INDEX_NAME);
         SearchResponse response = client().prepareSearch(INDEX_NAME).setSize(0).get();
         assertHitCount(response, 2);
     }

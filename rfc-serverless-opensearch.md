@@ -1565,9 +1565,18 @@ verified stable across 5 runs with fresh random seeds after the fix, including t
 previously-failing seed.
 
 What remains is the residual `activationWalPosition` atomicity limitation already documented in
-&sect;6.4 (out of scope -- needs the metadata-plane term-authority migration) and further broadening
-the IT (encryption enabled, multiple shards), not any further unproven piece of the crash-recovery
-story.
+&sect;6.4 (out of scope -- needs the metadata-plane term-authority migration), not any further
+unproven piece of the crash-recovery story. **The encryption-enabled half of "further broadening
+the IT" is now done too**: `ServerlessStorageWriterFailoverIT#testWriterShardSurvivesItsNodeBeingKilledWithEncryptionEnabled`
+runs the identical crash-recovery scenario with every node configured with the same shared AES
+key, so the survivor node has to genuinely decrypt the dying node's bundles, manifest, and WAL
+chunks to recover -- not merely re-read plaintext that happened to already be readable. (Attaching
+per-node secure settings inside an `InternalTestCluster` needed one small test-infrastructure
+fix along the way: secure settings can only ever be attached once per `Settings` object, so the
+key has to be threaded in via an overridden `nodeSettings(int)` -- the one place that builds each
+node's settings from scratch -- rather than pre-built and passed to `startClusterManagerOnlyNode`/
+`startDataOnlyNode` directly, which throws on the second, already-secure-settings-bearing merge.)
+The multiple-shards half remains open.
 
 **Phase 3 — Reader engine (materializer, open-from-manifest, and refresh-to-newer-generation all
 done; notification wiring still open in its event-driven form).** `ObjectStoreCommitMaterializer`
