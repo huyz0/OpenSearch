@@ -9,7 +9,8 @@
 package org.opensearch.serverless.storage.wal;
 
 import org.opensearch.common.blobstore.BlobContainer;
-import org.opensearch.common.blobstore.BlobMetadata;
+import org.opensearch.common.blobstore.BlobRegister;
+import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.core.common.bytes.BytesArray;
 
 import java.io.IOException;
@@ -19,7 +20,6 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Node-level WAL chunk writer (rfc-serverless-opensearch.md &sect;6.4): buffers {@link WalRecord}s
@@ -52,18 +52,36 @@ import java.util.concurrent.atomic.AtomicLong;
  * batching that's the entire reason this is a node-level service rather than a per-shard one
  * (rfc-serverless-opensearch.md &sect;6.4's cost-sanity argument). Fencing a superseded writer
  * therefore cannot mean "discard its epoch directory" (that would fence every other shard sharing
- * it); it is a per-record filter instead -- see {@link WalRecord}'s own javadoc. The chunk
- * sequence for a given {@code writerEpoch} resumes from whatever is already present in the blob
- * container rather than always starting at 0, so a fresh {@link WalChunkService} instance
- * constructed against a container that already holds chunks for this node's epoch (e.g. after a
- * process restart with the same node incarnation) will not overwrite them.
+ * it); it is a per-record filter instead -- see {@link WalRecord}'s own javadoc.
+ *
+ * <p><b>Chunk sequence numbers are claimed via {@code blobContainer}'s own {@link
+ * BlobContainer#compareAndSwapRegister} primitive</b>, not counted locally: an earlier version of
+ * this class seeded a plain {@code AtomicLong} once at construction from whatever the container
+ * already held and incremented it purely locally thereafter, which is only safe for a single
+ * {@link WalChunkService} instance -- since every node in a cluster with WAL mirroring enabled
+ * writes into the exact same shared container (one {@code <base_path>/wal/} root, not scoped per
+ * node), two independently-numbered instances writing concurrently would silently overwrite each
+ * other's chunks (confirmed with a real regression test before this fix,
+ * {@code WalChunkServiceTests#testTwoInstancesSharingOneContainerCanSilentlyOverwriteEachOthersChunks}
+ * -- see rfc-serverless-opensearch.md &sect;6.4's own status note for the full writeup). Using the
+ * register's own {@link BlobRegister#generation()} as the counter -- "monotonically increasing
+ * with each successful write," exactly a distributed atomic counter -- gets real cross-node safety
+ * for free from the same primitive {@code ShardStateStore}/{@code DurablePinRegistry} already rely
+ * on, with no new storage-backend-specific code.
  */
 public final class WalChunkService implements WalAppendTarget {
+
+    /**
+     * The register blob {@link #claimNextChunkSequence} and {@link #currentChunkSequenceUpperBound}
+     * both use -- shared across every {@link WalChunkService} instance pointed at this container
+     * (i.e. cluster-wide, not per-node), which is the entire point: its generation is what makes
+     * chunk sequence allocation actually safe under concurrent writers.
+     */
+    static final String SEQUENCE_REGISTER_NAME = "chunk-sequence";
 
     private final BlobContainer blobContainer;
     private final String writerEpoch;
     private final long perShardBudgetBytes;
-    private final AtomicLong nextChunkSequence;
     private final List<WalRecord> buffered = new ArrayList<>();
     private final Map<ShardKey, Long> bufferedBytesByShard = new HashMap<>();
 
@@ -76,18 +94,36 @@ public final class WalChunkService implements WalAppendTarget {
         this.blobContainer = blobContainer;
         this.writerEpoch = writerEpoch;
         this.perShardBudgetBytes = perShardBudgetBytes;
-        this.nextChunkSequence = new AtomicLong(firstUnusedChunkSequence(blobContainer, writerEpoch));
     }
 
-    private static long firstUnusedChunkSequence(BlobContainer blobContainer, String writerEpoch) throws IOException {
-        long maxExisting = -1;
-        for (BlobMetadata blob : blobContainer.listBlobsByPrefix(WalChunkNaming.LOG_BLOB_PREFIX).values()) {
-            long sequence = WalChunkNaming.parseChunkSequence(blob.name());
-            if (sequence > maxExisting) {
-                maxExisting = sequence;
+    /**
+     * Atomically claims the next chunk sequence number, safe under any number of concurrent {@link
+     * WalChunkService} instances (any number of nodes) sharing {@link #blobContainer}: retries the
+     * compare-and-swap against whatever the register's current generation actually is until one
+     * attempt wins, rather than assuming a single locally-cached expectation is still correct
+     * (which, under real concurrent writers, it frequently won't be -- that assumption was
+     * precisely this class's earlier bug, see the class javadoc). The register's own value is
+     * never read for content, only its generation; {@link org.opensearch.core.common.bytes.BytesArray#EMPTY}
+     * is written every time.
+     */
+    private long claimNextChunkSequence() throws IOException {
+        while (true) {
+            long expectedGeneration = blobContainer.readRegister(SEQUENCE_REGISTER_NAME)
+                .map(BlobRegister::generation)
+                .orElse(BlobRegister.ABSENT_GENERATION);
+            BlobRegisterCasResult result = blobContainer.compareAndSwapRegister(
+                SEQUENCE_REGISTER_NAME,
+                expectedGeneration,
+                BytesArray.EMPTY
+            );
+            if (result.applied()) {
+                // Generation 1 is the first successful write (ABSENT_GENERATION is 0), so the
+                // 0-based chunk sequence it corresponds to is one less.
+                return result.currentGeneration() - 1;
             }
+            // Lost the race -- another instance (this node or another) claimed a sequence between
+            // our read and our CAS attempt. Re-read and retry rather than guessing.
         }
-        return maxExisting + 1;
     }
 
     @Override
@@ -151,9 +187,15 @@ public final class WalChunkService implements WalAppendTarget {
      * excluded regardless of what term it claims, closing the gap a term-only filter (see {@link
      * WalChunkReader#filterByShardAndMinimumTerm}) leaves open on its own. See that model's own
      * STATUS note for the full verification result and what's still not wired to consume this.
+     *
+     * <p>A live read of {@link #SEQUENCE_REGISTER_NAME}'s current generation, deliberately not a
+     * locally cached value: since the register is the real, cross-node-shared source of truth (see
+     * {@link #claimNextChunkSequence}), a stale local cache could under-report this bound and let a
+     * fencing snapshot silently exclude chunks that genuinely existed before activation -- exactly
+     * the failure mode {@code WalReplayFencing.tla} exists to rule out.
      */
-    public synchronized long currentChunkSequenceUpperBound() {
-        return nextChunkSequence.get();
+    public long currentChunkSequenceUpperBound() throws IOException {
+        return blobContainer.readRegister(SEQUENCE_REGISTER_NAME).map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
     }
 
     /**
@@ -178,7 +220,7 @@ public final class WalChunkService implements WalAppendTarget {
     }
 
     private long writeChunk(List<WalRecord> records) throws IOException {
-        long chunkSequence = nextChunkSequence.getAndIncrement();
+        long chunkSequence = claimNextChunkSequence();
         byte[] chunkBytes = WalChunkWriter.write(records);
         String blobName = WalChunkNaming.blobName(writerEpoch, chunkSequence);
         blobContainer.writeBlob(blobName, new BytesArray(chunkBytes).streamInput(), chunkBytes.length, false);

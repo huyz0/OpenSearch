@@ -38,6 +38,7 @@ import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.List;
 import java.util.Optional;
 import java.util.function.LongSupplier;
@@ -330,7 +331,17 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     ) {
         CONSTRUCTION_WAL_CHUNK_SERVICE.set(walChunkService);
         CONSTRUCTION_ENCRYPTION_KEY_PROVIDER.set(encryptionKeyProvider);
-        CONSTRUCTION_ACTIVATION_WAL_POSITION.set(walChunkService == null ? -1L : walChunkService.currentChunkSequenceUpperBound());
+        long activationWalPosition;
+        try {
+            // A live read (see WalChunkService#currentChunkSequenceUpperBound's own javadoc for
+            // why it must be live, not cached) -- a failure here means this writer cannot safely
+            // establish its own fencing bound, so it must not activate at all rather than silently
+            // using a wrong one.
+            activationWalPosition = walChunkService == null ? -1L : walChunkService.currentChunkSequenceUpperBound();
+        } catch (IOException e) {
+            throw new UncheckedIOException("failed to snapshot activationWalPosition for writer engine activation", e);
+        }
+        CONSTRUCTION_ACTIVATION_WAL_POSITION.set(activationWalPosition);
         return null;
     }
 

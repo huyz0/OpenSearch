@@ -196,10 +196,17 @@ public class WalMirroringTranslogTests extends OpenSearchTestCase {
     /** Fails the first {@code failureCount} writeBlob calls, then delegates normally. */
     private static final class FailNTimesBlobContainer extends FilterBlobContainer {
 
+        // FilterBlobContainer keeps its own delegate reference private and doesn't override
+        // readRegister/compareAndSwapRegister (inheriting BlobContainer's own
+        // UnsupportedOperationException-throwing defaults instead of delegating) -- WalChunkService
+        // now needs both for its CAS-based chunk sequence allocation, so this class keeps its own
+        // reference to delegate to directly.
+        private final BlobContainer delegate;
         private int remainingFailures;
 
         FailNTimesBlobContainer(BlobContainer delegate, int failureCount) {
             super(delegate);
+            this.delegate = delegate;
             this.remainingFailures = failureCount;
         }
 
@@ -216,6 +223,20 @@ public class WalMirroringTranslogTests extends OpenSearchTestCase {
                 throw new java.io.IOException("injected transient failure writing " + blobName);
             }
             super.writeBlob(blobName, inputStream, blobSize, failIfAlreadyExists);
+        }
+
+        @Override
+        public java.util.Optional<org.opensearch.common.blobstore.BlobRegister> readRegister(String blobName) throws java.io.IOException {
+            return delegate.readRegister(blobName);
+        }
+
+        @Override
+        public org.opensearch.common.blobstore.BlobRegisterCasResult compareAndSwapRegister(
+            String blobName,
+            long expectedGeneration,
+            org.opensearch.core.common.bytes.BytesReference newValue
+        ) throws java.io.IOException {
+            return delegate.compareAndSwapRegister(blobName, expectedGeneration, newValue);
         }
     }
 }

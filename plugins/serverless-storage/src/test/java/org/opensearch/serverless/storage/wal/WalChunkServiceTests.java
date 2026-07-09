@@ -213,24 +213,22 @@ public class WalChunkServiceTests extends OpenSearchTestCase {
     }
 
     /**
-     * Documents a real, unresolved gap (see rfc-serverless-opensearch.md &sect;6.4's own status
-     * note): two {@link WalChunkService} instances sharing one container -- exactly what happens
-     * when two nodes in the same cluster both have WAL mirroring enabled against the same shared
-     * {@code serverless_storage.base_path}, since {@code ServerlessStoragePlugin} constructs the
-     * WAL container from that one shared root with no per-node scoping -- each compute their own
-     * "first unused chunk sequence" independently and increment it locally with no cross-instance
-     * coordination at all. If both are actively writing, their locally-numbered sequences collide,
-     * and the second writer's chunk silently overwrites the first's ({@link
-     * org.opensearch.common.blobstore.BlobContainer#writeBlob} is called with {@code
-     * failIfAlreadyExists=false}) -- an unrecoverable loss of the first writer's mirrored
-     * operations, discovered by reading this class's own construction/write path, not by a report.
+     * The fix for a real bug this class used to have (see rfc-serverless-opensearch.md &sect;6.4's
+     * own status note): two {@link WalChunkService} instances sharing one container -- exactly
+     * what happens when two nodes in the same cluster both have WAL mirroring enabled against the
+     * same shared {@code serverless_storage.base_path}, since {@code ServerlessStoragePlugin}
+     * constructs the WAL container from that one shared root with no per-node scoping -- used to
+     * each compute their own "first unused chunk sequence" independently and increment it locally
+     * with no cross-instance coordination, silently overwriting each other's chunks under real
+     * concurrent use. Chunk sequence allocation now goes through {@code blobContainer}'s own {@link
+     * org.opensearch.common.blobstore.BlobContainer#compareAndSwapRegister}, so two instances
+     * writing concurrently against the same container get genuinely distinct sequences instead.
      */
-    public void testTwoInstancesSharingOneContainerCanSilentlyOverwriteEachOthersChunks() throws Exception {
+    public void testTwoInstancesSharingOneContainerGetDistinctChunkSequencesNotOverwritingEachOther() throws Exception {
         BlobContainer sharedContainer = newBlobContainer();
         // Two independent "node incarnations" -- distinct writerEpoch strings, exactly as
         // ServerlessStoragePlugin#createComponents constructs a fresh UUIDs.base64UUID() epoch per
-        // node -- both against the SAME shared container, both starting fresh (no chunks written
-        // by either yet), so both independently compute firstUnusedChunkSequence() == 0.
+        // node -- both against the SAME shared container, both starting fresh.
         WalChunkService serviceA = new WalChunkService(sharedContainer, "node-a-epoch");
         WalChunkService serviceB = new WalChunkService(sharedContainer, "node-b-epoch");
 
@@ -240,27 +238,45 @@ public class WalChunkServiceTests extends OpenSearchTestCase {
         serviceB.append(new WalRecord("idx", 0, 1, 0, "from-node-b".getBytes("UTF-8")));
         long chunkSequenceB = serviceB.flush();
 
-        // The real bug: both services independently number their first chunk 0 -- node B's write
-        // silently clobbers node A's, even though nothing about either operation was invalid on
-        // its own.
-        assertEquals(
-            "this assertion documents the current (buggy) behavior, not a requirement -- a real fix "
-                + "must make this assertion false, not merely pass it",
-            0L,
-            chunkSequenceA
+        assertNotEquals(
+            "two concurrently-writing instances must never be assigned the same chunk sequence",
+            chunkSequenceA,
+            chunkSequenceB
         );
-        assertEquals(0L, chunkSequenceB);
 
-        byte[] survivingChunkBytes;
-        try (InputStream in = sharedContainer.readBlob(WalChunkNaming.blobName("node-a-epoch", 0))) {
-            survivingChunkBytes = in.readAllBytes();
+        byte[] chunkABytes;
+        try (InputStream in = sharedContainer.readBlob(WalChunkNaming.blobName("node-a-epoch", chunkSequenceA))) {
+            chunkABytes = in.readAllBytes();
         }
-        List<WalRecord> survivingRecords = WalChunkReader.readRecords(survivingChunkBytes);
-        assertEquals(1, survivingRecords.size());
+        List<WalRecord> chunkARecords = WalChunkReader.readRecords(chunkABytes);
+        assertEquals(1, chunkARecords.size());
+        assertEquals("from-node-a", new String(chunkARecords.get(0).payload(), "UTF-8"));
+
+        byte[] chunkBBytes;
+        try (InputStream in = sharedContainer.readBlob(WalChunkNaming.blobName("node-b-epoch", chunkSequenceB))) {
+            chunkBBytes = in.readAllBytes();
+        }
+        List<WalRecord> chunkBRecords = WalChunkReader.readRecords(chunkBBytes);
+        assertEquals(1, chunkBRecords.size());
         assertEquals(
-            "node A's chunk 0 was silently overwritten by node B's -- node A's mirrored operation is now unrecoverably lost",
+            "node B's write must not have overwritten node A's chunk -- both must independently survive",
             "from-node-b",
-            new String(survivingRecords.get(0).payload(), "UTF-8")
+            new String(chunkBRecords.get(0).payload(), "UTF-8")
         );
+    }
+
+    public void testCurrentChunkSequenceUpperBoundReflectsConcurrentWritersLiveNotCached() throws Exception {
+        BlobContainer sharedContainer = newBlobContainer();
+        WalChunkService serviceA = new WalChunkService(sharedContainer, "node-a-epoch");
+        WalChunkService serviceB = new WalChunkService(sharedContainer, "node-b-epoch");
+
+        assertEquals(0L, serviceA.currentChunkSequenceUpperBound());
+
+        serviceB.append(new WalRecord("idx", 0, 1, 0, "from-node-b".getBytes("UTF-8")));
+        serviceB.flush();
+
+        // serviceA never wrote anything itself, but must see serviceB's write reflected live --
+        // a locally cached value would wrongly still report 0 here.
+        assertEquals(1L, serviceA.currentChunkSequenceUpperBound());
     }
 }
