@@ -2036,8 +2036,12 @@ into a fresh target identity via `client().execute(ShardCloneAction.INSTANCE, ..
 lineage are confirmed present afterward, and a clone attempt against a source with no published
 manifest fails loudly rather than silently acknowledging.
 
-**Still deliberately out of scope**: the extended GC model check &sect;18.5 anticipates is still
-open.
+**No longer out of scope**: the extended GC model check this section originally anticipated as
+still open is done -- see §18 risk #5's `formal/CloneGc.tla`, which models exactly the
+clone-then-delete-source interleaving flagged above (§14's own "GC must be a cross-index reference
+count" bullet), found a genuine TOCTOU race in `ShardCloner.clone`'s original pin-after-read
+ordering, and verified the shipped pin-before-read fix sound across the complete reachable state
+space.
 
 **PITR reconciliation is now actually invoked, not just correct in isolation.**
 `PitrRetentionSchedulerTask` runs `PitrRetentionReconciler` for one shard on a fixed schedule (5
