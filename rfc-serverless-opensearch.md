@@ -1897,9 +1897,24 @@ cloned into a real index's real UUID, the clone's pin and lineage are confirmed 
 index is deleted through the normal delete API, and both the pin and lineage are confirmed gone
 without any explicit `deleteClone` call.
 
-**Still deliberately out of scope**: any REST/transport exposure -- `ShardCloner` is an internal
-component today, not a user-facing action. The extended GC model check &sect;18.5 anticipates is
-still open.
+**Clone is now user-facing.** `POST /_plugins/_serverless/storage/_clone` (body:
+`{"source": {"index_uuid", "shard_id"}, "target": {"index_uuid", "shard_id"}}`) is the first
+REST/transport action this plugin has ever exposed -- `ServerlessStoragePlugin` now also implements
+`ActionPlugin`. `ShardCloneAction`/`Request`/`Response` are a standard request/response triple;
+`TransportShardCloneAction` needs no routing to a specific data node (`ShardCloner.clone` operates
+purely against the shared object store, never node-local shard state, so whichever node receives
+the request executes it directly via `client.executeLocally`) and dispatches onto
+`ThreadPool.Names#GENERIC` rather than running its blob-store I/O on the transport thread. The
+plugin instance itself is now also returned from `createComponents` so Guice can inject it into the
+transport action, the same `blobContainerForDirectoryFactory` resolution
+`ServerlessStorageLazyDirectoryFactory` and the deletion listener above already depend on. Verified
+end to end over the real transport layer in a running cluster: a real published source is cloned
+into a fresh target identity via `client().execute(ShardCloneAction.INSTANCE, ...)`, the pin and
+lineage are confirmed present afterward, and a clone attempt against a source with no published
+manifest fails loudly rather than silently acknowledging.
+
+**Still deliberately out of scope**: the extended GC model check &sect;18.5 anticipates is still
+open.
 
 **PITR reconciliation is now actually invoked, not just correct in isolation.**
 `PitrRetentionSchedulerTask` runs `PitrRetentionReconciler` for one shard on a fixed schedule (5

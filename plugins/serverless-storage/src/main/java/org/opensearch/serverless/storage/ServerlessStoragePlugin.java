@@ -33,6 +33,7 @@ import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.shard.IndexSettingProvider;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.filecache.FileCacheFactory;
+import org.opensearch.plugins.ActionPlugin;
 import org.opensearch.plugins.ClusterPlugin;
 import org.opensearch.plugins.EnginePlugin;
 import org.opensearch.plugins.IndexStorePlugin;
@@ -102,7 +103,7 @@ import java.util.function.Supplier;
  * itself. Swapping in a real repository-backed container only touches {@link #blobContainerFor};
  * nothing else in this class or the engine/factory classes it wires together is FS-specific.
  */
-public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, ClusterPlugin, IndexStorePlugin {
+public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, ClusterPlugin, IndexStorePlugin, ActionPlugin {
 
     /**
      * The {@code index.store.type} value that opts a reader (search-only) shard copy into a
@@ -437,7 +438,11 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 throw new UncheckedIOException(e);
             }
         }
-        return Collections.emptyList();
+        // This plugin instance itself, so TransportShardCloneAction (the only consumer) can be
+        // constructor-injected with it and reach blobContainerForDirectoryFactory -- the same
+        // resolution ServerlessStorageLazyDirectoryFactory already depends on, just handed to a
+        // different consumer via a different injection path (Guice component vs. direct reference).
+        return Collections.singletonList(this);
     }
 
     /**
@@ -672,6 +677,36 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 // See this method's own javadoc: logged-and-swallowed, not fatal to index deletion.
             }
         }
+    }
+
+    /**
+     * The first user-facing REST/transport surface this plugin exposes
+     * (rfc-serverless-opensearch.md &sect;14): {@code ShardCloner} itself has existed since the
+     * clone feature landed, reachable only from Java code within the plugin until now.
+     */
+    @Override
+    public
+        java.util.List<ActionHandler<? extends org.opensearch.action.ActionRequest, ? extends org.opensearch.core.action.ActionResponse>>
+        getActions() {
+        return Collections.singletonList(
+            new ActionHandler<>(
+                org.opensearch.serverless.storage.clone.action.ShardCloneAction.INSTANCE,
+                org.opensearch.serverless.storage.clone.action.TransportShardCloneAction.class
+            )
+        );
+    }
+
+    @Override
+    public java.util.List<org.opensearch.rest.RestHandler> getRestHandlers(
+        Settings settings,
+        org.opensearch.rest.RestController restController,
+        ClusterSettings clusterSettings,
+        org.opensearch.common.settings.IndexScopedSettings indexScopedSettings,
+        org.opensearch.common.settings.SettingsFilter settingsFilter,
+        IndexNameExpressionResolver indexNameExpressionResolver,
+        java.util.function.Supplier<org.opensearch.cluster.node.DiscoveryNodes> nodesInCluster
+    ) {
+        return Collections.singletonList(new org.opensearch.serverless.storage.clone.action.RestShardCloneAction());
     }
 
     /** The node-shared bundle cache {@link #createComponents} built -- test-only visibility, not part of the plugin's contract. */
