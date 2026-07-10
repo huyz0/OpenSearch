@@ -1528,27 +1528,37 @@ RFC claims them deliberately rather than leaving them implicit:
    `ReplicationTracker`-related failures anywhere in the run.
 5. Generalized checkpoint/notification publisher (widen segment-replication checkpoint
    publishing to carry opaque payloads).
-6. ⚠️ REST handler capability annotation (§11) -- **the annotation itself now exists; enforcement
-   does not yet.** `RestHandler#serverlessScope()` (`server/src/main/java/org/opensearch/rest/RestHandler.java`),
+6. ✅ REST handler capability annotation (§11) -- **both the annotation and its enforcement are
+   now done.** `RestHandler#serverlessScope()` (`server/src/main/java/org/opensearch/rest/RestHandler.java`),
    a default method returning a new `RestHandler.ServerlessScope` enum (`AVAILABLE`/`INTERNAL_ONLY`/
    `UNAVAILABLE`), defaults to `UNAVAILABLE` -- matching §11's own "unannotated handlers default to
-   unavailable" design exactly, so new handlers must opt in consciously once enforcement lands.
-   `RestHandler.Wrapper` delegates it like every other method on that class, so a wrapped handler
-   (deprecation wrapper, etc.) doesn't silently fall back to the default and misreport its
-   delegate's real availability. Every one of this plugin's own 9 REST handlers now overrides it to
-   `AVAILABLE` -- verified by a new plugin test (`testEveryRestHandlerDeclaresItselfAvailableUnderServerlessMode`)
-   that iterates `getRestHandlers()` and fails if any handler reports anything else, catching the
-   exact mistake of adding a tenth handler without the override. **Deliberately not wired into
-   `RestController` yet**: enforcement needs a node-level "is this node in serverless mode" flag
-   that doesn't exist as a wired setting today, and threading `Settings` through `RestController`'s
-   construction (today's constructor takes none) to add that flag is real, separate, cross-cutting
-   surgery on a class core code depends on -- landing the annotation now lets every handler (this
-   plugin's and, eventually, core's own) record its intended availability incrementally rather than
-   needing one atomic change spanning every REST handler in the codebase once enforcement is built,
-   the same incremental-seam-before-consumer shape §15 item 8's `ownsRemoteSegmentDurability()`
-   already used. `server`'s own `RestHandlerTests` (new) covers the default and the `Wrapper`
-   delegation directly; `server:missingJavadoc`/`forbiddenApisMain` and this plugin's full `check`
-   both pass unchanged.
+   unavailable" design exactly. `RestHandler.Wrapper` delegates it like every other method on that
+   class, so a wrapped handler (deprecation wrapper, etc.) doesn't silently fall back to the
+   default and misreport its delegate's real availability. Every one of this plugin's own 9 REST
+   handlers overrides it to `AVAILABLE`, verified by a plugin test that iterates `getRestHandlers()`
+   and fails if any handler reports anything else.
+
+   **Enforcement landed in a follow-up pass**, once the annotation itself had something real to
+   consume it: a new node-level `rest.serverless_mode.enabled` setting (`RestController.SERVERLESS_MODE_ENABLED_SETTING`,
+   default `false`, registered in `ClusterSettings.BUILT_IN_CLUSTER_SETTINGS` the same way
+   `HttpTransportSettings`' own settings are) is resolved once in `ActionModule` and threaded into
+   a new 6-arg `RestController` constructor -- the existing 5-arg constructor (every pre-existing
+   call site: this class's own direct constructors, every test fixture) delegates to it with
+   `false`, so nothing else in the codebase changes behavior. When enabled, `RestController`'s
+   private per-request `dispatchRequest(RestRequest, RestChannel, RestHandler)` refuses any handler
+   that isn't `AVAILABLE` -- `INTERNAL_ONLY` is refused here too, not just `UNAVAILABLE`, since this
+   method is reached exclusively via external HTTP dispatch, so there is no such thing as an
+   "internal/system caller" arriving through this path by definition -- with a `410 GONE` response,
+   before `RestHandler#handleRequest` ever runs. `server`'s own `RestHandlerTests` covers the
+   annotation's default and `Wrapper` delegation directly; three new `RestControllerTests` cases
+   cover enforcement itself: an `UNAVAILABLE`-declaring handler is refused with `GONE` and its
+   `handleRequest` is never invoked (asserted by having it throw if reached, not just checking the
+   response status); an `AVAILABLE`-declaring handler dispatches normally; and, with serverless mode
+   left off entirely, an unannotated (default-`UNAVAILABLE`) handler still dispatches normally too --
+   proving the feature is a strict opt-in with zero effect on any node that doesn't turn it on.
+   `server:missingJavadoc`/`forbiddenApisMain`, `RestControllerTests`, `RestHandlerTests`,
+   `ActionModuleTests`, `ClusterSettingsTests`, and this plugin's own full `check` (unaffected --
+   core-only change) all pass.
 7. ✅ Node WAL service registration point: no core change needed here either -- confirmed
    `createComponents` is exactly the right lifecycle point, already in production use.
    `ServerlessStoragePlugin#createComponents` builds one `WalChunkService` per node incarnation

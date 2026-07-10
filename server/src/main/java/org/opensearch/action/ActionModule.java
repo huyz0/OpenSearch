@@ -633,7 +633,14 @@ public class ActionModule extends AbstractModule {
             actionPlugins.stream().flatMap(p -> p.indicesAliasesRequestValidators().stream()).collect(Collectors.toList())
         );
 
-        restController = new RestController(headers, restWrapper, nodeClient, circuitBreakerService, usageService);
+        restController = new RestController(
+            headers,
+            restWrapper,
+            nodeClient,
+            circuitBreakerService,
+            usageService,
+            RestController.SERVERLESS_MODE_ENABLED_SETTING.get(settings)
+        );
         restController.setRequestIdMaxLength(HttpTransportSettings.SETTING_HTTP_REQUEST_ID_MAX_LENGTH.get(settings));
         clusterSettings.addSettingsUpdateConsumer(
             HttpTransportSettings.SETTING_HTTP_REQUEST_ID_MAX_LENGTH,

@@ -238,6 +238,73 @@ public class RestControllerTests extends OpenSearchTestCase {
         assertTrue(channel.getSendResponseCalled());
     }
 
+    public void testServerlessModeRefusesAHandlerThatDoesNotDeclareItselfAvailable() {
+        final ThreadContext threadContext = client.threadPool().getThreadContext();
+        final RestController restController = new RestController(
+            Collections.emptySet(),
+            null,
+            client,
+            circuitBreakerService,
+            usageService,
+            true
+        );
+        RestRequest fakeRequest = new FakeRestRequest.Builder(xContentRegistry()).withPath("/unavailable").build();
+        restController.registerHandler(RestRequest.Method.GET, "/unavailable", new RestHandler() {
+            @Override
+            public void handleRequest(RestRequest request, RestChannel channel, NodeClient client) {
+                throw new AssertionError("must never be reached -- serverless mode must refuse this request before handleRequest runs");
+            }
+        });
+        AssertingChannel channel = new AssertingChannel(fakeRequest, false, RestStatus.GONE);
+        restController.dispatchRequest(fakeRequest, channel, threadContext);
+        assertTrue(channel.getSendResponseCalled());
+    }
+
+    public void testServerlessModeAllowsAHandlerThatDeclaresItselfAvailable() {
+        final ThreadContext threadContext = client.threadPool().getThreadContext();
+        final RestController restController = new RestController(
+            Collections.emptySet(),
+            null,
+            client,
+            circuitBreakerService,
+            usageService,
+            true
+        );
+        RestRequest fakeRequest = new FakeRestRequest.Builder(xContentRegistry()).withPath("/available").build();
+        restController.registerHandler(RestRequest.Method.GET, "/available", new RestHandler() {
+            @Override
+            public void handleRequest(RestRequest request, RestChannel channel, NodeClient client) throws Exception {
+                channel.sendResponse(new BytesRestResponse(RestStatus.OK, BytesRestResponse.TEXT_CONTENT_TYPE, BytesArray.EMPTY));
+            }
+
+            @Override
+            public ServerlessScope serverlessScope() {
+                return ServerlessScope.AVAILABLE;
+            }
+        });
+        AssertingChannel channel = new AssertingChannel(fakeRequest, false, RestStatus.OK);
+        restController.dispatchRequest(fakeRequest, channel, threadContext);
+        assertTrue(channel.getSendResponseCalled());
+    }
+
+    public void testServerlessModeDisabledIgnoresServerlessScopeEntirely() {
+        // The default (5-arg) constructor -- unaffected by SERVERLESS_MODE_ENABLED_SETTING even
+        // existing -- must still dispatch an UNAVAILABLE-declaring handler normally, exactly as
+        // every pre-existing call site already relies on.
+        final ThreadContext threadContext = client.threadPool().getThreadContext();
+        final RestController restController = new RestController(Collections.emptySet(), null, client, circuitBreakerService, usageService);
+        RestRequest fakeRequest = new FakeRestRequest.Builder(xContentRegistry()).withPath("/unannotated").build();
+        restController.registerHandler(RestRequest.Method.GET, "/unannotated", new RestHandler() {
+            @Override
+            public void handleRequest(RestRequest request, RestChannel channel, NodeClient client) throws Exception {
+                channel.sendResponse(new BytesRestResponse(RestStatus.OK, BytesRestResponse.TEXT_CONTENT_TYPE, BytesArray.EMPTY));
+            }
+        });
+        AssertingChannel channel = new AssertingChannel(fakeRequest, false, RestStatus.OK);
+        restController.dispatchRequest(fakeRequest, channel, threadContext);
+        assertTrue(channel.getSendResponseCalled());
+    }
+
     public void testRegisterAsDeprecatedHandler() {
         RestController controller = mock(RestController.class);
 

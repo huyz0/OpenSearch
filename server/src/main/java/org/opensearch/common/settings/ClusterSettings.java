@@ -162,6 +162,7 @@ import org.opensearch.ratelimitting.admissioncontrol.settings.NativeMemoryBasedA
 import org.opensearch.repositories.blobstore.BlobStoreRepository;
 import org.opensearch.repositories.fs.FsRepository;
 import org.opensearch.rest.BaseRestHandler;
+import org.opensearch.rest.RestController;
 import org.opensearch.script.ScriptService;
 import org.opensearch.search.SearchService;
 import org.opensearch.search.aggregations.MultiBucketConsumerService;
@@ -406,6 +407,7 @@ public final class ClusterSettings extends AbstractScopedSettings {
                 HttpTransportSettings.SETTING_HTTP_BIND_HOST,
                 HttpTransportSettings.SETTING_HTTP_PORT,
                 HttpTransportSettings.SETTING_HTTP_PUBLISH_PORT,
+                RestController.SERVERLESS_MODE_ENABLED_SETTING,
                 HttpTransportSettings.SETTING_PIPELINING_MAX_EVENTS,
                 HttpTransportSettings.SETTING_HTTP_COMPRESSION,
                 HttpTransportSettings.SETTING_HTTP_COMPRESSION_LEVEL,
