@@ -122,6 +122,96 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
         }
     }
 
+    public void testMillisSinceLastActivityUpdatesOnIndexAndDecreasesUntilTheNextOne() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+
+        ObjectStoreWriterEngine engine = openWriterEngine(shardStateStore, commitPublisher);
+        try {
+            long freshlyOpened = engine.millisSinceLastActivity();
+            assertTrue("a freshly opened engine should read as just active, not idle since the epoch", freshlyOpened < 10_000);
+
+            // A deliberately long sleep, not a tight one: this needs enough separation from the
+            // post-index bound below to stay robust even if index() itself (real, variable-duration
+            // work -- parsing, Lucene indexing, translog append) takes a while, which would make a
+            // *relative* "afterIndex < beforeIndex" comparison flaky by construction (index() could
+            // legitimately outlast a short sleep). 2s leaves generous headroom on both sides.
+            Thread.sleep(2_000);
+            long beforeIndex = engine.millisSinceLastActivity();
+            assertTrue("idle time must have advanced by roughly the sleep duration while nothing wrote", beforeIndex >= 1_800);
+
+            index(engine, "1");
+            long afterIndex = engine.millisSinceLastActivity();
+            assertTrue(
+                "indexing a document must reset the idle clock back down to just now, not leave it accumulating "
+                    + "from before the write (beforeIndex was "
+                    + beforeIndex
+                    + "ms, afterIndex was "
+                    + afterIndex
+                    + "ms)",
+                afterIndex < 1_500
+            );
+        } finally {
+            IOUtils.close(engine, lastOpenedStore);
+        }
+    }
+
+    public void testMillisSinceLastActivityIgnoresTranslogRecoveryReplayOperations() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+
+        ObjectStoreWriterEngine engine = openWriterEngine(shardStateStore, commitPublisher);
+        try {
+            Thread.sleep(2_000);
+            long beforeReplay = engine.millisSinceLastActivity();
+            assertTrue("idle time must have advanced by roughly the sleep duration", beforeReplay >= 1_800);
+
+            // Simulates what a real crash/restart's translogManager().recoverFromTranslog(...) call
+            // does internally -- re-applying an already-sequenced operation via LOCAL_TRANSLOG_RECOVERY,
+            // not a fresh client write. This must NOT reset the idle clock: a shard that just
+            // recovered from a crash with no new client activity since well before the crash is
+            // still idle, not "just active."
+            ParsedDocument doc = testParsedDocument("recovery-replay", null, testDocumentWithTextField(), SOURCE, null);
+            Engine.Index replayedIndex = new Engine.Index(
+                new Term("_id", "recovery-replay"),
+                doc,
+                0,
+                primaryTerm.get(),
+                1,
+                null,
+                Engine.Operation.Origin.LOCAL_TRANSLOG_RECOVERY,
+                System.nanoTime(),
+                -1,
+                false,
+                SequenceNumbers.UNASSIGNED_SEQ_NO,
+                0
+            );
+            engine.index(replayedIndex);
+
+            long afterReplay = engine.millisSinceLastActivity();
+            assertTrue(
+                "a recovery-replay operation must not reset the idle clock (beforeReplay was "
+                    + beforeReplay
+                    + "ms, afterReplay was "
+                    + afterReplay
+                    + "ms)",
+                afterReplay >= 1_800
+            );
+        } finally {
+            IOUtils.close(engine, lastOpenedStore);
+        }
+    }
+
     public void testOpeningTheEngineReportsToTheShardDirectory() throws Exception {
         FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
         BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());

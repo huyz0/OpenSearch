@@ -12,6 +12,10 @@ import org.apache.lucene.index.SegmentInfos;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.index.engine.DocumentIndexWriter;
+import org.opensearch.index.engine.Engine.Delete;
+import org.opensearch.index.engine.Engine.DeleteResult;
+import org.opensearch.index.engine.Engine.Index;
+import org.opensearch.index.engine.Engine.IndexResult;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.EngineException;
 import org.opensearch.index.engine.InternalEngine;
@@ -41,6 +45,7 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
 
 /**
@@ -139,6 +144,27 @@ public class ObjectStoreWriterEngine extends InternalEngine {
      * there is no WAL chunk stream to bound in that case.
      */
     private final long activationWalPosition;
+
+    /**
+     * Wall-clock time of this engine's last {@link #index} or {@link #delete} call -- the
+     * foundational signal rfc-serverless-opensearch.md &sect;16 Phase 4's "suspended writers,
+     * scale-to-zero/cold-start" milestone needs (a controller can only decide a shard is idle if
+     * something reports how long it's actually been idle), and the "autoscaling signal emitters"
+     * bullet &sect;15 lists under plugin/module code. Initialized to construction time, not
+     * {@code 0}, so a freshly opened engine reads as "just active," not as "idle since the epoch."
+     *
+     * <p>Deliberately tracks real write calls, not flush/commit/refresh activity: this plugin's own
+     * background scheduling (directory refresh, lease renewal, compaction/GC/PITR ticks) all run on
+     * fixed timers independent of whether the index is actually being written to, so using {@link
+     * #commitIndexWriter} or {@link #refresh} as the signal would make an index that's genuinely
+     * idle from a client's perspective look perpetually active. {@link #index}/{@link #delete} are
+     * this engine's only two entry points client writes ever actually reach.
+     *
+     * <p>Only the timestamp is tracked here -- routing it into an actual suspension/scale-to-zero
+     * decision, or exposing it over a stats/REST surface, is separate, still-open Phase 4 work; see
+     * {@link #millisSinceLastActivity()}'s own javadoc.
+     */
+    private final AtomicLong lastActivityMillis = new AtomicLong(System.currentTimeMillis());
 
     // Deliberately has NO initializer expression. InternalEngine's own constructor calls
     // getTranslogDeletionPolicy(EngineConfig) (overridden below) from inside super(engineConfig),
@@ -374,6 +400,58 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     protected TranslogDeletionPolicy getTranslogDeletionPolicy(EngineConfig engineConfig) {
         translogDeletionPolicy = new ObjectStoreDurabilityTranslogDeletionPolicy();
         return translogDeletionPolicy;
+    }
+
+    /**
+     * Records this call as write activity (see {@link #lastActivityMillis}'s own javadoc) before
+     * delegating to {@link InternalEngine#index}, unless {@code index.origin().isRecovery()} --
+     * {@code LOCAL_TRANSLOG_RECOVERY} (this engine's own translog replay on open, e.g. after a
+     * crash/restart) and {@code PEER_RECOVERY} both re-apply operations that already happened, not
+     * new client activity, and counting them would make a genuinely idle-but-just-recovered shard
+     * misreport as freshly active. Timestamped unconditionally on entry for every other origin
+     * (i.e. every real client write), not only on success -- a client genuinely attempting to write
+     * is not an idle shard even if the write itself later fails (e.g. a version conflict), and
+     * gating on the result here would need inspecting {@link IndexResult} after the fact for no
+     * real benefit to what this signal means.
+     *
+     * @param index the operation to index, delegated to {@link InternalEngine#index} unchanged
+     * @return whatever {@link InternalEngine#index} returns
+     */
+    @Override
+    public IndexResult index(Index index) throws IOException {
+        if (index.origin().isRecovery() == false) {
+            lastActivityMillis.set(System.currentTimeMillis());
+        }
+        return super.index(index);
+    }
+
+    /**
+     * Same reasoning as {@link #index}, for the delete entry point.
+     *
+     * @param delete the operation to delete, delegated to {@link InternalEngine#delete} unchanged
+     * @return whatever {@link InternalEngine#delete} returns
+     */
+    @Override
+    public DeleteResult delete(Delete delete) throws IOException {
+        if (delete.origin().isRecovery() == false) {
+            lastActivityMillis.set(System.currentTimeMillis());
+        }
+        return super.delete(delete);
+    }
+
+    /**
+     * How long it's been since this engine last saw a real client {@link #index}/{@link #delete}
+     * call -- the raw signal, not a decision. Nothing in this plugin currently reads this value
+     * (see {@link #lastActivityMillis}'s own javadoc for what routing it into an actual
+     * suspension/scale-to-zero decision or a stats/REST surface would still need); this method
+     * exists so that future work has the data already being tracked, the same incremental shape
+     * {@link #activationWalPosition} was built in.
+     *
+     * @return milliseconds elapsed since the last {@link #index} or {@link #delete} call, or since
+     *         this engine was constructed if neither has ever been called
+     */
+    public long millisSinceLastActivity() {
+        return System.currentTimeMillis() - lastActivityMillis.get();
     }
 
     /**

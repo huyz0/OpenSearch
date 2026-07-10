@@ -1755,9 +1755,34 @@ where it didn't already exist, and each of those additions is a generally useful
 shared test infrastructure other plugins' tests benefit from too, not a special-cased double built
 only for this RFC's purposes.
 
-**Phase 4 — Topology (4–6 weeks).** Role-separated allocation, suspended writers,
-scale-to-zero/cold-start, balancer hysteresis. Milestone: idle index consumes zero compute;
-first query after idle returns < 5 s p95 for a cached-manifest index.
+**Phase 4 — Topology (4–6 weeks).** Role-separated allocation (done, see &sect;10 and
+`ServerlessStorageExistingShardsAllocator`/`ReaderShardPlacementAllocationDecider`), suspended
+writers, scale-to-zero/cold-start, balancer hysteresis. Milestone: idle index consumes zero
+compute; first query after idle returns < 5 s p95 for a cached-manifest index.
+
+**First increment of "suspended writers" landed: the raw idle-activity signal any suspension or
+scale-to-zero decision needs.** `ObjectStoreWriterEngine` now tracks the wall-clock time of its
+own last real client write (`index`/`delete` overrides record it unconditionally on entry, not
+gated on success), exposed via a new `millisSinceLastActivity()` accessor. Deliberately tracks
+real write calls, not this plugin's own flush/refresh/compaction/GC background scheduling (all of
+which run on fixed timers independent of client activity) -- using those as the signal would make
+a genuinely idle index look perpetually active. Also excludes `index.origin().isRecovery()`
+operations (`LOCAL_TRANSLOG_RECOVERY`/`PEER_RECOVERY`) -- caught during review, not the first
+version written: without this exclusion, a shard's own normal translog replay on open (e.g. after
+a crash/restart, already exercised by every existing test via `openWriterEngine`'s
+`recoverFromTranslog` call) would re-apply already-happened operations through the same `index`/
+`delete` entry points and reset the idle clock, making a genuinely idle-but-just-recovered shard
+misreport as freshly active to any future consumer of this signal. Nothing yet reads this value:
+routing it into an actual suspension decision, a scale-to-zero controller, cold-start reactivation,
+or a stats/REST exposure surface (the natural next increments) is still open, same "data first,
+decision later" shape `activationWalPosition` was built in before WAL replay recovery consumed it.
+Unit-tested two ways against a real `EngineTestCase`-provisioned engine:
+`testMillisSinceLastActivityUpdatesOnIndexAndDecreasesUntilTheNextOne` (asserting absolute time
+bounds around a real sleep rather than a relative before/after comparison -- `index()` itself is
+real, variable-duration work, so comparing its own duration against a short sleep window would have
+been flaky by construction) and
+`testMillisSinceLastActivityIgnoresTranslogRecoveryReplayOperations` (a directly constructed
+`LOCAL_TRANSLOG_RECOVERY`-origin operation must not reset the clock).
 
 **Phase 4.5 — Compaction service, fully done.** Candidate selection, rebase protocol, real Lucene
 merge, size-tiered shaping, background scheduling, a real concurrent-writer data-loss bug, real
