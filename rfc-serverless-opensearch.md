@@ -1275,10 +1275,11 @@ reader-designated node. Not implemented: the placement cost model / cache-locali
 (second bullet), the actual scale-to-zero mechanism (third bullet), and mandatory remote cluster
 state enforcement (fourth bullet). **The third bullet's signal-collection half is no longer
 entirely missing, though**: both named per-tier signals -- ingest tier's writer idle activity and
-search tier's manifest-generation lag -- now have a real, tested, per-node discovery surface (see
-&sect;16 Phase 4 below for both). What's still genuinely absent is everything downstream of
-collecting those signals: no policy consumes them, and no suspend/scale-to-zero mechanism exists
-to act on a policy's decision even if one did.
+search tier's manifest-generation lag -- now have a real, tested, per-node discovery surface, and a
+cluster-wide policy layer (`ScaleToZeroCandidatesAction`) now merges and threshold-evaluates both
+into a real candidate list (see &sect;16 Phase 4 below for all three). What's still genuinely
+absent is the *mechanism*: no suspend/scale-to-zero action exists to act on a policy decision, and
+no cold-start reactivation exists either, even though the policy deciding a shard qualifies is now real.
 
 ## 11. API Surface in Serverless Mode
 
@@ -2044,9 +2045,39 @@ search-only reader shard (`ServerlessStorageNodeManifestLagActionIT`, same clust
 the shard is listed with its own correct `(indexUuid, shardId)` and a lag of `0` once caught up to
 a just-flushed, just-served document.
 
-Still open: routing either signal into an actual suspension decision, a scale-to-zero controller,
-or cold-start reactivation is separate future work -- both increments close the "is the signal
-reachable at all" question for their own tier, not "what does the cluster do with it."
+The "is a policy consuming these signals at all" gap is now partly closed. New
+`ScaleToZeroCandidatesAction`/`ScaleToZeroCandidatesRequest`/`ScaleToZeroCandidatesResponse`/
+`TransportScaleToZeroCandidatesAction`/`RestScaleToZeroCandidatesAction`
+(`scaletozero/action` package, REST at `GET
+/_plugins/_serverless/storage/_scale_to_zero/candidates`) is a real `TransportNodesAction` --
+unlike `NodeIdleShardsAction`/`NodeManifestLagAction`, which are both deliberately single-node
+scoped, this one fans out to every data node in the cluster, then merges each shard's writer-idle
+and reader-lag signal by `(indexUuid, shardId)` (a shard's writer and reader copies are never
+co-located, so the merge routinely joins entries reported by two different nodes) and applies two
+new node-level settings -- `serverless_storage.scale_to_zero.idle_threshold` (default 10 minutes)
+and `serverless_storage.scale_to_zero.lag_threshold` (default `0`, i.e. "reader must be exactly
+caught up") -- to flag `candidate = true` only when a shard is both idle past the threshold *and*
+every reporting reader has caught up with its last published manifest. That second condition is
+deliberate, not incidental: suspending a writer whose readers are still behind would leave those
+readers permanently stale with no new manifest ever coming, so idle time alone is not a safe
+signal on its own. Both thresholds are overridable per-request (`idle_threshold`/`lag_threshold`
+query params, or directly on `ScaleToZeroCandidatesRequest`) without touching cluster settings.
+
+This is deliberately the "policy" half only, mirroring how `CompactionSchedulerTask`'s background
+schedule and `CompactionTriggerAction`'s on-demand trigger both separate "decide work is due" from
+"do the work": the action is entirely read-only and never closes, suspends, or reactivates
+anything. Verified with unit tests exercising the merge/threshold logic directly (worst-signal-wins
+across nodes for the same shard, idle-but-still-lagging is correctly rejected, lagging-but-not-idle-enough
+is correctly rejected, a shard with no node report is absent from the result, per-node failures
+don't suppress other nodes' candidates) and a real two-data-node integration test
+(`ServerlessStorageScaleToZeroCandidatesActionIT`) proving the fan-out genuinely reaches whichever
+node hosts the shard even when a different node answers the coordinating request -- the one thing
+a unit test alone cannot prove for a `TransportNodesAction`.
+
+Still genuinely open: the actual suspend/reactivate *mechanism*. Consuming this action's output to
+really stop serving a shard, and cold-start reactivation on the next write or query, both intersect
+`IndexShard`/allocation lifecycle in core and remain out of scope for a plugin-local action -- see
+&sect;7.3's own narrative design for what that mechanism still needs to do.
 
 **Phase 4.5 — Compaction service, fully done.** Candidate selection, rebase protocol, real Lucene
 merge, size-tiered shaping, background scheduling, a real concurrent-writer data-loss bug, real

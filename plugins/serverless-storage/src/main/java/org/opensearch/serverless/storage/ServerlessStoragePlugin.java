@@ -282,6 +282,36 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * The default idle-time threshold {@code ScaleToZeroCandidatesAction} uses to decide a writer
+     * shard is idle enough to matter (rfc-serverless-opensearch.md &sect;7.3/&sect;10's still-open
+     * "policy consumer" gap for the {@code NodeIdleShardsAction}/{@code NodeManifestLagAction}
+     * signals) -- a caller can override this per-request, this is only the default when they don't.
+     * Deliberately conservative (10 minutes): long enough that ordinary bursty-but-live traffic
+     * never gets flagged, short enough to be a useful signal for a real controller once one exists.
+     */
+    public static final Setting<TimeValue> SERVERLESS_STORAGE_SCALE_TO_ZERO_IDLE_THRESHOLD_SETTING = Setting.timeSetting(
+        "serverless_storage.scale_to_zero.idle_threshold",
+        TimeValue.timeValueMinutes(10),
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * The default manifest-generation-lag threshold {@code ScaleToZeroCandidatesAction} uses to
+     * decide every observed reader copy of a shard has caught up with the writer's last published
+     * manifest -- see that action's own javadoc for why a candidate additionally requires this,
+     * not idle time alone: suspending a writer whose readers are still catching up would leave
+     * those readers permanently stale with no new manifest ever coming. Zero (the default) means
+     * "reader must be exactly caught up," matching {@code ObjectStoreReaderEngine#manifestGenerationLag()}'s
+     * own "0 once caught up" contract.
+     */
+    public static final Setting<Long> SERVERLESS_STORAGE_SCALE_TO_ZERO_LAG_THRESHOLD_SETTING = Setting.longSetting(
+        "serverless_storage.scale_to_zero.lag_threshold",
+        0L,
+        0L,
+        Setting.Property.NodeScope
+    );
+
+    /**
      * Per-shard fairness budget for the one node-shared {@code WalChunkService}
      * (rfc-serverless-opensearch.md &sect;18 risk #4, "WAL multiplexing fairness") -- a shard whose
      * own buffered payload bytes since its last flush cross this budget is immediately siphoned
@@ -369,6 +399,13 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     // (the default) disables both the shared sweep (existing behavior) and any dedicated one.
     private volatile TimeValue walGcInterval;
     private volatile long gcRetentionWindowMillis;
+    // Resolved once in createComponents, same "read the NodeScope setting where Environment is
+    // actually available" reasoning as every other field in this group -- TransportScaleToZeroCandidatesAction
+    // reads these as its per-request defaults, overridable per ScaleToZeroCandidatesRequest.
+    private volatile long scaleToZeroIdleThresholdMillis = SERVERLESS_STORAGE_SCALE_TO_ZERO_IDLE_THRESHOLD_SETTING.getDefault(
+        Settings.EMPTY
+    ).millis();
+    private volatile long scaleToZeroLagThreshold = SERVERLESS_STORAGE_SCALE_TO_ZERO_LAG_THRESHOLD_SETTING.getDefault(Settings.EMPTY);
     // One node-local directory instance shared by every shard on this node -- matches the target
     // design's "one node block cache" shape (&sect;9) rather than a per-shard instance, and needs
     // no I/O to construct, so it's safe to build eagerly rather than threading through createComponents.
@@ -402,7 +439,9 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_WAL_PER_SHARD_BUDGET_SETTING,
             SERVERLESS_STORAGE_LAZY_DIRECTORY_CACHE_SIZE_SETTING,
             SERVERLESS_STORAGE_LAZY_DIRECTORY_ENABLED_SETTING,
-            SERVERLESS_STORAGE_WAL_DEDICATED_STREAM_SETTING
+            SERVERLESS_STORAGE_WAL_DEDICATED_STREAM_SETTING,
+            SERVERLESS_STORAGE_SCALE_TO_ZERO_IDLE_THRESHOLD_SETTING,
+            SERVERLESS_STORAGE_SCALE_TO_ZERO_LAG_THRESHOLD_SETTING
         );
     }
 
@@ -455,6 +494,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         Supplier<RepositoriesService> repositoriesServiceSupplier
     ) {
         this.threadPool = threadPool;
+        this.scaleToZeroIdleThresholdMillis = SERVERLESS_STORAGE_SCALE_TO_ZERO_IDLE_THRESHOLD_SETTING.get(environment.settings()).millis();
+        this.scaleToZeroLagThreshold = SERVERLESS_STORAGE_SCALE_TO_ZERO_LAG_THRESHOLD_SETTING.get(environment.settings());
         String configuredBasePath = SERVERLESS_STORAGE_BASE_PATH_SETTING.get(environment.settings());
         if (configuredBasePath.isEmpty() == false) {
             // Environment#resolveRepoFile is the same sanctioned path-resolution seam
@@ -921,6 +962,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 org.opensearch.serverless.storage.readerengine.action.TransportNodeManifestLagAction.class
             ),
             new ActionHandler<>(
+                org.opensearch.serverless.storage.scaletozero.action.ScaleToZeroCandidatesAction.INSTANCE,
+                org.opensearch.serverless.storage.scaletozero.action.TransportScaleToZeroCandidatesAction.class
+            ),
+            new ActionHandler<>(
                 org.opensearch.serverless.storage.retention.action.SnapshotPinAction.INSTANCE,
                 org.opensearch.serverless.storage.retention.action.TransportSnapshotPinAction.class
             ),
@@ -963,6 +1008,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new org.opensearch.serverless.storage.writerengine.action.RestShardIdleTimeAction(),
             new org.opensearch.serverless.storage.writerengine.action.RestNodeIdleShardsAction(),
             new org.opensearch.serverless.storage.readerengine.action.RestNodeManifestLagAction(),
+            new org.opensearch.serverless.storage.scaletozero.action.RestScaleToZeroCandidatesAction(),
             new org.opensearch.serverless.storage.retention.action.RestSnapshotPinAction(),
             new org.opensearch.serverless.storage.retention.action.RestSnapshotReleaseAction(),
             new org.opensearch.serverless.storage.retention.action.RestSnapshotRestoreAction(),
@@ -994,6 +1040,22 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      */
     public org.opensearch.serverless.storage.readerengine.ReaderShardActivityRegistry readerShardActivityRegistry() {
         return readerShardActivityRegistry;
+    }
+
+    /**
+     * This node's currently configured default idle-time threshold (millis) for {@code
+     * ScaleToZeroCandidatesAction} -- see {@link #SERVERLESS_STORAGE_SCALE_TO_ZERO_IDLE_THRESHOLD_SETTING}.
+     */
+    public long scaleToZeroIdleThresholdMillis() {
+        return scaleToZeroIdleThresholdMillis;
+    }
+
+    /**
+     * This node's currently configured default manifest-generation-lag threshold for {@code
+     * ScaleToZeroCandidatesAction} -- see {@link #SERVERLESS_STORAGE_SCALE_TO_ZERO_LAG_THRESHOLD_SETTING}.
+     */
+    public long scaleToZeroLagThreshold() {
+        return scaleToZeroLagThreshold;
     }
 
     /** The node-shared WAL chunk service {@link #createComponents} built, or {@code null} if WAL mirroring is off -- test-only visibility. */
