@@ -40,6 +40,7 @@ public final class ReaderEngineFactory implements EngineFactory {
     private final ReaderShardAdmissionController admissionController;
     private final CompactionSchedulerConfig compactionConfig;
     private final GcSchedulerConfig gcConfig;
+    private final ReaderShardActivityRegistry activityRegistry;
 
     /**
      * Creates a factory with no admission controller, compaction, or GC scheduling.
@@ -101,11 +102,11 @@ public final class ReaderEngineFactory implements EngineFactory {
         ReaderShardAdmissionController admissionController,
         CompactionSchedulerConfig compactionConfig
     ) {
-        this(shardStateStore, manifestStore, materializer, shardDirectory, localNodeId, admissionController, compactionConfig, null);
+        this(shardStateStore, manifestStore, materializer, shardDirectory, localNodeId, admissionController, compactionConfig, null, null);
     }
 
     /**
-     * Creates a factory with all optional features configurable.
+     * Creates a factory with no shard-activity registration.
      *
      * @param shardStateStore resolves the shard's currently-published head
      * @param manifestStore reads the commit manifest for a resolved head
@@ -126,6 +127,43 @@ public final class ReaderEngineFactory implements EngineFactory {
         CompactionSchedulerConfig compactionConfig,
         GcSchedulerConfig gcConfig
     ) {
+        this(
+            shardStateStore,
+            manifestStore,
+            materializer,
+            shardDirectory,
+            localNodeId,
+            admissionController,
+            compactionConfig,
+            gcConfig,
+            null
+        );
+    }
+
+    /**
+     * Creates a factory with all optional features configurable.
+     *
+     * @param shardStateStore resolves the shard's currently-published head
+     * @param manifestStore reads the commit manifest for a resolved head
+     * @param materializer applies a manifest's files to the engine's store directory
+     * @param shardDirectory the shard-directory-tier client the opened engine reports its entry to
+     * @param localNodeId this node's id, reported as part of the shard directory entry
+     * @param admissionController {@code null} to disable the admission cap entirely -- see its own javadoc.
+     * @param compactionConfig {@code null} disables this reader's own background compaction scheduler -- see its own javadoc.
+     * @param gcConfig {@code null} disables this reader's own background GC sweep -- see its own javadoc.
+     * @param activityRegistry {@code null} to skip registering this factory's engines for manifest-generation-lag lookups.
+     */
+    public ReaderEngineFactory(
+        ShardStateStore shardStateStore,
+        BlobContainerManifestStore manifestStore,
+        ObjectStoreCommitMaterializer materializer,
+        ShardDirectory shardDirectory,
+        String localNodeId,
+        ReaderShardAdmissionController admissionController,
+        CompactionSchedulerConfig compactionConfig,
+        GcSchedulerConfig gcConfig,
+        ReaderShardActivityRegistry activityRegistry
+    ) {
         this.shardStateStore = shardStateStore;
         this.manifestStore = manifestStore;
         this.materializer = materializer;
@@ -134,6 +172,7 @@ public final class ReaderEngineFactory implements EngineFactory {
         this.admissionController = admissionController;
         this.compactionConfig = compactionConfig;
         this.gcConfig = gcConfig;
+        this.activityRegistry = activityRegistry;
     }
 
     @Override
@@ -156,7 +195,7 @@ public final class ReaderEngineFactory implements EngineFactory {
             // &sect;9 activation path step 3, &sect;13 risk #1 metastability mitigation) -- see its
             // javadoc. This is a hint, not a fact, so a report failure is never worth failing engine
             // construction over.
-            return ObjectStoreReaderEngine.open(
+            ObjectStoreReaderEngine engine = ObjectStoreReaderEngine.open(
                 config,
                 manifest,
                 materializer,
@@ -169,6 +208,10 @@ public final class ReaderEngineFactory implements EngineFactory {
                 compactionConfig,
                 gcConfig
             );
+            if (activityRegistry != null) {
+                activityRegistry.register(indexUuid, shardId, engine);
+            }
+            return engine;
         } catch (RuntimeException e) {
             throw e;
         } catch (Exception e) {

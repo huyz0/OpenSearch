@@ -473,6 +473,7 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
                 )
             ) {
                 assertEquals(1L, readerEngine.currentManifestGenerationForTesting());
+                assertEquals("nothing newer has been observed yet, so lag must be zero", 0L, readerEngine.manifestGenerationLag());
 
                 CommitManifest secondManifest;
                 {
@@ -534,6 +535,14 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
                     1L,
                     readerEngine.currentManifestGenerationForTesting()
                 );
+                assertEquals(
+                    "an over-budget tick still reads the shard head before deciding to skip "
+                        + "materialization, so it must correctly report the real one-generation gap "
+                        + "it's now stuck behind -- not a stale zero from before the second manifest "
+                        + "was even published",
+                    1L,
+                    readerEngine.manifestGenerationLag()
+                );
 
                 // Budget eases back (e.g. the over-budget entry is evicted) -- the very next poll
                 // tick must catch up normally, with no other state having been disturbed.
@@ -546,6 +555,7 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
                     2L,
                     readerEngine.currentManifestGenerationForTesting()
                 );
+                assertEquals("caught up, so lag must be zero again", 0L, readerEngine.manifestGenerationLag());
             }
         } finally {
             writer.close();

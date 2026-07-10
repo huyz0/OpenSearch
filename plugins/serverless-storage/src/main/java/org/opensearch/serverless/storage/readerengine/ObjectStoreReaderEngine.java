@@ -104,6 +104,7 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
     private final int shardId;
     private final AtomicLong currentPrimaryTerm;
     private final AtomicLong currentManifestGeneration;
+    private final AtomicLong lastObservedLatestGeneration;
     private final ShardStateStore shardStateStore;
     private final BlobContainerManifestStore manifestStore;
     private final ObjectStoreCommitMaterializer materializer;
@@ -134,6 +135,7 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
         this.shardId = config.getShardId().getId();
         this.currentPrimaryTerm = new AtomicLong(primaryTerm);
         this.currentManifestGeneration = new AtomicLong(manifestGeneration);
+        this.lastObservedLatestGeneration = new AtomicLong(manifestGeneration);
         this.shardStateStore = shardStateStore;
         this.manifestStore = manifestStore;
         this.materializer = materializer;
@@ -234,19 +236,30 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
      */
     private void pollForNewerManifest() {
         try {
-            if (admissionController != null && admissionController.isOverBudgetForRefresh()) {
-                logger.debug(
-                    "skipping manifest poll: node's reader-shard admission budget is currently exceeded, staying on generation {}",
-                    currentManifestGeneration.get()
-                );
-                return;
-            }
+            // The head read (and the lastObservedLatestGeneration update below) deliberately runs
+            // BEFORE the admission-budget check, not after: an over-budget tick still needs to know
+            // how far behind it now is for manifestGenerationLag() to mean anything. Getting this
+            // ordering backwards -- checking the budget first and only reading the head if under
+            // budget, as an earlier version of this method did -- makes the lag observation and the
+            // materialization always advance together, so lag can only ever read zero right after
+            // any completed poll (skipped or applied) and never actually surfaces a real backlog,
+            // silently defeating the whole point of exposing it as an autoscaling signal. Caught by
+            // this method's own test asserting a nonzero lag during a real over-budget skip, not
+            // just a zero one.
             Optional<VersionedShardHead> head = shardStateStore.get(indexUuid, shardId);
             if (head.isEmpty()) {
                 return;
             }
             ShardHead shardHead = head.get().head();
+            lastObservedLatestGeneration.set(shardHead.latestManifestGeneration());
             if (shardHead.latestManifestGeneration() <= currentManifestGeneration.get()) {
+                return;
+            }
+            if (admissionController != null && admissionController.isOverBudgetForRefresh()) {
+                logger.debug(
+                    "skipping manifest poll: node's reader-shard admission budget is currently exceeded, staying on generation {}",
+                    currentManifestGeneration.get()
+                );
                 return;
             }
             CommitManifest manifest = manifestStore.readManifest(shardHead.primaryTerm(), shardHead.latestManifestGeneration());
@@ -305,6 +318,23 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
     /** Test-only visibility into what generation this engine currently has materialized/open. */
     long currentManifestGenerationForTesting() {
         return currentManifestGeneration.get();
+    }
+
+    /**
+     * How many manifest generations behind the latest one this engine has observed published for
+     * its shard -- the "search tier: manifest-generation lag" autoscaling signal &sect;10 names as
+     * a still-open hook, now backed by a real, continuously-updated measurement rather than
+     * nothing. {@code 0} means this engine is caught up as of its own last poll tick (see {@link
+     * #pollForNewerManifest} -- this is a point-in-time snapshot, not a live guarantee: a newer
+     * generation may have published in the object store since that tick and simply not have been
+     * observed yet, same staleness bound {@link #MANIFEST_POLL_INTERVAL} already governs for
+     * materialization itself.
+     *
+     * @return the non-negative gap between the latest generation this engine has observed and the
+     *         generation it currently has materialized/open
+     */
+    public long manifestGenerationLag() {
+        return Math.max(0, lastObservedLatestGeneration.get() - currentManifestGeneration.get());
     }
 
     /** Invokes {@link #pollForNewerManifest()} synchronously, rather than waiting out {@link #MANIFEST_POLL_INTERVAL}. */

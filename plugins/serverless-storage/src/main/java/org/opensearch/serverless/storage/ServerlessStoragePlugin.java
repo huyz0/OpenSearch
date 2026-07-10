@@ -351,6 +351,11 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     // &sect;16 Phase 4's idle-activity signal, &sect;15's "autoscaling signal emitters" bullet).
     private final org.opensearch.serverless.storage.writerengine.ShardActivityRegistry shardActivityRegistry =
         new org.opensearch.serverless.storage.writerengine.ShardActivityRegistry();
+    // Reader-tier counterpart to shardActivityRegistry above, same "no I/O, safe to build eagerly"
+    // reasoning -- every reader shard's engine on this node registers itself into this one for
+    // manifest-generation-lag lookups (&sect;10's "search tier: manifest-generation lag" hook).
+    private final org.opensearch.serverless.storage.readerengine.ReaderShardActivityRegistry readerShardActivityRegistry =
+        new org.opensearch.serverless.storage.readerengine.ReaderShardActivityRegistry();
 
     @Override
     public List<Setting<?>> getSettings() {
@@ -625,7 +630,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                         localNodeId,
                         readerShardAdmissionController,
                         compactionConfig,
-                        gcConfig
+                        gcConfig,
+                        readerShardActivityRegistry
                     )
                 );
             }
@@ -818,6 +824,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 org.opensearch.serverless.storage.writerengine.action.TransportNodeIdleShardsAction.class
             ),
             new ActionHandler<>(
+                org.opensearch.serverless.storage.readerengine.action.NodeManifestLagAction.INSTANCE,
+                org.opensearch.serverless.storage.readerengine.action.TransportNodeManifestLagAction.class
+            ),
+            new ActionHandler<>(
                 org.opensearch.serverless.storage.retention.action.SnapshotPinAction.INSTANCE,
                 org.opensearch.serverless.storage.retention.action.TransportSnapshotPinAction.class
             ),
@@ -859,6 +869,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new org.opensearch.serverless.storage.compaction.action.RestCompactionTriggerAction(),
             new org.opensearch.serverless.storage.writerengine.action.RestShardIdleTimeAction(),
             new org.opensearch.serverless.storage.writerengine.action.RestNodeIdleShardsAction(),
+            new org.opensearch.serverless.storage.readerengine.action.RestNodeManifestLagAction(),
             new org.opensearch.serverless.storage.retention.action.RestSnapshotPinAction(),
             new org.opensearch.serverless.storage.retention.action.RestSnapshotReleaseAction(),
             new org.opensearch.serverless.storage.retention.action.RestSnapshotRestoreAction(),
@@ -881,6 +892,15 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      */
     public org.opensearch.serverless.storage.writerengine.ShardActivityRegistry shardActivityRegistry() {
         return shardActivityRegistry;
+    }
+
+    /**
+     * The node-shared registry every reader shard's engine on this node registers itself into --
+     * used by {@code TransportNodeManifestLagAction} to answer manifest-generation-lag queries;
+     * public for the same reason as {@link #shardActivityRegistry()}.
+     */
+    public org.opensearch.serverless.storage.readerengine.ReaderShardActivityRegistry readerShardActivityRegistry() {
+        return readerShardActivityRegistry;
     }
 
     /** The node-shared WAL chunk service {@link #createComponents} built, or {@code null} if WAL mirroring is off -- test-only visibility. */

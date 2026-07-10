@@ -1272,8 +1272,13 @@ placement works outside serverless storage today. Every shard of a non-serverles
 a reader shard is allowed only on a reader-designated node; a writer shard is allowed everywhere
 *except* a reader-designated node; a non-serverless index's shards are unaffected even on a
 reader-designated node. Not implemented: the placement cost model / cache-locality hysteresis
-(second bullet), every autoscaling hook (third bullet -- no signal collection or scale-to-zero
-mechanism exists), and mandatory remote cluster state enforcement (fourth bullet).
+(second bullet), the actual scale-to-zero mechanism (third bullet), and mandatory remote cluster
+state enforcement (fourth bullet). **The third bullet's signal-collection half is no longer
+entirely missing, though**: both named per-tier signals -- ingest tier's writer idle activity and
+search tier's manifest-generation lag -- now have a real, tested, per-node discovery surface (see
+&sect;16 Phase 4 below for both). What's still genuinely absent is everything downstream of
+collecting those signals: no policy consumes them, and no suspend/scale-to-zero mechanism exists
+to act on a policy's decision even if one did.
 
 ## 11. API Surface in Serverless Mode
 
@@ -1917,9 +1922,41 @@ their own correct `(indexUuid, shardId)` pair (not swapped or merged), registere
 time rather than lazily on first write, matching `ShardIdleTimeAction`'s own already-proven
 before-any-write behavior.
 
-Still open: routing this signal into an actual suspension decision, a scale-to-zero controller, or
-cold-start reactivation is separate future work -- this closes the "is the signal reachable at
-all" question, not "what does the cluster do with it."
+**Fourth increment: the search tier's own named signal -- "manifest-generation lag" -- now exists
+too, closing the ingest/search pair &sect;10 explicitly names.** `ObjectStoreReaderEngine` gained
+`manifestGenerationLag()`: how many manifest generations behind the latest one this engine has
+observed published for its shard, backed by a new `lastObservedLatestGeneration` field updated
+every poll tick. New `ReaderShardActivityRegistry` (`readerengine` package) is the reader-tier
+mirror of `ShardActivityRegistry` -- same node-shared, `WeakReference`-keyed shape, for the
+identical no-close-hook reason -- and `ReaderEngineFactory` gained a ninth constructor overload
+registering each engine it produces, same telescoping-constructor pattern `WriterEngineFactory`
+already used for its own registry. New `NodeManifestLagAction`/`TransportNodeManifestLagAction`/
+`RestNodeManifestLagAction` (`readerengine/action` package, REST at `GET
+/_plugins/_serverless/storage/_manifest_lag`) expose it, mirroring `NodeIdleShardsAction`'s own
+per-node discovery shape exactly rather than inventing a second one.
+
+Landing this caught a real bug in the very feature being built, via this method's own test:
+`pollForNewerManifest`'s first version checked the admission-budget skip *before* reading the
+shard head, so the head read and the lag observation only ever happened in the same step as
+actually applying a newer generation -- meaning `manifestGenerationLag()` could only ever read
+zero immediately after any completed poll tick (skipped or applied), never a real nonzero backlog,
+silently defeating the entire point of exposing it as a signal. Fixed by reordering: the (cheap,
+already-documented-as-cheap) shard-head read and `lastObservedLatestGeneration` update now happen
+unconditionally, before the admission-budget check, so an over-budget-skipped tick still correctly
+reports how far behind it now is -- the expensive part (`manifestStore.readManifest` and the
+actual materialization) stays gated behind the budget check exactly as before, so this costs
+nothing extra under budget pressure. `ObjectStoreReaderEngineTests`'s existing over-budget-skip
+test (&sect;18 risk #3's own proof) now also asserts the lag reads `1`, not `0`, during the skip --
+the assertion that would have caught this bug had it shipped instead of being caught first.
+Verified end-to-end in a real three-node `RemoteStoreBaseIntegTestCase` cluster with a real
+search-only reader shard (`ServerlessStorageNodeManifestLagActionIT`, same cluster shape
+`ServerlessStorageSearchOnlyReplicaIT` already proved a reader engine serves real reads under):
+the shard is listed with its own correct `(indexUuid, shardId)` and a lag of `0` once caught up to
+a just-flushed, just-served document.
+
+Still open: routing either signal into an actual suspension decision, a scale-to-zero controller,
+or cold-start reactivation is separate future work -- both increments close the "is the signal
+reachable at all" question for their own tier, not "what does the cluster do with it."
 
 **Phase 4.5 — Compaction service, fully done.** Candidate selection, rebase protocol, real Lucene
 merge, size-tiered shaping, background scheduling, a real concurrent-writer data-loss bug, real
