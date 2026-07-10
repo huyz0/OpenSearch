@@ -1443,17 +1443,25 @@ RFC claims them deliberately rather than leaving them implicit:
    sketched here — `CombinedDeletionPolicy` itself never needed to be swappable, only the threshold
    value fed into it, since that value is a pure "safe to delete at or below" floor, never a
    suppressor of deletion. See §7.1.1 for the full design and `ObjectStoreWriterEngine`'s use of it.
-3. Flush/commit lifecycle hook: a post-commit callback carrying the commit + new-file set
-   (needed by the writer engine's publication step; today reachable only via deletion-policy
-   gymnastics).
+3. ✅ Flush/commit lifecycle hook: turned out not to need a new core seam at all --
+   `InternalEngine#commitIndexWriter(DocumentIndexWriter, String)` was already `protected` and
+   overridable before this branch touched anything. `ObjectStoreWriterEngine#commitIndexWriter`
+   overrides it directly, calls `super.commitIndexWriter(...)` first, then reads back the just-
+   committed `SegmentInfos` from `store.readLastCommittedSegmentsInfo()` and publishes it as the
+   new head via `headPublisher.publishCommitAsHead(...)` -- no deletion-policy indirection needed;
+   this list item was stale, carried over from before that override was written.
 4. Search-only routing → engine selection: `IndexShard` passes its routing into engine-factory
    resolution (done via `IndexService.createShard` on this branch); additionally, reader shards
    must skip `ReplicationTracker` paths that assume a local checkpointable engine.
 5. Generalized checkpoint/notification publisher (widen segment-replication checkpoint
    publishing to carry opaque payloads).
 6. REST handler capability annotation (§11).
-7. Node WAL service registration point (a `Plugin`-provided node-level component — likely
-   already expressible via `createComponents`; verify lifecycle ordering vs `IndicesService`).
+7. ✅ Node WAL service registration point: no core change needed here either -- confirmed
+   `createComponents` is exactly the right lifecycle point, already in production use.
+   `ServerlessStoragePlugin#createComponents` builds one `WalChunkService` per node incarnation
+   (stored in the `sharedWalChunkService` field) and every writer shard's `EngineFactory` receives
+   the same instance, giving the one-WAL-per-node sharing rfc-serverless-opensearch.md &sect;6.4
+   describes without any new core-level registration seam.
 8. ✅ Remote-store-upload opt-out: `EngineFactory#ownsRemoteSegmentDurability()`, a default-`false`
    method landed on this branch (`server/src/main/java/org/opensearch/index/engine/EngineFactory.java`)
    letting an `EngineFactory` declare it already keeps every segment durably reachable remotely by
