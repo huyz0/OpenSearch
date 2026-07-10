@@ -820,6 +820,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new ActionHandler<>(
                 org.opensearch.serverless.storage.retention.action.SnapshotReleaseAction.INSTANCE,
                 org.opensearch.serverless.storage.retention.action.TransportSnapshotReleaseAction.class
+            ),
+            new ActionHandler<>(
+                org.opensearch.serverless.storage.retention.action.SnapshotRestoreAction.INSTANCE,
+                org.opensearch.serverless.storage.retention.action.TransportSnapshotRestoreAction.class
             )
         );
     }
@@ -839,7 +843,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new org.opensearch.serverless.storage.compaction.action.RestCompactionTriggerAction(),
             new org.opensearch.serverless.storage.writerengine.action.RestShardIdleTimeAction(),
             new org.opensearch.serverless.storage.retention.action.RestSnapshotPinAction(),
-            new org.opensearch.serverless.storage.retention.action.RestSnapshotReleaseAction()
+            new org.opensearch.serverless.storage.retention.action.RestSnapshotReleaseAction(),
+            new org.opensearch.serverless.storage.retention.action.RestSnapshotRestoreAction()
         );
     }
 

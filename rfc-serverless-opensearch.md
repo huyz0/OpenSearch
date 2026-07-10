@@ -1411,8 +1411,8 @@ RFC claims them deliberately rather than leaving them implicit:
 - **Snapshot = pinned manifest set.** A snapshot of an index is a retention-pinned manifest per
   shard plus a copy of the index metadata object — metadata-only, O(shards) small writes, no
   data movement. Restore-in-place is "point the shard-heads at the pinned manifests."
-  **Status: the per-shard pin/release half is now implemented and tested; index-wide
-  orchestration and restore are still open.** New `SnapshotPinAction`/`SnapshotReleaseAction`
+  **Status: pin/release/restore are now all implemented and tested per-shard; only index-wide
+  orchestration is still open.** New `SnapshotPinAction`/`SnapshotReleaseAction`
   (`retention/action` package, REST at `POST /_plugins/_serverless/storage/_snapshot_pin` and
   `/_snapshot_release`) durably pin/release a single shard's *current* published manifest
   generation under a snapshot name, via the same `DurablePinRegistry` PITR retention and clone
@@ -1422,10 +1422,28 @@ RFC claims them deliberately rather than leaving them implicit:
   old one (never the other way -- a crash between the two only ever leaves both generations
   pinned, never a window where the name resolves to nothing), verified end to end in
   `ServerlessStorageSnapshotPinActionIT` including this exact replace-not-accumulate behavior
-  against a real advancing shard. Deliberately scoped to one shard per call, matching every other
-  action this plugin exposes (compaction trigger, clone) -- an index-wide "snapshot every shard
-  under one name, all-or-nothing" orchestration layer, and the actual restore-in-place half
-  ("point the shard-heads at the pinned manifests"), are both still open future work.
+  against a real advancing shard.
+
+  **`SnapshotRestoreAction` closes the read side** -- "point the shard-heads at the pinned
+  manifests," literally: it CASes the shard's head to the (primaryTerm, generation) a snapshot
+  pins, bypassing `ShardHead#withPublishedGeneration`'s forward-only validation directly (a
+  restore is deliberately a rollback, not a publication). Deliberately refuses to proceed while
+  the shard's writer/compactor lease is currently held -- a live writer would either immediately
+  overwrite the restore on its next flush or leave the head in a confusing state between the two.
+  This surfaced a real, easy-to-miss timing gotcha the IT itself caught: closing an index stops
+  its engine from *renewing* the lease, but does not retroactively clear the lease already
+  recorded in the shard head -- a deliberate fencing-safety property (an already-published lease
+  must stay formally valid until its own TTL naturally elapses, since this plugin has no way to
+  tell a graceful close from an ungraceful one from the object store's side, the same guarantee
+  that makes WAL replay fencing sound). `ServerlessStorageSnapshotRestoreActionIT` originally
+  assumed closing the index released the lease instantly and failed immediately against that wrong
+  assumption; fixed by polling (bounded to the engine's own 30s lease TTL) rather than asserting
+  once -- catching, along the way, that `assertBusy`'s retry loop only catches `AssertionError`,
+  not arbitrary exceptions, so the polling helper has to explicitly re-wrap failures.
+
+  Deliberately scoped to one shard per call throughout, matching every other action this plugin
+  exposes (compaction trigger, clone) -- an index-wide "snapshot/restore every shard under one
+  name, all-or-nothing" orchestration layer is the one piece of this design bullet still open.
 - **Clone = new index referencing existing bundles.** A zero-copy clone writes new manifests
   (under a new index UUID) that reference the source's bundles. This is the feature that makes
   dev/test-on-production-data and A/B reindexing cheap — and it is exactly why bundle GC must
