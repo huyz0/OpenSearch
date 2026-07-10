@@ -824,6 +824,18 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new ActionHandler<>(
                 org.opensearch.serverless.storage.retention.action.SnapshotRestoreAction.INSTANCE,
                 org.opensearch.serverless.storage.retention.action.TransportSnapshotRestoreAction.class
+            ),
+            new ActionHandler<>(
+                org.opensearch.serverless.storage.retention.action.IndexSnapshotPinAction.INSTANCE,
+                org.opensearch.serverless.storage.retention.action.TransportIndexSnapshotPinAction.class
+            ),
+            new ActionHandler<>(
+                org.opensearch.serverless.storage.retention.action.IndexSnapshotReleaseAction.INSTANCE,
+                org.opensearch.serverless.storage.retention.action.TransportIndexSnapshotReleaseAction.class
+            ),
+            new ActionHandler<>(
+                org.opensearch.serverless.storage.retention.action.IndexSnapshotRestoreAction.INSTANCE,
+                org.opensearch.serverless.storage.retention.action.TransportIndexSnapshotRestoreAction.class
             )
         );
     }
@@ -844,7 +856,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new org.opensearch.serverless.storage.writerengine.action.RestShardIdleTimeAction(),
             new org.opensearch.serverless.storage.retention.action.RestSnapshotPinAction(),
             new org.opensearch.serverless.storage.retention.action.RestSnapshotReleaseAction(),
-            new org.opensearch.serverless.storage.retention.action.RestSnapshotRestoreAction()
+            new org.opensearch.serverless.storage.retention.action.RestSnapshotRestoreAction(),
+            new org.opensearch.serverless.storage.retention.action.RestIndexSnapshotPinAction(),
+            new org.opensearch.serverless.storage.retention.action.RestIndexSnapshotReleaseAction(),
+            new org.opensearch.serverless.storage.retention.action.RestIndexSnapshotRestoreAction()
         );
     }
 

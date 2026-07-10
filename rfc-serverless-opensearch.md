@@ -1442,8 +1442,37 @@ RFC claims them deliberately rather than leaving them implicit:
   not arbitrary exceptions, so the polling helper has to explicitly re-wrap failures.
 
   Deliberately scoped to one shard per call throughout, matching every other action this plugin
-  exposes (compaction trigger, clone) -- an index-wide "snapshot/restore every shard under one
-  name, all-or-nothing" orchestration layer is the one piece of this design bullet still open.
+  exposes (compaction trigger, clone) -- callers needing every shard of an index covered by one
+  name used the per-shard actions in a loop of their own until this pass.
+
+  **Status: the index-wide orchestration layer is now built too.** `IndexSnapshotPinAction`/
+  `IndexSnapshotReleaseAction`/`IndexSnapshotRestoreAction` (same `retention/action` package, REST
+  at `POST /_plugins/_serverless/storage/index/{index}/_snapshot_pin`, `_snapshot_release`,
+  `_snapshot_restore`) resolve an index name to its UUID and shard count via `ClusterService`, then
+  fan out to the per-shard actions above, one shard at a time. Pin is **genuinely all-or-nothing**:
+  `TransportIndexSnapshotPinAction` releases `snapshotId` from every shard it already pinned in the
+  same call if any later shard's pin attempt fails (release is idempotent, so a failed compensating
+  release is itself safe to retry) -- verified in `ServerlessStorageIndexSnapshotActionIT` by
+  corrupting one shard's register with garbage bytes *after* two other shards already have a real
+  published head, forcing a genuine late-in-the-fan-out failure and confirming every shard
+  (including the two that had already succeeded) ends up unpinned. Restore, by contrast, is
+  **honestly documented as not fully atomic** -- `IndexSnapshotRestoreAction`'s own javadoc explains
+  exactly why (a shard's writer lease can be reacquired between its validation check and its own
+  restore call, a race no compensating rollback closes without a second rollback log this plugin
+  judged not worth the complexity for so rare an operation) rather than silently overpromising a
+  guarantee the implementation doesn't provide.
+
+  Landing this surfaced one real bug: the REST path `/_plugins/_serverless/storage/{index}/_snapshot_pin`
+  collided with `ShardIdleTimeAction`'s existing `/_plugins/_serverless/storage/{index_uuid}/{shard_id}/_idle_time`
+  route (same path position, two different wildcard names, which OpenSearch's router rejects at
+  startup) -- caught immediately by the new IT failing at cluster boot, fixed by nesting the
+  index-wide routes under `/_plugins/_serverless/storage/index/{index}/...` instead. It also
+  surfaced a wrong assumption in the first version of the rollback IT itself: a brand-new shard
+  already has a published manifest as an ordinary side effect of shard creation (an initial empty
+  commit), so "never flush, expect a `never published` pin failure" -- which works fine for a
+  *single* never-created shard (see `SnapshotPinAction`'s own never-published test) -- can't be used
+  to force a failure partway through an already-flushed multi-shard fan-out; fixed by corrupting one
+  shard's register directly instead of relying on an unreachable never-published state.
 - **Clone = new index referencing existing bundles.** A zero-copy clone writes new manifests
   (under a new index UUID) that reference the source's bundles. This is the feature that makes
   dev/test-on-production-data and A/B reindexing cheap — and it is exactly why bundle GC must
