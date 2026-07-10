@@ -1416,8 +1416,8 @@ RFC claims them deliberately rather than leaving them implicit:
 - **Snapshot = pinned manifest set.** A snapshot of an index is a retention-pinned manifest per
   shard plus a copy of the index metadata object — metadata-only, O(shards) small writes, no
   data movement. Restore-in-place is "point the shard-heads at the pinned manifests."
-  **Status: pin/release/restore are now all implemented and tested per-shard; only index-wide
-  orchestration is still open.** New `SnapshotPinAction`/`SnapshotReleaseAction`
+  **Status: pin/release/restore are now all implemented and tested, both per-shard and index-wide
+  (see the full status note further below).** New `SnapshotPinAction`/`SnapshotReleaseAction`
   (`retention/action` package, REST at `POST /_plugins/_serverless/storage/_snapshot_pin` and
   `/_snapshot_release`) durably pin/release a single shard's *current* published manifest
   generation under a snapshot name, via the same `DurablePinRegistry` PITR retention and clone
