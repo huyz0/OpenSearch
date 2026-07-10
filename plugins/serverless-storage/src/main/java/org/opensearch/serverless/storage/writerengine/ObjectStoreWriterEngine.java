@@ -37,6 +37,7 @@ import org.opensearch.serverless.storage.retention.PitrRetentionSchedulerTask;
 import org.opensearch.serverless.storage.translog.WalMirroringTranslog;
 import org.opensearch.serverless.storage.translog.WalMirroringTranslogFactory;
 import org.opensearch.serverless.storage.wal.WalChunkService;
+import org.opensearch.serverless.storage.wal.WalGcSchedulerTask;
 import org.opensearch.serverless.storage.wal.WalReplayRecovery;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
@@ -118,6 +119,19 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     private final PitrRetentionSchedulerTask pitrRetentionTask;
     private final WalChunkService walChunkService;
     private final org.opensearch.serverless.storage.security.EncryptionKeyProvider encryptionKeyProvider;
+    /**
+     * Sweeps {@link #walChunkService}'s own container on a schedule -- non-{@code null} only for a
+     * shard opted into a dedicated WAL stream (rfc-serverless-opensearch.md &sect;12's "dedicated
+     * WAL streams" regulatory co-residency bullet), where {@link #walChunkService} is scoped to
+     * exclusively this one shard rather than the node-shared container. Owned and closed by this
+     * engine (see {@link #close()}) rather than by a node-level task the way the shared WAL's own
+     * {@code WalGcSchedulerTask} is, because a per-shard container's lifecycle IS this engine's own
+     * lifecycle -- there is no other event (no close hook exists on the registries/factories this
+     * plugin builds elsewhere) that reliably fires when this shard stops using its dedicated
+     * container. {@code null} when this shard shares the node-level WAL container, matching every
+     * other optional-feature-off shape in this plugin.
+     */
+    private final WalGcSchedulerTask dedicatedWalGcSchedulerTask;
 
     /**
      * The fencing snapshot verified sound in {@code plugins/serverless-storage/formal/WalReplayFencing.tla}
@@ -286,6 +300,38 @@ public class ObjectStoreWriterEngine extends InternalEngine {
         WalChunkService walChunkService,
         org.opensearch.serverless.storage.security.EncryptionKeyProvider encryptionKeyProvider
     ) {
+        this(engineConfig, headPublisher, shardDirectory, localNodeId, pitrRetentionConfig, walChunkService, encryptionKeyProvider, null);
+    }
+
+    /**
+     * Creates a fully-configured writer engine, additionally owning a dedicated WAL container's own
+     * retention sweep for as long as this engine stays open.
+     *
+     * @param engineConfig the core engine configuration for this shard
+     * @param headPublisher publishes commits and manages lease acquisition/renewal for this shard's head
+     * @param shardDirectory the shard's directory-registry entry, refreshed periodically while this engine is active
+     * @param localNodeId the id of the node this engine is activating on
+     * @param pitrRetentionConfig {@code null} disables the periodic PITR retention reconciliation task; non-null schedules it
+     * @param walChunkService {@code null} disables WAL mirroring entirely, same shape as every other optional feature in this plugin.
+     * @param encryptionKeyProvider {@code null} leaves WAL-mirrored records unencrypted; non-null
+     *                              wraps {@code walChunkService} in an {@code EncryptingWalChunkService}.
+     * @param dedicatedWalGcSchedulerTask {@code null} for a shard sharing the node-level WAL
+     *                                    container (its retention is swept by that container's own
+     *                                    node-level task instead); non-null for a shard on a
+     *                                    dedicated WAL stream, whose container this engine then owns
+     *                                    sweeping for as long as it stays open -- see this field's
+     *                                    own javadoc for why ownership lives here.
+     */
+    public ObjectStoreWriterEngine(
+        EngineConfig engineConfig,
+        ObjectStoreCommitHeadPublisher headPublisher,
+        ShardDirectory shardDirectory,
+        String localNodeId,
+        PitrRetentionConfig pitrRetentionConfig,
+        WalChunkService walChunkService,
+        org.opensearch.serverless.storage.security.EncryptionKeyProvider encryptionKeyProvider,
+        WalGcSchedulerTask dedicatedWalGcSchedulerTask
+    ) {
         this(
             engineConfig,
             headPublisher,
@@ -294,6 +340,7 @@ public class ObjectStoreWriterEngine extends InternalEngine {
             pitrRetentionConfig,
             walChunkService,
             encryptionKeyProvider,
+            dedicatedWalGcSchedulerTask,
             beginConstruction(walChunkService, encryptionKeyProvider)
         );
     }
@@ -307,6 +354,7 @@ public class ObjectStoreWriterEngine extends InternalEngine {
         PitrRetentionConfig pitrRetentionConfig,
         WalChunkService walChunkService,
         org.opensearch.serverless.storage.security.EncryptionKeyProvider encryptionKeyProvider,
+        WalGcSchedulerTask dedicatedWalGcSchedulerTask,
         Void ignored
     ) {
         super(engineConfig);
@@ -321,6 +369,7 @@ public class ObjectStoreWriterEngine extends InternalEngine {
         this.localNodeId = localNodeId;
         this.walChunkService = walChunkService;
         this.encryptionKeyProvider = encryptionKeyProvider;
+        this.dedicatedWalGcSchedulerTask = dedicatedWalGcSchedulerTask;
         if (walChunkService != null) {
             // Once per activation, not per append -- see WalShardRegistry's own javadoc for why a
             // grow-only registry only needs to know "has this shard ever used this container," not
@@ -692,6 +741,9 @@ public class ObjectStoreWriterEngine extends InternalEngine {
         leaseRenewalTask.cancel();
         if (pitrRetentionTask != null) {
             pitrRetentionTask.close();
+        }
+        if (dedicatedWalGcSchedulerTask != null) {
+            dedicatedWalGcSchedulerTask.close();
         }
         super.close();
     }

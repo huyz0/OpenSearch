@@ -1304,7 +1304,50 @@ Three problems must be designed in, not bolted on:
   itself carries only framing in the clear. Group-commit efficiency is preserved; a compromised
   chunk yields nothing without per-index keys. Indices with hard co-residency prohibitions
   (regulatory) can opt into dedicated WAL streams at higher request cost — an explicit,
-  per-index trade.
+  per-index trade. **Status: implemented and tested.** New per-index setting
+  `index.serverless_storage.wal.dedicated_stream` (default `false`, `IndexScope`/`Final`, same
+  shape as every other opt-in index setting in this plugin). When set (and WAL mirroring is on at
+  the node level), `ServerlessStoragePlugin#getEngineFactory` gives that shard its own fresh
+  `WalChunkService` pointed at a container scoped to exactly that `(indexUuid, shardId)` under a
+  `wal-dedicated/` top-level prefix -- structurally distinct from both the node-shared `wal/`
+  container and this shard's own regular `<indexUuid>/<shardId>/` container -- rather than the
+  node-shared instance every ordinary shard uses. **Zero changes to `WalChunkService`,
+  `WalShardRegistry`, `WalGcSchedulerTask`, `WalMirroringTranslog`, or replay/fencing logic were
+  needed** -- every one of those classes already only knows about "a" `BlobContainer`, not
+  specifically the shared one, so a dedicated stream is purely a different, per-shard-exclusive
+  instance fed into already-proven machinery, the safest possible way to build this feature. (No
+  per-shard fairness budget is configured for it either -- that budget exists to protect other
+  shards sharing the *same* buffer, and a dedicated container has no such neighbor by
+  construction.) `ObjectStoreWriterEngine` already self-registers into a `WalShardRegistry` scoped
+  to whatever container it was given, entirely unmodified, confirming the reuse is genuinely
+  transparent.
+
+  The one real design problem a dedicated stream introduces -- unbounded growth, since the
+  existing node-level `WalGcSchedulerTask` only ever sweeps the shared `wal/` container it was
+  built against -- is solved by giving each dedicated-stream engine its **own** `WalGcSchedulerTask`
+  instance (same class, unmodified, just constructed against the shard's own container instead),
+  owned by and closed alongside that engine itself (`ObjectStoreWriterEngine#close`), the same
+  lifecycle shape `PitrRetentionSchedulerTask` already uses -- a per-shard container's lifecycle
+  *is* this engine's own lifecycle, and there is no other reliable close hook available anywhere
+  else in this plugin (see `ShardActivityRegistry`'s own javadoc for the same limitation elsewhere).
+  A new `DedicatedWalGcConfig` record (`wal` package, same nullable-bundle shape as
+  `PitrRetentionConfig`/`CompactionSchedulerConfig`/`GcSchedulerConfig`) carries what
+  `WriterEngineFactory#newReadWriteEngine` needs to build that task at the one moment a real
+  `ThreadPool` becomes available (engine construction) -- deliberately not pre-constructing the
+  task itself, both because the `ThreadPool` isn't available earlier and because a self-review
+  pass caught a real leak risk in an early version of this code: if `ObjectStoreWriterEngine`'s own
+  constructor throws (e.g. a lease-acquisition failure) *after* the dedicated task was already
+  started, nothing would ever close it. Fixed by constructing the task outside the engine's own
+  `try` block and explicitly closing it in both `catch` branches before rethrowing.
+
+  Verified end-to-end in a real two-index, one-data-node cluster
+  (`ServerlessStorageDedicatedWalStreamIT`): a dedicated-stream index's WAL chunks land in its own
+  `wal-dedicated/<uuid>/0/` directory, a plain index's chunks land in the ordinary shared `wal/`
+  directory, and the two are provably different filesystem locations -- not merely different in
+  theory. A second test proves the unbounded-growth problem is actually closed, not just
+  architecturally addressed: with a 1 s GC interval configured, a dedicated stream's own chunks are
+  genuinely deleted once covered by a published manifest, the same proof
+  `ServerlessStorageWalGcSchedulerTaskIT` already gives the shared container's node-level sweep.
 - **Bundles and manifests** are single-index by construction (§6.1 layout), so index-level
   encryption applies unchanged: encrypt bundle payloads with the index data key; manifests
   contain no document data (stats can optionally be suppressed for sensitive fields at the cost

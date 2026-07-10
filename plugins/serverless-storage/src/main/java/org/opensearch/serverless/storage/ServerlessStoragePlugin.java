@@ -328,6 +328,29 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         Setting.Property.Final
     );
 
+    /**
+     * Per-index opt-in into a WAL stream never physically co-resident (never sharing a chunk blob)
+     * with any other index's WAL bytes (rfc-serverless-opensearch.md &sect;12's "dedicated WAL
+     * streams" bullet: "indices with hard co-residency prohibitions (regulatory) can opt into
+     * dedicated WAL streams at higher request cost -- an explicit, per-index trade"). Stronger than
+     * the per-record envelope encryption every WAL record already gets regardless of this setting
+     * (&sect;12 bullet 1) -- that makes a compromised chunk yield nothing without this index's own
+     * key; this setting is for a compliance requirement that bytes never land in the same object at
+     * all, independent of whether they're encrypted. Has no effect when WAL mirroring itself is off
+     * ({@link #SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING} is the on/off switch this setting
+     * only refines, matching how {@link #SERVERLESS_STORAGE_LAZY_DIRECTORY_ENABLED_SETTING} only
+     * refines an already-node-enabled feature). Default {@code false}: the "higher request cost"
+     * the RFC's own bullet names (this index's chunks group-commit with nobody, so batching
+     * efficiency drops to whatever this one index's own write rate produces) is a real, deliberate
+     * per-index trade an operator opts into, not something every index should pay by default.
+     */
+    public static final Setting<Boolean> SERVERLESS_STORAGE_WAL_DEDICATED_STREAM_SETTING = Setting.boolSetting(
+        "index.serverless_storage.wal.dedicated_stream",
+        false,
+        Setting.Property.IndexScope,
+        Setting.Property.Final
+    );
+
     private volatile Path basePath;
     private volatile Path localCacheRoot;
     private volatile ThreadPool threadPool;
@@ -341,6 +364,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     private volatile org.opensearch.serverless.storage.wal.WalGcSchedulerTask walGcSchedulerTask;
     private volatile TimeValue compactionInterval;
     private volatile TimeValue gcInterval;
+    // Reused by getEngineFactory to schedule a dedicated-WAL-stream shard's own sweep at the same
+    // configured cadence as the shared WAL container's node-level WalGcSchedulerTask -- non-positive
+    // (the default) disables both the shared sweep (existing behavior) and any dedicated one.
+    private volatile TimeValue walGcInterval;
     private volatile long gcRetentionWindowMillis;
     // One node-local directory instance shared by every shard on this node -- matches the target
     // design's "one node block cache" shape (&sect;9) rather than a per-shard instance, and needs
@@ -374,7 +401,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_WAL_GC_INTERVAL_SETTING,
             SERVERLESS_STORAGE_WAL_PER_SHARD_BUDGET_SETTING,
             SERVERLESS_STORAGE_LAZY_DIRECTORY_CACHE_SIZE_SETTING,
-            SERVERLESS_STORAGE_LAZY_DIRECTORY_ENABLED_SETTING
+            SERVERLESS_STORAGE_LAZY_DIRECTORY_ENABLED_SETTING,
+            SERVERLESS_STORAGE_WAL_DEDICATED_STREAM_SETTING
         );
     }
 
@@ -493,6 +521,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 );
 
                 TimeValue configuredWalGcInterval = SERVERLESS_STORAGE_WAL_GC_INTERVAL_SETTING.get(environment.settings());
+                this.walGcInterval = configuredWalGcInterval;
                 if (configuredWalGcInterval.millis() > 0) {
                     walGcSchedulerTask = new org.opensearch.serverless.storage.wal.WalGcSchedulerTask(
                         threadPool,
@@ -638,13 +667,44 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             PitrRetentionConfig pitrRetentionConfig = pitrWindowMillis > 0
                 ? new PitrRetentionConfig(manifestStore, pinRegistry, pitrWindowMillis)
                 : null;
+
+            // §12's "dedicated WAL streams" bullet: an index opted into
+            // SERVERLESS_STORAGE_WAL_DEDICATED_STREAM_SETTING gets its own WalChunkService pointed
+            // at a container scoped to exactly this (indexUuid, shardId) -- never the node-shared
+            // one -- so its WAL bytes can never land in the same object as any other index's,
+            // independent of the per-record encryption every WAL record already gets regardless.
+            // Only meaningful when WAL mirroring itself is on at all (sharedWalChunkService != null);
+            // an index requesting a dedicated stream on a node with WAL mirroring off gets none,
+            // same as every other WAL-dependent feature already degrades in that case.
+            org.opensearch.serverless.storage.wal.WalChunkService writerWalChunkService = sharedWalChunkService;
+            org.opensearch.serverless.storage.wal.DedicatedWalGcConfig dedicatedWalGcConfig = null;
+            if (sharedWalChunkService != null && SERVERLESS_STORAGE_WAL_DEDICATED_STREAM_SETTING.get(indexSettings.getSettings())) {
+                BlobContainer dedicatedWalContainer = resolveDedicatedWalContainer(indexUuid, shardIdValue);
+                // No per-shard budget needed here (0, disabled): that budget exists to siphon one
+                // noisy shard's buffer out from under others sharing the SAME WalChunkService --
+                // a dedicated container is already scoped to exactly this one shard, so there is no
+                // "other shard" for it to protect against.
+                writerWalChunkService = new org.opensearch.serverless.storage.wal.WalChunkService(
+                    dedicatedWalContainer,
+                    UUIDs.base64UUID(),
+                    0L
+                );
+                if (walGcInterval != null && walGcInterval.millis() > 0) {
+                    dedicatedWalGcConfig = new org.opensearch.serverless.storage.wal.DedicatedWalGcConfig(
+                        dedicatedWalContainer,
+                        blobContainer,
+                        walGcInterval
+                    );
+                }
+            }
+
             return Optional.of(
                 new WriterEngineFactory(
                     new ObjectStoreCommitHeadPublisher(commitPublisher, shardStateStore),
                     shardDirectory,
                     localNodeId,
                     pitrRetentionConfig,
-                    sharedWalChunkService,
+                    writerWalChunkService,
                     // Cross-node failover materializes at most once per activation (rfc-serverless-opensearch.md
                     // &sect;7.1.2), not per-query like a reader shard -- no caching layer needed,
                     // straight to the bundle store, matching the "caching is wired in for reader
@@ -655,7 +715,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                     // WAL mirroring's own on/off switch (sharedWalChunkService being non-null) as the
                     // only thing this depends on, unaffected by encryption being off.
                     encryptionKeyProvider,
-                    shardActivityRegistry
+                    shardActivityRegistry,
+                    dedicatedWalGcConfig
                 )
             );
         } catch (IOException e) {
@@ -667,6 +728,38 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         FsBlobStore blobStore = new FsBlobStore(1024 * 1024, basePath, false);
         BlobPath shardPath = BlobPath.cleanPath().add(indexUuid).add(String.valueOf(shardId));
         return blobStore.blobContainer(shardPath);
+    }
+
+    /**
+     * Resolves a shard's own dedicated WAL container (rfc-serverless-opensearch.md &sect;12's
+     * "dedicated WAL streams" bullet, {@link #SERVERLESS_STORAGE_WAL_DEDICATED_STREAM_SETTING}) --
+     * under a {@code wal-dedicated/} top-level prefix, distinct from both the shared {@code wal/}
+     * container {@code createComponents} builds and this shard's own regular {@code
+     * <indexUuid>/<shardId>/} container {@link #resolveBlobContainer} builds, so this shard's WAL
+     * bytes can never land in the same object as either. Not wrapped in {@link
+     * EncryptingBlobContainer} -- the shared {@code wal/} container isn't either; per-record
+     * encryption is applied at the {@code WalChunkService} layer instead (via {@code
+     * EncryptingWalChunkService}, wired in {@code ObjectStoreWriterEngine} whenever {@link
+     * #encryptionKeyProvider} is configured, unaffected by whether the underlying container is
+     * shared or dedicated) -- see rfc-serverless-opensearch.md &sect;12 bullet 1.
+     */
+    private BlobContainer resolveDedicatedWalContainer(String indexUuid, int shardId) throws IOException {
+        if (basePath == null) {
+            throw new IllegalStateException(
+                "shard ["
+                    + indexUuid
+                    + "]["
+                    + shardId
+                    + "] has "
+                    + SERVERLESS_STORAGE_WAL_DEDICATED_STREAM_SETTING.getKey()
+                    + " enabled but no ["
+                    + SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey()
+                    + "] node setting was configured (or it did not resolve to an allowed path)"
+            );
+        }
+        FsBlobStore blobStore = new FsBlobStore(1024 * 1024, basePath, false);
+        BlobPath dedicatedWalPath = BlobPath.cleanPath().add("wal-dedicated").add(indexUuid).add(String.valueOf(shardId));
+        return blobStore.blobContainer(dedicatedWalPath);
     }
 
     @Override

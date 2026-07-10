@@ -20,7 +20,10 @@ import org.opensearch.serverless.storage.directory.ShardDirectory;
 import org.opensearch.serverless.storage.manifest.CommitManifest;
 import org.opensearch.serverless.storage.readerengine.ObjectStoreCommitMaterializer;
 import org.opensearch.serverless.storage.retention.PitrRetentionConfig;
+import org.opensearch.serverless.storage.wal.DedicatedWalGcConfig;
 import org.opensearch.serverless.storage.wal.WalChunkService;
+import org.opensearch.serverless.storage.wal.WalGcSchedulerTask;
+import org.opensearch.serverless.storage.wal.WalShardRegistry;
 
 import java.io.IOException;
 import java.util.Optional;
@@ -36,6 +39,7 @@ public final class WriterEngineFactory implements EngineFactory {
     private final ObjectStoreCommitMaterializer materializer;
     private final org.opensearch.serverless.storage.security.EncryptionKeyProvider encryptionKeyProvider;
     private final ShardActivityRegistry activityRegistry;
+    private final DedicatedWalGcConfig dedicatedWalGcConfig;
 
     /**
      * Creates a factory with neither PITR retention nor WAL mirroring configured, delegating to the
@@ -137,13 +141,24 @@ public final class WriterEngineFactory implements EngineFactory {
         ObjectStoreCommitMaterializer materializer,
         org.opensearch.serverless.storage.security.EncryptionKeyProvider encryptionKeyProvider
     ) {
-        this(headPublisher, shardDirectory, localNodeId, pitrRetentionConfig, walChunkService, materializer, encryptionKeyProvider, null);
+        this(
+            headPublisher,
+            shardDirectory,
+            localNodeId,
+            pitrRetentionConfig,
+            walChunkService,
+            materializer,
+            encryptionKeyProvider,
+            null,
+            null
+        );
     }
 
     /**
      * Creates a fully-configured factory, storing every dependency for engines it will later
      * produce via {@link #newReadWriteEngine}, including a {@link ShardActivityRegistry} produced
-     * engines register themselves into.
+     * engines register themselves into, leaving dedicated-WAL-stream retention unconfigured
+     * (delegates to the fullest constructor with {@code dedicatedWalGcConfig} set to {@code null}).
      *
      * @param headPublisher publishes commits and manages lease acquisition/renewal for produced engines
      * @param shardDirectory the directory-registry entry produced engines report themselves into
@@ -170,6 +185,58 @@ public final class WriterEngineFactory implements EngineFactory {
         org.opensearch.serverless.storage.security.EncryptionKeyProvider encryptionKeyProvider,
         ShardActivityRegistry activityRegistry
     ) {
+        this(
+            headPublisher,
+            shardDirectory,
+            localNodeId,
+            pitrRetentionConfig,
+            walChunkService,
+            materializer,
+            encryptionKeyProvider,
+            activityRegistry,
+            null
+        );
+    }
+
+    /**
+     * Creates a fully-configured factory, additionally scheduling a dedicated WAL stream's own
+     * retention sweep on each engine it produces, when {@code walChunkService} is itself scoped to
+     * this one shard's own dedicated container (rfc-serverless-opensearch.md &sect;12's "dedicated
+     * WAL streams" bullet) rather than the node-shared one.
+     *
+     * @param headPublisher publishes commits and manages lease acquisition/renewal for produced engines
+     * @param shardDirectory the directory-registry entry produced engines report themselves into
+     * @param localNodeId the id of the node produced engines activate on
+     * @param pitrRetentionConfig {@code null} disables PITR retention reconciliation on produced engines; non-null enables it
+     * @param walChunkService {@code null} disables WAL mirroring entirely; the shared node-level
+     *                        instance for an ordinary shard, or a shard-scoped dedicated instance
+     *                        matching {@code dedicatedWalGcConfig} for an opted-in one.
+     * @param materializer {@code null} disables missing-local-store recovery entirely (same shape
+     *                     as every other optional feature in this plugin) -- see {@link
+     *                     #recoverMissingLocalStore} for what it's for.
+     * @param encryptionKeyProvider {@code null} leaves WAL-mirrored records unencrypted, same shape
+     *                              as every other optional feature in this plugin -- see {@link
+     *                              ObjectStoreWriterEngine}'s own matching constructor javadoc.
+     * @param activityRegistry {@code null} leaves produced engines unreachable for idle-time
+     *                         queries (same shape as every other optional feature in this plugin);
+     *                         non-null registers each produced engine into it as it's constructed.
+     * @param dedicatedWalGcConfig {@code null} for a shard sharing the node-level WAL container (its
+     *                             retention is a separate node-level concern, unaffected by this
+     *                             factory); non-null schedules a dedicated sweep on each produced
+     *                             engine, owned by that engine's own lifecycle -- see {@link
+     *                             ObjectStoreWriterEngine}'s matching constructor javadoc for why.
+     */
+    public WriterEngineFactory(
+        ObjectStoreCommitHeadPublisher headPublisher,
+        ShardDirectory shardDirectory,
+        String localNodeId,
+        PitrRetentionConfig pitrRetentionConfig,
+        WalChunkService walChunkService,
+        ObjectStoreCommitMaterializer materializer,
+        org.opensearch.serverless.storage.security.EncryptionKeyProvider encryptionKeyProvider,
+        ShardActivityRegistry activityRegistry,
+        DedicatedWalGcConfig dedicatedWalGcConfig
+    ) {
         this.headPublisher = headPublisher;
         this.shardDirectory = shardDirectory;
         this.localNodeId = localNodeId;
@@ -178,6 +245,7 @@ public final class WriterEngineFactory implements EngineFactory {
         this.materializer = materializer;
         this.encryptionKeyProvider = encryptionKeyProvider;
         this.activityRegistry = activityRegistry;
+        this.dedicatedWalGcConfig = dedicatedWalGcConfig;
     }
 
     /** Exposed for tests (including from other packages, e.g. {@code ServerlessStoragePluginTests}) -- not part of this class's public contract. */
@@ -187,6 +255,24 @@ public final class WriterEngineFactory implements EngineFactory {
 
     @Override
     public Engine newReadWriteEngine(EngineConfig config) {
+        // A WalGcSchedulerTask (if dedicatedWalGcConfig is configured) is constructed fresh here,
+        // not stored as a factory field: this method runs exactly once per real engine activation,
+        // and the task's Scheduler.Cancellable needs engineConfig's own ThreadPool, which only
+        // becomes available at this point -- see DedicatedWalGcConfig's own javadoc for why it
+        // deliberately doesn't carry a pre-built task. Declared outside the try below (not inline
+        // in the ObjectStoreWriterEngine constructor call) so a failure constructing the engine
+        // itself can still close this already-started task before rethrowing -- otherwise a lease
+        // acquisition failure (or any other engine-construction failure) would leak a live scheduled
+        // sweep with nothing left holding a reference to cancel it.
+        WalGcSchedulerTask dedicatedWalGcSchedulerTask = dedicatedWalGcConfig == null
+            ? null
+            : new WalGcSchedulerTask(
+                config.getThreadPool(),
+                dedicatedWalGcConfig.gcInterval(),
+                dedicatedWalGcConfig.walContainer(),
+                new WalShardRegistry(dedicatedWalGcConfig.walContainer()),
+                (indexUuid, shardId) -> dedicatedWalGcConfig.shardBlobContainer()
+            );
         try {
             // ObjectStoreWriterEngine reports to the directory tier itself, both on activation and
             // on a fixed refresh schedule for as long as it stays open (rfc-serverless-metadata-plane.md
@@ -202,15 +288,22 @@ public final class WriterEngineFactory implements EngineFactory {
                 localNodeId,
                 pitrRetentionConfig,
                 walChunkService,
-                encryptionKeyProvider
+                encryptionKeyProvider,
+                dedicatedWalGcSchedulerTask
             );
             if (activityRegistry != null) {
                 activityRegistry.register(config.getShardId().getIndex().getUUID(), config.getShardId().getId(), engine);
             }
             return engine;
         } catch (RuntimeException e) {
+            if (dedicatedWalGcSchedulerTask != null) {
+                dedicatedWalGcSchedulerTask.close();
+            }
             throw e;
         } catch (Exception e) {
+            if (dedicatedWalGcSchedulerTask != null) {
+                dedicatedWalGcSchedulerTask.close();
+            }
             throw new EngineCreationFailureException(config.getShardId(), "failed to create object-store writer engine", e);
         }
     }
