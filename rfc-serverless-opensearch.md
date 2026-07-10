@@ -1450,9 +1450,15 @@ RFC claims them deliberately rather than leaving them implicit:
    committed `SegmentInfos` from `store.readLastCommittedSegmentsInfo()` and publishes it as the
    new head via `headPublisher.publishCommitAsHead(...)` -- no deletion-policy indirection needed;
    this list item was stale, carried over from before that override was written.
-4. Search-only routing → engine selection: `IndexShard` passes its routing into engine-factory
-   resolution (done via `IndexService.createShard` on this branch); additionally, reader shards
-   must skip `ReplicationTracker` paths that assume a local checkpointable engine.
+4. ✅ Search-only routing → engine selection: `IndexShard` passes its routing into engine-factory
+   resolution (done via `IndexService.createShard` on this branch). The second half of this item
+   ("reader shards must skip `ReplicationTracker` paths that assume a local checkpointable engine")
+   turned out not to need any change either -- `ObjectStoreReaderEngine extends ReadOnlyEngine`,
+   and core's own `ReadOnlyEngine` semantics already keep it out of those paths; nothing in the
+   plugin ever references `ReplicationTracker` at all. Confirmed empirically, not just by absence
+   of a reference: `ServerlessStorageSearchOnlyReplicaIT` runs a real search-only shard copy
+   end-to-end (allocate, start, materialize from a manifest, serve a search) with no
+   `ReplicationTracker`-related failures anywhere in the run.
 5. Generalized checkpoint/notification publisher (widen segment-replication checkpoint
    publishing to carry opaque payloads).
 6. REST handler capability annotation (§11).
