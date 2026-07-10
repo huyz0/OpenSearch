@@ -238,6 +238,27 @@ public class RestControllerTests extends OpenSearchTestCase {
         assertTrue(channel.getSendResponseCalled());
     }
 
+    public void testFaviconStaysAvailableUnderServerlessMode() {
+        // The favicon handler is registered internally by RestController's own constructor, not by
+        // a caller who could annotate it -- a real bug caught by this suite's own review: without
+        // an explicit ServerlessScope.AVAILABLE override, it would default to UNAVAILABLE just like
+        // any other unannotated handler and start 410-ing once serverless mode is enabled, an
+        // unintended side effect of introducing that mode at all.
+        final ThreadContext threadContext = client.threadPool().getThreadContext();
+        final RestController restController = new RestController(
+            Collections.emptySet(),
+            null,
+            client,
+            circuitBreakerService,
+            usageService,
+            true
+        );
+        RestRequest fakeRequest = new FakeRestRequest.Builder(xContentRegistry()).withPath("/favicon.ico").build();
+        AssertingChannel channel = new AssertingChannel(fakeRequest, false, RestStatus.OK);
+        restController.dispatchRequest(fakeRequest, channel, threadContext);
+        assertTrue(channel.getSendResponseCalled());
+    }
+
     public void testServerlessModeRefusesAHandlerThatDoesNotDeclareItselfAvailable() {
         final ThreadContext threadContext = client.threadPool().getThreadContext();
         final RestController restController = new RestController(

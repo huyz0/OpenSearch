@@ -181,11 +181,23 @@ public class RestController implements HttpServerTransport.Dispatcher {
         this.handlerWrapper = handlerWrapper;
         this.client = client;
         this.circuitBreakerService = circuitBreakerService;
-        registerHandlerNoWrap(
-            RestRequest.Method.GET,
-            "/favicon.ico",
-            (request, channel, clnt) -> channel.sendResponse(new BytesRestResponse(RestStatus.OK, "image/x-icon", FAVICON_RESPONSE))
-        );
+        registerHandlerNoWrap(RestRequest.Method.GET, "/favicon.ico", new RestHandler() {
+            @Override
+            public void handleRequest(RestRequest request, RestChannel channel, NodeClient clnt) throws IOException {
+                channel.sendResponse(new BytesRestResponse(RestStatus.OK, "image/x-icon", FAVICON_RESPONSE));
+            }
+
+            // A static, cosmetic asset for browsers hitting the node directly, not a data or admin
+            // API -- §11's "unannotated handlers default to unavailable" gating is about the API
+            // surface, not this. Explicit, not left to default to UNAVAILABLE: without this
+            // override, enabling SERVERLESS_MODE_ENABLED_SETTING would start 410-ing the favicon on
+            // every node that opts in, an unintended side effect this class's own introduction of
+            // that setting would otherwise have silently caused.
+            @Override
+            public ServerlessScope serverlessScope() {
+                return ServerlessScope.AVAILABLE;
+            }
+        });
     }
 
     public void setRequestIdMaxLength(int maxLength) {

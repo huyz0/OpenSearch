@@ -1559,6 +1559,15 @@ RFC claims them deliberately rather than leaving them implicit:
    `server:missingJavadoc`/`forbiddenApisMain`, `RestControllerTests`, `RestHandlerTests`,
    `ActionModuleTests`, `ClusterSettingsTests`, and this plugin's own full `check` (unaffected --
    core-only change) all pass.
+
+   **Self-review after landing caught one real, if minor, bug in the enforcement itself**: the
+   `/favicon.ico` handler `RestController`'s own constructor registers internally (not through any
+   caller who could annotate it) was a bare lambda with no `serverlessScope()` override, so it
+   would have silently defaulted to `UNAVAILABLE` and started returning `410 GONE` for the favicon
+   on any node that opted into serverless mode -- an unintended side effect of introducing the
+   setting at all, not a deliberate policy choice (a static, cosmetic browser asset is not part of
+   the API surface &sect;11 means to gate). Fixed by giving that internal registration an explicit
+   `AVAILABLE` override, covered by a new `testFaviconStaysAvailableUnderServerlessMode` case.
 7. ✅ Node WAL service registration point: no core change needed here either -- confirmed
    `createComponents` is exactly the right lifecycle point, already in production use.
    `ServerlessStoragePlugin#createComponents` builds one `WalChunkService` per node incarnation
