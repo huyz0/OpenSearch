@@ -33,14 +33,26 @@ import org.opensearch.serverless.storage.allocation.ServerlessStorageExistingSha
  * operators from needing to know the store-type value at all, consistent with how every other
  * optional feature in this plugin is a single boolean/config knob, not raw core plumbing.
  *
- * <p>Finally, rejects explicit {@code index.replication.type: SEGMENT} on a serverless-storage
- * index at creation time (rfc-serverless-opensearch.md &sect;18 risk #7, "indices can't mix
- * modes; enforce at index-settings validation"). Serverless storage's own manifest publication
- * (&sect;8) already *is* the shard's segment replication mechanism -- reader shards pick up new
- * segments by polling for a newer published manifest, not via core's peer-to-peer segment-copy
- * protocol -- so also requesting core's {@code SEGMENT} replication type would configure a second,
- * conflicting distribution mechanism for the same shard rather than a real, usable feature
- * combination.
+ * <p>Finally, rejects explicit {@code index.replication.type: SEGMENT} <em>together with at least
+ * one writer replica</em> ({@code index.number_of_replicas > 0}) on a serverless-storage index at
+ * creation time (rfc-serverless-opensearch.md &sect;18 risk #7, "indices can't mix modes; enforce
+ * at index-settings validation"). Serverless storage's own manifest publication (&sect;8) already
+ * *is* the shard's segment replication mechanism for its writer-side replicas -- so also
+ * requesting core's peer-to-peer {@code SEGMENT} replication for those same writer replicas would
+ * configure a second, conflicting distribution mechanism for the same shard.
+ *
+ * <p>Deliberately scoped to writer replicas only, not to every explicit {@code SEGMENT} request:
+ * a search-only shard copy never goes through core's peer-to-peer segment-copy protocol regardless
+ * of this setting (routed via {@code RecoverySource.EmptyStoreRecoverySource} purely off {@link
+ * org.opensearch.cluster.routing.ShardRouting#isSearchOnly()}, see {@code ShardRouting}'s own
+ * {@code initializeUnassignedShard}), so an index with zero writer replicas requesting {@code
+ * SEGMENT} only to satisfy core's own prerequisite chain for search-only replicas ({@code
+ * index.number_of_search_replicas} requires {@code index.remote_store.enabled}, which itself
+ * requires {@code index.replication.type: SEGMENT}, per {@code
+ * IndexMetadata#INDEX_REMOTE_STORE_ENABLED_SETTING}'s validator) has no real conflicting mechanism
+ * to reject -- rejecting it anyway would make reader-shard creation via {@code
+ * index.number_of_search_replicas} impossible for every serverless-storage index, closing off this
+ * plugin's only entry point into that path (rfc-serverless-opensearch.md &sect;18 risk #10).
  */
 public final class ServerlessStorageIndexSettingProvider implements IndexSettingProvider {
 
@@ -52,7 +64,9 @@ public final class ServerlessStorageIndexSettingProvider implements IndexSetting
         if (ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.get(templateAndRequestSettings) == false) {
             return Settings.EMPTY;
         }
-        if (templateAndRequestSettings.hasValue(IndexMetadata.INDEX_REPLICATION_TYPE_SETTING.getKey())
+        int numberOfWriterReplicas = IndexMetadata.INDEX_NUMBER_OF_REPLICAS_SETTING.get(templateAndRequestSettings);
+        if (numberOfWriterReplicas > 0
+            && templateAndRequestSettings.hasValue(IndexMetadata.INDEX_REPLICATION_TYPE_SETTING.getKey())
             && IndexMetadata.INDEX_REPLICATION_TYPE_SETTING.get(templateAndRequestSettings) == ReplicationType.SEGMENT) {
             throw new IllegalArgumentException(
                 "index ["
@@ -63,9 +77,14 @@ public final class ServerlessStorageIndexSettingProvider implements IndexSetting
                     + IndexMetadata.INDEX_REPLICATION_TYPE_SETTING.getKey()
                     + "="
                     + ReplicationType.SEGMENT
+                    + " and "
+                    + IndexMetadata.SETTING_NUMBER_OF_REPLICAS
+                    + "="
+                    + numberOfWriterReplicas
                     + ": serverless storage's own manifest publication already is this shard's segment "
-                    + "replication mechanism, so requesting core's segment replication as well would "
-                    + "configure two conflicting distribution mechanisms for the same shard"
+                    + "replication mechanism for its writer replicas, so requesting core's segment "
+                    + "replication for those same replicas would configure two conflicting "
+                    + "distribution mechanisms for the same shard"
             );
         }
         Settings.Builder settings = Settings.builder()

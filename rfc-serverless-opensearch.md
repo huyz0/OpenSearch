@@ -2367,6 +2367,45 @@ directions documented so serverless adoption is not a one-way door.
     resulting search-only shard copy actually receives -- but the "should this plugin add a
     rejection" question itself is closed: it must not.
 
+    **The real experiment was attempted, and it surfaced a second, more fundamental gap than the
+    one it set out to check.** Ran a real three-node cluster (`RemoteStoreBaseIntegTestCase` +
+    `ServerlessStoragePlugin`, one writer node, one dedicated search-only node, an index with
+    `serverless_storage.enabled: true`, `number_of_replicas: 0`, `number_of_search_replicas: 1`)
+    and hit a real bug on the very first attempt to create the index: the pre-existing risk #7
+    `SEGMENT`-replication rejection fired unconditionally, blocking index creation outright, since
+    core's own prerequisite chain (`number_of_search_replicas` requires `remote_store.enabled`,
+    which requires explicit `replication.type: SEGMENT`) has no way to ask for a search-only
+    replica without also requesting `SEGMENT`. **Fixed**: `ServerlessStorageIndexSettingProvider`'s
+    `SEGMENT`-replication rejection is now scoped to `index.number_of_replicas > 0` only -- a
+    search-only shard copy never goes through core's peer-to-peer segment-copy protocol regardless
+    of this setting (routed via `RecoverySource.EmptyStoreRecoverySource` purely off
+    `ShardRouting#isSearchOnly()`), so `SEGMENT` with zero writer replicas has no real conflicting
+    mechanism to reject. Covered by a new unit test
+    (`testAllowsExplicitSegmentReplicationWithZeroWriterReplicas`).
+
+    With that fixed, index creation succeeded, but the search-only shard copy itself then never
+    left `UNASSIGNED` -- `ensureGreen` timed out with `allocation_status[no_attempt]`, meaning
+    `ServerlessStorageExistingShardsAllocator#allocateUnassigned` was never even invoked for this
+    shard copy (not a decider rejecting it -- a rejection would show `deciders_no`, not
+    `no_attempt`). The primary shard on the writer node allocated and started normally in the same
+    run, so this is specific to the search-only copy, not a general breakage of this plugin's
+    allocator. Root cause not yet isolated: `AllocationService#getAllocatorForShard` resolves the
+    allocator purely from `EXISTING_SHARDS_ALLOCATOR_SETTING`, with no primary/replica/search-only
+    branching visible in that path, so why the search-only copy's unassigned-shard loop never
+    reaches `allocateUnassigned` at all is still an open question -- something upstream of that
+    call (batch-mode shard grouping, `afterPrimariesBeforeReplicas` ordering, or a search-only-only
+    branch elsewhere in `AllocationService`/`ShardsBatchGatewayAllocator` not yet located) is the
+    likely suspect. **This is now the operationally load-bearing blocker for risk #10, not the
+    `remote_store.enabled` setting question above** -- a serverless-storage index literally cannot
+    get a working search-only replica today, independent of what settings are or aren't rejected.
+    The exploratory IT that found this (`ServerlessStorageSearchOnlyReplicaIT`) was not committed --
+    it fails on this unresolved allocation gap, and a known-red IT has no place in the tree -- but
+    its recipe (three-node `RemoteStoreBaseIntegTestCase` cluster, `randomRepoPath()` for this
+    plugin's own `serverless_storage.base_path` so it lands under the cluster's already-configured
+    `path.repo`, `super.nodePlugins()` composed with `ServerlessStoragePlugin` so the mock
+    repository plugins `RemoteStoreBaseIntegTestCase` depends on stay registered) is preserved here
+    for whoever picks this back up.
+
 ## 19. Summary
 
 The strategy is: keep Lucene and the mechanical engine internals; replace *where bytes live and

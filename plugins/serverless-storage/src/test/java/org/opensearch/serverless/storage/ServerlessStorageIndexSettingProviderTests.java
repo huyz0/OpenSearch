@@ -81,6 +81,27 @@ public class ServerlessStorageIndexSettingProviderTests extends OpenSearchTestCa
         );
     }
 
+    public void testAllowsExplicitSegmentReplicationWithZeroWriterReplicas() {
+        // Zero writer replicas means core's peer-to-peer segment-copy protocol never actually
+        // engages for this index -- SEGMENT is only requested here to satisfy core's own
+        // prerequisite chain for search-only replicas (index.number_of_search_replicas requires
+        // index.remote_store.enabled, which requires index.replication.type: SEGMENT). Rejecting
+        // this would make reader-shard creation via number_of_search_replicas impossible for every
+        // serverless-storage index (rfc-serverless-opensearch.md &sect;18 risk #10).
+        Settings requestSettings = Settings.builder()
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey(), true)
+            .put(IndexMetadata.INDEX_REPLICATION_TYPE_SETTING.getKey(), ReplicationType.SEGMENT.toString())
+            .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+            .build();
+
+        Settings additional = new ServerlessStorageIndexSettingProvider().getAdditionalIndexSettings("my-index", false, requestSettings);
+
+        assertEquals(
+            ServerlessStorageExistingShardsAllocator.NAME,
+            additional.get(ExistingShardsAllocator.EXISTING_SHARDS_ALLOCATOR_SETTING.getKey())
+        );
+    }
+
     public void testDoesNotRejectSegmentReplicationForAnOrdinaryIndex() {
         Settings requestSettings = Settings.builder()
             .put(IndexMetadata.INDEX_REPLICATION_TYPE_SETTING.getKey(), ReplicationType.SEGMENT.toString())
