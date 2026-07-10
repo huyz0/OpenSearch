@@ -791,7 +791,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      * this adds a way to trigger the same check immediately rather than waiting it out), and a
      * writer-shard idle-time query (&sect;16 Phase 4's "suspended writers, scale-to-zero/cold-start"
      * milestone -- the first real consumer of {@code ObjectStoreWriterEngine#millisSinceLastActivity()}
-     * outside the engine itself).
+     * outside the engine itself), and a snapshot pin/release pair (&sect;14's "snapshot = pinned
+     * manifest set" -- until now only the underlying {@code DurablePinRegistry} mechanism existed,
+     * used by PITR retention and clone, with no way for an operator to actually pin a shard's
+     * current manifest generation under a snapshot name).
      */
     @Override
     public
@@ -809,6 +812,14 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new ActionHandler<>(
                 org.opensearch.serverless.storage.writerengine.action.ShardIdleTimeAction.INSTANCE,
                 org.opensearch.serverless.storage.writerengine.action.TransportShardIdleTimeAction.class
+            ),
+            new ActionHandler<>(
+                org.opensearch.serverless.storage.retention.action.SnapshotPinAction.INSTANCE,
+                org.opensearch.serverless.storage.retention.action.TransportSnapshotPinAction.class
+            ),
+            new ActionHandler<>(
+                org.opensearch.serverless.storage.retention.action.SnapshotReleaseAction.INSTANCE,
+                org.opensearch.serverless.storage.retention.action.TransportSnapshotReleaseAction.class
             )
         );
     }
@@ -826,7 +837,9 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         return java.util.List.of(
             new org.opensearch.serverless.storage.clone.action.RestShardCloneAction(),
             new org.opensearch.serverless.storage.compaction.action.RestCompactionTriggerAction(),
-            new org.opensearch.serverless.storage.writerengine.action.RestShardIdleTimeAction()
+            new org.opensearch.serverless.storage.writerengine.action.RestShardIdleTimeAction(),
+            new org.opensearch.serverless.storage.retention.action.RestSnapshotPinAction(),
+            new org.opensearch.serverless.storage.retention.action.RestSnapshotReleaseAction()
         );
     }
 

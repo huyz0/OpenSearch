@@ -1411,6 +1411,21 @@ RFC claims them deliberately rather than leaving them implicit:
 - **Snapshot = pinned manifest set.** A snapshot of an index is a retention-pinned manifest per
   shard plus a copy of the index metadata object — metadata-only, O(shards) small writes, no
   data movement. Restore-in-place is "point the shard-heads at the pinned manifests."
+  **Status: the per-shard pin/release half is now implemented and tested; index-wide
+  orchestration and restore are still open.** New `SnapshotPinAction`/`SnapshotReleaseAction`
+  (`retention/action` package, REST at `POST /_plugins/_serverless/storage/_snapshot_pin` and
+  `/_snapshot_release`) durably pin/release a single shard's *current* published manifest
+  generation under a snapshot name, via the same `DurablePinRegistry` PITR retention and clone
+  already depend on -- until this pass only that underlying generic mechanism existed, with
+  nothing letting an operator actually create one. Create-or-replace, not additive: re-pinning
+  under an already-used `snapshotId` at a newer generation adds the new pin *before* removing the
+  old one (never the other way -- a crash between the two only ever leaves both generations
+  pinned, never a window where the name resolves to nothing), verified end to end in
+  `ServerlessStorageSnapshotPinActionIT` including this exact replace-not-accumulate behavior
+  against a real advancing shard. Deliberately scoped to one shard per call, matching every other
+  action this plugin exposes (compaction trigger, clone) -- an index-wide "snapshot every shard
+  under one name, all-or-nothing" orchestration layer, and the actual restore-in-place half
+  ("point the shard-heads at the pinned manifests"), are both still open future work.
 - **Clone = new index referencing existing bundles.** A zero-copy clone writes new manifests
   (under a new index UUID) that reference the source's bundles. This is the feature that makes
   dev/test-on-production-data and A/B reindexing cheap — and it is exactly why bundle GC must
