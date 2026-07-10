@@ -312,6 +312,20 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * How often {@code ScaleToZeroCandidatesSchedulerTask} re-evaluates {@code
+     * ScaleToZeroCandidatesAction} in the background, turning it from an on-demand-only REST/transport
+     * surface into a live, continuously refreshed signal -- same "background schedule mirrors an
+     * on-demand trigger" shape {@link #SERVERLESS_STORAGE_COMPACTION_INTERVAL_SETTING}/{@code
+     * CompactionTriggerAction} already established. Non-positive (the default) disables the
+     * scheduled evaluation entirely; the on-demand REST/transport action is unaffected either way.
+     */
+    public static final Setting<TimeValue> SERVERLESS_STORAGE_SCALE_TO_ZERO_EVAL_INTERVAL_SETTING = Setting.timeSetting(
+        "serverless_storage.scale_to_zero.eval_interval",
+        TimeValue.MINUS_ONE,
+        Setting.Property.NodeScope
+    );
+
+    /**
      * Per-shard fairness budget for the one node-shared {@code WalChunkService}
      * (rfc-serverless-opensearch.md &sect;18 risk #4, "WAL multiplexing fairness") -- a shard whose
      * own buffered payload bytes since its last flush cross this budget is immediately siphoned
@@ -406,6 +420,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         Settings.EMPTY
     ).millis();
     private volatile long scaleToZeroLagThreshold = SERVERLESS_STORAGE_SCALE_TO_ZERO_LAG_THRESHOLD_SETTING.getDefault(Settings.EMPTY);
+    private volatile org.opensearch.serverless.storage.scaletozero.ScaleToZeroCandidatesSchedulerTask scaleToZeroCandidatesSchedulerTask;
     // One node-local directory instance shared by every shard on this node -- matches the target
     // design's "one node block cache" shape (&sect;9) rather than a per-shard instance, and needs
     // no I/O to construct, so it's safe to build eagerly rather than threading through createComponents.
@@ -441,7 +456,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_LAZY_DIRECTORY_ENABLED_SETTING,
             SERVERLESS_STORAGE_WAL_DEDICATED_STREAM_SETTING,
             SERVERLESS_STORAGE_SCALE_TO_ZERO_IDLE_THRESHOLD_SETTING,
-            SERVERLESS_STORAGE_SCALE_TO_ZERO_LAG_THRESHOLD_SETTING
+            SERVERLESS_STORAGE_SCALE_TO_ZERO_LAG_THRESHOLD_SETTING,
+            SERVERLESS_STORAGE_SCALE_TO_ZERO_EVAL_INTERVAL_SETTING
         );
     }
 
@@ -496,6 +512,15 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         this.threadPool = threadPool;
         this.scaleToZeroIdleThresholdMillis = SERVERLESS_STORAGE_SCALE_TO_ZERO_IDLE_THRESHOLD_SETTING.get(environment.settings()).millis();
         this.scaleToZeroLagThreshold = SERVERLESS_STORAGE_SCALE_TO_ZERO_LAG_THRESHOLD_SETTING.get(environment.settings());
+        TimeValue scaleToZeroEvalInterval = SERVERLESS_STORAGE_SCALE_TO_ZERO_EVAL_INTERVAL_SETTING.get(environment.settings());
+        if (scaleToZeroEvalInterval.millis() > 0) {
+            this.scaleToZeroCandidatesSchedulerTask = new org.opensearch.serverless.storage.scaletozero.ScaleToZeroCandidatesSchedulerTask(
+                threadPool,
+                scaleToZeroEvalInterval,
+                client,
+                clusterService
+            );
+        }
         String configuredBasePath = SERVERLESS_STORAGE_BASE_PATH_SETTING.get(environment.settings());
         if (configuredBasePath.isEmpty() == false) {
             // Environment#resolveRepoFile is the same sanctioned path-resolution seam
@@ -1066,6 +1091,11 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     /** The WAL GC scheduler task {@link #createComponents} built, or {@code null} if disabled -- test-only visibility. */
     org.opensearch.serverless.storage.wal.WalGcSchedulerTask walGcSchedulerTaskForTesting() {
         return walGcSchedulerTask;
+    }
+
+    /** The scale-to-zero candidate scheduler task {@link #createComponents} built, or {@code null} if disabled -- test-only visibility. */
+    org.opensearch.serverless.storage.scaletozero.ScaleToZeroCandidatesSchedulerTask scaleToZeroCandidatesSchedulerTaskForTesting() {
+        return scaleToZeroCandidatesSchedulerTask;
     }
 
     /** The reader-shard admission controller {@link #createComponents} built, or {@code null} if disabled -- test-only visibility. */

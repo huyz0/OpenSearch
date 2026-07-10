@@ -2074,6 +2074,29 @@ don't suppress other nodes' candidates) and a real two-data-node integration tes
 node hosts the shard even when a different node answers the coordinating request -- the one thing
 a unit test alone cannot prove for a `TransportNodesAction`.
 
+The on-demand REST/transport action now also has a background counterpart:
+`ScaleToZeroCandidatesSchedulerTask` (`scaletozero` package, mirroring `CompactionSchedulerTask`/
+`PitrRetentionSchedulerTask`'s own "background schedule alongside an on-demand trigger" shape) runs
+`ScaleToZeroCandidatesAction`'s cluster-wide fan-out on a fixed interval
+(`serverless_storage.scale_to_zero.eval_interval`, non-positive/disabled by default) and caches the
+merged result in `latestCandidates()`, so an eventual policy consumer doesn't have to poll the REST
+API itself and every node in the cluster doesn't need to separately schedule the identical fan-out.
+Runs only on the elected cluster-manager node, re-checked fresh on every tick via
+`ClusterService#state()` rather than cached once at construction time, since the elected node can
+change while the task keeps running. Landing this caught a real bug via its own integration test:
+the first version's failure handling caught `Exception`, but `ClusterService#state()` throws an
+`AssertionError` -- not an `Exception` -- when called before a node's initial cluster state is
+applied, a real window this task's very first tick or two can land in (`threadPool.scheduleWithFixedDelay`
+starts ticking as soon as `createComponents` constructs the task, well before the node finishes
+starting up). An uncaught `AssertionError` on a scheduled-task thread doesn't get rescheduled,
+silently killing the entire background evaluation forever after just one unlucky early tick. Fixed
+by widening the catch to `Throwable`. Verified with unit tests covering the scheduling/gating logic
+directly (only the elected cluster-manager evaluates; a failed evaluation leaves the prior cached
+value in place rather than clearing it) and a real two-node integration test
+(`ServerlessStorageScaleToZeroCandidatesSchedulerTaskIT`) proving the scheduled evaluation discovers
+a real shard through the actual `createComponents` wiring, not just a direct method call -- the
+same test that caught the `AssertionError` bug above before it shipped.
+
 Still genuinely open: the actual suspend/reactivate *mechanism*. Consuming this action's output to
 really stop serving a shard, and cold-start reactivation on the next write or query, both intersect
 `IndexShard`/allocation lifecycle in core and remain out of scope for a plugin-local action -- see
