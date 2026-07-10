@@ -814,6 +814,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 org.opensearch.serverless.storage.writerengine.action.TransportShardIdleTimeAction.class
             ),
             new ActionHandler<>(
+                org.opensearch.serverless.storage.writerengine.action.NodeIdleShardsAction.INSTANCE,
+                org.opensearch.serverless.storage.writerengine.action.TransportNodeIdleShardsAction.class
+            ),
+            new ActionHandler<>(
                 org.opensearch.serverless.storage.retention.action.SnapshotPinAction.INSTANCE,
                 org.opensearch.serverless.storage.retention.action.TransportSnapshotPinAction.class
             ),
@@ -854,6 +858,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new org.opensearch.serverless.storage.clone.action.RestShardCloneAction(),
             new org.opensearch.serverless.storage.compaction.action.RestCompactionTriggerAction(),
             new org.opensearch.serverless.storage.writerengine.action.RestShardIdleTimeAction(),
+            new org.opensearch.serverless.storage.writerengine.action.RestNodeIdleShardsAction(),
             new org.opensearch.serverless.storage.retention.action.RestSnapshotPinAction(),
             new org.opensearch.serverless.storage.retention.action.RestSnapshotReleaseAction(),
             new org.opensearch.serverless.storage.retention.action.RestSnapshotRestoreAction(),

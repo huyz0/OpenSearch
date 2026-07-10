@@ -89,4 +89,46 @@ public class ShardActivityRegistryTests extends EngineTestCase {
             IOUtils.close(engine, lastOpenedStore);
         }
     }
+
+    public void testSnapshotAllIncludesEveryRegisteredLiveEngineAndSkipsUnregisteredKeys() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+
+        Store store = createStore();
+        lastOpenedStore = store;
+        store.createEmpty(defaultSettings.getIndexVersionCreated().luceneVersion);
+        java.nio.file.Path translogPath = createTempDir();
+        String translogUuid = Translog.createEmptyTranslog(translogPath, SequenceNumbers.NO_OPS_PERFORMED, shardId, primaryTerm.get());
+        store.associateIndexWithNewTranslog(translogUuid);
+        EngineConfig engineConfig = config(defaultSettings, store, translogPath, newMergePolicy(), null);
+
+        ObjectStoreWriterEngine engine = new ObjectStoreWriterEngine(
+            engineConfig,
+            new ObjectStoreCommitHeadPublisher(commitPublisher, shardStateStore),
+            shardDirectory,
+            LOCAL_NODE_ID
+        );
+        engine.translogManager().recoverFromTranslog(translogHandler, engine.getProcessedLocalCheckpoint(), Long.MAX_VALUE);
+        try {
+            ShardActivityRegistry registry = new ShardActivityRegistry();
+            registry.register(shardId.getIndex().getUUID(), shardId.getId(), engine);
+
+            java.util.Map<String, Long> snapshot = registry.snapshotAll();
+            assertEquals("exactly the one registered, still-live engine must appear -- nothing more, nothing less", 1, snapshot.size());
+            String expectedKey = shardId.getIndex().getUUID() + "/" + shardId.getId();
+            assertTrue(
+                "the snapshot key must use the same (indexUuid, shardId) shape every other lookup uses",
+                snapshot.containsKey(expectedKey)
+            );
+            long delta = Math.abs(engine.millisSinceLastActivity() - snapshot.get(expectedKey));
+            assertTrue("the snapshot must report the same value the engine itself reports (delta was " + delta + "ms)", delta < 50);
+        } finally {
+            IOUtils.close(engine, lastOpenedStore);
+        }
+    }
 }

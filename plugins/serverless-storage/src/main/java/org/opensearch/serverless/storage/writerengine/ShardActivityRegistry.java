@@ -74,4 +74,30 @@ public final class ShardActivityRegistry {
         ObjectStoreWriterEngine engine = ref == null ? null : ref.get();
         return engine == null ? Optional.empty() : Optional.of(engine.millisSinceLastActivity());
     }
+
+    /**
+     * A point-in-time snapshot of every writer engine currently tracked on this node -- the
+     * cluster-wide counterpart to {@link #millisSinceLastActivity}, letting a caller (an
+     * autoscaling/suspension controller, {@code rfc-serverless-opensearch.md} &sect;7.3/&sect;10's
+     * still-open "signal collection" bullet) discover which shards on this node are idle, and by
+     * how much, without already knowing every (indexUuid, shardId) it might want to ask about.
+     *
+     * <p>Silently skips any entry whose {@link WeakReference} has already been collected (a closed
+     * engine's stale key -- see this class's own javadoc for why that key is harmless, self-correcting
+     * garbage) rather than reporting it with a stale or default value.
+     *
+     * @return every (indexUuid, shardId) key (see {@link #key}'s {@code "indexUuid/shardId"} format)
+     *         together with how long that shard's writer engine has been idle on this node, for
+     *         every entry whose engine is still live
+     */
+    public Map<String, Long> snapshotAll() {
+        Map<String, Long> snapshot = new java.util.HashMap<>();
+        for (Map.Entry<String, WeakReference<ObjectStoreWriterEngine>> entry : engines.entrySet()) {
+            ObjectStoreWriterEngine engine = entry.getValue().get();
+            if (engine != null) {
+                snapshot.put(entry.getKey(), engine.millisSinceLastActivity());
+            }
+        }
+        return snapshot;
+    }
 }

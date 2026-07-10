@@ -1897,6 +1897,26 @@ writer engine is tracked as soon as it's constructed (not only after a first wri
 resets to near-zero right after a real write, and a shard number the index doesn't have correctly
 reports not tracked rather than throwing or returning a stale value.
 
+**Third increment: the signal is now discoverable per-node, not just askable one shard at a
+time.** New `NodeIdleShardsAction`/`NodeIdleShardsRequest`/`NodeIdleShardsResponse`/
+`TransportNodeIdleShardsAction`/`RestNodeIdleShardsAction` (`writerengine/action` package, REST at
+`GET /_plugins/_serverless/storage/_idle_shards`) answer "what's idle on this node, and by how
+much" in one call, rather than requiring a caller to already know every (indexUuid, shardId) pair
+to ask `ShardIdleTimeAction` about individually -- the "signal collection" half of &sect;7.3/
+&sect;10's still-open autoscaling story an external controller actually needs before it can do
+anything. `ShardActivityRegistry` gained `snapshotAll()`, a point-in-time snapshot of every still-
+live registered engine (silently skipping any `WeakReference` already collected, same "harmless
+self-correcting garbage" reasoning as `millisSinceLastActivity` -- see that class's own javadoc);
+the new transport action parses each `"indexUuid/shardId"` map key back into a small `IdleShardEntry`
+value type. Same node-routing contract as `ShardIdleTimeAction` (only ever answers from the
+receiving node's own local registry; a caller wanting cluster-wide data calls this once per data
+node) -- deliberately not a new pattern, since inventing one would create two different discovery
+shapes for the same underlying signal. Verified end-to-end in a real two-index, one-data-node
+cluster (`ServerlessStorageNodeIdleShardsActionIT`): both writer shards' engines are listed with
+their own correct `(indexUuid, shardId)` pair (not swapped or merged), registered at construction
+time rather than lazily on first write, matching `ShardIdleTimeAction`'s own already-proven
+before-any-write behavior.
+
 Still open: routing this signal into an actual suspension decision, a scale-to-zero controller, or
 cold-start reactivation is separate future work -- this closes the "is the signal reachable at
 all" question, not "what does the cluster do with it."
