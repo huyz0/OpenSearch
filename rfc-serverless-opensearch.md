@@ -1772,17 +1772,52 @@ version written: without this exclusion, a shard's own normal translog replay on
 a crash/restart, already exercised by every existing test via `openWriterEngine`'s
 `recoverFromTranslog` call) would re-apply already-happened operations through the same `index`/
 `delete` entry points and reset the idle clock, making a genuinely idle-but-just-recovered shard
-misreport as freshly active to any future consumer of this signal. Nothing yet reads this value:
-routing it into an actual suspension decision, a scale-to-zero controller, cold-start reactivation,
-or a stats/REST exposure surface (the natural next increments) is still open, same "data first,
-decision later" shape `activationWalPosition` was built in before WAL replay recovery consumed it.
-Unit-tested two ways against a real `EngineTestCase`-provisioned engine:
+misreport as freshly active to any future consumer of this signal. Unit-tested two ways against a
+real `EngineTestCase`-provisioned engine:
 `testMillisSinceLastActivityUpdatesOnIndexAndDecreasesUntilTheNextOne` (asserting absolute time
 bounds around a real sleep rather than a relative before/after comparison -- `index()` itself is
 real, variable-duration work, so comparing its own duration against a short sleep window would have
 been flaky by construction) and
 `testMillisSinceLastActivityIgnoresTranslogRecoveryReplayOperations` (a directly constructed
 `LOCAL_TRANSLOG_RECOVERY`-origin operation must not reset the clock).
+
+**Second increment: the signal is now actually reachable outside the engine.** New
+`ShardActivityRegistry` (`writerengine` package) -- one node-shared, in-memory index of every
+`ObjectStoreWriterEngine` currently open on that node, by (indexUuid, shardId), the same
+"one node-shared instance" shape `sharedBundleCache`/`sharedWalChunkService` already use. Holds a
+`WeakReference` to each registered engine, not a strong one: this plugin has no hook into an
+engine's own `close()` to explicitly deregister, so a strong reference would leak every writer
+engine a node has ever hosted, across every shard relocation, for the node's entire lifetime; a
+`WeakReference` instead lets a closed engine's entry become naturally uncollectable garbage once
+core drops its own last strong reference, with `millisSinceLastActivity` simply reporting "not
+tracked" for an already-collected entry -- the correct answer, since a shard with no live writer
+engine on this node has no idle time to report anyway.
+
+`WriterEngineFactory` gained an eighth constructor overload accepting a `ShardActivityRegistry`
+(smaller/existing constructors delegate with `null`, same telescoping-constructor shape this class
+already used seven times over for every other optional feature) and registers each engine it
+produces immediately after construction, inside `newReadWriteEngine`. `ServerlessStoragePlugin`
+builds one `ShardActivityRegistry` eagerly (no I/O needed, same reasoning as `shardDirectory`) and
+passes it into the writer branch of `getEngineFactory`.
+
+New `ShardIdleTimeAction`/`ShardIdleTimeRequest`/`ShardIdleTimeResponse`/`TransportShardIdleTimeAction`/
+`RestShardIdleTimeAction` (`writerengine/action` package, same shape as `compaction/action`) expose
+it: `GET /_plugins/_serverless/storage/{index_uuid}/{shard_id}/_idle_time`. Unlike
+`TransportCompactionTriggerAction` (which operates purely against the shared object store and so
+can run on whichever node receives the request), this action can only ever answer from its own
+receiving node's local registry -- a request that lands on a node not hosting the shard (e.g. this
+plugin's own IT initially got this wrong, routing through `client()`, which can pick the
+cluster-manager-only node that hosts no shards at all -- fixed by using `dataNodeClient()` instead)
+gets `ShardIdleTimeResponse#notTracked()`, not an error; the caller is expected to already know
+which node to ask, the same way any other single-node transport action works. Verified end-to-end
+in a real cluster (`ServerlessStorageShardIdleTimeActionIT`, stable across repeated runs): a real
+writer engine is tracked as soon as it's constructed (not only after a first write), idle time
+resets to near-zero right after a real write, and a shard number the index doesn't have correctly
+reports not tracked rather than throwing or returning a stale value.
+
+Still open: routing this signal into an actual suspension decision, a scale-to-zero controller, or
+cold-start reactivation is separate future work -- this closes the "is the signal reachable at
+all" question, not "what does the cluster do with it."
 
 **Phase 4.5 — Compaction service, fully done.** Candidate selection, rebase protocol, real Lucene
 merge, size-tiered shaping, background scheduling, a real concurrent-writer data-loss bug, real

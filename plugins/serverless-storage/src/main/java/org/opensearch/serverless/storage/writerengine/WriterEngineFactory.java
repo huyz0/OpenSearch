@@ -35,6 +35,7 @@ public final class WriterEngineFactory implements EngineFactory {
     private final WalChunkService walChunkService;
     private final ObjectStoreCommitMaterializer materializer;
     private final org.opensearch.serverless.storage.security.EncryptionKeyProvider encryptionKeyProvider;
+    private final ShardActivityRegistry activityRegistry;
 
     /**
      * Creates a factory with neither PITR retention nor WAL mirroring configured, delegating to the
@@ -112,7 +113,8 @@ public final class WriterEngineFactory implements EngineFactory {
 
     /**
      * Creates a fully-configured factory, storing every dependency for engines it will later
-     * produce via {@link #newReadWriteEngine}.
+     * produce via {@link #newReadWriteEngine}, leaving produced engines unregistered with any
+     * {@link ShardActivityRegistry} (delegates to the fullest constructor with {@code null}).
      *
      * @param headPublisher publishes commits and manages lease acquisition/renewal for produced engines
      * @param shardDirectory the directory-registry entry produced engines report themselves into
@@ -135,6 +137,39 @@ public final class WriterEngineFactory implements EngineFactory {
         ObjectStoreCommitMaterializer materializer,
         org.opensearch.serverless.storage.security.EncryptionKeyProvider encryptionKeyProvider
     ) {
+        this(headPublisher, shardDirectory, localNodeId, pitrRetentionConfig, walChunkService, materializer, encryptionKeyProvider, null);
+    }
+
+    /**
+     * Creates a fully-configured factory, storing every dependency for engines it will later
+     * produce via {@link #newReadWriteEngine}, including a {@link ShardActivityRegistry} produced
+     * engines register themselves into.
+     *
+     * @param headPublisher publishes commits and manages lease acquisition/renewal for produced engines
+     * @param shardDirectory the directory-registry entry produced engines report themselves into
+     * @param localNodeId the id of the node produced engines activate on
+     * @param pitrRetentionConfig {@code null} disables PITR retention reconciliation on produced engines; non-null enables it
+     * @param walChunkService {@code null} disables WAL mirroring entirely, same shape as every other optional feature in this plugin.
+     * @param materializer {@code null} disables missing-local-store recovery entirely (same shape
+     *                     as every other optional feature in this plugin) -- see {@link
+     *                     #recoverMissingLocalStore} for what it's for.
+     * @param encryptionKeyProvider {@code null} leaves WAL-mirrored records unencrypted, same shape
+     *                              as every other optional feature in this plugin -- see {@link
+     *                              ObjectStoreWriterEngine}'s own matching constructor javadoc.
+     * @param activityRegistry {@code null} leaves produced engines unreachable for idle-time
+     *                         queries (same shape as every other optional feature in this plugin);
+     *                         non-null registers each produced engine into it as it's constructed.
+     */
+    public WriterEngineFactory(
+        ObjectStoreCommitHeadPublisher headPublisher,
+        ShardDirectory shardDirectory,
+        String localNodeId,
+        PitrRetentionConfig pitrRetentionConfig,
+        WalChunkService walChunkService,
+        ObjectStoreCommitMaterializer materializer,
+        org.opensearch.serverless.storage.security.EncryptionKeyProvider encryptionKeyProvider,
+        ShardActivityRegistry activityRegistry
+    ) {
         this.headPublisher = headPublisher;
         this.shardDirectory = shardDirectory;
         this.localNodeId = localNodeId;
@@ -142,6 +177,7 @@ public final class WriterEngineFactory implements EngineFactory {
         this.walChunkService = walChunkService;
         this.materializer = materializer;
         this.encryptionKeyProvider = encryptionKeyProvider;
+        this.activityRegistry = activityRegistry;
     }
 
     /** Exposed for tests (including from other packages, e.g. {@code ServerlessStoragePluginTests}) -- not part of this class's public contract. */
@@ -159,7 +195,7 @@ public final class WriterEngineFactory implements EngineFactory {
             // construction over. It also owns PITR retention reconciliation when pitrRetentionConfig
             // is configured (null disables it, same shape as encryption), and WAL mirroring when
             // walChunkService is configured (null disables it the same way).
-            return new ObjectStoreWriterEngine(
+            ObjectStoreWriterEngine engine = new ObjectStoreWriterEngine(
                 config,
                 headPublisher,
                 shardDirectory,
@@ -168,6 +204,10 @@ public final class WriterEngineFactory implements EngineFactory {
                 walChunkService,
                 encryptionKeyProvider
             );
+            if (activityRegistry != null) {
+                activityRegistry.register(config.getShardId().getIndex().getUUID(), config.getShardId().getId(), engine);
+            }
+            return engine;
         } catch (RuntimeException e) {
             throw e;
         } catch (Exception e) {

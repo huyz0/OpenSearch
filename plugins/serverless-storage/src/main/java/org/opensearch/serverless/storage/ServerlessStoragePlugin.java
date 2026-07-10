@@ -346,6 +346,11 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     // design's "one node block cache" shape (&sect;9) rather than a per-shard instance, and needs
     // no I/O to construct, so it's safe to build eagerly rather than threading through createComponents.
     private final ShardDirectory shardDirectory = new InMemoryShardDirectory();
+    // Same "no I/O, safe to build eagerly" reasoning as shardDirectory above -- one node-shared
+    // registry every writer shard's engine on this node registers itself into (rfc-serverless-opensearch.md
+    // &sect;16 Phase 4's idle-activity signal, &sect;15's "autoscaling signal emitters" bullet).
+    private final org.opensearch.serverless.storage.writerengine.ShardActivityRegistry shardActivityRegistry =
+        new org.opensearch.serverless.storage.writerengine.ShardActivityRegistry();
 
     @Override
     public List<Setting<?>> getSettings() {
@@ -643,7 +648,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                     // have when this is configured (&sect;12 bullet 1) -- null (the default) leaves
                     // WAL mirroring's own on/off switch (sharedWalChunkService being non-null) as the
                     // only thing this depends on, unaffected by encryption being off.
-                    encryptionKeyProvider
+                    encryptionKeyProvider,
+                    shardActivityRegistry
                 )
             );
         } catch (IOException e) {
@@ -782,7 +788,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      * feature landed but was reachable only from Java code within the plugin until now) and an
      * on-demand compaction trigger (&sect;7.4, &sect;16 Phase 4.5's "narrower than originally
      * scoped" gap -- {@code CompactionSchedulerTask}'s own background schedule already existed;
-     * this adds a way to trigger the same check immediately rather than waiting it out).
+     * this adds a way to trigger the same check immediately rather than waiting it out), and a
+     * writer-shard idle-time query (&sect;16 Phase 4's "suspended writers, scale-to-zero/cold-start"
+     * milestone -- the first real consumer of {@code ObjectStoreWriterEngine#millisSinceLastActivity()}
+     * outside the engine itself).
      */
     @Override
     public
@@ -796,6 +805,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new ActionHandler<>(
                 org.opensearch.serverless.storage.compaction.action.CompactionTriggerAction.INSTANCE,
                 org.opensearch.serverless.storage.compaction.action.TransportCompactionTriggerAction.class
+            ),
+            new ActionHandler<>(
+                org.opensearch.serverless.storage.writerengine.action.ShardIdleTimeAction.INSTANCE,
+                org.opensearch.serverless.storage.writerengine.action.TransportShardIdleTimeAction.class
             )
         );
     }
@@ -812,13 +825,24 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     ) {
         return java.util.List.of(
             new org.opensearch.serverless.storage.clone.action.RestShardCloneAction(),
-            new org.opensearch.serverless.storage.compaction.action.RestCompactionTriggerAction()
+            new org.opensearch.serverless.storage.compaction.action.RestCompactionTriggerAction(),
+            new org.opensearch.serverless.storage.writerengine.action.RestShardIdleTimeAction()
         );
     }
 
     /** The node-shared bundle cache {@link #createComponents} built -- test-only visibility, not part of the plugin's contract. */
     InMemoryPlaintextBundleCache sharedBundleCacheForTesting() {
         return sharedBundleCache;
+    }
+
+    /**
+     * The node-shared registry every writer shard's engine on this node registers itself into --
+     * used by {@code TransportShardIdleTimeAction} to answer idle-time queries; public (unlike
+     * this class's other {@code *ForTesting} accessors) since a real transport action, not just
+     * tests, needs to reach it via {@code @Inject}.
+     */
+    public org.opensearch.serverless.storage.writerengine.ShardActivityRegistry shardActivityRegistry() {
+        return shardActivityRegistry;
     }
 
     /** The node-shared WAL chunk service {@link #createComponents} built, or {@code null} if WAL mirroring is off -- test-only visibility. */
