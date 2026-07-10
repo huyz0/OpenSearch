@@ -57,13 +57,16 @@ import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertHitCount;
  *       before it will host a reader shard, and a plain {@code startSearchOnlyNode()} node doesn't
  *       carry it. Not a bug -- an undocumented-until-now operational prerequisite for reader
  *       placement to work at all, which this test (and this javadoc) now records.
- *   <li>Core's own remote segment-store upload machinery genuinely does run in the background on
+ *   <li>Core's own remote segment-store upload machinery genuinely did run in the background on
  *       the writer shard, uploading real segment bytes nothing in this plugin ever reads back --
  *       confirmed (not merely inferred) via this test's own assertion on {@code
  *       IndicesStatsResponse}'s {@code getRemoteSegmentStats().getUploadBytesStarted()}, reliably
- *       {@code > 0} across every run. Not a correctness bug, but a real, measured cost/efficiency
- *       gap (rfc-serverless-opensearch.md &sect;18 risk #10) left as documented future work: no
- *       existing plugin extension point can suppress it.
+ *       {@code > 0} before this was fixed. Not a correctness bug, but a real, measured cost/efficiency
+ *       gap (rfc-serverless-opensearch.md &sect;18 risk #10) -- fixed by a new core seam,
+ *       {@code EngineFactory#ownsRemoteSegmentDurability}, that {@link
+ *       org.opensearch.serverless.storage.writerengine.WriterEngineFactory} now implements to tell
+ *       {@code IndexShard} its own manifest publication already is this shard's durable remote
+ *       copy. This test now asserts the upload count is exactly {@code 0}.
  * </ul>
  */
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
@@ -166,28 +169,24 @@ public class ServerlessStorageSearchOnlyReplicaIT extends RemoteStoreBaseIntegTe
 
         // The other, previously-open half of risk #10: does core's own remote segment-store upload
         // machinery run pointlessly in the background alongside this plugin's manifest/bundle
-        // publication? Confirmed yes, not merely "likely" -- the primary shard's own
-        // uploadBytesStarted is > 0 (a real byte count, not a stub), even though this plugin's own
-        // writer path (ObjectStoreWriterEngine) never references remoteStore and this plugin's own
-        // DirectoryFactory owns the shard's actual on-disk directory. Core's remote segment-store
-        // upload path is wired independently of IndexModule.INDEX_STORE_TYPE_SETTING -- it engages
-        // purely off index.remote_store.enabled, uploading real segment bytes to the remote-store
-        // repository that nothing in this plugin's own reader/GC/retention paths ever reads from.
-        // This is confirmed wasted background work, not a correctness bug (nothing reads it, nothing
-        // breaks) -- a real cost/efficiency gap for a plugin whose whole premise is object-store
-        // cost control, left as documented future work (rfc-serverless-opensearch.md &sect;18 risk
-        // #10) rather than fixed here: suppressing it needs a seam inside IndexShard's own
-        // engine/flush path, not something reachable from this plugin's existing extension points.
+        // publication? It used to -- confirmed with real, non-zero uploadBytesStarted before
+        // WriterEngineFactory#ownsRemoteSegmentDurability existed -- but not anymore: that new
+        // EngineFactory method tells core this engine already keeps every segment durable via its
+        // own manifest publication, so IndexShard#createEngineConfig now skips wiring in
+        // RemoteStoreRefreshListener entirely for this shard. Asserting exactly 0 here, not just
+        // "no exception," is what actually proves the new core seam is taking effect end-to-end,
+        // not merely compiling.
         IndicesStatsResponse stats = client().admin().indices().prepareStats(INDEX_NAME).setSegments(true).get();
         boolean sawPrimary = false;
         for (ShardStats shardStats : stats.getShards()) {
             if (shardStats.getShardRouting().primary()) {
                 sawPrimary = true;
-                assertTrue(
-                    "expected confirmed wasted background upload activity on the writer shard "
-                        + "(rfc-serverless-opensearch.md §18 risk #10) -- if this ever reads 0, core's "
-                        + "remote-store upload behavior changed and this whole finding needs re-verifying",
-                    shardStats.getStats().getSegments().getRemoteSegmentStats().getUploadBytesStarted() > 0
+                assertEquals(
+                    "core's remote segment-store upload machinery must never fire for a serverless-storage "
+                        + "index's writer shard now that WriterEngineFactory#ownsRemoteSegmentDurability "
+                        + "returns true (rfc-serverless-opensearch.md §18 risk #10)",
+                    0L,
+                    shardStats.getStats().getSegments().getRemoteSegmentStats().getUploadBytesStarted()
                 );
             }
         }

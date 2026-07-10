@@ -148,6 +148,7 @@ import org.opensearch.index.engine.SafeCommitInfo;
 import org.opensearch.index.engine.Segment;
 import org.opensearch.index.engine.SegmentsStats;
 import org.opensearch.index.engine.dataformat.DataFormatRegistry;
+import org.opensearch.index.engine.exec.EngineBackedIndexerFactory;
 import org.opensearch.index.engine.exec.IndexReaderProvider;
 import org.opensearch.index.engine.exec.Indexer;
 import org.opensearch.index.engine.exec.IndexerFactory;
@@ -4805,7 +4806,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
             });
         }
 
-        if (isRemoteStoreEnabled() || isMigratingToRemote()) {
+        if ((isRemoteStoreEnabled() || isMigratingToRemote()) && engineFactoryOwnsRemoteSegmentDurability() == false) {
             internalRefreshListener.add(
                 new RemoteStoreRefreshListener(
                     this,
@@ -4869,6 +4870,21 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
 
     private boolean isRemoteStoreEnabled() {
         return (remoteStore != null && shardRouting.primary());
+    }
+
+    /**
+     * Whether the {@code EngineFactory} backing this shard's indexer (via {@link #indexerFactory})
+     * has declared, via {@code EngineFactory#ownsRemoteSegmentDurability}, that it already keeps
+     * every segment durably reachable remotely by its own mechanism -- in which case wiring in
+     * core's own {@link RemoteStoreRefreshListener} on top would be pure wasted upload work, not a
+     * correctness requirement. Only {@link EngineBackedIndexerFactory} wraps an actual {@code
+     * EngineFactory} to ask; any other {@link IndexerFactory} (e.g. a non-Lucene {@code
+     * DataFormatAwareEngine} path) has no such factory to consult and defaults to {@code false},
+     * preserving today's behavior exactly.
+     */
+    private boolean engineFactoryOwnsRemoteSegmentDurability() {
+        return indexerFactory instanceof EngineBackedIndexerFactory engineBackedIndexerFactory
+            && engineBackedIndexerFactory.getEngineFactory().ownsRemoteSegmentDurability();
     }
 
     public boolean isRemoteTranslogEnabled() {

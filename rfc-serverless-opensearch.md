@@ -2412,25 +2412,39 @@ directions documented so serverless adoption is not a one-way door.
     served by this plugin's own reader engine and lazy materialization path, not a hand-built
     `ShardRouting` in a unit test.
 
-    **The last open half of risk #10 is now also confirmed, not just hypothesized**: the IT reads
-    the primary shard's own `IndicesStatsResponse` segment stats
-    (`SegmentsStats#getRemoteSegmentStats().getUploadBytesStarted()`) after a real flush, and it is
-    reliably `> 0` (thousands of bytes, not a rounding artifact) across every run. Core's remote
-    segment-store upload machinery genuinely does upload real segment bytes to the remote-store
+    **The last open half of risk #10 was confirmed, then fixed with a small, targeted core seam.**
+    The IT initially read the primary shard's own `IndicesStatsResponse` segment stats
+    (`SegmentsStats#getRemoteSegmentStats().getUploadBytesStarted()`) after a real flush, and it was
+    reliably `> 0` (thousands of bytes, not a rounding artifact) across every run: core's remote
+    segment-store upload machinery genuinely was uploading real segment bytes to the remote-store
     repository in the background on a serverless-storage index's writer shard -- confirmed wasted
-    work, not a correctness bug (nothing in this plugin's reader/GC/retention paths ever reads from
-    that repository, so nothing breaks), but a real, measured cost/efficiency gap for a plugin whose
-    entire premise is object-store cost control. Root cause: core's remote segment-store upload path
-    engages purely off `index.remote_store.enabled` inside `IndexShard`'s own engine/flush wiring,
-    independent of `IndexModule.INDEX_STORE_TYPE_SETTING` -- this plugin's `DirectoryFactory` owns
-    the shard's actual on-disk directory, but has no seam to also suppress core's separate
-    remote-store upload path, which reads from wherever `IndexShard` itself decided the "real"
-    segment directory is, not from what a `DirectoryFactory` returns for arbitrary other purposes.
-    Left as documented future work rather than fixed in this pass: suppressing it needs a new core
-    seam (something like "let a plugin veto remote-store upload for its own store type"), not
-    something reachable from this plugin's existing `IndexStorePlugin`/`IndexSettingProvider`
-    extension points -- worth scoping as its own increment rather than attempting blind inside an
-    already-large change.
+    work, not a correctness bug (nothing in this plugin's reader/GC/retention paths ever read from
+    that repository, so nothing broke), but a real, measured cost/efficiency gap for a plugin whose
+    entire premise is object-store cost control.
+
+    Root cause: core's remote segment-store upload path (`RemoteStoreRefreshListener`, wired into
+    `IndexShard#createEngineConfig`) engages purely off `index.remote_store.enabled`, independent of
+    `IndexModule.INDEX_STORE_TYPE_SETTING` -- this plugin's `DirectoryFactory` owns the shard's
+    actual on-disk directory, but had no seam to also suppress core's separate remote-store upload
+    listener. Rather than reach for a broad or heuristic fix (e.g. inferring "owns durability" from
+    a non-default store type -- which wouldn't even have caught this case, since the *writer* shard
+    never sets `index.store.type` at all, only the *reader* path's lazy directory does), added a new
+    narrow, explicit, opt-in `EngineFactory` method: `EngineFactory#ownsRemoteSegmentDurability()`
+    (`server/src/main/java/org/opensearch/index/engine/EngineFactory.java`), defaulting to `false`
+    (zero behavior change for every existing `EngineFactory`, including every other plugin's). Wired
+    into `IndexShard#createEngineConfig` as one more condition (`&& !engineFactoryOwnsRemoteSegmentDurability()`)
+    guarding `RemoteStoreRefreshListener`'s registration -- surgically scoped to that one call site,
+    not a redefinition of the shared private `isRemoteStoreEnabled()` helper, which has an unrelated
+    second call site (`activateWithPrimaryContext`'s primary-relocation checkpoint logic) this change
+    must not touch. `WriterEngineFactory` now overrides the new method to return `true`
+    unconditionally -- safe, since `ServerlessStoragePlugin#getEngineFactory` only ever returns a
+    `WriterEngineFactory` for an index that already has `serverless_storage.enabled: true`, and that
+    engine's own manifest publication already is this shard's durable remote copy. Re-ran
+    `ServerlessStorageSearchOnlyReplicaIT` after the fix and it now asserts the upload count is
+    exactly `0`, not merely "no exception" -- proof the seam takes effect end-to-end, not just that
+    it compiles. `server:test`'s `IndexShardTests` and `RemoteStoreRefreshListenerTests` (the two
+    core test classes most directly exercising this code path) both still pass unmodified,
+    confirming this is additive and doesn't change behavior for indices that don't opt in.
 
 ## 19. Summary
 

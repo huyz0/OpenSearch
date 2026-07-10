@@ -121,4 +121,32 @@ public class WriterEngineFactoryCrossNodeFailoverTests extends IndexShardTestCas
             closeShards(shard);
         }
     }
+
+    /**
+     * The other half of this test class's job, unrelated to cross-node failover: proves {@link
+     * WriterEngineFactory#ownsRemoteSegmentDurability} always returns {@code true}, the seam
+     * {@code IndexShard} now checks (via {@code EngineBackedIndexerFactory#getEngineFactory}) to
+     * skip wiring in core's own remote segment-store upload path for a serverless-storage writer
+     * shard -- confirmed to actually suppress those uploads end-to-end by
+     * {@code ServerlessStorageSearchOnlyReplicaIT}, not just at this unit level.
+     */
+    public void testOwnsRemoteSegmentDurabilityIsAlwaysTrue() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+        WriterEngineFactory factory = new WriterEngineFactory(
+            new ObjectStoreCommitHeadPublisher(commitPublisher, shardStateStore),
+            shardDirectory,
+            "test-node"
+        );
+        assertTrue(
+            "WriterEngineFactory's own manifest publication already is a serverless-storage writer shard's "
+                + "durable remote copy -- core's remote segment-store upload path must never also run",
+            factory.ownsRemoteSegmentDurability()
+        );
+    }
 }

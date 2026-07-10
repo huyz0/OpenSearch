@@ -75,4 +75,36 @@ public interface EngineFactory {
     default boolean recoverMissingLocalStore(IndexShard indexShard, Store store) throws IOException {
         return false;
     }
+
+    /**
+     * Whether this engine already provides its own durable, remote copy of every segment it
+     * writes, independent of core's own remote-store upload path ({@code
+     * RemoteStoreRefreshListener}, engaged whenever {@code index.remote_store.enabled} is {@code
+     * true}). Default {@code false} (current behavior unchanged for every existing {@link
+     * EngineFactory}): core has no reason to believe anything but its own remote-store upload path
+     * is keeping this shard's segments durable remotely, so that path stays wired in exactly as it
+     * always has.
+     *
+     * <p>An {@link EngineFactory} that overrides this to return {@code true} is asserting that it
+     * has <em>already</em> made every segment durable somewhere remote by some mechanism of its
+     * own (e.g. publishing an object-store manifest referencing this shard's own segment files
+     * directly, rather than delegating to core's remote-store directory/upload machinery) --
+     * wiring core's remote-store upload path in on top of that would not be a correctness problem
+     * (nothing about search or recovery depends on it), but would be pure wasted upload bandwidth
+     * and remote storage cost for bytes nothing ever reads back through that path. This method
+     * exists so such an {@link EngineFactory} can opt the shard out of that wasted work explicitly,
+     * rather than silently accepting it as an unavoidable cost of using {@code
+     * index.remote_store.enabled} for an unrelated reason (e.g. {@code
+     * index.number_of_search_replicas}'s own prerequisite chain, which requires {@code
+     * remote_store.enabled} regardless of whether anything durability-relevant should use it).
+     *
+     * <p>This is a durability claim, not merely a performance hint -- returning {@code true} when
+     * segments are not, in fact, durably reachable by some other means is a correctness regression
+     * for anything that assumes {@code index.remote_store.enabled: true} implies core's own
+     * remote-store durability guarantee, e.g. a future recovery path that trusts the remote-store
+     * directory without checking whether anything was ever actually uploaded to it.
+     */
+    default boolean ownsRemoteSegmentDurability() {
+        return false;
+    }
 }

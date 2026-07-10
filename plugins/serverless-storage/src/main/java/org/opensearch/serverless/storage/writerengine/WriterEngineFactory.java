@@ -234,4 +234,20 @@ public final class WriterEngineFactory implements EngineFactory {
         store.associateIndexWithNewTranslog(translogUUID);
         return true;
     }
+
+    /**
+     * {@code true}: {@link ObjectStoreWriterEngine} publishes every commit as an object-store
+     * manifest (rfc-serverless-opensearch.md &sect;8) referencing this shard's own segment files
+     * directly -- that manifest publication already <em>is</em> this shard's durable remote copy,
+     * so core's separate {@code RemoteStoreRefreshListener} upload path (engaged whenever {@code
+     * index.remote_store.enabled: true}, which this plugin's own reader-shard support requires
+     * regardless, per rfc-serverless-opensearch.md &sect;18 risk #10) would otherwise upload the
+     * same segment bytes a second time into a remote-store repository nothing in this plugin's own
+     * reader/GC/retention paths ever reads back from -- confirmed wasted work, not a hypothesis, by
+     * {@code ServerlessStorageSearchOnlyReplicaIT}.
+     */
+    @Override
+    public boolean ownsRemoteSegmentDurability() {
+        return true;
+    }
 }
