@@ -152,6 +152,18 @@ public class DeprecationRestHandlerTests extends OpenSearchTestCase {
         assertFalse(new DeprecationRestHandler(handler, deprecationMessage, deprecationLogger).supportsContentStream());
     }
 
+    public void testServerlessScopeDelegatesToWrappedHandler() {
+        // A real bug this test guards against regressing: without an explicit override,
+        // DeprecationRestHandler would silently inherit RestHandler's default UNAVAILABLE instead
+        // of the wrapped handler's own declaration, making every deprecated-but-still-available
+        // handler unreachable once serverless-mode enforcement is enabled.
+        when(handler.serverlessScope()).thenReturn(RestHandler.ServerlessScope.AVAILABLE);
+        assertEquals(
+            RestHandler.ServerlessScope.AVAILABLE,
+            new DeprecationRestHandler(handler, deprecationMessage, deprecationLogger).serverlessScope()
+        );
+    }
+
     /**
      * {@code ASCIIHeaderGenerator} only uses characters expected to be valid in headers (simplified US-ASCII).
      */

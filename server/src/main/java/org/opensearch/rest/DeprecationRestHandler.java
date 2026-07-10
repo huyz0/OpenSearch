@@ -83,6 +83,20 @@ public class DeprecationRestHandler implements RestHandler {
     }
 
     /**
+     * Delegates to the wrapped {@code handler}'s own declaration -- a real bug this override
+     * fixes, not a defensive addition: without it, every deprecated-but-still-available handler
+     * registered via {@code RestController#registerAsDeprecatedHandler} would silently inherit
+     * {@link RestHandler}'s default {@link ServerlessScope#UNAVAILABLE} regardless of what the
+     * wrapped handler actually declares, making it unreachable the moment serverless-mode
+     * enforcement is enabled -- deprecation and serverless-mode availability are independent axes,
+     * and this class's whole purpose is to be a transparent proxy for everything except logging.
+     */
+    @Override
+    public ServerlessScope serverlessScope() {
+        return handler.serverlessScope();
+    }
+
+    /**
      * This does a very basic pass at validating that a header's value contains only expected characters according to RFC-5987, and those
      * that it references.
      * <p>

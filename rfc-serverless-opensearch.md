@@ -1568,7 +1568,23 @@ RFC claims them deliberately rather than leaving them implicit:
    setting at all, not a deliberate policy choice (a static, cosmetic browser asset is not part of
    the API surface &sect;11 means to gate). Fixed by giving that internal registration an explicit
    `AVAILABLE` override, covered by a new `testFaviconStaysAvailableUnderServerlessMode` case.
-7. ✅ Node WAL service registration point: no core change needed here either -- confirmed
+
+   **A second, considerably more consequential sweep found the same bug's real shape**: `RestHandler`
+   gaining a new default method meant every existing *composing* `RestHandler` implementation --
+   not just the favicon's one-off lambda -- needed checking for whether it actually delegates the
+   new method or silently falls back to the interface default. `RestHandler.Wrapper` already did
+   (added alongside `serverlessScope()` itself, see this list's own earlier entry). `DeprecationRestHandler`
+   -- the real, widely-used proxy `RestController#registerAsDeprecatedHandler` wraps *any* handler
+   in across dozens of registered routes throughout this codebase -- did not: it overrides
+   `handleRequest` and `supportsContentStream` only. Without a fix, every deprecated-but-still-
+   available handler anywhere in the codebase would have silently become unreachable the moment
+   serverless-mode enforcement was enabled, regardless of what the wrapped handler itself declares
+   -- deprecation and serverless-mode availability are meant to be independent axes, and this
+   class's entire purpose is to be a transparent proxy for everything except logging. Fixed with an
+   explicit delegating override, covered by a new `testServerlessScopeDelegatesToWrappedHandler`
+   case in `DeprecationRestHandlerTests` (the existing mock-based suite this test slots directly
+   into). A full sweep of this repository for other `RestHandler`-composing classes (`grep`-based,
+   not just these two) found no other case.
    `createComponents` is exactly the right lifecycle point, already in production use.
    `ServerlessStoragePlugin#createComponents` builds one `WalChunkService` per node incarnation
    (stored in the `sharedWalChunkService` field) and every writer shard's `EngineFactory` receives
