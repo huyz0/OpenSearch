@@ -1585,6 +1585,18 @@ RFC claims them deliberately rather than leaving them implicit:
    case in `DeprecationRestHandlerTests` (the existing mock-based suite this test slots directly
    into). A full sweep of this repository for other `RestHandler`-composing classes (`grep`-based,
    not just these two) found no other case.
+
+   **Operational caveat worth stating plainly, not just implying**: zero core (`server`,
+   `modules/*`) `RestHandler`s have been annotated `AVAILABLE` yet -- only this plugin's own 9.
+   Turning on `rest.serverless_mode.enabled` on a real cluster today would refuse essentially every
+   built-in API (`_search`, `_cluster/health`, everything) alongside the genuinely-unwanted ones
+   §11 was written to gate, since an unannotated handler is indistinguishable from a deliberately-
+   `UNAVAILABLE` one. That is the intended, by-design behavior of "new APIs must opt in
+   consciously" -- but annotating the actual set of core APIs a serverless deployment needs
+   (search, index, bulk, cluster health, ...) is real, separate, follow-on work this pass
+   deliberately did not attempt, and the setting should not be flipped in any real deployment until
+   that annotation sweep happens.
+7. ✅ Node WAL service registration point: no core change needed here either -- confirmed
    `createComponents` is exactly the right lifecycle point, already in production use.
    `ServerlessStoragePlugin#createComponents` builds one `WalChunkService` per node incarnation
    (stored in the `sharedWalChunkService` field) and every writer shard's `EngineFactory` receives
