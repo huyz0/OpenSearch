@@ -1454,6 +1454,14 @@ RFC claims them deliberately rather than leaving them implicit:
 6. REST handler capability annotation (§11).
 7. Node WAL service registration point (a `Plugin`-provided node-level component — likely
    already expressible via `createComponents`; verify lifecycle ordering vs `IndicesService`).
+8. ✅ Remote-store-upload opt-out: `EngineFactory#ownsRemoteSegmentDurability()`, a default-`false`
+   method landed on this branch (`server/src/main/java/org/opensearch/index/engine/EngineFactory.java`)
+   letting an `EngineFactory` declare it already keeps every segment durably reachable remotely by
+   its own mechanism, checked as one more condition guarding `RemoteStoreRefreshListener`'s
+   registration in `IndexShard#createEngineConfig`. See §18 risk #10 for the concrete waste this
+   closes (confirmed via `IndicesStatsResponse` upload-byte counts, not inferred) and why a broader
+   heuristic (e.g. inferring "owns durability" from a non-default `index.store.type`) wouldn't have
+   worked here.
 
 **Plugin/module code (the bulk):** writer/reader engines, bundle+manifest format, WAL service
 (with per-record envelope encryption, §12), compaction service (§7.4), block cache unification,
