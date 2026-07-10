@@ -9,6 +9,7 @@
 package org.opensearch.serverless.storage.writerengine.action;
 
 import org.opensearch.rest.BaseRestHandler;
+import org.opensearch.rest.RestHandler.ServerlessScope;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.rest.action.RestToXContentListener;
 import org.opensearch.transport.client.node.NodeClient;
@@ -46,6 +47,18 @@ public class RestShardIdleTimeAction extends BaseRestHandler {
     }
 
     /** The single route this handler serves. */
+    /**
+     * Every action this plugin exposes is meaningful only when serverless storage is opted into
+     * for the target index, so every one of its REST handlers declares itself available under
+     * serverless mode (rfc-serverless-opensearch.md &sect;11) -- unlike, say, {@code _forcemerge}
+     * or shard-store APIs, nothing here assumes local-disk shard state that disaggregated storage
+     * invalidates.
+     */
+    @Override
+    public ServerlessScope serverlessScope() {
+        return ServerlessScope.AVAILABLE;
+    }
+
     @Override
     public List<Route> routes() {
         return singletonList(new Route(GET, "/_plugins/_serverless/storage/{index_uuid}/{shard_id}/_idle_time"));

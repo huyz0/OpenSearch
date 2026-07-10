@@ -132,6 +132,42 @@ public interface RestHandler {
         return false;
     }
 
+    /**
+     * Declares this handler's availability on a node running in serverless mode
+     * (rfc-serverless-opensearch.md &sect;11) -- disaggregated storage makes several existing APIs
+     * meaningless or dangerous (shard-store APIs report on local disk state that may not exist;
+     * {@code _forcemerge} semantics change entirely under a compaction service; snapshot/restore is
+     * partially redundant with a manifest-native format), so serverless mode needs a way to gate
+     * REST surface per handler rather than all-or-nothing.
+     *
+     * <p>Defaults to {@link ServerlessScope#UNAVAILABLE} deliberately: new APIs must opt in
+     * consciously to running under serverless mode rather than being silently exposed by omission.
+     * This default has <b>no behavioral effect today</b> -- nothing in {@link RestController} reads
+     * this method yet, since enforcement needs a node-level "is this node in serverless mode" flag
+     * that does not yet exist as a wired setting. Declaring the annotation now, ahead of that
+     * enforcement, lets handlers (this core module's own and every plugin's) start recording their
+     * intended availability incrementally rather than needing one atomic cross-cutting change once
+     * enforcement lands.
+     */
+    default ServerlessScope serverlessScope() {
+        return ServerlessScope.UNAVAILABLE;
+    }
+
+    /**
+     * The three availability levels a {@link RestHandler} can declare via {@link #serverlessScope()}.
+     *
+     * @opensearch.api
+     */
+    @PublicApi(since = "3.0.0")
+    enum ServerlessScope {
+        /** Available to ordinary callers on a node running in serverless mode. */
+        AVAILABLE,
+        /** Available only to internal/system callers on a node running in serverless mode, never external clients. */
+        INTERNAL_ONLY,
+        /** Not available at all on a node running in serverless mode -- the default for any unannotated handler. */
+        UNAVAILABLE
+    }
+
     static RestHandler wrapper(RestHandler delegate) {
         return new Wrapper(delegate);
     }
@@ -201,6 +237,11 @@ public interface RestHandler {
         @Override
         public boolean supportsStreaming() {
             return delegate.supportsStreaming();
+        }
+
+        @Override
+        public ServerlessScope serverlessScope() {
+            return delegate.serverlessScope();
         }
     }
 

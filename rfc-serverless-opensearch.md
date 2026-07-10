@@ -1523,7 +1523,27 @@ RFC claims them deliberately rather than leaving them implicit:
    `ReplicationTracker`-related failures anywhere in the run.
 5. Generalized checkpoint/notification publisher (widen segment-replication checkpoint
    publishing to carry opaque payloads).
-6. REST handler capability annotation (§11).
+6. ⚠️ REST handler capability annotation (§11) -- **the annotation itself now exists; enforcement
+   does not yet.** `RestHandler#serverlessScope()` (`server/src/main/java/org/opensearch/rest/RestHandler.java`),
+   a default method returning a new `RestHandler.ServerlessScope` enum (`AVAILABLE`/`INTERNAL_ONLY`/
+   `UNAVAILABLE`), defaults to `UNAVAILABLE` -- matching §11's own "unannotated handlers default to
+   unavailable" design exactly, so new handlers must opt in consciously once enforcement lands.
+   `RestHandler.Wrapper` delegates it like every other method on that class, so a wrapped handler
+   (deprecation wrapper, etc.) doesn't silently fall back to the default and misreport its
+   delegate's real availability. Every one of this plugin's own 9 REST handlers now overrides it to
+   `AVAILABLE` -- verified by a new plugin test (`testEveryRestHandlerDeclaresItselfAvailableUnderServerlessMode`)
+   that iterates `getRestHandlers()` and fails if any handler reports anything else, catching the
+   exact mistake of adding a tenth handler without the override. **Deliberately not wired into
+   `RestController` yet**: enforcement needs a node-level "is this node in serverless mode" flag
+   that doesn't exist as a wired setting today, and threading `Settings` through `RestController`'s
+   construction (today's constructor takes none) to add that flag is real, separate, cross-cutting
+   surgery on a class core code depends on -- landing the annotation now lets every handler (this
+   plugin's and, eventually, core's own) record its intended availability incrementally rather than
+   needing one atomic change spanning every REST handler in the codebase once enforcement is built,
+   the same incremental-seam-before-consumer shape §15 item 8's `ownsRemoteSegmentDurability()`
+   already used. `server`'s own `RestHandlerTests` (new) covers the default and the `Wrapper`
+   delegation directly; `server:missingJavadoc`/`forbiddenApisMain` and this plugin's full `check`
+   both pass unchanged.
 7. ✅ Node WAL service registration point: no core change needed here either -- confirmed
    `createComponents` is exactly the right lifecycle point, already in production use.
    `ServerlessStoragePlugin#createComponents` builds one `WalChunkService` per node incarnation

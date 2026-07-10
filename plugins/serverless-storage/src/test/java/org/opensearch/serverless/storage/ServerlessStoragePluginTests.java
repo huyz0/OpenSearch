@@ -424,4 +424,21 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
         );
         assertTrue("expected at least one action to sanity-check this comparison itself", actionCount > 0);
     }
+
+    public void testEveryRestHandlerDeclaresItselfAvailableUnderServerlessMode() {
+        // RestHandler#serverlessScope() (rfc-serverless-opensearch.md &sect;11) defaults to
+        // UNAVAILABLE precisely so new handlers must opt in consciously -- every handler this
+        // plugin exposes is itself part of the serverless storage feature, so an unannotated (or
+        // wrongly-UNAVAILABLE) one here would be silently unreachable the moment serverless-mode
+        // enforcement is wired into RestController, exactly the kind of easy-to-miss omission this
+        // annotation exists to catch before that enforcement lands.
+        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin();
+        for (org.opensearch.rest.RestHandler handler : plugin.getRestHandlers(null, null, null, null, null, null, null)) {
+            assertEquals(
+                handler.getClass().getSimpleName() + " must declare itself AVAILABLE under serverless mode",
+                org.opensearch.rest.RestHandler.ServerlessScope.AVAILABLE,
+                handler.serverlessScope()
+            );
+        }
+    }
 }
