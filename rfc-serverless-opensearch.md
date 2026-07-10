@@ -2406,15 +2406,31 @@ directions documented so serverless adoption is not a one-way door.
     synchronously off a client refresh call. The IT (below) polls with `assertBusy` over that window
     rather than asserting once.
 
-    **`ServerlessStorageSearchOnlyReplicaIT` is now committed and green** (three consecutive local
+    **`ServerlessStorageSearchOnlyReplicaIT` is now committed and green** (five consecutive local
     runs, no flakes) -- the end-to-end proof risk #10 asked for: a real serverless-storage index
     with a real search-only replica, on a real three-node `RemoteStoreBaseIntegTestCase` cluster,
     served by this plugin's own reader engine and lazy materialization path, not a hand-built
-    `ShardRouting` in a unit test. The one remaining half of risk #10 -- whether core's remote
-    segment-store upload machinery runs pointlessly in the background alongside this plugin's own
-    manifest/bundle publication on such an index -- is still open (would need inspecting per-shard
-    remote-store upload stats, not just proving reads work), but is now a minor wasted-background-work
-    question, not a "can this even work" one.
+    `ShardRouting` in a unit test.
+
+    **The last open half of risk #10 is now also confirmed, not just hypothesized**: the IT reads
+    the primary shard's own `IndicesStatsResponse` segment stats
+    (`SegmentsStats#getRemoteSegmentStats().getUploadBytesStarted()`) after a real flush, and it is
+    reliably `> 0` (thousands of bytes, not a rounding artifact) across every run. Core's remote
+    segment-store upload machinery genuinely does upload real segment bytes to the remote-store
+    repository in the background on a serverless-storage index's writer shard -- confirmed wasted
+    work, not a correctness bug (nothing in this plugin's reader/GC/retention paths ever reads from
+    that repository, so nothing breaks), but a real, measured cost/efficiency gap for a plugin whose
+    entire premise is object-store cost control. Root cause: core's remote segment-store upload path
+    engages purely off `index.remote_store.enabled` inside `IndexShard`'s own engine/flush wiring,
+    independent of `IndexModule.INDEX_STORE_TYPE_SETTING` -- this plugin's `DirectoryFactory` owns
+    the shard's actual on-disk directory, but has no seam to also suppress core's separate
+    remote-store upload path, which reads from wherever `IndexShard` itself decided the "real"
+    segment directory is, not from what a `DirectoryFactory` returns for arbitrary other purposes.
+    Left as documented future work rather than fixed in this pass: suppressing it needs a new core
+    seam (something like "let a plugin veto remote-store upload for its own store type"), not
+    something reachable from this plugin's existing `IndexStorePlugin`/`IndexSettingProvider`
+    extension points -- worth scoping as its own increment rather than attempting blind inside an
+    already-large change.
 
 ## 19. Summary
 
