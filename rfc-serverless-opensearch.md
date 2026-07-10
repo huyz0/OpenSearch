@@ -2346,11 +2346,26 @@ directions documented so serverless adoption is not a one-way door.
     `ServerlessStorageIndexSettingProvider` need to reject `remote_store.enabled` too, and if so,
     how does this plugin ever create a reader shard at all, since `index.number_of_search_replicas`
     currently requires it" -- a genuine unresolved tension between §18 risk #7's own reasoning and
-    the reader-shard story, not just an unverified compatibility question. Needs a real experiment
-    (a serverless-storage index with `index.remote_store.enabled: true` and
-    `index.number_of_search_replicas: 1`, observing what engine and directory the resulting
-    search-only shard copy actually receives, and whether remote segment uploads actually fire) to
-    move from code-reading inference to a verified answer.
+    the reader-shard story, not just an unverified compatibility question.
+
+    **This tension is now resolved in the negative, without writing the rejection**: confirmed by
+    reading `MetadataCreateIndexService#validateSearchOnlyReplicasSettings` that core hard-requires
+    `index.remote_store.enabled: true` whenever `index.number_of_search_replicas > 0` --
+    unconditionally, with no serverless-storage-aware carve-out available anywhere in that check.
+    A rejection symmetric with risk #7's `SEGMENT`-replication check (tried and reverted during
+    this pass, confirmed via a full `ServerlessStorageIndexSettingProviderTests` run) would not
+    merely be defensive-but-unnecessary here: it would make it *impossible* to ever create a
+    reader shard through `index.number_of_search_replicas` on a serverless-storage index at all,
+    which is this plugin's only entry point into that path today. So unlike explicit `SEGMENT`
+    replication (risk #7, a real conflicting mechanism with no legitimate use this plugin needs)
+    and unlike a hypothetical unconditional `remote_store.enabled` rejection, `remote_store.enabled`
+    must stay accepted -- the "two competing durability mechanisms" concern is real (core's remote
+    segment-store upload machinery would likely still run pointlessly in the background per the
+    `IndexService#createShard` tracing above) but is the lesser cost against a plugin that cannot
+    create reader shards at all. Still needs the real experiment described below to confirm the
+    background-upload-is-merely-wasteful hypothesis and to observe what engine/directory the
+    resulting search-only shard copy actually receives -- but the "should this plugin add a
+    rejection" question itself is closed: it must not.
 
 ## 19. Summary
 
