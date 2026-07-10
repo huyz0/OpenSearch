@@ -2383,28 +2383,38 @@ directions documented so serverless adoption is not a one-way door.
     mechanism to reject. Covered by a new unit test
     (`testAllowsExplicitSegmentReplicationWithZeroWriterReplicas`).
 
-    With that fixed, index creation succeeded, but the search-only shard copy itself then never
-    left `UNASSIGNED` -- `ensureGreen` timed out with `allocation_status[no_attempt]`, meaning
-    `ServerlessStorageExistingShardsAllocator#allocateUnassigned` was never even invoked for this
-    shard copy (not a decider rejecting it -- a rejection would show `deciders_no`, not
-    `no_attempt`). The primary shard on the writer node allocated and started normally in the same
-    run, so this is specific to the search-only copy, not a general breakage of this plugin's
-    allocator. Root cause not yet isolated: `AllocationService#getAllocatorForShard` resolves the
-    allocator purely from `EXISTING_SHARDS_ALLOCATOR_SETTING`, with no primary/replica/search-only
-    branching visible in that path, so why the search-only copy's unassigned-shard loop never
-    reaches `allocateUnassigned` at all is still an open question -- something upstream of that
-    call (batch-mode shard grouping, `afterPrimariesBeforeReplicas` ordering, or a search-only-only
-    branch elsewhere in `AllocationService`/`ShardsBatchGatewayAllocator` not yet located) is the
-    likely suspect. **This is now the operationally load-bearing blocker for risk #10, not the
-    `remote_store.enabled` setting question above** -- a serverless-storage index literally cannot
-    get a working search-only replica today, independent of what settings are or aren't rejected.
-    The exploratory IT that found this (`ServerlessStorageSearchOnlyReplicaIT`) was not committed --
-    it fails on this unresolved allocation gap, and a known-red IT has no place in the tree -- but
-    its recipe (three-node `RemoteStoreBaseIntegTestCase` cluster, `randomRepoPath()` for this
-    plugin's own `serverless_storage.base_path` so it lands under the cluster's already-configured
-    `path.repo`, `super.nodePlugins()` composed with `ServerlessStoragePlugin` so the mock
-    repository plugins `RemoteStoreBaseIntegTestCase` depends on stay registered) is preserved here
-    for whoever picks this back up.
+    With that fixed, index creation succeeded, but the search-only shard copy itself then sat
+    `UNASSIGNED` against a plain `startSearchOnlyNode()` node. Instrumented
+    `ServerlessStorageExistingShardsAllocator#allocateUnassigned` with temporary debug logging
+    (removed before landing) to check whether it was even being invoked -- it was, on every reroute,
+    but `firstDeciderApprovedNode` returned `null` every time (cluster health's own
+    `allocation_status[no_attempt]` field turned out to be a stale/unchanged display value, not a
+    reliable signal that the allocator was never called). Root cause: `startSearchOnlyNode()` gives
+    a node the `search` role but not `node.attr.serverless_storage_reader: "true"`, and
+    `ReaderShardPlacementAllocationDecider` was doing exactly what &sect;10 designed it to do --
+    refusing to place a reader shard copy on any node lacking that explicit attribute, decider
+    rejections included. **Not a bug** -- an easy-to-miss operational prerequisite (a reader node
+    needs both the `search` role *and* the attribute) that had never been exercised end-to-end
+    before this experiment. Setting the attribute on the search-only node during startup made the
+    shard allocate and start immediately.
+
+    One more real finding once the shard was placed: `client().admin().indices().prepareRefresh()`
+    right after a writer-side flush was not enough to make the just-published manifest visible on
+    the reader -- `ObjectStoreReaderEngine#refresh` only reopens against whatever this engine has
+    already materialized locally; picking up a *newer* manifest is `pollForNewerManifest`'s job,
+    which only runs on its own background schedule (`DIRECTORY_ENTRY_TTL_MILLIS / 3` = 20s), not
+    synchronously off a client refresh call. The IT (below) polls with `assertBusy` over that window
+    rather than asserting once.
+
+    **`ServerlessStorageSearchOnlyReplicaIT` is now committed and green** (three consecutive local
+    runs, no flakes) -- the end-to-end proof risk #10 asked for: a real serverless-storage index
+    with a real search-only replica, on a real three-node `RemoteStoreBaseIntegTestCase` cluster,
+    served by this plugin's own reader engine and lazy materialization path, not a hand-built
+    `ShardRouting` in a unit test. The one remaining half of risk #10 -- whether core's remote
+    segment-store upload machinery runs pointlessly in the background alongside this plugin's own
+    manifest/bundle publication on such an index -- is still open (would need inspecting per-shard
+    remote-store upload stats, not just proving reads work), but is now a minor wasted-background-work
+    question, not a "can this even work" one.
 
 ## 19. Summary
 
