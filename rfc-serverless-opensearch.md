@@ -2524,11 +2524,56 @@ internals themselves -- real background ticks, real pin add/remove, cancellation
 exhaustively covered directly in `PitrRetentionSchedulerTaskTests` against a short, configurable
 interval, since the engine's real 5-minute interval is far too long to observe in a test).
 
-**Phase 5 — Hardening (ongoing).** Chaos suite (§17) including full object-store outage modes
-(§13), performance tuning of bundle/WAL batch parameters, API gating audit, autoscaling signal
-calibration, resharding-by-copy (split/shrink via manifest rewrite + bundle copy — no reindex;
-note: until bundles are physically rewritten, readers of a split target apply a doc-routing
-partition filter, so the transition is logical-first, physical-later).
+**Phase 5 — Hardening (ongoing). Resharding-by-copy: split, done; shrink and physical
+bundle rewrite, not started.** The split half of "split/shrink via manifest rewrite + bundle copy —
+no reindex" is implemented: `ShardSplitter.split` (`resharding` package) creates one target shard
+as one of `numPartitions` logical partitions of a source shard's current published manifest, and is
+deliberately not a new mechanism at all -- it's `ShardCloner.clone` (§14, already formally verified
+pin-ordering-safe against `GcSchedulerTask`, `formal/CloneGc.tla`) plus one extra durable write, a
+`ShardPartitionDescriptor` recording which partition the target serves. A split target is therefore
+exactly as GC-safe as a plain clone, for free. New `ShardSplitAction`/`ShardSplitRequest`/
+`ShardSplitResponse`/`TransportShardSplitAction`/`RestShardSplitAction` (`resharding/action`
+package, REST at `POST /_plugins/_serverless/storage/_split`) expose it -- one call per target,
+same "one call per target" shape `ShardCloneAction` already has.
+
+"Logical-first, physical-later" is now real, not just a plan: until a split target's bundles are
+physically rewritten (still not attempted -- see below), every target's directory holds the
+pre-split shard's *entire* document set, so each target must filter its own reads down to just its
+assigned partition or every target would return every document. New `PartitionFilteringDirectoryReader`
+(a `FilterDirectoryReader`, following the exact shape Lucene's own `SoftDeletesDirectoryReaderWrapper`
+uses to overlay soft-delete visibility onto live docs) computes each leaf's partition-membership
+`Bits` once per reader open, reading every live document's stored `_id` field and hashing it via
+`Murmur3HashFunction` (OpenSearch's own default routing hash, reused purely for its
+already-well-tested distribution -- deliberately *not* an attempt to bit-match core's real
+shard-count consistent-hashing scheme, since a split target here is a plugin-level shard identity,
+not one derived from `index.number_of_shards`/`index.number_of_routing_shards` math; what matters
+is only that the partitioning is deterministic and disjoint-and-complete for a fixed
+`numPartitions`, which it is). Wired into `ObjectStoreReaderEngine` via `ReadOnlyEngine`'s own
+existing `readerWrapperFunction` constructor parameter -- an already-provided core seam needing zero
+core changes -- so `DirectoryReader#openIfChanged` on an already-wrapped reader automatically
+re-wraps the new generation with the same filter on every later refresh, with no further change to
+`ObjectStoreReaderEngine`'s own refresh logic. `ReaderEngineFactory` and `ServerlessStoragePlugin#getEngineFactory`'s
+reader branch both thread the descriptor through (read once via `BlobContainerShardPartitionStore`
+at engine-construction time; `null` for every non-split shard, which is the overwhelming majority
+and pays zero cost). Verified with a real Lucene-level test proving every document across all
+partitions combined exactly reconstructs the original document set with zero overlap, and that the
+filter survives a real `DirectoryReader#openIfChanged` reopen after a new document is added -- not
+just that the wrapping code compiles -- plus a real three-way split over the transport layer in a
+running cluster (`ServerlessStorageShardSplitActionIT`), confirming a single source split more than
+once carries one independent pin per target rather than one clobbering another's.
+
+**Accepted cost, deliberately not optimized away this increment**: computing a leaf's
+partition-membership bitset means reading every live document's stored `_id` once per reader open --
+real I/O the un-split read path never pays. This is the explicit price of staying logical-first
+rather than physically rewriting bundles at split time.
+
+**Explicitly out of scope for this increment, real follow-up work**: physically rewriting a split
+target's bundles down to just its own partition (which would let the doc-routing filter be dropped
+once done, closing the accepted-cost gap above), and shrink (the inverse operation, merging several
+shards' document spaces back into one shard) -- both real, sizeable increments on top of the split
+primitive now implemented, not attempted here. Chaos suite (§17) including full object-store
+outage modes (§13), performance tuning of bundle/WAL batch parameters, API gating audit, and
+autoscaling signal calibration remain separately ongoing Phase 5 work.
 
 **Phase 6 — Migration tooling.** Conversion of existing remote-store indices to the bundle
 format (their segments already sit in the object store — conversion is manifest synthesis plus

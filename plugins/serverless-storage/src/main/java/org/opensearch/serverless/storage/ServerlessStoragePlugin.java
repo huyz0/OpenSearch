@@ -742,6 +742,14 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                         bundleStore,
                         pinRegistry
                     );
+                org.opensearch.serverless.storage.resharding.ShardPartitionDescriptor partitionDescriptor;
+                try {
+                    partitionDescriptor = new org.opensearch.serverless.storage.resharding.BlobContainerShardPartitionStore(blobContainer)
+                        .readDescriptor()
+                        .orElse(null);
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
                 return Optional.of(
                     new ReaderEngineFactory(
                         shardStateStore,
@@ -752,7 +760,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                         readerShardAdmissionController,
                         compactionConfig,
                         gcConfig,
-                        readerShardActivityRegistry
+                        readerShardActivityRegistry,
+                        partitionDescriptor
                     )
                 );
             }
@@ -1123,6 +1132,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new ActionHandler<>(
                 org.opensearch.serverless.storage.retention.action.ShardRetentionStatsAction.INSTANCE,
                 org.opensearch.serverless.storage.retention.action.TransportShardRetentionStatsAction.class
+            ),
+            new ActionHandler<>(
+                org.opensearch.serverless.storage.resharding.action.ShardSplitAction.INSTANCE,
+                org.opensearch.serverless.storage.resharding.action.TransportShardSplitAction.class
             )
         );
     }
@@ -1145,6 +1158,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new org.opensearch.serverless.storage.readerengine.action.RestNodeManifestLagAction(),
             new org.opensearch.serverless.storage.scaletozero.action.RestScaleToZeroCandidatesAction(),
             new org.opensearch.serverless.storage.retention.action.RestShardRetentionStatsAction(),
+            new org.opensearch.serverless.storage.resharding.action.RestShardSplitAction(),
             new org.opensearch.serverless.storage.retention.action.RestSnapshotPinAction(),
             new org.opensearch.serverless.storage.retention.action.RestSnapshotReleaseAction(),
             new org.opensearch.serverless.storage.retention.action.RestSnapshotRestoreAction(),

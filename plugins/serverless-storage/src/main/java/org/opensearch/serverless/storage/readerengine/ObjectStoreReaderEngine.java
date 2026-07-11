@@ -8,6 +8,7 @@
 
 package org.opensearch.serverless.storage.readerengine;
 
+import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.search.ReferenceManager;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.index.engine.EngineConfig;
@@ -24,6 +25,8 @@ import org.opensearch.serverless.storage.gc.GcSchedulerConfig;
 import org.opensearch.serverless.storage.gc.GcSchedulerTask;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.manifest.CommitManifest;
+import org.opensearch.serverless.storage.resharding.PartitionFilteringDirectoryReader;
+import org.opensearch.serverless.storage.resharding.ShardPartitionDescriptor;
 import org.opensearch.serverless.storage.shardstate.ShardHead;
 import org.opensearch.serverless.storage.shardstate.ShardStateStore;
 import org.opensearch.serverless.storage.shardstate.VersionedShardHead;
@@ -31,6 +34,7 @@ import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
@@ -128,9 +132,10 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
         String localNodeId,
         ReaderShardAdmissionController admissionController,
         CompactionSchedulerConfig compactionConfig,
-        GcSchedulerConfig gcConfig
+        GcSchedulerConfig gcConfig,
+        ShardPartitionDescriptor partitionDescriptor
     ) {
-        super(config, seqNoStats, new TranslogStats(), true, Function.identity(), false);
+        super(config, seqNoStats, new TranslogStats(), true, readerWrapperFunction(partitionDescriptor), false);
         this.indexUuid = config.getShardId().getIndex().getUUID();
         this.shardId = config.getShardId().getId();
         this.currentPrimaryTerm = new AtomicLong(primaryTerm);
@@ -176,6 +181,26 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
         this.gcSchedulerTask = gcConfig == null
             ? null
             : new GcSchedulerTask(config.getThreadPool(), gcConfig.interval(), indexUuid, shardId, gcConfig);
+    }
+
+    /**
+     * {@code null} (the common case -- every non-split shard has no partition descriptor) yields
+     * {@link Function#identity()}, exactly as before this parameter existed. Otherwise wraps with
+     * {@link PartitionFilteringDirectoryReader} -- see that class's own javadoc for why this single
+     * seam is all a reader engine needs to change to support &sect;16 Phase 5's doc-routing
+     * partition filter, and why it survives every later refresh with no further change here.
+     */
+    private static Function<DirectoryReader, DirectoryReader> readerWrapperFunction(ShardPartitionDescriptor partitionDescriptor) {
+        if (partitionDescriptor == null) {
+            return Function.identity();
+        }
+        return reader -> {
+            try {
+                return new PartitionFilteringDirectoryReader(reader, partitionDescriptor);
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        };
     }
 
     /**
@@ -399,14 +424,16 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
             localNodeId,
             null,
             null,
+            null,
             null
         );
     }
 
     /**
      * Same as {@link #open(EngineConfig, CommitManifest, ObjectStoreCommitMaterializer, long,
-     * ShardStateStore, BlobContainerManifestStore, ShardDirectory, String)}, with optional
-     * admission control and background schedulers.
+     * ShardStateStore, BlobContainerManifestStore, ShardDirectory, String, ReaderShardAdmissionController,
+     * CompactionSchedulerConfig, GcSchedulerConfig, ShardPartitionDescriptor)}, with no partition descriptor
+     * (i.e. this shard is not a &sect;16 Phase 5 split target -- the common case).
      *
      * @param config the engine configuration, whose {@link EngineConfig#getStore()} directory is materialized into
      * @param manifest the commit manifest to open the engine against
@@ -437,6 +464,60 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
         CompactionSchedulerConfig compactionConfig,
         GcSchedulerConfig gcConfig
     ) throws IOException {
+        return open(
+            config,
+            manifest,
+            materializer,
+            primaryTerm,
+            shardStateStore,
+            manifestStore,
+            shardDirectory,
+            localNodeId,
+            admissionController,
+            compactionConfig,
+            gcConfig,
+            null
+        );
+    }
+
+    /**
+     * Same as {@link #open(EngineConfig, CommitManifest, ObjectStoreCommitMaterializer, long,
+     * ShardStateStore, BlobContainerManifestStore, ShardDirectory, String)}, with optional
+     * admission control, background schedulers, and this shard's own &sect;16 Phase 5 partition descriptor.
+     *
+     * @param config the engine configuration, whose {@link EngineConfig#getStore()} directory is materialized into
+     * @param manifest the commit manifest to open the engine against
+     * @param materializer applies the manifest's files to the engine's store directory
+     * @param primaryTerm the primary term the manifest was published under
+     * @param shardStateStore used to poll for a newer published head
+     * @param manifestStore used to read newer manifest generations found via polling
+     * @param shardDirectory the shard-directory-tier client this engine reports its entry to
+     * @param localNodeId this node's id, reported as part of the shard directory entry
+     * @param admissionController {@code null} to disable the admission cap entirely -- see its own javadoc.
+     * @param compactionConfig {@code null} to disable this reader's own background compaction
+     *        scheduler entirely -- see {@link CompactionSchedulerConfig}'s own javadoc.
+     * @param gcConfig {@code null} to disable this reader's own background GC sweep entirely --
+     *        see {@link GcSchedulerConfig}'s own javadoc.
+     * @param partitionDescriptor {@code null} unless this shard is a &sect;16 Phase 5 split
+     *        target -- see {@link PartitionFilteringDirectoryReader}'s own javadoc for what
+     *        supplying one does.
+     * @return an open reader engine, with directory-tier reporting and manifest polling running
+     * @throws IOException if materializing the manifest into the store directory fails
+     */
+    public static ObjectStoreReaderEngine open(
+        EngineConfig config,
+        CommitManifest manifest,
+        ObjectStoreCommitMaterializer materializer,
+        long primaryTerm,
+        ShardStateStore shardStateStore,
+        BlobContainerManifestStore manifestStore,
+        ShardDirectory shardDirectory,
+        String localNodeId,
+        ReaderShardAdmissionController admissionController,
+        CompactionSchedulerConfig compactionConfig,
+        GcSchedulerConfig gcConfig,
+        ShardPartitionDescriptor partitionDescriptor
+    ) throws IOException {
         if (admissionController != null) {
             // Acquire before any I/O: rejecting an over-capacity open should never pay for a
             // materialization that's just going to be thrown away.
@@ -461,7 +542,8 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
                 localNodeId,
                 admissionController,
                 compactionConfig,
-                gcConfig
+                gcConfig,
+                partitionDescriptor
             );
         } catch (Exception e) {
             // The engine that would have owned releasing this permit in close() never got built --
