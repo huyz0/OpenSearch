@@ -2619,12 +2619,47 @@ real I/O the un-split read path never pays, for as long as a target stays unrewr
 explicit price of staying logical-first between a split and its (now real, on-demand) physical
 rewrite.
 
+**Shrink, the inverse operation -- done.** New `ShardShrinker` (`resharding` package) merges several
+existing shards' current document sets into one brand-new target shard identity. Unlike split, this
+is deliberately *not* zero-copy: split's target can share the pre-split shard's own segment files
+because it starts as a strict logical subset of one already-coherent Lucene commit, but combining
+several independent shards' document spaces into a single new shard has no manifest-schema trick
+that avoids a real merge -- there is no way for one commit's `segments_N` file to describe segments
+drawn from several unrelated directories without actually combining them. `ShardShrinker.shrink`
+materializes every source's current manifest and merges them via `IndexWriter#addIndexes(Directory...)`,
+the same "no document is re-parsed, only segment files combined" shape `LuceneMergeCompactionPublisher`
+already established for compaction, just across shards instead of within one. No pin is needed on
+any source (unlike split): the merged bundle is entirely fresh segment data written into the
+target's own directory, immediately self-sufficient and never dependent on any source's bundles
+staying alive -- no source shard is touched, deleted, or otherwise modified by a shrink. Merged
+`maxSeqNo`/`mappingVersion` deliberately take the maximum across sources (a safe upper bound, since
+independent shard identities have no coherent single merged sequence-number history); no WAL
+position is carried forward, since there is no single coherent one to carry.
+
+New `ShardShrinkAction`/`ShardShrinkRequest`/`ShardShrinkResponse`/`TransportShardShrinkAction`/
+`RestShardShrinkAction` (REST at `POST /_plugins/_serverless/storage/_shrink`) expose it, naming
+every source (at least two -- a single-source "shrink" is just a clone, and is rejected, pointing
+callers at `ShardCloneAction` instead) plus the target in one call. Each source's materializer reads
+through the same `FallbackBundleFileReader`/`CloneLineage` resolution `TransportShardPartitionRewriteAction`
+already established, since a source being shrunk may itself be an unrewritten split target whose
+manifest still references its own pre-split source's bundles.
+
+Verified with a real Lucene-level unit test (three independently-published sources' documents all
+land in the merged target, no more, no fewer; merged `maxSeqNo`/`mappingVersion` are genuinely the
+maximum across sources, not e.g. the last source's own values; shrinking onto an already-active
+target is refused) and a real end-to-end integration test merging two genuinely separate published
+shards over the transport layer in a running cluster, confirming every document from both real
+sources survives the merge with none lost or duplicated. Full plugin quality gate and the entire
+`internalClusterTest` suite pass clean.
+
 **Explicitly out of scope, real follow-up work still remaining**: an automatic background scheduler
-for the rewrite (on-demand only for now, mirroring compaction's own history); shrink (the inverse
-operation, merging several shards' document spaces back into one shard) -- a real, sizeable
-increment on top of the split/rewrite primitives now implemented, not attempted here. Chaos suite
-(§17) including full object-store outage modes (§13), performance tuning of bundle/WAL batch
-parameters, API gating audit, and autoscaling signal calibration remain separately ongoing Phase 5 work.
+for the rewrite (on-demand only for now, mirroring compaction's own history); deleting/deprecating a
+shrink's source shards afterward (this call only ever creates the merged target -- retiring the
+sources it merged is a separate, deliberately-not-automatic operator decision, the same "never
+auto-deletes anything it didn't itself just create" caution `ShardCloner#deleteClone` already
+applies). Chaos suite (§17) including full object-store outage modes (§13), performance tuning of
+bundle/WAL batch parameters, API gating audit, and autoscaling signal calibration remain separately
+ongoing Phase 5 work.
 
 **Phase 6 — Migration tooling.** Conversion of existing remote-store indices to the bundle
 format (their segments already sit in the object store — conversion is manifest synthesis plus
