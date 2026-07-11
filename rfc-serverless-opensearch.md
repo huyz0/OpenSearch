@@ -1965,6 +1965,19 @@ guard); first query after idle returns < 5 s p95 for a cached-manifest index (no
 but the "never a client-visible failure" correctness bar the milestone implies is now met and
 integration-tested).
 
+**A simulated-latency benchmark harness now exists** (`plugins/serverless-storage/src/test/java/org/opensearch/serverless/storage/benchmark/`),
+giving this section's cold-start/p95/p99 milestones a reproducible, controllable signal without
+depending on a real S3/GCS/Azure connection. `LatencyInjectingBlobContainer` wraps a real
+`FsBlobContainer` in a `FilterBlobContainer` decorator (the same pattern this plugin's other
+fault-injecting test decorators already use) and sleeps a configurable per-operation delay --
+drawn from a `LatencyProfile` with `LOW`/`TYPICAL`/`HIGH` presets approximating published
+single-region S3 GET/PUT/LIST figures -- before delegating each read/write/list call.
+`BlobLatencyBenchmarkTests` times manifest write+read round-trips and bundle reads under each
+preset and logs min/avg/max elapsed time. **These numbers are illustrative and simulated only**
+(`Thread.sleep` standing in for network latency against a local filesystem, not a real cloud
+backend) -- they are not a measurement of this section's actual cold-start/p95/p99 milestones,
+only a repeatable order-of-magnitude stand-in until those are benchmarked for real.
+
 **First increment of "suspended writers" landed: the raw idle-activity signal any suspension or
 scale-to-zero decision needs.** `ObjectStoreWriterEngine` now tracks the wall-clock time of its
 own last real client write (`index`/`delete` overrides record it unconditionally on entry, not
