@@ -122,6 +122,94 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
         }
     }
 
+    public void testFlushAndPublishQuiescentMarksTheManifestQuiescent() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            manifestStore
+        );
+
+        ObjectStoreWriterEngine engine = openWriterEngine(shardStateStore, commitPublisher);
+        try {
+            index(engine, "1");
+            engine.flush(true, true);
+
+            org.opensearch.serverless.storage.shardstate.VersionedShardHead beforeQuiesce = shardStateStore.get(
+                shardId.getIndex().getUUID(),
+                shardId.getId()
+            ).orElseThrow();
+            org.opensearch.serverless.storage.manifest.CommitManifest ordinaryManifest = manifestStore.readManifest(
+                beforeQuiesce.head().primaryTerm(),
+                beforeQuiesce.head().latestManifestGeneration()
+            );
+            assertFalse("an ordinary flush must not mark its manifest quiescent", ordinaryManifest.quiescent());
+
+            engine.flushAndPublishQuiescent();
+
+            org.opensearch.serverless.storage.shardstate.VersionedShardHead afterQuiesce = shardStateStore.get(
+                shardId.getIndex().getUUID(),
+                shardId.getId()
+            ).orElseThrow();
+            assertTrue(
+                "flushAndPublishQuiescent must publish a strictly newer generation",
+                afterQuiesce.head().latestManifestGeneration() > beforeQuiesce.head().latestManifestGeneration()
+            );
+            org.opensearch.serverless.storage.manifest.CommitManifest quiescentManifest = manifestStore.readManifest(
+                afterQuiesce.head().primaryTerm(),
+                afterQuiesce.head().latestManifestGeneration()
+            );
+            assertTrue("flushAndPublishQuiescent's own manifest must be marked quiescent", quiescentManifest.quiescent());
+        } finally {
+            IOUtils.close(engine, lastOpenedStore);
+        }
+    }
+
+    public void testClosingTheEnginePublishesAFinalQuiescentManifest() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            manifestStore
+        );
+
+        ObjectStoreWriterEngine engine = openWriterEngine(shardStateStore, commitPublisher);
+        index(engine, "1");
+        engine.flush(true, true);
+        try {
+            org.opensearch.serverless.storage.shardstate.VersionedShardHead beforeClose = shardStateStore.get(
+                shardId.getIndex().getUUID(),
+                shardId.getId()
+            ).orElseThrow();
+
+            // Index one more document without an explicit flush -- close() itself must force the
+            // final commit rather than relying on whatever was last published on the normal schedule.
+            index(engine, "2");
+
+            IOUtils.close(engine);
+
+            org.opensearch.serverless.storage.shardstate.VersionedShardHead afterClose = shardStateStore.get(
+                shardId.getIndex().getUUID(),
+                shardId.getId()
+            ).orElseThrow();
+            assertTrue(
+                "close() must force a strictly newer final commit, not just reuse the last flush",
+                afterClose.head().latestManifestGeneration() > beforeClose.head().latestManifestGeneration()
+            );
+            org.opensearch.serverless.storage.manifest.CommitManifest finalManifest = manifestStore.readManifest(
+                afterClose.head().primaryTerm(),
+                afterClose.head().latestManifestGeneration()
+            );
+            assertTrue("close()'s own final manifest must be marked quiescent", finalManifest.quiescent());
+        } finally {
+            IOUtils.close(lastOpenedStore);
+        }
+    }
+
     public void testMillisSinceLastActivityUpdatesOnIndexAndDecreasesUntilTheNextOne() throws Exception {
         FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
         BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());

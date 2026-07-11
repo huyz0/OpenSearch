@@ -147,6 +147,53 @@ public class ObjectStoreCommitPublisherTests extends OpenSearchTestCase {
         }
     }
 
+    public void testPublishCommitWithQuiescentFlagMarksTheManifest() throws Exception {
+        try (Directory directory = new ByteBuffersDirectory()) {
+            SegmentInfos segmentInfos = commitTwoDocuments(directory);
+
+            CommitManifest written = publisher.publishCommit(
+                directory,
+                segmentInfos,
+                INDEX_UUID,
+                SHARD_ID,
+                3,
+                7,
+                1,
+                1,
+                new WalPosition("epoch-0", 0),
+                0,
+                PruningStats.empty(),
+                true
+            );
+
+            assertTrue(written.quiescent());
+            CommitManifest reread = new BlobContainerManifestStore(blobContainer).readManifest(3, 7);
+            assertTrue("the quiescent flag must survive a real write/read round trip", reread.quiescent());
+        }
+    }
+
+    public void testPublishCommitWithoutQuiescentArgumentDefaultsToFalse() throws Exception {
+        try (Directory directory = new ByteBuffersDirectory()) {
+            SegmentInfos segmentInfos = commitTwoDocuments(directory);
+
+            CommitManifest written = publisher.publishCommit(
+                directory,
+                segmentInfos,
+                INDEX_UUID,
+                SHARD_ID,
+                3,
+                7,
+                1,
+                1,
+                new WalPosition("epoch-0", 0),
+                0,
+                PruningStats.empty()
+            );
+
+            assertFalse(written.quiescent());
+        }
+    }
+
     public void testRetriedPublishForTheSameGenerationIsANoOpAndReturnsTheExistingManifest() throws Exception {
         try (Directory directory = new ByteBuffersDirectory()) {
             SegmentInfos segmentInfos = commitTwoDocuments(directory);

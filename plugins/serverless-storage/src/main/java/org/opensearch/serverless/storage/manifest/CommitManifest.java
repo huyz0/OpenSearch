@@ -40,9 +40,12 @@ public final class CommitManifest implements Writeable {
     private final long mappingVersion;
     private final PruningStats pruningStats;
     private final long createdAtMillis;
+    private final boolean quiescent;
 
     /**
-     * Creates a manifest for one immutable Lucene commit.
+     * Creates a non-quiescent manifest for one immutable Lucene commit -- equivalent to the
+     * fuller constructor with {@code quiescent = false}, kept so every pre-existing caller (the
+     * ordinary hot commit path) is unaffected by {@link #quiescent}'s addition.
      *
      * @param indexUuid the UUID of the index this shard belongs to
      * @param shardId the shard number
@@ -72,6 +75,58 @@ public final class CommitManifest implements Writeable {
         PruningStats pruningStats,
         long createdAtMillis
     ) {
+        this(
+            indexUuid,
+            shardId,
+            primaryTerm,
+            generation,
+            segmentsFileName,
+            files,
+            maxSeqNo,
+            localCheckpoint,
+            walPosition,
+            mappingVersion,
+            pruningStats,
+            createdAtMillis,
+            false
+        );
+    }
+
+    /**
+     * Creates a manifest for one immutable Lucene commit.
+     *
+     * @param indexUuid the UUID of the index this shard belongs to
+     * @param shardId the shard number
+     * @param primaryTerm the primary term this commit was written under
+     * @param generation the generation of this commit, unique within {@code primaryTerm}
+     * @param segmentsFileName the name of the Lucene segments file for this commit, which must be
+     *                         a key of {@code files}
+     * @param files the manifest's file map, keyed by file name
+     * @param maxSeqNo the maximum sequence number included in this commit
+     * @param localCheckpoint the local checkpoint at this commit
+     * @param walPosition the write-ahead log position folded into this commit, or {@code null}
+     * @param mappingVersion the mapping version in effect at this commit
+     * @param pruningStats summary statistics used to decide whether this shard can be pruned
+     * @param createdAtMillis the wall-clock time this manifest was created, in epoch millis
+     * @param quiescent whether this is a writer's deliberate final commit before scale-to-zero
+     *                  suspension (rfc-serverless-opensearch.md &sect;7.3) -- {@code true} means no
+     *                  further commit is expected from this writer until it is reactivated.
+     */
+    public CommitManifest(
+        String indexUuid,
+        int shardId,
+        long primaryTerm,
+        long generation,
+        String segmentsFileName,
+        Map<String, FileReference> files,
+        long maxSeqNo,
+        long localCheckpoint,
+        WalPosition walPosition,
+        long mappingVersion,
+        PruningStats pruningStats,
+        long createdAtMillis,
+        boolean quiescent
+    ) {
         this.indexUuid = Objects.requireNonNull(indexUuid, "indexUuid");
         if (shardId < 0) {
             throw new IllegalArgumentException("shardId must be >= 0, got " + shardId);
@@ -96,6 +151,7 @@ public final class CommitManifest implements Writeable {
         this.mappingVersion = mappingVersion;
         this.pruningStats = Objects.requireNonNull(pruningStats, "pruningStats");
         this.createdAtMillis = createdAtMillis;
+        this.quiescent = quiescent;
     }
 
     /**
@@ -116,6 +172,7 @@ public final class CommitManifest implements Writeable {
         this.mappingVersion = in.readVLong();
         this.pruningStats = new PruningStats(in);
         this.createdAtMillis = in.readVLong();
+        this.quiescent = in.readBoolean();
     }
 
     @Override
@@ -132,6 +189,7 @@ public final class CommitManifest implements Writeable {
         out.writeVLong(mappingVersion);
         pruningStats.writeTo(out);
         out.writeVLong(createdAtMillis);
+        out.writeBoolean(quiescent);
     }
 
     /** The UUID of the index this shard belongs to. */
@@ -194,6 +252,15 @@ public final class CommitManifest implements Writeable {
         return createdAtMillis;
     }
 
+    /**
+     * Whether this is a writer's deliberate final commit before scale-to-zero suspension --
+     * {@code true} means no further commit is expected from this writer until it is reactivated
+     * (rfc-serverless-opensearch.md &sect;7.3).
+     */
+    public boolean quiescent() {
+        return quiescent;
+    }
+
     /** Every manifest blob name starts with this -- the prefix {@link org.opensearch.serverless.storage.manifest.BlobContainerManifestStore#listManifests} lists by. */
     public static final String NAME_PREFIX = "manifest-";
 
@@ -250,6 +317,7 @@ public final class CommitManifest implements Writeable {
             && localCheckpoint == that.localCheckpoint
             && mappingVersion == that.mappingVersion
             && createdAtMillis == that.createdAtMillis
+            && quiescent == that.quiescent
             && indexUuid.equals(that.indexUuid)
             && segmentsFileName.equals(that.segmentsFileName)
             && files.equals(that.files)
@@ -271,7 +339,8 @@ public final class CommitManifest implements Writeable {
             walPosition,
             mappingVersion,
             pruningStats,
-            createdAtMillis
+            createdAtMillis,
+            quiescent
         );
     }
 

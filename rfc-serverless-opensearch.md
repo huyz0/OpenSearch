@@ -2185,12 +2185,59 @@ waiting out a real idle window) started genuinely suspending its own just-create
 `ensureGreen` could observe it, hanging until timeout -- fixed by requiring the explicit opt-in
 setting rather than changing that test's premise.
 
-Deliberately not attempted: the "final flush+publication, manifest marked quiescent, pruning digest
-fold" nuance &sect;7.3's own narrative describes. Suspending a writer here only stops it from being
-allocated/kept allocated; it does not yet coordinate a clean last-commit hand-off with
-`ObjectStoreWriterEngine` first. No data is lost either way -- every commit is already durably
-published before suspension ever runs -- so this is a missed optimization (a future cold-start reads
-a very slightly older manifest than it could have), not a correctness gap.
+**The "final flush+publication, manifest marked quiescent" nuance &sect;7.3's own narrative describes
+is now implemented too** (the pruning-digest fold half is deliberately still deferred -- see below).
+`CommitManifest` gained a `quiescent` boolean (new trailing-parameter constructor overload, existing
+callers unaffected, defaulting `false`), threaded through new `ObjectStoreCommitPublisher`/`ObjectStoreCommitHeadPublisher`
+`publishCommit`/`publishCommitAsHead` overloads. `ObjectStoreWriterEngine` gained `flushAndPublishQuiescent()`,
+which forces a real commit unconditionally (even with nothing pending, so the published manifest is
+guaranteed as fresh as possible) and marks it quiescent via a field (`nextCommitIsQuiescent`) rather
+than a parameter, since `commitIndexWriter` is core's own fixed-signature callback invoked deep
+inside `InternalEngine#flush` -- there is no parameter to thread the flag through directly.
+
+Called unconditionally from `close()`, not only when the close is actually suspension-triggered: the
+proper suspension-aware version would need `ShardSuspensionCoordinator` to talk to the specific node
+hosting the live engine before evicting it, which its own javadoc already documents as deliberately
+out of scope (it acts purely through cluster state/allocation) -- building that channel is a
+materially larger, separate increment. Marking every closing engine's very last manifest quiescent
+unconditionally is harmless in the meantime: nothing in this plugin consumes the flag yet, and for
+the one case where the distinction would matter (ordinary relocation, not suspension), the new writer
+engine that immediately opens on the new node publishes its own non-quiescent manifests right away,
+superseding the old one -- no lasting incorrectness, only an unused bit on a manifest about to be
+superseded anyway.
+
+Landing this caught a real, previously-latent bug via its own regression sweep, not via a unit test in
+isolation: `WalPosition#writeTo` used `writeVLong`, which throws on any negative value, but `offset()`
+legitimately goes negative (`WalMirroringTranslog#lastFlushedWalChunkSequence()`'s own "nothing
+flushed yet" sentinel, `-1`) -- a real, reachable case that no existing unit test happened to
+construct, and that no existing code path had ever exercised at the moment WAL mirroring was enabled
+but nothing had flushed yet *and* a commit was being published. The extra close()-time forced flush
+this feature adds newly exercises exactly that combination during `ServerlessStorageWriterFailoverIT`'s
+own "node killed mid-write, with encryption enabled" scenario (index deletion, after failover,
+triggers `close()` on the old shard while its WAL-mirroring translog had never actually flushed a
+chunk) -- fixed by switching to `writeZLong`/`readZLong`, with a new `WalPositionTests` covering the
+negative-offset round trip directly.
+
+The pruning-digest fold remains deliberately unbuilt: rfc-serverless-metadata-plane.md &sect;5.1
+describes an index-level aggregation of every shard's `PruningStats`, letting a future query planner
+skip cold/suspended shards without materializing their manifests -- but no consumer of that
+aggregation exists anywhere in this codebase yet, and building the digest store now (a new blob type,
+an index-level `BlobContainer` resolution this plugin doesn't currently have, CAS read-modify-write
+semantics) would be speculative machinery with no way to verify it's actually correct beyond
+unit-testing its own merge math in isolation. Left for whenever a real consumer (a pruning-aware
+query planner, or an explicit request for it) exists to drive the design and prove it end to end.
+
+No data is lost either way, with or without either half -- every commit is already durably published
+before suspension ever runs -- so both remain missed optimizations (a future cold-start reads a very
+slightly older manifest than it could have, or a future query planner does more work than it
+strictly needs to), never a correctness gap.
+
+Verified with unit tests directly against the new pieces (`CommitManifestTests`'s quiescent-flag
+cases, `ObjectStoreCommitPublisherTests`'s quiescent-publish case, `ObjectStoreWriterEngineTests`'s
+`flushAndPublishQuiescent` and close()-forces-a-final-commit cases, and the new `WalPositionTests`
+covering the negative-offset serialization bug directly) plus a full `internalClusterTest` regression
+sweep across the entire plugin, which is what actually caught the `WalPosition` bug above before it
+shipped.
 
 Verified with unit tests (`SuspendedShardsMetadataTests`, `SuspendedShardAllocationDeciderTests`,
 `ReactivateShardsRequestTests`) and a real end-to-end integration test

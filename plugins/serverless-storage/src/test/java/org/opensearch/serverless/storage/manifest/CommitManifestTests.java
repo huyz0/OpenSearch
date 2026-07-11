@@ -81,6 +81,58 @@ public class CommitManifestTests extends OpenSearchTestCase {
         assertEquals(original, deserialized);
     }
 
+    public void testQuiescentDefaultsToFalse() {
+        assertFalse(randomManifest(1, 5).quiescent());
+    }
+
+    public void testQuiescentFlagRoundTripsThroughSerialization() throws Exception {
+        CommitManifest original = new CommitManifest(
+            "idx",
+            0,
+            1,
+            0,
+            "segments_1",
+            Map.of("segments_1", new FileReference("bundle-A", 0, 10, 1L)),
+            0,
+            0,
+            null,
+            0,
+            PruningStats.empty(),
+            0L,
+            true
+        );
+        assertTrue(original.quiescent());
+
+        BytesStreamOutput out = new BytesStreamOutput();
+        original.writeTo(out);
+        CommitManifest deserialized = new CommitManifest(out.bytes().streamInput());
+
+        assertTrue(deserialized.quiescent());
+        assertEquals(original, deserialized);
+    }
+
+    public void testQuiescentParticipatesInEquality() {
+        Map<String, FileReference> files = Map.of("segments_1", new FileReference("bundle-A", 0, 10, 1L));
+        CommitManifest notQuiescent = new CommitManifest(
+            "idx",
+            0,
+            1,
+            0,
+            "segments_1",
+            files,
+            0,
+            0,
+            null,
+            0,
+            PruningStats.empty(),
+            0L,
+            false
+        );
+        CommitManifest quiescent = new CommitManifest("idx", 0, 1, 0, "segments_1", files, 0, 0, null, 0, PruningStats.empty(), 0L, true);
+
+        assertNotEquals(notQuiescent, quiescent);
+    }
+
     public void testManifestNameEncodesTermAndGeneration() {
         assertEquals("manifest-7-42", CommitManifest.manifestName(7, 42));
         assertEquals("manifest-7-42", randomManifest(7, 42).manifestName());

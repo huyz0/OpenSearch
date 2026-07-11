@@ -42,13 +42,18 @@ public final class WalPosition implements Writeable {
      * @param in the stream to read from
      */
     public WalPosition(StreamInput in) throws IOException {
-        this(in.readString(), in.readVLong());
+        this(in.readString(), in.readZLong());
     }
 
     @Override
     public void writeTo(StreamOutput out) throws IOException {
         out.writeString(writerEpoch);
-        out.writeVLong(offset);
+        // writeZLong, not writeVLong: offset() legitimately goes negative (-1, WalMirroringTranslog's
+        // own "nothing flushed yet" sentinel from lastFlushedWalChunkSequence()) -- confirmed a real,
+        // reachable case, not a defensive guess, by ObjectStoreWriterEngine#flushAndPublishQuiescent
+        // (called from close()) hitting exactly this path and failing with writeVLong's own "Negative
+        // longs unsupported" exception in ServerlessStorageWriterFailoverIT.
+        out.writeZLong(offset);
     }
 
     /** The epoch identifying which writer produced this position. */

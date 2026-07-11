@@ -98,6 +98,57 @@ public final class ObjectStoreCommitPublisher {
         long mappingVersion,
         PruningStats pruningStats
     ) throws IOException {
+        return publishCommit(
+            directory,
+            segmentInfos,
+            indexUuid,
+            shardId,
+            primaryTerm,
+            generation,
+            maxSeqNo,
+            localCheckpoint,
+            walPosition,
+            mappingVersion,
+            pruningStats,
+            false
+        );
+    }
+
+    /**
+     * Same as {@link #publishCommit(Directory, SegmentInfos, String, int, long, long, long, long,
+     * WalPosition, long, PruningStats)}, additionally marking the published manifest {@link
+     * CommitManifest#quiescent()} -- a writer's deliberate final commit before scale-to-zero
+     * suspension (rfc-serverless-opensearch.md &sect;7.3), used by {@code
+     * ObjectStoreWriterEngine#flushAndPublishQuiescent}.
+     *
+     * @param directory the local Lucene {@link Directory} holding the files referenced by {@code segmentInfos}
+     * @param segmentInfos the local Lucene commit to package
+     * @param indexUuid the index this shard belongs to
+     * @param shardId the shard this commit belongs to
+     * @param primaryTerm the primary term this commit is published under
+     * @param generation the manifest generation this commit is published at
+     * @param maxSeqNo the maximum sequence number covered by this commit
+     * @param localCheckpoint the local checkpoint covered by this commit
+     * @param walPosition the WAL position this commit's manifest should record
+     * @param mappingVersion the mapping version in effect for this commit
+     * @param pruningStats pruning statistics to record in the manifest
+     * @param quiescent whether to mark the published manifest as this writer's final commit before suspension.
+     * @return the manifest describing the packaged commit
+     */
+    public CommitManifest publishCommit(
+        Directory directory,
+        SegmentInfos segmentInfos,
+        String indexUuid,
+        int shardId,
+        long primaryTerm,
+        long generation,
+        long maxSeqNo,
+        long localCheckpoint,
+        WalPosition walPosition,
+        long mappingVersion,
+        PruningStats pruningStats,
+        boolean quiescent
+    ) throws IOException {
         if (manifestStore.manifestExists(primaryTerm, generation)) {
             return manifestStore.readManifest(primaryTerm, generation);
         }
@@ -127,7 +178,8 @@ public final class ObjectStoreCommitPublisher {
             walPosition,
             mappingVersion,
             pruningStats,
-            System.currentTimeMillis()
+            System.currentTimeMillis(),
+            quiescent
         );
         manifestStore.writeManifest(manifest);
         return manifest;
