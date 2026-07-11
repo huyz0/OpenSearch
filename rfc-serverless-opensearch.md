@@ -2480,6 +2480,29 @@ that mechanism exists would have nothing safe to trigger against. This increment
 signal is already being tracked -- the same incremental shape `millisSinceLastActivity()` was built
 in -- ready for whenever a future controller can actually act on it.
 
+**`writesPerMinute()` now has its first consumer, but still deliberately no auto-action.**
+`ShardSplitCandidatesAction` (`resharding/action` package) fans `writesPerMinute()` out across every
+data node via `ShardActivityRegistry.snapshotWritesPerMinute()`, merges the highest reading per
+`(indexUuid, shardId)` cluster-wide, resolves each shard's index name from cluster metadata, and
+flags shards whose write rate exceeds a configurable threshold
+(`serverless_storage.resharding.split_candidate_writes_per_minute_threshold`, defaulting to 10,000
+writes/minute -- illustrative, not tuned against any real workload, since nothing yet exercises this
+signal under real traffic). It mirrors `ScaleUpCandidatesAction`'s "fan out, merge, join with cluster
+metadata, evaluate threshold in the response constructor" shape exactly, down to a REST endpoint
+(`GET /_plugins/_serverless/storage/_resharding/split_candidates`) and a request-level threshold
+override.
+
+This is still read-only and on-demand, with no scheduler task and no coordinator wired to it, and
+that is a deliberate scope decision, not an oversight: `ShardSplitter.split` only re-points an
+already-provisioned target shard identity onto a rewritten manifest -- it does not create or allocate
+the target shard, and it does not cut routing over from the source shard to the split targets. None
+of that orchestration exists in this plugin yet (see `resharding/package-info.java`'s own "logical-first,
+physical-later" status note). Auto-triggering a split off a write-rate threshold alone, with no
+provisioning or cutover mechanism behind it, would have nothing safe to trigger. So this increment
+stops exactly where reader scale-up's own first cut did not have to: it surfaces the signal against a
+threshold for an operator (or a future controller, once the provisioning/cutover mechanism exists) to
+act on manually via the existing `ShardSplitAction`, and nothing more.
+
 **Phase 4.5 — Compaction service, fully done.** Candidate selection, rebase protocol, real Lucene
 merge, size-tiered shaping, background scheduling, a real concurrent-writer data-loss bug, real
 lease acquisition/renewal, and busy-writer offload are all implemented and tested. Its hard dependency,

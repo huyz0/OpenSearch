@@ -428,6 +428,24 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * The default writes-per-minute threshold {@code ShardSplitCandidatesAction} uses to decide a
+     * writer shard's sustained write rate is high enough to be worth an operator's attention as a
+     * possible split target -- a caller can override this per-request, this is only the default
+     * when they don't. Illustrative, not tuned against any real workload: {@code
+     * ObjectStoreWriterEngine#writesPerMinute()} itself was added deliberately unconsumed (rfc-serverless-opensearch.md's
+     * resharding/autoscaling material), and this action is the first, deliberately read-only,
+     * consumer of that signal -- no auto-split trigger exists to calibrate this value against, see
+     * {@code org.opensearch.serverless.storage.resharding.action.ShardSplitCandidateEntry}'s own
+     * javadoc for why.
+     */
+    public static final Setting<Long> SERVERLESS_STORAGE_RESHARDING_SPLIT_CANDIDATE_WPM_THRESHOLD_SETTING = Setting.longSetting(
+        "serverless_storage.resharding.split_candidate_writes_per_minute_threshold",
+        10_000L,
+        0L,
+        Setting.Property.NodeScope
+    );
+
+    /**
      * How often {@code ScaleUpCandidatesSchedulerTask} re-evaluates {@code ScaleUpCandidatesAction}
      * in the background -- same "background schedule mirrors an on-demand trigger" shape as {@link
      * #SERVERLESS_STORAGE_SCALE_TO_ZERO_EVAL_INTERVAL_SETTING}, but deliberately its own setting
@@ -565,6 +583,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     // ScaleUpCandidatesRequest.
     private volatile long scaleUpQpmThreshold = SERVERLESS_STORAGE_SCALE_UP_QPM_THRESHOLD_SETTING.getDefault(Settings.EMPTY);
     private volatile int scaleUpMaxSearchReplicas = SERVERLESS_STORAGE_SCALE_UP_MAX_SEARCH_REPLICAS_SETTING.getDefault(Settings.EMPTY);
+    private volatile long reshardingSplitCandidateWritesPerMinuteThreshold =
+        SERVERLESS_STORAGE_RESHARDING_SPLIT_CANDIDATE_WPM_THRESHOLD_SETTING.getDefault(Settings.EMPTY);
     private volatile org.opensearch.serverless.storage.scaleup.ScaleUpCandidatesSchedulerTask scaleUpCandidatesSchedulerTask;
     // One node-local directory instance shared by every shard on this node -- matches the target
     // design's "one node block cache" shape (&sect;9) rather than a per-shard instance, and needs
@@ -610,6 +630,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_SCALE_UP_MAX_SEARCH_REPLICAS_SETTING,
             SERVERLESS_STORAGE_SCALE_UP_EVAL_INTERVAL_SETTING,
             SERVERLESS_STORAGE_SCALE_UP_ENABLED_SETTING,
+            SERVERLESS_STORAGE_RESHARDING_SPLIT_CANDIDATE_WPM_THRESHOLD_SETTING,
             SERVERLESS_STORAGE_REPOSITORY_SETTING
         );
     }
@@ -689,6 +710,9 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         }
         this.scaleUpQpmThreshold = SERVERLESS_STORAGE_SCALE_UP_QPM_THRESHOLD_SETTING.get(environment.settings());
         this.scaleUpMaxSearchReplicas = SERVERLESS_STORAGE_SCALE_UP_MAX_SEARCH_REPLICAS_SETTING.get(environment.settings());
+        this.reshardingSplitCandidateWritesPerMinuteThreshold = SERVERLESS_STORAGE_RESHARDING_SPLIT_CANDIDATE_WPM_THRESHOLD_SETTING.get(
+            environment.settings()
+        );
         TimeValue scaleUpEvalInterval = SERVERLESS_STORAGE_SCALE_UP_EVAL_INTERVAL_SETTING.get(environment.settings());
         if (scaleUpEvalInterval.millis() > 0) {
             boolean scaleUpEnabled = SERVERLESS_STORAGE_SCALE_UP_ENABLED_SETTING.get(environment.settings());
@@ -1306,6 +1330,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new ActionHandler<>(
                 org.opensearch.serverless.storage.resharding.action.ShardShrinkAction.INSTANCE,
                 org.opensearch.serverless.storage.resharding.action.TransportShardShrinkAction.class
+            ),
+            new ActionHandler<>(
+                org.opensearch.serverless.storage.resharding.action.ShardSplitCandidatesAction.INSTANCE,
+                org.opensearch.serverless.storage.resharding.action.TransportShardSplitCandidatesAction.class
             )
         );
     }
@@ -1333,6 +1361,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new org.opensearch.serverless.storage.resharding.action.RestShardSplitAction(),
             new org.opensearch.serverless.storage.resharding.action.RestShardPartitionRewriteAction(),
             new org.opensearch.serverless.storage.resharding.action.RestShardShrinkAction(),
+            new org.opensearch.serverless.storage.resharding.action.RestShardSplitCandidatesAction(),
             new org.opensearch.serverless.storage.retention.action.RestSnapshotPinAction(),
             new org.opensearch.serverless.storage.retention.action.RestSnapshotReleaseAction(),
             new org.opensearch.serverless.storage.retention.action.RestSnapshotRestoreAction(),
@@ -1396,6 +1425,14 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      */
     public int scaleUpMaxSearchReplicas() {
         return scaleUpMaxSearchReplicas;
+    }
+
+    /**
+     * This node's currently configured default writes-per-minute threshold for {@code
+     * ShardSplitCandidatesAction} -- see {@link #SERVERLESS_STORAGE_RESHARDING_SPLIT_CANDIDATE_WPM_THRESHOLD_SETTING}.
+     */
+    public long reshardingSplitCandidateWritesPerMinuteThreshold() {
+        return reshardingSplitCandidateWritesPerMinuteThreshold;
     }
 
     /**
