@@ -17,6 +17,7 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.NoSuchFileException;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -62,5 +63,15 @@ public final class BlobContainerShardPartitionStore {
         } catch (NoSuchFileException e) {
             return Optional.empty();
         }
+    }
+
+    /**
+     * Removes this shard's partition descriptor -- {@link PartitionRewritePublisher} calls this
+     * once its rewritten, partition-only manifest is durably published, so future engine opens stop
+     * applying {@link PartitionFilteringDirectoryReader}. A no-op if there was never one, or it was
+     * already cleared -- idempotent, safe to call more than once or speculatively.
+     */
+    public void clearDescriptor() throws IOException {
+        blobContainer.deleteBlobsIgnoringIfNotExists(List.of(BLOB_NAME));
     }
 }

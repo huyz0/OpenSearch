@@ -2562,18 +2562,69 @@ just that the wrapping code compiles -- plus a real three-way split over the tra
 running cluster (`ServerlessStorageShardSplitActionIT`), confirming a single source split more than
 once carries one independent pin per target rather than one clobbering another's.
 
-**Accepted cost, deliberately not optimized away this increment**: computing a leaf's
-partition-membership bitset means reading every live document's stored `_id` once per reader open --
-real I/O the un-split read path never pays. This is the explicit price of staying logical-first
-rather than physically rewriting bundles at split time.
+**Physical bundle rewrite, closing the accepted-cost gap above -- done.** New
+`PartitionRewritePublisher` (`resharding` package) closes exactly the gap the previous paragraph
+flagged: given a split target's currently published manifest, it materializes the full pre-split
+document set, filters it down to this target's own partition by reusing `PartitionFilteringDirectoryReader`
+-- the identical filter a live reader engine already applies at query time, so the rewritten bundle
+is guaranteed to contain precisely what queries were already seeing, never a separately-computed,
+potentially-drifting result -- and republishes the filtered result as a fresh, physical,
+partition-only bundle under a new manifest generation, using `SlowCodecReaderWrapper` to adapt the
+filtered reader's leaves for `IndexWriter#addIndexes(CodecReader...)`, the same "no document is
+re-parsed, only segment files combined" shape `LuceneMergeCompactionPublisher` already established
+for compaction. The old, unfiltered bundle is deliberately never explicitly deleted by this class --
+it simply becomes unreferenced once the new manifest publishes, so `GcSchedulerTask`'s own
+already-tested sweep reclaims it on its normal schedule, exactly like a compaction's superseded
+source bundle already does; no new deletion path was needed. Once the new manifest and head are
+both durably published, the target's `ShardPartitionDescriptor` is cleared -- ordered last,
+deliberately, so a mid-rewrite crash is merely retry-safe (the descriptor is still there to read on
+the next attempt) rather than leaving a target in a state where nothing tells a future engine open
+to keep filtering.
 
-**Explicitly out of scope for this increment, real follow-up work**: physically rewriting a split
-target's bundles down to just its own partition (which would let the doc-routing filter be dropped
-once done, closing the accepted-cost gap above), and shrink (the inverse operation, merging several
-shards' document spaces back into one shard) -- both real, sizeable increments on top of the split
-primitive now implemented, not attempted here. Chaos suite (§17) including full object-store
-outage modes (§13), performance tuning of bundle/WAL batch parameters, API gating audit, and
-autoscaling signal calibration remain separately ongoing Phase 5 work.
+New `ShardPartitionRewriteAction`/`ShardPartitionRewriteRequest`/`ShardPartitionRewriteResponse`/
+`TransportShardPartitionRewriteAction`/`RestShardPartitionRewriteAction` (REST at `POST
+/_plugins/_serverless/storage/_partition_rewrite`) expose it as an on-demand trigger, the same shape
+`CompactionTriggerAction` already established for triggering an immediate attempt without waiting
+out a background schedule (this increment does not add its own background scheduler for rewrite --
+on-demand only, matching the "narrower than originally scoped" precedent §16 Phase 4.5 already set
+for compaction's own on-demand trigger before its scheduler existed).
+
+Landing this caught a real bug via its own integration test, not by inspection: the first version's
+materializer read only from the target's own container, but a split target's manifest can reference
+bundles that still physically live in the *source* shard's own container -- zero-copy clone/split
+never copies bundle bytes, only manifest references. A unit test alone didn't catch this (it
+published the target's own commit directly, never exercising a real cross-container split), but the
+integration test -- which drives a real `ShardSplitAction` first, inheriting bundles from a genuinely
+separate source container the way production traffic would -- failed with a real `NoSuchFileException`
+the moment the rewrite tried to read an inherited bundle. Fixed by reading through the same
+`FallbackBundleFileReader` a cloned/split shard's live reader engine already relies on, resolving the
+source via the target's own `CloneLineage` (which `ShardSplitter.split` already records, since it's
+built on `ShardCloner.clone` unmodified). The newly rewritten bundle itself is always written back
+to the target's own container, never the source's -- only the *read* path needed the fallback.
+
+Verified with a real Lucene-level unit test (a rewritten manifest contains exactly the expected
+partition's documents, no more, no fewer, computed against `RoutingPartitionFilter` independently
+rather than trusting the same code path being tested; a second rewrite attempt after the descriptor
+is already cleared is a safe no-op) and a real end-to-end integration test driving the complete
+lifecycle over the transport layer in a running cluster: split a source, confirm the target's
+manifest is still the full unfiltered set immediately after (logical-first proven, not assumed),
+trigger the rewrite, confirm the manifest now holds strictly fewer documents matching exactly the
+target's own partition and the descriptor is gone, confirm a second rewrite attempt is a no-op, and
+confirm the source's split pin is untouched by the target's own rewrite. Full plugin quality gate
+and the entire `internalClusterTest` suite pass clean.
+
+**Accepted cost while a split target has not yet been rewritten**: computing a leaf's
+partition-membership bitset means reading every live document's stored `_id` once per reader open --
+real I/O the un-split read path never pays, for as long as a target stays unrewritten. This is the
+explicit price of staying logical-first between a split and its (now real, on-demand) physical
+rewrite.
+
+**Explicitly out of scope, real follow-up work still remaining**: an automatic background scheduler
+for the rewrite (on-demand only for now, mirroring compaction's own history); shrink (the inverse
+operation, merging several shards' document spaces back into one shard) -- a real, sizeable
+increment on top of the split/rewrite primitives now implemented, not attempted here. Chaos suite
+(§17) including full object-store outage modes (§13), performance tuning of bundle/WAL batch
+parameters, API gating audit, and autoscaling signal calibration remain separately ongoing Phase 5 work.
 
 **Phase 6 — Migration tooling.** Conversion of existing remote-store indices to the bundle
 format (their segments already sit in the object store — conversion is manifest synthesis plus
