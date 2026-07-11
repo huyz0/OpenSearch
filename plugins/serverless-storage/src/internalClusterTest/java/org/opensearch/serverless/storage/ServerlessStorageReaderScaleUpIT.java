@@ -123,10 +123,7 @@ public class ServerlessStorageReaderScaleUpIT extends RemoteStoreBaseIntegTestCa
         // window with query traffic on both sides of the rollover, not just firing a quick burst.
         long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(75);
         while (System.currentTimeMillis() < deadline) {
-            SearchResponse response = client().prepareSearch(INDEX_NAME)
-                .setPreference(Preference.SEARCH_REPLICA.type())
-                .setSize(0)
-                .get();
+            SearchResponse response = client().prepareSearch(INDEX_NAME).setPreference(Preference.SEARCH_REPLICA.type()).setSize(0).get();
             assertHitCount(response, 1);
             Thread.sleep(5000);
         }
@@ -140,10 +137,8 @@ public class ServerlessStorageReaderScaleUpIT extends RemoteStoreBaseIntegTestCa
         // this test's purposes, since the point is proving the mechanism wires together end to
         // end, not exercising the real default threshold's exact value.
         assertBusy(() -> {
-            ScaleUpCandidatesResponse response = client().execute(
-                ScaleUpCandidatesAction.INSTANCE,
-                new ScaleUpCandidatesRequest(0L, 5)
-            ).actionGet();
+            ScaleUpCandidatesResponse response = client().execute(ScaleUpCandidatesAction.INSTANCE, new ScaleUpCandidatesRequest(0L, 5))
+                .actionGet();
             boolean anyCandidate = response.candidates().stream().anyMatch(c -> c.indexName().equals(INDEX_NAME) && c.candidate());
             if (anyCandidate == false) {
                 // Force another completed query-rate window by sending one more burst, then retry.
