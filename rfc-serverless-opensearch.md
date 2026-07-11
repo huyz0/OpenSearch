@@ -2420,6 +2420,22 @@ it a candidate against a deliberately low threshold, and a real `ReaderReplicaEx
 genuinely raises `index.number_of_search_replicas` on the live index. A full `internalClusterTest`
 regression sweep across the entire plugin stayed green throughout.
 
+**The write-side equivalent of `queriesPerMinute()` now exists too, but deliberately stops at the
+signal.** `ObjectStoreWriterEngine` gained `writesPerMinute()`, the same deliberately crude
+two-window (previous/current) counter as the reader side, updated alongside `lastActivityMillis` in
+`index()`'s existing recovery-origin-excluding branch, and `ShardActivityRegistry` gained
+`writesPerMinute()`/`snapshotWritesPerMinute()` mirroring `millisSinceLastActivity()`/`snapshotAll()`'s
+shape exactly. Unlike the reader side, nothing consumes this signal yet, and that is intentional
+rather than an oversight: reader scale-up above has a real knob to turn (`index.number_of_search_replicas`)
+and a real mechanism already wired to a scheduler; writer capacity has neither. There is no "writer
+replica count" -- exactly one primary per shard -- and the only real mechanism for adding write
+capacity, `ShardSplitter`'s auto-split, is still only half-built (logical-first; the physical bundle
+rewrite that would actually shed write load off an overloaded shard is still future work, see
+`resharding/package-info.java`). Wiring a threshold-triggered auto-split off `writesPerMinute()` before
+that mechanism exists would have nothing safe to trigger against. This increment exists purely so the
+signal is already being tracked -- the same incremental shape `millisSinceLastActivity()` was built
+in -- ready for whenever a future controller can actually act on it.
+
 **Phase 4.5 — Compaction service, fully done.** Candidate selection, rebase protocol, real Lucene
 merge, size-tiered shaping, background scheduling, a real concurrent-writer data-loss bug, real
 lease acquisition/renewal, and busy-writer offload are all implemented and tested. Its hard dependency,

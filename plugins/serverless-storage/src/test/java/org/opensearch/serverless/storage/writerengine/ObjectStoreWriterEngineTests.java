@@ -300,6 +300,36 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
         }
     }
 
+    public void testWritesPerMinuteReportsZeroWhileStillInsideTheFirstWindow() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+
+        ObjectStoreWriterEngine engine = openWriterEngine(shardStateStore, commitPublisher);
+        try {
+            assertEquals("a freshly opened engine must report zero writes per minute", 0L, engine.writesPerMinute());
+
+            index(engine, "1");
+            index(engine, "2");
+
+            // writesPerMinute() deliberately reports the previous *completed* window's count, never
+            // the in-progress one -- see the field's own javadoc. So an engine that has only ever
+            // had writes land inside its very first (still-open) window reports 0, not the count of
+            // writes it has actually seen so far.
+            assertEquals(
+                "an engine still inside its first write-rate window must report 0, not the in-progress count",
+                0L,
+                engine.writesPerMinute()
+            );
+        } finally {
+            IOUtils.close(engine, lastOpenedStore);
+        }
+    }
+
     public void testOpeningTheEngineReportsToTheShardDirectory() throws Exception {
         FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
         BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());

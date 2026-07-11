@@ -181,6 +181,26 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     private final AtomicLong lastActivityMillis = new AtomicLong(System.currentTimeMillis());
 
     /**
+     * A deliberately crude two-window (previous/current) write-rate counter, mirroring {@code
+     * ObjectStoreReaderEngine#queriesPerMinute()}'s own field of the same shape exactly (see that
+     * field's own javadoc for the full reasoning -- repeated only in brief here): {@link
+     * #windowStartMillis} marks when {@link #windowWriteCount} started accumulating, and once a
+     * window has run for more than {@link #WRITE_RATE_WINDOW_MILLIS}, {@link #writesPerMinute()}
+     * rolls it over -- the just-finished window's count becomes {@link #completedWindowWriteCount},
+     * and a fresh window starts counting from 1 (the write that triggered the rollover).
+     *
+     * <p>This is intentionally not a real sliding window: {@link #writesPerMinute()} always reports
+     * the <em>previous completed window's</em> rate, never the in-progress one, so this deliberately
+     * under-reacts rather than over-reacts to a burst that just started. There is currently no
+     * consumer of this signal -- see {@link #writesPerMinute()}'s own javadoc for why that is fine
+     * for now.
+     */
+    private static final long WRITE_RATE_WINDOW_MILLIS = 60_000L;
+    private final AtomicLong windowStartMillis = new AtomicLong(System.currentTimeMillis());
+    private final AtomicLong windowWriteCount = new AtomicLong(0);
+    private final AtomicLong completedWindowWriteCount = new AtomicLong(0);
+
+    /**
      * Set just before {@link #flushAndPublishQuiescent} forces a commit, read (and cleared) by
      * {@link #commitIndexWriter} to mark that one resulting manifest as {@link
      * CommitManifest#quiescent()} -- see {@link #flushAndPublishQuiescent}'s own javadoc for why
@@ -479,7 +499,9 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     @Override
     public IndexResult index(Index index) throws IOException {
         if (index.origin().isRecovery() == false) {
-            lastActivityMillis.set(System.currentTimeMillis());
+            long now = System.currentTimeMillis();
+            lastActivityMillis.set(now);
+            recordWriteForRateCounter(now);
         }
         return super.index(index);
     }
@@ -511,6 +533,50 @@ public class ObjectStoreWriterEngine extends InternalEngine {
      */
     public long millisSinceLastActivity() {
         return System.currentTimeMillis() - lastActivityMillis.get();
+    }
+
+    /**
+     * Rolls {@link #windowStartMillis}/{@link #windowWriteCount} over into {@link
+     * #completedWindowWriteCount} once the current window has run longer than {@link
+     * #WRITE_RATE_WINDOW_MILLIS}, then counts {@code now}'s write into whichever window is current
+     * after that possible rollover. Synchronized for the same reason {@code
+     * ObjectStoreReaderEngine#recordQueryForRateCounter} is: rollover is a compound
+     * check-then-reset that must not race with itself across concurrent writes.
+     *
+     * @param now the current wall-clock time, as already computed by the caller.
+     */
+    private synchronized void recordWriteForRateCounter(long now) {
+        long start = windowStartMillis.get();
+        if (now - start >= WRITE_RATE_WINDOW_MILLIS) {
+            completedWindowWriteCount.set(windowWriteCount.get());
+            windowStartMillis.set(now);
+            windowWriteCount.set(1);
+        } else {
+            windowWriteCount.incrementAndGet();
+        }
+    }
+
+    /**
+     * A conservative, always-one-window-stale estimate of this engine's own real client-facing
+     * write rate, mirroring {@code ObjectStoreReaderEngine#queriesPerMinute()} exactly -- see that
+     * method's own javadoc for the full reasoning behind reporting the previous completed window
+     * rather than the in-progress one. Reports {@code 0} until this engine has completed at least
+     * one full {@link #WRITE_RATE_WINDOW_MILLIS} window since construction (or since its last
+     * write, if writes have since gone fully idle for a window).
+     *
+     * <p>Nothing in this plugin currently reads this value: unlike the reader side, there is no
+     * "writer replica count" knob to scale up (exactly one primary per shard), and the only real
+     * mechanism for adding write capacity -- {@code ShardSplitter}'s auto-split -- is still only
+     * half-built (logical-first; the physical bundle rewrite that would actually shed write load
+     * is still future work, see {@code resharding/package-info.java}). Wiring this counter into an
+     * actual scale-up trigger before that mechanism exists would have nothing safe to trigger. This
+     * method exists so that signal is already being tracked and ready to consume once it is, the
+     * same incremental shape {@link #millisSinceLastActivity()} was built in.
+     *
+     * @return writes observed during the previous completed {@link #WRITE_RATE_WINDOW_MILLIS} window.
+     */
+    public long writesPerMinute() {
+        return completedWindowWriteCount.get();
     }
 
     /**

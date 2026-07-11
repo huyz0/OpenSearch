@@ -100,4 +100,42 @@ public final class ShardActivityRegistry {
         }
         return snapshot;
     }
+
+    /**
+     * Looks up the currently-live writer engine's own {@link ObjectStoreWriterEngine#writesPerMinute()}
+     * for (indexUuid, shardId) -- the write-rate counterpart to {@link #millisSinceLastActivity},
+     * reachable from outside the engine itself for whenever a future consumer needs it (see {@link
+     * ObjectStoreWriterEngine#writesPerMinute()}'s own javadoc for why nothing consumes it yet).
+     *
+     * @param indexUuid the UUID of the index the shard belongs to
+     * @param shardId the shard number within {@code indexUuid}
+     * @return the currently-live writer engine's own {@link ObjectStoreWriterEngine#writesPerMinute()},
+     *         or empty if no writer engine for this shard is currently tracked on this node
+     */
+    public Optional<Long> writesPerMinute(String indexUuid, int shardId) {
+        WeakReference<ObjectStoreWriterEngine> ref = engines.get(key(indexUuid, shardId));
+        ObjectStoreWriterEngine engine = ref == null ? null : ref.get();
+        return engine == null ? Optional.empty() : Optional.of(engine.writesPerMinute());
+    }
+
+    /**
+     * A point-in-time snapshot of every tracked writer engine's own {@link
+     * ObjectStoreWriterEngine#writesPerMinute()} -- the write-rate counterpart to {@link
+     * #snapshotAll()}, silently skipping any entry whose {@link WeakReference} has already been
+     * collected, same as {@link #snapshotAll()} does.
+     *
+     * @return every (indexUuid, shardId) key (see {@link #key}'s {@code "indexUuid/shardId"} format)
+     *         together with that shard's writer engine's own {@link
+     *         ObjectStoreWriterEngine#writesPerMinute()}, for every entry whose engine is still live
+     */
+    public Map<String, Long> snapshotWritesPerMinute() {
+        Map<String, Long> snapshot = new java.util.HashMap<>();
+        for (Map.Entry<String, WeakReference<ObjectStoreWriterEngine>> entry : engines.entrySet()) {
+            ObjectStoreWriterEngine engine = entry.getValue().get();
+            if (engine != null) {
+                snapshot.put(entry.getKey(), engine.writesPerMinute());
+            }
+        }
+        return snapshot;
+    }
 }
