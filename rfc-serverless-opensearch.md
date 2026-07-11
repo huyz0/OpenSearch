@@ -1978,6 +1978,37 @@ preset and logs min/avg/max elapsed time. **These numbers are illustrative and s
 backend) -- they are not a measurement of this section's actual cold-start/p95/p99 milestones,
 only a repeatable order-of-magnitude stand-in until those are benchmarked for real.
 
+**The harness now also feeds a real cluster IT, `ServerlessStorageReactivationUnderLatencyIT`,
+checking whether `SERVERLESS_STORAGE_SCALE_TO_ZERO_SEARCH_REACTIVATION_WAIT_SETTING`'s 30s default
+has real headroom under realistic object-store latency, not just near-zero local disk.** It
+registers a small test-only `latency-fs` repository type (an `FsRepository` subclass whose
+`createBlobStore()` wraps every container it hands out in `LatencyInjectingBlobContainer`,
+following the same decorator-around-`createBlobStore()` shape `test.framework`'s own
+`MockRepository` already uses for fault injection) via
+`ServerlessStoragePlugin#SERVERLESS_STORAGE_REPOSITORY_SETTING`, suspends a writer shard, and times
+a write that must reactivate it. Under `LatencyProfile.TYPICAL`, one run measured 719 ms end to
+end -- comfortable headroom against the 30 s budget, though that exact number is itself simulated
+and illustrative, not a guarantee. **This uncovered a real bug in the harness itself, not just in
+this new test:** `LatencyInjectingBlobContainer` didn't override `readRegister`/
+`compareAndSwapRegister` -- `FilterBlobContainer` doesn't delegate those two methods, so they fell
+through to `BlobContainer`'s own default, which unconditionally throws
+`UnsupportedOperationException`. `FsBlobContainer` genuinely implements register semantics (used
+during real shard recovery), so wrapping it in the decorator broke recovery outright the moment a
+real container's register calls were exercised -- caught only by this IT driving an actual
+recovery through the wrapped container, not by `BlobLatencyBenchmarkTests`' own store-level tests,
+which never exercised that path. Fixed by adding delegating (and latency-injecting) overrides for
+both methods.
+
+**A separate, real finding this same investigation surfaced but deliberately did not fix:** using
+`LatencyProfile.HIGH` for *ordinary* (non-suspended) shard startup -- not just reactivation --
+failed to reach green within 120 s. Startup does dozens of small sequential blob writes (segment
+files, WAL chunks), and at `HIGH`'s up-to-400 ms-per-op ceiling those compound past what any
+bounded IT should wait on. Whether that blob-op count/sequencing during ordinary startup itself
+scales to degraded object-store latency is an open question worth its own future investigation --
+this IT sidesteps it by using `TYPICAL` instead, to get a decisive answer to the one question it
+set out to answer (reactivation-wait headroom), rather than conflating two different questions in
+one test.
+
 **First increment of "suspended writers" landed: the raw idle-activity signal any suspension or
 scale-to-zero decision needs.** `ObjectStoreWriterEngine` now tracks the wall-clock time of its
 own last real client write (`index`/`delete` overrides record it unconditionally on entry, not

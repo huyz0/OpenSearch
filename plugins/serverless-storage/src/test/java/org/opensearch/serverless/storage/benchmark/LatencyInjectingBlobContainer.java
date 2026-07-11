@@ -10,12 +10,16 @@ package org.opensearch.serverless.storage.benchmark;
 
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobMetadata;
+import org.opensearch.common.blobstore.BlobRegister;
+import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.support.FilterBlobContainer;
+import org.opensearch.core.common.bytes.BytesReference;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * A {@link FilterBlobContainer} decorator that sleeps a configurable, simulated delay before
@@ -91,6 +95,26 @@ public final class LatencyInjectingBlobContainer extends FilterBlobContainer {
     public void deleteBlobsIgnoringIfNotExists(List<String> blobNames) throws IOException {
         sleep(profile.sampleWriteMillis());
         delegate.deleteBlobsIgnoringIfNotExists(blobNames);
+    }
+
+    // FilterBlobContainer does not override readRegister/compareAndSwapRegister, so without these
+    // overrides they'd silently fall through to BlobContainer's own default, which unconditionally
+    // throws UnsupportedOperationException -- a real bug caught by
+    // ServerlessStorageReactivationUnderLatencyIT wrapping a real FsBlobContainer (which DOES
+    // implement register semantics) in this decorator and hitting exactly that during shard
+    // recovery, not merely a hypothetical gap.
+
+    @Override
+    public Optional<BlobRegister> readRegister(String blobName) throws IOException {
+        sleep(profile.sampleReadMillis());
+        return delegate.readRegister(blobName);
+    }
+
+    @Override
+    public BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
+        throws IOException {
+        sleep(profile.sampleWriteMillis());
+        return delegate.compareAndSwapRegister(blobName, expectedGeneration, newValue);
     }
 
     private static void sleep(long millis) throws IOException {
