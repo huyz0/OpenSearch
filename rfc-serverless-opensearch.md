@@ -1957,8 +1957,10 @@ only for this RFC's purposes.
 
 **Phase 4 — Topology (4–6 weeks).** Role-separated allocation (done, see &sect;10 and
 `ServerlessStorageExistingShardsAllocator`/`ReaderShardPlacementAllocationDecider`), suspended
-writers, scale-to-zero/cold-start, balancer hysteresis. Milestone: idle index consumes zero
-compute; first query after idle returns < 5 s p95 for a cached-manifest index.
+writers and scale-to-zero (done, signal collection through the actual suspend/reactivate mechanism
+-- see below), balancer hysteresis (still open). Milestone: idle index consumes zero compute (done
+for writers); first query after idle returns < 5 s p95 for a cached-manifest index (not yet
+benchmarked -- reader-shard scale-to-zero itself remains out of scope, see below).
 
 **First increment of "suspended writers" landed: the raw idle-activity signal any suspension or
 scale-to-zero decision needs.** `ObjectStoreWriterEngine` now tracks the wall-clock time of its
@@ -2119,10 +2121,84 @@ value in place rather than clearing it) and a real two-node integration test
 a real shard through the actual `createComponents` wiring, not just a direct method call -- the
 same test that caught the `AssertionError` bug above before it shipped.
 
-Still genuinely open: the actual suspend/reactivate *mechanism*. Consuming this action's output to
-really stop serving a shard, and cold-start reactivation on the next write or query, both intersect
-`IndexShard`/allocation lifecycle in core and remain out of scope for a plugin-local action -- see
-&sect;7.3's own narrative design for what that mechanism still needs to do.
+**The suspend/reactivate mechanism itself is now done too, and it needed no core diff.** This was
+originally framed above as requiring real changes to `IndexShard`/allocation lifecycle in core.
+Direct research into core before writing a line of code overturned that: `ExistingShardsAllocator`'s
+`UnassignedAllocationHandler#removeAndIgnore` is a sanctioned, already-existing way to hold a shard
+unassigned on purpose, and `TransportReplicationAction`/`TransportSingleShardAction` already
+wait-and-retry via `ClusterStateObserver` against a shard with no active copy rather than failing
+fast -- so the whole mechanism is achievable as an ordinary `AllocationDecider` plus a plugin-side
+trigger, both already-sanctioned SPIs, zero core changes.
+
+New `SuspendedShardsMetadata` (`allocation` package) stores a serverless-storage index's currently-
+suspended writer shard ids as plain `IndexMetadata` custom data (`IndexMetadata.Builder#putCustom`)
+-- no new `ClusterState.Custom`/diffable type needed, persistence/failover-survival/serialization all
+come free from core. New `SuspendedShardAllocationDecider` (mirroring `ReaderShardPlacementAllocationDecider`'s
+own shape) returns `NO` from both `canAllocate` and `canRemain` for a suspended writer shard.
+
+Landing this caught a real design mistake, not just a bug: the original assumption that `canRemain`
+returning `NO` alone (plus a plain reroute) would evict an already-*started* shard is wrong. Reading
+`LocalShardsBalancer.decideMove` (core's actual move logic) directly shows a shard failing `canRemain`
+is only ever *moved* to a better node -- finding no valid target (guaranteed here, since the same
+decider also returns `NO` from `canAllocate` everywhere while suspended) simply leaves the shard
+exactly where it is; core has no "no target, so unassign anyway" fallback for a plain reroute. This
+was caught by `ServerlessStorageShardSuspensionIT` asserting the shard's actual routing state, not by
+`SuspendedShardAllocationDeciderTests`'s own unit tests (which only ever check the decision in
+isolation, never what core's balancer does with it). Fixed by having `ShardSuspensionCoordinator`
+(new, `scaletozero` package) explicitly issue a `CancelAllocationCommand` (`allowPrimary=true`, safe
+specifically because the decider already guarantees nothing will re-allocate the shard back
+mid-cancel) via the ordinary `_cluster/reroute` mechanism -- after which the shard correctly stays
+`UNASSIGNED`, since the decider still says `NO` to every candidate node.
+
+Reactivation hit a second real bug, also only caught by the integration test, not a unit test: the
+first version of `ShardReactivationActionFilter` called `ClusterService#submitStateUpdateTask`
+directly, which only works when invoked *on* the elected cluster-manager node and throws
+`NotClusterManagerException` otherwise -- a real failure mode, since this filter runs on whichever
+node happens to receive the triggering write/search request, frequently not the cluster-manager.
+Fixed by routing through a proper `TransportClusterManagerNodeAction` (new `ReactivateShardsAction`/
+`TransportReactivateShardsAction`, `scaletozero/action` package), which transparently forwards to
+whichever node actually is cluster-manager, the same way any other cluster-state-mutating admin
+action already does. `ShardReactivationActionFilter` itself is index-granular, not shard-granular
+(core hasn't resolved which shard a request touches yet at the point an `ActionFilter` sees it),
+runs first (`order() == Integer.MIN_VALUE`), and never blocks the triggering request -- it fires the
+reactivation dispatch asynchronously and always calls `chain.proceed` immediately, letting the
+request's own already-existing `ClusterStateObserver` retry loop do the actual waiting. A REST/
+transport surface (`POST /_plugins/_serverless/storage/_reactivate?index=<name>`) also lets an
+operator manually warm a shard back up ahead of expected traffic. Deliberately a query parameter,
+not a `{index_uuid}` path segment like this plugin's other single-index routes: this route addresses
+an index by its ordinary (mutable) name, and reusing the `{index_uuid}` path-wildcard name would
+collide with those other routes at the same `PathTrie` depth -- caught by the same integration test,
+which failed node startup entirely with an `IllegalArgumentException` before this was fixed.
+
+`ScaleToZeroCandidatesSchedulerTask` now optionally does the actual suspending too: a new
+`ShardSuspensionCoordinator` parameter (`null` by default, existing callers unaffected) hands every
+evaluation's candidates to `suspendCandidates`. Gated behind a **separate** new setting,
+`serverless_storage.scale_to_zero.suspend_enabled` (default `false`), deliberately independent of
+`serverless_storage.scale_to_zero.eval_interval` -- turning on the eval interval alone must stay
+purely observational, as it always has, never a silent trigger for real suspension the moment an
+operator enables it. This distinction was forced by a real regression: without it, a pre-existing
+test (`ServerlessStorageScaleToZeroCandidatesSchedulerTaskIT`, using a zero idle threshold to avoid
+waiting out a real idle window) started genuinely suspending its own just-created shard before
+`ensureGreen` could observe it, hanging until timeout -- fixed by requiring the explicit opt-in
+setting rather than changing that test's premise.
+
+Deliberately not attempted: the "final flush+publication, manifest marked quiescent, pruning digest
+fold" nuance &sect;7.3's own narrative describes. Suspending a writer here only stops it from being
+allocated/kept allocated; it does not yet coordinate a clean last-commit hand-off with
+`ObjectStoreWriterEngine` first. No data is lost either way -- every commit is already durably
+published before suspension ever runs -- so this is a missed optimization (a future cold-start reads
+a very slightly older manifest than it could have), not a correctness gap. Reader-shard scale-to-zero
+is also still out of scope for this first increment: `SuspendedShardAllocationDecider` explicitly
+only ever acts on non-search-only (writer) shard copies.
+
+Verified with unit tests (`SuspendedShardsMetadataTests`, `SuspendedShardAllocationDeciderTests`,
+`ReactivateShardsRequestTests`) and a real end-to-end integration test
+(`ServerlessStorageShardSuspensionIT`) driving the full lifecycle over a real cluster: a real started
+writer shard is suspended and genuinely evicted (`UNASSIGNED`), a real write against the now-suspended
+index reactivates it end to end over the real transport layer, and the write succeeds and is visible
+on search afterward -- plus a full regression sweep of the existing scale-to-zero/allocation/writer-
+failover/reader-replica integration suites confirming no interaction with the new decider or action
+filter.
 
 **Phase 4.5 — Compaction service, fully done.** Candidate selection, rebase protocol, real Lucene
 merge, size-tiered shaping, background scheduling, a real concurrent-writer data-loss bug, real

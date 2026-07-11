@@ -38,9 +38,10 @@ import java.util.concurrent.atomic.AtomicReference;
  * itself already fans out cluster-wide; running this on every node would just multiply identical
  * work by the node count for no benefit.
  *
- * <p>Deliberately still the "policy" half only: {@link #latestCandidates()} is read-only, and
- * nothing in this class suspends, closes, or reactivates anything -- see {@code
- * ScaleToZeroCandidatesAction}'s own javadoc for why the actual mechanism stays out of scope here.
+ * <p>Now also the "do the work" half, when constructed with a non-{@code null} {@link
+ * ShardSuspensionCoordinator}: every successful evaluation's candidates are handed to {@link
+ * ShardSuspensionCoordinator#suspendCandidates} exactly as read, with no additional policy applied
+ * here -- {@link #latestCandidates()} remains read-only either way, for observability.
  */
 public final class ScaleToZeroCandidatesSchedulerTask implements Closeable {
 
@@ -48,8 +49,23 @@ public final class ScaleToZeroCandidatesSchedulerTask implements Closeable {
 
     private final Client client;
     private final ClusterService clusterService;
+    private final ShardSuspensionCoordinator suspensionCoordinator;
     private final Scheduler.Cancellable task;
     private final AtomicReference<List<ScaleToZeroCandidateEntry>> latestCandidates = new AtomicReference<>(List.of());
+
+    /**
+     * Starts the scheduled evaluation without acting on its own candidates -- equivalent to calling
+     * the other constructor with a {@code null} coordinator (policy-only, this class's original
+     * scope before suspension itself existed).
+     *
+     * @param threadPool schedules {@link #evaluate()} on a fixed delay.
+     * @param interval how often to evaluate.
+     * @param client dispatches the cluster-wide {@link ScaleToZeroCandidatesAction} request.
+     * @param clusterService used on every tick to check whether this is currently the elected cluster-manager node.
+     */
+    public ScaleToZeroCandidatesSchedulerTask(ThreadPool threadPool, TimeValue interval, Client client, ClusterService clusterService) {
+        this(threadPool, interval, client, clusterService, null);
+    }
 
     /**
      * Starts the scheduled evaluation.
@@ -58,10 +74,19 @@ public final class ScaleToZeroCandidatesSchedulerTask implements Closeable {
      * @param interval how often to evaluate.
      * @param client dispatches the cluster-wide {@link ScaleToZeroCandidatesAction} request.
      * @param clusterService used on every tick to check whether this is currently the elected cluster-manager node.
+     * @param suspensionCoordinator acts on every evaluation's candidates by suspending them, or
+     *                              {@code null} to stay policy-only (no shard is ever suspended).
      */
-    public ScaleToZeroCandidatesSchedulerTask(ThreadPool threadPool, TimeValue interval, Client client, ClusterService clusterService) {
+    public ScaleToZeroCandidatesSchedulerTask(
+        ThreadPool threadPool,
+        TimeValue interval,
+        Client client,
+        ClusterService clusterService,
+        ShardSuspensionCoordinator suspensionCoordinator
+    ) {
         this.client = client;
         this.clusterService = clusterService;
+        this.suspensionCoordinator = suspensionCoordinator;
         this.task = threadPool.scheduleWithFixedDelay(this::evaluateSafely, interval, ThreadPool.Names.GENERIC);
     }
 
@@ -97,6 +122,9 @@ public final class ScaleToZeroCandidatesSchedulerTask implements Closeable {
                     response.candidates().size(),
                     candidateCount
                 );
+                if (suspensionCoordinator != null) {
+                    suspensionCoordinator.suspendCandidates(response.candidates());
+                }
             }
 
             @Override

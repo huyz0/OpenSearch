@@ -42,6 +42,7 @@ import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.script.ScriptService;
 import org.opensearch.serverless.storage.allocation.ReaderShardPlacementAllocationDecider;
 import org.opensearch.serverless.storage.allocation.ServerlessStorageExistingShardsAllocator;
+import org.opensearch.serverless.storage.allocation.SuspendedShardAllocationDecider;
 import org.opensearch.serverless.storage.compaction.CompactionPolicy;
 import org.opensearch.serverless.storage.compaction.CompactionRebaseExecutor;
 import org.opensearch.serverless.storage.compaction.CompactionSchedulerConfig;
@@ -108,6 +109,14 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
 
     /** Creates the plugin; all real wiring happens in {@link #createComponents} once node services are available. */
     public ServerlessStoragePlugin() {}
+
+    /**
+     * Constructed eagerly (not in {@link #createComponents}) because {@link #getActionFilters()} is
+     * called before {@code createComponents} runs -- see the filter's own javadoc for why it takes
+     * its {@code ClusterService} via a late setter instead of its constructor.
+     */
+    private final org.opensearch.serverless.storage.scaletozero.ShardReactivationActionFilter shardReactivationActionFilter =
+        new org.opensearch.serverless.storage.scaletozero.ShardReactivationActionFilter();
 
     /**
      * The {@code index.store.type} value that opts a reader (search-only) shard copy into a
@@ -352,6 +361,20 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * Deliberately separate from {@link #SERVERLESS_STORAGE_SCALE_TO_ZERO_EVAL_INTERVAL_SETTING}
+     * and defaulting to {@code false}: turning on the scheduled evaluation alone must stay purely
+     * observational (as it always has -- {@code ScaleToZeroCandidatesSchedulerTask#latestCandidates()}
+     * remains read-only either way), never a silent trigger for real suspension the first time an
+     * operator enables the eval interval. An operator (or an eventual real policy controller) opts
+     * into the actual "do the work" half by setting both this <em>and</em> a positive eval interval.
+     */
+    public static final Setting<Boolean> SERVERLESS_STORAGE_SCALE_TO_ZERO_SUSPEND_ENABLED_SETTING = Setting.boolSetting(
+        "serverless_storage.scale_to_zero.suspend_enabled",
+        false,
+        Setting.Property.NodeScope
+    );
+
+    /**
      * Per-shard fairness budget for the one node-shared {@code WalChunkService}
      * (rfc-serverless-opensearch.md &sect;18 risk #4, "WAL multiplexing fairness") -- a shard whose
      * own buffered payload bytes since its last flush cross this budget is immediately siphoned
@@ -492,6 +515,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_SCALE_TO_ZERO_IDLE_THRESHOLD_SETTING,
             SERVERLESS_STORAGE_SCALE_TO_ZERO_LAG_THRESHOLD_SETTING,
             SERVERLESS_STORAGE_SCALE_TO_ZERO_EVAL_INTERVAL_SETTING,
+            SERVERLESS_STORAGE_SCALE_TO_ZERO_SUSPEND_ENABLED_SETTING,
             SERVERLESS_STORAGE_REPOSITORY_SETTING
         );
     }
@@ -549,13 +573,16 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         this.repositoryName = SERVERLESS_STORAGE_REPOSITORY_SETTING.get(environment.settings());
         this.scaleToZeroIdleThresholdMillis = SERVERLESS_STORAGE_SCALE_TO_ZERO_IDLE_THRESHOLD_SETTING.get(environment.settings()).millis();
         this.scaleToZeroLagThreshold = SERVERLESS_STORAGE_SCALE_TO_ZERO_LAG_THRESHOLD_SETTING.get(environment.settings());
+        shardReactivationActionFilter.setClusterServiceAndClient(clusterService, client);
         TimeValue scaleToZeroEvalInterval = SERVERLESS_STORAGE_SCALE_TO_ZERO_EVAL_INTERVAL_SETTING.get(environment.settings());
         if (scaleToZeroEvalInterval.millis() > 0) {
+            boolean suspendEnabled = SERVERLESS_STORAGE_SCALE_TO_ZERO_SUSPEND_ENABLED_SETTING.get(environment.settings());
             this.scaleToZeroCandidatesSchedulerTask = new org.opensearch.serverless.storage.scaletozero.ScaleToZeroCandidatesSchedulerTask(
                 threadPool,
                 scaleToZeroEvalInterval,
                 client,
-                clusterService
+                clusterService,
+                suspendEnabled ? new org.opensearch.serverless.storage.scaletozero.ShardSuspensionCoordinator(clusterService, client) : null
             );
         }
         String configuredBasePath = SERVERLESS_STORAGE_BASE_PATH_SETTING.get(environment.settings());
@@ -945,7 +972,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
 
     @Override
     public Collection<AllocationDecider> createAllocationDeciders(Settings settings, ClusterSettings clusterSettings) {
-        return Collections.singletonList(new ReaderShardPlacementAllocationDecider());
+        return java.util.List.of(new ReaderShardPlacementAllocationDecider(), new SuspendedShardAllocationDecider());
     }
 
     /**
@@ -963,6 +990,16 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     @Override
     public Collection<IndexSettingProvider> getAdditionalIndexSettingProviders() {
         return Collections.singletonList(new ServerlessStorageIndexSettingProvider());
+    }
+
+    /**
+     * Registers {@link org.opensearch.serverless.storage.scaletozero.ShardReactivationActionFilter}
+     * -- the cold-start-reactivation-on-access half of scale-to-zero (rfc-serverless-opensearch.md
+     * &sect;7.3), see that class's own javadoc.
+     */
+    @Override
+    public List<org.opensearch.action.support.ActionFilter> getActionFilters() {
+        return Collections.singletonList(shardReactivationActionFilter);
     }
 
     /**
@@ -1106,6 +1143,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 org.opensearch.serverless.storage.scaletozero.action.TransportScaleToZeroCandidatesAction.class
             ),
             new ActionHandler<>(
+                org.opensearch.serverless.storage.scaletozero.action.ReactivateShardsAction.INSTANCE,
+                org.opensearch.serverless.storage.scaletozero.action.TransportReactivateShardsAction.class
+            ),
+            new ActionHandler<>(
                 org.opensearch.serverless.storage.retention.action.SnapshotPinAction.INSTANCE,
                 org.opensearch.serverless.storage.retention.action.TransportSnapshotPinAction.class
             ),
@@ -1165,6 +1206,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new org.opensearch.serverless.storage.writerengine.action.RestNodeIdleShardsAction(),
             new org.opensearch.serverless.storage.readerengine.action.RestNodeManifestLagAction(),
             new org.opensearch.serverless.storage.scaletozero.action.RestScaleToZeroCandidatesAction(),
+            new org.opensearch.serverless.storage.scaletozero.action.RestReactivateShardsAction(),
             new org.opensearch.serverless.storage.retention.action.RestShardRetentionStatsAction(),
             new org.opensearch.serverless.storage.resharding.action.RestShardSplitAction(),
             new org.opensearch.serverless.storage.resharding.action.RestShardPartitionRewriteAction(),
