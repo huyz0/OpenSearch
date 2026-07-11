@@ -21,7 +21,7 @@ import static java.util.Collections.singletonList;
 import static org.opensearch.rest.RestRequest.Method.POST;
 
 /**
- * {@code POST /_plugins/_serverless/storage/_reactivate?index=<name>} -- the REST surface for
+ * {@code POST /_plugins/_serverless/storage/_reactivate?index=<name>[&reader=true]} -- the REST surface for
  * {@link ReactivateShardsAction}, letting an operator manually reactivate a suspended index rather
  * than only ever relying on {@code ShardReactivationActionFilter}'s automatic on-access trigger
  * (useful to warm a shard back up ahead of expected traffic, avoiding the first real request paying
@@ -62,12 +62,18 @@ public class RestReactivateShardsAction extends BaseRestHandler {
     }
 
     /**
-     * @param request the incoming REST request; the required {@code index} query parameter names the index to reactivate.
+     * @param request the incoming REST request; the required {@code index} query parameter names
+     *                the index to reactivate, and the optional {@code reader} boolean query
+     *                parameter (default {@code false}) selects reader (search-only) copies instead
+     *                of writer copies.
      * @param client used to dispatch the parsed {@link ReactivateShardsRequest}.
      */
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
-        ReactivateShardsRequest reactivateRequest = new ReactivateShardsRequest(request.param("index"));
+        ReactivateShardsRequest reactivateRequest = new ReactivateShardsRequest(
+            request.param("index"),
+            request.paramAsBoolean("reader", false)
+        );
         return channel -> client.execute(ReactivateShardsAction.INSTANCE, reactivateRequest, new RestToXContentListener<>(channel));
     }
 }

@@ -11,6 +11,9 @@ package org.opensearch.serverless.storage.readerengine;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.search.ReferenceManager;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.index.engine.Engine.Searcher;
+import org.opensearch.index.engine.Engine.SearcherScope;
+import org.opensearch.index.engine.Engine.SearcherSupplier;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.EngineException;
 import org.opensearch.index.engine.ReadOnlyEngine;
@@ -119,6 +122,23 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
     private final ReaderShardAdmissionController admissionController;
     private final CompactionSchedulerTask compactionSchedulerTask;
     private final GcSchedulerTask gcSchedulerTask;
+
+    /**
+     * The wall-clock time of this engine's own last real query-serving searcher acquisition
+     * (rfc-serverless-opensearch.md &sect;7.3's reader-shard scale-to-zero, the mirror of {@code
+     * ObjectStoreWriterEngine#lastActivityMillis} on the writer side). Initialized to construction
+     * time so a freshly-opened, never-yet-queried engine reports "just activated," not "infinitely
+     * idle" -- the same reasoning {@code lastActivityMillis} already uses.
+     *
+     * <p>Updated only from {@link #acquireSearcherSupplier(Function, SearcherScope)} with {@link
+     * SearcherScope#EXTERNAL}: that scope is real, client-facing search/get traffic; {@link
+     * SearcherScope#INTERNAL} covers this engine's own bookkeeping (segment/doc-count stats,
+     * completion stats, refresh-needed checks -- see every {@code SearcherScope.INTERNAL} call site
+     * in {@code Engine} itself), none of which represents a real client query and none of which
+     * should reset the idle clock, mirroring exactly how {@code ObjectStoreWriterEngine} excludes
+     * translog-replay-origin operations from resetting its own idle clock.
+     */
+    private final AtomicLong lastQueryMillis = new AtomicLong(System.currentTimeMillis());
 
     private ObjectStoreReaderEngine(
         EngineConfig config,
@@ -360,6 +380,32 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
      */
     public long manifestGenerationLag() {
         return Math.max(0, lastObservedLatestGeneration.get() - currentManifestGeneration.get());
+    }
+
+    /**
+     * Records real query-serving searcher acquisitions (see {@link #lastQueryMillis}'s own javadoc
+     * for the {@link SearcherScope#EXTERNAL}-only distinction) before delegating to {@link
+     * ReadOnlyEngine#acquireSearcherSupplier(Function, SearcherScope)}.
+     *
+     * @param wrapper passed through unchanged to {@link ReadOnlyEngine#acquireSearcherSupplier}.
+     * @param scope only {@link SearcherScope#EXTERNAL} counts as real query activity.
+     */
+    @Override
+    public SearcherSupplier acquireSearcherSupplier(Function<Searcher, Searcher> wrapper, SearcherScope scope) throws EngineException {
+        if (scope == SearcherScope.EXTERNAL) {
+            lastQueryMillis.set(System.currentTimeMillis());
+        }
+        return super.acquireSearcherSupplier(wrapper, scope);
+    }
+
+    /**
+     * How long since this engine's own last real client-facing search/get, mirroring {@code
+     * ObjectStoreWriterEngine#millisSinceLastActivity()} on the reader side (rfc-serverless-opensearch.md
+     * &sect;7.3's "reader shards scale to zero the same way [as writers]" -- the query-activity
+     * signal that still-open goal needs).
+     */
+    public long millisSinceLastQuery() {
+        return System.currentTimeMillis() - lastQueryMillis.get();
     }
 
     /** Invokes {@link #pollForNewerManifest()} synchronously, rather than waiting out {@link #MANIFEST_POLL_INTERVAL}. */

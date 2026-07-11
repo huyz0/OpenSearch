@@ -28,16 +28,16 @@ import org.opensearch.transport.client.Client;
 import java.util.List;
 
 /**
- * The "do the work" half of scale-to-zero writer suspension (rfc-serverless-opensearch.md
+ * The "do the work" half of scale-to-zero suspension, both writer and reader (rfc-serverless-opensearch.md
  * &sect;7.3), consuming {@link ScaleToZeroCandidateEntry} the same way {@code
  * CompactionSchedulerTask}'s own trigger consumes {@code CompactionPolicy}'s candidate selection --
- * this class makes no eligibility decision of its own, it only acts on {@link
- * ScaleToZeroCandidateEntry#candidate()} already being {@code true}.
+ * this class makes no eligibility decision of its own, it only acts on a candidate already being
+ * flagged eligible.
  *
  * <p>Marking a shard suspended is a plain {@link IndexMetadata} custom-data mutation ({@link
- * SuspendedShardsMetadata#withShardSuspended}) submitted as an ordinary {@link
- * ClusterStateUpdateTask} -- the same shape any other cluster-state-mutating feature in core uses,
- * requiring no new customization point.
+ * SuspendedShardsMetadata#withShardSuspended}/{@link SuspendedShardsMetadata#withReaderShardSuspended})
+ * submitted as an ordinary {@link ClusterStateUpdateTask} -- the same shape any other
+ * cluster-state-mutating feature in core uses, requiring no new customization point.
  *
  * <p><b>Eviction needs an explicit {@link CancelAllocationCommand}, not just a reroute -- a real
  * correction made during this feature's own integration testing, not the original design.</b> The
@@ -57,6 +57,11 @@ import java.util.List;
  * SuspendedShardAllocationDecider} already guarantees nothing will re-allocate this shard back
  * mid-cancel) explicitly force-unassigns the shard from its current node, after which it correctly
  * stays {@code UNASSIGNED} (the decider still says {@code NO} to every candidate node).
+ *
+ * <p><b>Reader eviction cancels every currently-assigned search-only copy, not just one.</b> Unlike
+ * a writer shard (exactly one primary), a shard's reader role can have several concurrently-assigned
+ * search-only replica copies ({@code index.number_of_search_only_replicas > 1}); suspending the
+ * reader role means evicting all of them, via {@link IndexShardRoutingTable#searchOnlyReplicas()}.
  */
 public final class ShardSuspensionCoordinator {
 
@@ -77,9 +82,10 @@ public final class ShardSuspensionCoordinator {
     }
 
     /**
-     * Marks every {@link ScaleToZeroCandidateEntry#candidate()} shard in {@code candidates} as
-     * suspended, skipping any already suspended (idempotent, so calling this on every scheduled
-     * evaluation tick -- most of which will find nothing new to do -- is cheap and safe).
+     * Marks every {@link ScaleToZeroCandidateEntry#candidate()} shard's <em>writer</em> copy in
+     * {@code candidates} as suspended, skipping any already suspended (idempotent, so calling this
+     * on every scheduled evaluation tick -- most of which will find nothing new to do -- is cheap
+     * and safe).
      *
      * @param candidates one evaluation's worth of scale-to-zero candidates; only entries with
      *                   {@link ScaleToZeroCandidateEntry#candidate()} {@code true} are acted on.
@@ -87,55 +93,109 @@ public final class ShardSuspensionCoordinator {
     public void suspendCandidates(List<ScaleToZeroCandidateEntry> candidates) {
         for (ScaleToZeroCandidateEntry entry : candidates) {
             if (entry.candidate()) {
-                suspend(entry.indexUuid(), entry.shardId());
+                suspendWriterShard(entry.indexUuid(), entry.shardId());
             }
         }
     }
 
-    private void suspend(String indexUuid, int shardId) {
+    /**
+     * Marks every {@link ScaleToZeroCandidateEntry#readerCandidate()} shard's <em>reader</em>
+     * (search-only) copy in {@code candidates} as suspended, skipping any already suspended.
+     * Independent of {@link #suspendCandidates} -- a shard's writer and reader copies are
+     * suspended on their own, unrelated schedules (see {@link ScaleToZeroCandidateEntry}'s own
+     * javadoc).
+     *
+     * @param candidates one evaluation's worth of scale-to-zero candidates; only entries with
+     *                   {@link ScaleToZeroCandidateEntry#readerCandidate()} {@code true} are acted on.
+     */
+    public void suspendReaderCandidates(List<ScaleToZeroCandidateEntry> candidates) {
+        for (ScaleToZeroCandidateEntry entry : candidates) {
+            if (entry.readerCandidate()) {
+                suspendReaderShard(entry.indexUuid(), entry.shardId());
+            }
+        }
+    }
+
+    /**
+     * Marks one shard's writer copy suspended. A no-op (idempotent) if already suspended.
+     *
+     * @param indexUuid the index the shard belongs to.
+     * @param shardId the shard number to suspend.
+     */
+    public void suspendWriterShard(String indexUuid, int shardId) {
+        suspend(indexUuid, shardId, false);
+    }
+
+    /**
+     * Marks one shard's reader (search-only) copy suspended. A no-op (idempotent) if already
+     * suspended.
+     *
+     * @param indexUuid the index the shard belongs to.
+     * @param shardId the shard number to suspend.
+     */
+    public void suspendReaderShard(String indexUuid, int shardId) {
+        suspend(indexUuid, shardId, true);
+    }
+
+    private void suspend(String indexUuid, int shardId, boolean reader) {
+        String role = reader ? "reader" : "writer";
         clusterService.submitStateUpdateTask("serverless-storage-suspend-shard", new ClusterStateUpdateTask(Priority.NORMAL) {
             @Override
             public ClusterState execute(ClusterState currentState) {
                 IndexMetadata indexMetadata = findByUuid(currentState.metadata(), indexUuid);
-                if (indexMetadata == null || SuspendedShardsMetadata.isSuspended(indexMetadata, shardId)) {
+                boolean alreadySuspended = indexMetadata != null
+                    && (reader
+                        ? SuspendedShardsMetadata.isReaderSuspended(indexMetadata, shardId)
+                        : SuspendedShardsMetadata.isSuspended(indexMetadata, shardId));
+                if (indexMetadata == null || alreadySuspended) {
                     return currentState;
                 }
-                IndexMetadata updated = SuspendedShardsMetadata.withShardSuspended(indexMetadata, shardId);
+                IndexMetadata updated = reader
+                    ? SuspendedShardsMetadata.withReaderShardSuspended(indexMetadata, shardId)
+                    : SuspendedShardsMetadata.withShardSuspended(indexMetadata, shardId);
                 return ClusterState.builder(currentState).metadata(Metadata.builder(currentState.metadata()).put(updated, true)).build();
             }
 
             @Override
             public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {
                 if (oldState != newState) {
-                    logger.info("suspended serverless-storage writer shard [" + indexUuid + "][" + shardId + "]");
-                    evict(newState, indexUuid, shardId);
+                    logger.info("suspended serverless-storage " + role + " shard [" + indexUuid + "][" + shardId + "]");
+                    evict(newState, indexUuid, shardId, reader);
                 }
             }
 
             @Override
             public void onFailure(String source, Exception e) {
-                logger.warn("failed to suspend serverless-storage writer shard [" + indexUuid + "][" + shardId + "]", e);
+                logger.warn("failed to suspend serverless-storage " + role + " shard [" + indexUuid + "][" + shardId + "]", e);
             }
         });
     }
 
-    private void evict(ClusterState state, String indexUuid, int shardId) {
+    private void evict(ClusterState state, String indexUuid, int shardId, boolean reader) {
         IndexMetadata indexMetadata = findByUuid(state.metadata(), indexUuid);
         if (indexMetadata == null) {
             return;
         }
         String indexName = indexMetadata.getIndex().getName();
         IndexShardRoutingTable shardRoutingTable = state.routingTable().index(indexName).shard(shardId);
-        ShardRouting primary = shardRoutingTable.primaryShard();
-        if (primary.unassigned()) {
+        List<ShardRouting> toEvict = reader ? shardRoutingTable.searchOnlyReplicas() : List.of(shardRoutingTable.primaryShard());
+
+        ClusterRerouteRequest reroute = new ClusterRerouteRequest();
+        int assignedCount = 0;
+        for (ShardRouting shardRouting : toEvict) {
+            if (shardRouting.unassigned() == false) {
+                reroute.add(new CancelAllocationCommand(indexName, shardId, shardRouting.currentNodeId(), true));
+                assignedCount++;
+            }
+        }
+        if (assignedCount == 0) {
             return; // already evicted, or was never assigned in the first place -- nothing to cancel.
         }
 
-        ClusterRerouteRequest reroute = new ClusterRerouteRequest();
-        reroute.add(new CancelAllocationCommand(indexName, shardId, primary.currentNodeId(), true));
+        String role = reader ? "reader" : "writer";
         client.admin().cluster().reroute(reroute, ActionListener.wrap(response -> {
-            logger.info("evicted suspended serverless-storage writer shard [" + indexUuid + "][" + shardId + "]");
-        }, e -> logger.warn("failed to evict suspended serverless-storage writer shard [" + indexUuid + "][" + shardId + "]", e)));
+            logger.info("evicted suspended serverless-storage " + role + " shard [" + indexUuid + "][" + shardId + "]");
+        }, e -> logger.warn("failed to evict suspended serverless-storage " + role + " shard [" + indexUuid + "][" + shardId + "]", e)));
     }
 
     private static IndexMetadata findByUuid(Metadata metadata, String indexUuid) {

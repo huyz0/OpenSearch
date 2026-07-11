@@ -36,6 +36,10 @@ public class SuspendedShardAllocationDeciderTests extends OpenSearchAllocationTe
     private static final String CLASSIC_INDEX = "suspend-decider-classic-idx";
 
     private ClusterState buildClusterState(boolean shard0Suspended) {
+        return buildClusterState(shard0Suspended, false);
+    }
+
+    private ClusterState buildClusterState(boolean shard0WriterSuspended, boolean shard0ReaderSuspended) {
         Settings serverlessIndexSettings = settings(Version.CURRENT).put(
             ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey(),
             true
@@ -45,8 +49,11 @@ public class SuspendedShardAllocationDeciderTests extends OpenSearchAllocationTe
             .numberOfShards(1)
             .numberOfReplicas(0);
         IndexMetadata serverlessIndex = serverlessIndexBuilder.build();
-        if (shard0Suspended) {
+        if (shard0WriterSuspended) {
             serverlessIndex = SuspendedShardsMetadata.withShardSuspended(serverlessIndex, 0);
+        }
+        if (shard0ReaderSuspended) {
+            serverlessIndex = SuspendedShardsMetadata.withReaderShardSuspended(serverlessIndex, 0);
         }
         IndexMetadata classicIndex = IndexMetadata.builder(CLASSIC_INDEX)
             .settings(settings(Version.CURRENT))
@@ -117,9 +124,10 @@ public class SuspendedShardAllocationDeciderTests extends OpenSearchAllocationTe
         assertEquals(Decision.Type.YES, decider.canRemain(writerShard, routingNode, allocation).type());
     }
 
-    public void testReaderShardIsNeverAffectedBySuspension() {
-        // Reader-shard scale-to-zero is deliberately out of scope for this decider (see its own javadoc).
-        ClusterState state = buildClusterState(true);
+    public void testUnsuspendedReaderShardIsUnaffectedByWriterSuspension() {
+        // Writer and reader suspension are tracked completely independently (see the decider's own
+        // javadoc): suspending the writer must never affect the reader copy's own decision.
+        ClusterState state = buildClusterState(true, false);
         RoutingAllocation allocation = newAllocation(state);
         SuspendedShardAllocationDecider decider = new SuspendedShardAllocationDecider();
 
@@ -135,6 +143,47 @@ public class SuspendedShardAllocationDeciderTests extends OpenSearchAllocationTe
 
         RoutingNode routingNode = state.getRoutingNodes().node("node-1");
         assertEquals(Decision.Type.YES, decider.canAllocate(readerShard, routingNode, allocation).type());
+    }
+
+    public void testSuspendedReaderShardCannotBeAllocated() {
+        ClusterState state = buildClusterState(false, true);
+        RoutingAllocation allocation = newAllocation(state);
+        SuspendedShardAllocationDecider decider = new SuspendedShardAllocationDecider();
+
+        ShardId shardId = new ShardId(new Index(SERVERLESS_INDEX, state.metadata().index(SERVERLESS_INDEX).getIndexUUID()), 0);
+        ShardRouting readerShard = TestShardRouting.newShardRouting(
+            shardId,
+            null,
+            false,
+            true,
+            ShardRoutingState.UNASSIGNED,
+            RecoverySource.EmptyStoreRecoverySource.INSTANCE
+        );
+
+        RoutingNode routingNode = state.getRoutingNodes().node("node-1");
+        assertEquals(Decision.Type.NO, decider.canAllocate(readerShard, routingNode, allocation).type());
+    }
+
+    public void testSuspendedReaderShardCannotRemainButUnsuspendedWriterOnSameShardCan() {
+        ClusterState state = buildClusterState(false, true);
+        RoutingAllocation allocation = newAllocation(state);
+        SuspendedShardAllocationDecider decider = new SuspendedShardAllocationDecider();
+
+        ShardId shardId = new ShardId(new Index(SERVERLESS_INDEX, state.metadata().index(SERVERLESS_INDEX).getIndexUUID()), 0);
+        ShardRouting readerShard = TestShardRouting.newShardRouting(shardId, "node-1", false, true, ShardRoutingState.STARTED, null);
+        ShardRouting writerShard = TestShardRouting.newShardRouting(shardId, "node-1", true, ShardRoutingState.STARTED);
+
+        RoutingNode routingNode = state.getRoutingNodes().node("node-1");
+        assertEquals(
+            "an already-started reader shard must be evicted once its reader copy is marked suspended",
+            Decision.Type.NO,
+            decider.canRemain(readerShard, routingNode, allocation).type()
+        );
+        assertEquals(
+            "the writer copy of the same shard is unaffected by the reader's own suspension",
+            Decision.Type.YES,
+            decider.canRemain(writerShard, routingNode, allocation).type()
+        );
     }
 
     public void testNonServerlessIndexIsUnaffected() {

@@ -69,4 +69,46 @@ public class SuspendedShardsMetadataTests extends OpenSearchTestCase {
         IndexMetadata index = freshIndex();
         assertSame(index, SuspendedShardsMetadata.withAllShardsReactivated(index));
     }
+
+    public void testWriterAndReaderSuspensionAreTrackedCompletelyIndependently() {
+        IndexMetadata index = freshIndex();
+        IndexMetadata writerSuspended = SuspendedShardsMetadata.withShardSuspended(index, 1);
+
+        assertTrue(SuspendedShardsMetadata.isSuspended(writerSuspended, 1));
+        assertFalse(
+            "suspending the writer copy must not suspend the reader copy of the same shard",
+            SuspendedShardsMetadata.isReaderSuspended(writerSuspended, 1)
+        );
+        assertEquals(Set.of(), SuspendedShardsMetadata.suspendedReaderShardIds(writerSuspended));
+
+        IndexMetadata bothSuspended = SuspendedShardsMetadata.withReaderShardSuspended(writerSuspended, 1);
+        assertTrue(SuspendedShardsMetadata.isSuspended(bothSuspended, 1));
+        assertTrue(SuspendedShardsMetadata.isReaderSuspended(bothSuspended, 1));
+
+        IndexMetadata writerReactivated = SuspendedShardsMetadata.withAllShardsReactivated(bothSuspended);
+        assertFalse(
+            "reactivating writer shards must not affect reader suspension",
+            SuspendedShardsMetadata.isSuspended(writerReactivated, 1)
+        );
+        assertTrue(
+            "reactivating writer shards must not affect reader suspension",
+            SuspendedShardsMetadata.isReaderSuspended(writerReactivated, 1)
+        );
+
+        IndexMetadata readerReactivated = SuspendedShardsMetadata.withAllReaderShardsReactivated(writerReactivated);
+        assertFalse(SuspendedShardsMetadata.isReaderSuspended(readerReactivated, 1));
+    }
+
+    public void testWithReaderShardSuspendedIsIdempotentAndReturnsSameInstanceIfAlreadySuspended() {
+        IndexMetadata index = freshIndex();
+        IndexMetadata suspendedOnce = SuspendedShardsMetadata.withReaderShardSuspended(index, 1);
+        IndexMetadata suspendedTwice = SuspendedShardsMetadata.withReaderShardSuspended(suspendedOnce, 1);
+
+        assertSame("suspending an already-suspended reader shard must be a true no-op", suspendedOnce, suspendedTwice);
+    }
+
+    public void testWithAllReaderShardsReactivatedIsANoOpWhenNothingIsSuspended() {
+        IndexMetadata index = freshIndex();
+        assertSame(index, SuspendedShardsMetadata.withAllReaderShardsReactivated(index));
+    }
 }

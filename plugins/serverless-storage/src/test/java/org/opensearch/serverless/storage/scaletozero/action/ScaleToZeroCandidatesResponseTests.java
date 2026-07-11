@@ -33,6 +33,7 @@ public class ScaleToZeroCandidatesResponseTests extends OpenSearchTestCase {
         NodeScaleToZeroCandidatesResponse writerNode = new NodeScaleToZeroCandidatesResponse(
             node("writer"),
             List.of(new IdleShardEntry("idx-1", 0, 20_000L)),
+            List.of(),
             List.of()
         );
         ScaleToZeroCandidatesResponse response = new ScaleToZeroCandidatesResponse(
@@ -52,12 +53,14 @@ public class ScaleToZeroCandidatesResponseTests extends OpenSearchTestCase {
         NodeScaleToZeroCandidatesResponse writerNode = new NodeScaleToZeroCandidatesResponse(
             node("writer"),
             List.of(new IdleShardEntry("idx-1", 0, 20_000L)),
+            List.of(),
             List.of()
         );
         NodeScaleToZeroCandidatesResponse readerNode = new NodeScaleToZeroCandidatesResponse(
             node("reader"),
             List.of(),
-            List.of(new ShardLagEntry("idx-1", 0, 3L))
+            List.of(new ShardLagEntry("idx-1", 0, 3L)),
+            List.of()
         );
         ScaleToZeroCandidatesResponse response = new ScaleToZeroCandidatesResponse(
             new ClusterName("test"),
@@ -75,12 +78,14 @@ public class ScaleToZeroCandidatesResponseTests extends OpenSearchTestCase {
         NodeScaleToZeroCandidatesResponse writerNode = new NodeScaleToZeroCandidatesResponse(
             node("writer"),
             List.of(new IdleShardEntry("idx-1", 0, 1_000L)),
+            List.of(),
             List.of()
         );
         NodeScaleToZeroCandidatesResponse readerNode = new NodeScaleToZeroCandidatesResponse(
             node("reader"),
             List.of(),
-            List.of(new ShardLagEntry("idx-1", 0, 0L))
+            List.of(new ShardLagEntry("idx-1", 0, 0L)),
+            List.of()
         );
         ScaleToZeroCandidatesResponse response = new ScaleToZeroCandidatesResponse(
             new ClusterName("test"),
@@ -100,11 +105,13 @@ public class ScaleToZeroCandidatesResponseTests extends OpenSearchTestCase {
         NodeScaleToZeroCandidatesResponse nodeA = new NodeScaleToZeroCandidatesResponse(
             node("a"),
             List.of(new IdleShardEntry("idx-1", 0, 5_000L)),
+            List.of(),
             List.of()
         );
         NodeScaleToZeroCandidatesResponse nodeB = new NodeScaleToZeroCandidatesResponse(
             node("b"),
             List.of(new IdleShardEntry("idx-1", 0, 15_000L)),
+            List.of(),
             List.of()
         );
         ScaleToZeroCandidatesResponse response = new ScaleToZeroCandidatesResponse(
@@ -122,7 +129,7 @@ public class ScaleToZeroCandidatesResponseTests extends OpenSearchTestCase {
     public void testAShardWithNoNodeReportsIsAbsentFromTheMergedList() {
         ScaleToZeroCandidatesResponse response = new ScaleToZeroCandidatesResponse(
             new ClusterName("test"),
-            List.of(new NodeScaleToZeroCandidatesResponse(node("a"), List.of(), List.of())),
+            List.of(new NodeScaleToZeroCandidatesResponse(node("a"), List.of(), List.of(), List.of())),
             List.of(),
             10_000L,
             0L
@@ -134,6 +141,7 @@ public class ScaleToZeroCandidatesResponseTests extends OpenSearchTestCase {
         NodeScaleToZeroCandidatesResponse writerNode = new NodeScaleToZeroCandidatesResponse(
             node("writer"),
             List.of(new IdleShardEntry("idx-1", 0, 20_000L)),
+            List.of(),
             List.of()
         );
         ScaleToZeroCandidatesResponse response = new ScaleToZeroCandidatesResponse(
@@ -145,5 +153,51 @@ public class ScaleToZeroCandidatesResponseTests extends OpenSearchTestCase {
         );
         assertTrue(response.hasFailures());
         assertTrue(findEntry(response, "idx-1", 0).isPresent());
+    }
+
+    public void testReaderCandidacyIsIndependentOfWriterCandidacy() {
+        // A shard whose writer is busy (not idle enough) but whose reader has had no query
+        // traffic in a long time must still be flagged as a reader candidate.
+        NodeScaleToZeroCandidatesResponse writerNode = new NodeScaleToZeroCandidatesResponse(
+            node("writer"),
+            List.of(new IdleShardEntry("idx-1", 0, 1_000L)),
+            List.of(),
+            List.of()
+        );
+        NodeScaleToZeroCandidatesResponse readerNode = new NodeScaleToZeroCandidatesResponse(
+            node("reader"),
+            List.of(),
+            List.of(),
+            List.of(new IdleShardEntry("idx-1", 0, 20_000L))
+        );
+        ScaleToZeroCandidatesResponse response = new ScaleToZeroCandidatesResponse(
+            new ClusterName("test"),
+            List.of(writerNode, readerNode),
+            List.of(),
+            10_000L,
+            0L
+        );
+        ScaleToZeroCandidateEntry entry = findEntry(response, "idx-1", 0).orElseThrow();
+        assertFalse("the writer is not idle enough, so it must not be a candidate", entry.candidate());
+        assertTrue("the reader has had no queries for long enough, so it must be a candidate", entry.readerCandidate());
+        assertEquals(20_000L, entry.readerMillisSinceLastQuery());
+    }
+
+    public void testReaderNotYetIdleEnoughIsNotAReaderCandidate() {
+        NodeScaleToZeroCandidatesResponse readerNode = new NodeScaleToZeroCandidatesResponse(
+            node("reader"),
+            List.of(),
+            List.of(),
+            List.of(new IdleShardEntry("idx-1", 0, 1_000L))
+        );
+        ScaleToZeroCandidatesResponse response = new ScaleToZeroCandidatesResponse(
+            new ClusterName("test"),
+            List.of(readerNode),
+            List.of(),
+            10_000L,
+            0L
+        );
+        ScaleToZeroCandidateEntry entry = findEntry(response, "idx-1", 0).orElseThrow();
+        assertFalse(entry.readerCandidate());
     }
 }

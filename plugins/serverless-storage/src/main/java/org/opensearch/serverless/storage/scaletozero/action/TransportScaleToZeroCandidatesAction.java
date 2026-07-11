@@ -129,7 +129,13 @@ public class TransportScaleToZeroCandidatesAction extends TransportNodesAction<
             lagEntries.add(toShardLagEntry(entry));
         }
 
-        return new NodeScaleToZeroCandidatesResponse(clusterService.localNode(), idleEntries, lagEntries);
+        Map<String, Long> readerIdleSnapshot = plugin.readerShardActivityRegistry().snapshotQueryIdleMillis();
+        List<IdleShardEntry> readerIdleEntries = new ArrayList<>(readerIdleSnapshot.size());
+        for (Map.Entry<String, Long> entry : readerIdleSnapshot.entrySet()) {
+            readerIdleEntries.add(toIdleShardEntry(entry));
+        }
+
+        return new NodeScaleToZeroCandidatesResponse(clusterService.localNode(), idleEntries, lagEntries, readerIdleEntries);
     }
 
     private static IdleShardEntry toIdleShardEntry(Map.Entry<String, Long> entry) {

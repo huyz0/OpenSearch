@@ -66,6 +66,22 @@ public final class ReaderShardActivityRegistry {
     }
 
     /**
+     * Looks up how long since the currently-live reader engine for (indexUuid, shardId) on this
+     * node last saw a real client-facing search/get (rfc-serverless-opensearch.md &sect;7.3's
+     * reader-shard scale-to-zero query-activity signal).
+     *
+     * @param indexUuid the UUID of the index the shard belongs to
+     * @param shardId the shard number within {@code indexUuid}
+     * @return the reader engine's own {@link ObjectStoreReaderEngine#millisSinceLastQuery()}, or
+     *         empty if no reader engine for this shard is currently tracked on this node
+     */
+    public Optional<Long> millisSinceLastQuery(String indexUuid, int shardId) {
+        WeakReference<ObjectStoreReaderEngine> ref = engines.get(key(indexUuid, shardId));
+        ObjectStoreReaderEngine engine = ref == null ? null : ref.get();
+        return engine == null ? Optional.empty() : Optional.of(engine.millisSinceLastQuery());
+    }
+
+    /**
      * A point-in-time snapshot of every reader engine currently tracked on this node, keyed the
      * same {@code "indexUuid/shardId"} way as {@code
      * org.opensearch.serverless.storage.writerengine.ShardActivityRegistry#snapshotAll} -- silently
@@ -79,6 +95,25 @@ public final class ReaderShardActivityRegistry {
             ObjectStoreReaderEngine engine = entry.getValue().get();
             if (engine != null) {
                 snapshot.put(entry.getKey(), engine.manifestGenerationLag());
+            }
+        }
+        return snapshot;
+    }
+
+    /**
+     * A point-in-time snapshot of every reader engine currently tracked on this node's own {@link
+     * ObjectStoreReaderEngine#millisSinceLastQuery()} -- the query-activity counterpart to {@link
+     * #snapshotAll()}'s manifest-lag snapshot, silently skipping any entry whose {@link
+     * WeakReference} has already been collected.
+     *
+     * @return every (indexUuid, shardId) key together with that shard's current query idle time
+     */
+    public Map<String, Long> snapshotQueryIdleMillis() {
+        Map<String, Long> snapshot = new java.util.HashMap<>();
+        for (Map.Entry<String, WeakReference<ObjectStoreReaderEngine>> entry : engines.entrySet()) {
+            ObjectStoreReaderEngine engine = entry.getValue().get();
+            if (engine != null) {
+                snapshot.put(entry.getKey(), engine.millisSinceLastQuery());
             }
         }
         return snapshot;

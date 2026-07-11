@@ -17,12 +17,12 @@ import org.opensearch.cluster.routing.allocation.decider.Decision;
 import org.opensearch.serverless.storage.ServerlessStoragePlugin;
 
 /**
- * Enforces writer-shard suspension (rfc-serverless-opensearch.md &sect;7.3) purely through the
- * ordinary {@link AllocationDecider} SPI -- no core diff needed, confirmed by direct research into
- * {@code ExistingShardsAllocator}/{@code TransportReplicationAction} before this was written (see
- * this feature's own commit message): a shard marked suspended via {@link SuspendedShardsMetadata}
- * simply fails both halves of ordinary allocation decision-making, which core already handles
- * correctly on its own:
+ * Enforces both writer- and reader-shard suspension (rfc-serverless-opensearch.md &sect;7.3) purely
+ * through the ordinary {@link AllocationDecider} SPI -- no core diff needed, confirmed by direct
+ * research into {@code ExistingShardsAllocator}/{@code TransportReplicationAction} before this was
+ * written (see this feature's own commit message): a shard marked suspended via {@link
+ * SuspendedShardsMetadata} simply fails both halves of ordinary allocation decision-making, which
+ * core already handles correctly on its own:
  *
  * <ul>
  *   <li>{@link #canAllocate}: {@code NO} on every node keeps a not-yet-assigned suspended shard
@@ -30,20 +30,24 @@ import org.opensearch.serverless.storage.ServerlessStoragePlugin;
  *       loops every {@code AllocationDecider} via {@code firstDeciderApprovedNode} and calls {@code
  *       removeAndIgnore} when none approve, exactly the same path an ordinary "no capacity"
  *       decision already takes. No change needed there.
- *   <li>{@link #canRemain}: {@code NO} is what actually evicts an <em>already started</em> writer
- *       shard -- core's balancer/rebalance pass re-checks {@code canRemain} for started shards on
- *       every reroute and unassigns any that now fail it, the same mechanism that already moves a
- *       shard off a node that newly fails a disk-watermark or awareness decider. This is the actual
- *       "stop consuming compute" half of suspension: {@code ShardSuspensionCoordinator} pairs
- *       marking a shard suspended with an explicit {@code RerouteService#reroute} call so this
- *       eviction happens promptly rather than waiting for an unrelated cluster-state change.
+ *   <li>{@link #canRemain}: {@code NO} is what actually evicts an <em>already started</em> shard --
+ *       core's balancer/rebalance pass re-checks {@code canRemain} for started shards on every
+ *       reroute and unassigns any that now fail it, the same mechanism that already moves a shard
+ *       off a node that newly fails a disk-watermark or awareness decider. This is the actual "stop
+ *       consuming compute" half of suspension: {@code ShardSuspensionCoordinator} pairs marking a
+ *       shard suspended with an explicit {@code CancelAllocationCommand} so this eviction happens
+ *       promptly rather than waiting for an unrelated cluster-state change (see that class's own
+ *       javadoc for why {@code canRemain} alone, without the explicit cancel, does not evict a
+ *       started shard with no valid relocation target).
  * </ul>
  *
- * <p>Scoped to non-search-only (writer) copies only, mirroring {@link
- * ReaderShardPlacementAllocationDecider}'s own {@code isSearchOnly()} split -- reader-shard
- * scale-to-zero (&sect;7.3's "reader shards scale to zero the same way") is deliberately out of
- * scope for this first increment, since a reader shard's own admission-control/staleness story
- * (already implemented, &sect;7.2) is a materially different mechanism from a writer's.
+ * <p>Writer and reader (search-only) copies are suspended completely independently, reading {@link
+ * SuspendedShardsMetadata#isSuspended}/{@link SuspendedShardsMetadata#isReaderSuspended}
+ * respectively based on {@link ShardRouting#isSearchOnly()} -- the same split {@link
+ * ReaderShardPlacementAllocationDecider} already uses for placement, just applied to suspension
+ * instead. Reader-shard suspension was deliberately deferred out of this class's first version
+ * (writer-only); extending it required no change to the eviction/allocation mechanism itself, only
+ * this per-role metadata lookup -- the mechanism was already role-agnostic by construction.
  */
 public class SuspendedShardAllocationDecider extends AllocationDecider {
 
@@ -64,17 +68,23 @@ public class SuspendedShardAllocationDecider extends AllocationDecider {
     }
 
     private Decision decide(ShardRouting shardRouting, RoutingAllocation allocation) {
-        if (shardRouting.isSearchOnly()) {
-            return allocation.decision(Decision.YES, NAME, "reader shard, suspension does not apply");
-        }
         IndexMetadata indexMetadata = allocation.metadata().getIndexSafe(shardRouting.index());
         boolean isServerlessStorageIndex = ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.get(indexMetadata.getSettings());
         if (isServerlessStorageIndex == false) {
             return allocation.decision(Decision.YES, NAME, "index has not opted into serverless storage, no opinion");
         }
-        if (SuspendedShardsMetadata.isSuspended(indexMetadata, shardRouting.id())) {
-            return allocation.decision(Decision.NO, NAME, "writer shard is suspended (scale-to-zero), awaiting reactivation");
+        boolean isReader = shardRouting.isSearchOnly();
+        boolean suspended = isReader
+            ? SuspendedShardsMetadata.isReaderSuspended(indexMetadata, shardRouting.id())
+            : SuspendedShardsMetadata.isSuspended(indexMetadata, shardRouting.id());
+        if (suspended) {
+            return allocation.decision(
+                Decision.NO,
+                NAME,
+                "%s shard is suspended (scale-to-zero), awaiting reactivation",
+                isReader ? "reader" : "writer"
+            );
         }
-        return allocation.decision(Decision.YES, NAME, "writer shard is not suspended");
+        return allocation.decision(Decision.YES, NAME, "%s shard is not suspended", isReader ? "reader" : "writer");
     }
 }

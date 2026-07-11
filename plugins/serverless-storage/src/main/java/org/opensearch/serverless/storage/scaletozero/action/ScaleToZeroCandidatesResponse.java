@@ -82,6 +82,7 @@ public class ScaleToZeroCandidatesResponse extends BaseNodesResponse<NodeScaleTo
     ) {
         Map<String, Long> worstIdleByShard = new LinkedHashMap<>();
         Map<String, Long> worstLagByShard = new LinkedHashMap<>();
+        Map<String, Long> worstReaderIdleByShard = new LinkedHashMap<>();
         for (NodeScaleToZeroCandidatesResponse node : nodes) {
             for (IdleShardEntry entry : node.idleShards()) {
                 String key = key(entry.indexUuid(), entry.shardId());
@@ -91,14 +92,24 @@ public class ScaleToZeroCandidatesResponse extends BaseNodesResponse<NodeScaleTo
                 String key = key(entry.indexUuid(), entry.shardId());
                 worstLagByShard.merge(key, entry.manifestGenerationLag(), Math::max);
             }
+            for (IdleShardEntry entry : node.readerIdleShards()) {
+                String key = key(entry.indexUuid(), entry.shardId());
+                worstReaderIdleByShard.merge(key, entry.millisSinceLastActivity(), Math::max);
+            }
         }
 
         Map<String, ScaleToZeroCandidateEntry> byShard = new LinkedHashMap<>();
         for (Map.Entry<String, Long> idle : worstIdleByShard.entrySet()) {
-            byShard.put(idle.getKey(), buildEntry(idle.getKey(), idle.getValue(), worstLagByShard.get(idle.getKey())));
+            byShard.put(
+                idle.getKey(),
+                buildEntry(idle.getKey(), idle.getValue(), worstLagByShard.get(idle.getKey()), worstReaderIdleByShard.get(idle.getKey()))
+            );
         }
         for (Map.Entry<String, Long> lag : worstLagByShard.entrySet()) {
-            byShard.putIfAbsent(lag.getKey(), buildEntry(lag.getKey(), null, lag.getValue()));
+            byShard.putIfAbsent(lag.getKey(), buildEntry(lag.getKey(), null, lag.getValue(), worstReaderIdleByShard.get(lag.getKey())));
+        }
+        for (Map.Entry<String, Long> readerIdle : worstReaderIdleByShard.entrySet()) {
+            byShard.putIfAbsent(readerIdle.getKey(), buildEntry(readerIdle.getKey(), null, null, readerIdle.getValue()));
         }
 
         List<ScaleToZeroCandidateEntry> result = new ArrayList<>(byShard.size());
@@ -109,20 +120,29 @@ public class ScaleToZeroCandidatesResponse extends BaseNodesResponse<NodeScaleTo
             boolean readersCaughtUp = raw.manifestGenerationLag() == ScaleToZeroCandidateEntry.UNKNOWN
                 || raw.manifestGenerationLag() <= lagThreshold;
             boolean candidate = idleEnough && readersCaughtUp;
+            boolean readerIdleEnough = raw.readerMillisSinceLastQuery() != ScaleToZeroCandidateEntry.UNKNOWN
+                && raw.readerMillisSinceLastQuery() >= idleThresholdMillis;
             result.add(
                 new ScaleToZeroCandidateEntry(
                     raw.indexUuid(),
                     raw.shardId(),
                     raw.millisSinceLastActivity(),
                     raw.manifestGenerationLag(),
-                    candidate
+                    candidate,
+                    raw.readerMillisSinceLastQuery(),
+                    readerIdleEnough
                 )
             );
         }
         return result;
     }
 
-    private static ScaleToZeroCandidateEntry buildEntry(String key, Long millisSinceLastActivity, Long manifestGenerationLag) {
+    private static ScaleToZeroCandidateEntry buildEntry(
+        String key,
+        Long millisSinceLastActivity,
+        Long manifestGenerationLag,
+        Long readerMillisSinceLastQuery
+    ) {
         int separator = key.lastIndexOf('/');
         String indexUuid = key.substring(0, separator);
         int shardId = Integer.parseInt(key.substring(separator + 1));
@@ -131,6 +151,8 @@ public class ScaleToZeroCandidatesResponse extends BaseNodesResponse<NodeScaleTo
             shardId,
             millisSinceLastActivity == null ? ScaleToZeroCandidateEntry.UNKNOWN : millisSinceLastActivity,
             manifestGenerationLag == null ? ScaleToZeroCandidateEntry.UNKNOWN : manifestGenerationLag,
+            false,
+            readerMillisSinceLastQuery == null ? ScaleToZeroCandidateEntry.UNKNOWN : readerMillisSinceLastQuery,
             false
         );
     }

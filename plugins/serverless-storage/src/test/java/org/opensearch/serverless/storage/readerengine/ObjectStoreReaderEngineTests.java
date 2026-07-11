@@ -167,6 +167,80 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
         }
     }
 
+    public void testMillisSinceLastQueryUpdatesOnRealSearchesButNotOnInternalSearcherAcquisitions() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ObjectStoreCommitPublisher publisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+
+        CommitManifest manifest;
+        try (Directory writerDirectory = new ByteBuffersDirectory()) {
+            IndexWriterConfig config = new IndexWriterConfig();
+            try (IndexWriter writer = new IndexWriter(writerDirectory, config)) {
+                Document doc = new Document();
+                doc.add(new StringField("id", "1", Field.Store.YES));
+                writer.addDocument(doc);
+                writer.commit();
+            }
+            SegmentInfos segmentInfos = SegmentInfos.readLatestCommit(writerDirectory);
+            manifest = publisher.publishCommit(
+                writerDirectory,
+                segmentInfos,
+                INDEX_UUID,
+                SHARD_ID,
+                1,
+                segmentInfos.getGeneration(),
+                0,
+                0,
+                new WalPosition("epoch-0", 0),
+                0,
+                PruningStats.empty()
+            );
+        }
+
+        try (Store store = createStore()) {
+            EngineConfig engineConfig = config(defaultSettings, store, createTempDir(), newMergePolicy(), null);
+            ObjectStoreCommitMaterializer materializer = new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer));
+            ShardDirectory shardDirectory = new InMemoryShardDirectory();
+
+            try (
+                ObjectStoreReaderEngine readerEngine = ObjectStoreReaderEngine.open(
+                    engineConfig,
+                    manifest,
+                    materializer,
+                    PRIMARY_TERM,
+                    new org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore(blobContainer),
+                    new BlobContainerManifestStore(blobContainer),
+                    shardDirectory,
+                    LOCAL_NODE_ID
+                )
+            ) {
+                assertTrue(
+                    "freshly opened, never-queried engine should report roughly zero idle time, not an arbitrarily large one",
+                    readerEngine.millisSinceLastQuery() < 5000
+                );
+
+                // docStats() acquires its searcher purely via SearcherScope.INTERNAL (unlike
+                // segmentsStats(), which also does an EXTERNAL acquisition internally) -- must
+                // never look like real query traffic.
+                Thread.sleep(50);
+                readerEngine.docStats();
+                long idleAfterInternalOnly = readerEngine.millisSinceLastQuery();
+                assertTrue("an internal-scope searcher acquisition must not reset the idle clock", idleAfterInternalOnly >= 40);
+
+                // acquireSearcher("test") (used throughout this test class) goes through
+                // SearcherScope.EXTERNAL -- a real client-facing query.
+                try (Engine.Searcher searcher = readerEngine.acquireSearcher("test")) {
+                    TopDocs hits = searcher.search(new TermQuery(new Term("id", "1")), 10);
+                    assertEquals(1, hits.totalHits.value());
+                }
+                assertTrue("a real query must reset the idle clock back down near zero", readerEngine.millisSinceLastQuery() < 5000);
+            }
+        }
+    }
+
     public void testAdmissionControllerRejectsOpeningBeyondItsCapacityThenAllowsAgainAfterClose() throws Exception {
         FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
         BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());

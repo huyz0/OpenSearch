@@ -1957,10 +1957,11 @@ only for this RFC's purposes.
 
 **Phase 4 — Topology (4–6 weeks).** Role-separated allocation (done, see &sect;10 and
 `ServerlessStorageExistingShardsAllocator`/`ReaderShardPlacementAllocationDecider`), suspended
-writers and scale-to-zero (done, signal collection through the actual suspend/reactivate mechanism
--- see below), balancer hysteresis (still open). Milestone: idle index consumes zero compute (done
-for writers); first query after idle returns < 5 s p95 for a cached-manifest index (not yet
-benchmarked -- reader-shard scale-to-zero itself remains out of scope, see below).
+writers and readers and scale-to-zero for both (done, signal collection through the actual
+suspend/reactivate mechanism -- see below), balancer hysteresis (still open). Milestone: idle index
+consumes zero compute (done for both writer and reader shards); first query after idle returns < 5 s
+p95 for a cached-manifest index (not yet benchmarked, but the "never a client-visible failure"
+correctness bar the milestone implies is now met and integration-tested).
 
 **First increment of "suspended writers" landed: the raw idle-activity signal any suspension or
 scale-to-zero decision needs.** `ObjectStoreWriterEngine` now tracks the wall-clock time of its
@@ -2187,9 +2188,7 @@ fold" nuance &sect;7.3's own narrative describes. Suspending a writer here only 
 allocated/kept allocated; it does not yet coordinate a clean last-commit hand-off with
 `ObjectStoreWriterEngine` first. No data is lost either way -- every commit is already durably
 published before suspension ever runs -- so this is a missed optimization (a future cold-start reads
-a very slightly older manifest than it could have), not a correctness gap. Reader-shard scale-to-zero
-is also still out of scope for this first increment: `SuspendedShardAllocationDecider` explicitly
-only ever acts on non-search-only (writer) shard copies.
+a very slightly older manifest than it could have), not a correctness gap.
 
 Verified with unit tests (`SuspendedShardsMetadataTests`, `SuspendedShardAllocationDeciderTests`,
 `ReactivateShardsRequestTests`) and a real end-to-end integration test
@@ -2199,6 +2198,76 @@ index reactivates it end to end over the real transport layer, and the write suc
 on search afterward -- plus a full regression sweep of the existing scale-to-zero/allocation/writer-
 failover/reader-replica integration suites confirming no interaction with the new decider or action
 filter.
+
+**Reader (search-only) shard scale-to-zero is now done too, deliberately scoped as its own increment
+after researching core's own read/write separation first** (`SearchReplicaAllocationDecider`,
+`TransportScaleIndexAction`, segment replication's `isSearchOnly()` carve-outs) to check for conflict
+or reuse before writing code. That research found no conflict -- core already fully excludes
+`isSearchOnly()` shards from segment-replication checkpoint publishing/tracking, so this plugin's own
+`ObjectStoreReaderEngine` was never racing core's replication machinery -- but also found no free
+lunch: `TransportScaleIndexAction` is an index-wide "go read-only and drop writer/replica shards"
+operation, not a per-shard reader pause/resume, and critically, **core provides no retry-on-unassigned
+for search-only shard routing**, unlike the write path. `IndexShardRoutingTable#searchReplicaActiveInitializingShardIt`
+is a bare filter with no wait, and `cluster.routing.search_replica.strict` defaults to `true` (and
+this plugin already uses `index.number_of_search_replicas`, which is exactly what that strict-routing
+check keys off), so a search against a fully-suspended reader shard would otherwise fail immediately
+with `NoShardAvailableActionException` -- an explicit product decision was made that scale-to-zero
+must never be client-visible as a failure, so this increment had to build that wait itself rather than
+reuse anything from core.
+
+`SuspendedShardsMetadata` now tracks writer and reader suspension under two entirely independent
+`IndexMetadata` custom-data keys (`WRITER_CUSTOM_TYPE`/`READER_CUSTOM_TYPE`) -- a shard's writer copy
+and its reader copy(ies) suspend and reactivate on their own, unrelated schedules (a busy writer with
+an idle reader, or vice versa, is the common case), so conflating them into one key would make the two
+roles' suspend/reactivate writes mutually destructive. `SuspendedShardAllocationDecider` no longer
+skips `isSearchOnly()` shards -- it now reads whichever of the two keys matches the shard's own role,
+with no change to the underlying `canAllocate`/`canRemain` eviction mechanism itself, which was already
+role-agnostic by construction. `ShardSuspensionCoordinator` gained `suspendReaderShard`/eviction that
+cancels *every* currently-assigned search-only copy via `IndexShardRoutingTable#searchOnlyReplicas()`
+(unlike a writer's single primary, a shard's reader role can have several concurrently-assigned
+copies).
+
+The query-activity signal itself is new: `ObjectStoreReaderEngine#millisSinceLastQuery()` (mirroring
+the writer's own `millisSinceLastActivity()`) overrides `acquireSearcherSupplier`, updating only on
+`SearcherScope.EXTERNAL` acquisitions -- `SearcherScope.INTERNAL` covers this engine's own bookkeeping
+(segment/doc-count stats, refresh-needed checks) and must never look like real query traffic, the same
+distinction the writer engine already draws for translog-replay-origin operations. Landing this caught
+a real bug in the test proving it, not the feature itself: `segmentsStats()` internally acquires *both*
+an `INTERNAL` and an `EXTERNAL` searcher, so a test using it to prove "internal-only access doesn't
+reset the clock" was actually proving the opposite by accident -- fixed by switching to `docStats()`,
+which is purely `INTERNAL`-scoped. `ReaderShardActivityRegistry` gained the same node-local snapshot
+shape it already had for manifest lag (`snapshotQueryIdleMillis()`), and `ScaleToZeroCandidateEntry`
+gained independent `readerMillisSinceLastQuery()`/`readerCandidate()` fields alongside the existing
+writer ones, merged and threshold-evaluated by `ScaleToZeroCandidatesResponse` exactly the same way,
+just as a second, unrelated judgement rather than folded into the writer's own idle+lag logic.
+
+**The search-wait mechanism itself hit two real bugs, both caught only by its own integration test,
+not by any unit test in isolation** -- consistent with this entire feature's pattern of unit tests
+proving a decision in isolation while integration tests prove what core's own machinery actually does
+with that decision:
+
+1. The first version's `ClusterStateObserver` predicate checked only "is the suspended marker
+   cleared," which resolves the instant `TransportReactivateShardsAction`'s cluster-state update
+   commits -- well before the reactivated shard copy has actually finished recovering. The held
+   search proceeded immediately and still failed with `SearchPhaseExecutionException: all shards
+   failed`, because nothing was actually `STARTED` yet.
+2. The fix -- requiring the routing table to show the shard actually `STARTED` before proceeding --
+   initially checked "is *any* copy of the shard `STARTED`," which is also wrong: a reader-only
+   suspension leaves the writer's own primary copy `STARTED` the entire time, so that check resolved
+   immediately too, for the same underlying reason. The real fix tracks which role (writer, reader,
+   or both) was actually triggered per index (`ShardReactivationActionFilter.PendingReactivation`)
+   and checks specifically that role's own routing -- `primaryShard().state()` for a writer wait,
+   `searchOnlyReplicas()` having at least one `STARTED` entry for a reader wait.
+
+Verified end-to-end in a real cluster (`ServerlessStorageReaderShardSuspensionIT`), reusing the same
+search-only-replica topology `ServerlessStorageSearchOnlyReplicaIT` already proved a reader engine
+serves real reads under (`index.remote_store.enabled`/`index.number_of_search_replicas`/a
+reader-designated node): a real started reader shard is suspended and genuinely evicted, and a real
+search issued against the now fully-suspended reader shard -- routed with `Preference.SEARCH_REPLICA`
+to force it onto the reader copy specifically, not fall back to the primary -- succeeds and returns
+the correct hit count, proving the "never a client-visible failure" bar end to end rather than by
+inference from the unit-level wait logic alone. A full `internalClusterTest` regression sweep across
+the entire plugin stayed green throughout.
 
 **Phase 4.5 — Compaction service, fully done.** Candidate selection, rebase protocol, real Lucene
 merge, size-tiered shaping, background scheduling, a real concurrent-writer data-loss bug, real

@@ -124,6 +124,7 @@ public final class ScaleToZeroCandidatesSchedulerTask implements Closeable {
                 );
                 if (suspensionCoordinator != null) {
                     suspensionCoordinator.suspendCandidates(response.candidates());
+                    suspensionCoordinator.suspendReaderCandidates(response.candidates());
                 }
             }
 

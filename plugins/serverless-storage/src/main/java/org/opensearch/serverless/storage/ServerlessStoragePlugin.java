@@ -375,6 +375,18 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * The maximum time {@code ShardReactivationActionFilter} holds a search request against a
+     * suspended reader shard while waiting for reactivation, before proceeding anyway (rfc-serverless-opensearch.md
+     * &sect;7.3) -- see that class's own javadoc for why search (unlike write/get) needs this filter
+     * to do its own bounded wait rather than relying on a core-provided retry.
+     */
+    public static final Setting<TimeValue> SERVERLESS_STORAGE_SCALE_TO_ZERO_SEARCH_REACTIVATION_WAIT_SETTING = Setting.timeSetting(
+        "serverless_storage.scale_to_zero.search_reactivation_wait",
+        TimeValue.timeValueSeconds(30),
+        Setting.Property.NodeScope
+    );
+
+    /**
      * Per-shard fairness budget for the one node-shared {@code WalChunkService}
      * (rfc-serverless-opensearch.md &sect;18 risk #4, "WAL multiplexing fairness") -- a shard whose
      * own buffered payload bytes since its last flush cross this budget is immediately siphoned
@@ -516,6 +528,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_SCALE_TO_ZERO_LAG_THRESHOLD_SETTING,
             SERVERLESS_STORAGE_SCALE_TO_ZERO_EVAL_INTERVAL_SETTING,
             SERVERLESS_STORAGE_SCALE_TO_ZERO_SUSPEND_ENABLED_SETTING,
+            SERVERLESS_STORAGE_SCALE_TO_ZERO_SEARCH_REACTIVATION_WAIT_SETTING,
             SERVERLESS_STORAGE_REPOSITORY_SETTING
         );
     }
@@ -573,7 +586,12 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         this.repositoryName = SERVERLESS_STORAGE_REPOSITORY_SETTING.get(environment.settings());
         this.scaleToZeroIdleThresholdMillis = SERVERLESS_STORAGE_SCALE_TO_ZERO_IDLE_THRESHOLD_SETTING.get(environment.settings()).millis();
         this.scaleToZeroLagThreshold = SERVERLESS_STORAGE_SCALE_TO_ZERO_LAG_THRESHOLD_SETTING.get(environment.settings());
-        shardReactivationActionFilter.setClusterServiceAndClient(clusterService, client);
+        shardReactivationActionFilter.setDependencies(
+            clusterService,
+            client,
+            threadPool,
+            SERVERLESS_STORAGE_SCALE_TO_ZERO_SEARCH_REACTIVATION_WAIT_SETTING.get(environment.settings())
+        );
         TimeValue scaleToZeroEvalInterval = SERVERLESS_STORAGE_SCALE_TO_ZERO_EVAL_INTERVAL_SETTING.get(environment.settings());
         if (scaleToZeroEvalInterval.millis() > 0) {
             boolean suspendEnabled = SERVERLESS_STORAGE_SCALE_TO_ZERO_SUSPEND_ENABLED_SETTING.get(environment.settings());

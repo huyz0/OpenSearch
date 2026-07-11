@@ -18,9 +18,10 @@ import java.io.IOException;
 import static org.opensearch.action.ValidateActions.addValidationError;
 
 /**
- * Reactivates every suspended shard of one index (rfc-serverless-opensearch.md &sect;7.3) -- see
- * {@code org.opensearch.serverless.storage.scaletozero.ShardReactivationActionFilter}, this
- * request's only caller. A {@link ClusterManagerNodeRequest} specifically because {@code
+ * Reactivates every suspended shard of one index, either the writer or the reader (search-only)
+ * copies (rfc-serverless-opensearch.md &sect;7.3) -- see {@code
+ * org.opensearch.serverless.storage.scaletozero.ShardReactivationActionFilter}, this request's only
+ * caller. A {@link ClusterManagerNodeRequest} specifically because {@code
  * ShardReactivationActionFilter} runs on whichever node happens to receive the triggering write or
  * search request, which is frequently not the elected cluster-manager node -- {@link
  * org.opensearch.action.support.clustermanager.TransportClusterManagerNodeAction} is what
@@ -30,14 +31,17 @@ import static org.opensearch.action.ValidateActions.addValidationError;
 public final class ReactivateShardsRequest extends ClusterManagerNodeRequest<ReactivateShardsRequest> {
 
     private final String indexName;
+    private final boolean reader;
 
     /**
      * Creates a request.
      *
      * @param indexName the index whose suspended shards (if any) should be reactivated.
+     * @param reader {@code true} to reactivate reader (search-only) copies, {@code false} for writer copies.
      */
-    public ReactivateShardsRequest(String indexName) {
+    public ReactivateShardsRequest(String indexName, boolean reader) {
         this.indexName = indexName;
+        this.reader = reader;
     }
 
     /**
@@ -48,6 +52,7 @@ public final class ReactivateShardsRequest extends ClusterManagerNodeRequest<Rea
     public ReactivateShardsRequest(StreamInput in) throws IOException {
         super(in);
         this.indexName = in.readString();
+        this.reader = in.readBoolean();
     }
 
     /** @param out stream to write this request's fields to. */
@@ -55,11 +60,17 @@ public final class ReactivateShardsRequest extends ClusterManagerNodeRequest<Rea
     public void writeTo(StreamOutput out) throws IOException {
         super.writeTo(out);
         out.writeString(indexName);
+        out.writeBoolean(reader);
     }
 
     /** The index whose suspended shards (if any) should be reactivated. */
     public String indexName() {
         return indexName;
+    }
+
+    /** {@code true} to reactivate reader (search-only) copies, {@code false} for writer copies. */
+    public boolean reader() {
+        return reader;
     }
 
     @Override

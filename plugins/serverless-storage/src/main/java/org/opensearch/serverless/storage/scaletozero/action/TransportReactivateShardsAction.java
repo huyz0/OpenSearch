@@ -95,6 +95,8 @@ public final class TransportReactivateShardsAction extends TransportClusterManag
         ActionListener<AcknowledgedResponse> listener
     ) {
         String indexName = request.indexName();
+        boolean reader = request.reader();
+        String role = reader ? "reader" : "writer";
         clusterService.submitStateUpdateTask("serverless-storage-reactivate-shards", new ClusterStateUpdateTask(Priority.URGENT) {
             @Override
             public ClusterState execute(ClusterState currentState) {
@@ -102,7 +104,9 @@ public final class TransportReactivateShardsAction extends TransportClusterManag
                 if (indexMetadata == null) {
                     return currentState;
                 }
-                IndexMetadata updated = SuspendedShardsMetadata.withAllShardsReactivated(indexMetadata);
+                IndexMetadata updated = reader
+                    ? SuspendedShardsMetadata.withAllReaderShardsReactivated(indexMetadata)
+                    : SuspendedShardsMetadata.withAllShardsReactivated(indexMetadata);
                 if (updated == indexMetadata) {
                     return currentState;
                 }
@@ -112,7 +116,7 @@ public final class TransportReactivateShardsAction extends TransportClusterManag
             @Override
             public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {
                 if (oldState != newState) {
-                    logger.info("reactivating suspended serverless-storage shard(s) of index [" + indexName + "]");
+                    logger.info("reactivating suspended serverless-storage " + role + " shard(s) of index [" + indexName + "]");
                     clusterService.getRerouteService()
                         .reroute(
                             "serverless-storage reactivate " + indexName,
@@ -131,7 +135,7 @@ public final class TransportReactivateShardsAction extends TransportClusterManag
 
             @Override
             public void onFailure(String source, Exception e) {
-                logger.warn("failed to reactivate suspended serverless-storage shard(s) of index [" + indexName + "]", e);
+                logger.warn("failed to reactivate suspended serverless-storage " + role + " shard(s) of index [" + indexName + "]", e);
                 listener.onFailure(e);
             }
         });
