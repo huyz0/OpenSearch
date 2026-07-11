@@ -1875,10 +1875,32 @@ untouched, matching Goal 6), each shard gets its own blob container scoped to
 rather than trusting an arbitrary settings string directly), and `ShardRouting.isSearchOnly()`
 picks `ReaderEngineFactory` vs. `WriterEngineFactory`. Verified end-to-end at the settings/routing
 level (opted-out index gets no factory, missing base path fails loudly, primary/search-only/absent
-routing each resolve to the right factory type). The base path is local-filesystem-only for now
-(swapping in a real repository-backed container only touches one method, `blobContainerFor`;
-nothing else in the plugin or the classes it wires together is FS-specific) pending the
-`repository-s3` register support noted below extending to this plugin's own wiring.
+routing each resolve to the right factory type). The base path defaults to local-filesystem, but is
+no longer the only option: **`serverless_storage.repository`, new**, names an already-registered
+snapshot repository (`repository-s3`/`repository-gcs`/`repository-azure`, or any other
+`BlobStoreRepository`) whose `BlobStore` this shard's own container resolves through instead --
+exactly the one method, `blobContainerFor`, this section's own earlier status note said swapping in
+a real repository-backed container would only ever need to touch, and nothing else in the plugin
+needed to change to make that true. Deliberately reuses `RepositoriesService`/`BlobStoreRepository`
+rather than this plugin constructing its own S3/GCS/Azure client: every backend's real, tested
+`compareAndSwapRegister` implementation (documented just below) is already exposed through
+`BlobStoreRepository#blobStore()`, so this plugin never needs to depend on `repository-s3`/
+`repository-gcs`/`repository-azure` directly, hold its own credentials, or duplicate any client
+configuration an operator already set up via the standard `_snapshot` API. The container is scoped
+under the repository's own `basePath()` plus a `serverless_storage/` prefix, so this plugin's data
+can never collide with snapshots the same repository also stores. Resolved lazily on every call
+(never cached), since `RepositoriesService` may not have the named repository registered yet this
+early in node startup and a repository can be deleted/recreated later in the node's lifetime.
+Deliberately scoped to only this shard's own regular manifest/bundle container for now -- the
+shared/dedicated WAL containers remain local-filesystem-only, a natural follow-up once this seam is
+proven in production rather than widening one change's blast radius. Verified against a real
+`fs`-type repository in a real cluster (`ServerlessStorageRepositoryBackedContainerIT`, standing in
+for S3/GCS/Azure since all four share the identical `BlobStoreRepository#blobStore()` seam this
+plugin reads through -- the concrete repository type is irrelevant to what's being proven): a real
+indexed, flushed, and refreshed document is genuinely searchable back out of the repository-backed
+container, real manifest/bundle bytes land under the registered repository's own path, and nothing
+is written under a simultaneously-configured-but-superseded local `base_path` -- proving the
+repository setting takes precedence, not merely that it also works.
 
 **`compareAndSwapRegister` backends: FS done; S3 done; GCS done; Azure done -- all four planned
 backends now implemented.**

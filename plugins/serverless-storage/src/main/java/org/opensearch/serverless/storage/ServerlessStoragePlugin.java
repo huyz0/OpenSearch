@@ -94,14 +94,15 @@ import java.util.function.Supplier;
  * Optional#empty()}, so the platform's default engine applies), matching Goal 6 of the RFC:
  * classic mode stays default and untouched.
  *
- * <p>The blob container backing an opted-in index is, for now, always a local-filesystem
- * container rooted at {@link #SERVERLESS_STORAGE_BASE_PATH_SETTING}. S3, GCS, and Azure all have
- * real, tested {@code compareAndSwapRegister} implementations in their own repository plugins
- * (see {@code S3BlobContainer}/{@code GoogleCloudStorageBlobStore}/{@code AzureBlobStore}); this
- * plugin doesn't yet construct one of those concrete containers instead of the local-filesystem
- * one, which is the remaining piece of wiring, not a correctness gap in the register primitive
- * itself. Swapping in a real repository-backed container only touches {@link #blobContainerFor};
- * nothing else in this class or the engine/factory classes it wires together is FS-specific.
+ * <p>The blob container backing an opted-in index defaults to a local-filesystem container rooted
+ * at {@link #SERVERLESS_STORAGE_BASE_PATH_SETTING}, but {@link #SERVERLESS_STORAGE_REPOSITORY_SETTING}
+ * can instead name an already-registered snapshot repository (S3, GCS, and Azure all have real,
+ * tested {@code compareAndSwapRegister} implementations in their own repository plugins -- see
+ * {@code S3BlobContainer}/{@code GoogleCloudStorageBlobStore}/{@code AzureBlobStore}) whose {@code
+ * BlobStore} this plugin resolves shard containers through instead, via the standard {@code
+ * BlobStoreRepository} seam every repository plugin already exposes. Swapping between the two only
+ * ever touches {@link #blobContainerFor}; nothing else in this class or the engine/factory classes
+ * it wires together is storage-backend-specific.
  */
 public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, ClusterPlugin, IndexStorePlugin, ActionPlugin {
 
@@ -130,6 +131,31 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     /** Node-level root path of the local-filesystem blob container backing every opted-in index on this node. */
     public static final Setting<String> SERVERLESS_STORAGE_BASE_PATH_SETTING = Setting.simpleString(
         "serverless_storage.base_path",
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * The name of an already-registered snapshot repository (via the standard {@code _snapshot}
+     * API -- {@code repository-s3}/{@code repository-gcs}/{@code repository-azure} or any other
+     * {@code BlobStoreRepository} implementation) whose underlying {@code BlobStore} this shard's
+     * own manifest/bundle {@link BlobContainer} should be built from, instead of the local
+     * filesystem {@link #SERVERLESS_STORAGE_BASE_PATH_SETTING} otherwise uses. This is the "one
+     * remaining piece of wiring" this class's own top-of-file javadoc used to describe: S3, GCS,
+     * and Azure each already have a real, tested {@code compareAndSwapRegister} implementation in
+     * their own repository plugin -- {@code BlobStoreRepository#blobStore()} is the seam that
+     * reaches whichever one the operator registered, without this plugin ever needing to depend on
+     * {@code repository-s3}/{@code repository-gcs}/{@code repository-azure} directly or construct
+     * a concrete client of its own.
+     *
+     * <p>Empty (the default) preserves every existing deployment's behavior unchanged: the local
+     * filesystem container {@link #SERVERLESS_STORAGE_BASE_PATH_SETTING} resolves. Deliberately
+     * scoped to only this shard's own regular container -- the shared/dedicated WAL containers
+     * ({@link #SERVERLESS_STORAGE_WAL_DEDICATED_STREAM_SETTING} and the node-shared {@code wal/}
+     * container {@code createComponents} builds) remain local-filesystem-only for now, a natural
+     * follow-up once this seam is proven rather than widening the blast radius of one change.
+     */
+    public static final Setting<String> SERVERLESS_STORAGE_REPOSITORY_SETTING = Setting.simpleString(
+        "serverless_storage.repository",
         Setting.Property.NodeScope
     );
 
@@ -396,6 +422,14 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     private volatile Path basePath;
+    // Empty means "use the local-filesystem basePath above" -- see SERVERLESS_STORAGE_REPOSITORY_SETTING's
+    // own javadoc for why a registered repository's BlobStore is resolved lazily via this name
+    // (repositoriesServiceSupplier) rather than eagerly here: RepositoriesService may not have the
+    // named repository registered yet this early in node startup, and a repository can be
+    // deleted/recreated later in the node's lifetime, so nothing about it is safe to cache once at
+    // createComponents time.
+    private volatile String repositoryName;
+    private volatile Supplier<RepositoriesService> repositoriesServiceSupplier;
     private volatile Path localCacheRoot;
     private volatile ThreadPool threadPool;
     private volatile FileCache lazyDirectoryFileCache;
@@ -457,7 +491,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_WAL_DEDICATED_STREAM_SETTING,
             SERVERLESS_STORAGE_SCALE_TO_ZERO_IDLE_THRESHOLD_SETTING,
             SERVERLESS_STORAGE_SCALE_TO_ZERO_LAG_THRESHOLD_SETTING,
-            SERVERLESS_STORAGE_SCALE_TO_ZERO_EVAL_INTERVAL_SETTING
+            SERVERLESS_STORAGE_SCALE_TO_ZERO_EVAL_INTERVAL_SETTING,
+            SERVERLESS_STORAGE_REPOSITORY_SETTING
         );
     }
 
@@ -510,6 +545,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         Supplier<RepositoriesService> repositoriesServiceSupplier
     ) {
         this.threadPool = threadPool;
+        this.repositoriesServiceSupplier = repositoriesServiceSupplier;
+        this.repositoryName = SERVERLESS_STORAGE_REPOSITORY_SETTING.get(environment.settings());
         this.scaleToZeroIdleThresholdMillis = SERVERLESS_STORAGE_SCALE_TO_ZERO_IDLE_THRESHOLD_SETTING.get(environment.settings()).millis();
         this.scaleToZeroLagThreshold = SERVERLESS_STORAGE_SCALE_TO_ZERO_LAG_THRESHOLD_SETTING.get(environment.settings());
         TimeValue scaleToZeroEvalInterval = SERVERLESS_STORAGE_SCALE_TO_ZERO_EVAL_INTERVAL_SETTING.get(environment.settings());
@@ -620,22 +657,11 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      * #blobContainerForDirectoryFactory}, which both need exactly this same resolution.
      */
     private BlobContainer resolveBlobContainer(String indexUuid, int shardId) throws IOException {
-        if (basePath == null) {
-            throw new IllegalStateException(
-                "shard ["
-                    + indexUuid
-                    + "]["
-                    + shardId
-                    + "] has serverless storage enabled but no ["
-                    + SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey()
-                    + "] node setting was configured (or it did not resolve to an allowed path)"
-            );
-        }
         // Each shard gets its own child container (rfc-serverless-opensearch.md &sect;6.1's
         // indices/<index-uuid>/<shard>/ layout): CommitManifest#manifestName() is intentionally
         // just <term>-<generation> with no index/shard component, since it assumes the
         // container it lives in is already shard-scoped.
-        BlobContainer blobContainer = blobContainerFor(basePath, indexUuid, shardId);
+        BlobContainer blobContainer = blobContainerFor(indexUuid, shardId);
         if (encryptionKeyProvider != null) {
             // Wrapping here, at the one seam every downstream class already depends on
             // abstractly (BlobContainer), is the entire integration -- see
@@ -790,10 +816,90 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         }
     }
 
-    private static BlobContainer blobContainerFor(Path basePath, String indexUuid, int shardId) throws IOException {
-        FsBlobStore blobStore = new FsBlobStore(1024 * 1024, basePath, false);
+    /**
+     * Resolves this shard's own regular (non-WAL) {@link BlobContainer}: from a real registered
+     * repository's {@code BlobStore} if {@link #SERVERLESS_STORAGE_REPOSITORY_SETTING} names one,
+     * otherwise the local-filesystem container under {@link #basePath} exactly as before -- see
+     * that setting's own javadoc for the full design and why this is the one seam swapping in
+     * S3/GCS/Azure only ever needs to touch.
+     */
+    private BlobContainer blobContainerFor(String indexUuid, int shardId) throws IOException {
         BlobPath shardPath = BlobPath.cleanPath().add(indexUuid).add(String.valueOf(shardId));
+        if (repositoryName != null && repositoryName.isEmpty() == false) {
+            return repositoryBackedBlobContainer(indexUuid, shardId, shardPath);
+        }
+        if (basePath == null) {
+            throw new IllegalStateException(
+                "shard ["
+                    + indexUuid
+                    + "]["
+                    + shardId
+                    + "] has serverless storage enabled but neither ["
+                    + SERVERLESS_STORAGE_REPOSITORY_SETTING.getKey()
+                    + "] nor ["
+                    + SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey()
+                    + "] resolved to a usable container (the latter's node setting is either unset "
+                    + "or did not resolve to an allowed path)"
+            );
+        }
+        FsBlobStore blobStore = new FsBlobStore(1024 * 1024, basePath, false);
         return blobStore.blobContainer(shardPath);
+    }
+
+    /**
+     * Resolves this shard's container from the {@link #repositoryName}-named repository's own
+     * {@code BlobStore}, scoped under that repository's own {@code basePath()} plus a {@code
+     * serverless_storage/} prefix -- so this plugin's data can never collide with whatever
+     * snapshots that same repository also stores, even though both share one underlying bucket.
+     */
+    private BlobContainer repositoryBackedBlobContainer(String indexUuid, int shardId, BlobPath shardPath) throws IOException {
+        if (repositoriesServiceSupplier == null) {
+            throw new IllegalStateException(
+                "shard [" + indexUuid + "][" + shardId + "] needs repository [" + repositoryName + "] before RepositoriesService is ready"
+            );
+        }
+        org.opensearch.repositories.Repository repository;
+        try {
+            repository = repositoriesServiceSupplier.get().repository(repositoryName);
+        } catch (RuntimeException e) {
+            // RepositoriesService#repository throws RepositoryMissingException (a RuntimeException,
+            // not IOException) for an unregistered name -- wrapped so every caller of
+            // resolveBlobContainer only ever has to catch IOException, same as the local-filesystem
+            // path already guarantees.
+            throw new IOException(
+                "shard ["
+                    + indexUuid
+                    + "]["
+                    + shardId
+                    + "] configured ["
+                    + SERVERLESS_STORAGE_REPOSITORY_SETTING.getKey()
+                    + "="
+                    + repositoryName
+                    + "] but that repository is not currently registered -- register it via the "
+                    + "_snapshot API before serverless storage indices can use it",
+                e
+            );
+        }
+        if (repository instanceof org.opensearch.repositories.blobstore.BlobStoreRepository == false) {
+            throw new IllegalStateException(
+                "shard ["
+                    + indexUuid
+                    + "]["
+                    + shardId
+                    + "] configured ["
+                    + SERVERLESS_STORAGE_REPOSITORY_SETTING.getKey()
+                    + "="
+                    + repositoryName
+                    + "], but that repository is a ["
+                    + repository.getClass().getName()
+                    + "], not a BlobStoreRepository -- only blob-store-backed repositories (fs, s3, "
+                    + "gcs, azure, ...) expose the BlobStore this plugin needs"
+            );
+        }
+        org.opensearch.repositories.blobstore.BlobStoreRepository blobStoreRepository =
+            (org.opensearch.repositories.blobstore.BlobStoreRepository) repository;
+        BlobPath fullPath = blobStoreRepository.basePath().add("serverless_storage").add(shardPath);
+        return blobStoreRepository.blobStore().blobContainer(fullPath);
     }
 
     /**
