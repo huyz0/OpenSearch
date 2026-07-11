@@ -2346,6 +2346,80 @@ proving a real coordinator constructed with a one-hour cooldown genuinely refuse
 just-reactivated shard, over a real cluster, not merely by reasoning about the pure function in
 isolation. A full `internalClusterTest` regression sweep stayed green throughout.
 
+**Scale-up (reader replica expansion) is now a first, minimal increment, mirroring scale-to-zero's
+own "policy, then mechanism" shape but for the opposite direction.** Everything above suspends idle
+copies; nothing until now expanded a busy one back out, the other still-open half of &sect;10's
+autoscaling story. This increment is deliberately narrow: a per-tick threshold check against a
+query-rate estimate, no sustained-duration tracking (a shard that spikes for one evaluation tick and
+drops back down is treated the same as one under real sustained load) -- a real cost model, or even
+just "N consecutive over-threshold ticks before acting," is future work, not attempted here.
+
+The query-rate signal is new: `ObjectStoreReaderEngine` gained a deliberately crude two-window
+(previous/current) `queriesPerMinute()` counter, updated alongside `lastQueryMillis` in the same
+`SearcherScope.EXTERNAL`-only branch of `acquireSearcherSupplier`. It is not a real sliding window --
+`queriesPerMinute()` always reports the *previous completed* 60-second window's count, never the
+in-progress one, so a shard that just had one query land right after a rollover briefly under-reports
+rather than extrapolating a spike. For a scale-*up* signal specifically, under-reacting for up to one
+window is the safer failure mode (an idle-looking shard simply isn't expanded yet); over-reacting
+would mean flapping replica count on noise. `ReaderShardActivityRegistry` gained
+`queriesPerMinute()`/`snapshotQueriesPerMinute()`, mirroring the existing
+`millisSinceLastQuery()`/`snapshotQueryIdleMillis()` pair's shape exactly.
+
+New `scaleup`/`scaleup.action` packages mirror `scaletozero`/`scaletozero.action` structurally.
+`ScaleUpCandidateEntry` carries `(indexUuid, shardId, indexName, queriesPerMinute,
+currentSearchReplicaCount, candidate)` -- notably `indexName`, which no other candidate entry in this
+plugin needs, because expanding replica count means submitting a name-addressed settings update, not
+a UUID-keyed cluster-state mutation. `ScaleUpCandidatesAction`/`TransportScaleUpCandidatesAction`
+fan out each node's raw `snapshotQueriesPerMinute()` and merge by `(indexUuid, shardId)` in
+`ScaleUpCandidatesResponse`'s constructor, same "merge happens in the response type" shape as
+`ScaleToZeroCandidatesResponse` -- but this merge also needs `index.number_of_search_replicas` and
+each index's current name, both index *metadata* rather than a per-node signal, so
+`TransportScaleUpCandidatesAction#newResponse` reads them off `ClusterService#state().metadata()`
+directly rather than threading them through any node response. Candidate policy: `queriesPerMinute >
+qpmThreshold && currentSearchReplicaCount < maxSearchReplicas`.
+
+`ReaderReplicaExpansionCoordinator` is the mechanism half, and it deliberately does *not* mirror
+`ShardSuspensionCoordinator`'s `ClusterStateUpdateTask`-mutates-`IndexMetadata`-custom-data shape:
+unlike `SuspendedShardsMetadata`, search-replica count is ordinary index configuration
+(`IndexMetadata.SETTING_NUMBER_OF_SEARCH_REPLICAS`, exposed as `getNumberOfSearchOnlyReplicas()`)
+with no dedicated builder setter -- core only ever derives it from settings during
+`IndexMetadata.Builder#build()`. Bumping it is therefore a plain `UpdateSettingsRequest`, the same
+sanctioned path an operator's own `PUT /index/_settings` would use. `expandCandidates` dedupes
+multiple candidate shards of the same index down to one settings update (the setting is index-wide,
+not per-shard) and bumps by exactly one step, capped at `maxSearchReplicas`, with the cap checked a
+second time coordinator-side against a possibly-stale entry.
+
+`ScaleUpCandidatesSchedulerTask` mirrors `ScaleToZeroCandidatesSchedulerTask` in shape
+(cluster-manager-only guard, `evaluateSafely`/`Throwable` catch, `latestCandidates()`,
+`evaluateForTesting()`) but is a genuinely separate `Scheduler.Cancellable`, not a shared one:
+scale-up and scale-to-zero are independent decisions on independent schedules -- an operator may well
+want to evaluate scale-up far more aggressively than scale-to-zero's own hysteresis-guarded
+suspend/reactivate -- the same reasoning `ShardSuspensionCoordinator` (suspend) and
+`ShardReactivationActionFilter` (reactivate) already stay separate mechanisms rather than one
+combined task.
+
+New node settings, following the existing `serverless_storage.scale_to_zero.*` naming/registration
+pattern: `serverless_storage.scale_up.qpm_threshold` (default 600), `serverless_storage.scale_up.max_search_replicas`
+(default 5), `serverless_storage.scale_up.eval_interval` (non-positive/disabled by default, same
+"off unless asked for" default every scheduled task in this plugin uses -- every existing
+`createComponents` unit test in `ServerlessStoragePluginTests` calls it with a `null` `ThreadPool`,
+which a positive default interval would have broken by unconditionally scheduling a task against it),
+and `serverless_storage.scale_up.enabled` (default `false`, gating whether a real
+`ReaderReplicaExpansionCoordinator` is wired in at all -- turning on the eval interval alone stays
+purely observational, exactly how `serverless_storage.scale_to_zero.suspend_enabled` already gates
+`ShardSuspensionCoordinator`).
+
+Verified with a unit test on the query-rate counter itself (an engine still inside its first window
+reports `0`, never the in-progress count), a serialization round-trip test for
+`ScaleUpCandidateEntry`, unit tests for `ReaderReplicaExpansionCoordinator` (dedupes same-index
+shards into one update, never exceeds the configured cap, targets the right index/replica count via
+`Mockito`), and a real end-to-end integration test (`ServerlessStorageReaderScaleUpIT`): real search
+traffic against a real reader shard over more than one real 60-second query-rate window, a real
+cluster-wide `ScaleUpCandidatesAction` evaluation (exactly what the scheduler's own tick runs) flags
+it a candidate against a deliberately low threshold, and a real `ReaderReplicaExpansionCoordinator`
+genuinely raises `index.number_of_search_replicas` on the live index. A full `internalClusterTest`
+regression sweep across the entire plugin stayed green throughout.
+
 **Phase 4.5 — Compaction service, fully done.** Candidate selection, rebase protocol, real Lucene
 merge, size-tiered shaping, background scheduling, a real concurrent-writer data-loss bug, real
 lease acquisition/renewal, and busy-writer offload are all implemented and tested. Its hard dependency,

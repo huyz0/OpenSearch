@@ -400,6 +400,63 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * The default queries-per-minute threshold {@code ScaleUpCandidatesAction} uses to decide a
+     * reader shard is busy enough to be worth expanding (see the RFC's scale-up autoscaling
+     * subsection) -- a caller can override this per-request, this is only the default when they
+     * don't. Deliberately just a per-tick threshold check, no sustained-duration tracking yet
+     * (unlike scale-to-zero's idle threshold, which only ever needs a single "how long since,"
+     * this would need multiple consecutive over-threshold ticks to avoid reacting to one noisy
+     * evaluation -- out of scope for this first increment, see {@code ScaleUpCandidatesSchedulerTask}'s own javadoc).
+     */
+    public static final Setting<Long> SERVERLESS_STORAGE_SCALE_UP_QPM_THRESHOLD_SETTING = Setting.longSetting(
+        "serverless_storage.scale_up.qpm_threshold",
+        600L,
+        0L,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * The maximum {@code index.number_of_search_replicas} {@code ScaleUpCandidatesAction} will
+     * ever flag a shard as a scale-up candidate past -- an index already at this cap is never a
+     * candidate, no matter how busy, until an operator raises this setting or lowers traffic.
+     */
+    public static final Setting<Integer> SERVERLESS_STORAGE_SCALE_UP_MAX_SEARCH_REPLICAS_SETTING = Setting.intSetting(
+        "serverless_storage.scale_up.max_search_replicas",
+        5,
+        0,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * How often {@code ScaleUpCandidatesSchedulerTask} re-evaluates {@code ScaleUpCandidatesAction}
+     * in the background -- same "background schedule mirrors an on-demand trigger" shape as {@link
+     * #SERVERLESS_STORAGE_SCALE_TO_ZERO_EVAL_INTERVAL_SETTING}, but deliberately its own setting
+     * and its own scheduler task instance (see {@code ScaleUpCandidatesSchedulerTask}'s own
+     * javadoc for why scale-up and scale-to-zero stay on independent schedules). Non-positive
+     * (the default, same as {@link #SERVERLESS_STORAGE_SCALE_TO_ZERO_EVAL_INTERVAL_SETTING}'s own
+     * default) disables the scheduled evaluation entirely -- an operator opts in explicitly by
+     * setting this to a positive value, same "off unless asked for" default every scheduled task
+     * in this plugin uses; the on-demand REST/transport action is unaffected either way.
+     */
+    public static final Setting<TimeValue> SERVERLESS_STORAGE_SCALE_UP_EVAL_INTERVAL_SETTING = Setting.timeSetting(
+        "serverless_storage.scale_up.eval_interval",
+        TimeValue.MINUS_ONE,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * Deliberately separate from {@link #SERVERLESS_STORAGE_SCALE_UP_EVAL_INTERVAL_SETTING} and
+     * defaulting to {@code false}, same reasoning as {@link #SERVERLESS_STORAGE_SCALE_TO_ZERO_SUSPEND_ENABLED_SETTING}:
+     * turning on the scheduled evaluation alone must stay purely observational, never a silent
+     * trigger for real index expansion the first time an operator enables the eval interval.
+     */
+    public static final Setting<Boolean> SERVERLESS_STORAGE_SCALE_UP_ENABLED_SETTING = Setting.boolSetting(
+        "serverless_storage.scale_up.enabled",
+        false,
+        Setting.Property.NodeScope
+    );
+
+    /**
      * Per-shard fairness budget for the one node-shared {@code WalChunkService}
      * (rfc-serverless-opensearch.md &sect;18 risk #4, "WAL multiplexing fairness") -- a shard whose
      * own buffered payload bytes since its last flush cross this budget is immediately siphoned
@@ -503,6 +560,12 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     ).millis();
     private volatile long scaleToZeroLagThreshold = SERVERLESS_STORAGE_SCALE_TO_ZERO_LAG_THRESHOLD_SETTING.getDefault(Settings.EMPTY);
     private volatile org.opensearch.serverless.storage.scaletozero.ScaleToZeroCandidatesSchedulerTask scaleToZeroCandidatesSchedulerTask;
+    // Same "resolved once in createComponents" reasoning as the scale-to-zero thresholds above --
+    // TransportScaleUpCandidatesAction reads these as its per-request defaults, overridable per
+    // ScaleUpCandidatesRequest.
+    private volatile long scaleUpQpmThreshold = SERVERLESS_STORAGE_SCALE_UP_QPM_THRESHOLD_SETTING.getDefault(Settings.EMPTY);
+    private volatile int scaleUpMaxSearchReplicas = SERVERLESS_STORAGE_SCALE_UP_MAX_SEARCH_REPLICAS_SETTING.getDefault(Settings.EMPTY);
+    private volatile org.opensearch.serverless.storage.scaleup.ScaleUpCandidatesSchedulerTask scaleUpCandidatesSchedulerTask;
     // One node-local directory instance shared by every shard on this node -- matches the target
     // design's "one node block cache" shape (&sect;9) rather than a per-shard instance, and needs
     // no I/O to construct, so it's safe to build eagerly rather than threading through createComponents.
@@ -543,6 +606,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_SCALE_TO_ZERO_SUSPEND_ENABLED_SETTING,
             SERVERLESS_STORAGE_SCALE_TO_ZERO_SEARCH_REACTIVATION_WAIT_SETTING,
             SERVERLESS_STORAGE_SCALE_TO_ZERO_COOLDOWN_SETTING,
+            SERVERLESS_STORAGE_SCALE_UP_QPM_THRESHOLD_SETTING,
+            SERVERLESS_STORAGE_SCALE_UP_MAX_SEARCH_REPLICAS_SETTING,
+            SERVERLESS_STORAGE_SCALE_UP_EVAL_INTERVAL_SETTING,
+            SERVERLESS_STORAGE_SCALE_UP_ENABLED_SETTING,
             SERVERLESS_STORAGE_REPOSITORY_SETTING
         );
     }
@@ -617,6 +684,21 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 clusterService,
                 suspendEnabled
                     ? new org.opensearch.serverless.storage.scaletozero.ShardSuspensionCoordinator(clusterService, client, cooldownMillis)
+                    : null
+            );
+        }
+        this.scaleUpQpmThreshold = SERVERLESS_STORAGE_SCALE_UP_QPM_THRESHOLD_SETTING.get(environment.settings());
+        this.scaleUpMaxSearchReplicas = SERVERLESS_STORAGE_SCALE_UP_MAX_SEARCH_REPLICAS_SETTING.get(environment.settings());
+        TimeValue scaleUpEvalInterval = SERVERLESS_STORAGE_SCALE_UP_EVAL_INTERVAL_SETTING.get(environment.settings());
+        if (scaleUpEvalInterval.millis() > 0) {
+            boolean scaleUpEnabled = SERVERLESS_STORAGE_SCALE_UP_ENABLED_SETTING.get(environment.settings());
+            this.scaleUpCandidatesSchedulerTask = new org.opensearch.serverless.storage.scaleup.ScaleUpCandidatesSchedulerTask(
+                threadPool,
+                scaleUpEvalInterval,
+                client,
+                clusterService,
+                scaleUpEnabled
+                    ? new org.opensearch.serverless.storage.scaleup.ReaderReplicaExpansionCoordinator(client, scaleUpMaxSearchReplicas)
                     : null
             );
         }
@@ -1182,6 +1264,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 org.opensearch.serverless.storage.scaletozero.action.TransportReactivateShardsAction.class
             ),
             new ActionHandler<>(
+                org.opensearch.serverless.storage.scaleup.action.ScaleUpCandidatesAction.INSTANCE,
+                org.opensearch.serverless.storage.scaleup.action.TransportScaleUpCandidatesAction.class
+            ),
+            new ActionHandler<>(
                 org.opensearch.serverless.storage.retention.action.SnapshotPinAction.INSTANCE,
                 org.opensearch.serverless.storage.retention.action.TransportSnapshotPinAction.class
             ),
@@ -1242,6 +1328,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new org.opensearch.serverless.storage.readerengine.action.RestNodeManifestLagAction(),
             new org.opensearch.serverless.storage.scaletozero.action.RestScaleToZeroCandidatesAction(),
             new org.opensearch.serverless.storage.scaletozero.action.RestReactivateShardsAction(),
+            new org.opensearch.serverless.storage.scaleup.action.RestScaleUpCandidatesAction(),
             new org.opensearch.serverless.storage.retention.action.RestShardRetentionStatsAction(),
             new org.opensearch.serverless.storage.resharding.action.RestShardSplitAction(),
             new org.opensearch.serverless.storage.resharding.action.RestShardPartitionRewriteAction(),
@@ -1296,6 +1383,22 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     }
 
     /**
+     * This node's currently configured default queries-per-minute threshold for {@code
+     * ScaleUpCandidatesAction} -- see {@link #SERVERLESS_STORAGE_SCALE_UP_QPM_THRESHOLD_SETTING}.
+     */
+    public long scaleUpQpmThreshold() {
+        return scaleUpQpmThreshold;
+    }
+
+    /**
+     * This node's currently configured default max search-replica cap for {@code
+     * ScaleUpCandidatesAction} -- see {@link #SERVERLESS_STORAGE_SCALE_UP_MAX_SEARCH_REPLICAS_SETTING}.
+     */
+    public int scaleUpMaxSearchReplicas() {
+        return scaleUpMaxSearchReplicas;
+    }
+
+    /**
      * This node's currently configured PITR window (millis), or a non-positive value if PITR
      * retention is disabled -- see {@link #SERVERLESS_STORAGE_PITR_WINDOW_SETTING}. Used by {@code
      * TransportShardRetentionStatsAction} to report the configured window alongside real pin/manifest counts.
@@ -1326,6 +1429,11 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     /** The scale-to-zero candidate scheduler task {@link #createComponents} built, or {@code null} if disabled -- test-only visibility. */
     org.opensearch.serverless.storage.scaletozero.ScaleToZeroCandidatesSchedulerTask scaleToZeroCandidatesSchedulerTaskForTesting() {
         return scaleToZeroCandidatesSchedulerTask;
+    }
+
+    /** The scale-up candidate scheduler task {@link #createComponents} built, or {@code null} if disabled -- test-only visibility. */
+    org.opensearch.serverless.storage.scaleup.ScaleUpCandidatesSchedulerTask scaleUpCandidatesSchedulerTaskForTesting() {
+        return scaleUpCandidatesSchedulerTask;
     }
 
     /** The reader-shard admission controller {@link #createComponents} built, or {@code null} if disabled -- test-only visibility. */

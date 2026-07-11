@@ -118,4 +118,39 @@ public final class ReaderShardActivityRegistry {
         }
         return snapshot;
     }
+
+    /**
+     * Looks up the currently-live reader engine for (indexUuid, shardId) on this node's own {@link
+     * ObjectStoreReaderEngine#queriesPerMinute()} -- the scale-up counterpart to {@link
+     * #millisSinceLastQuery}'s scale-to-zero signal.
+     *
+     * @param indexUuid the UUID of the index the shard belongs to
+     * @param shardId the shard number within {@code indexUuid}
+     * @return the reader engine's own {@link ObjectStoreReaderEngine#queriesPerMinute()}, or empty
+     *         if no reader engine for this shard is currently tracked on this node
+     */
+    public Optional<Long> queriesPerMinute(String indexUuid, int shardId) {
+        WeakReference<ObjectStoreReaderEngine> ref = engines.get(key(indexUuid, shardId));
+        ObjectStoreReaderEngine engine = ref == null ? null : ref.get();
+        return engine == null ? Optional.empty() : Optional.of(engine.queriesPerMinute());
+    }
+
+    /**
+     * A point-in-time snapshot of every reader engine currently tracked on this node's own {@link
+     * ObjectStoreReaderEngine#queriesPerMinute()} -- the scale-up counterpart to {@link
+     * #snapshotQueryIdleMillis()}, silently skipping any entry whose {@link WeakReference} has
+     * already been collected.
+     *
+     * @return every (indexUuid, shardId) key together with that shard's current queries-per-minute estimate
+     */
+    public Map<String, Long> snapshotQueriesPerMinute() {
+        Map<String, Long> snapshot = new java.util.HashMap<>();
+        for (Map.Entry<String, WeakReference<ObjectStoreReaderEngine>> entry : engines.entrySet()) {
+            ObjectStoreReaderEngine engine = entry.getValue().get();
+            if (engine != null) {
+                snapshot.put(entry.getKey(), engine.queriesPerMinute());
+            }
+        }
+        return snapshot;
+    }
 }

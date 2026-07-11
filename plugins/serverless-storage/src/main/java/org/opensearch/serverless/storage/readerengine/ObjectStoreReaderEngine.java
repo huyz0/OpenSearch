@@ -140,6 +140,27 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
      */
     private final AtomicLong lastQueryMillis = new AtomicLong(System.currentTimeMillis());
 
+    /**
+     * A deliberately crude two-window (previous/current) query-rate counter, feeding the scale-up
+     * half of autoscaling (rfc-serverless-opensearch.md's scale-up subsection): {@link
+     * #windowStartMillis} marks when {@link #windowQueryCount} started accumulating, and once a
+     * window has run for more than {@link #QUERY_RATE_WINDOW_MILLIS}, {@link #queriesPerMinute()}
+     * rolls it over -- the just-finished window's count becomes {@link #completedWindowQueryCount},
+     * and a fresh window starts counting from 1 (the query that triggered the rollover).
+     *
+     * <p>This is intentionally not a real sliding window: {@link #queriesPerMinute()} always reports
+     * the <em>previous completed window's</em> rate, never the in-progress one, so a shard that just
+     * had a single query land right after a rollover briefly under-reports (looks like the old,
+     * possibly-lower rate) rather than over-reports (extrapolating one query into a spike). For a
+     * scale-up signal, under-reacting for up to one window is a far safer failure mode than
+     * flapping on noise, and a shard with sustained real traffic converges to an accurate rate
+     * within two windows regardless.
+     */
+    private static final long QUERY_RATE_WINDOW_MILLIS = 60_000L;
+    private final AtomicLong windowStartMillis = new AtomicLong(System.currentTimeMillis());
+    private final AtomicLong windowQueryCount = new AtomicLong(0);
+    private final AtomicLong completedWindowQueryCount = new AtomicLong(0);
+
     private ObjectStoreReaderEngine(
         EngineConfig config,
         SeqNoStats seqNoStats,
@@ -393,9 +414,50 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
     @Override
     public SearcherSupplier acquireSearcherSupplier(Function<Searcher, Searcher> wrapper, SearcherScope scope) throws EngineException {
         if (scope == SearcherScope.EXTERNAL) {
-            lastQueryMillis.set(System.currentTimeMillis());
+            long now = System.currentTimeMillis();
+            lastQueryMillis.set(now);
+            recordQueryForRateCounter(now);
         }
         return super.acquireSearcherSupplier(wrapper, scope);
+    }
+
+    /**
+     * Rolls {@link #windowStartMillis}/{@link #windowQueryCount} over into {@link
+     * #completedWindowQueryCount} once the current window has run longer than {@link
+     * #QUERY_RATE_WINDOW_MILLIS}, then counts {@code now}'s query into whichever window is current
+     * after that possible rollover. Synchronized: rollover is a compound check-then-reset that must
+     * not race with itself across concurrent searcher acquisitions, and query traffic on a single
+     * shard is not so hot that a short critical section here matters.
+     *
+     * @param now the current wall-clock time, as already computed by the caller.
+     */
+    private synchronized void recordQueryForRateCounter(long now) {
+        long start = windowStartMillis.get();
+        if (now - start >= QUERY_RATE_WINDOW_MILLIS) {
+            completedWindowQueryCount.set(windowQueryCount.get());
+            windowStartMillis.set(now);
+            windowQueryCount.set(1);
+        } else {
+            windowQueryCount.incrementAndGet();
+        }
+    }
+
+    /**
+     * A conservative, always-one-window-stale estimate of this engine's own real client-facing
+     * query rate (rfc-serverless-opensearch.md's scale-up subsection) -- see {@link
+     * #completedWindowQueryCount}'s own javadoc for why this deliberately reports the previous
+     * completed window's count rather than extrapolating the in-progress one. Reports {@code 0}
+     * until this engine has completed at least one full {@link #QUERY_RATE_WINDOW_MILLIS} window
+     * since construction (or since its last query, if traffic has since gone fully idle for a
+     * window -- {@link #recordQueryForRateCounter} only rolls the window over on the next query, so
+     * a shard that goes idle keeps reporting its last completed window's rate until one more query
+     * arrives after the gap, which is an acceptable imprecision for a scale-<em>up</em> signal: an
+     * idle shard has nothing to scale up for regardless).
+     *
+     * @return queries observed during the previous completed {@link #QUERY_RATE_WINDOW_MILLIS} window.
+     */
+    public long queriesPerMinute() {
+        return completedWindowQueryCount.get();
     }
 
     /**

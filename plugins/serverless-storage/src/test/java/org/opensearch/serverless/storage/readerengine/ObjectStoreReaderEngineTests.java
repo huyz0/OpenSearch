@@ -237,6 +237,16 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
                     assertEquals(1, hits.totalHits.value());
                 }
                 assertTrue("a real query must reset the idle clock back down near zero", readerEngine.millisSinceLastQuery() < 5000);
+
+                // queriesPerMinute() deliberately reports the previous *completed* window's count,
+                // never the in-progress one -- see the field's own javadoc. So a shard that has
+                // only ever had queries land inside its very first (still-open) window reports 0,
+                // not the count of queries it has actually seen so far.
+                assertEquals(
+                    "an engine still inside its first query-rate window must report 0, not the in-progress count",
+                    0L,
+                    readerEngine.queriesPerMinute()
+                );
             }
         }
     }
