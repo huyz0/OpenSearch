@@ -62,6 +62,16 @@ import java.util.List;
  * a writer shard (exactly one primary), a shard's reader role can have several concurrently-assigned
  * search-only replica copies ({@code index.number_of_search_only_replicas > 1}); suspending the
  * reader role means evicting all of them, via {@link IndexShardRoutingTable#searchOnlyReplicas()}.
+ *
+ * <p><b>Hysteresis via {@link #cooldownMillis}, rfc-serverless-opensearch.md &sect;16 Phase 4's
+ * "balancer hysteresis" milestone.</b> Without it, a shard idling just past the threshold, getting a
+ * single request, reactivating, and immediately idling again would suspend and reactivate on every
+ * single evaluation tick -- real, wasted allocation churn (a reroute plus a {@link
+ * CancelAllocationCommand} every cycle) rather than a one-time cost. {@link #suspend} checks {@link
+ * SuspendedShardsMetadata#isSuspensionAllowed} before ever marking a shard suspended, skipping (not
+ * suspending, not erroring) any shard reactivated more recently than {@link #cooldownMillis} ago.
+ * Zero (the default for the 2-arg constructor, matching every existing caller's prior behavior)
+ * disables the guard entirely.
  */
 public final class ShardSuspensionCoordinator {
 
@@ -69,16 +79,31 @@ public final class ShardSuspensionCoordinator {
 
     private final ClusterService clusterService;
     private final Client client;
+    private final long cooldownMillis;
+
+    /**
+     * Creates a coordinator with hysteresis disabled ({@code cooldownMillis = 0}) -- equivalent to
+     * the 3-arg constructor with {@code 0}, kept for callers that predate the hysteresis guard.
+     *
+     * @param clusterService used both to mutate index metadata and to read the shard's current node.
+     * @param client dispatches the {@link CancelAllocationCommand} that actually evicts the shard.
+     */
+    public ShardSuspensionCoordinator(ClusterService clusterService, Client client) {
+        this(clusterService, client, 0L);
+    }
 
     /**
      * Creates a coordinator.
      *
      * @param clusterService used both to mutate index metadata and to read the shard's current node.
      * @param client dispatches the {@link CancelAllocationCommand} that actually evicts the shard.
+     * @param cooldownMillis the minimum time that must have passed since a shard's own last
+     *                       reactivation before it may be suspended again; non-positive disables the guard.
      */
-    public ShardSuspensionCoordinator(ClusterService clusterService, Client client) {
+    public ShardSuspensionCoordinator(ClusterService clusterService, Client client, long cooldownMillis) {
         this.clusterService = clusterService;
         this.client = client;
+        this.cooldownMillis = cooldownMillis;
     }
 
     /**
@@ -143,11 +168,31 @@ public final class ShardSuspensionCoordinator {
             @Override
             public ClusterState execute(ClusterState currentState) {
                 IndexMetadata indexMetadata = findByUuid(currentState.metadata(), indexUuid);
-                boolean alreadySuspended = indexMetadata != null
-                    && (reader
-                        ? SuspendedShardsMetadata.isReaderSuspended(indexMetadata, shardId)
-                        : SuspendedShardsMetadata.isSuspended(indexMetadata, shardId));
-                if (indexMetadata == null || alreadySuspended) {
+                if (indexMetadata == null) {
+                    return currentState;
+                }
+                boolean alreadySuspended = reader
+                    ? SuspendedShardsMetadata.isReaderSuspended(indexMetadata, shardId)
+                    : SuspendedShardsMetadata.isSuspended(indexMetadata, shardId);
+                if (alreadySuspended) {
+                    return currentState;
+                }
+                if (SuspendedShardsMetadata.isSuspensionAllowed(
+                    indexMetadata,
+                    shardId,
+                    reader,
+                    System.currentTimeMillis(),
+                    cooldownMillis
+                ) == false) {
+                    logger.debug(
+                        "skipping suspend of serverless-storage "
+                            + role
+                            + " shard ["
+                            + indexUuid
+                            + "]["
+                            + shardId
+                            + "]: reactivated too recently (hysteresis)"
+                    );
                     return currentState;
                 }
                 IndexMetadata updated = reader

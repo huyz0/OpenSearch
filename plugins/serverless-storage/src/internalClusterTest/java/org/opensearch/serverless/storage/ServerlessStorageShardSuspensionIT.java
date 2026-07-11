@@ -106,4 +106,76 @@ public class ServerlessStorageShardSuspensionIT extends OpenSearchIntegTestCase 
         refresh(IDX);
         assertEquals(2L, client().prepareSearch(IDX).setSize(0).get().getHits().getTotalHits().value());
     }
+
+    public void testHysteresisSkipsSuspendingAShardReactivatedWithinTheCooldownWindow() throws Exception {
+        // rfc-serverless-opensearch.md §16 Phase 4's "balancer hysteresis" milestone: without this
+        // guard, a shard reactivated once would be immediately eligible for re-suspension on the
+        // very next evaluation, causing exactly the suspend/reactivate churn hysteresis exists to
+        // prevent.
+        Path basePath = createTempDir("serverless-storage-shard-suspension-hysteresis-it");
+        Settings nodeSettings = Settings.builder()
+            .putList("path.repo", basePath.toString())
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey(), basePath.toString())
+            .build();
+
+        String clusterManagerNode = internalCluster().startClusterManagerOnlyNode(nodeSettings);
+        internalCluster().startDataOnlyNode(nodeSettings);
+
+        String indexName = "shard-suspension-hysteresis-it-idx";
+        createIndex(
+            indexName,
+            Settings.builder()
+                .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+                .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+                .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey(), true)
+                .build()
+        );
+        ensureGreen(indexName);
+
+        String indexUuid = client().admin().cluster().prepareState().get().getState().metadata().index(indexName).getIndexUUID();
+        ClusterService clusterManagerClusterService = internalCluster().getInstance(ClusterService.class, clusterManagerNode);
+
+        // A one-hour cooldown -- long enough that this test's own real wall-clock runtime can never
+        // accidentally satisfy it.
+        ShardSuspensionCoordinator coordinator = new ShardSuspensionCoordinator(
+            clusterManagerClusterService,
+            client(),
+            java.util.concurrent.TimeUnit.HOURS.toMillis(1)
+        );
+
+        coordinator.suspendWriterShard(indexUuid, 0);
+        assertBusy(() -> {
+            IndexMetadata indexMetadata = clusterManagerClusterService.state().metadata().index(indexName);
+            assertTrue(SuspendedShardsMetadata.isSuspended(indexMetadata, 0));
+        });
+
+        // Reactivate directly (bypassing the ActionFilter, since this test only needs to prove the
+        // coordinator's own cooldown check, not the reactivation trigger path already covered above).
+        client().execute(
+            org.opensearch.serverless.storage.scaletozero.action.ReactivateShardsAction.INSTANCE,
+            new org.opensearch.serverless.storage.scaletozero.action.ReactivateShardsRequest(indexName, false)
+        ).get();
+        assertBusy(() -> {
+            IndexMetadata indexMetadata = clusterManagerClusterService.state().metadata().index(indexName);
+            assertFalse(SuspendedShardsMetadata.isSuspended(indexMetadata, 0));
+            assertEquals(
+                ShardRoutingState.STARTED,
+                clusterManagerClusterService.state().routingTable().index(indexName).shard(0).primaryShard().state()
+            );
+        });
+
+        // Immediately try to suspend it again -- must be silently skipped (still within the 1-hour cooldown).
+        coordinator.suspendWriterShard(indexUuid, 0);
+        assertBusy(() -> {
+            IndexMetadata indexMetadata = clusterManagerClusterService.state().metadata().index(indexName);
+            assertFalse(
+                "hysteresis must prevent suspension of a shard reactivated well within the cooldown window",
+                SuspendedShardsMetadata.isSuspended(indexMetadata, 0)
+            );
+            assertEquals(
+                ShardRoutingState.STARTED,
+                clusterManagerClusterService.state().routingTable().index(indexName).shard(0).primaryShard().state()
+            );
+        });
+    }
 }

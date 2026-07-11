@@ -387,6 +387,19 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * The hysteresis guard {@code ShardSuspensionCoordinator} enforces (rfc-serverless-opensearch.md
+     * &sect;16 Phase 4's "balancer hysteresis" milestone item): a shard reactivated more recently
+     * than this may not be suspended again, even if it otherwise qualifies as a candidate --
+     * without it, a shard idling just past the idle threshold, getting a single request, and
+     * immediately idling again would suspend and reactivate on every single evaluation tick.
+     */
+    public static final Setting<TimeValue> SERVERLESS_STORAGE_SCALE_TO_ZERO_COOLDOWN_SETTING = Setting.timeSetting(
+        "serverless_storage.scale_to_zero.cooldown",
+        TimeValue.timeValueMinutes(5),
+        Setting.Property.NodeScope
+    );
+
+    /**
      * Per-shard fairness budget for the one node-shared {@code WalChunkService}
      * (rfc-serverless-opensearch.md &sect;18 risk #4, "WAL multiplexing fairness") -- a shard whose
      * own buffered payload bytes since its last flush cross this budget is immediately siphoned
@@ -529,6 +542,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_SCALE_TO_ZERO_EVAL_INTERVAL_SETTING,
             SERVERLESS_STORAGE_SCALE_TO_ZERO_SUSPEND_ENABLED_SETTING,
             SERVERLESS_STORAGE_SCALE_TO_ZERO_SEARCH_REACTIVATION_WAIT_SETTING,
+            SERVERLESS_STORAGE_SCALE_TO_ZERO_COOLDOWN_SETTING,
             SERVERLESS_STORAGE_REPOSITORY_SETTING
         );
     }
@@ -595,12 +609,15 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         TimeValue scaleToZeroEvalInterval = SERVERLESS_STORAGE_SCALE_TO_ZERO_EVAL_INTERVAL_SETTING.get(environment.settings());
         if (scaleToZeroEvalInterval.millis() > 0) {
             boolean suspendEnabled = SERVERLESS_STORAGE_SCALE_TO_ZERO_SUSPEND_ENABLED_SETTING.get(environment.settings());
+            long cooldownMillis = SERVERLESS_STORAGE_SCALE_TO_ZERO_COOLDOWN_SETTING.get(environment.settings()).millis();
             this.scaleToZeroCandidatesSchedulerTask = new org.opensearch.serverless.storage.scaletozero.ScaleToZeroCandidatesSchedulerTask(
                 threadPool,
                 scaleToZeroEvalInterval,
                 client,
                 clusterService,
-                suspendEnabled ? new org.opensearch.serverless.storage.scaletozero.ShardSuspensionCoordinator(clusterService, client) : null
+                suspendEnabled
+                    ? new org.opensearch.serverless.storage.scaletozero.ShardSuspensionCoordinator(clusterService, client, cooldownMillis)
+                    : null
             );
         }
         String configuredBasePath = SERVERLESS_STORAGE_BASE_PATH_SETTING.get(environment.settings());

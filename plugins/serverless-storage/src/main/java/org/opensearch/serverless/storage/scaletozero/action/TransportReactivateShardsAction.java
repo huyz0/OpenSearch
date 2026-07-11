@@ -104,9 +104,10 @@ public final class TransportReactivateShardsAction extends TransportClusterManag
                 if (indexMetadata == null) {
                     return currentState;
                 }
+                long nowMillis = threadPool.absoluteTimeInMillis();
                 IndexMetadata updated = reader
-                    ? SuspendedShardsMetadata.withAllReaderShardsReactivated(indexMetadata)
-                    : SuspendedShardsMetadata.withAllShardsReactivated(indexMetadata);
+                    ? SuspendedShardsMetadata.withAllReaderShardsReactivated(indexMetadata, nowMillis)
+                    : SuspendedShardsMetadata.withAllShardsReactivated(indexMetadata, nowMillis);
                 if (updated == indexMetadata) {
                     return currentState;
                 }

@@ -1955,13 +1955,15 @@ where it didn't already exist, and each of those additions is a generally useful
 shared test infrastructure other plugins' tests benefit from too, not a special-cased double built
 only for this RFC's purposes.
 
-**Phase 4 — Topology (4–6 weeks).** Role-separated allocation (done, see &sect;10 and
+**Phase 4 — Topology (4–6 weeks), fully done.** Role-separated allocation (see &sect;10 and
 `ServerlessStorageExistingShardsAllocator`/`ReaderShardPlacementAllocationDecider`), suspended
-writers and readers and scale-to-zero for both (done, signal collection through the actual
-suspend/reactivate mechanism -- see below), balancer hysteresis (still open). Milestone: idle index
-consumes zero compute (done for both writer and reader shards); first query after idle returns < 5 s
-p95 for a cached-manifest index (not yet benchmarked, but the "never a client-visible failure"
-correctness bar the milestone implies is now met and integration-tested).
+writers and readers and scale-to-zero for both (signal collection through the actual
+suspend/reactivate mechanism -- see below), and balancer hysteresis (see below, `ShardSuspensionCoordinator`'s
+cooldown guard) are all implemented and tested. Milestone: idle index consumes zero compute (done for
+both writer and reader shards, with real suspend/reactivate churn also now bounded by the hysteresis
+guard); first query after idle returns < 5 s p95 for a cached-manifest index (not yet benchmarked,
+but the "never a client-visible failure" correctness bar the milestone implies is now met and
+integration-tested).
 
 **First increment of "suspended writers" landed: the raw idle-activity signal any suspension or
 scale-to-zero decision needs.** `ObjectStoreWriterEngine` now tracks the wall-clock time of its
@@ -2268,6 +2270,34 @@ to force it onto the reader copy specifically, not fall back to the primary -- s
 the correct hit count, proving the "never a client-visible failure" bar end to end rather than by
 inference from the unit-level wait logic alone. A full `internalClusterTest` regression sweep across
 the entire plugin stayed green throughout.
+
+**Balancer hysteresis is now done too, closing out Phase 4's last open milestone item.** Without a
+cooldown, a shard idling just past the threshold, getting a single request, reactivating, and
+immediately idling again would suspend and reactivate on every single scheduled evaluation tick --
+real, wasted allocation churn (a reroute plus a `CancelAllocationCommand` every cycle) for no benefit,
+the exact flapping hysteresis exists to prevent. `SuspendedShardsMetadata` gained a second pair of
+`IndexMetadata` custom-data keys (`WRITER_LAST_REACTIVATED_CUSTOM_TYPE`/`READER_LAST_REACTIVATED_CUSTOM_TYPE`),
+stamped by `withAllShardsReactivated`/`withAllReaderShardsReactivated` for exactly the shard ids they
+actually clear -- the same cluster-state-custom-data mechanism this whole feature already relies on,
+no new customization point needed. `TransportReactivateShardsAction` passes `threadPool.absoluteTimeInMillis()`
+as the stamp inside the same `ClusterStateUpdateTask` that clears the suspended marker, so the
+timestamp and the clear are atomic with each other.
+
+`ShardSuspensionCoordinator` gained a third constructor parameter, `cooldownMillis` (the existing
+2-arg constructor delegates with `0`, disabling the guard -- every pre-existing caller's behavior is
+unchanged), and its `suspend()` method now checks the new `SuspendedShardsMetadata#isSuspensionAllowed`
+inside the same `ClusterStateUpdateTask.execute()` that would otherwise mark the shard suspended,
+skipping (not erroring) any shard reactivated more recently than the cooldown. A new node setting,
+`serverless_storage.scale_to_zero.cooldown` (default 5 minutes), is threaded through from
+`ServerlessStoragePlugin` into the `ShardSuspensionCoordinator` the scheduler task constructs.
+
+Verified with unit tests directly against the new pure `isSuspensionAllowed`/`lastReactivatedAtMillis`
+functions (`SuspendedShardsMetadataTests`) -- no cooldown configured, a shard never reactivated, just
+inside the cooldown window, and just outside it -- and a real end-to-end integration test
+(`ServerlessStorageShardSuspensionIT#testHysteresisSkipsSuspendingAShardReactivatedWithinTheCooldownWindow`)
+proving a real coordinator constructed with a one-hour cooldown genuinely refuses to re-suspend a
+just-reactivated shard, over a real cluster, not merely by reasoning about the pure function in
+isolation. A full `internalClusterTest` regression sweep stayed green throughout.
 
 **Phase 4.5 — Compaction service, fully done.** Candidate selection, rebase protocol, real Lucene
 merge, size-tiered shaping, background scheduling, a real concurrent-writer data-loss bug, real
