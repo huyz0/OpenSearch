@@ -2376,6 +2376,28 @@ matching on the full pin (reason + term + generation) so one generation's pin ca
 without touching any other generation's pin under the same reason; `removePin(String, int,
 String)`'s original all-matching-reason behavior is unchanged and still used for snapshots.
 
+**Retention/GC observability, new.** `GcSchedulerTask`'s sweep and `PitrRetentionSchedulerTask`'s
+reconciliation both run for real now, but until now neither had any REST surface -- an operator had
+no way to see a shard's manifest/bundle/pin counts short of reading logs or reasoning about the
+background schedule's own timing, unlike idle shards, manifest lag, and scale-to-zero candidates,
+which all got a real `Node*Action`+REST surface as they landed. New `ShardRetentionStatsAction`/
+`ShardRetentionStatsRequest`/`ShardRetentionStatsResponse`/`TransportShardRetentionStatsAction`/
+`RestShardRetentionStatsAction` (`retention/action` package, REST at `GET
+/_plugins/_serverless/storage/{index_uuid}/{shard_id}/_retention_stats`) report, for one shard:
+total manifest/bundle counts, how many of each `ManifestRetentionPolicy`/`BundleReferenceCounter`
+currently consider deletable, total durable pin count, how many of those are specifically
+`"pitr"`-reason pins, and this node's configured GC retention window and PITR window. Built the
+same way `TransportCompactionTriggerAction` builds its stores (from `ServerlessStoragePlugin#blobContainerForDirectoryFactory`,
+no node routing needed since retention state lives entirely in the shared object store) and runs
+the exact same dry-run policy computations `GcSchedulerTask`'s real sweep uses -- it only counts
+the results rather than deleting anything, so a stats query and the real sweep's decision can never
+silently drift apart. Verified with a real two-generation shard against a real cluster
+(`ServerlessStorageShardRetentionStatsActionIT`): the older, non-latest generation is correctly
+reported deletable under a zero retention window with no pin, then correctly reported
+*not* deletable once a real `"pitr"` pin is added directly to the shared `BlobContainerDurablePinRegistry`
+-- proving the stats action's dry-run computation actually respects the same durable-pin protection
+the real sweep enforces, not a separate parallel implementation that could drift.
+
 **Zero-copy clone: a first, scoped slice landed.** `ShardCloner.clone` (new
 `clone` package) is the control-plane half: given a source shard with a published manifest and a
 target index/shard with no head yet, it durably pins the exact source generation being cloned from

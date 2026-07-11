@@ -1013,6 +1013,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new ActionHandler<>(
                 org.opensearch.serverless.storage.retention.action.IndexSnapshotRestoreAction.INSTANCE,
                 org.opensearch.serverless.storage.retention.action.TransportIndexSnapshotRestoreAction.class
+            ),
+            new ActionHandler<>(
+                org.opensearch.serverless.storage.retention.action.ShardRetentionStatsAction.INSTANCE,
+                org.opensearch.serverless.storage.retention.action.TransportShardRetentionStatsAction.class
             )
         );
     }
@@ -1034,6 +1038,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new org.opensearch.serverless.storage.writerengine.action.RestNodeIdleShardsAction(),
             new org.opensearch.serverless.storage.readerengine.action.RestNodeManifestLagAction(),
             new org.opensearch.serverless.storage.scaletozero.action.RestScaleToZeroCandidatesAction(),
+            new org.opensearch.serverless.storage.retention.action.RestShardRetentionStatsAction(),
             new org.opensearch.serverless.storage.retention.action.RestSnapshotPinAction(),
             new org.opensearch.serverless.storage.retention.action.RestSnapshotReleaseAction(),
             new org.opensearch.serverless.storage.retention.action.RestSnapshotRestoreAction(),
@@ -1081,6 +1086,24 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      */
     public long scaleToZeroLagThreshold() {
         return scaleToZeroLagThreshold;
+    }
+
+    /**
+     * This node's currently configured PITR window (millis), or a non-positive value if PITR
+     * retention is disabled -- see {@link #SERVERLESS_STORAGE_PITR_WINDOW_SETTING}. Used by {@code
+     * TransportShardRetentionStatsAction} to report the configured window alongside real pin/manifest counts.
+     */
+    public long pitrWindowMillis() {
+        return pitrWindowMillis;
+    }
+
+    /**
+     * This node's currently configured GC retention window (millis) -- see {@link
+     * #SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING}. Used by {@code TransportShardRetentionStatsAction}
+     * to report the configured window alongside real manifest/bundle deletability counts.
+     */
+    public long gcRetentionWindowMillis() {
+        return gcRetentionWindowMillis;
     }
 
     /** The node-shared WAL chunk service {@link #createComponents} built, or {@code null} if WAL mirroring is off -- test-only visibility. */
