@@ -9,17 +9,12 @@
 package org.opensearch.serverless.storage.security;
 
 import org.opensearch.common.blobstore.BlobContainer;
-import org.opensearch.common.blobstore.BlobRegister;
-import org.opensearch.common.blobstore.BlobRegisterCasResult;
-import org.opensearch.common.blobstore.support.FilterBlobContainer;
-import org.opensearch.core.common.bytes.BytesReference;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.Arrays;
-import java.util.Optional;
 
 /**
  * Encrypts blob content at rest, transparently to every caller that only knows {@link
@@ -52,12 +47,11 @@ import java.util.Optional;
  * {@code BlobContainerShardStateStore} already gives their *plaintext* today; segment and WAL data
  * (this class's actual target) carry the sensitive payload.
  */
-public final class EncryptingBlobContainer extends FilterBlobContainer {
+public final class EncryptingBlobContainer extends RegisterDelegatingBlobContainer {
 
     /** 64 KiB: large enough that most bundle files fit in one or two blocks, small enough that a ranged read of a single file doesn't drag in unrelated data. */
     private static final int DEFAULT_BLOCK_SIZE_BYTES = 64 * 1024;
 
-    private final BlobContainer delegate;
     private final EncryptionKeyProvider keyProvider;
     private final int blockSizeBytes;
 
@@ -80,7 +74,6 @@ public final class EncryptingBlobContainer extends FilterBlobContainer {
      */
     EncryptingBlobContainer(BlobContainer delegate, EncryptionKeyProvider keyProvider, int blockSizeBytes) {
         super(delegate);
-        this.delegate = delegate;
         this.keyProvider = keyProvider;
         this.blockSizeBytes = blockSizeBytes;
     }
@@ -116,17 +109,6 @@ public final class EncryptingBlobContainer extends FilterBlobContainer {
     public void writeBlobAtomic(String blobName, InputStream inputStream, long blobSize, boolean failIfAlreadyExists) throws IOException {
         byte[] ciphertext = encryptBlocked(inputStream.readAllBytes());
         delegate.writeBlobAtomic(blobName, new ByteArrayInputStream(ciphertext), ciphertext.length, failIfAlreadyExists);
-    }
-
-    @Override
-    public Optional<BlobRegister> readRegister(String blobName) throws IOException {
-        return delegate.readRegister(blobName);
-    }
-
-    @Override
-    public BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
-        throws IOException {
-        return delegate.compareAndSwapRegister(blobName, expectedGeneration, newValue);
     }
 
     private static byte[] readAllAndClose(InputStream in) throws IOException {

@@ -14,6 +14,7 @@ import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.support.FilterBlobContainer;
 import org.opensearch.core.common.bytes.BytesReference;
+import org.opensearch.serverless.storage.security.RegisterDelegatingBlobContainer;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -35,9 +36,8 @@ import java.util.Optional;
  * decorators, e.g. {@code WalMirroringTranslogTests.FailNTimesBlobContainer}), not {@code
  * src/main}.
  */
-public final class LatencyInjectingBlobContainer extends FilterBlobContainer {
+public final class LatencyInjectingBlobContainer extends RegisterDelegatingBlobContainer {
 
-    private final BlobContainer delegate;
     private final LatencyProfile profile;
 
     /**
@@ -46,7 +46,6 @@ public final class LatencyInjectingBlobContainer extends FilterBlobContainer {
      */
     public LatencyInjectingBlobContainer(BlobContainer delegate, LatencyProfile profile) {
         super(delegate);
-        this.delegate = delegate;
         this.profile = profile;
     }
 
@@ -97,24 +96,22 @@ public final class LatencyInjectingBlobContainer extends FilterBlobContainer {
         delegate.deleteBlobsIgnoringIfNotExists(blobNames);
     }
 
-    // FilterBlobContainer does not override readRegister/compareAndSwapRegister, so without these
-    // overrides they'd silently fall through to BlobContainer's own default, which unconditionally
-    // throws UnsupportedOperationException -- a real bug caught by
-    // ServerlessStorageReactivationUnderLatencyIT wrapping a real FsBlobContainer (which DOES
-    // implement register semantics) in this decorator and hitting exactly that during shard
-    // recovery, not merely a hypothetical gap.
+    // RegisterDelegatingBlobContainer already delegates readRegister/compareAndSwapRegister
+    // correctly (see its own javadoc for why that delegation has to be explicit at all); these
+    // overrides only layer the simulated latency on top before calling super for the actual
+    // delegation.
 
     @Override
     public Optional<BlobRegister> readRegister(String blobName) throws IOException {
         sleep(profile.sampleReadMillis());
-        return delegate.readRegister(blobName);
+        return super.readRegister(blobName);
     }
 
     @Override
     public BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
         throws IOException {
         sleep(profile.sampleWriteMillis());
-        return delegate.compareAndSwapRegister(blobName, expectedGeneration, newValue);
+        return super.compareAndSwapRegister(blobName, expectedGeneration, newValue);
     }
 
     private static void sleep(long millis) throws IOException {

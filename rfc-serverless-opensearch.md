@@ -1702,6 +1702,21 @@ re-running shows the exception escaping the call, exactly as the bug predicted, 
 scheduler wrapper happens to also tolerate an escaping exception and would have silently masked
 the difference in any end-to-end test through the real scheduled path.
 
+**A final cleanup from the same review pass**: `RestrictingBlobContainer` and
+`EncryptingBlobContainer` each independently reimplemented the identical
+`readRegister`/`compareAndSwapRegister`-delegation boilerplate (and, in `EncryptingBlobContainer`'s
+case, its own private `delegate` field duplicate for it too) -- the exact shape of bug that already broke this
+plugin's own production register-based recovery once (the `readRegister` regression this section
+documents above) and test-only code before that (`LatencyInjectingBlobContainer`'s own history).
+Extracted into a shared `RegisterDelegatingBlobContainer` base (security package) that both
+production classes now extend, along with the test-only `LatencyInjectingBlobContainer` (which
+layers simulated latency on top by overriding and calling `super`, since it needs more than plain
+delegation there) -- a third independent copy of that exact bug can no longer happen, since every
+subclass gets correct delegation just by extending this instead of `FilterBlobContainer` directly.
+Verified: reverting the new base class fails every one of those three subclasses' own compile; a
+dedicated test exercises the base class's delegation directly through a real `BlobContainer`, not
+just indirectly through its subclasses' own test suites.
+
 ## 13. Degraded Modes: Object-Store Brownouts
 
 The object store is now the single dependency of everything, so its failure modes must map to

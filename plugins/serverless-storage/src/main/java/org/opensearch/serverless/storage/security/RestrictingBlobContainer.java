@@ -9,15 +9,10 @@
 package org.opensearch.serverless.storage.security;
 
 import org.opensearch.common.blobstore.BlobContainer;
-import org.opensearch.common.blobstore.BlobRegister;
-import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.DeleteResult;
-import org.opensearch.common.blobstore.support.FilterBlobContainer;
-import org.opensearch.core.common.bytes.BytesReference;
 
 import java.io.IOException;
 import java.util.List;
-import java.util.Optional;
 
 /**
  * Denies delete operations on the wrapped {@link BlobContainer} (rfc-serverless-opensearch.md
@@ -52,16 +47,8 @@ import java.util.Optional;
  * need per-action review before wrapping, not a blanket application of this class; each is a
  * distinct decision left for a follow-up, not silently assumed safe.
  */
-public final class RestrictingBlobContainer extends FilterBlobContainer {
+public final class RestrictingBlobContainer extends RegisterDelegatingBlobContainer {
 
-    // FilterBlobContainer keeps its own delegate reference private, so BlobContainer's register
-    // operations (readRegister/compareAndSwapRegister -- BlobContainerShardStateStore's whole
-    // mechanism) have to be delegated explicitly here too, exactly as EncryptingBlobContainer
-    // already has to; without this, BlobContainer's own default method implementations for those
-    // two throw UnsupportedOperationException regardless of what the real delegate supports,
-    // since FilterBlobContainer never overrides them and Java doesn't fall through to a
-    // superinterface default through an unrelated subclass.
-    private final BlobContainer delegate;
     private final boolean deleteAllowed;
 
     /**
@@ -74,24 +61,12 @@ public final class RestrictingBlobContainer extends FilterBlobContainer {
      */
     public RestrictingBlobContainer(BlobContainer delegate, boolean deleteAllowed) {
         super(delegate);
-        this.delegate = delegate;
         this.deleteAllowed = deleteAllowed;
     }
 
     @Override
     protected BlobContainer wrapChild(BlobContainer child) {
         return new RestrictingBlobContainer(child, deleteAllowed);
-    }
-
-    @Override
-    public Optional<BlobRegister> readRegister(String blobName) throws IOException {
-        return delegate.readRegister(blobName);
-    }
-
-    @Override
-    public BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
-        throws IOException {
-        return delegate.compareAndSwapRegister(blobName, expectedGeneration, newValue);
     }
 
     @Override
