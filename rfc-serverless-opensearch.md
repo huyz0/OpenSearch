@@ -3078,7 +3078,24 @@ directions documented so serverless adoption is not a one-way door.
 - **Format-level**: property-based tests on bundle/manifest round-trips; corruption injection
   (truncated bundle, missing manifest, checksum mismatch) must fail closed.
 - **Fencing**: dual-writer tests — old-term writer keeps publishing during/after failover;
-  assert its manifests are never visible and are GC'd.
+  assert its manifests are never visible and are GC'd. **Status: implemented.**
+  `DualWriterFencingGcTests` proves this end to end against the real production classes
+  (`ObjectStoreCommitPublisher`, `ObjectStoreCommitHeadPublisher`, `BlobContainerShardStateStore`,
+  `GcSchedulerTask`), not mocks: an old-term writer passes the term check, durably packages its
+  bundle and manifest, then loses the head CAS to a new-term writer's publish landing first,
+  reproducing the narrow interleaving `ObjectStoreCommitHeadPublisher#publishCommitAsHead`'s own
+  javadoc identifies as the only case that leaves a genuine orphan (the common case — a writer
+  already superseded before it next tries to publish — never writes anything at all). The test
+  forces that interleaving deterministically by manually driving the same two low-level steps
+  `publishCommitAsHead` uses internally (`publishCommit` to package, then `compareAndSet` to
+  attempt to become head), rather than relying on real threads or network-disruption tricks; this
+  is a deliberate choice — component-level and deterministic beats real-cluster and racy for
+  proving a specific interleaving exists and is handled correctly. A coarser real-cluster IT via
+  `NetworkDisruption` remains a possible future secondary confirmation but wasn't built, since it
+  can only ever *hope* to reproduce this interleaving rather than force it. Verified: the old
+  writer's manifest is durably written but never becomes the visible head/latest-manifest, the CAS
+  it attempts fails, and a subsequent GC sweep reclaims its orphaned manifest while the winning
+  manifest survives.
 - **Chaos**: kill writer mid-bundle-upload, mid-manifest-write, mid-WAL-chunk; kill readers
   mid-refresh; object store fault injection (throttling, 5xx storms, elevated latency) — the
   mock repository infrastructure in-repo already supports much of this.
