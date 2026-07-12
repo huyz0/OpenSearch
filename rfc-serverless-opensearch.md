@@ -1502,8 +1502,8 @@ and is unaffected structurally — but the *cache* is node-shared, so cache keys
 across indices (they don't: keyed by bundle object key), and cache-timing side channels between
 tenants are accepted as out of scope pending the multi-tenancy effort (§3).
 
-**Status: bundles/manifests encryption done; WAL per-record envelope encryption and credential
-scoping not started.** `EncryptingBlobContainer` implements the second bullet directly: it wraps
+**Status: bundles/manifests encryption and WAL per-record envelope encryption both done; only
+credential scoping per tier remains not started.** `EncryptingBlobContainer` implements the second bullet directly: it wraps
 any real `BlobContainer` transparently (AES-256-GCM, random IV per blob, authenticated -- a
 tampered or corrupted blob fails to decrypt loudly rather than silently), and because it's wired
 in at the per-shard container construction seam in `ServerlessStoragePlugin`, every bundle,
