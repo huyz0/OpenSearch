@@ -910,9 +910,17 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             String indexUuid = indexSettings.getIndex().getUUID();
             int shardIdValue = shardRouting != null ? shardRouting.shardId().getId() : 0;
             BlobContainer blobContainer = resolveBlobContainer(indexUuid, shardIdValue);
-            ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
-            BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(blobContainer);
-            BlobContainerBundleStore bundleStore = new BlobContainerBundleStore(blobContainer);
+            // Credential scoping per tier (rfc-serverless-opensearch.md &sect;15): every consumer
+            // built from this container below except GcSchedulerConfig's own store pair further
+            // down only ever needs GET+PUT, never DELETE -- deletion is reserved to the
+            // GC/reconciler role. Wrapping here, not at resolveBlobContainer itself, keeps
+            // `blobContainer` available unrestricted for the two places that still need it
+            // directly (the shard-partition descriptor read below and DedicatedWalGcConfig's own
+            // WAL-container GC, unrelated to this credential-scoping change).
+            BlobContainer scopedContainer = new org.opensearch.serverless.storage.security.RestrictingBlobContainer(blobContainer, false);
+            ShardStateStore shardStateStore = new BlobContainerShardStateStore(scopedContainer);
+            BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(scopedContainer);
+            BlobContainerBundleStore bundleStore = new BlobContainerBundleStore(scopedContainer);
             // Shared by both roles below: the reader branch's own background CompactionSchedulerTask
             // needs one just as much as the writer branch's ordinary commit-publish path does --
             // cheap and stateless to construct once here rather than duplicating it in each branch.
@@ -922,7 +930,9 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             // Always constructed, not gated on PITR being enabled: a snapshot can pin a manifest
             // independent of PITR, and the reader branch's own background GcSchedulerTask needs a
             // real registry to check regardless of whether PITR retention is configured on this node.
-            DurablePinRegistry pinRegistry = new BlobContainerDurablePinRegistry(blobContainer);
+            // A pin is only ever added or overwritten by CAS, never deleted through this registry
+            // itself, so the delete-denying scoped container is safe here too.
+            DurablePinRegistry pinRegistry = new BlobContainerDurablePinRegistry(scopedContainer);
 
             boolean isReaderShard = shardRouting != null && shardRouting.isSearchOnly();
             if (isReaderShard) {
@@ -959,16 +969,22 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                         CompactionPolicy.withDefaults(),
                         new CompactionRebaseExecutor(shardStateStore, 5)
                     );
+                // GC is the one tier &sect;15's credential-scoping model actually grants DELETE to
+                // ("the GC/reconciler role is the only DELETE-capable principal") -- built against
+                // its own store pair on the *unrestricted* blobContainer, deliberately not reusing
+                // manifestStore/bundleStore above (which are wired through the delete-denying
+                // scopedContainer and would throw the moment GcSchedulerTask's sweep tried to
+                // delete anything through them).
                 GcSchedulerConfig gcConfig = gcInterval == null
                     ? null
                     : new GcSchedulerConfig(
                         gcInterval,
                         gcRetentionWindowMillis,
-                        manifestStore,
+                        new BlobContainerManifestStore(blobContainer),
                         // Raw bundle store, same "no hot-rereading benefit from a cache" reasoning as
                         // the compaction config just above -- a sweep lists/deletes bundle names, it
                         // never reads their contents at all.
-                        bundleStore,
+                        new BlobContainerBundleStore(blobContainer),
                         pinRegistry
                     );
                 org.opensearch.serverless.storage.resharding.ShardPartitionDescriptor partitionDescriptor;

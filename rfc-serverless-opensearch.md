@@ -1502,8 +1502,9 @@ and is unaffected structurally — but the *cache* is node-shared, so cache keys
 across indices (they don't: keyed by bundle object key), and cache-timing side channels between
 tenants are accepted as out of scope pending the multi-tenancy effort (§3).
 
-**Status: bundles/manifests encryption and WAL per-record envelope encryption both done; only
-credential scoping per tier remains not started.** `EncryptingBlobContainer` implements the second bullet directly: it wraps
+**Status: bundles/manifests encryption and WAL per-record envelope encryption both done; credential
+scoping per tier now has its in-process defense-in-depth half done too (real IAM/role-assumption
+wiring per cloud backend remains out of scope for this repo).** `EncryptingBlobContainer` implements the second bullet directly: it wraps
 any real `BlobContainer` transparently (AES-256-GCM, random IV per blob, authenticated -- a
 tampered or corrupted blob fails to decrypt loudly rather than silently), and because it's wired
 in at the per-shard container construction seam in `ServerlessStoragePlugin`, every bundle,
@@ -1566,9 +1567,33 @@ component level (`EncryptingWalChunkServiceTests`/`WalRecordCryptoTests` already
 real indexed document, mirrored through a real `ObjectStoreWriterEngine` configured with a key
 provider, produces a WAL chunk blob whose raw payload does not deserialize as a valid
 `Translog.Operation` (genuine ciphertext on disk, not unasserted plaintext) and which decrypts back
-to the exact original operation with the right key. **Not implemented**: credential scoping per
-tier (bullet 3), which needs IAM/role-assumption wiring per cloud backend, not just a core
-primitive like the ones built so far.
+to the exact original operation with the right key. **Now implemented (in-process defense-in-depth
+half only)**: credential scoping per tier (bullet 3). Real per-tier IAM/role-assumption wiring is
+still deployment-specific and out of scope for this repo, but `RestrictingBlobContainer`
+(security package) closes the in-process half of the same gap: it wraps a `BlobContainer` and
+throws a `SecurityException` on `delete()`/`deleteBlobsIgnoringIfNotExists`, turning "a reader or
+compactor bug calls delete" into a loud, immediate exception instead of a silent reach into real
+storage. Wired at `ServerlessStoragePlugin#getEngineFactory`'s construction seam: the shared
+container backing `ShardStateStore`/`ManifestStore`/`BundleStore`/`DurablePinRegistry` (and
+therefore the reader, writer, and compaction paths, which all currently share one `BlobContainer`
+instance per shard -- see that method's own comments) is delete-denied; `GcSchedulerConfig` alone
+gets its own store pair built against the unrestricted underlying container, matching "the
+GC/reconciler role is the only DELETE-capable principal" exactly. **Known, explicit limitation**:
+only the DELETE-vs-not-DELETE axis (bullets 2 and 3) is enforced -- the GET-only search-compute
+tier (bullet 1) isn't, because the reader and writer paths aren't yet built against genuinely
+separate `BlobContainer` instances at that construction seam; a reader shard's own background
+compaction/GC tasks currently share the exact same container as its query-serving path, so a hard
+GET-only wrapper there would break those background tasks too. Verified with real-`BlobContainer`
+unit tests (write/read pass through unchanged regardless of delete permission; a denied delete
+throws before ever reaching the delegate and leaves it untouched; a permitted delete actually
+deletes; children reached via `children()` stay wrapped with the same permission) and caught a
+real regression before it shipped: the first `internalClusterTest` sweep failed broadly with
+`UnsupportedOperationException: ... does not support readRegister` -- `FilterBlobContainer`
+doesn't delegate `BlobContainer`'s default `readRegister`/`compareAndSwapRegister` methods on its
+own, so without an explicit override (the same one `EncryptingBlobContainer` already needed for
+the same reason) every register-based shard-state read/write, i.e. every shard's recovery, broke
+the moment this wrapper was wired in. Fixed by adding that override; a full re-run of the sweep
+came back clean.
 
 ## 13. Degraded Modes: Object-Store Brownouts
 
