@@ -962,17 +962,38 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
                     }
                 });
 
+                // Two independent pollNow() hammerers -- pollForNewerManifest() is now synchronized
+                // specifically because pollNow(), waitForGeneration()'s own on-demand polling, and
+                // the background scheduler can all reach it concurrently for the same shard;
+                // without that synchronization, these threads racing the rywThread's own
+                // waitForGeneration() calls and the background scheduler would be the way a
+                // regression here would actually surface as a monotonicity violation above.
+                Thread[] pollNowThreads = new Thread[2];
+                for (int i = 0; i < pollNowThreads.length; i++) {
+                    pollNowThreads[i] = new Thread(() -> {
+                        while (publishingDone.get() == false) {
+                            readerEngine.pollNow();
+                        }
+                    });
+                }
+
                 publisherThread.start();
                 for (Thread observer : observerThreads) {
                     observer.start();
                 }
                 rywThread.start();
+                for (Thread pollNowThread : pollNowThreads) {
+                    pollNowThread.start();
+                }
 
                 publisherThread.join();
                 for (Thread observer : observerThreads) {
                     observer.join();
                 }
                 rywThread.join();
+                for (Thread pollNowThread : pollNowThreads) {
+                    pollNowThread.join();
+                }
 
                 if (failure.get() != null) {
                     throw new AssertionError("concurrent linearizability/monotonicity check failed", failure.get());

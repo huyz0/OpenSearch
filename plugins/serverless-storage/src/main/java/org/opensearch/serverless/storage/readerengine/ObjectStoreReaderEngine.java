@@ -299,8 +299,20 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
      * than pulling more segment bytes into an already-over-budget cache. The next poll tick tries
      * again, so the shard catches up automatically once cache pressure eases (e.g. another shard
      * closes or its own cache entries get evicted).
+     *
+     * <p><b>{@code synchronized}, not just backed by an {@link java.util.concurrent.atomic.AtomicLong}.</b>
+     * Three independent call paths can reach this method for the same shard: the background poll
+     * scheduler, {@link #waitForGeneration}'s on-demand polling (one caller thread per RYW waiter),
+     * and {@link #pollNow} (dispatched per publication-notification request). The read-check-apply-write
+     * sequence here is a compound operation -- {@code currentManifestGeneration}'s atomicity only
+     * covers the individual {@code get()}/{@code set()} calls, not the sequence between them -- so
+     * without serialization, two overlapping callers could both observe a stale generation, both
+     * apply a manifest to the same {@code Directory} concurrently, and whichever one calls {@code
+     * set()} last could regress the tracked generation backward even if it applied the older
+     * manifest last. Contention is expected to be rare and each call is already bounded by real
+     * object-store I/O, so blocking here is cheap relative to the work already being serialized.
      */
-    private void pollForNewerManifest() {
+    private synchronized void pollForNewerManifest() {
         try {
             // The head read (and the lastObservedLatestGeneration update below) deliberately runs
             // BEFORE the admission-budget check, not after: an over-budget tick still needs to know
