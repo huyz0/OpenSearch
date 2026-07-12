@@ -82,7 +82,16 @@ public class TransportCompactionTriggerAction extends HandledTransportAction<Com
     protected void doExecute(Task task, CompactionTriggerRequest request, ActionListener<CompactionTriggerResponse> listener) {
         threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
             try {
-                BlobContainer container = plugin.blobContainerForDirectoryFactory(request.indexUuid(), request.shardId());
+                // Credential scoping per tier (rfc-serverless-opensearch.md &sect;15): the
+                // compaction service needs GET+PUT but no DELETE (deletion stays with GC) --
+                // CompactionSchedulerTask#maybeCompact never calls delete through any of the
+                // stores built here, so wrapping in RestrictingBlobContainer is a safe, real
+                // application of the same defense-in-depth ServerlessStoragePlugin#getEngineFactory
+                // already applies to the scheduled compaction path.
+                BlobContainer container = new org.opensearch.serverless.storage.security.RestrictingBlobContainer(
+                    plugin.blobContainerForDirectoryFactory(request.indexUuid(), request.shardId()),
+                    false
+                );
                 BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(container);
                 ShardStateStore shardStateStore = new BlobContainerShardStateStore(container);
                 ObjectStoreCommitMaterializer materializer = new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(container));

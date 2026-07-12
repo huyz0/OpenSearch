@@ -1660,6 +1660,23 @@ the same reason) every register-based shard-state read/write, i.e. every shard's
 the moment this wrapper was wired in. Fixed by adding that override; a full re-run of the sweep
 came back clean.
 
+**Coverage broadened past the one engine-construction seam, and the class's own javadoc corrected
+to stop overclaiming -- a real gap and a real documentation-accuracy issue, both caught by code
+review.** `TransportCompactionTriggerAction#doExecute` (the on-demand compaction trigger, &sect;16
+Phase 4) now wraps its container the same way, since `CompactionSchedulerTask#maybeCompact` -- the
+exact logic both the scheduled and on-demand paths share -- never calls delete, matching this
+section's own "compaction service needs GET+PUT but no DELETE" bullet directly. `RestrictingBlobContainer`'s
+class javadoc previously claimed "every consumer other than `GcSchedulerTask` ... is wired through
+an instance of this class," which was never accurate: shard clone, shrink, split,
+partition-rewrite, the snapshot pin/restore/release actions, and retention-stats all still build
+their stores directly against the raw, unrestricted container from `ServerlessStoragePlugin#blobContainerForDirectoryFactory`.
+Several of those -- shard clone's own lineage deletion, in particular -- genuinely need delete, so
+blanket-wrapping all of them would have been actively wrong, not just incomplete; each remaining
+path needs its own per-action review before it can safely opt in, left as an explicit follow-up
+rather than rushed in under this pass. Verified: the real end-to-end `ServerlessStorageCompactionTriggerActionIT`
+(merges an actual fragmented shard over transport) still passes unchanged with the wrap in place,
+proving the restriction doesn't interfere with compaction's real read/write/publish flow.
+
 ## 13. Degraded Modes: Object-Store Brownouts
 
 The object store is now the single dependency of everything, so its failure modes must map to

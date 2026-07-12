@@ -26,24 +26,31 @@ import java.util.Optional;
  *
  * <p>Real per-tier credential scoping is ultimately an object-store IAM/deployment concern -- this
  * class doesn't (and can't) replace scoped cloud credentials. What it buys is defense-in-depth
- * <em>inside</em> this process: every consumer other than {@code GcSchedulerTask} (the reader,
- * writer, and compaction paths, all of which share one {@link BlobContainer} instance per shard at
- * {@code ServerlessStoragePlugin#getEngineFactory}'s construction seam -- see that method's own
- * comments) is wired through an instance of this class with deletes denied, so a bug that makes a
- * reader or compactor call {@code delete()}/{@code deleteBlobsIgnoringIfNotExists} becomes a
- * loud {@link SecurityException} instead of quietly reaching the real store. {@code
- * GcSchedulerConfig} alone is built against the unrestricted underlying container, matching "the
- * GC/reconciler role is the only DELETE-capable principal" exactly.
+ * <em>inside</em> this process, applied at each construction seam that opts in: the long-lived
+ * per-shard engine construction seam in {@code ServerlessStoragePlugin#getEngineFactory} (the
+ * reader, writer, and compaction paths sharing one {@link BlobContainer} instance per shard there
+ * -- see that method's own comments) and the on-demand {@code
+ * TransportCompactionTriggerAction#doExecute} trigger both wrap in an instance of this class with
+ * deletes denied, so a bug that makes either path call {@code delete()}/{@code
+ * deleteBlobsIgnoringIfNotExists} becomes a loud {@link SecurityException} instead of quietly
+ * reaching the real store. {@code GcSchedulerConfig} alone is built against the unrestricted
+ * underlying container, matching "the GC/reconciler role is the only DELETE-capable principal"
+ * exactly.
  *
- * <p><b>Known, explicit limitation, matching this section's own encryption-status pattern</b>: this
- * only implements the DELETE-vs-not-DELETE axis (bullets 2 and 3 of &sect;15's credential-scoping
- * list). The GET-only search-compute tier (bullet 1) isn't separately enforced, because the reader
- * and writer paths aren't yet built against genuinely separate {@link BlobContainer} instances at
- * that construction seam -- a reader shard's own {@code CompactionSchedulerConfig}/{@code
- * GcSchedulerConfig} background tasks (which must write and, for GC, delete) currently share the
- * exact same shard as query serving, so a hard GET-only wrapper there would break those background
- * tasks too. Closing that gap needs the reader/writer construction split itself, not just another
- * wrapper.
+ * <p><b>Known, explicit gaps, matching this section's own encryption-status pattern</b>: (1) The
+ * GET-only search-compute tier (bullet 1 of &sect;15's credential-scoping list) isn't enforced,
+ * because the reader and writer paths aren't yet built against genuinely separate {@link
+ * BlobContainer} instances at the engine-construction seam -- a reader shard's own {@code
+ * CompactionSchedulerConfig}/{@code GcSchedulerConfig} background tasks (which must write and, for
+ * GC, delete) currently share the exact same shard as query serving, so a hard GET-only wrapper
+ * there would break those background tasks too; closing that gap needs the reader/writer
+ * construction split itself, not just another wrapper. (2) Several other on-demand transport
+ * actions (shard clone, shrink, split, partition-rewrite, snapshot pin/restore/release,
+ * retention-stats) still build their stores directly against the raw, unrestricted container from
+ * {@code ServerlessStoragePlugin#blobContainerForDirectoryFactory}, not through this class -- some
+ * of those (shard clone's own lineage deletion, in particular) genuinely need delete and would
+ * need per-action review before wrapping, not a blanket application of this class; each is a
+ * distinct decision left for a follow-up, not silently assumed safe.
  */
 public final class RestrictingBlobContainer extends FilterBlobContainer {
 
