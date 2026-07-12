@@ -22,7 +22,7 @@ import static java.util.Collections.singletonList;
 import static org.opensearch.rest.RestRequest.Method.GET;
 
 /**
- * {@code GET /_plugins/_serverless/storage/{index}/{shard}/_wait_for_generation} -- the REST
+ * {@code GET /_plugins/_serverless/storage/{index_uuid}/{shard_id}/_wait_for_generation} -- the REST
  * surface for {@link WaitForGenerationAction}, rfc-serverless-opensearch.md &sect;8's
  * read-after-write mechanism. Must be sent directly to a node already known (from the routing
  * table) to hold the reader shard copy being waited on -- same "answers only from the receiving
@@ -53,20 +53,20 @@ public class RestWaitForGenerationAction extends BaseRestHandler {
     /** The single route this handler serves. */
     @Override
     public List<Route> routes() {
-        return singletonList(new Route(GET, "/_plugins/_serverless/storage/{index}/{shard}/_wait_for_generation"));
+        return singletonList(new Route(GET, "/_plugins/_serverless/storage/{index_uuid}/{shard_id}/_wait_for_generation"));
     }
 
     /**
-     * @param request path params {@code index} (the index UUID) and {@code shard} (the shard
-     *                number), and query params {@code min_generation} (required) and {@code
+     * @param request path params {@code index_uuid} (the index UUID) and {@code shard_id} (the
+     *                shard number), and query params {@code min_generation} (required) and {@code
      *                timeout} (defaults to {@code 30s}, matching most other blocking OpenSearch
      *                REST APIs' own default).
      * @param client used to dispatch the parsed {@link WaitForGenerationRequest} locally.
      */
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
-        String indexUuid = request.param("index");
-        int shardId = Integer.parseInt(request.param("shard"));
+        String indexUuid = request.param("index_uuid");
+        int shardId = Integer.parseInt(request.param("shard_id"));
         long minGeneration = Long.parseLong(request.param("min_generation"));
         TimeValue timeout = request.paramAsTime("timeout", TimeValue.timeValueSeconds(30));
         WaitForGenerationRequest waitRequest = new WaitForGenerationRequest(indexUuid, shardId, minGeneration, timeout);

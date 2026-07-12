@@ -21,7 +21,7 @@ import static java.util.Collections.singletonList;
 import static org.opensearch.rest.RestRequest.Method.GET;
 
 /**
- * {@code GET /_plugins/_serverless/storage/{index}/{shard}/_realtime_get/{id}} -- the REST surface
+ * {@code GET /_plugins/_serverless/storage/{index_uuid}/{shard_id}/_realtime_get/{id}} -- the REST surface
  * for {@link RealtimeGetAction}, rfc-serverless-opensearch.md &sect;8's "{@code _get} by document
  * id can optionally route to the writer shard for true realtime gets, controlled per request."
  * Must be sent directly to a node already known (from the routing table) to hold the shard's
@@ -52,17 +52,17 @@ public class RestRealtimeGetAction extends BaseRestHandler {
     /** The single route this handler serves. */
     @Override
     public List<Route> routes() {
-        return singletonList(new Route(GET, "/_plugins/_serverless/storage/{index}/{shard}/_realtime_get/{id}"));
+        return singletonList(new Route(GET, "/_plugins/_serverless/storage/{index_uuid}/{shard_id}/_realtime_get/{id}"));
     }
 
     /**
-     * @param request path params {@code index} (the index UUID), {@code shard} (the shard number), and {@code id} (the document id).
+     * @param request path params {@code index_uuid} (the index UUID), {@code shard_id} (the shard number), and {@code id} (the document id).
      * @param client used to dispatch the parsed {@link RealtimeGetRequest} locally.
      */
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
-        String indexUuid = request.param("index");
-        int shardId = Integer.parseInt(request.param("shard"));
+        String indexUuid = request.param("index_uuid");
+        int shardId = Integer.parseInt(request.param("shard_id"));
         String id = request.param("id");
         RealtimeGetRequest getRequest = new RealtimeGetRequest(indexUuid, shardId, id);
         return channel -> client.executeLocally(RealtimeGetAction.INSTANCE, getRequest, new RestToXContentListener<>(channel));

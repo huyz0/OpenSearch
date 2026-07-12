@@ -21,7 +21,7 @@ import static java.util.Collections.singletonList;
 import static org.opensearch.rest.RestRequest.Method.POST;
 
 /**
- * {@code POST /_plugins/_serverless/storage/{index}/{shard}/_poll_now} -- the REST surface for
+ * {@code POST /_plugins/_serverless/storage/{index_uuid}/{shard_id}/_poll_now} -- the REST surface for
  * {@link PollNowAction}, rfc-serverless-opensearch.md &sect;8's publication notification
  * mechanism. Must be sent directly to a node already known to hold a reader copy of the shard --
  * same "answers only from the receiving node" contract as {@code RestWaitForGenerationAction}.
@@ -50,17 +50,17 @@ public class RestPollNowAction extends BaseRestHandler {
     /** The single route this handler serves. */
     @Override
     public List<Route> routes() {
-        return singletonList(new Route(POST, "/_plugins/_serverless/storage/{index}/{shard}/_poll_now"));
+        return singletonList(new Route(POST, "/_plugins/_serverless/storage/{index_uuid}/{shard_id}/_poll_now"));
     }
 
     /**
-     * @param request path params {@code index} (the index UUID) and {@code shard} (the shard number).
+     * @param request path params {@code index_uuid} (the index UUID) and {@code shard_id} (the shard number).
      * @param client used to dispatch the parsed {@link PollNowRequest} locally.
      */
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
-        String indexUuid = request.param("index");
-        int shardId = Integer.parseInt(request.param("shard"));
+        String indexUuid = request.param("index_uuid");
+        int shardId = Integer.parseInt(request.param("shard_id"));
         PollNowRequest pollRequest = new PollNowRequest(indexUuid, shardId);
         return channel -> client.executeLocally(PollNowAction.INSTANCE, pollRequest, new RestToXContentListener<>(channel));
     }
