@@ -136,6 +136,61 @@ public class BundleWriterReaderTests extends OpenSearchTestCase {
         assertTrue(e.getMessage(), e.getMessage().contains("is outside bundle of length"));
     }
 
+    /**
+     * rfc-serverless-opensearch.md &sect;17's "Format-level: property-based tests on bundle/manifest
+     * round-trips; corruption injection... must fail closed" bullet. This codebase doesn't pull in
+     * a dedicated property-based-testing library, but {@link OpenSearchTestCase}'s own randomized
+     * base (a real seed-driven `RandomizedRunner`, reproducible via the seed the test framework
+     * already prints on failure) gives the same essential property: run the same invariant across
+     * many independently-random inputs, not one hand-picked example. The invariant here: for any
+     * randomly-shaped bundle, corrupting exactly one random byte anywhere in its file-content region
+     * must always be caught as a checksum mismatch -- extraction must never silently return
+     * different bytes than were written.
+     */
+    public void testRandomizedSingleByteCorruptionAlwaysFailsClosedAcrossManyTrials() throws Exception {
+        int trialCount = 200;
+        for (int trial = 0; trial < trialCount; trial++) {
+            int fileCount = randomIntBetween(1, 8);
+            List<BundleFileContent> files = new ArrayList<>();
+            for (int i = 0; i < fileCount; i++) {
+                // At least 1 byte so there's always somewhere to flip; a genuinely empty file would
+                // have nothing to corrupt and isn't the case this property is testing.
+                files.add(new BundleFileContent("f" + i + "-" + randomAlphaOfLength(4), randomByteArrayOfLength(randomIntBetween(1, 512))));
+            }
+            SegmentBundle bundle = BundleWriter.write(files);
+
+            // Pick a random file and a random byte within it -- not a random offset across the
+            // whole bundle, which could land in header/padding regions other tests already cover
+            // specifically; this property is about file-content corruption always being caught.
+            BundleFileContent target = files.get(randomIntBetween(0, files.size() - 1));
+            BundleFileEntry entry = bundle.entries().get(target.name());
+            int flipIndex = (int) entry.offset() + randomIntBetween(0, (int) entry.length() - 1);
+
+            byte[] corrupted = bundle.bytes().clone();
+            corrupted[flipIndex] ^= 0xFF;
+
+            BundleFormatException e = expectThrows(BundleFormatException.class, () -> BundleReader.extractFile(corrupted, entry));
+            assertTrue(
+                "trial " + trial + " (fileCount=" + fileCount + ", flipIndex=" + flipIndex + "): must fail closed with a checksum mismatch",
+                e.getMessage().contains("checksum mismatch")
+            );
+
+            // The uncorrupted round-trip for every OTHER file in this same bundle must still be
+            // exact -- one corrupted file's bytes must never leak into or invalidate a sibling's.
+            for (BundleFileContent other : files) {
+                if (other == target) {
+                    continue;
+                }
+                BundleFileEntry otherEntry = bundle.entries().get(other.name());
+                assertArrayEquals(
+                    "trial " + trial + ": an untouched sibling file must still round-trip exactly despite another file's corruption",
+                    other.content(),
+                    BundleReader.extractFile(bundle.bytes(), otherEntry)
+                );
+            }
+        }
+    }
+
     public void testDuplicateFileNamesAreRejectedOnWrite() {
         // BundleWriter itself doesn't dedupe; verify the reader rejects a header hand-crafted with
         // duplicate names, since that would make offset reconstruction ambiguous downstream.

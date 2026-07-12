@@ -3157,6 +3157,20 @@ directions documented so serverless adoption is not a one-way door.
 
 - **Format-level**: property-based tests on bundle/manifest round-trips; corruption injection
   (truncated bundle, missing manifest, checksum mismatch) must fail closed.
+  **Status: corruption injection is implemented (example-based); the property-based half is now a
+  pragmatic seed-driven equivalent, not a dedicated PBT library.** This codebase doesn't pull in a
+  property-based-testing framework (jqwik or similar) -- a new test dependency is a real build-graph
+  change this increment didn't take on. `BundleWriterReaderTests#testRandomizedSingleByteCorruptionAlwaysFailsClosedAcrossManyTrials`
+  gets the same essential property using `OpenSearchTestCase`'s own seed-driven randomized base
+  instead: 200 independent trials, each with a randomly-shaped bundle (random file count, random
+  sizes) and a random single-byte flip inside a random file's content, asserting extraction always
+  fails closed with a checksum mismatch, and that every untouched sibling file in the same bundle
+  still round-trips exactly. `testCorruptedFileBytesFailChecksumVerification`,
+  `testCorruptedFormatVersionByteIsRejectedWithSpecificMessage`,
+  `testCorruptedHeaderChecksumIsRejectedWithSpecificMessage`, `testTruncatedBundleIsRejectedWithSpecificMessage`,
+  and `BlobContainerBundleStoreTests`'s own corrupted-blob test cover the specific
+  truncated/missing-manifest/checksum-mismatch scenarios this bullet names by name, each with a
+  hand-picked example, same as before this increment.
 - **Fencing**: dual-writer tests — old-term writer keeps publishing during/after failover;
   assert its manifests are never visible and are GC'd. **Status: implemented.**
   `DualWriterFencingGcTests` proves this end to end against the real production classes
