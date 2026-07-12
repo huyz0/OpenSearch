@@ -18,19 +18,20 @@ import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
 
-import java.util.Optional;
-
 /**
  * The actual work behind {@link WaitForGenerationAction}: looks up the receiving node's own
- * {@link ReaderShardActivityRegistry} for the requested shard and blocks on {@link
+ * {@link ReaderShardActivityRegistry} for the requested shard and asynchronously waits via {@link
  * ReaderShardActivityRegistry#waitForGeneration} -- see that method's own javadoc, and {@link
  * org.opensearch.serverless.storage.readerengine.ObjectStoreReaderEngine#waitForGeneration} it
  * ultimately delegates to, for the actual wait mechanism.
  *
- * <p>Dispatched onto {@link ThreadPool.Names#GENERIC}, not run on the transport thread directly:
- * this can block for up to the request's own {@code timeout} (real time, not I/O-bound but still
- * a genuine blocking wait), which must never happen on a transport/network thread -- same
- * reasoning as {@code TransportCompactionTriggerAction}'s own dispatch.
+ * <p>The initial lookup+dispatch is pushed onto {@link ThreadPool.Names#GENERIC}, not run on the
+ * transport thread directly, since {@link
+ * org.opensearch.serverless.storage.readerengine.ObjectStoreReaderEngine#pollForNewerManifest}'s
+ * first check does real object-store I/O -- same reasoning as {@code
+ * TransportCompactionTriggerAction}'s own dispatch. Unlike that first hop, nothing here blocks
+ * once dispatched: the wait itself is listener-based all the way down, so this action never pins a
+ * {@code GENERIC} worker for the request's full {@code timeout}.
  */
 public class TransportWaitForGenerationAction extends HandledTransportAction<WaitForGenerationRequest, WaitForGenerationResponse> {
 
@@ -43,7 +44,7 @@ public class TransportWaitForGenerationAction extends HandledTransportAction<Wai
      * @param transportService used by {@link HandledTransportAction} to register this action.
      * @param actionFilters applied by {@link HandledTransportAction} around every request.
      * @param plugin resolves this node's {@link ServerlessStoragePlugin#readerShardActivityRegistry()}.
-     * @param threadPool dispatches the actual wait off the transport thread.
+     * @param threadPool dispatches the initial lookup off the transport thread.
      */
     @Inject
     public TransportWaitForGenerationAction(
@@ -60,21 +61,23 @@ public class TransportWaitForGenerationAction extends HandledTransportAction<Wai
     /**
      * @param task the task tracking this request, unused.
      * @param request names the shard, the generation to wait for, and the timeout.
-     * @param listener notified with the result once the wait (dispatched off-thread) completes.
+     * @param listener notified with the result once the asynchronous wait completes.
      */
     @Override
     protected void doExecute(Task task, WaitForGenerationRequest request, ActionListener<WaitForGenerationResponse> listener) {
-        threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
-            try {
-                Optional<Boolean> reached = plugin.readerShardActivityRegistry()
-                    .waitForGeneration(request.indexUuid(), request.shardId(), request.minGeneration(), request.timeout());
-                listener.onResponse(new WaitForGenerationResponse(reached.orElse(false), reached.isPresent()));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                listener.onFailure(e);
-            } catch (Exception e) {
-                listener.onFailure(e);
-            }
-        });
+        threadPool.executor(ThreadPool.Names.GENERIC)
+            .execute(
+                () -> plugin.readerShardActivityRegistry()
+                    .waitForGeneration(
+                        request.indexUuid(),
+                        request.shardId(),
+                        request.minGeneration(),
+                        request.timeout(),
+                        ActionListener.wrap(
+                            reached -> listener.onResponse(new WaitForGenerationResponse(reached.orElse(false), reached.isPresent())),
+                            listener::onFailure
+                        )
+                    )
+            );
     }
 }

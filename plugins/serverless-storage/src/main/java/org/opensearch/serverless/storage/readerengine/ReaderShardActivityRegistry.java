@@ -83,27 +83,40 @@ public final class ReaderShardActivityRegistry {
 
     /**
      * Looks up the currently-live reader engine for (indexUuid, shardId) on this node and, if
-     * found, blocks the calling thread on its own {@link ObjectStoreReaderEngine#waitForGeneration}
-     * -- the lookup half of &sect;8's read-after-write mechanism, letting a transport action reach
-     * a specific node's specific reader engine instance by (indexUuid, shardId) alone.
+     * found, asynchronously waits on its own {@link ObjectStoreReaderEngine#waitForGeneration(long,
+     * org.opensearch.common.unit.TimeValue, org.opensearch.core.action.ActionListener)} -- the
+     * lookup half of &sect;8's read-after-write mechanism, letting a transport action reach a
+     * specific node's specific reader engine instance by (indexUuid, shardId) alone, without
+     * blocking the calling thread for the wait's duration (see that method's own javadoc for why
+     * that matters).
      *
      * @param indexUuid the UUID of the index the shard belongs to
      * @param shardId the shard number within {@code indexUuid}
      * @param minGeneration the manifest generation the reader engine must reach
      * @param timeout how long to wait before giving up
-     * @return empty if no reader engine for this shard is currently tracked on this node;
-     *         otherwise {@code true}/{@code false} per {@link ObjectStoreReaderEngine#waitForGeneration}
-     * @throws InterruptedException if the waiting thread is interrupted
+     * @param listener resolved with empty if no reader engine for this shard is currently tracked
+     *                  on this node; otherwise with {@code true}/{@code false} per {@link
+     *                  ObjectStoreReaderEngine#waitForGeneration(long, org.opensearch.common.unit.TimeValue,
+     *                  org.opensearch.core.action.ActionListener)}.
      */
-    public Optional<Boolean> waitForGeneration(
+    public void waitForGeneration(
         String indexUuid,
         int shardId,
         long minGeneration,
-        org.opensearch.common.unit.TimeValue timeout
-    ) throws InterruptedException {
+        org.opensearch.common.unit.TimeValue timeout,
+        org.opensearch.core.action.ActionListener<Optional<Boolean>> listener
+    ) {
         WeakReference<ObjectStoreReaderEngine> ref = engines.get(key(indexUuid, shardId));
         ObjectStoreReaderEngine engine = ref == null ? null : ref.get();
-        return engine == null ? Optional.empty() : Optional.of(engine.waitForGeneration(minGeneration, timeout));
+        if (engine == null) {
+            listener.onResponse(Optional.empty());
+            return;
+        }
+        engine.waitForGeneration(
+            minGeneration,
+            timeout,
+            org.opensearch.core.action.ActionListener.wrap(reached -> listener.onResponse(Optional.of(reached)), listener::onFailure)
+        );
     }
 
     /**

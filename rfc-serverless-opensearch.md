@@ -1052,15 +1052,35 @@ returns a safe `attempted: false` rather than an error.
   (returned to the client in the index response). The coordinator routes to a reader at or above
   that generation, or the reader waits for it (with timeout). This gives per-request RYW without
   making the whole system synchronous. **Status: the wait primitive is implemented and tested; full
-  core search/index-response wire integration is not.** `ObjectStoreReaderEngine#waitForGeneration(long,
-  TimeValue)` blocks the calling thread until this specific engine instance has materialized at
+  core search/index-response wire integration is not.** `ObjectStoreReaderEngine#waitForGeneration`
+  asynchronously waits until this specific engine instance has materialized at
   least the requested generation or the timeout elapses, forcing an on-demand poll on every check
   rather than waiting out the fixed 5s background schedule. `WaitForGenerationAction`
-  (`GET /_plugins/_serverless/storage/{index}/{shard}/_wait_for_generation`, dispatched off the
-  transport thread since it blocks) exposes this per (index, shard) on whichever node receives the
+  (`GET /_plugins/_serverless/storage/{index}/{shard}/_wait_for_generation`) exposes this per
+  (index, shard) on whichever node receives the
   request -- a caller who already knows from the routing table which node holds the reader copy it
   is about to query can wait for it directly, deliberately single-node/no-fan-out, the same shape
-  as `NodeManifestLagAction`. What this does NOT yet do: thread a minimum-visible-generation field
+  as `NodeManifestLagAction`.
+
+  **Never blocks a thread for the wait's duration -- a real regression this session's own code
+  review caught and fixed.** The original implementation blocked via `Thread.sleep` in a loop; the
+  transport action dispatched that blocking call onto `ThreadPool.Names.GENERIC` (since it can run
+  for up to the request's own timeout, which must never happen on a transport thread), which meant
+  a `GENERIC` worker stayed pinned for the whole wait. Since this plugin's own background tasks
+  (directory refresh, lease renewal, the manifest poll schedule itself) also run on `GENERIC`, a
+  burst of concurrent RYW waiters could genuinely starve those unrelated periodic tasks
+  cluster-wide on the node, not merely delay other RYW callers. Fixed by rewriting the wait as a
+  real listener-based retry loop scheduled via the engine's own thread pool `schedule` method
+  instead of a blocking sleep: each retry briefly occupies a `GENERIC` worker to run one check and
+  either resolve the caller or reschedule, never holding a worker for the wait's full duration. A
+  synchronous convenience wrapper (kept for this class's own unit tests, not for production/transport
+  use) bridges the listener-based version via a `CompletableFuture` rather than duplicating the
+  polling logic. Verified directly: calling the async version with a generation that will never
+  arrive returns from the call site itself in well under a second, with the result resolving
+  `false` only once the real timeout later elapses -- reverting the fix and re-running the same
+  test shows the call blocking for the full timeout instead, exactly as the bug predicted.
+
+  What this does NOT yet do: thread a minimum-visible-generation field
   through core's actual `SearchRequest`/`IndexResponse` wire format or have the search coordinator
   call this automatically -- that is a genuine core wire-protocol change (new fields on
   cluster-wide request/response types, BWC implications) out of scope for this increment; the

@@ -784,6 +784,101 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
         }
     }
 
+    public void testAsyncWaitForGenerationNeverBlocksTheCallingThread() throws Exception {
+        // Code review finding: the old implementation blocked the calling thread via Thread.sleep
+        // for the whole wait. The real fix is the listener-based overload never blocking at all --
+        // proven here by calling it with a generation that will never arrive and a long timeout,
+        // then asserting the calling thread's own call returns almost immediately regardless.
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ObjectStoreCommitPublisher publisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+        org.opensearch.serverless.storage.shardstate.ShardStateStore shardStateStore =
+            new org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore(blobContainer);
+        BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(blobContainer);
+        ObjectStoreCommitMaterializer materializer = new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer));
+        ShardDirectory shardDirectory = new InMemoryShardDirectory();
+
+        try (Directory writerDirectory = new ByteBuffersDirectory(); Store store = createStore()) {
+            EngineConfig engineConfig = config(defaultSettings, store, createTempDir(), newMergePolicy(), null);
+            String indexUuid = engineConfig.getShardId().getIndex().getUUID();
+            int shardId = engineConfig.getShardId().getId();
+
+            CommitManifest firstManifest;
+            try (IndexWriter writer = new IndexWriter(writerDirectory, new IndexWriterConfig())) {
+                Document doc = new Document();
+                doc.add(new StringField("id", "1", Field.Store.YES));
+                writer.addDocument(doc);
+                writer.commit();
+                SegmentInfos segmentInfos = SegmentInfos.readLatestCommit(writerDirectory);
+                firstManifest = publisher.publishCommit(
+                    writerDirectory,
+                    segmentInfos,
+                    indexUuid,
+                    shardId,
+                    PRIMARY_TERM,
+                    1,
+                    0,
+                    0,
+                    new WalPosition("epoch-0", 0),
+                    0,
+                    PruningStats.empty()
+                );
+            }
+            assertEquals(
+                org.opensearch.serverless.storage.shardstate.CasResult.SUCCESS,
+                shardStateStore.compareAndSet(
+                    indexUuid,
+                    shardId,
+                    java.util.Optional.empty(),
+                    new org.opensearch.serverless.storage.shardstate.ShardHead(PRIMARY_TERM, null, 0L, firstManifest.generation())
+                )
+            );
+
+            try (
+                ObjectStoreReaderEngine readerEngine = ObjectStoreReaderEngine.open(
+                    engineConfig,
+                    firstManifest,
+                    materializer,
+                    PRIMARY_TERM,
+                    shardStateStore,
+                    manifestStore,
+                    shardDirectory,
+                    LOCAL_NODE_ID
+                )
+            ) {
+                java.util.concurrent.CountDownLatch resolved = new java.util.concurrent.CountDownLatch(1);
+                java.util.concurrent.atomic.AtomicReference<Boolean> result = new java.util.concurrent.atomic.AtomicReference<>();
+
+                long callStart = System.currentTimeMillis();
+                readerEngine.waitForGeneration(
+                    2L,
+                    org.opensearch.common.unit.TimeValue.timeValueSeconds(5),
+                    org.opensearch.core.action.ActionListener.wrap(reached -> {
+                        result.set(reached);
+                        resolved.countDown();
+                    }, e -> resolved.countDown())
+                );
+                long callElapsedMillis = System.currentTimeMillis() - callStart;
+
+                assertTrue(
+                    "the async call itself must return almost immediately, not block for anywhere near the 5s timeout, took "
+                        + callElapsedMillis
+                        + "ms",
+                    callElapsedMillis < 1000
+                );
+
+                assertTrue(
+                    "the listener must eventually resolve once the timeout elapses",
+                    resolved.await(10, java.util.concurrent.TimeUnit.SECONDS)
+                );
+                assertEquals(Boolean.FALSE, result.get());
+            }
+        }
+    }
+
     /**
      * rfc-serverless-opensearch.md &sect;17's "Staleness/consistency" testing-strategy bullet:
      * "linearizability-style checker for the RYW path (indexed doc with generation token must be

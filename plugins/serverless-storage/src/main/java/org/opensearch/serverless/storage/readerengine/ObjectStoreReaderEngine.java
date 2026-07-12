@@ -419,16 +419,67 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
     private static final long WAIT_FOR_GENERATION_POLL_INTERVAL_MILLIS = 100L;
 
     /**
-     * Blocks the calling thread until this engine has materialized at least {@code minGeneration},
-     * or {@code timeout} elapses -- the read-after-write mechanism rfc-serverless-opensearch.md
+     * Asynchronously waits until this engine has materialized at least {@code minGeneration}, or
+     * {@code timeout} elapses -- the read-after-write mechanism rfc-serverless-opensearch.md
      * &sect;8 asks for: "the reader waits for it (with timeout)." Deliberately forces an on-demand
      * {@link #pollForNewerManifest} on every check rather than only relying on {@link
      * #MANIFEST_POLL_INTERVAL}'s own background schedule -- an RYW caller waiting out that fixed
      * 5-second interval by coincidence would defeat the point of a bounded, responsive wait.
      *
-     * <p>Never called from this engine's own background scheduler or any transport/network thread
-     * (see {@code TransportWaitForGenerationAction}'s own javadoc for how it dispatches this off
-     * such a thread) -- this method's own {@link Thread#sleep} is safe only because of that.
+     * <p><b>Never blocks the calling thread</b> -- a real fix for a real problem code review
+     * caught: an earlier version of this method blocked via {@link Thread#sleep} in a loop, which
+     * meant whatever thread called it (dispatched off the transport thread onto {@code
+     * ThreadPool.Names#GENERIC}, since this can take up to the full {@code timeout}) stayed pinned
+     * to a shared pool thread for the entire wait. Since this plugin's own background tasks
+     * (directory refresh, lease renewal, the poll schedule itself) also run on {@code GENERIC}, a
+     * burst of concurrent RYW waiters could genuinely starve those unrelated periodic tasks
+     * cluster-wide on the node, not just delay other RYW callers. Each retry here is instead
+     * dispatched via {@link EngineConfig#getThreadPool()}'s own {@code schedule}, so a {@code
+     * GENERIC} worker is only ever briefly occupied to run one check and either resolve {@code
+     * listener} or reschedule -- never held for the wait's full duration.
+     *
+     * @param minGeneration the manifest generation this engine must reach before resolving {@code true}
+     * @param timeout how long to wait before giving up and resolving {@code false}
+     * @param listener resolved with {@code true} if {@code minGeneration} was reached before the
+     *                  timeout, {@code false} otherwise; never fails, since {@link
+     *                  #pollForNewerManifest} already tolerates its own errors internally.
+     */
+    public void waitForGeneration(long minGeneration, TimeValue timeout, org.opensearch.core.action.ActionListener<Boolean> listener) {
+        scheduleWaitForGenerationCheck(minGeneration, System.currentTimeMillis() + timeout.millis(), listener);
+    }
+
+    private void scheduleWaitForGenerationCheck(
+        long minGeneration,
+        long deadlineMillis,
+        org.opensearch.core.action.ActionListener<Boolean> listener
+    ) {
+        if (currentManifestGeneration.get() >= minGeneration) {
+            listener.onResponse(true);
+            return;
+        }
+        long remainingMillis = deadlineMillis - System.currentTimeMillis();
+        if (remainingMillis <= 0) {
+            listener.onResponse(false);
+            return;
+        }
+        pollForNewerManifest();
+        if (currentManifestGeneration.get() >= minGeneration) {
+            listener.onResponse(true);
+            return;
+        }
+        engineConfig.getThreadPool()
+            .schedule(
+                () -> scheduleWaitForGenerationCheck(minGeneration, deadlineMillis, listener),
+                TimeValue.timeValueMillis(Math.min(WAIT_FOR_GENERATION_POLL_INTERVAL_MILLIS, remainingMillis)),
+                ThreadPool.Names.GENERIC
+            );
+    }
+
+    /**
+     * Synchronous convenience wrapper around {@link #waitForGeneration(long, TimeValue,
+     * org.opensearch.core.action.ActionListener)} for callers that are already off any thread this
+     * engine shouldn't block (this class's own unit tests) -- production code reaching this engine
+     * from a transport action must use the listener-based overload directly, never this one.
      *
      * @param minGeneration the manifest generation this engine must reach before returning {@code true}
      * @param timeout how long to wait before giving up and returning {@code false}
@@ -436,19 +487,23 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
      * @throws InterruptedException if the waiting thread is interrupted
      */
     public boolean waitForGeneration(long minGeneration, TimeValue timeout) throws InterruptedException {
-        long deadlineMillis = System.currentTimeMillis() + timeout.millis();
-        while (currentManifestGeneration.get() < minGeneration) {
-            long remainingMillis = deadlineMillis - System.currentTimeMillis();
-            if (remainingMillis <= 0) {
-                return false;
-            }
-            pollForNewerManifest();
-            if (currentManifestGeneration.get() >= minGeneration) {
-                break;
-            }
-            Thread.sleep(Math.min(WAIT_FOR_GENERATION_POLL_INTERVAL_MILLIS, remainingMillis));
+        java.util.concurrent.CompletableFuture<Boolean> future = new java.util.concurrent.CompletableFuture<>();
+        waitForGeneration(
+            minGeneration,
+            timeout,
+            org.opensearch.core.action.ActionListener.wrap(future::complete, future::completeExceptionally)
+        );
+        try {
+            // A generous grace buffer over the caller's own timeout: the real deadline is already
+            // enforced inside scheduleWaitForGenerationCheck itself (which resolves false on its
+            // own), this just bounds how long this blocking wrapper waits for that resolution to
+            // arrive back on this thread.
+            return future.get(timeout.millis() + 5_000L, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (java.util.concurrent.ExecutionException e) {
+            throw new RuntimeException(e.getCause());
+        } catch (java.util.concurrent.TimeoutException e) {
+            return false;
         }
-        return true;
     }
 
     /**
