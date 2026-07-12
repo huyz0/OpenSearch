@@ -134,6 +134,23 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     private final WalGcSchedulerTask dedicatedWalGcSchedulerTask;
 
     /**
+     * Non-positive disables rate limiting entirely (every {@code api}/{@code schedule}-sourced
+     * refresh may attempt a publish); positive is the minimum real milliseconds between two
+     * refresh-triggered publish attempts -- see {@link #maybePublishOnRefresh} and the constructor
+     * javadoc that introduces this parameter.
+     */
+    private final long publicationRateLimitMillis;
+
+    /**
+     * Set (via {@link java.util.concurrent.atomic.AtomicLong#compareAndSet}, so two concurrent
+     * refreshes can't both win) to {@code engineConfig.getThreadPool().relativeTimeInMillis()}
+     * every time {@link #maybePublishOnRefresh} actually attempts a publish. {@code 0} initially,
+     * meaning the very first {@code api}/{@code schedule} refresh after activation is never
+     * rate-limited regardless of {@link #publicationRateLimitMillis}.
+     */
+    private final AtomicLong lastRefreshPublicationAttemptMillis = new AtomicLong(0);
+
+    /**
      * The fencing snapshot verified sound in {@code plugins/serverless-storage/formal/WalReplayFencing.tla}
      * (its {@code leaseTransferWalPos}): an exclusive upper bound on WAL chunk sequences that
      * existed at the moment this engine activated, captured as early as possible -- before {@code
@@ -370,6 +387,60 @@ public class ObjectStoreWriterEngine extends InternalEngine {
             walChunkService,
             encryptionKeyProvider,
             dedicatedWalGcSchedulerTask,
+            0L
+        );
+    }
+
+    /**
+     * Creates a fully-configured writer engine, additionally rate-limiting how often an
+     * externally-triggered refresh (rfc-serverless-opensearch.md &sect;8's "{@code _refresh}
+     * changes meaning honestly": {@code api}/{@code schedule}-sourced refreshes now also flush and
+     * publish, not just reopen the local reader) is allowed to trigger a publish.
+     *
+     * @param engineConfig the core engine configuration for this shard
+     * @param headPublisher publishes commits and manages lease acquisition/renewal for this shard's head
+     * @param shardDirectory the shard's directory-registry entry, refreshed periodically while this engine is active
+     * @param localNodeId the id of the node this engine is activating on
+     * @param pitrRetentionConfig {@code null} disables the periodic PITR retention reconciliation task; non-null schedules it
+     * @param walChunkService {@code null} disables WAL mirroring entirely, same shape as every other optional feature in this plugin.
+     * @param encryptionKeyProvider {@code null} leaves WAL-mirrored records unencrypted; non-null
+     *                              wraps {@code walChunkService} in an {@code EncryptingWalChunkService}.
+     * @param dedicatedWalGcSchedulerTask {@code null} for a shard sharing the node-level WAL
+     *                                    container (its retention is swept by that container's own
+     *                                    node-level task instead); non-null for a shard on a
+     *                                    dedicated WAL stream, whose container this engine then owns
+     *                                    sweeping for as long as it stays open -- see this field's
+     *                                    own javadoc for why ownership lives here.
+     * @param publicationRateLimitMillis non-positive (the default) disables rate limiting: every
+     *                                   {@code api}/{@code schedule}-sourced refresh may trigger a
+     *                                   publish (still a no-op if nothing has changed since the last
+     *                                   commit, since it flows through the same non-forcing {@link
+     *                                   #flush}). A positive value is the minimum real time between
+     *                                   two refresh-triggered publish attempts on this engine,
+     *                                   protecting the object store from a caller hammering
+     *                                   {@code _refresh}.
+     */
+    public ObjectStoreWriterEngine(
+        EngineConfig engineConfig,
+        ObjectStoreCommitHeadPublisher headPublisher,
+        ShardDirectory shardDirectory,
+        String localNodeId,
+        PitrRetentionConfig pitrRetentionConfig,
+        WalChunkService walChunkService,
+        org.opensearch.serverless.storage.security.EncryptionKeyProvider encryptionKeyProvider,
+        WalGcSchedulerTask dedicatedWalGcSchedulerTask,
+        long publicationRateLimitMillis
+    ) {
+        this(
+            engineConfig,
+            headPublisher,
+            shardDirectory,
+            localNodeId,
+            pitrRetentionConfig,
+            walChunkService,
+            encryptionKeyProvider,
+            dedicatedWalGcSchedulerTask,
+            publicationRateLimitMillis,
             beginConstruction(walChunkService, encryptionKeyProvider)
         );
     }
@@ -384,9 +455,11 @@ public class ObjectStoreWriterEngine extends InternalEngine {
         WalChunkService walChunkService,
         org.opensearch.serverless.storage.security.EncryptionKeyProvider encryptionKeyProvider,
         WalGcSchedulerTask dedicatedWalGcSchedulerTask,
+        long publicationRateLimitMillis,
         Void ignored
     ) {
         super(engineConfig);
+        this.publicationRateLimitMillis = publicationRateLimitMillis;
         CONSTRUCTION_WAL_CHUNK_SERVICE.remove();
         CONSTRUCTION_ENCRYPTION_KEY_PROVIDER.remove();
         this.activationWalPosition = CONSTRUCTION_ACTIVATION_WAL_POSITION.get();
@@ -878,6 +951,79 @@ public class ObjectStoreWriterEngine extends InternalEngine {
         } finally {
             nextCommitIsQuiescent.set(false);
         }
+    }
+
+    /**
+     * Sources a real user/scheduler-driven refresh actually arrives with -- see {@code
+     * TransportShardRefreshAction#shardOperationOnPrimary}'s {@code primary.refresh("api")} for the
+     * explicit {@code _refresh} API path, and {@code IndexShard#scheduledRefresh}'s {@code
+     * getIndexer().maybeRefresh("schedule")} for the {@code index.refresh_interval}-driven periodic
+     * one. Every other source string ({@code "recovery_finalization"}, {@code "post_recovery"},
+     * {@code "reset_engine"}, {@code "too_many_listeners"}, snapshot/relocation refreshes, etc.) is
+     * an internal engine-lifecycle refresh this engine must not react to by publishing -- publishing
+     * mid-recovery, before this engine is fully activated, or on every listener-driven internal
+     * reopen would be either wrong or simply noisy, not the honest "{@code _refresh} now costs a
+     * publish" contract rfc-serverless-opensearch.md &sect;8 actually asks for.
+     */
+    private static final java.util.Set<String> PUBLICATION_TRIGGERING_REFRESH_SOURCES = java.util.Set.of("api", "schedule");
+
+    /**
+     * {@code Engine#refresh}'s contract is a local reader reopen -- always run first via {@code
+     * super.refresh(source)}, so this engine's own local searches stay correct even if the publish
+     * attempt below is rate-limited or fails. rfc-serverless-opensearch.md &sect;8: "{@code
+     * _refresh} changes meaning honestly: it becomes 'flush, publish, notify'... the API contract
+     * ('changes visible to search after refresh returns') is preserved."
+     *
+     * @param source what triggered this refresh; only {@code "api"} (explicit {@code _refresh}) and
+     *               {@code "schedule"} ({@code index.refresh_interval}) are publication-triggering
+     */
+    @Override
+    public void refresh(String source) throws EngineException {
+        super.refresh(source);
+        maybePublishOnRefresh(source);
+    }
+
+    /**
+     * Same publication-triggering treatment as {@link #refresh}, for the {@code maybeRefresh}
+     * variant {@code IndexShard#scheduledRefresh} actually calls (only reopens if a refresh is
+     * genuinely pending, unlike {@link #refresh}'s unconditional reopen).
+     *
+     * @param source what triggered this refresh; only {@code "api"} and {@code "schedule"} are publication-triggering
+     * @return whatever {@code super.maybeRefresh(source)} returned -- this override's added publish
+     *         attempt never changes whether a reader-visible refresh actually happened
+     */
+    @Override
+    public boolean maybeRefresh(String source) throws EngineException {
+        boolean refreshed = super.maybeRefresh(source);
+        maybePublishOnRefresh(source);
+        return refreshed;
+    }
+
+    /**
+     * Flushes (non-forcing: a no-op if nothing has changed since the last commit, so an idle
+     * index's periodic {@code schedule} refreshes never publish an identical manifest) and thereby
+     * publishes, honoring {@link #publicationRateLimitMillis} -- see that field's own javadoc.
+     * {@link #flush} throws only the unchecked {@link EngineException} ({@link
+     * #commitIndexWriter}'s own publish-failure handling already wraps anything else), so a
+     * rate-limited-out or genuinely failed publish attempt here surfaces exactly the same way an
+     * explicit {@code _flush} call's failure would -- consistent with &sect;8's "durable,
+     * observable operation with real cost," not a best-effort/swallowed one.
+     */
+    private void maybePublishOnRefresh(String source) {
+        if (PUBLICATION_TRIGGERING_REFRESH_SOURCES.contains(source) == false) {
+            return;
+        }
+        if (publicationRateLimitMillis > 0) {
+            long now = engineConfig.getThreadPool().relativeTimeInMillis();
+            long last = lastRefreshPublicationAttemptMillis.get();
+            if (now - last < publicationRateLimitMillis) {
+                return;
+            }
+            if (lastRefreshPublicationAttemptMillis.compareAndSet(last, now) == false) {
+                return;
+            }
+        }
+        flush(false, false);
     }
 
     @Override

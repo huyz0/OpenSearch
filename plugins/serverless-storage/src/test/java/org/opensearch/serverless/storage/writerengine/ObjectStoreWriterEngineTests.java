@@ -60,6 +60,14 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
 
     private ObjectStoreWriterEngine openWriterEngine(ShardStateStore shardStateStore, ObjectStoreCommitPublisher commitPublisher)
         throws Exception {
+        return openWriterEngine(shardStateStore, commitPublisher, 0L);
+    }
+
+    private ObjectStoreWriterEngine openWriterEngine(
+        ShardStateStore shardStateStore,
+        ObjectStoreCommitPublisher commitPublisher,
+        long publicationRateLimitMillis
+    ) throws Exception {
         Store store = createStore();
         lastOpenedStore = store;
         store.createEmpty(defaultSettings.getIndexVersionCreated().luceneVersion);
@@ -72,7 +80,12 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
             engineConfig,
             new ObjectStoreCommitHeadPublisher(commitPublisher, shardStateStore),
             shardDirectory,
-            LOCAL_NODE_ID
+            LOCAL_NODE_ID,
+            null,
+            null,
+            null,
+            null,
+            publicationRateLimitMillis
         );
         engine.translogManager().recoverFromTranslog(translogHandler, engine.getProcessedLocalCheckpoint(), Long.MAX_VALUE);
         return engine;
@@ -117,6 +130,130 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
             );
             assertTrue("a manifest should have been published as the shard head after flush", head.isPresent());
             assertEquals(primaryTerm.get(), head.get().head().primaryTerm());
+        } finally {
+            IOUtils.close(engine, lastOpenedStore);
+        }
+    }
+
+    public void testApiSourcedRefreshPublishesAManifest() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+
+        ObjectStoreWriterEngine engine = openWriterEngine(shardStateStore, commitPublisher);
+        try {
+            // Engine construction itself already publishes one baseline manifest: InternalEngine's
+            // own onAfterTranslogRecovery listener unconditionally calls flush(false, true) at the
+            // end of recoverFromTranslog, independent of anything this test does -- so the
+            // meaningful assertion is "generation advances," not "no manifest exists yet."
+            long initialGeneration = shardStateStore.get(shardId.getIndex().getUUID(), shardId.getId())
+                .orElseThrow()
+                .head()
+                .latestManifestGeneration();
+
+            index(engine, "1");
+            engine.refresh("api");
+
+            long afterRefreshGeneration = shardStateStore.get(shardId.getIndex().getUUID(), shardId.getId())
+                .orElseThrow()
+                .head()
+                .latestManifestGeneration();
+            assertTrue(
+                "an api-sourced refresh must publish a manifest -- rfc-serverless-opensearch.md section 8",
+                afterRefreshGeneration > initialGeneration
+            );
+        } finally {
+            IOUtils.close(engine, lastOpenedStore);
+        }
+    }
+
+    public void testScheduleSourcedRefreshPublishesAManifest() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+
+        ObjectStoreWriterEngine engine = openWriterEngine(shardStateStore, commitPublisher);
+        try {
+            long initialGeneration = shardStateStore.get(shardId.getIndex().getUUID(), shardId.getId())
+                .orElseThrow()
+                .head()
+                .latestManifestGeneration();
+
+            index(engine, "1");
+            engine.maybeRefresh("schedule");
+
+            long afterRefreshGeneration = shardStateStore.get(shardId.getIndex().getUUID(), shardId.getId())
+                .orElseThrow()
+                .head()
+                .latestManifestGeneration();
+            assertTrue("a schedule-sourced refresh must publish a manifest too, same as api", afterRefreshGeneration > initialGeneration);
+        } finally {
+            IOUtils.close(engine, lastOpenedStore);
+        }
+    }
+
+    public void testInternalSourcedRefreshDoesNotPublish() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+
+        ObjectStoreWriterEngine engine = openWriterEngine(shardStateStore, commitPublisher);
+        try {
+            long initialGeneration = shardStateStore.get(shardId.getIndex().getUUID(), shardId.getId())
+                .orElseThrow()
+                .head()
+                .latestManifestGeneration();
+
+            index(engine, "1");
+            engine.refresh("post_recovery");
+
+            long afterRefreshGeneration = shardStateStore.get(shardId.getIndex().getUUID(), shardId.getId())
+                .orElseThrow()
+                .head()
+                .latestManifestGeneration();
+            assertEquals("an internal-lifecycle refresh source must not trigger a publish", initialGeneration, afterRefreshGeneration);
+        } finally {
+            IOUtils.close(engine, lastOpenedStore);
+        }
+    }
+
+    public void testPublicationRateLimitSkipsARefreshPublishWithinTheWindow() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+
+        // A rate limit far longer than this test can possibly take to run its two refreshes.
+        ObjectStoreWriterEngine engine = openWriterEngine(shardStateStore, commitPublisher, 5 * 60 * 1000L);
+        try {
+            index(engine, "1");
+            engine.refresh("api");
+            VersionedShardHead afterFirst = shardStateStore.get(shardId.getIndex().getUUID(), shardId.getId()).orElseThrow();
+
+            index(engine, "2");
+            engine.refresh("api");
+            VersionedShardHead afterSecond = shardStateStore.get(shardId.getIndex().getUUID(), shardId.getId()).orElseThrow();
+
+            assertEquals(
+                "a second api-sourced refresh within the rate-limit window must not publish again",
+                afterFirst.head().latestManifestGeneration(),
+                afterSecond.head().latestManifestGeneration()
+            );
         } finally {
             IOUtils.close(engine, lastOpenedStore);
         }

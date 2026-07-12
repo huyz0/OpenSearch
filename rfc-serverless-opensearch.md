@@ -1042,7 +1042,22 @@ returns a safe `attempted: false` rather than an error.
   intervals translate to publication cadence; the API contract ("changes visible to search after
   refresh returns") is preserved, but callers hammering `_refresh` per document will feel it in
   latency and request cost — documentation and a per-index publication rate limit protect
-  against that footgun.
+  against that footgun. **Status: implemented and tested.** `ObjectStoreWriterEngine` now
+  overrides `refresh`/`maybeRefresh`: after the ordinary local reader reopen (so local read
+  correctness is unaffected either way), an `api`-sourced (explicit `_refresh`) or
+  `schedule`-sourced (`index.refresh_interval`-driven) refresh also flushes and thereby publishes
+  -- every other refresh source (`post_recovery`, `reset_engine`, `too_many_listeners`, etc.) is
+  internal engine-lifecycle housekeeping this engine deliberately does not react to, since
+  publishing mid-recovery or on every internal reopen would be noisy, not the honest "refresh now
+  costs a publish" contract this section asks for. The flush this triggers is non-forcing, so an
+  idle index's periodic `schedule` refreshes never publish an identical manifest, and a new node
+  setting, `serverless_storage.publication_rate_limit` (default disabled, matching every other
+  optional-feature-off default in this plugin), additionally bounds how often two refresh-triggered
+  publish attempts on one shard can happen regardless of write volume. Verified: an
+  `api`-sourced refresh publishes a strictly newer manifest generation, a `schedule`-sourced one
+  does too, an internal-lifecycle-sourced one does not change the generation at all, and with the
+  rate limit configured, a second `api`-sourced refresh immediately following the first (well
+  inside the window) does not publish again.
 
 ## 9. Cache Layer
 

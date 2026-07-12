@@ -40,6 +40,7 @@ public final class WriterEngineFactory implements EngineFactory {
     private final org.opensearch.serverless.storage.security.EncryptionKeyProvider encryptionKeyProvider;
     private final ShardActivityRegistry activityRegistry;
     private final DedicatedWalGcConfig dedicatedWalGcConfig;
+    private final long publicationRateLimitMillis;
 
     /**
      * Creates a factory with neither PITR retention nor WAL mirroring configured, delegating to the
@@ -237,6 +238,64 @@ public final class WriterEngineFactory implements EngineFactory {
         ShardActivityRegistry activityRegistry,
         DedicatedWalGcConfig dedicatedWalGcConfig
     ) {
+        this(
+            headPublisher,
+            shardDirectory,
+            localNodeId,
+            pitrRetentionConfig,
+            walChunkService,
+            materializer,
+            encryptionKeyProvider,
+            activityRegistry,
+            dedicatedWalGcConfig,
+            0L
+        );
+    }
+
+    /**
+     * Creates a fully-configured factory, additionally rate-limiting how often an
+     * externally-triggered refresh may trigger a publish on produced engines (rfc-serverless-opensearch.md
+     * &sect;8) -- see {@link ObjectStoreWriterEngine}'s own matching constructor javadoc for the
+     * full mechanism.
+     *
+     * @param headPublisher publishes commits and manages lease acquisition/renewal for produced engines
+     * @param shardDirectory the directory-registry entry produced engines report themselves into
+     * @param localNodeId the id of the node produced engines activate on
+     * @param pitrRetentionConfig {@code null} disables PITR retention reconciliation on produced engines; non-null enables it
+     * @param walChunkService {@code null} disables WAL mirroring entirely; the shared node-level
+     *                        instance for an ordinary shard, or a shard-scoped dedicated instance
+     *                        matching {@code dedicatedWalGcConfig} for an opted-in one.
+     * @param materializer {@code null} disables missing-local-store recovery entirely (same shape
+     *                     as every other optional feature in this plugin) -- see {@link
+     *                     #recoverMissingLocalStore} for what it's for.
+     * @param encryptionKeyProvider {@code null} leaves WAL-mirrored records unencrypted, same shape
+     *                              as every other optional feature in this plugin -- see {@link
+     *                              ObjectStoreWriterEngine}'s own matching constructor javadoc.
+     * @param activityRegistry {@code null} leaves produced engines unreachable for idle-time
+     *                         queries (same shape as every other optional feature in this plugin);
+     *                         non-null registers each produced engine into it as it's constructed.
+     * @param dedicatedWalGcConfig {@code null} for a shard sharing the node-level WAL container (its
+     *                             retention is a separate node-level concern, unaffected by this
+     *                             factory); non-null schedules a dedicated sweep on each produced
+     *                             engine, owned by that engine's own lifecycle -- see {@link
+     *                             ObjectStoreWriterEngine}'s matching constructor javadoc for why.
+     * @param publicationRateLimitMillis non-positive (the default) disables rate limiting on
+     *                                   produced engines; positive is the minimum real milliseconds
+     *                                   between two refresh-triggered publish attempts on any one
+     *                                   produced engine.
+     */
+    public WriterEngineFactory(
+        ObjectStoreCommitHeadPublisher headPublisher,
+        ShardDirectory shardDirectory,
+        String localNodeId,
+        PitrRetentionConfig pitrRetentionConfig,
+        WalChunkService walChunkService,
+        ObjectStoreCommitMaterializer materializer,
+        org.opensearch.serverless.storage.security.EncryptionKeyProvider encryptionKeyProvider,
+        ShardActivityRegistry activityRegistry,
+        DedicatedWalGcConfig dedicatedWalGcConfig,
+        long publicationRateLimitMillis
+    ) {
         this.headPublisher = headPublisher;
         this.shardDirectory = shardDirectory;
         this.localNodeId = localNodeId;
@@ -246,6 +305,7 @@ public final class WriterEngineFactory implements EngineFactory {
         this.encryptionKeyProvider = encryptionKeyProvider;
         this.activityRegistry = activityRegistry;
         this.dedicatedWalGcConfig = dedicatedWalGcConfig;
+        this.publicationRateLimitMillis = publicationRateLimitMillis;
     }
 
     /** Exposed for tests (including from other packages, e.g. {@code ServerlessStoragePluginTests}) -- not part of this class's public contract. */
@@ -289,7 +349,8 @@ public final class WriterEngineFactory implements EngineFactory {
                 pitrRetentionConfig,
                 walChunkService,
                 encryptionKeyProvider,
-                dedicatedWalGcSchedulerTask
+                dedicatedWalGcSchedulerTask,
+                publicationRateLimitMillis
             );
             if (activityRegistry != null) {
                 activityRegistry.register(config.getShardId().getIndex().getUUID(), config.getShardId().getId(), engine);

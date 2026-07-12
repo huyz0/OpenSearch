@@ -490,6 +490,23 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * Minimum real time between two refresh-triggered publish attempts on any one writer shard
+     * (rfc-serverless-opensearch.md &sect;8: "a per-index publication rate limit protect[s] against
+     * that footgun" of a caller hammering {@code _refresh}, now that {@code api}/{@code
+     * schedule}-sourced refreshes flush and publish rather than just reopening the local reader --
+     * see {@code ObjectStoreWriterEngine#maybePublishOnRefresh}). Zero (non-positive) disables this
+     * limiter entirely, matching how every other optional-feature-off default in this plugin is
+     * expressed -- but even disabled, an unchanged index still never publishes an identical
+     * manifest on every {@code schedule} tick, since the underlying flush this triggers is
+     * non-forcing.
+     */
+    public static final Setting<TimeValue> SERVERLESS_STORAGE_PUBLICATION_RATE_LIMIT_SETTING = Setting.timeSetting(
+        "serverless_storage.publication_rate_limit",
+        TimeValue.ZERO,
+        Setting.Property.NodeScope
+    );
+
+    /**
      * Budget for the one node-shared {@link FileCache} backing every reader shard opted into
      * {@link #LAZY_DIRECTORY_STORE_TYPE} (rfc-serverless-opensearch.md &sect;9's "one node block
      * cache" target) -- reused directly from core's own searchable-snapshots feature, not a new
@@ -571,6 +588,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     private volatile TimeValue walGcInterval;
     private volatile long gcRetentionWindowMillis;
     // Resolved once in createComponents, same "read the NodeScope setting where Environment is
+    // actually available" reasoning as every other field in this group -- getEngineFactory reads
+    // this to configure each produced WriterEngineFactory's own rate limiter.
+    private volatile long publicationRateLimitMillis;
+    // Resolved once in createComponents, same "read the NodeScope setting where Environment is
     // actually available" reasoning as every other field in this group -- TransportScaleToZeroCandidatesAction
     // reads these as its per-request defaults, overridable per ScaleToZeroCandidatesRequest.
     private volatile long scaleToZeroIdleThresholdMillis = SERVERLESS_STORAGE_SCALE_TO_ZERO_IDLE_THRESHOLD_SETTING.getDefault(
@@ -617,6 +638,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING,
             SERVERLESS_STORAGE_WAL_GC_INTERVAL_SETTING,
             SERVERLESS_STORAGE_WAL_PER_SHARD_BUDGET_SETTING,
+            SERVERLESS_STORAGE_PUBLICATION_RATE_LIMIT_SETTING,
             SERVERLESS_STORAGE_LAZY_DIRECTORY_CACHE_SIZE_SETTING,
             SERVERLESS_STORAGE_LAZY_DIRECTORY_ENABLED_SETTING,
             SERVERLESS_STORAGE_WAL_DEDICATED_STREAM_SETTING,
@@ -757,6 +779,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         TimeValue configuredGcInterval = SERVERLESS_STORAGE_GC_INTERVAL_SETTING.get(environment.settings());
         gcInterval = configuredGcInterval.millis() > 0 ? configuredGcInterval : null;
         gcRetentionWindowMillis = SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING.get(environment.settings()).millis();
+        publicationRateLimitMillis = SERVERLESS_STORAGE_PUBLICATION_RATE_LIMIT_SETTING.get(environment.settings()).millis();
         long lazyDirectoryCacheSizeBytes = SERVERLESS_STORAGE_LAZY_DIRECTORY_CACHE_SIZE_SETTING.get(environment.settings()).getBytes();
         lazyDirectoryFileCache = lazyDirectoryCacheSizeBytes > 0
             ? FileCacheFactory.createConcurrentLRUFileCache(lazyDirectoryCacheSizeBytes)
@@ -985,7 +1008,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                     // only thing this depends on, unaffected by encryption being off.
                     encryptionKeyProvider,
                     shardActivityRegistry,
-                    dedicatedWalGcConfig
+                    dedicatedWalGcConfig,
+                    publicationRateLimitMillis
                 )
             );
         } catch (IOException e) {
