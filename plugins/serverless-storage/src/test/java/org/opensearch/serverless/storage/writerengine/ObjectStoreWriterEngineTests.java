@@ -158,14 +158,19 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
             index(engine, "1");
             engine.refresh("api");
 
-            long afterRefreshGeneration = shardStateStore.get(shardId.getIndex().getUUID(), shardId.getId())
-                .orElseThrow()
-                .head()
-                .latestManifestGeneration();
-            assertTrue(
-                "an api-sourced refresh must publish a manifest -- rfc-serverless-opensearch.md section 8",
-                afterRefreshGeneration > initialGeneration
-            );
+            // The publish itself now runs asynchronously (dispatched off the calling thread so it
+            // never blocks the shared REFRESH pool) -- refresh() only guarantees local search
+            // visibility synchronously, so this must poll rather than read the head immediately.
+            assertBusy(() -> {
+                long afterRefreshGeneration = shardStateStore.get(shardId.getIndex().getUUID(), shardId.getId())
+                    .orElseThrow()
+                    .head()
+                    .latestManifestGeneration();
+                assertTrue(
+                    "an api-sourced refresh must publish a manifest -- rfc-serverless-opensearch.md section 8",
+                    afterRefreshGeneration > initialGeneration
+                );
+            });
         } finally {
             IOUtils.close(engine, lastOpenedStore);
         }
@@ -190,11 +195,16 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
             index(engine, "1");
             engine.maybeRefresh("schedule");
 
-            long afterRefreshGeneration = shardStateStore.get(shardId.getIndex().getUUID(), shardId.getId())
-                .orElseThrow()
-                .head()
-                .latestManifestGeneration();
-            assertTrue("a schedule-sourced refresh must publish a manifest too, same as api", afterRefreshGeneration > initialGeneration);
+            assertBusy(() -> {
+                long afterRefreshGeneration = shardStateStore.get(shardId.getIndex().getUUID(), shardId.getId())
+                    .orElseThrow()
+                    .head()
+                    .latestManifestGeneration();
+                assertTrue(
+                    "a schedule-sourced refresh must publish a manifest too, same as api",
+                    afterRefreshGeneration > initialGeneration
+                );
+            });
         } finally {
             IOUtils.close(engine, lastOpenedStore);
         }
@@ -241,8 +251,22 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
         // A rate limit far longer than this test can possibly take to run its two refreshes.
         ObjectStoreWriterEngine engine = openWriterEngine(shardStateStore, commitPublisher, 5 * 60 * 1000L);
         try {
+            long initialGeneration = shardStateStore.get(shardId.getIndex().getUUID(), shardId.getId())
+                .orElseThrow()
+                .head()
+                .latestManifestGeneration();
+
             index(engine, "1");
             engine.refresh("api");
+            // Wait for the first (async) publish to actually land before triggering the second
+            // refresh, so the rate-limit window genuinely starts from a completed first attempt.
+            assertBusy(() -> {
+                long generation = shardStateStore.get(shardId.getIndex().getUUID(), shardId.getId())
+                    .orElseThrow()
+                    .head()
+                    .latestManifestGeneration();
+                assertTrue(generation > initialGeneration);
+            });
             VersionedShardHead afterFirst = shardStateStore.get(shardId.getIndex().getUUID(), shardId.getId()).orElseThrow();
 
             index(engine, "2");
@@ -254,6 +278,54 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
                 afterFirst.head().latestManifestGeneration(),
                 afterSecond.head().latestManifestGeneration()
             );
+        } finally {
+            IOUtils.close(engine, lastOpenedStore);
+        }
+    }
+
+    public void testApiSourcedRefreshDoesNotBlockOnASlowPublish() throws Exception {
+        // rfc-serverless-opensearch.md section 8 / code review finding: refresh()/maybeRefresh()
+        // are dispatched by core on the small, node-wide-shared ThreadPool.Names.REFRESH pool, so
+        // the actual object-store publish must never run inline there -- proven here with a real,
+        // deliberately slow container standing in for high object-store latency, not just asserted.
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer rawBlobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        long slowWriteMillis = 2000L;
+        BlobContainer slowBlobContainer = new org.opensearch.serverless.storage.benchmark.LatencyInjectingBlobContainer(
+            rawBlobContainer,
+            new org.opensearch.serverless.storage.benchmark.LatencyProfile(0, 0, slowWriteMillis, slowWriteMillis, 0, 0)
+        );
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(slowBlobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(slowBlobContainer),
+            new BlobContainerManifestStore(slowBlobContainer)
+        );
+
+        ObjectStoreWriterEngine engine = openWriterEngine(shardStateStore, commitPublisher);
+        try {
+            long initialGeneration = shardStateStore.get(shardId.getIndex().getUUID(), shardId.getId())
+                .orElseThrow()
+                .head()
+                .latestManifestGeneration();
+
+            index(engine, "1");
+            long start = System.nanoTime();
+            engine.refresh("api");
+            long elapsedMillis = (System.nanoTime() - start) / 1_000_000L;
+
+            assertTrue(
+                "refresh() must return well before the simulated " + slowWriteMillis + "ms publish completes, took " + elapsedMillis,
+                elapsedMillis < slowWriteMillis
+            );
+
+            // The publish genuinely did happen -- just not before refresh() returned.
+            assertBusy(() -> {
+                long generation = shardStateStore.get(shardId.getIndex().getUUID(), shardId.getId())
+                    .orElseThrow()
+                    .head()
+                    .latestManifestGeneration();
+                assertTrue(generation > initialGeneration);
+            });
         } finally {
             IOUtils.close(engine, lastOpenedStore);
         }

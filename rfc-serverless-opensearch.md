@@ -1111,6 +1111,27 @@ returns a safe `attempted: false` rather than an error.
   rate limit configured, a second `api`-sourced refresh immediately following the first (well
   inside the window) does not publish again.
 
+  **The publish itself is dispatched asynchronously, not run inline on the calling thread --
+  a fix for a real, code-review-caught regression this section's own implementation introduced.**
+  Core dispatches `refresh`/`maybeRefresh` on `ThreadPool.Names.REFRESH`, a small, node-wide pool
+  shared by every shard on the node, not scoped to serverless-storage ones; running the real
+  object-store publish network I/O inline there meant every `api`/`schedule` refresh on every
+  serverless-storage writer shard (default-on, since the rate limit only throttles *frequency*, not
+  whether a refresh publishes at all) could tie up that shared pool long enough to stall unrelated
+  shards' refreshes under load. Fixed by dispatching the flush/publish onto
+  `ThreadPool.Names.GENERIC` instead, guarded by an in-flight flag so a burst of refreshes with
+  rate limiting disabled can't flood `GENERIC` with redundant overlapping flushes for the same
+  shard -- a skipped, already-in-flight trigger loses nothing, since the running attempt's own
+  `flush` picks up every change made up to when it actually runs. The "changes visible to search
+  after refresh returns" contract still holds exactly as before: the local reader reopen
+  (`super.refresh`) still runs synchronously first, unaffected by this change; only the
+  publish-to-object-store half is now asynchronous, tolerating failure the same way
+  `pollForNewerManifest` already does on the reader side (logged, left for the next triggering
+  refresh to retry -- nothing is lost, since the write is already durable locally via the
+  translog/WAL before this ever runs). Verified with a real deliberately-slow container standing
+  in for high object-store latency: `refresh("api")` returns in well under the simulated publish
+  delay, and the publish is confirmed to land afterward, not skipped.
+
 ## 9. Cache Layer
 
 One **node block cache** shared by all shards on a node, replacing per-feature caches:

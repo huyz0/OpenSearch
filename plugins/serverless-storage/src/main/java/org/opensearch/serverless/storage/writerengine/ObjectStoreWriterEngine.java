@@ -8,6 +8,8 @@
 
 package org.opensearch.serverless.storage.writerengine;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.SegmentInfos;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.io.IOUtils;
@@ -47,6 +49,7 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
 
@@ -81,6 +84,8 @@ import java.util.function.LongSupplier;
  * this plugin.
  */
 public class ObjectStoreWriterEngine extends InternalEngine {
+
+    private static final Logger logger = LogManager.getLogger(ObjectStoreWriterEngine.class);
 
     /** How long a directory entry for a writer shard is trusted before it's treated as stale. */
     private static final long DIRECTORY_ENTRY_TTL_MILLIS = 60_000L;
@@ -150,6 +155,12 @@ public class ObjectStoreWriterEngine extends InternalEngine {
      * rate-limited regardless of {@link #publicationRateLimitMillis}.
      */
     private final AtomicLong lastRefreshPublicationAttemptMillis = new AtomicLong(0);
+
+    /**
+     * Guards against dispatching a second async refresh-triggered publish while one is already
+     * running for this engine -- see {@link #maybePublishOnRefresh}'s own javadoc for why.
+     */
+    private final AtomicBoolean refreshPublicationInFlight = new AtomicBoolean(false);
 
     /**
      * The fencing snapshot verified sound in {@code plugins/serverless-storage/formal/WalReplayFencing.tla}
@@ -1000,10 +1011,13 @@ public class ObjectStoreWriterEngine extends InternalEngine {
 
     /**
      * {@code Engine#refresh}'s contract is a local reader reopen -- always run first via {@code
-     * super.refresh(source)}, so this engine's own local searches stay correct even if the publish
-     * attempt below is rate-limited or fails. rfc-serverless-opensearch.md &sect;8: "{@code
-     * _refresh} changes meaning honestly: it becomes 'flush, publish, notify'... the API contract
-     * ('changes visible to search after refresh returns') is preserved."
+     * super.refresh(source)}, so this engine's own local searches stay correct regardless of
+     * whether the publish attempt below is rate-limited, still running, or fails.
+     * rfc-serverless-opensearch.md &sect;8: "{@code _refresh} changes meaning honestly: it becomes
+     * 'flush, publish, notify'... the API contract ('changes visible to search after refresh
+     * returns') is preserved" -- that contract is about local search visibility, which {@code
+     * super.refresh} already guarantees synchronously; the publish itself runs asynchronously (see
+     * {@link #maybePublishOnRefresh}) so this call never blocks on it.
      *
      * @param source what triggered this refresh; only {@code "api"} (explicit {@code _refresh}) and
      *               {@code "schedule"} ({@code index.refresh_interval}) are publication-triggering
@@ -1031,14 +1045,30 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     }
 
     /**
-     * Flushes (non-forcing: a no-op if nothing has changed since the last commit, so an idle
-     * index's periodic {@code schedule} refreshes never publish an identical manifest) and thereby
-     * publishes, honoring {@link #publicationRateLimitMillis} -- see that field's own javadoc.
-     * {@link #flush} throws only the unchecked {@link EngineException} ({@link
-     * #commitIndexWriter}'s own publish-failure handling already wraps anything else), so a
-     * rate-limited-out or genuinely failed publish attempt here surfaces exactly the same way an
-     * explicit {@code _flush} call's failure would -- consistent with &sect;8's "durable,
-     * observable operation with real cost," not a best-effort/swallowed one.
+     * Dispatches a flush (non-forcing: a no-op if nothing has changed since the last commit, so an
+     * idle index's periodic {@code schedule} refreshes never publish an identical manifest), and
+     * thereby a publish, onto {@link ThreadPool.Names#GENERIC} -- honoring {@link
+     * #publicationRateLimitMillis}, see that field's own javadoc for the rate-limit half.
+     *
+     * <p><b>Dispatched asynchronously, not run inline on the calling thread.</b> {@code refresh}/
+     * {@code maybeRefresh} are invoked by core on {@link ThreadPool.Names#REFRESH} -- a small,
+     * node-wide pool shared by every shard on the node, not scoped to serverless-storage ones.
+     * Running this method's real object-store network I/O inline there would tie up that shared
+     * pool for the duration of every {@code api}/{@code schedule} refresh on every serverless-storage
+     * writer shard, starving unrelated shards' refreshes under load -- caught by code review, not
+     * by any test, since nothing here throws or returns wrong data, it just contends for a resource
+     * this class has no business monopolizing. A failed async publish is logged and left for the
+     * next triggering refresh to retry, the same tolerance {@code pollForNewerManifest} already
+     * applies on the reader side -- a delayed or dropped publish attempt only delays reader-visible
+     * generation advancement, it never loses data (already durable locally via the translog/WAL
+     * before this ever runs).
+     *
+     * <p>{@link #refreshPublicationInFlight} skips dispatching a second publish while one is
+     * already running for this engine: a redundant trigger loses nothing since the in-flight
+     * attempt's own {@link #flush} call picks up every change made up to when it actually runs,
+     * including ones made after this skipped call was triggered -- and it keeps an unbounded burst
+     * of rapid refreshes (rate limiting disabled, the default) from flooding {@code GENERIC} with
+     * many overlapping flushes for the same shard.
      */
     private void maybePublishOnRefresh(String source) {
         if (PUBLICATION_TRIGGERING_REFRESH_SOURCES.contains(source) == false) {
@@ -1054,7 +1084,18 @@ public class ObjectStoreWriterEngine extends InternalEngine {
                 return;
             }
         }
-        flush(false, false);
+        if (refreshPublicationInFlight.compareAndSet(false, true) == false) {
+            return;
+        }
+        engineConfig.getThreadPool().executor(ThreadPool.Names.GENERIC).execute(() -> {
+            try {
+                flush(false, false);
+            } catch (Exception e) {
+                logger.warn("failed to publish on refresh (source [" + source + "]), will retry on the next triggering refresh", e);
+            } finally {
+                refreshPublicationInFlight.set(false);
+            }
+        });
     }
 
     @Override
