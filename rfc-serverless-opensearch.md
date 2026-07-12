@@ -2328,6 +2328,22 @@ preset and logs min/avg/max elapsed time. **These numbers are illustrative and s
 backend) -- they are not a measurement of this section's actual cold-start/p95/p99 milestones,
 only a repeatable order-of-magnitude stand-in until those are benchmarked for real.
 
+**The "not yet benchmarked" cold-start milestone above now has a real, repeatable percentile
+measurement, though still simulated, not production-representative.**
+`ColdStartReaderEngineBenchmarkTests` times the actual sequence a reader-shard cold start runs --
+resolve the published head, read its manifest, open a real `ObjectStoreReaderEngine` against it,
+acquire a searcher -- matching `ReaderEngineFactory#newReadWriteEngine`'s own sequence exactly, not
+a narrower stand-in for it, across 15 independent trials per `LatencyProfile` plus a no-injected-
+latency baseline, computing p50/p95/p99. Measured in this sandbox (not representative production
+hardware/network, so these are not claimed as real production numbers): p99 was 143ms with no
+injected latency, 67ms/218ms/805ms at `LOW`/`TYPICAL`/`HIGH` respectively -- comfortably inside the
+5s p95 target even at `HIGH`'s simulated degraded/cross-region conditions, though that comparison
+is illustrative given the milestone's own real-world target was never meant to be validated against
+a local-filesystem simulation. The honest value here is a repeatable, CI-visible regression signal
+(did cold-start get slower relative to its own prior runs?), not a production SLO measurement --
+no pass/fail threshold is asserted for that reason, same restraint `BlobLatencyBenchmarkTests`
+already exercises for its own numbers.
+
 **The harness now also feeds a real cluster IT, `ServerlessStorageReactivationUnderLatencyIT`,
 checking whether `SERVERLESS_STORAGE_SCALE_TO_ZERO_SEARCH_REACTIVATION_WAIT_SETTING`'s 30s default
 has real headroom under realistic object-store latency, not just near-zero local disk.** It
