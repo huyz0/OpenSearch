@@ -3192,7 +3192,19 @@ directions documented so serverless adoption is not a one-way door.
   manifest survives.
 - **Chaos**: kill writer mid-bundle-upload, mid-manifest-write, mid-WAL-chunk; kill readers
   mid-refresh; object store fault injection (throttling, 5xx storms, elevated latency) — the
-  mock repository infrastructure in-repo already supports much of this.
+  mock repository infrastructure in-repo already supports much of this. **Status: elevated latency
+  and a first real fault-injection case are implemented and tested; broader throttling/5xx-storm
+  coverage is not.** `LatencyInjectingBlobContainer` (`benchmark` package) already covers elevated
+  latency, exercised by `ServerlessStorageReactivationUnderLatencyIT`. `GcSchedulerTaskTests#testSweepIsSafeToRetryAfterAnInjectedTransientObjectStoreFault`
+  adds a real throttling/5xx-storm-style case: a `FaultInjectingBlobContainer` (a `FilterBlobContainer`
+  that throws on the first `deleteBlobsIgnoringIfNotExists` call, then succeeds) proves `GcSchedulerTask#sweep`'s
+  own documented crash-safety property (bundles deleted before manifests, so a fault between the
+  two steps is always retry-safe) holds under a real injected fault, not just a natural crash --
+  the failed attempt leaves state completely untouched, and a bare retry converges to the correct
+  final state. This is one representative case, not a general chaos harness: kill-mid-bundle-upload/
+  mid-manifest-write/mid-WAL-chunk on the writer path, kill-mid-refresh on the reader path, and
+  broader probabilistic multi-operation throttling/5xx-storm injection across the whole plugin
+  remain open.
 - **Staleness/consistency**: linearizability-style checker for the RYW path (indexed doc with
   generation token must be visible to a routed search); monotonicity checker for readers.
 - **GC safety**: long-running PIT queries concurrent with aggressive ingest+merge; assert no

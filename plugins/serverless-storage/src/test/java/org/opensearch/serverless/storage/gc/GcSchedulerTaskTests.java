@@ -240,6 +240,86 @@ public class GcSchedulerTaskTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * rfc-serverless-opensearch.md &sect;17's "Chaos" testing-strategy bullet's object-store fault
+     * injection half (throttling/5xx-storm style transient failures). {@link GcSchedulerTask#sweep}'s
+     * own javadoc already documents the crash-safety property this proves under a real injected
+     * fault rather than just a natural crash: bundles are deleted before manifests, so a fault
+     * between the two steps leaves, at worst, a still-listed manifest pointing at already-gone
+     * bundles -- itself still correctly classified deletable and retried by the very next sweep --
+     * never an orphaned bundle no future sweep would revisit.
+     */
+    private static final class FaultInjectingBlobContainer extends org.opensearch.common.blobstore.support.FilterBlobContainer {
+
+        private int remainingFailures;
+
+        FaultInjectingBlobContainer(BlobContainer delegate, int failureCount) {
+            super(delegate);
+            this.remainingFailures = failureCount;
+        }
+
+        @Override
+        protected BlobContainer wrapChild(BlobContainer child) {
+            return new FaultInjectingBlobContainer(child, remainingFailures);
+        }
+
+        @Override
+        public synchronized void deleteBlobsIgnoringIfNotExists(List<String> blobNames) throws java.io.IOException {
+            if (remainingFailures > 0) {
+                remainingFailures--;
+                throw new java.io.IOException("injected transient object-store fault (simulated throttling/5xx) deleting blobs");
+            }
+            super.deleteBlobsIgnoringIfNotExists(blobNames);
+        }
+    }
+
+    public void testSweepIsSafeToRetryAfterAnInjectedTransientObjectStoreFault() throws Exception {
+        long farInThePast = System.currentTimeMillis() - TimeValue.timeValueDays(1).millis();
+        CommitManifest gen1 = writeGeneration(1, farInThePast);
+        CommitManifest gen2 = writeGeneration(2, farInThePast);
+
+        FaultInjectingBlobContainer faultyContainer = new FaultInjectingBlobContainer(blobContainer, 1);
+        GcSchedulerConfig config = new GcSchedulerConfig(
+            TimeValue.timeValueMinutes(5),
+            TimeValue.timeValueMinutes(1).millis(),
+            new BlobContainerManifestStore(faultyContainer),
+            new BlobContainerBundleStore(faultyContainer),
+            pinRegistry
+        );
+        GcSchedulerTask task = new GcSchedulerTask(threadPool, config.interval(), INDEX_UUID, SHARD_ID, config);
+        try {
+            // First attempt: the injected fault fires on the bundle-delete step (the first
+            // deleteBlobsIgnoringIfNotExists call sweep() makes) and must surface, not be silently
+            // swallowed at this level -- sweepForTesting() (unlike the real scheduled sweepSafely())
+            // deliberately propagates so this test can observe it.
+            expectThrows(java.io.IOException.class, task::sweepForTesting);
+
+            // State must be untouched by the failed attempt: the fault fired before either delete
+            // actually reached the real underlying container.
+            List<CommitManifest> afterFailedAttempt = manifestStore.listManifests();
+            assertEquals("a failed sweep attempt must not have deleted anything", 2, afterFailedAttempt.size());
+            assertTrue(bundleStore.listBundleNames().contains(gen1.referencedBundles().iterator().next()));
+
+            // Retrying (exactly what the real scheduled task's own periodic tick does naturally)
+            // now succeeds cleanly, since the injected failure budget is exhausted.
+            task.sweepForTesting();
+
+            List<CommitManifest> remaining = manifestStore.listManifests();
+            assertEquals(1, remaining.size());
+            assertTrue(remaining.stream().anyMatch(m -> m.generation() == gen2.generation()));
+            assertFalse(
+                "the retry must converge to the correct final state despite the earlier injected fault",
+                remaining.stream().anyMatch(m -> m.generation() == gen1.generation())
+            );
+            assertFalse(
+                "gen 1's bundle must be gone after the successful retry",
+                bundleStore.listBundleNames().contains(gen1.referencedBundles().iterator().next())
+            );
+        } finally {
+            task.close();
+        }
+    }
+
     public void testSweepRetainsEverythingWithinTheRetentionWindowEvenIfSupersededAndUnpinned() throws Exception {
         long now = System.currentTimeMillis();
 
