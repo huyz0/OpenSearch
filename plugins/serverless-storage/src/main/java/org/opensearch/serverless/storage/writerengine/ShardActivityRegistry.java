@@ -76,6 +76,27 @@ public final class ShardActivityRegistry {
     }
 
     /**
+     * Looks up the currently-live writer engine for (indexUuid, shardId) on this node and, if
+     * found, performs a real-time {@code get} by document id directly against its own live
+     * version map (rfc-serverless-opensearch.md &sect;8) -- the lookup half of the "route to the
+     * writer for true realtime gets" mechanism, letting a transport action reach a specific node's
+     * specific writer engine instance by (indexUuid, shardId) alone, the same shape as {@link
+     * org.opensearch.serverless.storage.readerengine.ReaderShardActivityRegistry#waitForGeneration}
+     * on the reader side.
+     *
+     * @param indexUuid the UUID of the index the shard belongs to
+     * @param shardId the shard number within {@code indexUuid}
+     * @param id the document id to look up
+     * @return empty if no writer engine for this shard is currently tracked on this node;
+     *         otherwise the real-time existence/version/seqNo result
+     */
+    public Optional<RealtimeGetResult> realtimeGet(String indexUuid, int shardId, String id) {
+        WeakReference<ObjectStoreWriterEngine> ref = engines.get(key(indexUuid, shardId));
+        ObjectStoreWriterEngine engine = ref == null ? null : ref.get();
+        return engine == null ? Optional.empty() : Optional.of(engine.realtimeGet(id));
+    }
+
+    /**
      * A point-in-time snapshot of every writer engine currently tracked on this node -- the
      * cluster-wide counterpart to {@link #millisSinceLastActivity}, letting a caller (an
      * autoscaling/suspension controller, {@code rfc-serverless-opensearch.md} &sect;7.3/&sect;10's

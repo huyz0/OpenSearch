@@ -12,6 +12,7 @@ import org.apache.lucene.index.SegmentInfos;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.index.engine.DocumentIndexWriter;
+import org.opensearch.index.engine.Engine;
 import org.opensearch.index.engine.Engine.Delete;
 import org.opensearch.index.engine.Engine.DeleteResult;
 import org.opensearch.index.engine.Engine.Index;
@@ -647,6 +648,36 @@ public class ObjectStoreWriterEngine extends InternalEngine {
      */
     public long writesPerMinute() {
         return completedWindowWriteCount.get();
+    }
+
+    /**
+     * A real-time existence/version/seqNo check against this engine's own live version map
+     * (rfc-serverless-opensearch.md &sect;8: "{@code _get} by document id can optionally route to
+     * the writer shard for true realtime gets"). Delegates straight to the inherited {@link
+     * InternalEngine#get} -- this class overrides neither {@code get} nor anything it depends on,
+     * so this is exactly the same real-time-get machinery any ordinary {@link InternalEngine}
+     * shard already provides, just reached directly rather than through core's own routing.
+     *
+     * <p>A reader engine ({@code ObjectStoreReaderEngine}) cannot answer this authoritatively at
+     * all -- it has no live version map, only whatever manifest generation it last materialized,
+     * which can lag the writer's true state by up to {@code MANIFEST_POLL_INTERVAL}. This method
+     * is what {@code TransportRealtimeGetAction} calls when a caller explicitly opts into routing
+     * to the writer instead.
+     *
+     * @param id the document id to look up
+     * @return the real-time existence/version/seqNo result
+     */
+    public RealtimeGetResult realtimeGet(String id) {
+        org.apache.lucene.index.Term uidTerm = new org.apache.lucene.index.Term(
+            org.opensearch.index.mapper.IdFieldMapper.NAME,
+            org.opensearch.index.mapper.Uid.encodeId(id)
+        );
+        try (Engine.GetResult result = get(new Engine.Get(true, true, id, uidTerm), this::acquireSearcher)) {
+            if (result.exists() == false) {
+                return new RealtimeGetResult(false, org.opensearch.common.lucene.uid.Versions.NOT_FOUND, -1, -1);
+            }
+            return new RealtimeGetResult(true, result.version(), result.docIdAndVersion().seqNo, result.docIdAndVersion().primaryTerm);
+        }
     }
 
     /**

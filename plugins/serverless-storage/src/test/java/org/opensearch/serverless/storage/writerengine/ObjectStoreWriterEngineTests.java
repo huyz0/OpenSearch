@@ -94,7 +94,7 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
     private void index(ObjectStoreWriterEngine engine, String id) throws Exception {
         ParsedDocument doc = testParsedDocument(id, null, testDocumentWithTextField(), SOURCE, null);
         Engine.Index index = new Engine.Index(
-            new Term("_id", id),
+            new Term("_id", org.opensearch.index.mapper.Uid.encodeId(id)),
             doc,
             SequenceNumbers.UNASSIGNED_SEQ_NO,
             primaryTerm.get(),
@@ -254,6 +254,33 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
                 afterFirst.head().latestManifestGeneration(),
                 afterSecond.head().latestManifestGeneration()
             );
+        } finally {
+            IOUtils.close(engine, lastOpenedStore);
+        }
+    }
+
+    public void testRealtimeGetFindsAnIndexedDocumentBeforeAnyRefreshOrFlush() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+
+        ObjectStoreWriterEngine engine = openWriterEngine(shardStateStore, commitPublisher);
+        try {
+            org.opensearch.serverless.storage.writerengine.RealtimeGetResult before = engine.realtimeGet("1");
+            assertFalse("must not exist before it's indexed", before.exists());
+
+            index(engine, "1");
+
+            // Deliberately no refresh() or flush() call: a real-time get must find the document
+            // straight off the live version map/translog, exactly the point of routing to the
+            // writer instead of a reader engine that only sees materialized manifest generations.
+            org.opensearch.serverless.storage.writerengine.RealtimeGetResult after = engine.realtimeGet("1");
+            assertTrue("must exist immediately after indexing, with no refresh/flush", after.exists());
+            assertTrue("version must be a real assigned version, not a placeholder", after.version() > 0);
         } finally {
             IOUtils.close(engine, lastOpenedStore);
         }

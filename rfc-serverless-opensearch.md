@@ -1049,7 +1049,23 @@ returns a safe `attempted: false` rather than an error.
   published from a concurrent thread partway through the wait is picked up and returns `true`, with
   the newly-visible document actually searchable immediately after.
 - `_get` by document id can optionally route to the writer shard for true realtime gets (the
-  writer has the live version map), controlled per request.
+  writer has the live version map), controlled per request. **Status: the routing primitive is
+  implemented and tested; full core `_get` wire integration is not.** `ObjectStoreWriterEngine#realtimeGet(id)`
+  delegates straight to the inherited `InternalEngine#get` (a real-time, translog-aware version-map
+  lookup -- this class overrides neither `get` nor anything it depends on), since a reader engine
+  has no live version map at all and can lag the writer by up to the manifest poll interval.
+  `RealtimeGetAction` (`GET /_plugins/_serverless/storage/{index}/{shard}/_realtime_get/{id}`,
+  dispatched off the transport thread since it does real Lucene/translog I/O) exposes this per
+  (index, shard, id) on whichever node receives the request -- same single-node,
+  caller-already-knows-the-routing shape as `WaitForGenerationAction`. Deliberately
+  existence/version/seqNo only, not `_source`: extracting `_source` needs a `MapperService`/`ShardGetService`-level
+  context this plugin's node-local engine registry does not carry. What this does NOT yet do:
+  thread a "route to writer" flag through core's actual `GetRequest`/`TransportGetAction` or have
+  `_get` call this automatically -- that is a real core wire-protocol change out of scope for this
+  increment, same reasoning as the RYW primitive above. Verified: a document not yet indexed
+  reports not-existing; immediately after indexing, with no refresh or flush at all, the same
+  lookup reports it exists with a real assigned version -- proof this reaches the live version map
+  directly, not a materialized/refreshed view.
 - **No cross-shard snapshot isolation** — a multi-shard search may observe different shards at
   different generations. This is already true of OpenSearch today; it is stated here so nobody
   assumes the manifest mechanism accidentally added it.

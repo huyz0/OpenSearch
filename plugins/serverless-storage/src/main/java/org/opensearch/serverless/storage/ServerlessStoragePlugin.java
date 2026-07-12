@@ -1300,6 +1300,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 org.opensearch.serverless.storage.writerengine.action.TransportNodeIdleShardsAction.class
             ),
             new ActionHandler<>(
+                org.opensearch.serverless.storage.writerengine.action.RealtimeGetAction.INSTANCE,
+                org.opensearch.serverless.storage.writerengine.action.TransportRealtimeGetAction.class
+            ),
+            new ActionHandler<>(
                 org.opensearch.serverless.storage.readerengine.action.NodeManifestLagAction.INSTANCE,
                 org.opensearch.serverless.storage.readerengine.action.TransportNodeManifestLagAction.class
             ),
@@ -1381,6 +1385,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new org.opensearch.serverless.storage.compaction.action.RestCompactionTriggerAction(),
             new org.opensearch.serverless.storage.writerengine.action.RestShardIdleTimeAction(),
             new org.opensearch.serverless.storage.writerengine.action.RestNodeIdleShardsAction(),
+            new org.opensearch.serverless.storage.writerengine.action.RestRealtimeGetAction(),
             new org.opensearch.serverless.storage.readerengine.action.RestNodeManifestLagAction(),
             new org.opensearch.serverless.storage.readerengine.action.RestWaitForGenerationAction(),
             new org.opensearch.serverless.storage.scaletozero.action.RestScaleToZeroCandidatesAction(),
