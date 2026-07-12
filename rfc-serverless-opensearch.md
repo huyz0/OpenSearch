@@ -2204,6 +2204,18 @@ directory/gossip tier, &sect;9) -- polling, not push, is what's implemented. Tha
 later refinement for latency/efficiency, not a correctness gap: the milestone's own freshness-lag
 target is already comfortably met by a 5 s poll interval against a 15 s p99 budget.
 
+**Partially narrowed since this was written, though not in the form originally sketched here.**
+&sect;8's `WriterPublicationNotifier`/`PollNowAction` now gives writer-triggered push notification
+after every publish -- not the gossip/directory-tier pub/sub this paragraph originally called for
+(reader locations come from the routing table, a simpler mechanism than a distributed gossip
+layer), but it delivers the same practical outcome for the common case: a reader picks up a new
+generation in the time a single RPC takes, not up to the full 5 s poll interval. What remains open
+in the form this paragraph names is specifically the gossip/directory-tier-based version -- a
+different, larger mechanism, not merely a missing wiring step -- still worth building eventually for
+the cases routing-table-based notification doesn't reach (e.g. a reader not yet visible in routing
+because its own directory entry lapsed), but no longer the only way this milestone's freshness goal
+gets met in practice.
+
 **Plugin wiring (done).** `ServerlessStoragePlugin implements EnginePlugin` assembles everything
 above into a working `getEngineFactory(IndexSettings, ShardRouting)`: an index only gets an
 object-store engine if it opts in via `index.serverless_storage.enabled` (every other index is
