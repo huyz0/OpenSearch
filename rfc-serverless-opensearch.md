@@ -2917,8 +2917,8 @@ internals themselves -- real background ticks, real pin add/remove, cancellation
 exhaustively covered directly in `PitrRetentionSchedulerTaskTests` against a short, configurable
 interval, since the engine's real 5-minute interval is far too long to observe in a test).
 
-**Phase 5 — Hardening (ongoing). Resharding-by-copy: split, done; shrink and physical
-bundle rewrite, not started.** The split half of "split/shrink via manifest rewrite + bundle copy —
+**Phase 5 — Hardening (ongoing). Resharding-by-copy: split, shrink, and physical bundle
+rewrite all done.** The split half of "split/shrink via manifest rewrite + bundle copy —
 no reindex" is implemented: `ShardSplitter.split` (`resharding` package) creates one target shard
 as one of `numPartitions` logical partitions of a source shard's current published manifest, and is
 deliberately not a new mechanism at all -- it's `ShardCloner.clone` (§14, already formally verified
@@ -3268,6 +3268,11 @@ directions documented so serverless adoption is not a one-way door.
    value that would configure a second, competing segment-distribution mechanism for the same
    shard. An ordinary (non-serverless-storage) index requesting `SEGMENT` replication is
    completely unaffected, as this validation only ever fires when serverless storage is enabled.
+   **Refined by risk #10 below**: the rejection is now scoped to `index.number_of_replicas > 0`
+   only, since a search-only shard copy never goes through core's peer-to-peer segment-copy
+   protocol regardless of this setting, and rejecting it unconditionally made it impossible to
+   ever request a search-only replica (which requires `remote_store.enabled`, which in turn
+   requires an explicit `SEGMENT` request) on a serverless-storage index at all.
 8. **Vector/kNN workloads.** HNSW graph traversal is random-access over large structures —
    nearly the worst case for a 1 MB-block LRU cache. Vector-heavy indices likely need a
    distinct cache class (pin whole graphs while a shard is query-active) and possibly

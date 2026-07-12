@@ -87,9 +87,9 @@
 (*      the fact from a value-comparison that other actions can           *)
 (*      coincidentally also satisfy.                                      *)
 (*                                                                         *)
-(* Run 3 (ShardHeadDecoupled.cfg, SpecDecoupled -- a PROPOSED, not yet      *)
-(* implemented-in-Java redesign, run to de-risk it before touching the     *)
-(* hot-path writer-publish Java code): decouples a writer's generation      *)
+(* Run 3 (ShardHeadDecoupled.cfg, SpecDecoupled -- a redesign now          *)
+(* implemented in Java (ObjectStoreCommitHeadPublisher), run to de-risk it *)
+(* before it was implemented): decouples a writer's generation             *)
 (* numbering from local Lucene state entirely -- PublishDecoupled always    *)
 (* computes its target live as head.generation + 1 and fences against the  *)
 (* live head.holder (not a cached localHead[n] belief), mirroring how       *)
@@ -289,8 +289,8 @@ PublishBuggy(n, g) ==
     /\ UNCHANGED <<head, leaseExpired, version, localHead, localVersion>>
 
 (***************************************************************************)
-(* Models the PROPOSED redesign (not yet implemented in Java -- this is    *)
-(* the design verification the RFC's AuthorshipHonest section flags as    *)
+(* Models the redesign now implemented in Java (ObjectStoreCommitHeadPublisher) --*)
+(* this is the design verification the RFC's AuthorshipHonest section flags as *)
 (* the real remaining fix, done here BEFORE touching production code):     *)
 (* a writer's generation target is no longer fixed ahead of time from      *)
 (* local Lucene state and then checked against a possibly-stale cached     *)
