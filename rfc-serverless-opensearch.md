@@ -1370,14 +1370,21 @@ wins over an arbitrary first-approved node when fresh and still decider-approved
 never consults reader affinity; a non-positive TTL fully disables the preference; the recorder's
 cluster-state update actually lands, proven against a real `ClusterService`, not just the pure
 metadata accessor logic) -- confirmed meaningful by reverting the implementation and watching the
-new tests fail to compile. What remains unimplemented: the actual scale-to-zero mechanism (third
-bullet) and mandatory remote cluster state enforcement (fourth bullet). **The third bullet's signal-collection half is no longer
-entirely missing, though**: both named per-tier signals -- ingest tier's writer idle activity and
-search tier's manifest-generation lag -- now have a real, tested, per-node discovery surface, and a
-cluster-wide policy layer (`ScaleToZeroCandidatesAction`) now merges and threshold-evaluates both
-into a real candidate list (see &sect;16 Phase 4 below for all three). What's still genuinely
-absent is the *mechanism*: no suspend/scale-to-zero action exists to act on a policy decision, and
-no cold-start reactivation exists either, even though the policy deciding a shard qualifies is now real.
+new tests fail to compile.
+
+**The third bullet (scale-to-zero mechanism) is now fully implemented too -- stale text corrected
+here, no code change.** Both named per-tier signals -- ingest tier's writer idle activity and
+search tier's manifest-generation lag -- have a real, tested, per-node discovery surface, and a
+cluster-wide policy layer (`ScaleToZeroCandidatesAction`) merges and threshold-evaluates both into
+a real candidate list (see &sect;16 Phase 4 below for all three). The mechanism this note
+previously called "genuinely absent" now exists: `ShardSuspensionCoordinator` acts on a policy
+decision by marking a shard suspended (`SuspendedShardsMetadata`, an `IndexMetadata` custom-data
+mutation, the same shape this section's own cache-affinity feature reuses) and evicting it via an
+explicit `CancelAllocationCommand`, and `ShardReactivationActionFilter` transparently reactivates a
+suspended shard on the next real request against it (writer and reader roles independently,
+&sect;16 Phase 4), with cooldown-based hysteresis (`SuspendedShardsMetadata#isSuspensionAllowed`)
+guarding against suspend/reactivate flapping. What remains unimplemented is only mandatory remote
+cluster state enforcement (fourth bullet).
 
 ## 11. API Surface in Serverless Mode
 
