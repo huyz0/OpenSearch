@@ -939,7 +939,21 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
 
             boolean isReaderShard = shardRouting != null && shardRouting.isSearchOnly();
             if (isReaderShard) {
-                BundleFileReader readPath = bundleStore;
+                // Credential scoping per tier, bullet 1 (rfc-serverless-opensearch.md &sect;15):
+                // "search-compute needs GET-only on data prefixes." This reader shard's own
+                // background CompactionSchedulerConfig/GcSchedulerConfig below still need write
+                // (and, for GC, delete) access, so they keep using scopedContainer/blobContainer
+                // directly -- only the query-serving trio (shardStateStore/manifestStore/readPath,
+                // what ObjectStoreReaderEngine itself actually reads from on every query and on its
+                // own background poll) gets this separate, strictly-narrower container.
+                BlobContainer readOnlyContainer = new org.opensearch.serverless.storage.security.RestrictingBlobContainer(
+                    scopedContainer,
+                    false,
+                    false
+                );
+                ShardStateStore readerShardStateStore = new BlobContainerShardStateStore(readOnlyContainer);
+                BlobContainerManifestStore readerManifestStore = new BlobContainerManifestStore(readOnlyContainer);
+                BundleFileReader readPath = new BlobContainerBundleStore(readOnlyContainer);
                 if (localCacheRoot != null) {
                     // The cache layer (rfc-serverless-opensearch.md &sect;9): a reader shard
                     // re-fetches the same bundle files across queries far more often than a writer
@@ -955,7 +969,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                     // shard -- see InMemoryPlaintextBundleCache's javadoc) is what keeps the
                     // actually-hot working set decrypted, so most reads never pay that decrypt cost
                     // repeatedly; only a disk-cache hit that missed this layer does.
-                    BundleFileReader diskCache = new LocalDiskCachingBundleStore(bundleStore, shardCacheDir, encryptionKeyProvider);
+                    BundleFileReader diskCache = new LocalDiskCachingBundleStore(readPath, shardCacheDir, encryptionKeyProvider);
                     readPath = new CachingBundleFileReader(sharedBundleCache, diskCache);
                 }
                 CompactionSchedulerConfig compactionConfig = compactionInterval == null
@@ -1000,8 +1014,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 }
                 return Optional.of(
                     new ReaderEngineFactory(
-                        shardStateStore,
-                        manifestStore,
+                        readerShardStateStore,
+                        readerManifestStore,
                         new ObjectStoreCommitMaterializer(readPath),
                         shardDirectory,
                         localNodeId,

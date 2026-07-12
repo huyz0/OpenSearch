@@ -23,10 +23,10 @@ import java.util.Optional;
 
 /**
  * Proves {@link RestrictingBlobContainer} enforces rfc-serverless-opensearch.md &sect;15's
- * "compaction service needs GET+PUT but no DELETE ... GC/reconciler role is the only
- * DELETE-capable principal" against a real {@link BlobContainer} (not a mock), so a genuine
- * {@code writeBlob}/{@code readBlob}/{@code delete} actually reaches (or is refused before ever
- * reaching) real backing storage.
+ * "search-compute needs GET-only ... compaction service needs GET+PUT but no DELETE ...
+ * GC/reconciler role is the only DELETE-capable principal" against a real {@link BlobContainer}
+ * (not a mock), so a genuine {@code writeBlob}/{@code readBlob}/{@code delete} actually reaches (or
+ * is refused before ever reaching) real backing storage.
  */
 public class RestrictingBlobContainerTests extends OpenSearchTestCase {
 
@@ -91,6 +91,52 @@ public class RestrictingBlobContainerTests extends OpenSearchTestCase {
         assertEquals(new BytesArray("v1"), readBack.get().value());
     }
 
+    public void testWriteThrowsWhenNotAllowed() throws Exception {
+        BlobContainer delegate = newFsBlobContainer();
+        BlobContainer restricted = new RestrictingBlobContainer(delegate, false, false);
+
+        byte[] content = "hello".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        expectThrows(SecurityException.class, () -> restricted.writeBlob("a", new ByteArrayInputStream(content), content.length, true));
+        expectThrows(
+            SecurityException.class,
+            () -> restricted.writeBlobAtomic("a", new ByteArrayInputStream(content), content.length, true)
+        );
+        expectThrows(
+            SecurityException.class,
+            () -> restricted.compareAndSwapRegister("r", BlobRegister.ABSENT_GENERATION, new BytesArray("v1"))
+        );
+
+        assertFalse("a denied write attempt must never reach the real delegate", delegate.blobExists("a"));
+        assertEquals(Optional.empty(), delegate.readRegister("r"));
+    }
+
+    public void testReadStillPassesThroughWhenWriteIsDenied() throws Exception {
+        BlobContainer delegate = newFsBlobContainer();
+        byte[] content = "hello".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        delegate.writeBlob("a", new ByteArrayInputStream(content), content.length, true);
+        delegate.compareAndSwapRegister("r", BlobRegister.ABSENT_GENERATION, new BytesArray("v1"));
+        BlobContainer restricted = new RestrictingBlobContainer(delegate, false, false);
+
+        try (var in = restricted.readBlob("a")) {
+            assertArrayEquals(content, in.readAllBytes());
+        }
+        Optional<BlobRegister> readBack = restricted.readRegister("r");
+        assertTrue(readBack.isPresent());
+        assertEquals(new BytesArray("v1"), readBack.get().value());
+    }
+
+    public void testTwoArgConstructorLeavesWriteAllowed() throws Exception {
+        // The pre-existing writer/compaction-tier constructor -- GET+PUT but no DELETE -- must keep
+        // allowing writes exactly as before now that write denial exists as a separate axis.
+        BlobContainer delegate = newFsBlobContainer();
+        BlobContainer restricted = new RestrictingBlobContainer(delegate, false);
+
+        byte[] content = "hello".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        restricted.writeBlob("a", new ByteArrayInputStream(content), content.length, true);
+
+        assertTrue(delegate.blobExists("a"));
+    }
+
     public void testChildrenStayWrappedWithTheSamePermission() throws Exception {
         java.nio.file.Path root = createTempDir();
         FsBlobStore blobStore = new FsBlobStore(1024, root, false);
@@ -103,11 +149,16 @@ public class RestrictingBlobContainerTests extends OpenSearchTestCase {
             true
         );
         BlobContainer delegate = new FsBlobContainer(blobStore, BlobPath.cleanPath(), root);
-        BlobContainer restricted = new RestrictingBlobContainer(delegate, false);
+        BlobContainer restricted = new RestrictingBlobContainer(delegate, false, false);
 
-        // Any container reached via children() must itself still be delete-restricted, not a bare passthrough.
+        // Any container reached via children() must itself still be restricted, not a bare passthrough.
         BlobContainer wrappedChild = restricted.children().get("nested");
         assertNotNull(wrappedChild);
         expectThrows(SecurityException.class, () -> wrappedChild.deleteBlobsIgnoringIfNotExists(List.of("b")));
+        byte[] childContent = "y".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        expectThrows(
+            SecurityException.class,
+            () -> wrappedChild.writeBlob("c", new ByteArrayInputStream(childContent), childContent.length, true)
+        );
     }
 }

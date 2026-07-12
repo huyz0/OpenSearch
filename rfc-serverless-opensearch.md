@@ -1665,15 +1665,32 @@ container backing `ShardStateStore`/`ManifestStore`/`BundleStore`/`DurablePinReg
 therefore the reader, writer, and compaction paths, which all currently share one `BlobContainer`
 instance per shard -- see that method's own comments) is delete-denied; `GcSchedulerConfig` alone
 gets its own store pair built against the unrestricted underlying container, matching "the
-GC/reconciler role is the only DELETE-capable principal" exactly. **Known, explicit limitation**:
-only the DELETE-vs-not-DELETE axis (bullets 2 and 3) is enforced -- the GET-only search-compute
-tier (bullet 1) isn't, because the reader and writer paths aren't yet built against genuinely
-separate `BlobContainer` instances at that construction seam; a reader shard's own background
-compaction/GC tasks currently share the exact same container as its query-serving path, so a hard
-GET-only wrapper there would break those background tasks too. Verified with real-`BlobContainer`
-unit tests (write/read pass through unchanged regardless of delete permission; a denied delete
-throws before ever reaching the delegate and leaves it untouched; a permitted delete actually
-deletes; children reached via `children()` stay wrapped with the same permission) and caught a
+GC/reconciler role is the only DELETE-capable principal" exactly. **Now, all three tiers are
+enforced, including the GET-only search-compute tier (bullet 1).** `RestrictingBlobContainer`
+gained a second, independent axis -- `writeAllowed`, alongside the existing `deleteAllowed` --
+denying `writeBlob`/`writeBlobAtomic`/`compareAndSwapRegister` the same way `delete()`/
+`deleteBlobsIgnoringIfNotExists` were already denied, via a new 3-arg constructor (the original
+2-arg constructor is preserved unchanged, defaulting to `writeAllowed=true`, so the
+writer/compaction tier's existing "GET+PUT but no DELETE" scope is untouched). Closing the gap
+needed exactly the split the previous status note called for: `ServerlessStoragePlugin#getEngineFactory`'s
+reader-shard branch now builds a second, strictly-narrower container (write and delete both denied)
+used only for the query-serving trio `ObjectStoreReaderEngine` itself actually reads from on every
+query and its own background poll (`shardStateStore`/`manifestStore`/the bundle-read path feeding
+`materializer`, cache-wrapped or not) -- `CompactionSchedulerConfig`/`GcSchedulerConfig`, that same
+reader shard's own background maintenance tasks, keep using the write-capable `scopedContainer`/raw
+`blobContainer` exactly as before, since they still legitimately need PUT (and, for GC, DELETE).
+Verified with real-`BlobContainer` unit tests (a denied write throws before ever reaching the
+delegate and leaves it untouched, for `writeBlob`, `writeBlobAtomic`, and `compareAndSwapRegister`
+independently; reads still pass through unchanged when writes are denied; the pre-existing 2-arg
+constructor still allows writes; children reached via `children()` stay wrapped with both
+permissions) and a full `internalClusterTest` sweep -- including the real search-only-replica
+tests that exercise a reader shard's actual query path end to end -- confirmed no regression from
+narrowing that path's own container. Real per-tier IAM/role-assumption wiring per cloud backend
+remains out of scope for this repo, same as the other two tiers.
+
+Also verified with real-`BlobContainer` unit tests from the earlier delete-only work (write/read
+pass through unchanged regardless of delete permission; a denied delete throws before ever
+reaching the delegate and leaves it untouched; a permitted delete actually deletes) and caught a
 real regression before it shipped: the first `internalClusterTest` sweep failed broadly with
 `UnsupportedOperationException: ... does not support readRegister` -- `FilterBlobContainer`
 doesn't delegate `BlobContainer`'s default `readRegister`/`compareAndSwapRegister` methods on its
