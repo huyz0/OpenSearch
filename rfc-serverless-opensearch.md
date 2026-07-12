@@ -3207,6 +3207,16 @@ directions documented so serverless adoption is not a one-way door.
   remain open.
 - **Staleness/consistency**: linearizability-style checker for the RYW path (indexed doc with
   generation token must be visible to a routed search); monotonicity checker for readers.
+  **Status: implemented and tested, now that the RYW primitive itself exists (see &sect;8).**
+  `ObjectStoreReaderEngineTests#testMonotonicityAndReadYourWriteLinearizationHoldUnderConcurrentPublishing`
+  runs a real writer publishing 10 successive generations concurrently against one reader engine,
+  checked two ways at once: three independent observer threads each repeatedly sample the engine's
+  current generation and assert their own personally-observed sequence never decreases (the
+  monotonicity checker); a fourth thread calls `waitForGeneration` for each generation in strict
+  order and, the instant it returns `true`, immediately searches for that generation's own
+  uniquely-identifying document, proving the linearization point actually holds -- `waitForGeneration`
+  returning `true` for generation N means N's writes are really searchable right then, not merely
+  that some internal counter reached N. Verified stable across 5 repeated runs with no flakes.
 - **GC safety**: long-running PIT queries concurrent with aggressive ingest+merge; assert no
   read ever touches a deleted object. **Status: implemented and tested.**
   `GcSchedulerTaskTests#testPitPinSurvivesConcurrentAggressiveIngestAndGcSweeps` runs three real

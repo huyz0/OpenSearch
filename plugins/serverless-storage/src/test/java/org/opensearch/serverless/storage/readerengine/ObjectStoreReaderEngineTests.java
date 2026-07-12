@@ -784,6 +784,207 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
         }
     }
 
+    /**
+     * rfc-serverless-opensearch.md &sect;17's "Staleness/consistency" testing-strategy bullet:
+     * "linearizability-style checker for the RYW path (indexed doc with generation token must be
+     * visible to a routed search); monotonicity checker for readers." Runs a real writer publishing
+     * 10 successive generations concurrently against this same reader engine, checked two ways at
+     * once:
+     *
+     * <ul>
+     *   <li>Monotonicity: three independent observer threads each repeatedly sample {@link
+     *       ObjectStoreReaderEngine#currentManifestGenerationForTesting()} and record every value
+     *       they personally saw -- each thread's own sequence must never decrease, exactly the
+     *       "a reader never goes backward" property &sect;8's consistency model promises.
+     *   <li>RYW linearizability: a checker thread calls {@link ObjectStoreReaderEngine#waitForGeneration}
+     *       for each generation in strict order and, the instant it returns {@code true}, immediately
+     *       searches for that generation's own uniquely-identifying document -- proving the
+     *       linearization point actually holds: {@code waitForGeneration} returning {@code true}
+     *       for generation N means N's writes are really visible to a search issued right then, not
+     *       merely that some internal counter reached N.
+     * </ul>
+     */
+    public void testMonotonicityAndReadYourWriteLinearizationHoldUnderConcurrentPublishing() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ObjectStoreCommitPublisher publisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+        org.opensearch.serverless.storage.shardstate.ShardStateStore shardStateStore =
+            new org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore(blobContainer);
+        BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(blobContainer);
+        ObjectStoreCommitMaterializer materializer = new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer));
+        ShardDirectory shardDirectory = new InMemoryShardDirectory();
+
+        Directory writerDirectory = new ByteBuffersDirectory();
+        IndexWriter writer = new IndexWriter(writerDirectory, new IndexWriterConfig());
+
+        try (Store store = createStore()) {
+            EngineConfig engineConfig = config(defaultSettings, store, createTempDir(), newMergePolicy(), null);
+            String indexUuid = engineConfig.getShardId().getIndex().getUUID();
+            int shardId = engineConfig.getShardId().getId();
+
+            Document firstDoc = new Document();
+            firstDoc.add(new StringField("id", "gen-1", Field.Store.YES));
+            writer.addDocument(firstDoc);
+            writer.commit();
+            SegmentInfos firstSegments = SegmentInfos.readLatestCommit(writerDirectory);
+            CommitManifest firstManifest = publisher.publishCommit(
+                writerDirectory,
+                firstSegments,
+                indexUuid,
+                shardId,
+                PRIMARY_TERM,
+                1,
+                0,
+                0,
+                new WalPosition("epoch-0", 0),
+                0,
+                PruningStats.empty()
+            );
+            assertEquals(
+                org.opensearch.serverless.storage.shardstate.CasResult.SUCCESS,
+                shardStateStore.compareAndSet(
+                    indexUuid,
+                    shardId,
+                    java.util.Optional.empty(),
+                    new org.opensearch.serverless.storage.shardstate.ShardHead(PRIMARY_TERM, null, 0L, firstManifest.generation())
+                )
+            );
+
+            int lastGeneration = 10;
+            try (
+                ObjectStoreReaderEngine readerEngine = ObjectStoreReaderEngine.open(
+                    engineConfig,
+                    firstManifest,
+                    materializer,
+                    PRIMARY_TERM,
+                    shardStateStore,
+                    manifestStore,
+                    shardDirectory,
+                    LOCAL_NODE_ID
+                )
+            ) {
+                java.util.concurrent.atomic.AtomicBoolean publishingDone = new java.util.concurrent.atomic.AtomicBoolean(false);
+                java.util.concurrent.atomic.AtomicReference<Throwable> failure = new java.util.concurrent.atomic.AtomicReference<>();
+
+                Thread publisherThread = new Thread(() -> {
+                    try {
+                        for (int gen = 2; gen <= lastGeneration; gen++) {
+                            Document doc = new Document();
+                            doc.add(new StringField("id", "gen-" + gen, Field.Store.YES));
+                            writer.addDocument(doc);
+                            writer.commit();
+                            SegmentInfos segmentInfos = SegmentInfos.readLatestCommit(writerDirectory);
+                            CommitManifest manifest = publisher.publishCommit(
+                                writerDirectory,
+                                segmentInfos,
+                                indexUuid,
+                                shardId,
+                                PRIMARY_TERM,
+                                gen,
+                                gen - 1,
+                                gen - 1,
+                                new WalPosition("epoch-0", 0),
+                                0,
+                                PruningStats.empty()
+                            );
+                            long currentVersion = shardStateStore.get(indexUuid, shardId).orElseThrow().version();
+                            shardStateStore.compareAndSet(
+                                indexUuid,
+                                shardId,
+                                java.util.Optional.of(currentVersion),
+                                new org.opensearch.serverless.storage.shardstate.ShardHead(PRIMARY_TERM, null, 0L, manifest.generation())
+                            );
+                        }
+                    } catch (Throwable t) {
+                        failure.compareAndSet(null, t);
+                    } finally {
+                        publishingDone.set(true);
+                    }
+                });
+
+                // Three independent monotonicity observers.
+                Thread[] observerThreads = new Thread[3];
+                for (int i = 0; i < observerThreads.length; i++) {
+                    observerThreads[i] = new Thread(() -> {
+                        long lastSeen = 0;
+                        try {
+                            while (publishingDone.get() == false || lastSeen < lastGeneration) {
+                                long current = readerEngine.currentManifestGenerationForTesting();
+                                if (current < lastSeen) {
+                                    throw new AssertionError(
+                                        "monotonicity violated: observed generation "
+                                            + current
+                                            + " after already having observed "
+                                            + lastSeen
+                                    );
+                                }
+                                lastSeen = current;
+                                if (publishingDone.get() && lastSeen >= lastGeneration) {
+                                    break;
+                                }
+                            }
+                        } catch (Throwable t) {
+                            failure.compareAndSet(null, t);
+                        }
+                    });
+                }
+
+                // RYW linearizability checker: for each generation in order, wait for it, then
+                // immediately verify its own document is really searchable right then.
+                Thread rywThread = new Thread(() -> {
+                    try {
+                        for (int gen = 1; gen <= lastGeneration; gen++) {
+                            boolean reached = readerEngine.waitForGeneration(
+                                gen,
+                                org.opensearch.common.unit.TimeValue.timeValueSeconds(30)
+                            );
+                            if (reached == false) {
+                                throw new AssertionError("waitForGeneration(" + gen + ") timed out");
+                            }
+                            try (Engine.Searcher searcher = readerEngine.acquireSearcher("test")) {
+                                int hits = searcher.search(new TermQuery(new Term("id", "gen-" + gen)), 10).totalHits.value() > 0 ? 1 : 0;
+                                if (hits == 0) {
+                                    throw new AssertionError(
+                                        "RYW linearizability violated: waitForGeneration("
+                                            + gen
+                                            + ") returned true but gen-"
+                                            + gen
+                                            + "'s own document is not yet searchable"
+                                    );
+                                }
+                            }
+                        }
+                    } catch (Throwable t) {
+                        failure.compareAndSet(null, t);
+                    }
+                });
+
+                publisherThread.start();
+                for (Thread observer : observerThreads) {
+                    observer.start();
+                }
+                rywThread.start();
+
+                publisherThread.join();
+                for (Thread observer : observerThreads) {
+                    observer.join();
+                }
+                rywThread.join();
+
+                if (failure.get() != null) {
+                    throw new AssertionError("concurrent linearizability/monotonicity check failed", failure.get());
+                }
+                assertEquals(lastGeneration, readerEngine.currentManifestGenerationForTesting());
+            }
+        } finally {
+            writer.close();
+            writerDirectory.close();
+        }
+    }
+
     public void testEngineSkipsAPollTickWhileOverBudgetAndCatchesUpOnceBudgetEases() throws Exception {
         // rfc-serverless-opensearch.md &sect;18 risk #3's per-refresh admission control: a poll
         // tick found while the node's file cache is over budget must NOT materialize the newer
