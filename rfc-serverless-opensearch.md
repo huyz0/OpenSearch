@@ -3148,10 +3148,27 @@ applies). Chaos suite (§17) including full object-store outage modes (§13), pe
 bundle/WAL batch parameters, API gating audit, and autoscaling signal calibration remain separately
 ongoing Phase 5 work.
 
-**Phase 6 — Migration tooling.** Conversion of existing remote-store indices to the bundle
-format (their segments already sit in the object store — conversion is manifest synthesis plus
-optional re-bundling, not data re-upload); snapshot-mount import for classic indices; both
-directions documented so serverless adoption is not a one-way door.
+**Phase 6 — Migration tooling. The packaging mechanism both migration directions ultimately need
+is implemented and tested; the per-direction orchestration (resolving a real, currently-open shard,
+or reading a source repository's own on-disk metadata format directly) is not.** `ClassicIndexMigrator#migrate`
+proves the "conversion is manifest synthesis... not data re-upload" claim directly: by the time any
+shard is open and recoverable at all -- classic peer/translog recovery, a core remote-store
+restore, or a snapshot-mount import, it makes no difference -- its store directory holds an
+ordinary valid Lucene commit, and `migrate` packages exactly that (via the same `ObjectStoreCommitPublisher#publishCommit`
+every live writer already uses: one bundle upload, one manifest write, no Lucene re-indexing) and
+CASes it in as the shard's first-ever serverless-storage head, refusing outright rather than
+overwriting if one already exists. This makes both migration directions this bullet names the same
+mechanical operation from here on, once a caller has a `Directory`/`SegmentInfos` pair in hand.
+
+What remains open is genuinely per-direction: reaching a real, currently-open `IndexShard`'s local
+`Store` from a transport action needs new `IndicesService` wiring this plugin has never used
+elsewhere; reading a classic repository's or remote-store's own on-disk metadata format directly
+(an alternative that could avoid requiring the shard be locally recovered first) depends on those
+formats' internals this plugin hasn't taken on. Both are real future work, not attempted here.
+Verified: migrating an already-populated directory produces a manifest a genuine `ObjectStoreReaderEngine`
+actually opens and serves the migrated document through, not merely a manifest object with
+plausible-looking fields; migrating a shard that already has a serverless-storage head fails
+outright, leaving the existing head completely untouched.
 
 ## 17. Testing Strategy
 
