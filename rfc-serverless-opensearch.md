@@ -1881,8 +1881,16 @@ RFC claims them deliberately rather than leaving them implicit:
    of a reference: `ServerlessStorageSearchOnlyReplicaIT` runs a real search-only shard copy
    end-to-end (allocate, start, materialize from a manifest, serve a search) with no
    `ReplicationTracker`-related failures anywhere in the run.
-5. Generalized checkpoint/notification publisher (widen segment-replication checkpoint
-   publishing to carry opaque payloads).
+5. ✅ Generalized checkpoint/notification publisher -- **turned out not to need this core seam at
+   all.** §8's publication notification (`WriterPublicationNotifier`/`PollNowAction`) ended up built
+   entirely as plugin-owned transport (a `HandledTransportAction` this plugin registers itself,
+   dispatched node-to-node via `TransportActionNodeProxy`, core's own established mechanism for a
+   single-node-targeted RPC), not by widening core's segment-replication checkpoint publisher to
+   carry an opaque payload as originally sketched here. The plugin's notification payload (index,
+   shard, generation) never needed to piggyback on segment-replication's own wire format -- it is a
+   fully separate message on a fully separate action name, so there was nothing in core to
+   generalize. This list item is retained for history; the need it anticipated is met a different
+   way.
 6. ✅ REST handler capability annotation (§11) -- **both the annotation and its enforcement are
    now done.** `RestHandler#serverlessScope()` (`server/src/main/java/org/opensearch/rest/RestHandler.java`),
    a default method returning a new `RestHandler.ServerlessScope` enum (`AVAILABLE`/`INTERNAL_ONLY`/
