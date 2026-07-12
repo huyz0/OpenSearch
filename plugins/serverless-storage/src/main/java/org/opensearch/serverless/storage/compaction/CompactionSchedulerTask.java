@@ -8,6 +8,8 @@
 
 package org.opensearch.serverless.storage.compaction;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.manifest.CommitManifest;
@@ -49,8 +51,19 @@ import java.util.Optional;
  * scheduled tick simply reevaluates from the (possibly by-then-different) live state. A failure here
  * is therefore logged-and-swallowed, never worth failing anything over -- this task has no engine to
  * fail in the first place, since it runs independently of whether any writer is active.
+ *
+ * <p>{@link #maybeCompactSafely} swallows every {@link Exception}, not just {@link IOException} --
+ * a real, code-review-caught gap: {@link ManifestSegmentMetrics#from}/{@link
+ * ObjectStoreCommitPublisher} run against a {@code BlobContainer} that may be wrapped in {@code
+ * RestrictingBlobContainer} (rfc-serverless-opensearch.md &sect;15 credential scoping), which
+ * throws the unchecked {@link SecurityException} on a denied delete rather than {@link
+ * IOException}. Compaction never actually calls delete today, so this was purely latent, but an
+ * {@code IOException}-only catch would have let that unchecked exception escape this scheduled
+ * task's documented "swallow and retry next tick" contract the moment it ever did.
  */
 public final class CompactionSchedulerTask implements Closeable {
+
+    private static final Logger logger = LogManager.getLogger(CompactionSchedulerTask.class);
 
     private final String indexUuid;
     private final int shardId;
@@ -99,11 +112,16 @@ public final class CompactionSchedulerTask implements Closeable {
         this.task = threadPool.scheduleWithFixedDelay(this::maybeCompactSafely, interval, ThreadPool.Names.GENERIC);
     }
 
-    private void maybeCompactSafely() {
+    /** Package-private, not private, purely so this task's own catch behavior is directly testable without reflection. */
+    void maybeCompactSafely() {
         try {
             maybeCompact(indexUuid, shardId, shardStateStore, manifestStore, materializer, commitPublisher, policy, rebaseExecutor);
-        } catch (IOException e) {
-            // See class javadoc: swallow and let the next scheduled tick reevaluate.
+        } catch (Exception e) {
+            // See class javadoc: swallow and let the next scheduled tick reevaluate. Catches every
+            // Exception, not just IOException, so an unchecked exception (e.g. SecurityException
+            // from a delete-denying RestrictingBlobContainer) can never escape this scheduled
+            // task's own contract either.
+            logger.warn("compaction tick failed for shard [" + indexUuid + "][" + shardId + "], will retry next tick", e);
         }
     }
 

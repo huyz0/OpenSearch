@@ -1690,6 +1690,18 @@ rather than rushed in under this pass. Verified: the real end-to-end `Serverless
 (merges an actual fragmented shard over transport) still passes unchanged with the wrap in place,
 proving the restriction doesn't interfere with compaction's real read/write/publish flow.
 
+**A related latent gap, also caught by code review and fixed**: `CompactionSchedulerTask`'s
+scheduled tick previously caught only `IOException` per its documented "swallow and retry next
+tick" contract, but `RestrictingBlobContainer` throws the unchecked `SecurityException` on a
+denied delete -- compaction never actually calls delete today, so this was purely latent, but an
+`IOException`-only catch would have let that unchecked exception break the documented contract the
+moment it ever did. Widened to catch every `Exception`, with a warning logged either way. Verified
+directly: `maybeCompactSafely` (made package-private for exactly this reason) is called with a
+fault-injecting `ShardStateStore` that throws `SecurityException` -- reverting the fix and
+re-running shows the exception escaping the call, exactly as the bug predicted, since core's own
+scheduler wrapper happens to also tolerate an escaping exception and would have silently masked
+the difference in any end-to-end test through the real scheduled path.
+
 ## 13. Degraded Modes: Object-Store Brownouts
 
 The object store is now the single dependency of everything, so its failure modes must map to

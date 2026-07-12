@@ -310,4 +310,69 @@ public class CompactionSchedulerTaskTests extends OpenSearchTestCase {
             task.close();
         }
     }
+
+    /**
+     * A shard-state store whose first {@code failureCount} calls to {@link #get} throw an unchecked
+     * {@link SecurityException} instead of delegating -- standing in for what a delete-denying
+     * {@code RestrictingBlobContainer} throws (rfc-serverless-opensearch.md &sect;15), used here to
+     * prove {@link CompactionSchedulerTask}'s own scheduled tick swallows more than just {@link
+     * java.io.IOException} and keeps ticking afterward.
+     */
+    private static final class FaultInjectingShardStateStore implements ShardStateStore {
+        private final ShardStateStore delegate;
+        private int remainingFailures;
+
+        FaultInjectingShardStateStore(ShardStateStore delegate, int failureCount) {
+            this.delegate = delegate;
+            this.remainingFailures = failureCount;
+        }
+
+        @Override
+        public synchronized Optional<org.opensearch.serverless.storage.shardstate.VersionedShardHead> get(String indexUuid, int shardId)
+            throws java.io.IOException {
+            if (remainingFailures > 0) {
+                remainingFailures--;
+                throw new SecurityException("simulated delete-denying container fault");
+            }
+            return delegate.get(indexUuid, shardId);
+        }
+
+        @Override
+        public CasResult compareAndSet(String indexUuid, int shardId, Optional<Long> expectedVersion, ShardHead newHead)
+            throws java.io.IOException {
+            return delegate.compareAndSet(indexUuid, shardId, expectedVersion, newHead);
+        }
+    }
+
+    public void testScheduledTickItselfSwallowsAnUncheckedExceptionNotJustIOException() throws Exception {
+        // Code review finding: maybeCompactSafely used to catch only IOException, which would have
+        // let an unchecked SecurityException (e.g. from a delete-denying RestrictingBlobContainer)
+        // escape this task's own "swallow and retry next tick" contract. core's own scheduler
+        // wrapper (Scheduler.ReschedulingRunnable) happens to also tolerate an escaping exception
+        // and keeps rescheduling regardless -- so asserting end-to-end recovery through a real
+        // scheduled run wouldn't actually distinguish the fixed catch(Exception) from the original,
+        // buggy catch(IOException). Calling maybeCompactSafely() directly (package-private for
+        // exactly this reason) isolates this class's own catch behavior from that outer resilience:
+        // under the old catch(IOException)-only version, this call would itself throw the
+        // SecurityException; under the fix, it must not.
+        CompactionSchedulerTask task = new CompactionSchedulerTask(
+            threadPool,
+            TimeValue.timeValueHours(1), // never actually ticks on its own -- invoked directly below
+            INDEX_UUID,
+            SHARD_ID,
+            new FaultInjectingShardStateStore(shardStateStore, Integer.MAX_VALUE),
+            manifestStore,
+            new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer)),
+            commitPublisher,
+            CompactionPolicy.withDefaults(),
+            new CompactionRebaseExecutor(shardStateStore, 10)
+        );
+        try {
+            // Must not throw -- a SecurityException here means it escaped this task's own catch,
+            // exactly the bug this test guards against.
+            task.maybeCompactSafely();
+        } finally {
+            task.close();
+        }
+    }
 }
