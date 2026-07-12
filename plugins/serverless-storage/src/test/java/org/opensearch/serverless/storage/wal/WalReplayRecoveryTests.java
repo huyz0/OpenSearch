@@ -16,7 +16,11 @@ import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.index.translog.Translog;
 import org.opensearch.serverless.storage.manifest.WalPosition;
+import org.opensearch.serverless.storage.security.StaticEncryptionKeyProvider;
 import org.opensearch.test.OpenSearchTestCase;
+
+import javax.crypto.KeyGenerator;
+import javax.crypto.SecretKey;
 
 import java.util.List;
 
@@ -116,6 +120,51 @@ public class WalReplayRecoveryTests extends OpenSearchTestCase {
 
         assertEquals(1, operations.size());
         assertEquals(1L, operations.get(0).seqNo());
+    }
+
+    private static SecretKey newAesKey() throws Exception {
+        KeyGenerator keyGenerator = KeyGenerator.getInstance("AES");
+        keyGenerator.init(256);
+        return keyGenerator.generateKey();
+    }
+
+    // Regression test for a real bug: WalReplayRecovery previously never decrypted a record's
+    // payload before handing it to Translog.Operation#readOperation, so recovery after a crash
+    // (with encryption + WAL mirroring both enabled) failed with an opaque deserialization error
+    // instead of returning the real operation. Reproduced directly against
+    // EncryptingWalChunkService (the real write-side wrapper ObjectStoreWriterEngine uses) rather
+    // than hand-encrypting a record, so this exercises the exact bytes a real crash recovery would
+    // read back.
+    public void testReplayDecryptsRecordsWhenAnEncryptionKeyProviderIsSupplied() throws Exception {
+        BlobContainer blobContainer = newBlobContainer();
+        WalChunkService delegate = new WalChunkService(blobContainer, "epoch-0");
+        StaticEncryptionKeyProvider keyProvider = new StaticEncryptionKeyProvider(newAesKey());
+        EncryptingWalChunkService encryptingService = new EncryptingWalChunkService(delegate, keyProvider);
+
+        Translog.Index op0 = new Translog.Index("doc0", 0, 1, "src0".getBytes("UTF-8"));
+        encryptingService.append(new WalRecord("idx", 0, 1, 0, serialize(op0)));
+        encryptingService.flush();
+
+        List<Translog.Operation> operations = WalReplayRecovery.replayOperations(blobContainer, "idx", 0, 1, null, 1, keyProvider);
+
+        assertEquals(1, operations.size());
+        assertEquals(0L, operations.get(0).seqNo());
+        assertEquals(Translog.Operation.Type.INDEX, operations.get(0).opType());
+    }
+
+    public void testReplayWithoutAnEncryptionKeyProviderFailsToDecodeEncryptedRecords() throws Exception {
+        // The negative case, proving the two overloads genuinely differ in behavior rather than
+        // one silently ignoring its own argument: replaying encrypted records through the
+        // six-argument (no-decryption) overload must fail, not silently succeed with garbage.
+        BlobContainer blobContainer = newBlobContainer();
+        WalChunkService delegate = new WalChunkService(blobContainer, "epoch-0");
+        EncryptingWalChunkService encryptingService = new EncryptingWalChunkService(delegate, new StaticEncryptionKeyProvider(newAesKey()));
+
+        Translog.Index op0 = new Translog.Index("doc0", 0, 1, "src0".getBytes("UTF-8"));
+        encryptingService.append(new WalRecord("idx", 0, 1, 0, serialize(op0)));
+        encryptingService.flush();
+
+        expectThrows(Exception.class, () -> WalReplayRecovery.replayOperations(blobContainer, "idx", 0, 1, null, 1));
     }
 
     public void testListChunkSequencesInRangeSortsAndFiltersCorrectly() throws Exception {

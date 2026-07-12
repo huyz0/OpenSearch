@@ -12,6 +12,7 @@ import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.index.translog.Translog;
 import org.opensearch.serverless.storage.manifest.WalPosition;
+import org.opensearch.serverless.storage.security.EncryptionKeyProvider;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -75,6 +76,49 @@ public final class WalReplayRecovery {
         WalPosition lastDurableWalPosition,
         long activationWalPosition
     ) throws IOException {
+        return replayOperations(walBlobContainer, indexUuid, shardId, minPrimaryTerm, lastDurableWalPosition, activationWalPosition, null);
+    }
+
+    /**
+     * Same as the six-argument overload, with one addition: {@code encryptionKeyProvider}, the
+     * same provider {@code ObjectStoreWriterEngine} passes to {@link EncryptingWalChunkService} on
+     * the write side. {@code null} means encryption is off, matching every record read back as
+     * plaintext already. Non-{@code null} means every record read back must be decrypted via
+     * {@link org.opensearch.serverless.storage.wal.WalRecordCrypto#decryptAll} before being handed
+     * to {@link Translog.Operation#readOperation} -- {@link EncryptingWalChunkService}'s own
+     * javadoc already documents this as the reader's responsibility, but nothing on this path
+     * actually did it until now: a record written through {@link EncryptingWalChunkService} has a
+     * ciphertext payload, and decoding ciphertext directly as a serialized {@link Translog.Operation}
+     * fails with an opaque deserialization error (a wrong-type byte read as ciphertext), not a
+     * clean, recognizable one.
+     *
+     * @param walBlobContainer the shared blob container every node's WAL chunks are written into
+     * @param indexUuid the UUID of the index this shard belongs to, used to filter records
+     * @param shardId the shard replaying, used to filter records
+     * @param minPrimaryTerm the term floor per {@code WalReplayFencing.tla}'s {@code ReplayFloor}
+     *                       (one term back from the term this writer is activating under, so a
+     *                       predecessor's legitimately-durable-but-not-yet-manifested records are
+     *                       not wrongly excluded by term alone) -- see {@link
+     *                       WalChunkReader#filterByShardAndMinimumTerm} for why this term filter is
+     *                       necessary but, on its own, insufficient; {@code activationWalPosition}
+     *                       is what closes the gap it leaves open.
+     * @param lastDurableWalPosition the previous writer's last durably-published {@link WalPosition},
+     *                               or {@code null} for a shard with no prior manifest at all
+     * @param activationWalPosition {@code < 0} (WAL mirroring was disabled when this writer
+     *                              activated) short-circuits to an empty list -- there is nothing
+     *                              durable in the WAL to replay from.
+     * @param encryptionKeyProvider {@code null} if WAL records are not encrypted; otherwise the
+     *                              same provider used to encrypt them, needed to decrypt them back.
+     */
+    public static List<Translog.Operation> replayOperations(
+        BlobContainer walBlobContainer,
+        String indexUuid,
+        int shardId,
+        long minPrimaryTerm,
+        WalPosition lastDurableWalPosition,
+        long activationWalPosition,
+        EncryptionKeyProvider encryptionKeyProvider
+    ) throws IOException {
         if (activationWalPosition < 0) {
             return List.of();
         }
@@ -92,6 +136,9 @@ public final class WalReplayRecovery {
                 shardId,
                 minPrimaryTerm
             );
+            if (encryptionKeyProvider != null) {
+                records = WalRecordCrypto.decryptAll(records, encryptionKeyProvider);
+            }
             for (WalRecord record : records) {
                 operations.add(Translog.Operation.readOperation(StreamInput.wrap(record.payload())));
             }

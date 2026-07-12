@@ -139,11 +139,9 @@ public class ObjectStoreWriterEngine extends InternalEngine {
      * existed at the moment this engine activated, captured as early as possible -- before {@code
      * super(engineConfig)} even runs, ahead of any of this engine's own construction work including
      * local translog recovery -- so it is as tight a bound on "chunks that existed before this
-     * writer took over" as this architecture can currently produce. Not yet consumed by anything:
-     * no WAL-replay recovery mechanism exists yet to use it as a filter bound (see
-     * rfc-serverless-opensearch.md &sect;16 Phase 2's "still open" note) -- this field exists so
-     * that mechanism, whenever it's built, has the value it needs already captured at the right
-     * moment, rather than needing engine-construction-timing changes of its own.
+     * writer took over" as this architecture can currently produce. Consumed by {@link
+     * #replayWalOperations()} as the exclusive upper bound {@link WalReplayRecovery#replayOperations}
+     * filters WAL chunk replay against.
      *
      * <p><b>Honest limitation, not yet closed</b>: this narrows the race the TLA+ model's
      * {@code AcquireLease} action captures atomically with the term change itself, but isn't
@@ -191,9 +189,10 @@ public class ObjectStoreWriterEngine extends InternalEngine {
      *
      * <p>This is intentionally not a real sliding window: {@link #writesPerMinute()} always reports
      * the <em>previous completed window's</em> rate, never the in-progress one, so this deliberately
-     * under-reacts rather than over-reacts to a burst that just started. There is currently no
-     * consumer of this signal -- see {@link #writesPerMinute()}'s own javadoc for why that is fine
-     * for now.
+     * under-reacts rather than over-reacts to a burst that just started. {@code
+     * org.opensearch.serverless.storage.resharding.action.ShardSplitCandidatesAction} is this
+     * signal's first, deliberately read-only, consumer -- see that class's own javadoc for why
+     * nothing yet acts on it automatically.
      */
     private static final long WRITE_RATE_WINDOW_MILLIS = 60_000L;
     private final AtomicLong windowStartMillis = new AtomicLong(System.currentTimeMillis());
@@ -564,14 +563,12 @@ public class ObjectStoreWriterEngine extends InternalEngine {
      * one full {@link #WRITE_RATE_WINDOW_MILLIS} window since construction (or since its last
      * write, if writes have since gone fully idle for a window).
      *
-     * <p>Nothing in this plugin currently reads this value: unlike the reader side, there is no
-     * "writer replica count" knob to scale up (exactly one primary per shard), and the only real
-     * mechanism for adding write capacity -- {@code ShardSplitter}'s auto-split -- is still only
-     * half-built (logical-first; the physical bundle rewrite that would actually shed write load
-     * is still future work, see {@code resharding/package-info.java}). Wiring this counter into an
-     * actual scale-up trigger before that mechanism exists would have nothing safe to trigger. This
-     * method exists so that signal is already being tracked and ready to consume once it is, the
-     * same incremental shape {@link #millisSinceLastActivity()} was built in.
+     * <p>{@code org.opensearch.serverless.storage.resharding.action.ShardSplitCandidatesAction}
+     * reads this value, but only to surface a candidate signal -- unlike the reader side, there is
+     * no "writer replica count" knob to scale up (exactly one primary per shard), and {@code
+     * ShardSplitter.split} only re-points an already-provisioned target shard identity, it does not
+     * create or allocate one, so there is still no automatic action wired to this signal. See
+     * {@code ShardSplitCandidatesAction}'s own javadoc for the full reasoning.
      *
      * @return writes observed during the previous completed {@link #WRITE_RATE_WINDOW_MILLIS} window.
      */
@@ -751,7 +748,8 @@ public class ObjectStoreWriterEngine extends InternalEngine {
             shardId,
             minPrimaryTerm,
             lastDurableWalPosition,
-            activationWalPosition
+            activationWalPosition,
+            encryptionKeyProvider
         );
     }
 
