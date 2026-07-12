@@ -10,6 +10,9 @@ package org.opensearch.serverless.storage.resharding.action;
 
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
+import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
@@ -39,11 +42,28 @@ import org.opensearch.transport.TransportService;
  * <p>Dispatched onto {@link ThreadPool.Names#GENERIC}, not run on the transport thread directly:
  * real blob-store I/O across two shards' worth of manifests, pins, lineage, and the new partition
  * descriptor, which must never block a transport/network thread.
+ *
+ * <p><b>Validates both shards are real, already-provisioned OpenSearch shards before touching the
+ * object store</b> (rfc-serverless-opensearch.md &sect;16 Phase 4's own gap note: {@code
+ * ShardSplitter#split} "does not create or allocate the target shard"). Neither
+ * {@code (indexUuid, shardId)} pair used to be checked against anything -- {@link
+ * ServerlessStoragePlugin#blobContainerForDirectoryFactory} resolves a container from any string
+ * whatsoever, so a typo'd or not-yet-created target index used to silently "succeed" at writing
+ * object-store state nothing could ever open, only failing (confusingly) much later when a real
+ * shard tried to activate against it. This still does not automatically create or allocate the
+ * target shard -- an operator (or a future controller) must create the real target index/shard
+ * first, exactly as before -- it only turns "silently write into the void" into a clear, immediate
+ * error when that prerequisite wasn't met. Real routing cutover (retiring the source, redirecting
+ * client-facing requests to whichever target partition now owns their documents) remains
+ * undesigned, not just unimplemented -- there is no existing alias/redirect mechanism anywhere in
+ * this plugin to build it on, unlike the delete-ratio or disk-cache gaps closed elsewhere this
+ * session, which had a clear mechanism to extend.
  */
 public class TransportShardSplitAction extends HandledTransportAction<ShardSplitRequest, ShardSplitResponse> {
 
     private final ServerlessStoragePlugin plugin;
     private final ThreadPool threadPool;
+    private final ClusterService clusterService;
 
     /**
      * Creates the transport action.
@@ -52,17 +72,20 @@ public class TransportShardSplitAction extends HandledTransportAction<ShardSplit
      * @param actionFilters applied by {@link HandledTransportAction} around every request.
      * @param plugin resolves each request's source/target {@link BlobContainer}s.
      * @param threadPool dispatches the actual split work off the transport thread.
+     * @param clusterService resolves whether the source/target index/shard pairs are real.
      */
     @Inject
     public TransportShardSplitAction(
         TransportService transportService,
         ActionFilters actionFilters,
         ServerlessStoragePlugin plugin,
-        ThreadPool threadPool
+        ThreadPool threadPool,
+        ClusterService clusterService
     ) {
         super(ShardSplitAction.NAME, transportService, actionFilters, ShardSplitRequest::new);
         this.plugin = plugin;
         this.threadPool = threadPool;
+        this.clusterService = clusterService;
     }
 
     /**
@@ -74,6 +97,10 @@ public class TransportShardSplitAction extends HandledTransportAction<ShardSplit
     protected void doExecute(Task task, ShardSplitRequest request, ActionListener<ShardSplitResponse> listener) {
         threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
             try {
+                Metadata metadata = clusterService.state().metadata();
+                requireRealShard(metadata, "source", request.sourceIndexUuid(), request.sourceShardId());
+                requireRealShard(metadata, "target", request.targetIndexUuid(), request.targetShardId());
+
                 BlobContainer sourceContainer = plugin.blobContainerForDirectoryFactory(request.sourceIndexUuid(), request.sourceShardId());
                 BlobContainer targetContainer = plugin.blobContainerForDirectoryFactory(request.targetIndexUuid(), request.targetShardId());
 
@@ -107,5 +134,39 @@ public class TransportShardSplitAction extends HandledTransportAction<ShardSplit
                 listener.onFailure(e);
             }
         });
+    }
+
+    /**
+     * @throws IllegalArgumentException if {@code indexUuid} doesn't resolve to a real, currently-existing
+     *                                   index, or {@code shardId} is out of bounds for it.
+     */
+    private static void requireRealShard(Metadata metadata, String role, String indexUuid, int shardId) {
+        IndexMetadata indexMetadata = findByUuid(metadata, indexUuid);
+        if (indexMetadata == null) {
+            throw new IllegalArgumentException(role + " index [" + indexUuid + "] does not exist");
+        }
+        if (shardId >= indexMetadata.getNumberOfShards()) {
+            throw new IllegalArgumentException(
+                role
+                    + " shard ["
+                    + shardId
+                    + "] is out of bounds for index ["
+                    + indexMetadata.getIndex().getName()
+                    + "]["
+                    + indexUuid
+                    + "], which has "
+                    + indexMetadata.getNumberOfShards()
+                    + " shard(s)"
+            );
+        }
+    }
+
+    private static IndexMetadata findByUuid(Metadata metadata, String indexUuid) {
+        for (IndexMetadata indexMetadata : metadata.indices().values()) {
+            if (indexUuid.equals(indexMetadata.getIndexUUID())) {
+                return indexMetadata;
+            }
+        }
+        return null;
     }
 }

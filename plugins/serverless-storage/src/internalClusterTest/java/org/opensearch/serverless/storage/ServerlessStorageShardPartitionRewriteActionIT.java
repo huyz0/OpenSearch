@@ -15,6 +15,8 @@ import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
+import org.opensearch.action.support.ActiveShardCount;
+import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
@@ -60,12 +62,18 @@ import java.util.Set;
  * then confirm the target's manifest now holds only its own partition's documents and the
  * descriptor is gone (the "physical-later" phase closing) -- rfc-serverless-opensearch.md
  * &sect;16 Phase 5.
+ *
+ * <p>Both the source and target here are real, cluster-created indices (not arbitrary strings):
+ * {@code TransportShardSplitAction} now validates both are real, already-provisioned shards
+ * before touching the object store (RFC &sect;16 Phase 4's own gap note) -- see {@code
+ * ServerlessStorageShardSplitActionIT}'s own javadoc for the full reasoning, including why this
+ * cluster deliberately never starts a data node.
  */
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
 public class ServerlessStorageShardPartitionRewriteActionIT extends ServerlessStorageIntegTestCase {
 
-    private static final String SOURCE_INDEX_UUID = "partition-rewrite-it-source-idx";
-    private static final String TARGET_INDEX_UUID = "partition-rewrite-it-target-idx";
+    private static final String SOURCE_INDEX_NAME = "partition-rewrite-it-source-idx";
+    private static final String TARGET_INDEX_NAME = "partition-rewrite-it-target-idx";
     private static final int SHARD_ID = 0;
     private static final int DOC_COUNT = 60;
     private static final int NUM_PARTITIONS = 3;
@@ -87,6 +95,22 @@ public class ServerlessStorageShardPartitionRewriteActionIT extends ServerlessSt
         return blobStore.blobContainer(shardPath);
     }
 
+    /** Creates a real serverless-storage index with one shard, deliberately never assigned (no data node in this cluster), and returns its real UUID. */
+    private String createUnassignedServerlessIndex(String name) {
+        client().admin()
+            .indices()
+            .prepareCreate(name)
+            .setSettings(
+                Settings.builder()
+                    .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+                    .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+                    .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey(), true)
+            )
+            .setWaitForActiveShards(ActiveShardCount.NONE)
+            .get();
+        return client().admin().cluster().prepareState().get().getState().metadata().index(name).getIndexUUID();
+    }
+
     public void testSplitThenRewriteEndsWithAPhysicallyPartitionedTargetAndNoDescriptor() throws Exception {
         Path basePath = createTempDir("serverless-storage-partition-rewrite-it");
         Settings nodeSettings = Settings.builder()
@@ -95,9 +119,11 @@ public class ServerlessStorageShardPartitionRewriteActionIT extends ServerlessSt
             .build();
 
         internalCluster().startClusterManagerOnlyNode(nodeSettings);
-        internalCluster().startDataOnlyNode(nodeSettings);
 
-        BlobContainer sourceContainer = blobContainerFor(basePath, SOURCE_INDEX_UUID, SHARD_ID);
+        String sourceIndexUuid = createUnassignedServerlessIndex(SOURCE_INDEX_NAME);
+        String targetIndexUuid = createUnassignedServerlessIndex(TARGET_INDEX_NAME);
+
+        BlobContainer sourceContainer = blobContainerFor(basePath, sourceIndexUuid, SHARD_ID);
         BlobContainerBundleStore sourceBundleStore = new BlobContainerBundleStore(sourceContainer);
         BlobContainerManifestStore sourceManifestStore = new BlobContainerManifestStore(sourceContainer);
         ShardStateStore sourceShardStateStore = new BlobContainerShardStateStore(sourceContainer);
@@ -122,7 +148,7 @@ public class ServerlessStorageShardPartitionRewriteActionIT extends ServerlessSt
             CommitManifest sourceManifest = publisher.publishCommit(
                 writerDirectory,
                 segmentInfos,
-                SOURCE_INDEX_UUID,
+                sourceIndexUuid,
                 SHARD_ID,
                 1,
                 1,
@@ -135,7 +161,7 @@ public class ServerlessStorageShardPartitionRewriteActionIT extends ServerlessSt
             assertEquals(
                 CasResult.SUCCESS,
                 sourceShardStateStore.compareAndSet(
-                    SOURCE_INDEX_UUID,
+                    sourceIndexUuid,
                     SHARD_ID,
                     Optional.empty(),
                     new ShardHead(1, null, 0L, sourceManifest.generation())
@@ -150,16 +176,16 @@ public class ServerlessStorageShardPartitionRewriteActionIT extends ServerlessSt
 
         ShardSplitResponse splitResponse = client().execute(
             ShardSplitAction.INSTANCE,
-            new ShardSplitRequest(SOURCE_INDEX_UUID, SHARD_ID, TARGET_INDEX_UUID, SHARD_ID, PARTITION_INDEX, NUM_PARTITIONS)
+            new ShardSplitRequest(sourceIndexUuid, SHARD_ID, targetIndexUuid, SHARD_ID, PARTITION_INDEX, NUM_PARTITIONS)
         ).get();
         assertTrue(splitResponse.acknowledged());
 
-        BlobContainer targetContainer = blobContainerFor(basePath, TARGET_INDEX_UUID, SHARD_ID);
+        BlobContainer targetContainer = blobContainerFor(basePath, targetIndexUuid, SHARD_ID);
         BlobContainerManifestStore targetManifestStore = new BlobContainerManifestStore(targetContainer);
         ShardStateStore targetShardStateStore = new BlobContainerShardStateStore(targetContainer);
         BlobContainerShardPartitionStore targetPartitionStore = new BlobContainerShardPartitionStore(targetContainer);
 
-        VersionedShardHead afterSplit = targetShardStateStore.get(TARGET_INDEX_UUID, SHARD_ID).orElseThrow();
+        VersionedShardHead afterSplit = targetShardStateStore.get(targetIndexUuid, SHARD_ID).orElseThrow();
         CommitManifest manifestAfterSplit = targetManifestStore.readManifest(
             afterSplit.head().primaryTerm(),
             afterSplit.head().latestManifestGeneration()
@@ -183,13 +209,13 @@ public class ServerlessStorageShardPartitionRewriteActionIT extends ServerlessSt
 
         ShardPartitionRewriteResponse rewriteResponse = client().execute(
             ShardPartitionRewriteAction.INSTANCE,
-            new ShardPartitionRewriteRequest(TARGET_INDEX_UUID, SHARD_ID)
+            new ShardPartitionRewriteRequest(targetIndexUuid, SHARD_ID)
         ).get();
         assertTrue("the rewrite must have actually run", rewriteResponse.rewritten());
 
         assertTrue("the descriptor must be gone once the rewrite is durably published", targetPartitionStore.readDescriptor().isEmpty());
 
-        VersionedShardHead afterRewrite = targetShardStateStore.get(TARGET_INDEX_UUID, SHARD_ID).orElseThrow();
+        VersionedShardHead afterRewrite = targetShardStateStore.get(targetIndexUuid, SHARD_ID).orElseThrow();
         assertTrue(
             "the rewrite must have published a strictly newer generation than the split's own",
             afterRewrite.head().latestManifestGeneration() > afterSplit.head().latestManifestGeneration()
@@ -208,14 +234,14 @@ public class ServerlessStorageShardPartitionRewriteActionIT extends ServerlessSt
         // A second rewrite attempt must be a safe, acknowledged no-op.
         ShardPartitionRewriteResponse secondAttempt = client().execute(
             ShardPartitionRewriteAction.INSTANCE,
-            new ShardPartitionRewriteRequest(TARGET_INDEX_UUID, SHARD_ID)
+            new ShardPartitionRewriteRequest(targetIndexUuid, SHARD_ID)
         ).get();
         assertFalse("a second rewrite attempt with no descriptor left must be a no-op, never an error", secondAttempt.rewritten());
 
         assertEquals(
             "the source's split pin must be untouched by the target's own rewrite",
             1,
-            sourcePinRegistry.getPins(SOURCE_INDEX_UUID, SHARD_ID).size()
+            sourcePinRegistry.getPins(sourceIndexUuid, SHARD_ID).size()
         );
     }
 

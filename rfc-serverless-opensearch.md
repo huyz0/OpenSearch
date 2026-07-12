@@ -2841,6 +2841,35 @@ stops exactly where reader scale-up's own first cut did not have to: it surfaces
 threshold for an operator (or a future controller, once the provisioning/cutover mechanism exists) to
 act on manually via the existing `ShardSplitAction`, and nothing more.
 
+**Narrowed one real correctness gap in the "target is already-provisioned" assumption above --
+`ShardSplitAction` used to silently trust it.** Neither the source nor target `(indexUuid, shardId)`
+pair in a `ShardSplitRequest` used to be checked against anything: `TransportShardSplitAction`
+resolved a `BlobContainer` straight from any string, so a typo'd or not-yet-created index used to
+"succeed" at writing object-store state nothing could ever open, only failing (confusingly) much
+later when a real shard eventually tried to activate against it -- or never failing at all, if
+nothing ever did. `TransportShardSplitAction` now resolves both sides against live `ClusterState`
+before touching the object store, rejecting with a clear `IllegalArgumentException` if either
+index doesn't exist or the shard id is out of bounds for it. This still does not automatically
+create or allocate the target shard -- an operator (or a future controller) must create the real
+target index/shard first, exactly as before -- it only turns "silently write into the void" into
+an immediate, actionable error when that prerequisite wasn't met. Verified over the real transport
+layer, not just at the unit level: `ServerlessStorageShardSplitActionIT` now creates genuine
+(deliberately unassigned -- see its own javadoc for why) target indices before splitting into
+them, and three new negative-path tests confirm a bogus source, a bogus target, and an
+out-of-bounds target shard id are each rejected with the new precondition error rather than
+silently corrupting object-store state; a pre-existing sibling IT
+(`ServerlessStorageShardPartitionRewriteActionIT`) needed the same fix once this check landed,
+confirming the gap was real and not hypothetical.
+
+**Real routing cutover remains undesigned, not just unimplemented -- deliberately left out of this
+increment.** Unlike the provisioning-precondition gap just closed, cutover has no existing
+mechanism in this plugin to extend: a split target is a wholly separate index identity, not a
+shard within the source's own index, so there is no `ShardRouting`/alias/redirect concept anywhere
+in this plugin's code today that "stop routing writes to the source, resolve client-facing
+requests to the right target partition" could be built on top of. Inventing that concept from
+scratch is real design work, not implementation time, and was deliberately scoped out rather than
+rushed in under this increment.
+
 **Phase 4.5 — Compaction service, fully done.** Candidate selection, rebase protocol, real Lucene
 merge, size-tiered shaping, background scheduling, a real concurrent-writer data-loss bug, real
 lease acquisition/renewal, and busy-writer offload are all implemented and tested. Its hard dependency,
