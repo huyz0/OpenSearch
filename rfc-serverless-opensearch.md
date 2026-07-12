@@ -3185,6 +3185,13 @@ directions documented so serverless adoption is not a one-way door.
   read ever touches a deleted object.
 - **Cost accounting**: per-workload object-store request counts as a regression metric —
   a change that doubles PUT count is a failed build, same as a latency regression.
+  **Status: implemented for the publish path.** `CostAccountingRegressionTests` wraps a real `FsBlobContainer`
+  in a request-counting `FilterBlobContainer` and asserts `ObjectStoreCommitPublisher#publishCommit`
+  costs exactly 2 PUTs per commit (one bundle write, one manifest write) regardless of how many
+  documents or underlying segment files that commit packages -- a future change that starts writing
+  bundle files individually, or adds an extra manifest write, fails this assertion outright, exactly
+  the gate this bullet asks for. Scoped to the publish path only, the workload every other write
+  eventually reduces to; GC/compaction/PITR's own request-cost profiles are not separately gated yet.
 
 ## 18. Risks and Open Questions
 
