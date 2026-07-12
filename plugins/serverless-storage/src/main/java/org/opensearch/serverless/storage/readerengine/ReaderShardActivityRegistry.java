@@ -107,6 +107,26 @@ public final class ReaderShardActivityRegistry {
     }
 
     /**
+     * Looks up the currently-live reader engine for (indexUuid, shardId) on this node and, if
+     * found, forces it to {@link ObjectStoreReaderEngine#pollNow()} -- the lookup half of
+     * &sect;8's publication notification mechanism.
+     *
+     * @param indexUuid the UUID of the index the shard belongs to
+     * @param shardId the shard number within {@code indexUuid}
+     * @return {@code true} if a reader engine was found and polled; {@code false} if no reader
+     *         engine for this shard is currently tracked on this node
+     */
+    public boolean pollNow(String indexUuid, int shardId) {
+        WeakReference<ObjectStoreReaderEngine> ref = engines.get(key(indexUuid, shardId));
+        ObjectStoreReaderEngine engine = ref == null ? null : ref.get();
+        if (engine == null) {
+            return false;
+        }
+        engine.pollNow();
+        return true;
+    }
+
+    /**
      * A point-in-time snapshot of every reader engine currently tracked on this node, keyed the
      * same {@code "indexUuid/shardId"} way as {@code
      * org.opensearch.serverless.storage.writerengine.ShardActivityRegistry#snapshotAll} -- silently

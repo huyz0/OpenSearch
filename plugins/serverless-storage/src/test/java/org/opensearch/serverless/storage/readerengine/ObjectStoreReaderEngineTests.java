@@ -480,6 +480,118 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
         }
     }
 
+    public void testRegistryPollNowForcesAnImmediateCatchUpToANewerGeneration() throws Exception {
+        // The receiving side of section 8's publication notification mechanism: a caller (standing
+        // in for TransportPollNowAction) reaches a specific reader engine by (indexUuid, shardId)
+        // through ReaderShardActivityRegistry alone, exactly as a real cross-node notification would.
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ObjectStoreCommitPublisher publisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+        org.opensearch.serverless.storage.shardstate.ShardStateStore shardStateStore =
+            new org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore(blobContainer);
+        BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(blobContainer);
+        ObjectStoreCommitMaterializer materializer = new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer));
+        ShardDirectory shardDirectory = new InMemoryShardDirectory();
+        ReaderShardActivityRegistry registry = new ReaderShardActivityRegistry();
+
+        Directory writerDirectory = new ByteBuffersDirectory();
+        IndexWriter writer = new IndexWriter(writerDirectory, new IndexWriterConfig());
+
+        try (Store store = createStore()) {
+            EngineConfig engineConfig = config(defaultSettings, store, createTempDir(), newMergePolicy(), null);
+            String indexUuid = engineConfig.getShardId().getIndex().getUUID();
+            int shardId = engineConfig.getShardId().getId();
+
+            assertFalse("no reader engine registered yet -- must report false, not throw", registry.pollNow(indexUuid, shardId));
+
+            CommitManifest firstManifest;
+            {
+                Document doc = new Document();
+                doc.add(new StringField("id", "1", Field.Store.YES));
+                writer.addDocument(doc);
+                writer.commit();
+                SegmentInfos segmentInfos = SegmentInfos.readLatestCommit(writerDirectory);
+                firstManifest = publisher.publishCommit(
+                    writerDirectory,
+                    segmentInfos,
+                    indexUuid,
+                    shardId,
+                    PRIMARY_TERM,
+                    1,
+                    0,
+                    0,
+                    new WalPosition("epoch-0", 0),
+                    0,
+                    PruningStats.empty()
+                );
+            }
+            assertEquals(
+                org.opensearch.serverless.storage.shardstate.CasResult.SUCCESS,
+                shardStateStore.compareAndSet(
+                    indexUuid,
+                    shardId,
+                    java.util.Optional.empty(),
+                    new org.opensearch.serverless.storage.shardstate.ShardHead(PRIMARY_TERM, null, 0L, firstManifest.generation())
+                )
+            );
+
+            try (
+                ObjectStoreReaderEngine readerEngine = ObjectStoreReaderEngine.open(
+                    engineConfig,
+                    firstManifest,
+                    materializer,
+                    PRIMARY_TERM,
+                    shardStateStore,
+                    manifestStore,
+                    shardDirectory,
+                    LOCAL_NODE_ID
+                )
+            ) {
+                registry.register(indexUuid, shardId, readerEngine);
+
+                Document doc2 = new Document();
+                doc2.add(new StringField("id", "2", Field.Store.YES));
+                writer.addDocument(doc2);
+                writer.commit();
+                SegmentInfos segmentInfos = SegmentInfos.readLatestCommit(writerDirectory);
+                CommitManifest secondManifest = publisher.publishCommit(
+                    writerDirectory,
+                    segmentInfos,
+                    indexUuid,
+                    shardId,
+                    PRIMARY_TERM,
+                    2,
+                    1,
+                    1,
+                    new WalPosition("epoch-0", 0),
+                    0,
+                    PruningStats.empty()
+                );
+                long currentVersion = shardStateStore.get(indexUuid, shardId).orElseThrow().version();
+                shardStateStore.compareAndSet(
+                    indexUuid,
+                    shardId,
+                    java.util.Optional.of(currentVersion),
+                    new org.opensearch.serverless.storage.shardstate.ShardHead(PRIMARY_TERM, null, 0L, secondManifest.generation())
+                );
+
+                assertEquals(1L, readerEngine.currentManifestGenerationForTesting());
+                assertTrue("a registered reader engine must be found and polled", registry.pollNow(indexUuid, shardId));
+                assertEquals(
+                    "pollNow must force an immediate catch-up, not wait for the background schedule",
+                    2L,
+                    readerEngine.currentManifestGenerationForTesting()
+                );
+            }
+        } finally {
+            writer.close();
+            writerDirectory.close();
+        }
+    }
+
     public void testWaitForGenerationTimesOutIfTheGenerationNeverArrives() throws Exception {
         FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
         BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());

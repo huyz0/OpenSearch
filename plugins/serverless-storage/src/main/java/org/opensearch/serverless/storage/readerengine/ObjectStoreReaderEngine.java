@@ -511,6 +511,21 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
         pollForNewerManifest();
     }
 
+    /**
+     * The real, public entry point for forcing this engine to check for a newer manifest generation
+     * right now, rather than waiting out {@link #MANIFEST_POLL_INTERVAL} -- the receiving side of
+     * rfc-serverless-opensearch.md &sect;8's publication notification mechanism ("a small
+     * publication notification... generalize the existing segment-replication checkpoint
+     * publisher"). {@link org.opensearch.serverless.storage.readerengine.action.PollNowAction}
+     * calls this (via {@link org.opensearch.serverless.storage.readerengine.ReaderShardActivityRegistry})
+     * when a caller wants a specific reader engine to catch up immediately instead of on its own
+     * schedule. Notifications remain strictly an optimization: {@link #waitForGeneration} and the
+     * background poll schedule both already converge correctly with nobody ever calling this.
+     */
+    public void pollNow() {
+        pollForNewerManifest();
+    }
+
     @Override
     public void close() throws IOException {
         manifestPollTask.cancel();

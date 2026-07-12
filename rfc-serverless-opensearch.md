@@ -1024,7 +1024,27 @@ returns a safe `attempted: false` rather than an error.
   (metadata-plane RFC §5), whose entries it already touches on every publication to bump the
   generation hint. Notifications are an optimization in either case; the object store is the
   truth. A reader that missed notifications (restart, partition, stale directory entry) lists
-  manifests and catches up.
+  manifests and catches up. **Status: the receiving side is implemented and tested; the writer
+  never automatically sends one yet.** `ObjectStoreReaderEngine#pollNow()` is the real, public
+  entry point for forcing a specific reader engine to check for a newer manifest generation
+  immediately rather than waiting out its own 5s background poll -- the same underlying mechanism
+  `waitForGeneration` already uses internally, now reachable from outside the engine too.
+  `PollNowAction` (`POST /_plugins/_serverless/storage/{index}/{shard}/_poll_now`, dispatched off
+  the transport thread since it does real blob-store I/O) exposes this per (index, shard) on
+  whichever node receives the request, same single-node routing shape as `WaitForGenerationAction`.
+  What this does NOT yet do: have `ObjectStoreWriterEngine#commitIndexWriter` automatically call
+  this against every reader after a successful publish. That final wiring needs a `Client`/`TransportService`
+  threaded through the writer engine's own construction (currently has neither) and a real answer
+  to "where does the writer learn reader locations" -- the directory tier this plugin already
+  builds (`ShardDirectory`) is the natural fit the RFC itself names, but it's deliberately a single
+  soft hint per shard, not an enumerable multi-replica list, so even wiring it in would only ever
+  notify one reader copy, not every one. Given this section's own "notifications are an
+  optimization... the object store is the truth" framing and that `waitForGeneration`/the
+  background poll schedule both already converge correctly with nobody ever calling `pollNow`, the
+  automatic writer-side trigger is left for a follow-up rather than rushed in under this
+  increment. Verified: a caller that doesn't yet know about a shard gets a clean "not tracked"
+  answer; a caller that reaches a real registered reader engine forces it to catch up to a newer
+  manifest generation immediately, rather than only on its own schedule.
 - **Consistency model (default): monotonic bounded staleness.** A reader never goes backward
   (manifest generations are totally ordered per shard) and lag is bounded by publication
   frequency plus notification delivery. This matches the existing segment-replication model.
