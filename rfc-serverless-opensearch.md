@@ -1352,9 +1352,26 @@ placement works outside serverless storage today. Every shard of a non-serverles
 `AllocationDecider` in the allocator is expected to have. Verified directly against `canAllocate`:
 a reader shard is allowed only on a reader-designated node; a writer shard is allowed everywhere
 *except* a reader-designated node; a non-serverless index's shards are unaffected even on a
-reader-designated node. Not implemented: the placement cost model / cache-locality hysteresis
-(second bullet), the actual scale-to-zero mechanism (third bullet), and mandatory remote cluster
-state enforcement (fourth bullet). **The third bullet's signal-collection half is no longer
+reader-designated node. **The placement cost model / cache-locality hysteresis (second bullet) is
+now implemented too**, as a real `ExistingShardsAllocator` preference, not a decider: `ReaderCacheAffinityRecorder`
+persists, via an ordinary `ClusterStateUpdateTask` into `IndexMetadata` custom data
+(`ReaderCacheAffinityMetadata`), the node id a reader shard's `ObjectStoreReaderEngine` most
+recently started on -- the node whose lazy-directory block cache (&sect;7.2) is warm for that
+shard. `ServerlessStorageExistingShardsAllocator#applyStartedShards` is the recorder's only caller;
+`allocateUnassigned`/`explainUnassignedShardAllocation` consult the record and prefer that node
+over the plain first-decider-approved node, but only when it's still decider-approved (every
+ordinary decider, including `ReaderShardPlacementAllocationDecider`, still gets the final say) and
+the record hasn't gone stale. Staleness is the hysteresis half: `serverless_storage.reader_cache_affinity.ttl`
+(`TimeValue.MINUS_ONE`, i.e. disabled, by default -- explicit opt-in, matching every other
+scale-related node setting in this plugin) bounds how long a record stays honorable, so a
+permanently departed node can never pin a shard's placement forever, while a merely transient
+reassignment still gets to keep its warm cache. Verified with real unit tests (the preferred node
+wins over an arbitrary first-approved node when fresh and still decider-approved; a writer shard
+never consults reader affinity; a non-positive TTL fully disables the preference; the recorder's
+cluster-state update actually lands, proven against a real `ClusterService`, not just the pure
+metadata accessor logic) -- confirmed meaningful by reverting the implementation and watching the
+new tests fail to compile. What remains unimplemented: the actual scale-to-zero mechanism (third
+bullet) and mandatory remote cluster state enforcement (fourth bullet). **The third bullet's signal-collection half is no longer
 entirely missing, though**: both named per-tier signals -- ingest tier's writer idle activity and
 search tier's manifest-generation lag -- now have a real, tested, per-node discovery surface, and a
 cluster-wide policy layer (`ScaleToZeroCandidatesAction`) now merges and threshold-evaluates both

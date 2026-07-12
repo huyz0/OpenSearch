@@ -8,6 +8,7 @@
 
 package org.opensearch.serverless.storage.allocation;
 
+import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.routing.RoutingNode;
 import org.opensearch.cluster.routing.ShardRouting;
@@ -18,6 +19,8 @@ import org.opensearch.cluster.routing.allocation.FailedShard;
 import org.opensearch.cluster.routing.allocation.NodeAllocationResult;
 import org.opensearch.cluster.routing.allocation.RoutingAllocation;
 import org.opensearch.cluster.routing.allocation.decider.Decision;
+import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.serverless.storage.ServerlessStoragePlugin;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -64,8 +67,44 @@ public final class ServerlessStorageExistingShardsAllocator implements ExistingS
     /** Creates an allocator with no state, since this class caches nothing (see the class-level javadoc). */
     public ServerlessStorageExistingShardsAllocator() {}
 
+    /**
+     * Test-only constructor: sets the cache-locality TTL directly without requiring a real {@link
+     * ClusterService} (which {@link #setDependencies} needs only to construct a {@link
+     * ReaderCacheAffinityRecorder}, itself only ever used by {@link #applyStartedShards}, not by
+     * placement preference reads). {@link #cacheAffinityRecorder} stays {@code null}, so {@link
+     * #applyStartedShards} is a no-op under this constructor -- fine for tests exercising only
+     * placement preference.
+     *
+     * @param cacheAffinityTtlMillis how long a recorded affinity stays honorable; non-positive disables the preference entirely.
+     */
+    ServerlessStorageExistingShardsAllocator(long cacheAffinityTtlMillis) {
+        this.cacheAffinityTtlMillis = cacheAffinityTtlMillis;
+    }
+
     /** The allocator name registered via {@code ServerlessStorageIndexSettingProvider} for every serverless-storage index. */
     public static final String NAME = "serverless_storage";
+
+    // Set once, via #setDependencies, by ServerlessStoragePlugin#createComponents -- unset (null
+    // recorder, zero TTL) in every test that constructs this allocator directly with the no-arg
+    // constructor, which simply disables cache-locality preference and falls back to this
+    // class's original "first decider-approved node" behavior, exactly as before this feature
+    // existed.
+    private volatile ReaderCacheAffinityRecorder cacheAffinityRecorder;
+    private volatile long cacheAffinityTtlMillis;
+
+    /**
+     * Wires this allocator's cache-locality hysteresis (rfc-serverless-opensearch.md &sect;10)
+     * -- constructed eagerly by {@code ClusterPlugin#getExistingShardsAllocators}, before {@code
+     * ClusterService} exists, this is the same late-setter shape {@code
+     * ShardReactivationActionFilter#setDependencies} already uses for the same reason.
+     *
+     * @param clusterService used by the {@link ReaderCacheAffinityRecorder} this constructs to persist affinity records.
+     * @param cacheAffinityTtlMillis how long a recorded affinity stays honorable; non-positive disables the preference entirely.
+     */
+    public void setDependencies(ClusterService clusterService, long cacheAffinityTtlMillis) {
+        this.cacheAffinityRecorder = new ReaderCacheAffinityRecorder(clusterService);
+        this.cacheAffinityTtlMillis = cacheAffinityTtlMillis;
+    }
 
     @Override
     public void beforeAllocation(RoutingAllocation allocation) {
@@ -102,34 +141,67 @@ public final class ServerlessStorageExistingShardsAllocator implements ExistingS
     }
 
     /**
-     * The one piece of actual logic in this class: the first node every {@code AllocationDecider}
-     * (node attribute filters, disk watermarks, awareness, this plugin's own {@link
+     * The node picked for {@code shardRouting}: the cache-locality-preferred node (rfc-serverless-opensearch.md
+     * &sect;10) if {@code shardRouting} is a reader shard with a fresh, still-decider-approved
+     * affinity record, otherwise simply the first node every {@code AllocationDecider} (node
+     * attribute filters, disk watermarks, awareness, this plugin's own {@link
      * ReaderShardPlacementAllocationDecider}, etc. -- every ordinary decider still applies, only the
-     * gateway/data-presence question is skipped) approves for {@code shardRouting}, or {@code null}
-     * if none do. {@code nodeDecisions}, if non-null, is populated with every node's decision for
+     * gateway/data-presence question is skipped) approves for {@code shardRouting}; {@code null} if
+     * none do. {@code nodeDecisions}, if non-null, is populated with every node's decision for
      * {@link #explainUnassignedShardAllocation}'s benefit; {@link #allocateUnassigned} passes {@code
      * null} since it only needs the answer, not a full explanation.
      */
-    private static DiscoveryNode firstDeciderApprovedNode(
+    private DiscoveryNode firstDeciderApprovedNode(
         ShardRouting shardRouting,
         RoutingAllocation allocation,
         List<NodeAllocationResult> nodeDecisions
     ) {
+        String preferredNodeId = preferredCacheAffinityNodeId(shardRouting, allocation);
         DiscoveryNode target = null;
+        DiscoveryNode preferredTarget = null;
         int weightRanking = 0;
         for (RoutingNode routingNode : allocation.routingNodes()) {
             Decision decision = allocation.deciders().canAllocate(shardRouting, routingNode, allocation);
             if (nodeDecisions != null) {
                 nodeDecisions.add(new NodeAllocationResult(routingNode.node(), decision, ++weightRanking));
             }
-            if (decision.type() == Decision.Type.YES && target == null) {
-                target = routingNode.node();
-                if (nodeDecisions == null) {
+            if (decision.type() == Decision.Type.YES) {
+                if (target == null) {
+                    target = routingNode.node();
+                }
+                if (preferredNodeId != null && preferredNodeId.equals(routingNode.nodeId())) {
+                    preferredTarget = routingNode.node();
+                    if (nodeDecisions == null) {
+                        break;
+                    }
+                }
+                if (nodeDecisions == null && preferredNodeId == null) {
                     break;
                 }
             }
         }
-        return target;
+        return preferredTarget != null ? preferredTarget : target;
+    }
+
+    /**
+     * The cache-locality-preferred node id for {@code shardRouting}, or {@code null} if this
+     * feature is disabled ({@link #setDependencies} never called, or a non-positive TTL), {@code
+     * shardRouting} isn't a reader shard, or no fresh affinity record exists for it.
+     */
+    private String preferredCacheAffinityNodeId(ShardRouting shardRouting, RoutingAllocation allocation) {
+        long ttlMillis = cacheAffinityTtlMillis;
+        if (ttlMillis <= 0 || shardRouting.isSearchOnly() == false) {
+            return null;
+        }
+        IndexMetadata indexMetadata = allocation.metadata().index(shardRouting.index());
+        if (indexMetadata == null || ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.get(indexMetadata.getSettings()) == false) {
+            return null;
+        }
+        int shardId = shardRouting.id();
+        if (ReaderCacheAffinityMetadata.isAffinityFresh(indexMetadata, shardId, System.currentTimeMillis(), ttlMillis) == false) {
+            return null;
+        }
+        return ReaderCacheAffinityMetadata.preferredNodeId(indexMetadata, shardId);
     }
 
     @Override
@@ -139,7 +211,21 @@ public final class ServerlessStorageExistingShardsAllocator implements ExistingS
 
     @Override
     public void applyStartedShards(List<ShardRouting> startedShards, RoutingAllocation allocation) {
-        // No in-flight state to invalidate.
+        ReaderCacheAffinityRecorder recorder = cacheAffinityRecorder;
+        if (recorder == null) {
+            return;
+        }
+        for (ShardRouting shardRouting : startedShards) {
+            if (shardRouting.isSearchOnly() == false) {
+                continue;
+            }
+            IndexMetadata indexMetadata = allocation.metadata().index(shardRouting.index());
+            if (indexMetadata == null
+                || ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.get(indexMetadata.getSettings()) == false) {
+                continue;
+            }
+            recorder.recordStarted(indexMetadata.getIndexUUID(), shardRouting.id(), shardRouting.currentNodeId());
+        }
     }
 
     @Override

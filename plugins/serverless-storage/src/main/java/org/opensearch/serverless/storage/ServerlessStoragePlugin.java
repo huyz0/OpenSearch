@@ -119,6 +119,15 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         new org.opensearch.serverless.storage.scaletozero.ShardReactivationActionFilter();
 
     /**
+     * Constructed eagerly for the same reason as {@link #shardReactivationActionFilter}: {@link
+     * #getExistingShardsAllocators()} is called before {@link #createComponents} runs, and this is
+     * the instance returned from there, so the one {@link #createComponents} later calls {@code
+     * setDependencies} on is the exact same one core holds onto.
+     */
+    private final org.opensearch.serverless.storage.allocation.ServerlessStorageExistingShardsAllocator serverlessStorageExistingShardsAllocator =
+        new org.opensearch.serverless.storage.allocation.ServerlessStorageExistingShardsAllocator();
+
+    /**
      * The {@code index.store.type} value that opts a reader (search-only) shard copy into a
      * {@code LazyBundleDirectory} instead of a normal local {@code FSDirectory}
      * (rfc-serverless-opensearch.md &sect;7.2/&sect;9) -- see {@link ServerlessStorageLazyDirectoryFactory}'s
@@ -400,6 +409,20 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * How long a reader shard's recorded cache-locality affinity (rfc-serverless-opensearch.md
+     * &sect;10, {@code ReaderCacheAffinityMetadata}) stays honorable after being recorded. {@code
+     * TimeValue.MINUS_ONE} (this setting's default) disables cache-locality preference entirely,
+     * restoring {@code ServerlessStorageExistingShardsAllocator}'s original "first decider-approved
+     * node" behavior -- the same "explicit opt-in, off by default" shape {@code
+     * SERVERLESS_STORAGE_GC_INTERVAL_SETTING} uses.
+     */
+    public static final Setting<TimeValue> SERVERLESS_STORAGE_READER_CACHE_AFFINITY_TTL_SETTING = Setting.timeSetting(
+        "serverless_storage.reader_cache_affinity.ttl",
+        TimeValue.MINUS_ONE,
+        Setting.Property.NodeScope
+    );
+
+    /**
      * The default queries-per-minute threshold {@code ScaleUpCandidatesAction} uses to decide a
      * reader shard is busy enough to be worth expanding (see the RFC's scale-up autoscaling
      * subsection) -- a caller can override this per-request, this is only the default when they
@@ -648,6 +671,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_SCALE_TO_ZERO_SUSPEND_ENABLED_SETTING,
             SERVERLESS_STORAGE_SCALE_TO_ZERO_SEARCH_REACTIVATION_WAIT_SETTING,
             SERVERLESS_STORAGE_SCALE_TO_ZERO_COOLDOWN_SETTING,
+            SERVERLESS_STORAGE_READER_CACHE_AFFINITY_TTL_SETTING,
             SERVERLESS_STORAGE_SCALE_UP_QPM_THRESHOLD_SETTING,
             SERVERLESS_STORAGE_SCALE_UP_MAX_SEARCH_REPLICAS_SETTING,
             SERVERLESS_STORAGE_SCALE_UP_EVAL_INTERVAL_SETTING,
@@ -715,6 +739,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             client,
             threadPool,
             SERVERLESS_STORAGE_SCALE_TO_ZERO_SEARCH_REACTIVATION_WAIT_SETTING.get(environment.settings())
+        );
+        serverlessStorageExistingShardsAllocator.setDependencies(
+            clusterService,
+            SERVERLESS_STORAGE_READER_CACHE_AFFINITY_TTL_SETTING.get(environment.settings()).millis()
         );
         TimeValue scaleToZeroEvalInterval = SERVERLESS_STORAGE_SCALE_TO_ZERO_EVAL_INTERVAL_SETTING.get(environment.settings());
         if (scaleToZeroEvalInterval.millis() > 0) {
@@ -1149,7 +1177,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      */
     @Override
     public Map<String, ExistingShardsAllocator> getExistingShardsAllocators() {
-        return Collections.singletonMap(ServerlessStorageExistingShardsAllocator.NAME, new ServerlessStorageExistingShardsAllocator());
+        return Collections.singletonMap(ServerlessStorageExistingShardsAllocator.NAME, serverlessStorageExistingShardsAllocator);
     }
 
     @Override

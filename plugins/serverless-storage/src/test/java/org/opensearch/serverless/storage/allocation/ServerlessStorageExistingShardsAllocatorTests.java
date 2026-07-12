@@ -30,6 +30,9 @@ import org.opensearch.cluster.routing.allocation.RoutingAllocation;
 import org.opensearch.cluster.routing.allocation.decider.AllocationDeciders;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.serverless.storage.ServerlessStoragePlugin;
+
+import java.util.List;
 
 /**
  * Proves the sidestep rfc-serverless-opensearch.md &sect;7.1.2 describes: this allocator never
@@ -125,6 +128,146 @@ public class ServerlessStorageExistingShardsAllocatorTests extends OpenSearchAll
 
     public void testRegisteredUnderItsOwnNameInThePlugin() {
         assertEquals("serverless_storage", ServerlessStorageExistingShardsAllocator.NAME);
+    }
+
+    // -- Cache-locality hysteresis (rfc-serverless-opensearch.md &sect;10) --
+
+    private ClusterState buildServerlessStorageClusterStateWithAffinity(String preferredNodeId, long recordedAtMillis) {
+        IndexMetadata indexMetadata = IndexMetadata.builder(INDEX_NAME)
+            .settings(settings(Version.CURRENT).put(ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey(), true))
+            .numberOfShards(1)
+            .numberOfReplicas(0)
+            .build();
+        if (preferredNodeId != null) {
+            indexMetadata = ReaderCacheAffinityMetadata.withShardCacheAffinity(indexMetadata, 0, preferredNodeId, recordedAtMillis);
+        }
+        DiscoveryNode node1 = newNode("node1");
+        DiscoveryNode node2 = newNode("node2");
+
+        Metadata metadata = Metadata.builder().put(indexMetadata, false).build();
+        RoutingTable routingTable = RoutingTable.builder().addAsNew(indexMetadata).build();
+        DiscoveryNodes discoveryNodes = DiscoveryNodes.builder().add(node1).add(node2).localNodeId("node1").build();
+
+        return ClusterState.builder(ClusterName.DEFAULT).metadata(metadata).routingTable(routingTable).nodes(discoveryNodes).build();
+    }
+
+    private ShardRouting unassignedReaderShard(ClusterState state) {
+        ShardId shardId = new ShardId(new Index(INDEX_NAME, state.metadata().index(INDEX_NAME).getIndexUUID()), 0);
+        return TestShardRouting.newShardRouting(
+            shardId,
+            null,
+            false,
+            true,
+            ShardRoutingState.UNASSIGNED,
+            RecoverySource.EmptyStoreRecoverySource.INSTANCE
+        );
+    }
+
+    /**
+     * The node id {@link ServerlessStorageExistingShardsAllocator} would pick with no cache
+     * affinity in play at all -- {@code RoutingNodes} iteration order isn't guaranteed to match
+     * insertion order (it varies with the test's random seed), so every test below computes this
+     * baseline dynamically from the exact same cluster state rather than assuming a fixed node id,
+     * then asserts either "matches the baseline" (preference not honored) or "differs from the
+     * baseline, equals the recorded node" (preference honored).
+     */
+    private String baselineFirstApprovedNodeId(ClusterState state, ShardRouting shard) {
+        RoutingAllocation allocation = newRoutingAllocation(yesAllocationDeciders(), state);
+        RecordingHandler handler = new RecordingHandler();
+        new ServerlessStorageExistingShardsAllocator(0L).allocateUnassigned(shard, allocation, handler);
+        return handler.initializedNodeId;
+    }
+
+    public void testPrefersTheCacheAffinityRecordedNodeOverTheFirstApprovedNode() {
+        ClusterState noAffinityState = buildServerlessStorageClusterStateWithAffinity(null, 0L);
+        String baselineNodeId = baselineFirstApprovedNodeId(noAffinityState, unassignedReaderShard(noAffinityState));
+        String otherNodeId = "node1".equals(baselineNodeId) ? "node2" : "node1";
+
+        ClusterState state = buildServerlessStorageClusterStateWithAffinity(otherNodeId, System.currentTimeMillis());
+        RoutingAllocation allocation = newRoutingAllocation(yesAllocationDeciders(), state);
+        ServerlessStorageExistingShardsAllocator allocator = new ServerlessStorageExistingShardsAllocator(60_000L);
+        ShardRouting shard = unassignedReaderShard(state);
+
+        RecordingHandler handler = new RecordingHandler();
+        allocator.allocateUnassigned(shard, allocation, handler);
+
+        assertEquals(otherNodeId, handler.initializedNodeId);
+    }
+
+    public void testFallsBackToFirstApprovedNodeWhenNoAffinityIsRecorded() {
+        ClusterState state = buildServerlessStorageClusterStateWithAffinity(null, 0L);
+        String baselineNodeId = baselineFirstApprovedNodeId(state, unassignedReaderShard(state));
+
+        RoutingAllocation allocation = newRoutingAllocation(yesAllocationDeciders(), state);
+        ServerlessStorageExistingShardsAllocator allocator = new ServerlessStorageExistingShardsAllocator(60_000L);
+        ShardRouting shard = unassignedReaderShard(state);
+
+        RecordingHandler handler = new RecordingHandler();
+        allocator.allocateUnassigned(shard, allocation, handler);
+
+        assertEquals(baselineNodeId, handler.initializedNodeId);
+    }
+
+    public void testCacheAffinityIsIgnoredWhenTheFeatureIsDisabledViaNonPositiveTtl() {
+        ClusterState noAffinityState = buildServerlessStorageClusterStateWithAffinity(null, 0L);
+        String baselineNodeId = baselineFirstApprovedNodeId(noAffinityState, unassignedReaderShard(noAffinityState));
+        String otherNodeId = "node1".equals(baselineNodeId) ? "node2" : "node1";
+
+        ClusterState state = buildServerlessStorageClusterStateWithAffinity(otherNodeId, System.currentTimeMillis());
+        RoutingAllocation allocation = newRoutingAllocation(yesAllocationDeciders(), state);
+        ServerlessStorageExistingShardsAllocator allocator = new ServerlessStorageExistingShardsAllocator(0L);
+        ShardRouting shard = unassignedReaderShard(state);
+
+        RecordingHandler handler = new RecordingHandler();
+        allocator.allocateUnassigned(shard, allocation, handler);
+
+        assertEquals(baselineNodeId, handler.initializedNodeId);
+    }
+
+    public void testCacheAffinityIsIgnoredForAWriterShardEvenWhenRecorded() {
+        // A recorded affinity always came from a reader shard start (see applyStartedShards); a
+        // writer/primary shard of the same shard id must never consult it.
+        ClusterState noAffinityState = buildServerlessStorageClusterStateWithAffinity(null, 0L);
+        ShardId baselineShardId = new ShardId(new Index(INDEX_NAME, noAffinityState.metadata().index(INDEX_NAME).getIndexUUID()), 0);
+        ShardRouting baselineWriterShard = TestShardRouting.newShardRouting(
+            baselineShardId,
+            null,
+            true,
+            ShardRoutingState.UNASSIGNED,
+            RecoverySource.EmptyStoreRecoverySource.INSTANCE
+        );
+        String baselineNodeId = baselineFirstApprovedNodeId(noAffinityState, baselineWriterShard);
+        String otherNodeId = "node1".equals(baselineNodeId) ? "node2" : "node1";
+
+        ClusterState state = buildServerlessStorageClusterStateWithAffinity(otherNodeId, System.currentTimeMillis());
+        RoutingAllocation allocation = newRoutingAllocation(yesAllocationDeciders(), state);
+        ServerlessStorageExistingShardsAllocator allocator = new ServerlessStorageExistingShardsAllocator(60_000L);
+        ShardId shardId = new ShardId(new Index(INDEX_NAME, state.metadata().index(INDEX_NAME).getIndexUUID()), 0);
+        ShardRouting writerShard = TestShardRouting.newShardRouting(
+            shardId,
+            null,
+            true,
+            ShardRoutingState.UNASSIGNED,
+            RecoverySource.EmptyStoreRecoverySource.INSTANCE
+        );
+
+        RecordingHandler handler = new RecordingHandler();
+        allocator.allocateUnassigned(writerShard, allocation, handler);
+
+        assertEquals(baselineNodeId, handler.initializedNodeId);
+    }
+
+    public void testApplyStartedShardsIsANoOpWithoutARecorder() {
+        // The no-arg / test-only-TTL constructors never wire a ReaderCacheAffinityRecorder --
+        // applyStartedShards must simply do nothing, not throw.
+        ClusterState state = buildServerlessStorageClusterStateWithAffinity(null, 0L);
+        RoutingAllocation allocation = newRoutingAllocation(yesAllocationDeciders(), state);
+        ServerlessStorageExistingShardsAllocator allocator = new ServerlessStorageExistingShardsAllocator(60_000L);
+        ShardId shardId = new ShardId(new Index(INDEX_NAME, state.metadata().index(INDEX_NAME).getIndexUUID()), 0);
+        ShardRouting startedReaderShard = TestShardRouting.newShardRouting(shardId, "node2", false, true, ShardRoutingState.STARTED, null);
+
+        allocator.applyStartedShards(List.of(startedReaderShard), allocation);
+        // No exception, and (since there's no recorder) no affinity record materializes from this call alone.
     }
 
     private static final class RecordingHandler implements ExistingShardsAllocator.UnassignedAllocationHandler {
