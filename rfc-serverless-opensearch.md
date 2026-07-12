@@ -1393,6 +1393,16 @@ cluster-state update actually lands, proven against a real `ClusterService`, not
 metadata accessor logic) -- confirmed meaningful by reverting the implementation and watching the
 new tests fail to compile.
 
+**A real regression this session's own code review caught and fixed**: the real-allocation path
+(`allocateUnassigned`, as opposed to the always-full-scan explain path) lost its O(1)
+first-decider-approved-node early-exit whenever a cache-affinity preference existed, silently
+turning every unassigned reader-shard placement into a full `AllocationDeciders.canAllocate` scan
+of every node in the cluster. Fixed by checking the preferred node directly (`RoutingNodes#node`,
+an O(1) lookup, plus exactly one decider check) instead of finding it by scanning; falls back to
+the original first-approved scan only when no preference exists, it's stale, or the preferred node
+itself isn't decider-approved. Verified with a call-counting `AllocationDecider`: honoring a fresh,
+approved preference now costs exactly one decider check, not one per node in the cluster.
+
 **The third bullet (scale-to-zero mechanism) is now fully implemented too -- stale text corrected
 here, no code change.** Both named per-tier signals -- ingest tier's writer idle activity and
 search tier's manifest-generation lag -- have a real, tested, per-node discovery surface, and a

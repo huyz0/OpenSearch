@@ -194,6 +194,52 @@ public class ServerlessStorageExistingShardsAllocatorTests extends OpenSearchAll
         assertEquals(otherNodeId, handler.initializedNodeId);
     }
 
+    /**
+     * A real regression this session's own code review caught: {@code firstDeciderApprovedNode}
+     * used to lose its O(1) early-exit whenever a cache-affinity preference existed, scanning
+     * every node's deciders instead of checking only the preferred one. Proven here with a
+     * call-counting decider, not just by asserting the right node wins (which the earlier, buggy
+     * version also got right -- it just did far more work to get there).
+     */
+    private static final class CountingAllocationDecider extends org.opensearch.cluster.routing.allocation.decider.AllocationDecider {
+        private final java.util.concurrent.atomic.AtomicInteger callCount = new java.util.concurrent.atomic.AtomicInteger();
+
+        @Override
+        public org.opensearch.cluster.routing.allocation.decider.Decision canAllocate(
+            ShardRouting shardRouting,
+            org.opensearch.cluster.routing.RoutingNode node,
+            RoutingAllocation allocation
+        ) {
+            callCount.incrementAndGet();
+            return org.opensearch.cluster.routing.allocation.decider.Decision.YES;
+        }
+    }
+
+    public void testHonoringAFreshPreferenceCostsExactlyOneDeciderCheckNotAFullScan() {
+        ClusterState noAffinityState = buildServerlessStorageClusterStateWithAffinity(null, 0L);
+        String baselineNodeId = baselineFirstApprovedNodeId(noAffinityState, unassignedReaderShard(noAffinityState));
+        String otherNodeId = "node1".equals(baselineNodeId) ? "node2" : "node1";
+
+        ClusterState state = buildServerlessStorageClusterStateWithAffinity(otherNodeId, System.currentTimeMillis());
+        CountingAllocationDecider countingDecider = new CountingAllocationDecider();
+        RoutingAllocation allocation = newRoutingAllocation(
+            new org.opensearch.cluster.routing.allocation.decider.AllocationDeciders(java.util.List.of(countingDecider)),
+            state
+        );
+        ServerlessStorageExistingShardsAllocator allocator = new ServerlessStorageExistingShardsAllocator(60_000L);
+        ShardRouting shard = unassignedReaderShard(state);
+
+        RecordingHandler handler = new RecordingHandler();
+        allocator.allocateUnassigned(shard, allocation, handler);
+
+        assertEquals(otherNodeId, handler.initializedNodeId);
+        assertEquals(
+            "honoring a fresh, decider-approved preference must check only that one node, not scan every node in the cluster",
+            1,
+            countingDecider.callCount.get()
+        );
+    }
+
     public void testFallsBackToFirstApprovedNodeWhenNoAffinityIsRecorded() {
         ClusterState state = buildServerlessStorageClusterStateWithAffinity(null, 0L);
         String baselineNodeId = baselineFirstApprovedNodeId(state, unassignedReaderShard(state));

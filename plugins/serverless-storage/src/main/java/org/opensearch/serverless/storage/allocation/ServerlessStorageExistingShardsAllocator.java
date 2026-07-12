@@ -11,6 +11,7 @@ package org.opensearch.serverless.storage.allocation;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.routing.RoutingNode;
+import org.opensearch.cluster.routing.RoutingNodes;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.UnassignedInfo;
 import org.opensearch.cluster.routing.allocation.AllocateUnassignedDecision;
@@ -150,37 +151,52 @@ public final class ServerlessStorageExistingShardsAllocator implements ExistingS
      * none do. {@code nodeDecisions}, if non-null, is populated with every node's decision for
      * {@link #explainUnassignedShardAllocation}'s benefit; {@link #allocateUnassigned} passes {@code
      * null} since it only needs the answer, not a full explanation.
+     *
+     * <p><b>The preferred node is checked directly, not found by scanning</b> -- a real regression
+     * caught by code review: an earlier version of this method tracked the preferred node inside
+     * the same scan used to find the first-approved fallback, which meant the scan's early-break
+     * (this method's entire point on the hot real-allocation path, {@code nodeDecisions == null})
+     * never fired once a preference existed, silently turning every unassigned reader-shard
+     * placement into a full {@code canAllocate} scan of every node in the cluster instead of an
+     * O(1) lookup. {@link RoutingNodes#node(String)} answers "is the preferred node even a
+     * candidate" directly, so the real-allocation path costs one lookup plus one decider check when
+     * a preference is honored, exactly as cheap as it was before this feature existed.
      */
     private DiscoveryNode firstDeciderApprovedNode(
         ShardRouting shardRouting,
         RoutingAllocation allocation,
         List<NodeAllocationResult> nodeDecisions
     ) {
-        String preferredNodeId = preferredCacheAffinityNodeId(shardRouting, allocation);
+        if (nodeDecisions == null) {
+            String preferredNodeId = preferredCacheAffinityNodeId(shardRouting, allocation);
+            if (preferredNodeId != null) {
+                RoutingNode preferredRoutingNode = allocation.routingNodes().node(preferredNodeId);
+                if (preferredRoutingNode != null
+                    && allocation.deciders().canAllocate(shardRouting, preferredRoutingNode, allocation).type() == Decision.Type.YES) {
+                    return preferredRoutingNode.node();
+                }
+            }
+        }
+        // No preference to honor (feature disabled, writer shard, no/stale record, or the
+        // preferred node itself isn't decider-approved), or the explain path, which always needs
+        // every node's decision anyway and so gets no benefit from the fast path above: fall back
+        // to the first decider-approved node, unchanged from this method's pre-cache-affinity
+        // behavior.
         DiscoveryNode target = null;
-        DiscoveryNode preferredTarget = null;
         int weightRanking = 0;
         for (RoutingNode routingNode : allocation.routingNodes()) {
             Decision decision = allocation.deciders().canAllocate(shardRouting, routingNode, allocation);
             if (nodeDecisions != null) {
                 nodeDecisions.add(new NodeAllocationResult(routingNode.node(), decision, ++weightRanking));
             }
-            if (decision.type() == Decision.Type.YES) {
-                if (target == null) {
-                    target = routingNode.node();
-                }
-                if (preferredNodeId != null && preferredNodeId.equals(routingNode.nodeId())) {
-                    preferredTarget = routingNode.node();
-                    if (nodeDecisions == null) {
-                        break;
-                    }
-                }
-                if (nodeDecisions == null && preferredNodeId == null) {
+            if (decision.type() == Decision.Type.YES && target == null) {
+                target = routingNode.node();
+                if (nodeDecisions == null) {
                     break;
                 }
             }
         }
-        return preferredTarget != null ? preferredTarget : target;
+        return target;
     }
 
     /**
