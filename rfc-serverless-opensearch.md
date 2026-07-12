@@ -1403,6 +1403,20 @@ the original first-approved scan only when no preference exists, it's stale, or 
 itself isn't decider-approved. Verified with a call-counting `AllocationDecider`: honoring a fresh,
 approved preference now costs exactly one decider check, not one per node in the cluster.
 
+**A second real bug from the same review pass, in `ReaderCacheAffinityMetadata#withShardCacheAffinity`'s
+own "cheap no-op for steady-state" guard**: the original `>=` timestamp comparison was dead code in
+practice -- callers always pass a freshly captured, strictly later "now," so it was only ever true
+for out-of-order/stale calls, never the genuine repeated-same-node case the javadoc claimed to
+optimize, meaning every single reader-shard start rewrote cluster state regardless of how often the
+same node kept getting recorded. Fixed with a real interval-based guard (a fixed minimum time
+between rewrites for the same shard+node, rather than an exact timestamp comparison) -- a
+same-node call within the interval is now a genuine no-op, while a same-node call after the
+interval elapses still refreshes the timestamp, so a shard that keeps reactivating on the same node
+over a long period never goes TTL-stale between real reactivations. Verified directly: a same-node
+call well inside the interval returns the identical `IndexMetadata` instance; one past the interval
+returns an updated one with a refreshed timestamp; reverting the fix and re-running both new tests
+shows the no-op test fail exactly as the bug predicts.
+
 **The third bullet (scale-to-zero mechanism) is now fully implemented too -- stale text corrected
 here, no code change.** Both named per-tier signals -- ingest tier's writer idle activity and
 search tier's manifest-generation lag -- have a real, tested, per-node discovery surface, and a

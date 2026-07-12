@@ -45,6 +45,13 @@ public final class ReaderCacheAffinityMetadata {
     public static final String RECORDED_AT_CUSTOM_TYPE = "serverless_storage_reader_cache_affinity_recorded_at";
 
     /**
+     * Minimum real time between two recorded-at rewrites for the same (shard, node) pair -- see
+     * {@link #withShardCacheAffinity}'s own javadoc for why a fixed interval, not an exact
+     * timestamp comparison, is what actually makes repeated same-node calls a genuine no-op.
+     */
+    private static final long MIN_REWRITE_INTERVAL_MILLIS = 60_000L;
+
+    /**
      * The node id most recently recorded as having a live reader engine for {@code shardId}, or
      * {@code null} if none has ever been recorded.
      *
@@ -82,8 +89,21 @@ public final class ReaderCacheAffinityMetadata {
     /**
      * Returns a copy of {@code indexMetadata} with {@code shardId}'s cache-affinity node set to
      * {@code nodeId}, stamped {@code nowMillis}. A no-op (returns {@code indexMetadata} unchanged)
-     * if {@code nodeId} is already the recorded node and the existing timestamp is at least as
-     * recent, so repeated calls for the same steady-state node don't churn cluster state.
+     * if {@code nodeId} is already the recorded node and it was recorded less than {@link
+     * #MIN_REWRITE_INTERVAL_MILLIS} ago, so repeated calls for the same steady-state node -- e.g.
+     * a reader shard flapping between suspend/reactivate on the same node -- don't churn cluster
+     * state on every single call.
+     *
+     * <p><b>A fixed interval, not "is the new timestamp older/equal," is the point.</b> An earlier
+     * version of this guard compared the new timestamp against the existing one with {@code >=},
+     * intending to skip real steady-state repeats -- but since callers always pass a freshly
+     * captured, strictly later "now," that comparison was true only for out-of-order/stale calls,
+     * never for the genuine repeated-same-node case the javadoc claimed to optimize, so it was
+     * dead code in practice: caught by code review, confirmed by the test suite only ever
+     * exercising the out-of-order case. This interval-based guard is what a real steady-state
+     * caller actually hits, while still refreshing the timestamp (and so the freshness window)
+     * often enough that a long-lived, repeatedly-reactivated-on-the-same-node shard never goes
+     * stale between real reactivations more than a minute apart.
      *
      * @param indexMetadata the index to update.
      * @param shardId the shard number to record affinity for.
@@ -94,8 +114,11 @@ public final class ReaderCacheAffinityMetadata {
         String existingNode = preferredNodeId(indexMetadata, shardId);
         Map<String, String> recordedAtCustom = indexMetadata.getCustomData(RECORDED_AT_CUSTOM_TYPE);
         String existingRecordedAtValue = recordedAtCustom == null ? null : recordedAtCustom.get(Integer.toString(shardId));
-        if (nodeId.equals(existingNode) && existingRecordedAtValue != null && Long.parseLong(existingRecordedAtValue) >= nowMillis) {
-            return indexMetadata;
+        if (nodeId.equals(existingNode) && existingRecordedAtValue != null) {
+            long millisSinceLastRecorded = nowMillis - Long.parseLong(existingRecordedAtValue);
+            if (millisSinceLastRecorded > -MIN_REWRITE_INTERVAL_MILLIS && millisSinceLastRecorded < MIN_REWRITE_INTERVAL_MILLIS) {
+                return indexMetadata;
+            }
         }
         Map<String, String> updatedNodes = new HashMap<>(asStringMap(indexMetadata, NODE_CUSTOM_TYPE));
         updatedNodes.put(Integer.toString(shardId), nodeId);

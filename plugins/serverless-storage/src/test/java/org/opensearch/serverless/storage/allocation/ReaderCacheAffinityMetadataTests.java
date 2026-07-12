@@ -64,6 +64,32 @@ public class ReaderCacheAffinityMetadataTests extends OpenSearchAllocationTestCa
         assertSame("a same-node, older-or-equal-timestamp record must be a no-op", indexMetadata, unchanged);
     }
 
+    public void testRepeatedSameNodeCallsWithinTheMinRewriteIntervalAreGenuinelyNoOps() {
+        // The real bug this test guards against: an earlier version of this guard's ">="
+        // comparison was never true for genuine steady-state repeats (a freshly captured "now" is
+        // always strictly later than a previously stored timestamp), so every single same-node
+        // call rewrote cluster state regardless of how soon after the last one it happened. A real
+        // interval-based guard must actually skip a same-node call shortly after the first one.
+        IndexMetadata indexMetadata = ReaderCacheAffinityMetadata.withShardCacheAffinity(newIndexMetadata(), 0, "node1", 100_000L);
+        IndexMetadata unchanged = ReaderCacheAffinityMetadata.withShardCacheAffinity(indexMetadata, 0, "node1", 100_000L + 30_000L);
+        assertSame("a same-node call well within the min-rewrite interval must be a genuine no-op", indexMetadata, unchanged);
+        assertEquals(100_000L, Long.parseLong(indexMetadata.getCustomData(ReaderCacheAffinityMetadata.RECORDED_AT_CUSTOM_TYPE).get("0")));
+    }
+
+    public void testSameNodeCallAfterTheMinRewriteIntervalElapsesRefreshesTheTimestamp() {
+        // A shard that keeps reactivating on the same node over a long period must still have its
+        // recorded-at timestamp refreshed occasionally, or a long-lived, continuously-reused
+        // affinity record would eventually go TTL-stale even though the node preference is still
+        // completely accurate.
+        IndexMetadata indexMetadata = ReaderCacheAffinityMetadata.withShardCacheAffinity(newIndexMetadata(), 0, "node1", 100_000L);
+        IndexMetadata updated = ReaderCacheAffinityMetadata.withShardCacheAffinity(indexMetadata, 0, "node1", 100_000L + 60_001L);
+        assertNotSame("a same-node call past the min-rewrite interval must refresh the timestamp", indexMetadata, updated);
+        assertEquals(
+            100_000L + 60_001L,
+            Long.parseLong(updated.getCustomData(ReaderCacheAffinityMetadata.RECORDED_AT_CUSTOM_TYPE).get("0"))
+        );
+    }
+
     public void testDifferentShardsOfTheSameIndexTrackIndependentAffinity() {
         IndexMetadata indexMetadata = IndexMetadata.builder(INDEX_NAME)
             .settings(settings(Version.CURRENT))
