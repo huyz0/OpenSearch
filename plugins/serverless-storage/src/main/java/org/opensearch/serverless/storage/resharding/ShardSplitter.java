@@ -93,6 +93,12 @@ public final class ShardSplitter {
         // touching anything" contract ShardCloner's own target-already-active check gives.
         ShardPartitionDescriptor descriptor = new ShardPartitionDescriptor(partitionIndex, numPartitions);
 
+        // The descriptor must be durable before the target becomes visible/openable (ShardCloner's
+        // own head CAS), not after -- see ShardCloner#clone(..., CheckedRunnable)'s own javadoc for
+        // the real race this ordering fixes: an engine-open retry landing between the CAS and a
+        // later descriptor write would cache "no partition filter" for that engine's whole
+        // lifetime, silently serving the full pre-split document set instead of just this target's
+        // own slice.
         ShardCloner.clone(
             sourceIndexUuid,
             sourceShardId,
@@ -104,8 +110,8 @@ public final class ShardSplitter {
             targetManifestStore,
             targetShardStateStore,
             targetLineageStore,
-            nowMillis
+            nowMillis,
+            () -> targetPartitionStore.writeDescriptor(descriptor)
         );
-        targetPartitionStore.writeDescriptor(descriptor);
     }
 }

@@ -33,9 +33,11 @@ import org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore
 import org.opensearch.serverless.storage.shardstate.CasResult;
 import org.opensearch.serverless.storage.shardstate.ShardHead;
 import org.opensearch.serverless.storage.shardstate.ShardStateStore;
+import org.opensearch.serverless.storage.shardstate.VersionedShardHead;
 import org.opensearch.serverless.storage.writerengine.ObjectStoreCommitPublisher;
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.io.IOException;
 import java.util.Optional;
 import java.util.Set;
 
@@ -214,5 +216,60 @@ public class ShardSplitterTests extends OpenSearchTestCase {
         // descriptor -- confirms readDescriptor()'s absent-blob path is the default for every
         // ordinary shard, not just an assumption.
         assertTrue(targetPartitionStore.readDescriptor().isEmpty());
+    }
+
+    // Regression test for a real bug: the partition descriptor used to be written only *after*
+    // ShardCloner.clone returned successfully, i.e. after the head CAS that makes the target
+    // shard visible/openable. An engine-open retry landing in the window between that CAS and the
+    // descriptor write would cache "no partition filter" for the engine's entire lifetime,
+    // silently serving the full pre-split document set. Proven here by making the head CAS fail:
+    // if the descriptor is written before activation (the fix), it survives a failed activation;
+    // if it were still written after (the bug), a failed activation would leave no descriptor at
+    // all -- a directly observable difference between the two orderings.
+    public void testPartitionDescriptorIsDurableBeforeActivationEvenIfActivationFails() throws Exception {
+        publishSourceCommit();
+
+        ShardStateStore activationFailingStore = new ShardStateStore() {
+            @Override
+            public Optional<VersionedShardHead> get(String indexUuid, int shardId) throws IOException {
+                return targetShardStateStore.get(indexUuid, shardId);
+            }
+
+            @Override
+            public CasResult compareAndSet(String indexUuid, int shardId, Optional<Long> expectedVersion, ShardHead newHead)
+                throws IOException {
+                throw new IOException("simulated activation failure");
+            }
+        };
+
+        expectThrows(
+            IOException.class,
+            () -> ShardSplitter.split(
+                SOURCE_INDEX_UUID,
+                SHARD_ID,
+                sourceManifestStore,
+                sourceShardStateStore,
+                sourcePinRegistry,
+                TARGET_INDEX_UUID,
+                SHARD_ID,
+                targetManifestStore,
+                activationFailingStore,
+                targetLineageStore,
+                targetPartitionStore,
+                1,
+                3,
+                System.currentTimeMillis()
+            )
+        );
+
+        assertTrue(
+            "the partition descriptor must be durable even when activation (the head CAS) itself "
+                + "fails -- it must never depend on activation having already succeeded",
+            targetPartitionStore.readDescriptor().isPresent()
+        );
+        assertTrue(
+            "a failed activation must leave no published target head",
+            targetShardStateStore.get(TARGET_INDEX_UUID, SHARD_ID).isEmpty()
+        );
     }
 }

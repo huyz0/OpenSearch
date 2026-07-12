@@ -8,6 +8,7 @@
 
 package org.opensearch.serverless.storage.clone;
 
+import org.opensearch.common.CheckedRunnable;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.manifest.CommitManifest;
 import org.opensearch.serverless.storage.manifest.PruningStats;
@@ -112,6 +113,73 @@ public final class ShardCloner {
         BlobContainerCloneLineageStore targetLineageStore,
         long nowMillis
     ) throws IOException {
+        clone(
+            sourceIndexUuid,
+            sourceShardId,
+            sourceManifestStore,
+            sourceShardStateStore,
+            sourcePinRegistry,
+            targetIndexUuid,
+            targetShardId,
+            targetManifestStore,
+            targetShardStateStore,
+            targetLineageStore,
+            nowMillis,
+            null
+        );
+    }
+
+    /**
+     * Same as the eleven-argument overload, with one addition: {@code beforeActivation}, run after
+     * every durable write up to and including the target's manifest, but strictly before the head
+     * {@link ShardStateStore#compareAndSet} below that is what actually makes the target shard
+     * visible/openable. {@code null} is a no-op, matching the eleven-argument overload's behavior
+     * exactly.
+     *
+     * <p>This exists for {@link org.opensearch.serverless.storage.resharding.ShardSplitter#split},
+     * which needs to durably write a {@code ShardPartitionDescriptor} before the target becomes
+     * openable -- not after, the way an earlier version of that class did it. Writing the
+     * descriptor after this method's own head CAS left a real window where an engine-open retry
+     * landing between the CAS succeeding and the descriptor write completing would cache "no
+     * partition filter" for that engine's entire lifetime, silently serving the full pre-split
+     * document set instead of just the target's own slice -- exactly the kind of TOCTOU this
+     * class's own pin-before-read fix (see this class's own javadoc, {@code formal/CloneGc.tla})
+     * already established the pattern for solving: do the extra durable write before the
+     * visibility-creating step, not after it.
+     *
+     * @param sourceIndexUuid the index being cloned from; must already have a published manifest.
+     * @param sourceShardId the shard number within {@code sourceIndexUuid}.
+     * @param sourceManifestStore where the source shard's manifests live.
+     * @param sourceShardStateStore where the source shard's head lives.
+     * @param sourcePinRegistry the source shard's durable pin registry, protected via this call.
+     * @param targetIndexUuid the brand-new index the clone creates; must not already have a
+     *                        published head -- cloning onto an already-active shard is refused,
+     *                        the same put-if-absent contract {@link ShardStateStore#compareAndSet}
+     *                        already gives every first activation.
+     * @param targetShardId the shard number within {@code targetIndexUuid}.
+     * @param targetManifestStore where the target shard's new manifest is written.
+     * @param targetShardStateStore where the target shard's new head is published.
+     * @param targetLineageStore where the target shard's {@link CloneLineage} is recorded.
+     * @param nowMillis the target manifest's {@link CommitManifest#createdAtMillis()} -- passed in
+     *                  rather than read internally so this class stays trivially deterministic to
+     *                  test.
+     * @param beforeActivation run after the manifest write, before the head CAS; {@code null} for none.
+     * @throws IOException if the source has no published manifest, or the target already does.
+     */
+    public static void clone(
+        String sourceIndexUuid,
+        int sourceShardId,
+        BlobContainerManifestStore sourceManifestStore,
+        ShardStateStore sourceShardStateStore,
+        DurablePinRegistry sourcePinRegistry,
+        String targetIndexUuid,
+        int targetShardId,
+        BlobContainerManifestStore targetManifestStore,
+        ShardStateStore targetShardStateStore,
+        BlobContainerCloneLineageStore targetLineageStore,
+        long nowMillis,
+        CheckedRunnable<IOException> beforeActivation
+    ) throws IOException {
         Optional<VersionedShardHead> sourceHead = sourceShardStateStore.get(sourceIndexUuid, sourceShardId);
         if (sourceHead.isEmpty() || sourceHead.get().head().latestManifestGeneration() == 0) {
             throw new IOException("source shard " + sourceIndexUuid + "/" + sourceShardId + " has no published manifest to clone from");
@@ -151,6 +219,10 @@ public final class ShardCloner {
             nowMillis
         );
         targetManifestStore.writeManifest(targetManifest);
+
+        if (beforeActivation != null) {
+            beforeActivation.run();
+        }
 
         CasResult result = targetShardStateStore.compareAndSet(
             targetIndexUuid,

@@ -415,6 +415,20 @@ real `IndexShard` actually applies an engine-supplied extra operation on shard s
 existing `IndexShardTests`/`InternalEngineTests` suites (264 tests) unchanged and passing, confirming
 this additive seam doesn't disturb any existing engine's recovery path.
 
+**Real bug found and fixed in a later whole-plugin review: WAL replay never decrypted a record's
+payload, breaking crash recovery whenever encryption and WAL mirroring were both configured.**
+`EncryptingWalChunkService` (&sect;12) encrypts each record's payload on the write side, and its own
+javadoc already documented that a reader must call `WalRecordCrypto#decryptAll` with the same key
+provider to get plaintext back -- but nothing on the replay path ever did. `WalReplayRecovery` handed
+a still-encrypted payload straight to `Translog.Operation#readOperation`, which failed with an opaque
+deserialization error rather than a clean, recognizable one. `ServerlessStorageWriterFailoverIT`'s own
+encryption-enabled case didn't catch it: its unflushed document happened to get flushed by a later
+call in the same test, so an actually-encrypted record's replay was never exercised. Fixed by
+threading the engine's existing `encryptionKeyProvider` through a new `WalReplayRecovery.replayOperations`
+overload, which decrypts each record before decoding it whenever a provider is supplied. A regression
+test in `WalReplayRecoveryTests` reproduces the bug directly against a real `EncryptingWalChunkService`
+(the same wrapper the writer engine uses) rather than hand-encrypting a record.
+
 **A real gap found and scoped while attempting the genuine crash-recovery test this section's own
 work enables -- since closed, see &sect;7.1.2 and this same section's own later "store population"
 paragraph below for the actual fix and its end-to-end proof: bundle materialization on writer
@@ -2940,6 +2954,20 @@ filter survives a real `DirectoryReader#openIfChanged` reopen after a new docume
 just that the wrapping code compiles -- plus a real three-way split over the transport layer in a
 running cluster (`ServerlessStorageShardSplitActionIT`), confirming a single source split more than
 once carries one independent pin per target rather than one clobbering another's.
+
+**Real bug found and fixed in a later whole-plugin review: a split target could serve its entire
+pre-split document set instead of just its own partition.** `ShardSplitter.split` used to write the
+`ShardPartitionDescriptor` only after `ShardCloner.clone` returned -- and that call's own head CAS
+is what makes the target shard visible/openable. An engine-open retry landing in the window between
+the CAS succeeding and the descriptor write completing would cache "no partition filter" for that
+engine's entire lifetime, silently returning every document instead of just the target's slice.
+This is exactly the TOCTOU class `formal/CloneGc.tla` was written to catch for `ShardCloner`'s own
+pin ordering, just one write later in the same sequence and never re-checked when `ShardSplitter`
+added it. Fixed by giving `ShardCloner#clone` an optional `beforeActivation` hook, run after the
+manifest write but strictly before the head CAS, so `ShardSplitter` now writes the descriptor durably
+before the target can ever become visible rather than after. A regression test proves the fix
+directly: with a `ShardStateStore` whose CAS always fails, the descriptor still lands durably
+(previously it wouldn't have, since the old code path never reached the write on a failed clone).
 
 **Physical bundle rewrite, closing the accepted-cost gap above -- done.** New
 `PartitionRewritePublisher` (`resharding` package) closes exactly the gap the previous paragraph
