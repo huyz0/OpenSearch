@@ -24,6 +24,7 @@ import org.opensearch.serverless.storage.format.BlobContainerBundleStore;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.manifest.PruningStats;
 import org.opensearch.serverless.storage.manifest.WalPosition;
+import org.opensearch.serverless.storage.security.RegisterDelegatingBlobContainer;
 import org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore;
 import org.opensearch.serverless.storage.shardstate.CasResult;
 import org.opensearch.serverless.storage.shardstate.ShardHead;
@@ -32,7 +33,9 @@ import org.opensearch.serverless.storage.shardstate.VersionedShardHead;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.util.Optional;
+import java.util.function.Predicate;
 
 public class ObjectStoreCommitHeadPublisherTests extends OpenSearchTestCase {
 
@@ -217,6 +220,162 @@ public class ObjectStoreCommitHeadPublisherTests extends OpenSearchTestCase {
             assertTrue("a writer resuming after a concurrent compaction must succeed at the next live generation", published);
             ShardHead head = shardStateStore.get(INDEX_UUID, SHARD_ID).orElseThrow().head();
             assertEquals(compactedGeneration + 1, head.latestManifestGeneration());
+        }
+    }
+
+    /**
+     * Fails the first {@code writeBlobAtomic}/{@code writeBlob} call whose blob name matches {@code
+     * failWhen}, then passes every subsequent call through -- simulates rfc-serverless-opensearch.md
+     * &sect;17's "kill writer mid-bundle-upload" / "mid-manifest-write" chaos cases via a single hard
+     * exception, same shape as {@code GcSchedulerTaskTests}' own {@code FaultInjectingBlobContainer}.
+     */
+    private static final class OneShotFailingBlobContainer extends RegisterDelegatingBlobContainer {
+
+        private final Predicate<String> failWhen;
+        private boolean failed;
+
+        OneShotFailingBlobContainer(BlobContainer delegate, Predicate<String> failWhen) {
+            super(delegate);
+            this.failWhen = failWhen;
+        }
+
+        @Override
+        protected BlobContainer wrapChild(BlobContainer child) {
+            return new OneShotFailingBlobContainer(child, failWhen);
+        }
+
+        @Override
+        public void writeBlobAtomic(String blobName, InputStream inputStream, long blobSize, boolean failIfAlreadyExists)
+            throws IOException {
+            maybeFail(blobName);
+            super.writeBlobAtomic(blobName, inputStream, blobSize, failIfAlreadyExists);
+        }
+
+        @Override
+        public void writeBlob(String blobName, InputStream inputStream, long blobSize, boolean failIfAlreadyExists) throws IOException {
+            maybeFail(blobName);
+            super.writeBlob(blobName, inputStream, blobSize, failIfAlreadyExists);
+        }
+
+        private void maybeFail(String blobName) throws IOException {
+            if (failed == false && failWhen.test(blobName)) {
+                failed = true;
+                throw new IOException("injected fault writing [" + blobName + "]");
+            }
+        }
+    }
+
+    public void testAKilledBundleUploadLeavesTheHeadUntouchedAndARetrySucceeds() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer rawContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        BlobContainer faultyContainer = new OneShotFailingBlobContainer(
+            rawContainer,
+            blobName -> blobName.startsWith(BlobContainerBundleStore.NAME_PREFIX)
+        );
+        ShardStateStore faultyShardStateStore = new BlobContainerShardStateStore(rawContainer);
+        ObjectStoreCommitHeadPublisher faultyHeadPublisher = new ObjectStoreCommitHeadPublisher(
+            new ObjectStoreCommitPublisher(new BlobContainerBundleStore(faultyContainer), new BlobContainerManifestStore(faultyContainer)),
+            faultyShardStateStore
+        );
+
+        try (Directory directory = new ByteBuffersDirectory()) {
+            SegmentInfos segmentInfos = commitOneDocument(directory, "1");
+
+            IOException failure = expectThrows(
+                IOException.class,
+                () -> faultyHeadPublisher.publishCommitAsHead(
+                    directory,
+                    segmentInfos,
+                    INDEX_UUID,
+                    SHARD_ID,
+                    1,
+                    0,
+                    0,
+                    new WalPosition("epoch-0", 0),
+                    0,
+                    PruningStats.empty()
+                )
+            );
+            assertTrue(failure.getMessage(), failure.getMessage().contains(BlobContainerBundleStore.NAME_PREFIX));
+
+            // The head must be completely untouched by a publish that never got past the bundle
+            // upload -- no orphaned/half-published head, matching ObjectStoreCommitPublisher's own
+            // "a crash between them leaves an orphaned bundle, never the reverse" invariant.
+            assertTrue("a killed bundle upload must never create a head", faultyShardStateStore.get(INDEX_UUID, SHARD_ID).isEmpty());
+
+            // A retry (the injected fault only fires once) must succeed cleanly and land at generation 1.
+            boolean published = faultyHeadPublisher.publishCommitAsHead(
+                directory,
+                segmentInfos,
+                INDEX_UUID,
+                SHARD_ID,
+                1,
+                0,
+                0,
+                new WalPosition("epoch-0", 0),
+                0,
+                PruningStats.empty()
+            );
+            assertTrue("a retry after the injected fault must succeed", published);
+            ShardHead head = faultyShardStateStore.get(INDEX_UUID, SHARD_ID).orElseThrow().head();
+            assertEquals(1, head.latestManifestGeneration());
+        }
+    }
+
+    public void testAKilledManifestWriteLeavesTheHeadUntouchedAndARetrySucceeds() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer rawContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        BlobContainer faultyContainer = new OneShotFailingBlobContainer(
+            rawContainer,
+            blobName -> blobName.startsWith(BlobContainerBundleStore.NAME_PREFIX) == false
+        );
+        ShardStateStore faultyShardStateStore = new BlobContainerShardStateStore(rawContainer);
+        ObjectStoreCommitHeadPublisher faultyHeadPublisher = new ObjectStoreCommitHeadPublisher(
+            new ObjectStoreCommitPublisher(new BlobContainerBundleStore(faultyContainer), new BlobContainerManifestStore(faultyContainer)),
+            faultyShardStateStore
+        );
+
+        try (Directory directory = new ByteBuffersDirectory()) {
+            SegmentInfos segmentInfos = commitOneDocument(directory, "1");
+
+            IOException failure = expectThrows(
+                IOException.class,
+                () -> faultyHeadPublisher.publishCommitAsHead(
+                    directory,
+                    segmentInfos,
+                    INDEX_UUID,
+                    SHARD_ID,
+                    1,
+                    0,
+                    0,
+                    new WalPosition("epoch-0", 0),
+                    0,
+                    PruningStats.empty()
+                )
+            );
+            assertFalse(failure.getMessage().contains(BlobContainerBundleStore.NAME_PREFIX));
+
+            // The bundle is now a real, harmless orphan (never referenced by any manifest) and the
+            // head is still completely untouched -- exactly ObjectStoreCommitPublisher's own
+            // documented "orphaned bundle... never the reverse" safety property, not a corrupted or
+            // half-visible state.
+            assertTrue("a killed manifest write must never create a head", faultyShardStateStore.get(INDEX_UUID, SHARD_ID).isEmpty());
+
+            boolean published = faultyHeadPublisher.publishCommitAsHead(
+                directory,
+                segmentInfos,
+                INDEX_UUID,
+                SHARD_ID,
+                1,
+                0,
+                0,
+                new WalPosition("epoch-0", 0),
+                0,
+                PruningStats.empty()
+            );
+            assertTrue("a retry after the injected fault must succeed", published);
+            ShardHead head = faultyShardStateStore.get(INDEX_UUID, SHARD_ID).orElseThrow().head();
+            assertEquals(1, head.latestManifestGeneration());
         }
     }
 }

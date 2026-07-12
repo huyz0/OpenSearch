@@ -47,12 +47,26 @@ public final class BlobContainerBundleStore implements BundleFileReader {
      * fetch byte ranges out of them concurrently with no coordination (rfc-serverless-opensearch.md
      * &sect;6.2).
      *
+     * <p><b>Idempotent under retry</b>, matching {@code ObjectStoreCommitPublisher#publishCommit}'s
+     * own documented contract: {@code bundleName} is fully deterministic per commit ({@code
+     * indexUuid}/{@code shardId}/{@code primaryTerm}/{@code generation}), so if it already exists
+     * -- e.g. an earlier attempt's bundle upload succeeded but a subsequent step (the manifest
+     * write) failed before that attempt could return -- this returns the packed bundle without
+     * re-uploading, rather than failing on {@code writeBlobAtomic}'s {@code failIfAlreadyExists}.
+     * Caught by a real chaos test (a fault injected between bundle upload and manifest write, then
+     * a bare retry) before this existed: the retry hit a raw {@code FileAlreadyExistsException}
+     * writing the exact same bundle name a previous, partially-successful attempt had already
+     * uploaded.
+     *
      * @param bundleName the name to upload the bundle under.
      * @param files the files to pack into the bundle, in bundle order.
      * @return the packed bundle, with its parsed file-entry map.
      */
     public SegmentBundle writeBundle(String bundleName, List<BundleFileContent> files) throws IOException {
         SegmentBundle bundle = BundleWriter.write(files);
+        if (blobContainer.blobExists(bundleName)) {
+            return bundle;
+        }
         try (InputStream in = new ByteArrayInputStream(bundle.bytes())) {
             blobContainer.writeBlobAtomic(bundleName, in, bundle.length(), true);
         }

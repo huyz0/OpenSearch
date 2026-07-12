@@ -69,6 +69,26 @@ public class BlobContainerBundleStoreTests extends OpenSearchTestCase {
         assertArrayEquals(files.get(files.size() - 1).content(), content);
     }
 
+    public void testWritingTheSameBundleNameTwiceIsAnIdempotentNoOpNotAFailure() throws Exception {
+        // ObjectStoreCommitPublisher relies on this: bundleName is fully deterministic per commit,
+        // so a retry after a fault between the bundle upload and the following manifest write must
+        // not fail on writeBlobAtomic's failIfAlreadyExists just because the first attempt's bundle
+        // upload already succeeded.
+        BlobContainerBundleStore store = new BlobContainerBundleStore(newFsBlobContainer());
+        List<BundleFileContent> files = List.of(new BundleFileContent("_0.si", randomByteArrayOfLength(256)));
+
+        SegmentBundle first = store.writeBundle("bundle-retry", files);
+        SegmentBundle second = store.writeBundle("bundle-retry", files);
+
+        assertArrayEquals(
+            "a retried write of the identical bundle must not fail or corrupt the existing blob",
+            first.bytes(),
+            second.bytes()
+        );
+        BundleHeader header = store.readHeader("bundle-retry", second.length());
+        assertEquals(1, header.entries().size());
+    }
+
     public void testCorruptedBundleDetectedOnRead() throws Exception {
         BlobContainer blobContainer = newFsBlobContainer();
         BlobContainerBundleStore store = new BlobContainerBundleStore(blobContainer);

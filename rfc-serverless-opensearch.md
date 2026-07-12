@@ -3521,19 +3521,42 @@ head untouched, and that naming a nonexistent index fails with a clear precondit
   manifest survives.
 - **Chaos**: kill writer mid-bundle-upload, mid-manifest-write, mid-WAL-chunk; kill readers
   mid-refresh; object store fault injection (throttling, 5xx storms, elevated latency) — the
-  mock repository infrastructure in-repo already supports much of this. **Status: elevated latency
-  and a first real fault-injection case are implemented and tested; broader throttling/5xx-storm
-  coverage is not.** `LatencyInjectingBlobContainer` (`benchmark` package) already covers elevated
-  latency, exercised by `ServerlessStorageReactivationUnderLatencyIT`. `GcSchedulerTaskTests#testSweepIsSafeToRetryAfterAnInjectedTransientObjectStoreFault`
+  mock repository infrastructure in-repo already supports much of this. **Status: elevated latency,
+  the GC-sweep fault-injection case, and kill-mid-bundle-upload/mid-manifest-write on the writer
+  path are all implemented and tested; kill-mid-WAL-chunk, kill-mid-refresh on the reader path, and
+  broader throttling/5xx-storm coverage are not.** `LatencyInjectingBlobContainer` (`benchmark`
+  package) already covers elevated latency, exercised by `ServerlessStorageReactivationUnderLatencyIT`.
+  `GcSchedulerTaskTests#testSweepIsSafeToRetryAfterAnInjectedTransientObjectStoreFault`
   adds a real throttling/5xx-storm-style case: a `FaultInjectingBlobContainer` (a `FilterBlobContainer`
   that throws on the first `deleteBlobsIgnoringIfNotExists` call, then succeeds) proves `GcSchedulerTask#sweep`'s
   own documented crash-safety property (bundles deleted before manifests, so a fault between the
   two steps is always retry-safe) holds under a real injected fault, not just a natural crash --
   the failed attempt leaves state completely untouched, and a bare retry converges to the correct
-  final state. This is one representative case, not a general chaos harness: kill-mid-bundle-upload/
-  mid-manifest-write/mid-WAL-chunk on the writer path, kill-mid-refresh on the reader path, and
-  broader probabilistic multi-operation throttling/5xx-storm injection across the whole plugin
-  remain open.
+  final state.
+
+  **Kill-mid-bundle-upload and kill-mid-manifest-write, closed together, and a real bug they
+  caught.** `ObjectStoreCommitHeadPublisherTests#testAKilledBundleUploadLeavesTheHeadUntouchedAndARetrySucceeds`/
+  `#testAKilledManifestWriteLeavesTheHeadUntouchedAndARetrySucceeds` inject a one-shot hard
+  `IOException` (a `OneShotFailingBlobContainer`, same shape as `GcSchedulerTaskTests`' own fault
+  injector) at each of the two write points `ObjectStoreCommitPublisher#publishCommit` makes,
+  confirm the shard head is left completely untouched by the killed attempt (matching that class's
+  own "a crash between them leaves an orphaned bundle... never the reverse" documented invariant),
+  then confirm a bare retry succeeds. **The kill-mid-bundle-upload test caught a real bug, not a
+  hypothetical one**: `publishCommit`'s own javadoc already claimed retries are idempotent because
+  `(primaryTerm, generation)` fully determines the bundle name -- true for the manifest (checked via
+  `manifestStore.manifestExists` before doing any work) but not, until now, for the bundle itself.
+  A retry after a fault that hit *after* the bundle upload succeeded but *before* the manifest write
+  (i.e. exactly the kill-mid-manifest-write case) would recompute the identical, deterministic
+  bundle name and call `writeBlobAtomic(..., failIfAlreadyExists=true)` against a blob already
+  sitting there from the killed attempt -- a raw `FileAlreadyExistsException`, forever, since the
+  target generation never advances until a publish actually succeeds. Fixed in
+  `BlobContainerBundleStore#writeBundle`: check `blobContainer.blobExists(bundleName)` first and
+  skip the (otherwise-redundant) upload if it's already there, matching the manifest side's own
+  existence-check idempotency exactly. Verified meaningfully, not just added: reverting the fix
+  reproduces the exact `FileAlreadyExistsException` the chaos test was written to catch.
+
+  Kill-mid-WAL-chunk on the writer path, kill-mid-refresh on the reader path, and broader
+  probabilistic multi-operation throttling/5xx-storm injection across the whole plugin remain open.
 - **Staleness/consistency**: linearizability-style checker for the RYW path (indexed doc with
   generation token must be visible to a routed search); monotonicity checker for readers.
   **Status: implemented and tested, now that the RYW primitive itself exists (see &sect;8).**
