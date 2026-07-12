@@ -1451,25 +1451,38 @@ suspended shard on the next real request against it (writer and reader roles ind
 guarding against suspend/reactivate flapping.
 
 **The fourth bullet (mandatory remote cluster state) is now implemented too, closing out all four
-bullets of this section.** `ServerlessStorageIndexSettingProvider` -- the same seam that already
-translates the lazy-directory and existing-shards-allocator settings and rejects the conflicting
-replication-type combo above -- now also rejects `index.serverless_storage.enabled=true` at index
-creation time unless the node has `cluster.remote_store.state.enabled=true` (core's
+bullets of this section.** Rejects `index.serverless_storage.enabled=true` at index creation time
+unless the node has `cluster.remote_store.state.enabled=true` (core's
 `RemoteClusterStateService.REMOTE_CLUSTER_STATE_ENABLED_SETTING`, a `Property.Final` node-level
-flag). The provider learns the node's resolved value via a late setter (`setRemoteClusterStateEnabled`,
-wired from `ServerlessStoragePlugin#createComponents`, the same "constructed eagerly, wired late"
-shape `ServerlessStorageExistingShardsAllocator#setDependencies` already uses) since `IndexSettingProvider`
-itself only ever sees per-request index settings, never node-level ones. Verified with unit tests
-(rejects when disabled, allows when enabled, ordinary non-serverless indices unaffected either way)
-confirmed meaningful by reverting and watching the new tests fail to compile -- and, since this
-check runs on every real index creation, by a full `internalClusterTest` sweep (every one of this
-plugin's ~26 IT classes creates at least one serverless-storage index): the first sweep attempt
-caught a real, broad regression this change introduced (every one of those IT classes failed,
-since none of their test clusters had remote cluster state enabled), fixed by adding a shared
-`ServerlessStorageIntegTestCase` base class (and, for the four IT classes that couldn't extend it
-because they already extend core's `RemoteStoreBaseIntegTestCase`, by adding the setting directly
-to those four classes' own `nodeSettings` overrides) so every test cluster this plugin's IT suite
-starts satisfies its own new prerequisite. Re-run clean after the fix.
+flag). Verified with unit tests (rejects when disabled, allows when enabled, ordinary
+non-serverless indices unaffected either way) confirmed meaningful by reverting and watching the
+new tests fail to compile -- and, since this check runs on every real index creation, by a full
+`internalClusterTest` sweep (every one of this plugin's ~26 IT classes creates at least one
+serverless-storage index): the first sweep attempt caught a real, broad regression this change
+introduced (every one of those IT classes failed, since none of their test clusters had remote
+cluster state enabled), fixed by adding a shared `ServerlessStorageIntegTestCase` base class (and,
+for the four IT classes that couldn't extend it because they already extend core's
+`RemoteStoreBaseIntegTestCase`, by adding the setting directly to those four classes' own
+`nodeSettings` overrides) so every test cluster this plugin's IT suite starts satisfies its own new
+prerequisite.
+
+**Moved to a real `IndexCreationValidator`, closing a design gap code review caught.** Originally
+built on `ServerlessStorageIndexSettingProvider` -- the same seam that translates the
+lazy-directory and existing-shards-allocator settings and rejects the conflicting replication-type
+combo above -- since that interface only ever sees per-request index settings, never node-level
+ones, the node's resolved remote-cluster-state value had to be smuggled in via a late-setter
+mutable field (`setRemoteClusterStateEnabled`, wired from `ServerlessStoragePlugin#createComponents`),
+directly contradicting that class's own "no configuration state" javadoc and forcing every
+pre-existing test in its suite to route through a special constructor helper first. Moved to a new
+`ServerlessStorageRemoteClusterStateValidator implements IndexCreationValidator`, registered via
+`Plugin#getIndexCreationValidators()`: `IndexCreationValidator#validate` receives a real
+`IndexSettings` per call, and `IndexSettings#getNodeSettings()` already exposes real node settings
+with no injection, no ordering hazard, and no mutable state needed at all, so the new validator is
+a genuinely stateless function of its arguments and `ServerlessStorageIndexSettingProvider` is back
+to being the pure function of request settings its own javadoc always claimed. Verified: reverting
+the new validator class fails the plugin's own compile (its registration site no longer resolves);
+a full `internalClusterTest` sweep re-run clean after the migration, confirming every IT's index
+creation still succeeds under the new enforcement path.
 
 ## 11. API Surface in Serverless Mode
 

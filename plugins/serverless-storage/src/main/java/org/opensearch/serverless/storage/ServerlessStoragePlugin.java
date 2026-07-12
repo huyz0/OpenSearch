@@ -28,6 +28,7 @@ import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.env.Environment;
 import org.opensearch.env.NodeEnvironment;
+import org.opensearch.index.IndexCreationValidator;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.shard.IndexSettingProvider;
@@ -126,13 +127,6 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      */
     private final org.opensearch.serverless.storage.allocation.ServerlessStorageExistingShardsAllocator serverlessStorageExistingShardsAllocator =
         new org.opensearch.serverless.storage.allocation.ServerlessStorageExistingShardsAllocator();
-
-    /**
-     * Constructed eagerly for the same reason as {@link #serverlessStorageExistingShardsAllocator}:
-     * {@link #getAdditionalIndexSettingProviders()} is called before {@link #createComponents}
-     * runs, and this is the instance returned from there.
-     */
-    private final ServerlessStorageIndexSettingProvider serverlessStorageIndexSettingProvider = new ServerlessStorageIndexSettingProvider();
 
     /**
      * The {@code index.store.type} value that opts a reader (search-only) shard copy into a
@@ -751,9 +745,6 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             clusterService,
             SERVERLESS_STORAGE_READER_CACHE_AFFINITY_TTL_SETTING.get(environment.settings()).millis()
         );
-        serverlessStorageIndexSettingProvider.setRemoteClusterStateEnabled(
-            org.opensearch.gateway.remote.RemoteClusterStateService.REMOTE_CLUSTER_STATE_ENABLED_SETTING.get(environment.settings())
-        );
         TimeValue scaleToZeroEvalInterval = SERVERLESS_STORAGE_SCALE_TO_ZERO_EVAL_INTERVAL_SETTING.get(environment.settings());
         if (scaleToZeroEvalInterval.millis() > 0) {
             boolean suspendEnabled = SERVERLESS_STORAGE_SCALE_TO_ZERO_SUSPEND_ENABLED_SETTING.get(environment.settings());
@@ -1208,7 +1199,17 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
 
     @Override
     public Collection<IndexSettingProvider> getAdditionalIndexSettingProviders() {
-        return Collections.singletonList(serverlessStorageIndexSettingProvider);
+        return Collections.singletonList(new ServerlessStorageIndexSettingProvider());
+    }
+
+    /**
+     * Registers {@link ServerlessStorageRemoteClusterStateValidator} -- see that class's own
+     * javadoc for why this check belongs on {@link IndexCreationValidator}, not {@link
+     * IndexSettingProvider} (which is where it originally lived).
+     */
+    @Override
+    public Collection<IndexCreationValidator> getIndexCreationValidators() {
+        return Collections.singletonList(new ServerlessStorageRemoteClusterStateValidator());
     }
 
     /**

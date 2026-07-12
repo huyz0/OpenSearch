@@ -11,7 +11,6 @@ package org.opensearch.serverless.storage;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.routing.allocation.ExistingShardsAllocator;
 import org.opensearch.common.settings.Settings;
-import org.opensearch.gateway.remote.RemoteClusterStateService;
 import org.opensearch.index.IndexModule;
 import org.opensearch.index.shard.IndexSettingProvider;
 import org.opensearch.indices.replication.common.ReplicationType;
@@ -60,42 +59,10 @@ public final class ServerlessStorageIndexSettingProvider implements IndexSetting
     /** Creates a provider with no configuration state; all decisions are derived from the settings passed to it. */
     public ServerlessStorageIndexSettingProvider() {}
 
-    // Set once, via #setRemoteClusterStateEnabled, by ServerlessStoragePlugin#createComponents --
-    // constructed eagerly (getAdditionalIndexSettingProviders runs before createComponents, the
-    // same ordering ServerlessStorageExistingShardsAllocator's own late-setter already works
-    // around), so this defaults to false until createComponents runs. Every real index-creation
-    // request is handled long after node startup completes, so by the time this provider is ever
-    // actually asked to validate a request, the setter has always already run.
-    private volatile boolean remoteClusterStateEnabled;
-
-    /**
-     * Wires this provider's mandatory-remote-cluster-state enforcement (rfc-serverless-opensearch.md
-     * &sect;10, "cluster state: remote cluster state ... becomes mandatory in serverless mode") --
-     * late-setter for the same reason {@code ShardReactivationActionFilter#setDependencies} and
-     * {@code ServerlessStorageExistingShardsAllocator#setDependencies} already are.
-     *
-     * @param remoteClusterStateEnabled the node's resolved {@link RemoteClusterStateService#REMOTE_CLUSTER_STATE_ENABLED_SETTING} value.
-     */
-    public void setRemoteClusterStateEnabled(boolean remoteClusterStateEnabled) {
-        this.remoteClusterStateEnabled = remoteClusterStateEnabled;
-    }
-
     @Override
     public Settings getAdditionalIndexSettings(String indexName, boolean isDataStreamIndex, Settings templateAndRequestSettings) {
         if (ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.get(templateAndRequestSettings) == false) {
             return Settings.EMPTY;
-        }
-        if (remoteClusterStateEnabled == false) {
-            throw new IllegalArgumentException(
-                "index ["
-                    + indexName
-                    + "] cannot set "
-                    + ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey()
-                    + "=true because this node does not have "
-                    + RemoteClusterStateService.REMOTE_CLUSTER_STATE_ENABLED_SETTING.getKey()
-                    + "=true: serverless storage requires remote cluster state to be enabled "
-                    + "cluster-wide (rfc-serverless-opensearch.md section 10)"
-            );
         }
         int numberOfWriterReplicas = IndexMetadata.INDEX_NUMBER_OF_REPLICAS_SETTING.get(templateAndRequestSettings);
         if (numberOfWriterReplicas > 0

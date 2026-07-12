@@ -11,64 +11,26 @@ package org.opensearch.serverless.storage;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.routing.allocation.ExistingShardsAllocator;
 import org.opensearch.common.settings.Settings;
-import org.opensearch.gateway.remote.RemoteClusterStateService;
 import org.opensearch.index.IndexModule;
 import org.opensearch.indices.replication.common.ReplicationType;
 import org.opensearch.serverless.storage.allocation.ServerlessStorageExistingShardsAllocator;
 import org.opensearch.test.OpenSearchTestCase;
 
+/**
+ * The mandatory-remote-cluster-state check this provider used to also enforce now lives on {@link
+ * ServerlessStorageRemoteClusterStateValidator} instead (see that class's own javadoc for why) --
+ * covered by {@link ServerlessStorageRemoteClusterStateValidatorTests}, not here. This provider is
+ * back to being a pure function of the request settings passed to it, exactly as its own
+ * constructor javadoc claims, so every test below constructs it with the plain no-arg constructor.
+ */
 public class ServerlessStorageIndexSettingProviderTests extends OpenSearchTestCase {
-
-    /**
-     * Every test unrelated to the mandatory-remote-cluster-state check itself needs this wired on,
-     * exactly as {@code ServerlessStoragePlugin#createComponents} always wires it before any real
-     * index-creation request is ever handled -- {@code remoteClusterStateEnabled} defaults to
-     * {@code false} only in the narrow window before that setter runs (see the field's own javadoc).
-     */
-    private static ServerlessStorageIndexSettingProvider newProviderWithRemoteClusterStateEnabled() {
-        ServerlessStorageIndexSettingProvider provider = new ServerlessStorageIndexSettingProvider();
-        provider.setRemoteClusterStateEnabled(true);
-        return provider;
-    }
-
-    public void testRejectsServerlessStorageWhenRemoteClusterStateIsNotEnabled() {
-        Settings requestSettings = Settings.builder()
-            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey(), true)
-            .build();
-
-        IllegalArgumentException e = expectThrows(
-            IllegalArgumentException.class,
-            () -> new ServerlessStorageIndexSettingProvider().getAdditionalIndexSettings("my-index", false, requestSettings)
-        );
-        assertTrue(e.getMessage().contains(ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey()));
-        assertTrue(e.getMessage().contains(RemoteClusterStateService.REMOTE_CLUSTER_STATE_ENABLED_SETTING.getKey()));
-    }
-
-    public void testAllowsServerlessStorageWhenRemoteClusterStateIsEnabled() {
-        Settings requestSettings = Settings.builder()
-            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey(), true)
-            .build();
-
-        Settings additional = newProviderWithRemoteClusterStateEnabled().getAdditionalIndexSettings("my-index", false, requestSettings);
-
-        assertEquals(
-            ServerlessStorageExistingShardsAllocator.NAME,
-            additional.get(ExistingShardsAllocator.EXISTING_SHARDS_ALLOCATOR_SETTING.getKey())
-        );
-    }
-
-    public void testMissingRemoteClusterStateDoesNotAffectAnOrdinaryIndex() {
-        Settings additional = new ServerlessStorageIndexSettingProvider().getAdditionalIndexSettings("my-index", false, Settings.EMPTY);
-
-        assertTrue("an index that never opted into serverless storage must never be rejected on this basis", additional.isEmpty());
-    }
 
     public void testInjectsTheCustomAllocatorForAnIndexThatOptsIntoServerlessStorage() {
         Settings requestSettings = Settings.builder()
             .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey(), true)
             .build();
 
-        Settings additional = newProviderWithRemoteClusterStateEnabled().getAdditionalIndexSettings("my-index", false, requestSettings);
+        Settings additional = new ServerlessStorageIndexSettingProvider().getAdditionalIndexSettings("my-index", false, requestSettings);
 
         assertEquals(
             ServerlessStorageExistingShardsAllocator.NAME,
@@ -77,7 +39,7 @@ public class ServerlessStorageIndexSettingProviderTests extends OpenSearchTestCa
     }
 
     public void testAddsNothingForAnOrdinaryIndex() {
-        Settings additional = newProviderWithRemoteClusterStateEnabled().getAdditionalIndexSettings("my-index", false, Settings.EMPTY);
+        Settings additional = new ServerlessStorageIndexSettingProvider().getAdditionalIndexSettings("my-index", false, Settings.EMPTY);
 
         assertTrue("an index that never opted in must get no additional settings at all", additional.isEmpty());
     }
@@ -90,7 +52,7 @@ public class ServerlessStorageIndexSettingProviderTests extends OpenSearchTestCa
 
         IllegalArgumentException e = expectThrows(
             IllegalArgumentException.class,
-            () -> newProviderWithRemoteClusterStateEnabled().getAdditionalIndexSettings("my-index", false, requestSettings)
+            () -> new ServerlessStorageIndexSettingProvider().getAdditionalIndexSettings("my-index", false, requestSettings)
         );
         assertTrue(e.getMessage().contains(ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey()));
         assertTrue(e.getMessage().contains(IndexMetadata.INDEX_REPLICATION_TYPE_SETTING.getKey()));
@@ -104,7 +66,7 @@ public class ServerlessStorageIndexSettingProviderTests extends OpenSearchTestCa
             .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey(), true)
             .build();
 
-        Settings additional = newProviderWithRemoteClusterStateEnabled().getAdditionalIndexSettings("my-index", false, requestSettings);
+        Settings additional = new ServerlessStorageIndexSettingProvider().getAdditionalIndexSettings("my-index", false, requestSettings);
 
         assertEquals(
             ServerlessStorageExistingShardsAllocator.NAME,
@@ -118,7 +80,7 @@ public class ServerlessStorageIndexSettingProviderTests extends OpenSearchTestCa
             .put(IndexMetadata.INDEX_REPLICATION_TYPE_SETTING.getKey(), ReplicationType.DOCUMENT.toString())
             .build();
 
-        Settings additional = newProviderWithRemoteClusterStateEnabled().getAdditionalIndexSettings("my-index", false, requestSettings);
+        Settings additional = new ServerlessStorageIndexSettingProvider().getAdditionalIndexSettings("my-index", false, requestSettings);
 
         assertEquals(
             ServerlessStorageExistingShardsAllocator.NAME,
@@ -139,7 +101,7 @@ public class ServerlessStorageIndexSettingProviderTests extends OpenSearchTestCa
             .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
             .build();
 
-        Settings additional = newProviderWithRemoteClusterStateEnabled().getAdditionalIndexSettings("my-index", false, requestSettings);
+        Settings additional = new ServerlessStorageIndexSettingProvider().getAdditionalIndexSettings("my-index", false, requestSettings);
 
         assertEquals(
             ServerlessStorageExistingShardsAllocator.NAME,
@@ -152,7 +114,7 @@ public class ServerlessStorageIndexSettingProviderTests extends OpenSearchTestCa
             .put(IndexMetadata.INDEX_REPLICATION_TYPE_SETTING.getKey(), ReplicationType.SEGMENT.toString())
             .build();
 
-        Settings additional = newProviderWithRemoteClusterStateEnabled().getAdditionalIndexSettings("my-index", false, requestSettings);
+        Settings additional = new ServerlessStorageIndexSettingProvider().getAdditionalIndexSettings("my-index", false, requestSettings);
 
         assertTrue("an index that never opted into serverless storage must never be rejected on this basis", additional.isEmpty());
     }
@@ -163,7 +125,7 @@ public class ServerlessStorageIndexSettingProviderTests extends OpenSearchTestCa
             .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_LAZY_DIRECTORY_ENABLED_SETTING.getKey(), true)
             .build();
 
-        Settings additional = newProviderWithRemoteClusterStateEnabled().getAdditionalIndexSettings("my-index", false, requestSettings);
+        Settings additional = new ServerlessStorageIndexSettingProvider().getAdditionalIndexSettings("my-index", false, requestSettings);
 
         assertEquals(ServerlessStoragePlugin.LAZY_DIRECTORY_STORE_TYPE, additional.get(IndexModule.INDEX_STORE_TYPE_SETTING.getKey()));
     }
@@ -173,7 +135,7 @@ public class ServerlessStorageIndexSettingProviderTests extends OpenSearchTestCa
             .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey(), true)
             .build();
 
-        Settings additional = newProviderWithRemoteClusterStateEnabled().getAdditionalIndexSettings("my-index", false, requestSettings);
+        Settings additional = new ServerlessStorageIndexSettingProvider().getAdditionalIndexSettings("my-index", false, requestSettings);
 
         assertNull(
             "index.store.type must stay unset (normal FSDirectory) unless the lazy directory feature is explicitly enabled",
