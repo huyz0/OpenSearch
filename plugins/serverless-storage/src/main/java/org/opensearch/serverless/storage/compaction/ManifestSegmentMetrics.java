@@ -32,6 +32,21 @@ import java.util.Map;
  * corrupted update"), underestimating delete ratio only means the delete-reclaim trigger in {@link
  * CompactionPolicy#shouldCompact} never fires from this estimator -- a missed optimization, not a
  * correctness issue; the segment-count/size triggers are unaffected and remain accurate.
+ *
+ * <p><b>Confirmed empirically, not just asserted from reading Lucene's source</b>: a per-segment
+ * live-docs file (Lucene's {@code .liv}) looked like a plausible manifest-metadata-only proxy for
+ * "this segment has deletions" -- but it is not, because it only ever gets written for *hard*
+ * deletes. A real {@code ObjectStoreWriterEngine}, indexing two documents then soft-deleting one
+ * (the default deletion path every OpenSearch index actually uses, {@code
+ * index.soft_deletes.enabled=true}) and flushing, produces a manifest with <em>no</em> {@code .liv}
+ * file at all -- the soft-delete instead shows up only as a doc-values field-generation update
+ * ({@code SegmentCommitInfo#getSoftDelCount()} is 1, {@code hasDeletions()} is {@code false}). A
+ * {@code .liv}-presence heuristic would therefore silently do nothing for the dominant real-world
+ * deletion path while looking like real logic -- worse than the honest {@code 0.0} this class
+ * already returns. No other manifest-metadata-only signal for soft-delete count was found that
+ * doesn't share this same blind spot or a worse one (e.g. a doc-values generation bump is not
+ * specific to deletions at all), so this remains unimplemented rather than shipped as something
+ * that looks like it works but mostly doesn't.
  */
 public final class ManifestSegmentMetrics {
 

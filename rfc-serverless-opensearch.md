@@ -2925,6 +2925,18 @@ doc-values data, not its file name or size) and is always reported as `0.0`; per
 fires from this estimator, a missed optimization rather than a correctness issue -- the
 segment-count/size triggers, which don't depend on it, are unaffected.
 
+**Checked for a manifest-metadata-only proxy signal, and confirmed empirically that none of the
+obvious ones work.** A per-segment live-docs file (Lucene's `.liv`) looked like a plausible
+"has deletions" signal derivable from the file list alone, without opening a bundle -- but a real
+`ObjectStoreWriterEngine` test (index two docs, soft-delete one, the default path every OpenSearch
+index actually uses, then flush) produced a manifest with no `.liv` file at all: the soft-delete
+only shows up as a doc-values field-generation update (`SegmentCommitInfo#getSoftDelCount()==1`,
+`hasDeletions()==false`). `.liv` only ever gets written for *hard* deletes. A heuristic built on it
+would silently do nothing for the dominant real-world deletion path while looking like real logic
+-- worse than the honest `0.0` already returned, not better. No other manifest-metadata-only signal
+found avoids this same blind spot (or a worse one -- a doc-values generation bump isn't specific to
+deletions at all), so this remains genuinely unimplemented, not merely unattempted.
+
 **Real lease acquisition/renewal, closing a dormant fencing bug found while investigating this**:
 `ShardHead.leaseHolderNodeId`/`leaseExpiryMillis` existed from the start, but nothing ever wrote
 them -- `ShardHead#withNewLease` (the only method that touched them) had zero callers anywhere in
