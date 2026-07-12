@@ -3182,7 +3182,16 @@ directions documented so serverless adoption is not a one-way door.
 - **Staleness/consistency**: linearizability-style checker for the RYW path (indexed doc with
   generation token must be visible to a routed search); monotonicity checker for readers.
 - **GC safety**: long-running PIT queries concurrent with aggressive ingest+merge; assert no
-  read ever touches a deleted object.
+  read ever touches a deleted object. **Status: implemented and tested.**
+  `GcSchedulerTaskTests#testPitPinSurvivesConcurrentAggressiveIngestAndGcSweeps` runs three real
+  concurrent threads against real `FsBlobContainer`-backed stores: one durably pins a generation
+  (standing in for an open PIT) and repeatedly reads its manifest and confirms its bundle still
+  exists; one aggressively "ingests" (writes 30 new superseding generations back to back); one runs
+  GC sweeps in a tight loop with a minimal retention window, so every unpinned superseded
+  generation is immediately eligible for deletion. After the concurrent phase, the pin is removed
+  and one final sweep confirms the generation IS then reclaimed -- closing the loop that its
+  earlier survival was really the pin doing its job, not GC merely never getting a chance to run.
+  Verified stable across 5 repeated runs with no flakes.
 - **Cost accounting**: per-workload object-store request counts as a regression metric —
   a change that doubles PUT count is a failed build, same as a latency regression.
   **Status: implemented for the publish path.** `CostAccountingRegressionTests` wraps a real `FsBlobContainer`
