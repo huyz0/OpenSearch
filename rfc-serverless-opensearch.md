@@ -3434,8 +3434,8 @@ bundle/WAL batch parameters, API gating audit, and autoscaling signal calibratio
 ongoing Phase 5 work.
 
 **Phase 6 — Migration tooling. The packaging mechanism both migration directions ultimately need
-is implemented and tested; the per-direction orchestration (resolving a real, currently-open shard,
-or reading a source repository's own on-disk metadata format directly) is not.** `ClassicIndexMigrator#migrate`
+is implemented and tested; one direction's per-direction orchestration -- resolving a real,
+currently-open shard on this node -- is now also done.** `ClassicIndexMigrator#migrate`
 proves the "conversion is manifest synthesis... not data re-upload" claim directly: by the time any
 shard is open and recoverable at all -- classic peer/translog recovery, a core remote-store
 restore, or a snapshot-mount import, it makes no difference -- its store directory holds an
@@ -3445,15 +3445,42 @@ CASes it in as the shard's first-ever serverless-storage head, refusing outright
 overwriting if one already exists. This makes both migration directions this bullet names the same
 mechanical operation from here on, once a caller has a `Directory`/`SegmentInfos` pair in hand.
 
-What remains open is genuinely per-direction: reaching a real, currently-open `IndexShard`'s local
-`Store` from a transport action needs new `IndicesService` wiring this plugin has never used
-elsewhere; reading a classic repository's or remote-store's own on-disk metadata format directly
-(an alternative that could avoid requiring the shard be locally recovered first) depends on those
-formats' internals this plugin hasn't taken on. Both are real future work, not attempted here.
-Verified: migrating an already-populated directory produces a manifest a genuine `ObjectStoreReaderEngine`
-actually opens and serves the migrated document through, not merely a manifest object with
-plausible-looking fields; migrating a shard that already has a serverless-storage head fails
-outright, leaving the existing head completely untouched.
+**`MigrateShardAction`/`TransportMigrateShardAction` close the "reaching a real, currently-open
+`IndexShard`'s local `Store`" half of what used to be open** -- the `IndicesService` wiring this
+plugin had never used elsewhere turned out to be standard core API, the same shape core's own
+`TransportShardFlushAction`/`TransportShardRefreshAction` already use, not a design gap: `@Inject`
+an `IndicesService`, resolve the request's `indexUuid` against live cluster state (the same
+real-index precondition check &sect;16 Phase 4's shard-split validation just established),
+`indicesService.indexService(index)` (nullable, not `indexServiceSafe`, which throws a raw core
+exception) and `IndexService#getShardOrNull` to reach the live shard without ever crashing on a
+misrouted request, `store.incRef()`/`decRef()` to hold it safely open, then read the current
+commit's `Directory`/`SegmentInfos` and its `maxSeqNo`/`localCheckpoint` straight from
+`segmentInfos.userData` -- the same fields `ObjectStoreWriterEngine#commitIndexWriter` reads, not
+the shard's live in-memory state, which could have advanced past what this specific commit covers
+-- and delegate to `ClassicIndexMigrator#migrate` unchanged. Same single-node-routing contract as
+`PollNowAction`/`WaitForGenerationAction`: the caller already knows which node hosts the shard and
+routes there directly (`POST /_plugins/_serverless/storage/{index_uuid}/{shard_id}/_migrate`); a
+request that lands on the wrong node gets a clear, actionable error naming the problem, not an
+opaque core `IndexNotFoundException`/`ShardNotFoundException` a caller could mistake for the index
+not existing at all. **A real bug this exact distinction caught during testing**: the first version
+used `indexServiceSafe`/`getShard` (the throwing variants) and passed `internalClusterTest`s that
+happened, by luck of the test framework's random node selection, to route through the node that
+actually hosted the shard -- but failed intermittently when routed through the cluster-manager-only
+node instead, which never hosts any shard. Fixed by switching to the nullable variants with an
+explicit check, and by making the tests route deliberately (`internalCluster().client(dataNodeName)`)
+rather than relying on chance, matching the real single-node-routing contract instead of
+accidentally depending on which node the test framework happened to pick.
+
+**Still open**: reading a classic repository's or remote-store's own on-disk metadata format
+directly (an alternative that could avoid requiring the shard be locally recovered first) depends
+on those formats' internals this plugin hasn't taken on -- real future work, not attempted here.
+Verified end to end over the real transport layer, not just at the unit level (`ClassicIndexMigratorTests`
+already covered the packaging mechanism against a synthetic `Directory`): `ServerlessStorageMigrateShardActionIT`
+indexes a real document through a real classic (non-serverless-storage) writer engine, migrates its
+live shard in place via a real two-node cluster, and confirms the adopted manifest's `maxSeqNo`/
+`localCheckpoint` and materialized document count are exactly right, that the still-running classic
+engine is untouched, that migrating an already-migrated shard fails outright leaving the existing
+head untouched, and that naming a nonexistent index fails with a clear precondition error.
 
 ## 17. Testing Strategy
 
