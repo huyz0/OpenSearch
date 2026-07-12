@@ -72,7 +72,9 @@ import org.opensearch.serverless.storage.wal.WalChunkService;
 import org.opensearch.serverless.storage.writerengine.ObjectStoreCommitHeadPublisher;
 import org.opensearch.serverless.storage.writerengine.ObjectStoreCommitPublisher;
 import org.opensearch.serverless.storage.writerengine.WriterEngineFactory;
+import org.opensearch.serverless.storage.writerengine.WriterPublicationNotifier;
 import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.transport.TransportService;
 import org.opensearch.transport.client.Client;
 import org.opensearch.watcher.ResourceWatcherService;
 
@@ -615,6 +617,14 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     // actually available" reasoning as every other field in this group -- getEngineFactory reads
     // this to configure each produced WriterEngineFactory's own rate limiter.
     private volatile long publicationRateLimitMillis;
+    // Resolved once in createComponents, needed by writerPublicationNotifierForWriterEngine()
+    // below to build a WriterPublicationNotifier.
+    private volatile Settings nodeSettings;
+    // Resolved once in createComponents -- createComponents itself has no TransportService
+    // parameter, so this stays null until TransportPollNowAction's own constructor sets it (see
+    // that class's javadoc for why it's the seam that captures this instead).
+    private volatile ClusterService clusterService;
+    private volatile TransportService transportService;
     // Resolved once in createComponents, same "read the NodeScope setting where Environment is
     // actually available" reasoning as every other field in this group -- TransportScaleToZeroCandidatesAction
     // reads these as its per-request defaults, overridable per ScaleToZeroCandidatesRequest.
@@ -731,6 +741,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         Supplier<RepositoriesService> repositoriesServiceSupplier
     ) {
         this.threadPool = threadPool;
+        this.nodeSettings = environment.settings();
+        this.clusterService = clusterService;
         this.repositoriesServiceSupplier = repositoriesServiceSupplier;
         this.repositoryName = SERVERLESS_STORAGE_REPOSITORY_SETTING.get(environment.settings());
         this.scaleToZeroIdleThresholdMillis = SERVERLESS_STORAGE_SCALE_TO_ZERO_IDLE_THRESHOLD_SETTING.get(environment.settings()).millis();
@@ -1054,7 +1066,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                     encryptionKeyProvider,
                     shardActivityRegistry,
                     dedicatedWalGcConfig,
-                    publicationRateLimitMillis
+                    publicationRateLimitMillis,
+                    writerPublicationNotifierForWriterEngine()
                 )
             );
         } catch (IOException e) {
@@ -1487,6 +1500,36 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      */
     public org.opensearch.serverless.storage.readerengine.ReaderShardActivityRegistry readerShardActivityRegistry() {
         return readerShardActivityRegistry;
+    }
+
+    /**
+     * Captures this node's {@link TransportService} -- called exactly once, by {@link
+     * org.opensearch.serverless.storage.readerengine.action.TransportPollNowAction}'s own
+     * constructor, since {@link #createComponents} has no {@code TransportService} parameter to
+     * capture it from directly. See that action's javadoc for why it's the seam that does this.
+     *
+     * @param transportService this node's transport service.
+     */
+    public void setTransportService(TransportService transportService) {
+        this.transportService = transportService;
+    }
+
+    /**
+     * Builds a fresh {@link WriterPublicationNotifier} for {@link #getEngineFactory} to hand to a
+     * produced {@code WriterEngineFactory}, or {@code null} if {@link #setTransportService} hasn't
+     * run yet -- in practice this never happens for a real writer shard (every registered transport
+     * action, including {@code TransportPollNowAction}, is constructed as an eager Guice singleton
+     * well before any shard exists), but a test building a {@code WriterEngineFactory} against a
+     * bare plugin instance that never went through real node bootstrap gets a clean {@code null}
+     * (disabling notification, same shape as every other optional feature in this plugin) instead
+     * of a {@link NullPointerException}.
+     */
+    public WriterPublicationNotifier writerPublicationNotifierForWriterEngine() {
+        TransportService currentTransportService = transportService;
+        if (currentTransportService == null) {
+            return null;
+        }
+        return new WriterPublicationNotifier(nodeSettings, currentTransportService, clusterService);
     }
 
     /**

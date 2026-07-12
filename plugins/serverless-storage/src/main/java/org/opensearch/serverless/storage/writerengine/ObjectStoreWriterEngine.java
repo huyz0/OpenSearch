@@ -147,6 +147,9 @@ public class ObjectStoreWriterEngine extends InternalEngine {
      */
     private final long publicationRateLimitMillis;
 
+    /** {@code null} disables writer-side publication notification entirely -- see that class's own javadoc. */
+    private final WriterPublicationNotifier publicationNotifier;
+
     /**
      * Set (via {@link java.util.concurrent.atomic.AtomicLong#compareAndSet}, so two concurrent
      * refreshes can't both win) to {@code engineConfig.getThreadPool().relativeTimeInMillis()}
@@ -453,6 +456,65 @@ public class ObjectStoreWriterEngine extends InternalEngine {
             encryptionKeyProvider,
             dedicatedWalGcSchedulerTask,
             publicationRateLimitMillis,
+            null
+        );
+    }
+
+    /**
+     * Creates a fully-configured writer engine, additionally notifying reader copies after each
+     * publish (rfc-serverless-opensearch.md &sect;8).
+     *
+     * @param engineConfig the core engine configuration for this shard
+     * @param headPublisher publishes commits and manages lease acquisition/renewal for this shard's head
+     * @param shardDirectory the shard's directory-registry entry, refreshed periodically while this engine is active
+     * @param localNodeId the id of the node this engine is activating on
+     * @param pitrRetentionConfig {@code null} disables the periodic PITR retention reconciliation task; non-null schedules it
+     * @param walChunkService {@code null} disables WAL mirroring entirely, same shape as every other optional feature in this plugin.
+     * @param encryptionKeyProvider {@code null} leaves WAL-mirrored records unencrypted; non-null
+     *                              wraps {@code walChunkService} in an {@code EncryptingWalChunkService}.
+     * @param dedicatedWalGcSchedulerTask {@code null} for a shard sharing the node-level WAL
+     *                                    container (its retention is swept by that container's own
+     *                                    node-level task instead); non-null for a shard on a
+     *                                    dedicated WAL stream, whose container this engine then owns
+     *                                    sweeping for as long as it stays open -- see this field's
+     *                                    own javadoc for why ownership lives here.
+     * @param publicationRateLimitMillis non-positive (the default) disables rate limiting: every
+     *                                   {@code api}/{@code schedule}-sourced refresh may trigger a
+     *                                   publish (still a no-op if nothing has changed since the last
+     *                                   commit, since it flows through the same non-forcing {@link
+     *                                   #flush}). A positive value is the minimum real time between
+     *                                   two refresh-triggered publish attempts on this engine,
+     *                                   protecting the object store from a caller hammering
+     *                                   {@code _refresh}.
+     * @param publicationNotifier {@code null} disables writer-side publication notification
+     *                            (same shape as every other optional feature in this plugin);
+     *                            non-null notifies every reader copy of this shard after each
+     *                            successful publish -- see that class's own javadoc for the
+     *                            mechanism.
+     */
+    public ObjectStoreWriterEngine(
+        EngineConfig engineConfig,
+        ObjectStoreCommitHeadPublisher headPublisher,
+        ShardDirectory shardDirectory,
+        String localNodeId,
+        PitrRetentionConfig pitrRetentionConfig,
+        WalChunkService walChunkService,
+        org.opensearch.serverless.storage.security.EncryptionKeyProvider encryptionKeyProvider,
+        WalGcSchedulerTask dedicatedWalGcSchedulerTask,
+        long publicationRateLimitMillis,
+        WriterPublicationNotifier publicationNotifier
+    ) {
+        this(
+            engineConfig,
+            headPublisher,
+            shardDirectory,
+            localNodeId,
+            pitrRetentionConfig,
+            walChunkService,
+            encryptionKeyProvider,
+            dedicatedWalGcSchedulerTask,
+            publicationRateLimitMillis,
+            publicationNotifier,
             beginConstruction(walChunkService, encryptionKeyProvider)
         );
     }
@@ -468,10 +530,12 @@ public class ObjectStoreWriterEngine extends InternalEngine {
         org.opensearch.serverless.storage.security.EncryptionKeyProvider encryptionKeyProvider,
         WalGcSchedulerTask dedicatedWalGcSchedulerTask,
         long publicationRateLimitMillis,
+        WriterPublicationNotifier publicationNotifier,
         Void ignored
     ) {
         super(engineConfig);
         this.publicationRateLimitMillis = publicationRateLimitMillis;
+        this.publicationNotifier = publicationNotifier;
         CONSTRUCTION_WAL_CHUNK_SERVICE.remove();
         CONSTRUCTION_ENCRYPTION_KEY_PROVIDER.remove();
         this.activationWalPosition = CONSTRUCTION_ACTIVATION_WAL_POSITION.get();
@@ -1135,6 +1199,21 @@ public class ObjectStoreWriterEngine extends InternalEngine {
             // uploaded -- see ObjectStoreCommitPublisher's own "never the reverse" invariant), is
             // it safe to let local translog retention advance past these ops.
             translogDeletionPolicy.recordDurablePublication(maxSeqNo);
+            if (publicationNotifier != null) {
+                // Dispatched, never called inline: commitIndexWriter can run synchronously inside
+                // a cluster-state-applier callback (IndicesClusterStateService#updateShard ->
+                // IndexShard#flush, on initial shard start/promotion), and
+                // WriterPublicationNotifier#notifyReaders calls clusterService.state(), which
+                // ClusterApplierService asserts against reentrantly from that exact call stack --
+                // caught by ServerlessStoragePublicationNotificationIT before this dispatch existed.
+                engineConfig.getThreadPool().executor(ThreadPool.Names.GENERIC).execute(() -> {
+                    try {
+                        publicationNotifier.notifyReaders(indexUuid, shardId);
+                    } catch (Exception e) {
+                        logger.warn("failed to notify readers of new publication for shard [" + indexUuid + "][" + shardId + "]", e);
+                    }
+                });
+            }
         } catch (final EngineException ex) {
             failEngine("object-store commit publication fenced out", ex);
             throw ex;

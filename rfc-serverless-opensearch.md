@@ -1024,27 +1024,36 @@ returns a safe `attempted: false` rather than an error.
   (metadata-plane RFC §5), whose entries it already touches on every publication to bump the
   generation hint. Notifications are an optimization in either case; the object store is the
   truth. A reader that missed notifications (restart, partition, stale directory entry) lists
-  manifests and catches up. **Status: the receiving side is implemented and tested; the writer
-  never automatically sends one yet.** `ObjectStoreReaderEngine#pollNow()` is the real, public
-  entry point for forcing a specific reader engine to check for a newer manifest generation
-  immediately rather than waiting out its own 5s background poll -- the same underlying mechanism
-  `waitForGeneration` already uses internally, now reachable from outside the engine too.
-  `PollNowAction` (`POST /_plugins/_serverless/storage/{index}/{shard}/_poll_now`, dispatched off
-  the transport thread since it does real blob-store I/O) exposes this per (index, shard) on
-  whichever node receives the request, same single-node routing shape as `WaitForGenerationAction`.
-  What this does NOT yet do: have `ObjectStoreWriterEngine#commitIndexWriter` automatically call
-  this against every reader after a successful publish. That final wiring needs a `Client`/`TransportService`
-  threaded through the writer engine's own construction (currently has neither) and a real answer
-  to "where does the writer learn reader locations" -- the directory tier this plugin already
-  builds (`ShardDirectory`) is the natural fit the RFC itself names, but it's deliberately a single
-  soft hint per shard, not an enumerable multi-replica list, so even wiring it in would only ever
-  notify one reader copy, not every one. Given this section's own "notifications are an
-  optimization... the object store is the truth" framing and that `waitForGeneration`/the
-  background poll schedule both already converge correctly with nobody ever calling `pollNow`, the
-  automatic writer-side trigger is left for a follow-up rather than rushed in under this
-  increment. Verified: a caller that doesn't yet know about a shard gets a clean "not tracked"
-  answer; a caller that reaches a real registered reader engine forces it to catch up to a newer
-  manifest generation immediately, rather than only on its own schedule.
+  manifests and catches up. **Status: both sides are implemented and tested.**
+  `ObjectStoreReaderEngine#pollNow()` is the real, public entry point for forcing a specific reader
+  engine to check for a newer manifest generation immediately rather than waiting out its own 5s
+  background poll -- the same underlying mechanism `waitForGeneration` already uses internally, now
+  reachable from outside the engine too. `PollNowAction`
+  (`POST /_plugins/_serverless/storage/{index}/{shard}/_poll_now`, dispatched off the transport
+  thread since it does real blob-store I/O) exposes this per (index, shard) on whichever node
+  receives the request, same single-node routing shape as `WaitForGenerationAction`.
+  `ObjectStoreWriterEngine#commitIndexWriter` now automatically calls this against every reader
+  after a successful publish, via a new `WriterPublicationNotifier`: reader locations come from the
+  routing table (this section's own "in early phases, from the routing table" option), via
+  `IndexShardRoutingTable#searchOnlyReplicas()`, not the directory tier -- `ShardDirectory`'s entry
+  is deliberately a single soft hint per shard, so it could only ever notify one reader copy even
+  when a shard has several, while the routing table already enumerates every currently-assigned
+  one. Reaching a specific remote node needed a real node-targeted transport dispatch
+  (`TransportActionNodeProxy`, core's own established mechanism for this shape of single-node RPC),
+  not a plain `Client#execute` call, since `TransportPollNowAction` only ever checks the *local*
+  node's own reader registry. The missing `TransportService` reference was resolved by having
+  `TransportPollNowAction`'s own constructor (already Guice-injected with one, and already bound as
+  an eager singleton at node startup) hand it to the plugin -- `createComponents` itself has no
+  `TransportService` parameter to capture it from directly. The notification call is dispatched off
+  the calling thread (not run inline): `commitIndexWriter` can run synchronously inside a
+  cluster-state-applier callback (initial shard start/promotion), and resolving reader locations
+  reads live cluster state, which `ClusterApplierService` asserts against calling reentrantly from
+  that exact stack -- caught by this section's own new IT, not by inference. Verified end to end
+  over a real two-node cluster with a search-only replica: `ServerlessStoragePublicationNotificationIT`
+  asserts a write becomes visible on the replica within 2 real seconds, well under the 5s
+  background-poll interval that would otherwise be the only way it catches up -- confirmed
+  discriminating by reverting the notification call and observing the same test fail (the replica
+  only saw the write after the background poll, past the 2s window).
 - **Consistency model (default): monotonic bounded staleness.** A reader never goes backward
   (manifest generations are totally ordered per shard) and lag is bounded by publication
   frequency plus notification delivery. This matches the existing segment-replication model.

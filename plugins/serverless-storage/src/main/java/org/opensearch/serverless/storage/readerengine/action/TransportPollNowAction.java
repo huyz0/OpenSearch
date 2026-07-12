@@ -30,6 +30,14 @@ import org.opensearch.transport.TransportService;
  * <p>Requires routing to the specific node actually hosting a reader copy, same "the caller
  * already knows which node to ask" contract as {@code TransportWaitForGenerationAction}: a
  * request for a shard not hosted on the receiving node gets {@code polled=false}, not an error.
+ *
+ * <p>Also the one place this node's {@link TransportService} reaches {@link ServerlessStoragePlugin}:
+ * {@link ServerlessStoragePlugin#createComponents} has no {@code TransportService} parameter, so
+ * there is no other seam for the plugin to obtain one. Every registered transport action is bound
+ * as an eager Guice singleton (core's {@code ActionModule} binds every {@code getActions()} entry
+ * that way), so this constructor is guaranteed to run during node startup, well before any shard --
+ * and therefore {@code ObjectStoreWriterEngine}, the actual consumer via {@link
+ * org.opensearch.serverless.storage.writerengine.WriterPublicationNotifier} -- is ever constructed.
  */
 public class TransportPollNowAction extends HandledTransportAction<PollNowRequest, PollNowResponse> {
 
@@ -54,6 +62,7 @@ public class TransportPollNowAction extends HandledTransportAction<PollNowReques
         super(PollNowAction.NAME, transportService, actionFilters, PollNowRequest::new);
         this.plugin = plugin;
         this.threadPool = threadPool;
+        plugin.setTransportService(transportService);
     }
 
     /**
