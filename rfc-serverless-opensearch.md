@@ -1320,6 +1320,19 @@ when the node runs in serverless mode. Unannotated handlers default to unavailab
 must opt in consciously. This is a small core change with value beyond serverless (it doubles
 as an operator/managed-service API gating mechanism).
 
+**Status: implemented and enforced.** `RestHandler#serverlessScope()` (`server/src/main/java/org/opensearch/rest/RestHandler.java`)
+is exactly this annotation: a three-way `ServerlessScope` enum (`AVAILABLE`, `INTERNAL_ONLY`,
+`UNAVAILABLE`), defaulting to `UNAVAILABLE` so an unannotated handler must opt in consciously,
+matching this section's own design verbatim. `RestController` enforces it (`RestController.java`,
+guarded by a real node-level `serverlessModeEnabled` field resolved from its own
+`SERVERLESS_MODE_ENABLED_SETTING`): `if (serverlessModeEnabled && handler.serverlessScope() !=
+AVAILABLE)` rejects the request before it ever reaches the handler. Every REST handler this plugin
+registers declares `ServerlessScope.AVAILABLE` explicitly (e.g. `RestNodeManifestLagAction`,
+`RestCompactionTriggerAction`, `RestShardCloneAction`), since every one of this plugin's own APIs
+is meaningful only when serverless storage is enabled for the target index -- unlike `_forcemerge`
+or shard-store APIs, nothing this plugin exposes assumes local-disk shard state disaggregation
+invalidates.
+
 ## 12. Security and Encryption Boundaries
 
 Disaggregation moves the trust boundary: today a shard's bytes live on nodes an operator
