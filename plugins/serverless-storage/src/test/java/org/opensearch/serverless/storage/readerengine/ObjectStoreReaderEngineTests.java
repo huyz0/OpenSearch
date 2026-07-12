@@ -480,6 +480,198 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
         }
     }
 
+    public void testWaitForGenerationTimesOutIfTheGenerationNeverArrives() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ObjectStoreCommitPublisher publisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+        org.opensearch.serverless.storage.shardstate.ShardStateStore shardStateStore =
+            new org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore(blobContainer);
+        BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(blobContainer);
+        ObjectStoreCommitMaterializer materializer = new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer));
+        ShardDirectory shardDirectory = new InMemoryShardDirectory();
+
+        try (Directory writerDirectory = new ByteBuffersDirectory(); Store store = createStore()) {
+            EngineConfig engineConfig = config(defaultSettings, store, createTempDir(), newMergePolicy(), null);
+            String indexUuid = engineConfig.getShardId().getIndex().getUUID();
+            int shardId = engineConfig.getShardId().getId();
+
+            CommitManifest firstManifest;
+            try (IndexWriter writer = new IndexWriter(writerDirectory, new IndexWriterConfig())) {
+                Document doc = new Document();
+                doc.add(new StringField("id", "1", Field.Store.YES));
+                writer.addDocument(doc);
+                writer.commit();
+                SegmentInfos segmentInfos = SegmentInfos.readLatestCommit(writerDirectory);
+                firstManifest = publisher.publishCommit(
+                    writerDirectory,
+                    segmentInfos,
+                    indexUuid,
+                    shardId,
+                    PRIMARY_TERM,
+                    1,
+                    0,
+                    0,
+                    new WalPosition("epoch-0", 0),
+                    0,
+                    PruningStats.empty()
+                );
+            }
+            assertEquals(
+                org.opensearch.serverless.storage.shardstate.CasResult.SUCCESS,
+                shardStateStore.compareAndSet(
+                    indexUuid,
+                    shardId,
+                    java.util.Optional.empty(),
+                    new org.opensearch.serverless.storage.shardstate.ShardHead(PRIMARY_TERM, null, 0L, firstManifest.generation())
+                )
+            );
+
+            try (
+                ObjectStoreReaderEngine readerEngine = ObjectStoreReaderEngine.open(
+                    engineConfig,
+                    firstManifest,
+                    materializer,
+                    PRIMARY_TERM,
+                    shardStateStore,
+                    manifestStore,
+                    shardDirectory,
+                    LOCAL_NODE_ID
+                )
+            ) {
+                long start = System.currentTimeMillis();
+                boolean reached = readerEngine.waitForGeneration(2L, org.opensearch.common.unit.TimeValue.timeValueMillis(200));
+                long elapsed = System.currentTimeMillis() - start;
+                assertFalse("a generation that never publishes must time out, not hang or return true", reached);
+                assertTrue("must actually wait roughly the full timeout, not return immediately", elapsed >= 150);
+                assertEquals(1L, readerEngine.currentManifestGenerationForTesting());
+            }
+        }
+    }
+
+    public void testWaitForGenerationReturnsTrueOnceThePublishLands() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ObjectStoreCommitPublisher publisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+        org.opensearch.serverless.storage.shardstate.ShardStateStore shardStateStore =
+            new org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore(blobContainer);
+        BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(blobContainer);
+        ObjectStoreCommitMaterializer materializer = new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer));
+        ShardDirectory shardDirectory = new InMemoryShardDirectory();
+
+        Directory writerDirectory = new ByteBuffersDirectory();
+        IndexWriter writer = new IndexWriter(writerDirectory, new IndexWriterConfig());
+
+        try (Store store = createStore()) {
+            EngineConfig engineConfig = config(defaultSettings, store, createTempDir(), newMergePolicy(), null);
+            String indexUuid = engineConfig.getShardId().getIndex().getUUID();
+            int shardId = engineConfig.getShardId().getId();
+
+            CommitManifest firstManifest;
+            {
+                Document doc = new Document();
+                doc.add(new StringField("id", "1", Field.Store.YES));
+                writer.addDocument(doc);
+                writer.commit();
+                SegmentInfos segmentInfos = SegmentInfos.readLatestCommit(writerDirectory);
+                firstManifest = publisher.publishCommit(
+                    writerDirectory,
+                    segmentInfos,
+                    indexUuid,
+                    shardId,
+                    PRIMARY_TERM,
+                    1,
+                    0,
+                    0,
+                    new WalPosition("epoch-0", 0),
+                    0,
+                    PruningStats.empty()
+                );
+            }
+            assertEquals(
+                org.opensearch.serverless.storage.shardstate.CasResult.SUCCESS,
+                shardStateStore.compareAndSet(
+                    indexUuid,
+                    shardId,
+                    java.util.Optional.empty(),
+                    new org.opensearch.serverless.storage.shardstate.ShardHead(PRIMARY_TERM, null, 0L, firstManifest.generation())
+                )
+            );
+
+            try (
+                ObjectStoreReaderEngine readerEngine = ObjectStoreReaderEngine.open(
+                    engineConfig,
+                    firstManifest,
+                    materializer,
+                    PRIMARY_TERM,
+                    shardStateStore,
+                    manifestStore,
+                    shardDirectory,
+                    LOCAL_NODE_ID
+                )
+            ) {
+                // Publishes the second manifest and CASes the head from a background thread, after a
+                // short delay -- proof waitForGeneration actually blocks and picks it up, rather than
+                // the generation already being there before the wait even starts.
+                Thread publisherThread = new Thread(() -> {
+                    try {
+                        Thread.sleep(150);
+                        Document doc2 = new Document();
+                        doc2.add(new StringField("id", "2", Field.Store.YES));
+                        writer.addDocument(doc2);
+                        writer.commit();
+                        SegmentInfos segmentInfos = SegmentInfos.readLatestCommit(writerDirectory);
+                        CommitManifest secondManifest = publisher.publishCommit(
+                            writerDirectory,
+                            segmentInfos,
+                            indexUuid,
+                            shardId,
+                            PRIMARY_TERM,
+                            2,
+                            1,
+                            1,
+                            new WalPosition("epoch-0", 0),
+                            0,
+                            PruningStats.empty()
+                        );
+                        long currentVersion = shardStateStore.get(indexUuid, shardId).orElseThrow().version();
+                        shardStateStore.compareAndSet(
+                            indexUuid,
+                            shardId,
+                            java.util.Optional.of(currentVersion),
+                            new org.opensearch.serverless.storage.shardstate.ShardHead(PRIMARY_TERM, null, 0L, secondManifest.generation())
+                        );
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+                publisherThread.start();
+                try {
+                    boolean reached = readerEngine.waitForGeneration(2L, org.opensearch.common.unit.TimeValue.timeValueSeconds(10));
+                    assertTrue("must return true once the background publish actually lands", reached);
+                    assertEquals(2L, readerEngine.currentManifestGenerationForTesting());
+                    try (Engine.Searcher searcher = readerEngine.acquireSearcher("test")) {
+                        assertEquals(
+                            "doc 2 must be visible once waitForGeneration returns true",
+                            1,
+                            searcher.search(new TermQuery(new Term("id", "2")), 10).totalHits.value()
+                        );
+                    }
+                } finally {
+                    publisherThread.join();
+                }
+            }
+        } finally {
+            writer.close();
+            writerDirectory.close();
+        }
+    }
+
     public void testEngineSkipsAPollTickWhileOverBudgetAndCatchesUpOnceBudgetEases() throws Exception {
         // rfc-serverless-opensearch.md &sect;18 risk #3's per-refresh admission control: a poll
         // tick found while the node's file cache is over budget must NOT materialize the newer

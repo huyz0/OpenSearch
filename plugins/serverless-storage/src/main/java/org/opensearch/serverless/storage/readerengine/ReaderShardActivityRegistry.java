@@ -82,6 +82,31 @@ public final class ReaderShardActivityRegistry {
     }
 
     /**
+     * Looks up the currently-live reader engine for (indexUuid, shardId) on this node and, if
+     * found, blocks the calling thread on its own {@link ObjectStoreReaderEngine#waitForGeneration}
+     * -- the lookup half of &sect;8's read-after-write mechanism, letting a transport action reach
+     * a specific node's specific reader engine instance by (indexUuid, shardId) alone.
+     *
+     * @param indexUuid the UUID of the index the shard belongs to
+     * @param shardId the shard number within {@code indexUuid}
+     * @param minGeneration the manifest generation the reader engine must reach
+     * @param timeout how long to wait before giving up
+     * @return empty if no reader engine for this shard is currently tracked on this node;
+     *         otherwise {@code true}/{@code false} per {@link ObjectStoreReaderEngine#waitForGeneration}
+     * @throws InterruptedException if the waiting thread is interrupted
+     */
+    public Optional<Boolean> waitForGeneration(
+        String indexUuid,
+        int shardId,
+        long minGeneration,
+        org.opensearch.common.unit.TimeValue timeout
+    ) throws InterruptedException {
+        WeakReference<ObjectStoreReaderEngine> ref = engines.get(key(indexUuid, shardId));
+        ObjectStoreReaderEngine engine = ref == null ? null : ref.get();
+        return engine == null ? Optional.empty() : Optional.of(engine.waitForGeneration(minGeneration, timeout));
+    }
+
+    /**
      * A point-in-time snapshot of every reader engine currently tracked on this node, keyed the
      * same {@code "indexUuid/shardId"} way as {@code
      * org.opensearch.serverless.storage.writerengine.ShardActivityRegistry#snapshotAll} -- silently

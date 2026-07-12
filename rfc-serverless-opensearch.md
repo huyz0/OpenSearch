@@ -1031,7 +1031,23 @@ returns a safe `attempted: false` rather than an error.
 - **Read-after-write where required:** a search request may carry a minimum visible generation
   (returned to the client in the index response). The coordinator routes to a reader at or above
   that generation, or the reader waits for it (with timeout). This gives per-request RYW without
-  making the whole system synchronous.
+  making the whole system synchronous. **Status: the wait primitive is implemented and tested; full
+  core search/index-response wire integration is not.** `ObjectStoreReaderEngine#waitForGeneration(long,
+  TimeValue)` blocks the calling thread until this specific engine instance has materialized at
+  least the requested generation or the timeout elapses, forcing an on-demand poll on every check
+  rather than waiting out the fixed 5s background schedule. `WaitForGenerationAction`
+  (`GET /_plugins/_serverless/storage/{index}/{shard}/_wait_for_generation`, dispatched off the
+  transport thread since it blocks) exposes this per (index, shard) on whichever node receives the
+  request -- a caller who already knows from the routing table which node holds the reader copy it
+  is about to query can wait for it directly, deliberately single-node/no-fan-out, the same shape
+  as `NodeManifestLagAction`. What this does NOT yet do: thread a minimum-visible-generation field
+  through core's actual `SearchRequest`/`IndexResponse` wire format or have the search coordinator
+  call this automatically -- that is a genuine core wire-protocol change (new fields on
+  cluster-wide request/response types, BWC implications) out of scope for this increment; the
+  primitive and per-shard lookup it would need are what's built here. Verified: a generation that
+  never publishes times out (roughly the full requested duration, not immediately); a generation
+  published from a concurrent thread partway through the wait is picked up and returns `true`, with
+  the newly-visible document actually searchable immediately after.
 - `_get` by document id can optionally route to the writer shard for true realtime gets (the
   writer has the live version map), controlled per request.
 - **No cross-shard snapshot isolation** — a multi-shard search may observe different shards at

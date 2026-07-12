@@ -403,6 +403,42 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
         return Math.max(0, lastObservedLatestGeneration.get() - currentManifestGeneration.get());
     }
 
+    /** How often {@link #waitForGeneration} re-checks after forcing an on-demand poll, well under {@link #MANIFEST_POLL_INTERVAL}. */
+    private static final long WAIT_FOR_GENERATION_POLL_INTERVAL_MILLIS = 100L;
+
+    /**
+     * Blocks the calling thread until this engine has materialized at least {@code minGeneration},
+     * or {@code timeout} elapses -- the read-after-write mechanism rfc-serverless-opensearch.md
+     * &sect;8 asks for: "the reader waits for it (with timeout)." Deliberately forces an on-demand
+     * {@link #pollForNewerManifest} on every check rather than only relying on {@link
+     * #MANIFEST_POLL_INTERVAL}'s own background schedule -- an RYW caller waiting out that fixed
+     * 5-second interval by coincidence would defeat the point of a bounded, responsive wait.
+     *
+     * <p>Never called from this engine's own background scheduler or any transport/network thread
+     * (see {@code TransportWaitForGenerationAction}'s own javadoc for how it dispatches this off
+     * such a thread) -- this method's own {@link Thread#sleep} is safe only because of that.
+     *
+     * @param minGeneration the manifest generation this engine must reach before returning {@code true}
+     * @param timeout how long to wait before giving up and returning {@code false}
+     * @return {@code true} if {@code minGeneration} was reached before the timeout; {@code false} otherwise
+     * @throws InterruptedException if the waiting thread is interrupted
+     */
+    public boolean waitForGeneration(long minGeneration, TimeValue timeout) throws InterruptedException {
+        long deadlineMillis = System.currentTimeMillis() + timeout.millis();
+        while (currentManifestGeneration.get() < minGeneration) {
+            long remainingMillis = deadlineMillis - System.currentTimeMillis();
+            if (remainingMillis <= 0) {
+                return false;
+            }
+            pollForNewerManifest();
+            if (currentManifestGeneration.get() >= minGeneration) {
+                break;
+            }
+            Thread.sleep(Math.min(WAIT_FOR_GENERATION_POLL_INTERVAL_MILLIS, remainingMillis));
+        }
+        return true;
+    }
+
     /**
      * Records real query-serving searcher acquisitions (see {@link #lastQueryMillis}'s own javadoc
      * for the {@link SearcherScope#EXTERNAL}-only distinction) before delegating to {@link
