@@ -53,7 +53,7 @@ import java.util.Set;
  * unit-level call to {@code ShardShrinker.shrink} (rfc-serverless-opensearch.md &sect;16 Phase 5).
  */
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
-public class ServerlessStorageShardShrinkActionIT extends OpenSearchIntegTestCase {
+public class ServerlessStorageShardShrinkActionIT extends ServerlessStorageIntegTestCase {
 
     private static final String SOURCE_A_UUID = "shrink-action-it-source-a";
     private static final String SOURCE_B_UUID = "shrink-action-it-source-b";

@@ -41,7 +41,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * live writer, not just a hand-built {@code ShardHead}.
  */
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
-public class ServerlessStorageSnapshotRestoreActionIT extends OpenSearchIntegTestCase {
+public class ServerlessStorageSnapshotRestoreActionIT extends ServerlessStorageIntegTestCase {
 
     private static final String INDEX_NAME = "snapshot-restore-it-idx";
     private static final String SNAPSHOT_ID = "test-snapshot-restore-1";

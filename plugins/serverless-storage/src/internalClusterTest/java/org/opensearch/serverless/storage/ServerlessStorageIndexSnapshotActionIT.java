@@ -46,7 +46,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * IndexSnapshotPinAction}'s own javadoc for the exact guarantee this proves.
  */
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
-public class ServerlessStorageIndexSnapshotActionIT extends OpenSearchIntegTestCase {
+public class ServerlessStorageIndexSnapshotActionIT extends ServerlessStorageIntegTestCase {
 
     private static final String INDEX_NAME = "index-snapshot-it-idx";
     private static final String SNAPSHOT_ID = "test-index-snapshot-1";

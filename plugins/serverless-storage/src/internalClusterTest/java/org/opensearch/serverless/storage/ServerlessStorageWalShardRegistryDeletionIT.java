@@ -33,7 +33,7 @@ import static org.hamcrest.Matchers.empty;
  * listener, the counterpart of {@code ServerlessStorageCloneDeletionIT} for clone pins.
  */
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
-public class ServerlessStorageWalShardRegistryDeletionIT extends OpenSearchIntegTestCase {
+public class ServerlessStorageWalShardRegistryDeletionIT extends ServerlessStorageIntegTestCase {
 
     private static final String INDEX_NAME = "serverless-wal-registry-idx";
 

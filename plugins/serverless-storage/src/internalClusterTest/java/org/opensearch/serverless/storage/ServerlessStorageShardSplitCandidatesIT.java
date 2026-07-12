@@ -40,7 +40,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * own javadoc for why. This test only proves the observability surface itself works end to end.
  */
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
-public class ServerlessStorageShardSplitCandidatesIT extends OpenSearchIntegTestCase {
+public class ServerlessStorageShardSplitCandidatesIT extends ServerlessStorageIntegTestCase {
 
     private static final String INDEX_NAME = "serverless-split-candidates-it-idx";
 

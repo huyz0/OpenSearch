@@ -31,7 +31,7 @@ import java.util.Collections;
  * engine actually run inside a real node (rfc-serverless-opensearch.md &sect;16 Phase 4).
  */
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
-public class ServerlessStorageShardIdleTimeActionIT extends OpenSearchIntegTestCase {
+public class ServerlessStorageShardIdleTimeActionIT extends ServerlessStorageIntegTestCase {
 
     private static final String INDEX_NAME = "shard-idle-time-it-idx";
 

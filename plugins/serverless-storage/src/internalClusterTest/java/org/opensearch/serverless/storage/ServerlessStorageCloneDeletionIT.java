@@ -58,7 +58,7 @@ import static org.hamcrest.Matchers.empty;
  * indices with real shard allocation just to prove the deletion hook fires for the target.
  */
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
-public class ServerlessStorageCloneDeletionIT extends OpenSearchIntegTestCase {
+public class ServerlessStorageCloneDeletionIT extends ServerlessStorageIntegTestCase {
 
     private static final String TARGET_INDEX_NAME = "serverless-clone-target-idx";
     private static final String SOURCE_INDEX_UUID = "synthetic-clone-source-idx";

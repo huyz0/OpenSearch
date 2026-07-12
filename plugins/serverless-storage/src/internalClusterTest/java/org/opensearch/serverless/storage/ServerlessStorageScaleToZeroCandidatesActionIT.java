@@ -31,7 +31,7 @@ import java.util.Optional;
  * node and see every data node's shards regardless of which one answers the coordinating request.
  */
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
-public class ServerlessStorageScaleToZeroCandidatesActionIT extends OpenSearchIntegTestCase {
+public class ServerlessStorageScaleToZeroCandidatesActionIT extends ServerlessStorageIntegTestCase {
 
     private static final String IDX = "scale-to-zero-it-idx";
 

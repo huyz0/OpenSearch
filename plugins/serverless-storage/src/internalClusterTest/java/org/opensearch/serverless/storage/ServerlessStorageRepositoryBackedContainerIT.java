@@ -31,7 +31,7 @@ import java.util.stream.Stream;
  * reads through; the concrete repository type is deliberately irrelevant to what's being proven.
  */
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
-public class ServerlessStorageRepositoryBackedContainerIT extends OpenSearchIntegTestCase {
+public class ServerlessStorageRepositoryBackedContainerIT extends ServerlessStorageIntegTestCase {
 
     private static final String INDEX_NAME = "serverless-repo-backed-it-idx";
     private static final String REPO_NAME = "serverless-repo-backed-it-repo";

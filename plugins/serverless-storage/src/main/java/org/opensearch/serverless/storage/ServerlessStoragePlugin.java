@@ -128,6 +128,13 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         new org.opensearch.serverless.storage.allocation.ServerlessStorageExistingShardsAllocator();
 
     /**
+     * Constructed eagerly for the same reason as {@link #serverlessStorageExistingShardsAllocator}:
+     * {@link #getAdditionalIndexSettingProviders()} is called before {@link #createComponents}
+     * runs, and this is the instance returned from there.
+     */
+    private final ServerlessStorageIndexSettingProvider serverlessStorageIndexSettingProvider = new ServerlessStorageIndexSettingProvider();
+
+    /**
      * The {@code index.store.type} value that opts a reader (search-only) shard copy into a
      * {@code LazyBundleDirectory} instead of a normal local {@code FSDirectory}
      * (rfc-serverless-opensearch.md &sect;7.2/&sect;9) -- see {@link ServerlessStorageLazyDirectoryFactory}'s
@@ -744,6 +751,9 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             clusterService,
             SERVERLESS_STORAGE_READER_CACHE_AFFINITY_TTL_SETTING.get(environment.settings()).millis()
         );
+        serverlessStorageIndexSettingProvider.setRemoteClusterStateEnabled(
+            org.opensearch.gateway.remote.RemoteClusterStateService.REMOTE_CLUSTER_STATE_ENABLED_SETTING.get(environment.settings())
+        );
         TimeValue scaleToZeroEvalInterval = SERVERLESS_STORAGE_SCALE_TO_ZERO_EVAL_INTERVAL_SETTING.get(environment.settings());
         if (scaleToZeroEvalInterval.millis() > 0) {
             boolean suspendEnabled = SERVERLESS_STORAGE_SCALE_TO_ZERO_SUSPEND_ENABLED_SETTING.get(environment.settings());
@@ -1182,7 +1192,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
 
     @Override
     public Collection<IndexSettingProvider> getAdditionalIndexSettingProviders() {
-        return Collections.singletonList(new ServerlessStorageIndexSettingProvider());
+        return Collections.singletonList(serverlessStorageIndexSettingProvider);
     }
 
     /**

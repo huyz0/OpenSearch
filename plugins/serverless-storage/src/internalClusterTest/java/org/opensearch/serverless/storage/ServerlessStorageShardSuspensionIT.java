@@ -33,7 +33,7 @@ import java.util.List;
  * a suspended shard's index triggers real reactivation end to end.
  */
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
-public class ServerlessStorageShardSuspensionIT extends OpenSearchIntegTestCase {
+public class ServerlessStorageShardSuspensionIT extends ServerlessStorageIntegTestCase {
 
     private static final String IDX = "shard-suspension-it-idx";
 

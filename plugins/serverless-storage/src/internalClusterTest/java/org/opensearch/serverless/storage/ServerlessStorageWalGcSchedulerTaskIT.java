@@ -33,7 +33,7 @@ import static org.hamcrest.Matchers.empty;
  * running cluster.
  */
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
-public class ServerlessStorageWalGcSchedulerTaskIT extends OpenSearchIntegTestCase {
+public class ServerlessStorageWalGcSchedulerTaskIT extends ServerlessStorageIntegTestCase {
 
     private static final String INDEX_NAME = "serverless-wal-gc-idx";
 

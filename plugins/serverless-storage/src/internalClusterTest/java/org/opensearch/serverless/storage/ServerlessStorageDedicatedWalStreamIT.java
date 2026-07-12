@@ -41,7 +41,7 @@ import static org.hamcrest.Matchers.empty;
  * index's WAL bytes actually landed in.
  */
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
-public class ServerlessStorageDedicatedWalStreamIT extends OpenSearchIntegTestCase {
+public class ServerlessStorageDedicatedWalStreamIT extends ServerlessStorageIntegTestCase {
 
     private static final String DEDICATED_INDEX = "dedicated-wal-it-idx";
     private static final String SHARED_INDEX = "shared-wal-it-idx";

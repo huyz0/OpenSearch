@@ -46,7 +46,7 @@ import java.util.Collections;
  * the real {@code GcSchedulerTask} sweep it mirrors, not just a direct unit-level call.
  */
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
-public class ServerlessStorageShardRetentionStatsActionIT extends OpenSearchIntegTestCase {
+public class ServerlessStorageShardRetentionStatsActionIT extends ServerlessStorageIntegTestCase {
 
     private static final String INDEX_UUID = "retention-stats-it-idx";
     private static final int SHARD_ID = 0;

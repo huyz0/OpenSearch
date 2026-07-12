@@ -35,7 +35,7 @@ import java.util.Set;
  * bullet that, until this pass, had nothing but its underlying generic pin mechanism built.
  */
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
-public class ServerlessStorageSnapshotPinActionIT extends OpenSearchIntegTestCase {
+public class ServerlessStorageSnapshotPinActionIT extends ServerlessStorageIntegTestCase {
 
     private static final String INDEX_NAME = "snapshot-pin-it-idx";
     private static final String SNAPSHOT_ID = "test-snapshot-1";

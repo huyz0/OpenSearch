@@ -59,7 +59,7 @@ import java.util.Set;
  * than once without pins from one target clobbering another's.
  */
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
-public class ServerlessStorageShardSplitActionIT extends OpenSearchIntegTestCase {
+public class ServerlessStorageShardSplitActionIT extends ServerlessStorageIntegTestCase {
 
     private static final String SOURCE_INDEX_UUID = "split-action-it-source-idx";
     private static final int SHARD_ID = 0;

@@ -32,7 +32,7 @@ import java.util.Collections;
  * about one at a time.
  */
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
-public class ServerlessStorageNodeIdleShardsActionIT extends OpenSearchIntegTestCase {
+public class ServerlessStorageNodeIdleShardsActionIT extends ServerlessStorageIntegTestCase {
 
     private static final String FIRST_INDEX = "node-idle-shards-it-idx-a";
     private static final String SECOND_INDEX = "node-idle-shards-it-idx-b";

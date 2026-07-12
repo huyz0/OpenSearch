@@ -54,7 +54,7 @@ import java.util.Set;
  * inside a real node (rfc-serverless-opensearch.md &sect;14).
  */
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
-public class ServerlessStorageShardCloneActionIT extends OpenSearchIntegTestCase {
+public class ServerlessStorageShardCloneActionIT extends ServerlessStorageIntegTestCase {
 
     private static final String SOURCE_INDEX_UUID = "action-it-source-idx";
     private static final String TARGET_INDEX_UUID = "action-it-target-idx";

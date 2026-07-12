@@ -75,6 +75,7 @@ public class ServerlessStorageReaderShardSuspensionIT extends RemoteStoreBaseInt
         Path sharedPath = serverlessStorageBasePath();
         return Settings.builder()
             .put(super.nodeSettings(nodeOrdinal))
+            .put(org.opensearch.gateway.remote.RemoteClusterStateService.REMOTE_CLUSTER_STATE_ENABLED_SETTING.getKey(), true)
             .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey(), sharedPath.toString())
             .build();
     }

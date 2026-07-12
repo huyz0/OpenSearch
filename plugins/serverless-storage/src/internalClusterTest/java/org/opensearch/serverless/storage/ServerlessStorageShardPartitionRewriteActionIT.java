@@ -62,7 +62,7 @@ import java.util.Set;
  * &sect;16 Phase 5.
  */
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
-public class ServerlessStorageShardPartitionRewriteActionIT extends OpenSearchIntegTestCase {
+public class ServerlessStorageShardPartitionRewriteActionIT extends ServerlessStorageIntegTestCase {
 
     private static final String SOURCE_INDEX_UUID = "partition-rewrite-it-source-idx";
     private static final String TARGET_INDEX_UUID = "partition-rewrite-it-target-idx";

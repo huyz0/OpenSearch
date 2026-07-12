@@ -51,7 +51,7 @@ import java.util.Optional;
  * &sect;7.4, &sect;16 Phase 4.5).
  */
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
-public class ServerlessStorageCompactionTriggerActionIT extends OpenSearchIntegTestCase {
+public class ServerlessStorageCompactionTriggerActionIT extends ServerlessStorageIntegTestCase {
 
     private static final String INDEX_UUID = "compaction-trigger-it-idx";
     private static final int SHARD_ID = 0;

@@ -28,7 +28,7 @@ import java.util.concurrent.TimeUnit;
  * a real, running, multi-node cluster's background evaluation.
  */
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
-public class ServerlessStorageScaleToZeroCandidatesSchedulerTaskIT extends OpenSearchIntegTestCase {
+public class ServerlessStorageScaleToZeroCandidatesSchedulerTaskIT extends ServerlessStorageIntegTestCase {
 
     private static final String INDEX_NAME = "serverless-scale-to-zero-scheduler-idx";
 

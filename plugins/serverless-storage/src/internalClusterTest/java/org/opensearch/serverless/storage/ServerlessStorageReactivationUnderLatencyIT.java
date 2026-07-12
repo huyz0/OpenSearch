@@ -75,7 +75,7 @@ import java.util.Map;
  * headroom under realistic, not just degraded, object-store latency.
  */
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
-public class ServerlessStorageReactivationUnderLatencyIT extends OpenSearchIntegTestCase {
+public class ServerlessStorageReactivationUnderLatencyIT extends ServerlessStorageIntegTestCase {
 
     private static final String IDX = "reactivation-under-latency-it-idx";
     private static final String REPO_NAME = "reactivation-under-latency-it-repo";
