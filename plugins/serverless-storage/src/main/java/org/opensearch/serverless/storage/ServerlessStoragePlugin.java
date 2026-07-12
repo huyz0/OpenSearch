@@ -548,6 +548,21 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * Per-shard byte budget for {@code LocalDiskCachingBundleStore}'s own on-disk cache
+     * (rfc-serverless-opensearch.md &sect;9.2's admission control). Zero (the default) leaves that
+     * cache exactly as unbounded as it always was -- every existing deployment is untouched.
+     * <b>A positive value here is a first-pass guess, not a default tuned against real workload
+     * data</b> -- see that class's own javadoc for the LRU-by-mtime eviction mechanism this
+     * actually configures; an operator with real numbers should override it, not treat this
+     * setting's own default as authoritative.
+     */
+    public static final Setting<ByteSizeValue> SERVERLESS_STORAGE_LOCAL_CACHE_MAX_BYTES_PER_SHARD_SETTING = Setting.byteSizeSetting(
+        "serverless_storage.local_cache.max_bytes_per_shard",
+        ByteSizeValue.ZERO,
+        Setting.Property.NodeScope
+    );
+
+    /**
      * Per-index opt-in into {@link #LAZY_DIRECTORY_STORE_TYPE} for that index's reader shard
      * copies, mirroring how {@link #SERVERLESS_STORAGE_ENABLED_SETTING} itself is an index-scoped
      * opt-in rather than a blanket node-wide default. Has no effect unless {@link
@@ -597,6 +612,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     private volatile String repositoryName;
     private volatile Supplier<RepositoriesService> repositoriesServiceSupplier;
     private volatile Path localCacheRoot;
+    // Resolved once in createComponents, same "read the NodeScope setting where Environment is
+    // actually available" reasoning as every other field in this group -- getEngineFactory reads
+    // this to configure each reader shard's own LocalDiskCachingBundleStore eviction budget.
+    private volatile long localCacheMaxBytesPerShard;
     private volatile ThreadPool threadPool;
     private volatile FileCache lazyDirectoryFileCache;
     private volatile EncryptionKeyProvider encryptionKeyProvider;
@@ -674,6 +693,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_WAL_PER_SHARD_BUDGET_SETTING,
             SERVERLESS_STORAGE_PUBLICATION_RATE_LIMIT_SETTING,
             SERVERLESS_STORAGE_LAZY_DIRECTORY_CACHE_SIZE_SETTING,
+            SERVERLESS_STORAGE_LOCAL_CACHE_MAX_BYTES_PER_SHARD_SETTING,
             SERVERLESS_STORAGE_LAZY_DIRECTORY_ENABLED_SETTING,
             SERVERLESS_STORAGE_WAL_DEDICATED_STREAM_SETTING,
             SERVERLESS_STORAGE_SCALE_TO_ZERO_IDLE_THRESHOLD_SETTING,
@@ -799,6 +819,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         if (nodeEnvironment != null && nodeEnvironment.nodeDataPaths().length > 0) {
             localCacheRoot = nodeEnvironment.nodeDataPaths()[0].resolve("serverless_storage_cache");
         }
+        localCacheMaxBytesPerShard = SERVERLESS_STORAGE_LOCAL_CACHE_MAX_BYTES_PER_SHARD_SETTING.get(environment.settings()).getBytes();
         if (nodeEnvironment != null) {
             // Deliberately not ClusterService#localNode(): that reads ClusterService#state(), which
             // is both not yet available this early in node startup ("initial cluster state not set
@@ -969,7 +990,12 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                     // shard -- see InMemoryPlaintextBundleCache's javadoc) is what keeps the
                     // actually-hot working set decrypted, so most reads never pay that decrypt cost
                     // repeatedly; only a disk-cache hit that missed this layer does.
-                    BundleFileReader diskCache = new LocalDiskCachingBundleStore(readPath, shardCacheDir, encryptionKeyProvider);
+                    BundleFileReader diskCache = new LocalDiskCachingBundleStore(
+                        readPath,
+                        shardCacheDir,
+                        encryptionKeyProvider,
+                        localCacheMaxBytesPerShard
+                    );
                     readPath = new CachingBundleFileReader(sharedBundleCache, diskCache);
                 }
                 CompactionSchedulerConfig compactionConfig = compactionInterval == null

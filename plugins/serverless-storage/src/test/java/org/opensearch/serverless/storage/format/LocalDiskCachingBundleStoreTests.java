@@ -17,7 +17,11 @@ import javax.crypto.SecretKey;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
+import java.time.Instant;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -212,6 +216,120 @@ public class LocalDiskCachingBundleStoreTests extends OpenSearchTestCase {
 
         assertEquals("hello", new String(result, java.nio.charset.StandardCharsets.UTF_8));
         assertEquals("undecryptable cache entry must fall back to a real fetch", 2, counting.callCount.get());
+    }
+
+    private interface ThrowingRunnable {
+        void run() throws IOException;
+    }
+
+    private static Set<Path> listCacheFiles(Path cacheDir) throws IOException {
+        try (var stream = Files.list(cacheDir)) {
+            return stream.filter(Files::isRegularFile).collect(java.util.stream.Collectors.toSet());
+        }
+    }
+
+    /** Runs {@code write}, returning whichever single cache file appeared in {@code cacheDir} as a result. */
+    private static Path fileWrittenBy(Path cacheDir, ThrowingRunnable write) throws IOException {
+        Set<Path> before = listCacheFiles(cacheDir);
+        write.run();
+        Set<Path> after = new HashSet<>(listCacheFiles(cacheDir));
+        after.removeAll(before);
+        assertEquals("expected exactly one new cache file", 1, after.size());
+        return after.iterator().next();
+    }
+
+    public void testEvictsTheLeastRecentlyTouchedEntryOnceOverBudget() throws Exception {
+        SegmentBundle bundle = BundleWriter.write(
+            List.of(
+                new BundleFileContent("a.bin", "aaaaaaaaaa".getBytes(java.nio.charset.StandardCharsets.UTF_8)),
+                new BundleFileContent("b.bin", "bbbbbbbbbb".getBytes(java.nio.charset.StandardCharsets.UTF_8)),
+                new BundleFileContent("c.bin", "cccccccccc".getBytes(java.nio.charset.StandardCharsets.UTF_8))
+            )
+        );
+        CountingBundleFileReader counting = new CountingBundleFileReader(inMemoryReader(bundle));
+        Path cacheDir = createTempDir();
+        // Each entry caches to 10 bytes; a 25-byte budget fits two but not all three.
+        LocalDiskCachingBundleStore cache = new LocalDiskCachingBundleStore(counting, cacheDir, null, 25L);
+
+        Path fileA = fileWrittenBy(cacheDir, () -> cache.readFile("bundle-1", bundle.entries().get("a.bin")));
+        Files.setLastModifiedTime(fileA, FileTime.from(Instant.now().minusSeconds(30)));
+        Path fileB = fileWrittenBy(cacheDir, () -> cache.readFile("bundle-1", bundle.entries().get("b.bin")));
+        Files.setLastModifiedTime(fileB, FileTime.from(Instant.now().minusSeconds(20)));
+        // Writing C pushes total bytes to 30 > 25, triggering a sweep down to floor(25*0.9)=22:
+        // A (oldest) alone is evicted (30 -> 20), B and C both survive.
+        cache.readFile("bundle-1", bundle.entries().get("c.bin"));
+
+        assertEquals(1, cache.evictedCount());
+        assertFalse("the least-recently-touched entry must actually be gone from disk", Files.exists(fileA));
+        assertTrue(Files.exists(fileB));
+
+        // Check the surviving entry first, while it's still on disk -- re-fetching the evicted
+        // entry below writes it back, which (at this same 2-of-3 budget) would otherwise trigger a
+        // second sweep and evict B in turn, confusing what this assertion is meant to prove.
+        int callsBeforeReread = counting.callCount.get();
+        cache.readFile("bundle-1", bundle.entries().get("b.bin"));
+        assertEquals("a surviving entry must still be a disk-cache hit", callsBeforeReread, counting.callCount.get());
+        cache.readFile("bundle-1", bundle.entries().get("a.bin"));
+        assertEquals(
+            "the evicted entry must re-fetch from the delegate, not silently return nothing",
+            callsBeforeReread + 1,
+            counting.callCount.get()
+        );
+    }
+
+    public void testATouchedHitOutlivesAnUntouchedEntryWrittenLater() throws Exception {
+        SegmentBundle bundle = BundleWriter.write(
+            List.of(
+                new BundleFileContent("a.bin", "aaaaaaaaaa".getBytes(java.nio.charset.StandardCharsets.UTF_8)),
+                new BundleFileContent("b.bin", "bbbbbbbbbb".getBytes(java.nio.charset.StandardCharsets.UTF_8)),
+                new BundleFileContent("c.bin", "cccccccccc".getBytes(java.nio.charset.StandardCharsets.UTF_8))
+            )
+        );
+        CountingBundleFileReader counting = new CountingBundleFileReader(inMemoryReader(bundle));
+        Path cacheDir = createTempDir();
+        LocalDiskCachingBundleStore cache = new LocalDiskCachingBundleStore(counting, cacheDir, null, 25L);
+
+        // A is written first (would be the oldest by write order alone) but explicitly backdated,
+        // then re-read (a hit) so its recency becomes "now" -- refreshed strictly newer than B.
+        Path fileA = fileWrittenBy(cacheDir, () -> cache.readFile("bundle-1", bundle.entries().get("a.bin")));
+        Files.setLastModifiedTime(fileA, FileTime.from(Instant.now().minusSeconds(30)));
+        cache.readFile("bundle-1", bundle.entries().get("a.bin"));
+
+        // B is written after A's original write, never touched again, and backdated older than
+        // both A's refreshed recency and C's imminent creation time.
+        Path fileB = fileWrittenBy(cacheDir, () -> cache.readFile("bundle-1", bundle.entries().get("b.bin")));
+        Files.setLastModifiedTime(fileB, FileTime.from(Instant.now().minusSeconds(20)));
+
+        // Writing C triggers the sweep: B, not A, must be the one evicted, proving the touch above
+        // actually changed eviction order rather than raw write order deciding it.
+        cache.readFile("bundle-1", bundle.entries().get("c.bin"));
+
+        assertEquals(1, cache.evictedCount());
+        assertTrue("the touched entry must survive over the untouched-but-more-recently-written one", Files.exists(fileA));
+        assertFalse(Files.exists(fileB));
+
+        int callsBeforeReread = counting.callCount.get();
+        cache.readFile("bundle-1", bundle.entries().get("a.bin"));
+        assertEquals("the touched, surviving entry must still be a disk-cache hit", callsBeforeReread, counting.callCount.get());
+    }
+
+    public void testUnboundedByDefaultNeverEvictsRegardlessOfSize() throws Exception {
+        SegmentBundle bundle = BundleWriter.write(
+            List.of(
+                new BundleFileContent("a.bin", "aaaaaaaaaa".getBytes(java.nio.charset.StandardCharsets.UTF_8)),
+                new BundleFileContent("b.bin", "bbbbbbbbbb".getBytes(java.nio.charset.StandardCharsets.UTF_8)),
+                new BundleFileContent("c.bin", "cccccccccc".getBytes(java.nio.charset.StandardCharsets.UTF_8))
+            )
+        );
+        CountingBundleFileReader counting = new CountingBundleFileReader(inMemoryReader(bundle));
+        // The 3-arg constructor (no maxBytesOnDisk) must remain exactly as unbounded as before.
+        LocalDiskCachingBundleStore cache = new LocalDiskCachingBundleStore(counting, createTempDir(), null);
+
+        cache.readFile("bundle-1", bundle.entries().get("a.bin"));
+        cache.readFile("bundle-1", bundle.entries().get("b.bin"));
+        cache.readFile("bundle-1", bundle.entries().get("c.bin"));
+
+        assertEquals(0, cache.evictedCount());
     }
 
     public void testUnencryptedCacheStillWorksWithNoKeyProvider() throws Exception {

@@ -1181,15 +1181,34 @@ the work is unifying its keying to the bundle layout and making it the single ca
 remote reads, rather than adding a fourth cache.
 
 **Status: a first, minimal slice done; not the design above.** `LocalDiskCachingBundleStore` is a
-read-through, whole-file, unbounded local-disk cache in front of any `BundleFileReader`, wired in
-for reader shards in `ServerlessStoragePlugin`. It gets the *correctness* half right (bundle files
-are immutable, so no invalidation is needed; a corrupted local copy is detected via checksum and
+read-through, whole-file local-disk cache in front of any `BundleFileReader`, wired in for reader
+shards in `ServerlessStoragePlugin`. It gets the *correctness* half right (bundle files are
+immutable, so no invalidation is needed; a corrupted local copy is detected via checksum and
 re-fetched rather than trusted) and the basic hit-path right (16 concurrent readers of the same
 file share exactly one real fetch; a fresh instance over the same directory survives a process
 restart) but is not the design above: no block granularity (whole files, not 1 MB regions), no
-node-shared single cache (one instance per shard, not one per node), no eviction/pinning policy at
-all (unbounded -- a real deployment would fill its disk), and no warming/prefetch. This is the
-foundation such a cache would sit on top of, not a replacement for building it.
+node-shared single cache (one instance per shard, not one per node), and no warming/prefetch. This
+is the foundation such a cache would sit on top of, not a replacement for building it.
+
+**Eviction: now optional, off by default, and explicitly a first-pass guess -- not the LRU/pinning
+design above, and not tuned against real workload data.** Previously unbounded unconditionally
+(a real deployment would eventually fill its disk); `LocalDiskCachingBundleStore` now takes an
+optional `maxBytesOnDisk`, configured per node via
+`ServerlessStoragePlugin#SERVERLESS_STORAGE_LOCAL_CACHE_MAX_BYTES_PER_SHARD_SETTING` (zero, the
+default, leaves every existing deployment exactly as unbounded as before). When positive, it
+evicts the least-recently-*touched* file (by disk `lastModifiedTime`, refreshed on every hit, not
+just on write) once a shard's cache directory crosses the budget, sweeping down to 90% of it so a
+write sitting right at the line doesn't immediately re-trigger another sweep -- plain LRU-by-mtime
+over a directory listing, evaluated synchronously (CAS-guarded so only one thread sweeps at a time)
+on whichever request's write happens to cross the budget. This is deliberately *not* the
+block-level, node-shared, pinning-aware cache the design above calls for, and the byte-budget
+default itself is a guess, not a number backed by real workload data -- built anyway on explicit
+request, to at least cap disk growth rather than leave it fully unbounded while the real design
+above remains unbuilt. Verified with real-filesystem unit tests: over budget, the least-recently-
+touched entry is actually deleted from disk and correctly re-fetches on its next read; a hit
+refreshes an entry's recency so it survives a sweep that would otherwise have evicted it in favor
+of an entry written later but never touched again; the default (unset) constructor path never
+evicts regardless of how much is written.
 
 **Encryption interaction, resolved.** When `EncryptingBlobContainer` is enabled, bytes reaching
 `LocalDiskCachingBundleStore` from its delegate are already plaintext (decrypted at the

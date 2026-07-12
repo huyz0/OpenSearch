@@ -8,16 +8,25 @@
 
 package org.opensearch.serverless.storage.format;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.serverless.storage.security.AesGcmCipher;
 import org.opensearch.serverless.storage.security.EncryptionKeyProvider;
 
 import java.io.IOException;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.FileTime;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.zip.CRC32C;
 
@@ -29,10 +38,18 @@ import java.util.zip.CRC32C;
  * superseded by a new one after a merge/compaction), so this cache never needs invalidation --
  * once a {@code (bundleName, entry)} pair is on disk, it is correct forever.
  *
- * <p>Deliberately not an LRU or size-bounded cache yet: eviction policy is a genuinely separate
- * concern (rfc-serverless-opensearch.md &sect;9.2's admission control) that needs real workload
- * data to tune sensibly, not a default guessed at here. This class is the correctness-and-hit-path
- * foundation an eviction policy would sit on top of.
+ * <p><b>Optional, off-by-default size-bounded eviction</b> (rfc-serverless-opensearch.md
+ * &sect;9.2's admission control): {@link #maxBytesOnDisk} &le; 0 (the default, via {@code
+ * ServerlessStoragePlugin#SERVERLESS_STORAGE_LOCAL_CACHE_MAX_BYTES_PER_SHARD_SETTING} being unset)
+ * leaves this exactly the unbounded cache it always was -- every existing deployment is untouched.
+ * When a positive budget is configured, this evicts the least-recently-*touched* file (by disk
+ * {@code lastModifiedTime}, refreshed on every hit, not just on write) once the shard's cache
+ * directory exceeds it, sweeping down to {@link #EVICTION_TARGET_FRACTION} of the budget so a
+ * write sitting right at the line doesn't immediately re-trigger another sweep. <b>This is a
+ * first-pass policy, not one tuned against real workload data</b> -- plain LRU-by-mtime over a
+ * directory listing, evaluated synchronously (CAS-guarded so only one thread sweeps at a time) on
+ * whichever request's write happens to cross the budget, not a background schedule. Good enough to
+ * cap disk growth; not represented as the final word on cache admission policy for this tier.
  *
  * <p>If an {@link EncryptionKeyProvider} is supplied, every file this cache writes to local disk
  * is encrypted first and decrypted on read back -- when {@code
@@ -48,6 +65,11 @@ import java.util.zip.CRC32C;
  */
 public final class LocalDiskCachingBundleStore implements BundleFileReader {
 
+    private static final Logger logger = LogManager.getLogger(LocalDiskCachingBundleStore.class);
+
+    /** Sweep down to this fraction of {@link #maxBytesOnDisk} once eviction triggers, so a write sitting right at the line doesn't immediately re-trigger another sweep. */
+    private static final double EVICTION_TARGET_FRACTION = 0.9;
+
     private final BundleFileReader delegate;
     private final Path cacheDirectory;
     private final EncryptionKeyProvider encryptionKeyProvider;
@@ -57,8 +79,17 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
     private final AtomicLong hitCount = new AtomicLong();
     private final AtomicLong missCount = new AtomicLong();
 
+    /** {@code <= 0} means unbounded -- see this class's own javadoc. */
+    private final long maxBytesOnDisk;
+    private final AtomicLong evictedCount = new AtomicLong();
+    // CAS-guarded so only one thread runs a sweep at a time; a write that loses the race just
+    // leaves its own overage for the next write to catch, same "best-effort, never blocks
+    // correctness" shape as this plugin's other in-flight guards (e.g. ObjectStoreWriterEngine's
+    // refreshPublicationInFlight).
+    private final AtomicBoolean evictionInProgress = new AtomicBoolean(false);
+
     /**
-     * Wraps a delegate reader with a plaintext-on-disk cache.
+     * Wraps a delegate reader with a plaintext-on-disk cache, unbounded (no eviction).
      *
      * @param delegate the underlying reader to consult on a cache miss.
      * @param cacheDirectory the local directory to cache files in.
@@ -68,7 +99,7 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
     }
 
     /**
-     * Wraps a delegate reader with a disk cache, optionally encrypting cached files at rest.
+     * Wraps a delegate reader with an unbounded disk cache, optionally encrypting cached files at rest.
      *
      * @param delegate the underlying reader to consult on a cache miss.
      * @param cacheDirectory the local directory to cache files in.
@@ -76,9 +107,30 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
      */
     public LocalDiskCachingBundleStore(BundleFileReader delegate, Path cacheDirectory, EncryptionKeyProvider encryptionKeyProvider)
         throws IOException {
+        this(delegate, cacheDirectory, encryptionKeyProvider, 0L);
+    }
+
+    /**
+     * Wraps a delegate reader with a disk cache, optionally encrypting cached files at rest and
+     * optionally bounding its size with LRU-by-mtime eviction -- see this class's own javadoc for
+     * the eviction mechanism and its "first-pass, not workload-tuned" caveat.
+     *
+     * @param delegate the underlying reader to consult on a cache miss.
+     * @param cacheDirectory the local directory to cache files in.
+     * @param encryptionKeyProvider {@code null} to cache plaintext on disk.
+     * @param maxBytesOnDisk {@code <= 0} (the default) leaves this cache unbounded; a positive value
+     *                       is the byte budget this cache directory evicts down to once crossed.
+     */
+    public LocalDiskCachingBundleStore(
+        BundleFileReader delegate,
+        Path cacheDirectory,
+        EncryptionKeyProvider encryptionKeyProvider,
+        long maxBytesOnDisk
+    ) throws IOException {
         this.delegate = delegate;
         this.cacheDirectory = cacheDirectory;
         this.encryptionKeyProvider = encryptionKeyProvider;
+        this.maxBytesOnDisk = maxBytesOnDisk;
         Files.createDirectories(cacheDirectory);
     }
 
@@ -98,6 +150,7 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
                 }
                 if (cached != null && cached.length == entry.length() && checksum(cached) == entry.checksum()) {
                     hitCount.incrementAndGet();
+                    touch(cachedPath);
                     return cached;
                 }
                 // A cached file that doesn't match its own name's recorded length/checksum can
@@ -107,8 +160,98 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
             missCount.incrementAndGet();
             byte[] fresh = delegate.readFile(bundleName, entry);
             writeAtomically(cachedPath, encryptIfNeeded(fresh));
+            maybeEvict();
             return fresh;
         }
+    }
+
+    /** Bumps {@code cachedPath}'s {@code lastModifiedTime} to now, so a hit keeps a hot file recently-touched for eviction purposes even if it was written long ago. */
+    private void touch(Path cachedPath) {
+        if (maxBytesOnDisk <= 0) {
+            return; // eviction disabled -- no reason to pay a metadata write on every hit.
+        }
+        try {
+            Files.setLastModifiedTime(cachedPath, FileTime.from(Instant.now()));
+        } catch (IOException e) {
+            // Best-effort recency tracking: at worst this file looks staler than it really is and
+            // gets evicted a bit early, never a correctness issue (a miss just re-fetches it).
+            logger.debug("failed to update cache entry recency for [" + cachedPath + "]", e);
+        }
+    }
+
+    private void maybeEvict() {
+        if (maxBytesOnDisk <= 0) {
+            return;
+        }
+        if (evictionInProgress.compareAndSet(false, true) == false) {
+            return;
+        }
+        try {
+            evictIfOverBudget();
+        } catch (IOException e) {
+            // Eviction failing must never fail the write/read that triggered it -- the cache
+            // directory just stays over budget until the next successful sweep.
+            logger.warn("failed to evict entries from local disk cache [" + cacheDirectory + "]", e);
+        } finally {
+            evictionInProgress.set(false);
+        }
+    }
+
+    private void evictIfOverBudget() throws IOException {
+        List<CacheEntry> entries = listCacheEntries();
+        long totalBytes = 0;
+        for (CacheEntry entry : entries) {
+            totalBytes += entry.sizeBytes;
+        }
+        if (totalBytes <= maxBytesOnDisk) {
+            return;
+        }
+        long targetBytes = (long) (maxBytesOnDisk * EVICTION_TARGET_FRACTION);
+        entries.sort(Comparator.comparing(e -> e.lastModifiedTime));
+        for (CacheEntry entry : entries) {
+            if (totalBytes <= targetBytes) {
+                break;
+            }
+            try {
+                Files.deleteIfExists(entry.path);
+                totalBytes -= entry.sizeBytes;
+                evictedCount.incrementAndGet();
+            } catch (IOException e) {
+                // Another thread's concurrent write/rename raced this file, or it's already gone --
+                // move on to the next candidate rather than aborting the whole sweep.
+                logger.debug("failed to evict cache entry [" + entry.path + "]", e);
+            }
+        }
+    }
+
+    private List<CacheEntry> listCacheEntries() throws IOException {
+        List<CacheEntry> entries = new ArrayList<>();
+        try (
+            DirectoryStream<Path> stream = Files.newDirectoryStream(
+                cacheDirectory,
+                p -> p.getFileName().toString().contains(".tmp-") == false
+            )
+        ) {
+            for (Path path : stream) {
+                if (Files.isRegularFile(path) == false) {
+                    continue;
+                }
+                try {
+                    entries.add(new CacheEntry(path, Files.size(path), Files.getLastModifiedTime(path)));
+                } catch (IOException e) {
+                    // Deleted or replaced between the listing and this stat -- not a candidate either way.
+                }
+            }
+        }
+        return entries;
+    }
+
+    /** Number of cache entries evicted so far by the size-bounded sweep -- always 0 when eviction is disabled. */
+    public long evictedCount() {
+        return evictedCount.get();
+    }
+
+    private record CacheEntry(Path path, long sizeBytes, FileTime lastModifiedTime) {
     }
 
     private byte[] encryptIfNeeded(byte[] plaintext) throws IOException {
