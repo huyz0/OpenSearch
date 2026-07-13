@@ -25,10 +25,15 @@ import java.util.List;
  * {@link WalChunkService} group-commits records from many shards (potentially many indices) into
  * one chunk blob, so a single whole-blob key wouldn't respect per-index key boundaries the way
  * whole-blob encryption does for bundles/manifests, which are already single-index by
- * construction. Today's {@link EncryptionKeyProvider} only ever supplies one key regardless of
- * index, so this doesn't yet buy per-index key isolation in practice -- but the record-level
- * design means it will, the moment a real per-index-aware key provider exists, without any change
- * to the WAL wire format or this class.
+ * construction. Each record's own {@code indexUuid} is looked up via {@link
+ * EncryptionKeyProvider#currentKey(String)} rather than the index-agnostic {@link
+ * EncryptionKeyProvider#currentKey()}, so this genuinely buys per-index key isolation the moment
+ * {@code keyProvider} is a real per-index-aware implementation (e.g. {@link
+ * org.opensearch.serverless.storage.security.PerIndexEncryptionKeyProvider}) -- a provider that
+ * only ever has one key regardless of index ({@link
+ * org.opensearch.serverless.storage.security.StaticEncryptionKeyProvider}) still works unchanged,
+ * since {@link EncryptionKeyProvider#currentKey(String)} defaults to {@link
+ * EncryptionKeyProvider#currentKey()} for those.
  */
 public final class WalRecordCrypto {
 
@@ -42,7 +47,7 @@ public final class WalRecordCrypto {
      * @return a copy of {@code record} with its payload replaced by ciphertext
      */
     public static WalRecord encrypt(WalRecord record, EncryptionKeyProvider keyProvider) throws IOException {
-        byte[] ciphertext = AesGcmCipher.encrypt(record.payload(), keyProvider.currentKey());
+        byte[] ciphertext = AesGcmCipher.encrypt(record.payload(), keyProvider.currentKey(record.indexUuid()));
         return new WalRecord(record.indexUuid(), record.shardId(), record.primaryTerm(), record.seqNo(), ciphertext);
     }
 
@@ -54,7 +59,7 @@ public final class WalRecordCrypto {
      * @return a copy of {@code record} with its payload replaced by plaintext
      */
     public static WalRecord decrypt(WalRecord record, EncryptionKeyProvider keyProvider) throws IOException {
-        byte[] plaintext = AesGcmCipher.decrypt(record.payload(), keyProvider.currentKey());
+        byte[] plaintext = AesGcmCipher.decrypt(record.payload(), keyProvider.currentKey(record.indexUuid()));
         return new WalRecord(record.indexUuid(), record.shardId(), record.primaryTerm(), record.seqNo(), plaintext);
     }
 

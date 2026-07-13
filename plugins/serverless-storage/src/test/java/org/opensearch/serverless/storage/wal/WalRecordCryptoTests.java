@@ -8,6 +8,7 @@
 
 package org.opensearch.serverless.storage.wal;
 
+import org.opensearch.serverless.storage.security.PerIndexEncryptionKeyProvider;
 import org.opensearch.serverless.storage.security.StaticEncryptionKeyProvider;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -17,6 +18,7 @@ import javax.crypto.SecretKey;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Map;
 
 public class WalRecordCryptoTests extends OpenSearchTestCase {
 
@@ -65,6 +67,34 @@ public class WalRecordCryptoTests extends OpenSearchTestCase {
 
         StaticEncryptionKeyProvider wrongKey = new StaticEncryptionKeyProvider(newAesKey());
         expectThrows(IOException.class, () -> WalRecordCrypto.decrypt(encrypted, wrongKey));
+    }
+
+    public void testPerIndexKeyProviderGivesGenuineIndexIsolation() throws Exception {
+        // rfc-serverless-opensearch.md §12's own previously-stated caveat -- record-level
+        // encryption "doesn't yet buy per-index key isolation in practice" against a provider that
+        // only ever has one key -- is what a real per-index-aware provider closes: two indices
+        // sharing one WAL chunk get genuinely different ciphertext under genuinely different keys,
+        // and cross-decrypting one index's record with another index's own provider view fails.
+        SecretKey keyA = newAesKey();
+        SecretKey keyB = newAesKey();
+        PerIndexEncryptionKeyProvider keyProvider = new PerIndexEncryptionKeyProvider(Map.of("index-a", keyA, "index-b", keyB), null);
+        byte[] plaintext = "same payload bytes, different index".getBytes(StandardCharsets.UTF_8);
+
+        WalRecord recordA = WalRecordCrypto.encrypt(new WalRecord("index-a", 0, 1, 0, plaintext), keyProvider);
+        WalRecord recordB = WalRecordCrypto.encrypt(new WalRecord("index-b", 0, 1, 0, plaintext), keyProvider);
+
+        assertFalse(
+            "the same plaintext under two indices' own keys must not produce identical ciphertext",
+            java.util.Arrays.equals(recordA.payload(), recordB.payload())
+        );
+        assertArrayEquals(plaintext, WalRecordCrypto.decrypt(recordA, keyProvider).payload());
+        assertArrayEquals(plaintext, WalRecordCrypto.decrypt(recordB, keyProvider).payload());
+
+        // Decrypting index A's record against a provider whose own "index-a" entry actually holds
+        // index B's key fails loudly (AEAD tag mismatch), the same as any other wrong-key decrypt --
+        // proving the lookup is genuinely keyed by index, not merely present/absent.
+        PerIndexEncryptionKeyProvider misconfigured = new PerIndexEncryptionKeyProvider(Map.of("index-a", keyB), null);
+        expectThrows(IOException.class, () -> WalRecordCrypto.decrypt(recordA, misconfigured));
     }
 
     public void testDecryptAllAppliesToEveryRecordInOrder() throws Exception {

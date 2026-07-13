@@ -1708,11 +1708,19 @@ into a shared `AesGcmCipher` utility rather than duplicated. Verified: a chunk w
 `EncryptingWalChunkService` contains ciphertext, not the plaintext payload, when read back raw;
 decrypting via `WalRecordCrypto#decryptAll` with the right key recovers the exact original
 payloads and preserves indexUuid/shardId/seqNo through the real wire format; a wrong key fails
-loudly rather than returning garbage. **Known, explicit limitation**: today's
-`EncryptionKeyProvider` only ever supplies one key regardless of index, so this doesn't yet buy
-real per-index key isolation for WAL data the way whole-blob encryption does for bundles --
-the record-level design means it will, the moment a per-index-aware key provider exists, without
-any WAL wire-format or wiring change.
+loudly rather than returning garbage. **The per-index key isolation limitation is now closed.**
+`EncryptionKeyProvider` gained a default `currentKey(String indexUuid)` overload (falling back to
+the original index-agnostic `currentKey()` for providers like `StaticEncryptionKeyProvider` that
+don't distinguish by index, so no existing caller broke), and `WalRecordCrypto#encrypt`/`#decrypt`
+now look up each record's own key via its `indexUuid` rather than the index-agnostic call -- exactly
+the wire-format-free, wiring-free upgrade this limitation always said was possible once a
+per-index-aware provider existed. New `PerIndexEncryptionKeyProvider` is that provider: a fixed key
+per `indexUuid` plus an optional default, failing loudly rather than silently picking a key for an
+unconfigured index with no default configured. Verified: two indices sharing one WAL chunk produce
+genuinely different ciphertext under their own genuinely different keys, both decrypt correctly
+under the right provider, and decrypting one index's record against a provider whose entry for that
+index actually holds a different index's key fails loudly (AEAD tag mismatch), same as any other
+wrong-key decrypt.
 
 **`EncryptingWalChunkService` is now actually wired in, closing what had been a real, silent gap**:
 this component was fully built and tested but never once invoked by a running engine --

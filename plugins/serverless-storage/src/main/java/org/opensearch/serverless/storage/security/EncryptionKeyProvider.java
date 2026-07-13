@@ -22,4 +22,20 @@ public interface EncryptionKeyProvider {
 
     /** The key to use for encrypting new content and decrypting content encrypted with it. */
     SecretKey currentKey();
+
+    /**
+     * The key to use for content belonging to a specific index. Defaults to {@link #currentKey()}
+     * for providers (like {@link StaticEncryptionKeyProvider}) that only ever have one key
+     * regardless of index -- {@link PerIndexEncryptionKeyProvider} is the one that actually
+     * distinguishes by {@code indexUuid}. Exists so callers that multiplex several indices' data
+     * through one shared object ({@code WalRecordCrypto}, whose own per-record encryption already
+     * carries {@code indexUuid} alongside each payload -- see its own javadoc) can get real
+     * per-index key isolation the moment a per-index-aware provider is configured, without any
+     * change to the caller or the wire format it produces.
+     *
+     * @param indexUuid the index the content being encrypted/decrypted belongs to.
+     */
+    default SecretKey currentKey(String indexUuid) {
+        return currentKey();
+    }
 }
