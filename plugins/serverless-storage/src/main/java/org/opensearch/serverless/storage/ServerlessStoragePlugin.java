@@ -863,6 +863,20 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 // <indexUuid>/<shardId>/ path -- the WAL chunk stream is node-scoped, spanning
                 // every writer shard (and index) on this node, not any one shard's storage
                 // (rfc-serverless-opensearch.md &sect;6.4, see WalChunkService's own javadoc).
+                //
+                // Deliberately still local-filesystem-only, unlike resolveDedicatedWalContainer
+                // and blobContainerFor below: this container (and sharedWalChunkService itself) is
+                // resolved exactly once here, synchronously inside createComponents at node
+                // startup -- before RepositoriesService necessarily has any repository registered
+                // yet, since repository registration happens later via the _snapshot API, well
+                // after this method returns. Routing this through resolveContainer would try the
+                // repository-backed branch (SERVERLESS_STORAGE_REPOSITORY_SETTING configured) too
+                // early and fail loudly at startup instead of lazily like every other container
+                // this plugin resolves -- caught by a real internalClusterTest reproducing exactly
+                // that failure, not reasoned out in advance. Making this genuinely lazy (matching
+                // the per-shard containers' own on-demand resolution) needs sharedWalChunkService's
+                // construction itself deferred to first real writer-shard use, a larger, separate
+                // change from the WAL container repository-backing this pass otherwise closes.
                 FsBlobStore walBlobStore = new FsBlobStore(1024 * 1024, basePath, false);
                 BlobContainer walBlobContainer = walBlobStore.blobContainer(BlobPath.cleanPath().add("wal"));
                 // A fresh epoch per node incarnation (see WalChunkService's own javadoc for what
@@ -1124,37 +1138,62 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      */
     private BlobContainer blobContainerFor(String indexUuid, int shardId) throws IOException {
         BlobPath shardPath = BlobPath.cleanPath().add(indexUuid).add(String.valueOf(shardId));
-        if (repositoryName != null && repositoryName.isEmpty() == false) {
-            return repositoryBackedBlobContainer(indexUuid, shardId, shardPath);
-        }
-        if (basePath == null) {
-            throw new IllegalStateException(
-                "shard ["
-                    + indexUuid
-                    + "]["
-                    + shardId
-                    + "] has serverless storage enabled but neither ["
-                    + SERVERLESS_STORAGE_REPOSITORY_SETTING.getKey()
-                    + "] nor ["
-                    + SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey()
-                    + "] resolved to a usable container (the latter's node setting is either unset "
-                    + "or did not resolve to an allowed path)"
-            );
-        }
-        FsBlobStore blobStore = new FsBlobStore(1024 * 1024, basePath, false);
-        return blobStore.blobContainer(shardPath);
+        return resolveContainer(
+            shardPath,
+            "shard ["
+                + indexUuid
+                + "]["
+                + shardId
+                + "] has serverless storage enabled but neither ["
+                + SERVERLESS_STORAGE_REPOSITORY_SETTING.getKey()
+                + "] nor ["
+                + SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey()
+                + "] resolved to a usable container (the latter's node setting is either unset "
+                + "or did not resolve to an allowed path)"
+        );
     }
 
     /**
-     * Resolves this shard's container from the {@link #repositoryName}-named repository's own
-     * {@code BlobStore}, scoped under that repository's own {@code basePath()} plus a {@code
-     * serverless_storage/} prefix -- so this plugin's data can never collide with whatever
-     * snapshots that same repository also stores, even though both share one underlying bucket.
+     * The one seam every container this plugin builds -- a shard's own regular container, the
+     * shared WAL container, and a shard's own dedicated WAL container alike -- resolves through:
+     * a real registered repository's {@code BlobStore} if {@link #SERVERLESS_STORAGE_REPOSITORY_SETTING}
+     * names one (scoped under that repository's own {@code basePath()} plus a {@code
+     * serverless_storage/} prefix, so this plugin's data can never collide with whatever snapshots
+     * that same repository also stores, even though both share one underlying bucket), otherwise
+     * the local-filesystem container under {@link #basePath} exactly as before. {@code
+     * relativePath} is everything after that shared prefix -- e.g. {@code <indexUuid>/<shardId>}
+     * for a shard's own container, {@code wal} for the shared WAL container, {@code
+     * wal-dedicated/<indexUuid>/<shardId>} for a dedicated one -- so every container this plugin
+     * builds lives under the exact same root regardless of which backend actually stores it.
+     *
+     * <p>Originally scoped to only the regular shard container, deliberately, not oversight --
+     * "the shared/dedicated WAL containers remain local-filesystem-only, a natural follow-up once
+     * this seam is proven in production rather than widening one change's blast radius" (this
+     * class's own prior status note). Now that the seam has proven itself (real S3/GCS/Azure
+     * verification via {@code ServerlessStorageRepositoryBackedContainerIT}), extending it to the
+     * WAL containers below is exactly that follow-up: the same one seam, no new resolution logic.
      */
-    private BlobContainer repositoryBackedBlobContainer(String indexUuid, int shardId, BlobPath shardPath) throws IOException {
+    private BlobContainer resolveContainer(BlobPath relativePath, String missingContainerErrorMessage) throws IOException {
+        if (repositoryName != null && repositoryName.isEmpty() == false) {
+            return repositoryBackedBlobContainer(relativePath);
+        }
+        if (basePath == null) {
+            throw new IllegalStateException(missingContainerErrorMessage);
+        }
+        FsBlobStore blobStore = new FsBlobStore(1024 * 1024, basePath, false);
+        return blobStore.blobContainer(relativePath);
+    }
+
+    /**
+     * Resolves {@code relativePath} against the {@link #repositoryName}-named repository's own
+     * {@code BlobStore}, scoped under that repository's own {@code basePath()} plus a {@code
+     * serverless_storage/} prefix -- see {@link #resolveContainer} for the full picture this is
+     * one half of.
+     */
+    private BlobContainer repositoryBackedBlobContainer(BlobPath relativePath) throws IOException {
         if (repositoriesServiceSupplier == null) {
             throw new IllegalStateException(
-                "shard [" + indexUuid + "][" + shardId + "] needs repository [" + repositoryName + "] before RepositoriesService is ready"
+                "container [" + relativePath + "] needs repository [" + repositoryName + "] before RepositoriesService is ready"
             );
         }
         org.opensearch.repositories.Repository repository;
@@ -1166,10 +1205,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             // resolveBlobContainer only ever has to catch IOException, same as the local-filesystem
             // path already guarantees.
             throw new IOException(
-                "shard ["
-                    + indexUuid
-                    + "]["
-                    + shardId
+                "container ["
+                    + relativePath
                     + "] configured ["
                     + SERVERLESS_STORAGE_REPOSITORY_SETTING.getKey()
                     + "="
@@ -1181,10 +1218,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         }
         if (repository instanceof org.opensearch.repositories.blobstore.BlobStoreRepository == false) {
             throw new IllegalStateException(
-                "shard ["
-                    + indexUuid
-                    + "]["
-                    + shardId
+                "container ["
+                    + relativePath
                     + "] configured ["
                     + SERVERLESS_STORAGE_REPOSITORY_SETTING.getKey()
                     + "="
@@ -1197,7 +1232,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         }
         org.opensearch.repositories.blobstore.BlobStoreRepository blobStoreRepository =
             (org.opensearch.repositories.blobstore.BlobStoreRepository) repository;
-        BlobPath fullPath = blobStoreRepository.basePath().add("serverless_storage").add(shardPath);
+        BlobPath fullPath = blobStoreRepository.basePath().add("serverless_storage").add(relativePath);
         return blobStoreRepository.blobStore().blobContainer(fullPath);
     }
 
@@ -1212,25 +1247,27 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      * encryption is applied at the {@code WalChunkService} layer instead (via {@code
      * EncryptingWalChunkService}, wired in {@code ObjectStoreWriterEngine} whenever {@link
      * #encryptionKeyProvider} is configured, unaffected by whether the underlying container is
-     * shared or dedicated) -- see rfc-serverless-opensearch.md &sect;12 bullet 1.
+     * shared or dedicated) -- see rfc-serverless-opensearch.md &sect;12 bullet 1. Repository-backed
+     * exactly like {@link #blobContainerFor} whenever {@link #SERVERLESS_STORAGE_REPOSITORY_SETTING}
+     * names one -- see {@link #resolveContainer}'s own javadoc for why this is now unconditional
+     * rather than local-filesystem-only.
      */
     private BlobContainer resolveDedicatedWalContainer(String indexUuid, int shardId) throws IOException {
-        if (basePath == null) {
-            throw new IllegalStateException(
-                "shard ["
-                    + indexUuid
-                    + "]["
-                    + shardId
-                    + "] has "
-                    + SERVERLESS_STORAGE_WAL_DEDICATED_STREAM_SETTING.getKey()
-                    + " enabled but no ["
-                    + SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey()
-                    + "] node setting was configured (or it did not resolve to an allowed path)"
-            );
-        }
-        FsBlobStore blobStore = new FsBlobStore(1024 * 1024, basePath, false);
         BlobPath dedicatedWalPath = BlobPath.cleanPath().add("wal-dedicated").add(indexUuid).add(String.valueOf(shardId));
-        return blobStore.blobContainer(dedicatedWalPath);
+        return resolveContainer(
+            dedicatedWalPath,
+            "shard ["
+                + indexUuid
+                + "]["
+                + shardId
+                + "] has "
+                + SERVERLESS_STORAGE_WAL_DEDICATED_STREAM_SETTING.getKey()
+                + " enabled but neither ["
+                + SERVERLESS_STORAGE_REPOSITORY_SETTING.getKey()
+                + "] nor ["
+                + SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey()
+                + "] resolved to a usable container"
+        );
     }
 
     @Override

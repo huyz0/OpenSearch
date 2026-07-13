@@ -2301,9 +2301,9 @@ under the repository's own `basePath()` plus a `serverless_storage/` prefix, so 
 can never collide with snapshots the same repository also stores. Resolved lazily on every call
 (never cached), since `RepositoriesService` may not have the named repository registered yet this
 early in node startup and a repository can be deleted/recreated later in the node's lifetime.
-Deliberately scoped to only this shard's own regular manifest/bundle container for now -- the
-shared/dedicated WAL containers remain local-filesystem-only, a natural follow-up once this seam is
-proven in production rather than widening one change's blast radius. Verified against a real
+Originally scoped to only this shard's own regular manifest/bundle container -- the shared/dedicated
+WAL containers were deliberately left local-filesystem-only, "a natural follow-up once this seam is
+proven in production rather than widening one change's blast radius." Verified against a real
 `fs`-type repository in a real cluster (`ServerlessStorageRepositoryBackedContainerIT`, standing in
 for S3/GCS/Azure since all four share the identical `BlobStoreRepository#blobStore()` seam this
 plugin reads through -- the concrete repository type is irrelevant to what's being proven): a real
@@ -2311,6 +2311,30 @@ indexed, flushed, and refreshed document is genuinely searchable back out of the
 container, real manifest/bundle bytes land under the registered repository's own path, and nothing
 is written under a simultaneously-configured-but-superseded local `base_path` -- proving the
 repository setting takes precedence, not merely that it also works.
+
+**The dedicated per-index WAL stream is now repository-backed too, half of that follow-up.**
+`repositoryBackedBlobContainer` was generalized from taking `(indexUuid, shardId, shardPath)` to an
+arbitrary `relativePath`, and a new shared `resolveContainer` helper wraps the same
+repository-or-local-filesystem branching `blobContainerFor` already had -- `resolveDedicatedWalContainer`
+(rfc-serverless-opensearch.md &sect;12's "dedicated WAL streams" bullet) now goes through it exactly
+like a shard's own regular container does, since both resolve lazily at real shard-open time, well
+after node startup, by which point an operator has had every opportunity to register a repository.
+Verified the same way: `ServerlessStorageRepositoryBackedContainerIT#testDedicatedWalChunksLandInTheRegisteredRepositoryNotTheLocalBasePath`
+proves real dedicated WAL chunk bytes land under the registered repository's `wal-dedicated/` prefix,
+not the local `base_path`'s.
+
+**The shared, node-scoped WAL container is not, and this is a newly-identified, concrete reason, not
+just residual caution.** Unlike every other container this plugin resolves, `createComponents` builds
+the shared WAL container (and `sharedWalChunkService` itself) exactly once, synchronously, at node
+startup -- before `RepositoriesService` necessarily has any repository registered at all, since
+repository registration happens later via the `_snapshot` API. Routing this through `resolveContainer`
+was tried and caught a real failure, not a hypothetical one: a real `internalClusterTest` reproduced
+`IOException: ... that repository is not currently registered` at node startup the moment this path
+was made repository-aware, before the test ever got to register one. Making this container genuinely
+lazy needs `sharedWalChunkService`'s own construction deferred to first real writer-shard use (a
+`volatile` field several call sites already null-check as WAL mirroring's on/off switch) -- a larger,
+separate change from the container-resolution seam this pass otherwise closes, left open rather than
+rushed in under this pass.
 
 **`compareAndSwapRegister` backends: FS done; S3 done; GCS done; Azure done -- all four planned
 backends now implemented.**

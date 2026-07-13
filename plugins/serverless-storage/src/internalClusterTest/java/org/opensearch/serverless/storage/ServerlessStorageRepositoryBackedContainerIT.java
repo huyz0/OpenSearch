@@ -103,6 +103,75 @@ public class ServerlessStorageRepositoryBackedContainerIT extends ServerlessStor
         );
     }
 
+    /**
+     * Closes part of rfc-serverless-opensearch.md &sect;16's own "shared/dedicated WAL containers
+     * remain local-filesystem-only, a natural follow-up" note: {@code resolveDedicatedWalContainer}
+     * now goes through the exact same {@code resolveContainer} seam a shard's own regular container
+     * does -- resolved lazily per shard, at real shard-open time, the same timing the regular
+     * container already has, so it doesn't hit the eager-resolution-at-node-startup problem that
+     * keeps the *shared* WAL container ({@code createComponents}'s own, node-scoped, spanning every
+     * writer shard) local-filesystem-only for now (see that method's own comment for why). With
+     * {@code serverless_storage.repository} configured and a dedicated WAL stream opted into via
+     * {@code index.serverless_storage.wal.dedicated_stream}, real dedicated WAL chunk bytes must
+     * land under the registered repository, not the local {@code base_path}.
+     */
+    public void testDedicatedWalChunksLandInTheRegisteredRepositoryNotTheLocalBasePath() throws Exception {
+        Path repoPath = createTempDir("serverless-storage-repo-backed-wal-it-repo");
+        Path unusedLocalBasePath = createTempDir("serverless-storage-repo-backed-wal-it-unused-local");
+        Settings nodeSettings = Settings.builder()
+            // Both paths must be registered path.repo roots: Environment#resolveRepoFile refuses
+            // to resolve SERVERLESS_STORAGE_BASE_PATH_SETTING otherwise, which would leave basePath
+            // null -- and the shared WAL container (createComponents' own, still local-filesystem-
+            // only, see that method's own comment) gates its entire construction, including the
+            // dedicated-stream machinery that depends on it existing at all, on basePath != null.
+            .putList("path.repo", repoPath.toString(), unusedLocalBasePath.toString())
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey(), unusedLocalBasePath.toString())
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_REPOSITORY_SETTING.getKey(), REPO_NAME)
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING.getKey(), true)
+            .build();
+
+        internalCluster().startClusterManagerOnlyNode(nodeSettings);
+        internalCluster().startDataOnlyNode(nodeSettings);
+
+        assertTrue(
+            "repository registration must be acknowledged before it's usable",
+            client().admin()
+                .cluster()
+                .preparePutRepository(REPO_NAME)
+                .setType(FsRepository.TYPE)
+                .setSettings(Settings.builder().put(FsRepository.LOCATION_SETTING.getKey(), repoPath.toString()))
+                .get()
+                .isAcknowledged()
+        );
+
+        createIndex(
+            INDEX_NAME,
+            Settings.builder()
+                .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+                .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+                .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey(), true)
+                .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_WAL_DEDICATED_STREAM_SETTING.getKey(), true)
+                .build()
+        );
+        ensureGreen(INDEX_NAME);
+
+        client().prepareIndex(INDEX_NAME).setId("1").setSource("field", "value1").get();
+        client().admin().indices().prepareFlush(INDEX_NAME).get();
+
+        assertTrue(
+            "real dedicated WAL chunk bytes must exist under the registered repository's own " + "wal-dedicated/ prefix",
+            hasAnyFileUnder(repoPath.resolve("serverless_storage").resolve("wal-dedicated"))
+        );
+        assertFalse(
+            "nothing must have been written under the local base_path's own wal-dedicated/ prefix -- "
+                + "the repository setting must take precedence for the dedicated WAL container too, "
+                + "not just the regular shard container (the shared, node-scoped WAL container's own "
+                + "wal/ prefix is deliberately excluded from this check -- it remains "
+                + "local-filesystem-only regardless of this setting, a separate, still-open gap)",
+            hasAnyFileUnder(unusedLocalBasePath.resolve("wal-dedicated"))
+        );
+    }
+
     private static boolean hasAnyFileUnder(Path root) throws Exception {
         if (Files.exists(root) == false) {
             return false;
