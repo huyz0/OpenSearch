@@ -2978,10 +2978,13 @@ shape exactly. Unlike the reader side, nothing consumes this signal yet, and tha
 rather than an oversight: reader scale-up above has a real knob to turn (`index.number_of_search_replicas`)
 and a real mechanism already wired to a scheduler; writer capacity has neither. There is no "writer
 replica count" -- exactly one primary per shard -- and the only real mechanism for adding write
-capacity, `ShardSplitter`'s auto-split, is still only half-built (logical-first; the physical bundle
-rewrite that would actually shed write load off an overloaded shard is still future work, see
-`resharding/package-info.java`). Wiring a threshold-triggered auto-split off `writesPerMinute()` before
-that mechanism exists would have nothing safe to trigger against. This increment exists purely so the
+capacity, `ShardSplitter`'s auto-split, still has nothing safe to trigger against for a different
+reason than an earlier draft of this paragraph gave: the physical bundle rewrite itself is done
+(`PartitionRewritePublisher`, with its own background scheduler -- see &sect;16 Phase 5), but the
+routing cutover a real auto-split would need after rewriting (directing traffic to the split targets
+instead of the original shard) is not designed at all, a separate, larger, deliberately out-of-scope
+gap (see &sect;16 Phase 4's own split-target routing note). Wiring a threshold-triggered auto-split off
+`writesPerMinute()` before that exists would have nothing safe to trigger against. This increment exists purely so the
 signal is already being tracked -- the same incremental shape `millisSinceLastActivity()` was built
 in -- ready for whenever a future controller can actually act on it.
 
@@ -3318,9 +3321,11 @@ pass on demand, rather than waiting out the scheduler's interval, was considered
 core's `_forcemerge` action and rejected this session -- see §7's status note for why (it would
 require building against the experimental, actively-changing `Indexer`/`IndexerFactory` SPI, and
 still needs a real local `Store` underneath regardless, since `StoreRecovery` requires one ahead of
-any `Indexer` construction). A plugin-owned on-demand-compaction action, reusing this scheduler's
-exact tick logic directly (no core changes, no experimental SPI), remains a smaller, safer
-alternative if the on-demand case turns out to matter in practice.
+any `Indexer` construction). That smaller, safer alternative -- a plugin-owned on-demand-compaction
+action reusing this scheduler's exact tick logic directly, no core changes, no experimental SPI --
+is now built: `CompactionTriggerAction`/`TransportCompactionTriggerAction`/`RestCompactionTriggerAction`
+(`POST /_plugins/_serverless/storage/_compact`) delegate straight to `maybeCompact`, the exact logic
+the scheduled task's own tick runs.
 
 **Phase 4.6 — Snapshots/clones/PITR (manifest pinning and PITR retention wiring done; a first,
 scoped slice of clone landed too -- see below).** Durable pins (§6.5) are implemented as `DurablePinRegistry`/`BlobContainerDurablePinRegistry`

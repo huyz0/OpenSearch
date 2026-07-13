@@ -7,15 +7,19 @@
  */
 
 /**
- * Resharding-by-copy (rfc-serverless-opensearch.md &sect;16 Phase 5): split a shard into {@code
- * numPartitions} zero-copy target shards without rewriting any bundle bytes, and the reader-side
+ * Resharding (rfc-serverless-opensearch.md &sect;16 Phase 5): split a shard into {@code
+ * numPartitions} zero-copy target shards without rewriting any bundle bytes, the reader-side
  * doc-routing partition filter ({@link org.opensearch.serverless.storage.resharding.PartitionFilteringDirectoryReader})
- * that makes each target correctly serve only its own slice of the pre-split document space in the
- * meantime -- "logical-first, physical-later," per that section's own status note.
+ * that makes each target correctly serve only its own slice of the pre-split document space, the
+ * background {@link org.opensearch.serverless.storage.resharding.PartitionRewriteSchedulerTask}
+ * that later physically rewrites a target down to just its own partition (dropping the doc-routing
+ * filter's job once done), and {@link org.opensearch.serverless.storage.resharding.ShardShrinker},
+ * shrink's inverse operation (merging several shards' document spaces back into one via a real
+ * Lucene merge).
  *
- * <p>Explicitly out of scope for this increment: physically rewriting a split target's bundles
- * down to just its own partition (which would let the doc-routing filter be dropped once done),
- * and shrink (the inverse operation, merging several shards' document spaces back into one) --
- * both real, sizeable follow-ups on top of the split primitive this package implements.
+ * <p>Explicitly out of scope: real client-facing routing cutover after a split (directing writes to
+ * the right target partition instead of the source) -- a wholly separate design problem this
+ * package's own split/rewrite primitives have nothing to build it on top of yet; and deleting a
+ * shrink's now-superseded source shards afterward, a deliberately-not-automatic operator decision.
  */
 package org.opensearch.serverless.storage.resharding;
