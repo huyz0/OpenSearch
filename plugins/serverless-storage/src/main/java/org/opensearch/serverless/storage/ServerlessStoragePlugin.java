@@ -65,6 +65,8 @@ import org.opensearch.serverless.storage.retention.DurablePinRegistry;
 import org.opensearch.serverless.storage.retention.PitrRetentionConfig;
 import org.opensearch.serverless.storage.security.EncryptingBlobContainer;
 import org.opensearch.serverless.storage.security.EncryptionKeyProvider;
+import org.opensearch.serverless.storage.security.ObjectStoreRequestCounter;
+import org.opensearch.serverless.storage.security.RequestCountingBlobContainer;
 import org.opensearch.serverless.storage.security.StaticEncryptionKeyProvider;
 import org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore;
 import org.opensearch.serverless.storage.shardstate.ShardStateStore;
@@ -694,6 +696,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     // readerShardActivityRegistry above closed the manifest-generation-lag one.
     private final org.opensearch.serverless.storage.format.CacheStatsRegistry cacheStatsRegistry =
         new org.opensearch.serverless.storage.format.CacheStatsRegistry();
+    // §18 risk #1's own mitigation ("publish request-count metrics from day one"): every real
+    // container this plugin resolves gets wrapped in RequestCountingBlobContainer against this one
+    // shared instance -- see resolveContainer and the shared WAL container's own construction below.
+    private final ObjectStoreRequestCounter requestCounter = new ObjectStoreRequestCounter();
 
     @Override
     public List<Setting<?>> getSettings() {
@@ -901,7 +907,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 // construction itself deferred to first real writer-shard use, a larger, separate
                 // change from the WAL container repository-backing this pass otherwise closes.
                 FsBlobStore walBlobStore = new FsBlobStore(1024 * 1024, basePath, false);
-                BlobContainer walBlobContainer = walBlobStore.blobContainer(BlobPath.cleanPath().add("wal"));
+                BlobContainer walBlobContainer = new RequestCountingBlobContainer(
+                    walBlobStore.blobContainer(BlobPath.cleanPath().add("wal")),
+                    requestCounter
+                );
                 // A fresh epoch per node incarnation (see WalChunkService's own javadoc for what
                 // this identifies) -- fencing during replay is a per-record primaryTerm filter, not
                 // an epoch-directory one, so nothing depends on this value being stable across
@@ -1221,6 +1230,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      * WAL containers below is exactly that follow-up: the same one seam, no new resolution logic.
      */
     private BlobContainer resolveContainer(BlobPath relativePath, String missingContainerErrorMessage) throws IOException {
+        return new RequestCountingBlobContainer(resolveContainerUncounted(relativePath, missingContainerErrorMessage), requestCounter);
+    }
+
+    private BlobContainer resolveContainerUncounted(BlobPath relativePath, String missingContainerErrorMessage) throws IOException {
         if (repositoryName != null && repositoryName.isEmpty() == false) {
             return repositoryBackedBlobContainer(relativePath);
         }
@@ -1504,6 +1517,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 org.opensearch.serverless.storage.format.action.TransportNodeCacheStatsAction.class
             ),
             new ActionHandler<>(
+                org.opensearch.serverless.storage.security.action.NodeObjectStoreRequestStatsAction.INSTANCE,
+                org.opensearch.serverless.storage.security.action.TransportNodeObjectStoreRequestStatsAction.class
+            ),
+            new ActionHandler<>(
                 org.opensearch.serverless.storage.readerengine.action.WaitForGenerationAction.INSTANCE,
                 org.opensearch.serverless.storage.readerengine.action.TransportWaitForGenerationAction.class
             ),
@@ -1592,6 +1609,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new org.opensearch.serverless.storage.writerengine.action.RestRealtimeGetAction(),
             new org.opensearch.serverless.storage.readerengine.action.RestNodeManifestLagAction(),
             new org.opensearch.serverless.storage.format.action.RestNodeCacheStatsAction(),
+            new org.opensearch.serverless.storage.security.action.RestNodeObjectStoreRequestStatsAction(),
             new org.opensearch.serverless.storage.readerengine.action.RestWaitForGenerationAction(),
             new org.opensearch.serverless.storage.readerengine.action.RestPollNowAction(),
             new org.opensearch.serverless.storage.scaletozero.action.RestScaleToZeroCandidatesAction(),
@@ -1629,6 +1647,15 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      */
     public org.opensearch.serverless.storage.format.CacheStatsRegistry cacheStatsRegistry() {
         return cacheStatsRegistry;
+    }
+
+    /**
+     * The node-wide tally every real container this plugin resolves is wrapped against -- used by
+     * {@code TransportNodeObjectStoreRequestStatsAction} to answer request-count queries; public
+     * for the same reason as {@link #shardActivityRegistry()}.
+     */
+    public ObjectStoreRequestCounter objectStoreRequestCounter() {
+        return requestCounter;
     }
 
     /**

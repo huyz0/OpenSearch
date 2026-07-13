@@ -3833,7 +3833,18 @@ head untouched, and that naming a nonexistent index fails with a clear precondit
 
 1. **Object-store request economics.** Group-commit intervals and bundle batching directly trade
    durability latency vs request cost. Mitigation: make ack policy explicit (§6.4), publish
-   request-count metrics from day one, and treat them as SLOs.
+   request-count metrics from day one, and treat them as SLOs. **Status: the "publish request-count
+   metrics" half is now a real runtime signal, not just a build-time regression-test guard.**
+   `CostAccountingRegressionTests` already caught PUT-count regressions at build time, but nothing
+   published real request counts from a running node. `RequestCountingBlobContainer` (new,
+   `security` package) wraps every real container `ServerlessStoragePlugin#resolveContainer`
+   resolves -- the single seam every container this plugin builds (a shard's own regular container,
+   a dedicated WAL container, and the shared node-wide WAL container alike) already funnels through
+   -- tallying get/put/delete/list requests into one shared node-wide `ObjectStoreRequestCounter`.
+   `NodeObjectStoreRequestStatsAction` (`GET /_plugins/_serverless/storage/_object_store_request_stats`)
+   reports it, same single-node-scope shape as `NodeCacheStatsAction`. Verified end-to-end: a real
+   flush against a real writer shard drives a real `writeBlobAtomic` (bundle + manifest) that shows
+   up in the count over transport, not just reachable via a direct counter call.
 2. **Cold-query latency.** A cache-empty reader answering an aggregation over 100 GB will be
    slow no matter what. Mitigation: boot-set prefetch, honest documentation, and autoscaling on
    cache hit rate; consider tiered "pinned working set" for latency-critical indices.
