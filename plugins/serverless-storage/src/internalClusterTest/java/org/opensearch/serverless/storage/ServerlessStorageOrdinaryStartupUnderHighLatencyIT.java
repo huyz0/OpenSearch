@@ -54,6 +54,11 @@ import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertHitCount;
  * &sect;18 risk #1) so this test's own log line reports not just how long ordinary startup took
  * under {@code HIGH}, but how many real blob-shaped requests it actually cost -- the "sequencing"
  * half of the open question, not just the "count" half.
+ *
+ * <p>{@link #testShardRecoveryWithManySegmentFilesUnderSimulatedHighBlobLatency} closes the
+ * remaining half of that same open question: whether the per-file blob-op count/sequencing
+ * observed for a single-segment shard above actually scales to a shard with hundreds of real
+ * segment files, not just whether ordinary startup and single-segment recovery complete at all.
  */
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
 public class ServerlessStorageOrdinaryStartupUnderHighLatencyIT extends ServerlessStorageIntegTestCase {
@@ -241,7 +246,116 @@ public class ServerlessStorageOrdinaryStartupUnderHighLatencyIT extends Serverle
         assertHitCount(client().prepareSearch(IDX + "-recovery").setSize(0).get(), 1);
     }
 
-    /** The data node name that ISN'T {@code deadNodeName} -- both data nodes started by {@link #testShardRecoveryOntoAFreshNodeUnderSimulatedHighBlobLatency} are equally-eligible candidates, but only one is actually still alive by the time this is called. */
+    /**
+     * The previous test's shard has nothing but a single tiny segment to materialize -- a
+     * degenerate case that doesn't actually exercise this section's own "startup does dozens of
+     * small sequential blob writes (segment files, WAL chunks)" concern about many-file recovery.
+     * This test forces a real many-segment commit (merges disabled via generous {@code
+     * index.merge.policy} tuning, one segment per individually-refreshed document) so the flushed
+     * manifest this survivor node materializes genuinely references hundreds of real segment files,
+     * not one -- the actual scaling question {@code ServerlessStorageReactivationUnderLatencyIT}'s
+     * own javadoc left open.
+     */
+    public void testShardRecoveryWithManySegmentFilesUnderSimulatedHighBlobLatency() throws Exception {
+        // Generous on purpose, same reasoning as STARTUP_BOUND: this test's real bound-breaking
+        // failure mode is startup that never completes, not a merely-slow-but-working result --
+        // hundreds of sequential per-file GETs under HIGH easily dwarfs STARTUP_BOUND's 180s.
+        TimeValue manySegmentStartupBound = TimeValue.timeValueSeconds(300);
+        int documentCount = 100;
+
+        Path repoPath = createTempDir("serverless-storage-recovery-many-segments-under-high-latency-it-repo");
+        Path unusedLocalBasePath = createTempDir("serverless-storage-recovery-many-segments-under-high-latency-it-unused-local");
+        Settings nodeSettings = Settings.builder()
+            .putList("path.repo", repoPath.toString())
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey(), unusedLocalBasePath.toString())
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_REPOSITORY_SETTING.getKey(), REPO_NAME)
+            .build();
+
+        internalCluster().startClusterManagerOnlyNode(nodeSettings);
+        internalCluster().startDataOnlyNode(nodeSettings);
+        internalCluster().startDataOnlyNode(nodeSettings);
+
+        assertTrue(
+            "repository registration must be acknowledged before it's usable",
+            client().admin()
+                .cluster()
+                .preparePutRepository(REPO_NAME)
+                .setType(REPO_TYPE)
+                .setSettings(Settings.builder().put(FsRepository.LOCATION_SETTING.getKey(), repoPath.toString()))
+                .get()
+                .isAcknowledged()
+        );
+
+        String manySegmentsIdx = IDX + "-many-segments";
+        createIndex(
+            manySegmentsIdx,
+            Settings.builder()
+                .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+                .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+                .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey(), true)
+                // Merges deliberately suppressed: the whole point is a many-segment commit, so
+                // TieredMergePolicy must never consolidate the per-document segments below into one.
+                .put("index.merge.policy.segments_per_tier", (double) (documentCount * 10))
+                .put("index.merge.policy.max_merge_at_once", documentCount * 10)
+                .build()
+        );
+        ensureGreen(STARTUP_BOUND, manySegmentsIdx);
+
+        for (int i = 0; i < documentCount; i++) {
+            client().prepareIndex(manySegmentsIdx).setId(Integer.toString(i)).setSource("field", "value" + i).get();
+            // One segment per document: this loop's whole purpose is producing a many-segment
+            // commit, not testing indexing throughput, so an individual refresh after every write
+            // is deliberate, not an oversight.
+            client().admin().indices().prepareRefresh(manySegmentsIdx).get();
+        }
+        // Publishing (rfc-serverless-opensearch.md &sect;7.1) only happens on flush -- a single
+        // flush here bundles every one of the documentCount un-merged segments above into one real,
+        // durable, many-segment-file manifest for the survivor node to materialize below.
+        client().admin().indices().prepareFlush(manySegmentsIdx).get();
+
+        String primaryNodeId = internalCluster().clusterService()
+            .state()
+            .routingTable()
+            .index(manySegmentsIdx)
+            .shard(0)
+            .primaryShard()
+            .currentNodeId();
+        String primaryNodeName = internalCluster().clusterService().state().nodes().get(primaryNodeId).getName();
+
+        NodeObjectStoreRequestStatsResponse survivorBefore = internalCluster().client(survivorNodeName(primaryNodeName))
+            .execute(NodeObjectStoreRequestStatsAction.INSTANCE, new NodeObjectStoreRequestStatsRequest())
+            .get();
+
+        long start = System.nanoTime();
+        internalCluster().stopRandomNode(settings -> primaryNodeName.equals(settings.get("node.name")));
+        // The survivor node starts with a completely empty local Store -- this ensureGreen only
+        // succeeds once it has fully materialized every one of the many flushed segment files from
+        // the (simulated HIGH-latency) object store, the actual "scales to hundreds of segment
+        // files" question this test exists to answer.
+        ensureGreen(manySegmentStartupBound, manySegmentsIdx);
+        long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+
+        NodeObjectStoreRequestStatsResponse survivorAfter = internalCluster().client(survivorNodeName(primaryNodeName))
+            .execute(NodeObjectStoreRequestStatsAction.INSTANCE, new NodeObjectStoreRequestStatsRequest())
+            .get();
+
+        logger.info(
+            "cross-node shard recovery ({} pre-flushed un-merged segments) under simulated HIGH blob latency took "
+                + "{} ms and cost {} PUTs, {} GETs, {} LISTs, {} DELETEs on the survivor node (bounded at {})",
+            documentCount,
+            elapsedMillis,
+            survivorAfter.putCount() - survivorBefore.putCount(),
+            survivorAfter.getCount() - survivorBefore.getCount(),
+            survivorAfter.listCount() - survivorBefore.listCount(),
+            survivorAfter.deleteCount() - survivorBefore.deleteCount(),
+            manySegmentStartupBound
+        );
+
+        refresh(manySegmentsIdx);
+        assertHitCount(client().prepareSearch(manySegmentsIdx).setSize(0).get(), documentCount);
+    }
+
+    /** The data node name that ISN'T {@code deadNodeName} -- both data nodes started by {@link #testShardRecoveryOntoAFreshNodeUnderSimulatedHighBlobLatency} and {@link #testShardRecoveryWithManySegmentFilesUnderSimulatedHighBlobLatency} are equally-eligible candidates, but only one is actually still alive by the time this is called. */
     private String survivorNodeName(String deadNodeName) {
         for (String nodeName : internalCluster().getNodeNames()) {
             if (nodeName.equals(deadNodeName) == false && nodeName.equals(internalCluster().getClusterManagerName()) == false) {
