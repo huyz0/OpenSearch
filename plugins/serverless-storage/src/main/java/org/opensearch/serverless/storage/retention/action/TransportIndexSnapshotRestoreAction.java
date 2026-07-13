@@ -19,6 +19,7 @@ import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.serverless.storage.ServerlessStoragePlugin;
 import org.opensearch.serverless.storage.retention.BlobContainerDurablePinRegistry;
 import org.opensearch.serverless.storage.retention.PinRecord;
+import org.opensearch.serverless.storage.security.RestrictingBlobContainer;
 import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
@@ -89,7 +90,15 @@ public class TransportIndexSnapshotRestoreAction extends HandledTransportAction<
         threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
             try {
                 for (int shardId = 0; shardId < numberOfShards; shardId++) {
-                    BlobContainer container = plugin.blobContainerForDirectoryFactory(indexUuid, shardId);
+                    // Credential scoping per tier (rfc-serverless-opensearch.md &sect;15): this
+                    // validation pass only reads pins (the actual restore is delegated per-shard to
+                    // SnapshotRestoreAction, which scopes its own container), so this container is
+                    // wrapped read-only.
+                    BlobContainer container = new RestrictingBlobContainer(
+                        plugin.blobContainerForDirectoryFactory(indexUuid, shardId),
+                        false,
+                        false
+                    );
                     Set<PinRecord> pins = new BlobContainerDurablePinRegistry(container).getPins(indexUuid, shardId);
                     boolean pinned = pins.stream().anyMatch(pin -> pin.pinId().equals(request.snapshotId()));
                     if (pinned == false) {

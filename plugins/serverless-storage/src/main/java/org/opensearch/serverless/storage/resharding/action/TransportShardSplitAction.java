@@ -23,6 +23,7 @@ import org.opensearch.serverless.storage.resharding.BlobContainerShardPartitionS
 import org.opensearch.serverless.storage.resharding.ShardSplitter;
 import org.opensearch.serverless.storage.retention.BlobContainerDurablePinRegistry;
 import org.opensearch.serverless.storage.retention.DurablePinRegistry;
+import org.opensearch.serverless.storage.security.RestrictingBlobContainer;
 import org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore;
 import org.opensearch.serverless.storage.shardstate.ShardStateStore;
 import org.opensearch.tasks.Task;
@@ -101,8 +102,17 @@ public class TransportShardSplitAction extends HandledTransportAction<ShardSplit
                 requireRealShard(metadata, "source", request.sourceIndexUuid(), request.sourceShardId());
                 requireRealShard(metadata, "target", request.targetIndexUuid(), request.targetShardId());
 
-                BlobContainer sourceContainer = plugin.blobContainerForDirectoryFactory(request.sourceIndexUuid(), request.sourceShardId());
-                BlobContainer targetContainer = plugin.blobContainerForDirectoryFactory(request.targetIndexUuid(), request.targetShardId());
+                // Credential scoping per tier (rfc-serverless-opensearch.md &sect;15): a split
+                // never deletes anything -- ShardSplitter#split only pins the source and
+                // publishes the target -- so both containers are wrapped delete-denied.
+                BlobContainer sourceContainer = new RestrictingBlobContainer(
+                    plugin.blobContainerForDirectoryFactory(request.sourceIndexUuid(), request.sourceShardId()),
+                    false
+                );
+                BlobContainer targetContainer = new RestrictingBlobContainer(
+                    plugin.blobContainerForDirectoryFactory(request.targetIndexUuid(), request.targetShardId()),
+                    false
+                );
 
                 BlobContainerManifestStore sourceManifestStore = new BlobContainerManifestStore(sourceContainer);
                 ShardStateStore sourceShardStateStore = new BlobContainerShardStateStore(sourceContainer);

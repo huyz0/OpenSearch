@@ -23,6 +23,7 @@ import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.readerengine.ObjectStoreCommitMaterializer;
 import org.opensearch.serverless.storage.resharding.BlobContainerShardPartitionStore;
 import org.opensearch.serverless.storage.resharding.PartitionRewritePublisher;
+import org.opensearch.serverless.storage.security.RestrictingBlobContainer;
 import org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore;
 import org.opensearch.serverless.storage.shardstate.ShardStateStore;
 import org.opensearch.serverless.storage.writerengine.ObjectStoreCommitPublisher;
@@ -93,6 +94,13 @@ public class TransportShardPartitionRewriteAction extends HandledTransportAction
     protected void doExecute(Task task, ShardPartitionRewriteRequest request, ActionListener<ShardPartitionRewriteResponse> listener) {
         threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
             try {
+                // Credential scoping per tier (rfc-serverless-opensearch.md &sect;15): the target's
+                // own container is NOT delete-denied here -- PartitionRewritePublisher#rewrite's
+                // last step (clearDescriptor) genuinely deletes the now-superseded partition
+                // descriptor blob as a required part of its own contract (see that class's own
+                // javadoc for why that ordering is deliberate), not a defense-in-depth violation to
+                // guard against. The clone source below, read only for fallback bundle reads, never
+                // deletes and stays wrapped delete-denied.
                 BlobContainer container = plugin.blobContainerForDirectoryFactory(request.indexUuid(), request.shardId());
                 BlobContainerBundleStore bundleStore = new BlobContainerBundleStore(container);
                 BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(container);
@@ -102,9 +110,9 @@ public class TransportShardPartitionRewriteAction extends HandledTransportAction
                 BundleFileReader readPath = bundleStore;
                 Optional<CloneLineage> lineage = new BlobContainerCloneLineageStore(container).readLineage();
                 if (lineage.isPresent()) {
-                    BlobContainer sourceContainer = plugin.blobContainerForDirectoryFactory(
-                        lineage.get().sourceIndexUuid(),
-                        lineage.get().sourceShardId()
+                    BlobContainer sourceContainer = new RestrictingBlobContainer(
+                        plugin.blobContainerForDirectoryFactory(lineage.get().sourceIndexUuid(), lineage.get().sourceShardId()),
+                        false
                     );
                     readPath = new FallbackBundleFileReader(bundleStore, new BlobContainerBundleStore(sourceContainer));
                 }

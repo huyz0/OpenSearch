@@ -23,6 +23,7 @@ import org.opensearch.serverless.storage.manifest.CommitManifest;
 import org.opensearch.serverless.storage.retention.BlobContainerDurablePinRegistry;
 import org.opensearch.serverless.storage.retention.PinRecord;
 import org.opensearch.serverless.storage.retention.PitrRetentionPolicy;
+import org.opensearch.serverless.storage.security.RestrictingBlobContainer;
 import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
@@ -82,7 +83,14 @@ public class TransportShardRetentionStatsAction extends HandledTransportAction<S
             try {
                 String indexUuid = request.indexUuid();
                 int shardId = request.shardId();
-                BlobContainer container = plugin.blobContainerForDirectoryFactory(indexUuid, shardId);
+                // Credential scoping per tier (rfc-serverless-opensearch.md &sect;15): this is a
+                // pure dry-run computation (lists manifests/bundles/pins, never writes or deletes
+                // anything -- see this class's own javadoc), so the container is wrapped read-only.
+                BlobContainer container = new RestrictingBlobContainer(
+                    plugin.blobContainerForDirectoryFactory(indexUuid, shardId),
+                    false,
+                    false
+                );
                 BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(container);
                 BlobContainerBundleStore bundleStore = new BlobContainerBundleStore(container);
                 BlobContainerDurablePinRegistry pinRegistry = new BlobContainerDurablePinRegistry(container);

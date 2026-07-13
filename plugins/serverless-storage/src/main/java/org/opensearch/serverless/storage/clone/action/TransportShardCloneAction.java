@@ -19,6 +19,7 @@ import org.opensearch.serverless.storage.clone.ShardCloner;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.retention.BlobContainerDurablePinRegistry;
 import org.opensearch.serverless.storage.retention.DurablePinRegistry;
+import org.opensearch.serverless.storage.security.RestrictingBlobContainer;
 import org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore;
 import org.opensearch.serverless.storage.shardstate.ShardStateStore;
 import org.opensearch.tasks.Task;
@@ -74,8 +75,18 @@ public class TransportShardCloneAction extends HandledTransportAction<ShardClone
     protected void doExecute(Task task, ShardCloneRequest request, ActionListener<ShardCloneResponse> listener) {
         threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
             try {
-                BlobContainer sourceContainer = plugin.blobContainerForDirectoryFactory(request.sourceIndexUuid(), request.sourceShardId());
-                BlobContainer targetContainer = plugin.blobContainerForDirectoryFactory(request.targetIndexUuid(), request.targetShardId());
+                // Credential scoping per tier (rfc-serverless-opensearch.md &sect;15): this action
+                // never deletes anything -- ShardCloner#clone only reads/writes -- so both
+                // containers are wrapped delete-denied, same defense-in-depth shape already applied
+                // at ServerlessStoragePlugin#getEngineFactory's own construction seam.
+                BlobContainer sourceContainer = new RestrictingBlobContainer(
+                    plugin.blobContainerForDirectoryFactory(request.sourceIndexUuid(), request.sourceShardId()),
+                    false
+                );
+                BlobContainer targetContainer = new RestrictingBlobContainer(
+                    plugin.blobContainerForDirectoryFactory(request.targetIndexUuid(), request.targetShardId()),
+                    false
+                );
 
                 BlobContainerManifestStore sourceManifestStore = new BlobContainerManifestStore(sourceContainer);
                 ShardStateStore sourceShardStateStore = new BlobContainerShardStateStore(sourceContainer);

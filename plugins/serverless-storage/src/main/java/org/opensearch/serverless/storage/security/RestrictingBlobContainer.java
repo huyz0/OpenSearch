@@ -36,13 +36,16 @@ import java.util.List;
  * GcSchedulerConfig} alone is built against the unrestricted underlying container, matching "the
  * GC/reconciler role is the only DELETE-capable principal" exactly.
  *
- * <p><b>Known, explicit gap, matching this section's own encryption-status pattern</b>: several
- * on-demand transport actions (shard clone, shrink, split, partition-rewrite, snapshot
- * pin/restore/release, retention-stats) still build their stores directly against the raw,
- * unrestricted container from {@code ServerlessStoragePlugin#blobContainerForDirectoryFactory}, not
- * through this class -- some of those (shard clone's own lineage deletion, in particular) genuinely
- * need delete and would need per-action review before wrapping, not a blanket application of this
- * class; each is a distinct decision left for a follow-up, not silently assumed safe.
+ * <p>The remaining on-demand transport actions (shard clone, shrink, split, partition-rewrite,
+ * snapshot pin/restore/release, index-snapshot restore's validation pass, retention-stats) are also
+ * wired through this class now, each independently reviewed for whether it genuinely needs delete.
+ * Eight of nine don't -- the one real delete most of this area of the codebase could reach,
+ * {@code BlobContainerCloneLineageStore#deleteLineage}, is itself reachable only from {@code
+ * ServerlessStoragePlugin}'s internal index-deletion listener, which correctly stays unrestricted.
+ * The ninth, {@code TransportShardPartitionRewriteAction}, is a genuine exception found by exactly
+ * this kind of review (an initial delete-denied wrap broke a real {@code internalClusterTest}):
+ * {@code PartitionRewritePublisher#rewrite} deletes the target's now-superseded partition descriptor
+ * as a required last step of its own contract, so that action's target container is left unwrapped.
  */
 public final class RestrictingBlobContainer extends RegisterDelegatingBlobContainer {
 

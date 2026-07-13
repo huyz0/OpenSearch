@@ -24,6 +24,7 @@ import org.opensearch.serverless.storage.manifest.CommitManifest;
 import org.opensearch.serverless.storage.readerengine.ObjectStoreCommitMaterializer;
 import org.opensearch.serverless.storage.resharding.ShardShrinker;
 import org.opensearch.serverless.storage.resharding.ShardShrinker.ShrinkSource;
+import org.opensearch.serverless.storage.security.RestrictingBlobContainer;
 import org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore;
 import org.opensearch.serverless.storage.shardstate.ShardStateStore;
 import org.opensearch.serverless.storage.shardstate.VersionedShardHead;
@@ -94,7 +95,14 @@ public class TransportShardShrinkAction extends HandledTransportAction<ShardShri
                     sources.add(resolveShrinkSource(sourceRef));
                 }
 
-                BlobContainer targetContainer = plugin.blobContainerForDirectoryFactory(request.targetIndexUuid(), request.targetShardId());
+                // Credential scoping per tier (rfc-serverless-opensearch.md &sect;15): a shrink
+                // never deletes anything -- ShardShrinker#shrink only reads sources and publishes
+                // a new target commit -- so every container resolved here and in
+                // resolveShrinkSource is wrapped delete-denied.
+                BlobContainer targetContainer = new RestrictingBlobContainer(
+                    plugin.blobContainerForDirectoryFactory(request.targetIndexUuid(), request.targetShardId()),
+                    false
+                );
                 ShardStateStore targetShardStateStore = new BlobContainerShardStateStore(targetContainer);
                 ObjectStoreCommitPublisher targetCommitPublisher = new ObjectStoreCommitPublisher(
                     new BlobContainerBundleStore(targetContainer),
@@ -117,7 +125,10 @@ public class TransportShardShrinkAction extends HandledTransportAction<ShardShri
     }
 
     private ShrinkSource resolveShrinkSource(ShardRef sourceRef) throws IOException {
-        BlobContainer sourceContainer = plugin.blobContainerForDirectoryFactory(sourceRef.indexUuid(), sourceRef.shardId());
+        BlobContainer sourceContainer = new RestrictingBlobContainer(
+            plugin.blobContainerForDirectoryFactory(sourceRef.indexUuid(), sourceRef.shardId()),
+            false
+        );
         ShardStateStore sourceShardStateStore = new BlobContainerShardStateStore(sourceContainer);
         BlobContainerManifestStore sourceManifestStore = new BlobContainerManifestStore(sourceContainer);
 
@@ -135,9 +146,9 @@ public class TransportShardShrinkAction extends HandledTransportAction<ShardShri
         BundleFileReader readPath = new BlobContainerBundleStore(sourceContainer);
         Optional<CloneLineage> lineage = new BlobContainerCloneLineageStore(sourceContainer).readLineage();
         if (lineage.isPresent()) {
-            BlobContainer sourceOfSourceContainer = plugin.blobContainerForDirectoryFactory(
-                lineage.get().sourceIndexUuid(),
-                lineage.get().sourceShardId()
+            BlobContainer sourceOfSourceContainer = new RestrictingBlobContainer(
+                plugin.blobContainerForDirectoryFactory(lineage.get().sourceIndexUuid(), lineage.get().sourceShardId()),
+                false
             );
             readPath = new FallbackBundleFileReader(readPath, new BlobContainerBundleStore(sourceOfSourceContainer));
         }

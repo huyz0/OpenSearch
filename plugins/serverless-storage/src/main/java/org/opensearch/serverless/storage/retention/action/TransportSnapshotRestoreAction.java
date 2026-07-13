@@ -16,6 +16,7 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.serverless.storage.ServerlessStoragePlugin;
 import org.opensearch.serverless.storage.retention.BlobContainerDurablePinRegistry;
 import org.opensearch.serverless.storage.retention.PinRecord;
+import org.opensearch.serverless.storage.security.RestrictingBlobContainer;
 import org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore;
 import org.opensearch.serverless.storage.shardstate.CasResult;
 import org.opensearch.serverless.storage.shardstate.ShardHead;
@@ -82,7 +83,13 @@ public class TransportSnapshotRestoreAction extends HandledTransportAction<Snaps
     protected void doExecute(Task task, SnapshotRestoreRequest request, ActionListener<SnapshotRestoreResponse> listener) {
         threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
             try {
-                BlobContainer container = plugin.blobContainerForDirectoryFactory(request.indexUuid(), request.shardId());
+                // Credential scoping per tier (rfc-serverless-opensearch.md &sect;15): a restore
+                // never deletes anything (it CASes the head to point at an already-pinned
+                // generation), so this container is wrapped delete-denied.
+                BlobContainer container = new RestrictingBlobContainer(
+                    plugin.blobContainerForDirectoryFactory(request.indexUuid(), request.shardId()),
+                    false
+                );
                 ShardStateStore shardStateStore = new BlobContainerShardStateStore(container);
                 BlobContainerDurablePinRegistry pinRegistry = new BlobContainerDurablePinRegistry(container);
 

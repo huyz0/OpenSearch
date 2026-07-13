@@ -1735,6 +1735,48 @@ rather than rushed in under this pass. Verified: the real end-to-end `Serverless
 (merges an actual fragmented shard over transport) still passes unchanged with the wrap in place,
 proving the restriction doesn't interfere with compaction's real read/write/publish flow.
 
+**That follow-up is now closed.** Each of the listed actions got the per-action review the previous
+note called for, by tracing its actual call chain (not assuming from its name) for a real
+`.delete(`/`deleteBundles`/`deleteBlobs` call: `TransportShardCloneAction`, `TransportShardShrinkAction`,
+and `TransportShardSplitAction` only ever read, write, or CAS-mutate; the snapshot
+`TransportSnapshotPinAction`/`TransportSnapshotRestoreAction`/`TransportSnapshotReleaseAction` trio's
+`removePin` is a CAS-based register mutate (`BlobContainerDurablePinRegistry`), never a raw blob
+delete; `TransportShardRetentionStatsAction` is a pure dry-run count (it computes what *would* be
+deletable without deleting anything, matching its own class javadoc). The one real delete in this
+whole area of the codebase -- `BlobContainerCloneLineageStore#deleteLineage`, reachable only via
+`ShardCloner#deleteClone` -- is called only from `ServerlessStoragePlugin`'s internal `onIndexModule`
+index-deletion listener, which already correctly builds against the unrestricted container and is
+untouched by this pass. Eight of the nine actions now wrap their containers via
+`RestrictingBlobContainer`: the mutating ones (clone, shrink, split, and the three snapshot actions)
+delete-denied via the 2-arg constructor, matching the writer/compaction tier's "GET+PUT but no
+DELETE" scope; the two purely read-only validation/stats paths (`TransportIndexSnapshotRestoreAction`'s
+pin-check pass and `TransportShardRetentionStatsAction`'s dry-run computation) write-and-delete-denied
+via the 3-arg constructor, matching the GET-only search-compute scope, since neither ever needs to
+mutate anything. `TransportIndexSnapshotPinAction`/`TransportIndexSnapshotReleaseAction` needed no
+change at all -- both delegate entirely, per shard, to the already-scoped `SnapshotPinAction`/
+`SnapshotReleaseAction` rather than building their own containers.
+
+**`TransportShardPartitionRewriteAction` is the ninth, and the one genuine exception the review
+found, caught by the same `internalClusterTest` sweep this pass leans on for verification rather
+than by code reading alone**: an initial delete-denied wrap on its target container broke
+`ServerlessStorageShardPartitionRewriteActionIT` outright, with a loud `SecurityException` -- proof
+the sweep is a real check, not a formality. `PartitionRewritePublisher#rewrite`'s own javadoc says
+so directly ("`rewrite` deletes the descriptor as its last step"): once the new manifest and head
+are both durably published, it deletes the now-superseded `ShardPartitionDescriptor` blob
+(`BlobContainerShardPartitionStore#clearDescriptor`) so a future engine open stops applying a
+filter that's no longer needed. That delete is a required part of the rewrite's own contract, not a
+bug to guard against, so the target's container here is left unwrapped (raw, from
+`blobContainerForDirectoryFactory` directly) while the clone-lineage source container (read-only
+fallback bundle reads, genuinely never deletes) stays wrapped delete-denied same as the other eight.
+
+Verified with a full `internalClusterTest` sweep: every one of these nine actions already has direct
+end-to-end IT coverage (clone, shrink, split, partition-rewrite, snapshot pin/restore/release,
+index-snapshot pin/restore/release, retention-stats), so a wrong call -- an action that actually
+needed delete or write and got denied it -- failed loudly with `SecurityException` rather than
+passing silently, exactly as it did for partition-rewrite above; after that one fix, the sweep came
+back clean. `RestrictingBlobContainer`'s own class javadoc "known, explicit gap" note is now stale
+and has been updated to match.
+
 **A related latent gap, also caught by code review and fixed**: `CompactionSchedulerTask`'s
 scheduled tick previously caught only `IOException` per its documented "swallow and retry next
 tick" contract, but `RestrictingBlobContainer` throws the unchecked `SecurityException` on a

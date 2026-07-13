@@ -15,6 +15,7 @@ import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.serverless.storage.ServerlessStoragePlugin;
 import org.opensearch.serverless.storage.retention.BlobContainerDurablePinRegistry;
+import org.opensearch.serverless.storage.security.RestrictingBlobContainer;
 import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
@@ -64,7 +65,13 @@ public class TransportSnapshotReleaseAction extends HandledTransportAction<Snaps
     protected void doExecute(Task task, SnapshotReleaseRequest request, ActionListener<SnapshotReleaseResponse> listener) {
         threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
             try {
-                BlobContainer container = plugin.blobContainerForDirectoryFactory(request.indexUuid(), request.shardId());
+                // Credential scoping per tier (rfc-serverless-opensearch.md &sect;15): removePin is
+                // a CAS-based mutate, not a raw blob delete, so this container is wrapped
+                // delete-denied.
+                BlobContainer container = new RestrictingBlobContainer(
+                    plugin.blobContainerForDirectoryFactory(request.indexUuid(), request.shardId()),
+                    false
+                );
                 BlobContainerDurablePinRegistry pinRegistry = new BlobContainerDurablePinRegistry(container);
                 pinRegistry.removePin(request.indexUuid(), request.shardId(), request.snapshotId());
                 listener.onResponse(new SnapshotReleaseResponse(true));
