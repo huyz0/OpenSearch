@@ -3551,9 +3551,10 @@ package, REST at `POST /_plugins/_serverless/storage/_split`) expose it -- one c
 same "one call per target" shape `ShardCloneAction` already has.
 
 "Logical-first, physical-later" is now real, not just a plan: until a split target's bundles are
-physically rewritten (still not attempted -- see below), every target's directory holds the
-pre-split shard's *entire* document set, so each target must filter its own reads down to just its
-assigned partition or every target would return every document. New `PartitionFilteringDirectoryReader`
+physically rewritten (now implemented, on demand -- see the "Physical bundle rewrite" paragraph
+below), every target's directory holds the pre-split shard's *entire* document set, so each target
+must filter its own reads down to just its assigned partition or every target would return every
+document. New `PartitionFilteringDirectoryReader`
 (a `FilterDirectoryReader`, following the exact shape Lucene's own `SoftDeletesDirectoryReaderWrapper`
 uses to overlay soft-delete visibility onto live docs) computes each leaf's partition-membership
 `Bits` once per reader open, reading every live document's stored `_id` field and hashing it via
