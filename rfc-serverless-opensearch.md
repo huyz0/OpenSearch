@@ -2135,8 +2135,23 @@ the cross-index-clone reference-counting case -- now actually invoked by `GcSche
 `BlobContainerManifestStore` (real I/O against `BlobContainer`, FS-tested). An end-to-end test
 (`ServerlessStorageEndToEndTests`) exercises the full write&rarr;publish&rarr;read&rarr;GC cycle
 against a real filesystem blob store with no mocks. JMH microbenchmarks establish baseline
-throughput for both formats. Remaining for this phase: one real cloud-object-store integration
-test (currently FS/mock only, per the original scope note above).
+throughput for both formats. **The remaining real cloud-object-store integration test is now
+done too, closing this phase entirely.** `ServerlessStorageS3FixtureIT` (new, package-scoped to
+`org.opensearch.repositories.s3` rather than this plugin's own package -- see that class's own
+javadoc for why) drives this plugin's write&rarr;publish&rarr;read cycle against `repository-s3`'s
+own real production `S3RepositoryPlugin`, backed by `test:fixtures:s3-fixture`'s real (in-process,
+JDK `HttpServer`-based) S3-API-compliant `S3HttpHandler` -- a genuine S3 HTTP wire-protocol
+round trip, not local-filesystem/mock containers dressed up as "cloud." Getting a real, stable
+run took fixing two real setup gaps along the way, both confirmed by actually hitting them, not
+anticipated in advance: `S3Service#setDefaultAwsProfilePath` NPEs without `opensearch.path.conf`
+set (the same setup `repository-s3`'s own `S3BlobStoreRepositoryTests` already needs for this
+exact reason), and the AWS CRT client's own native event-loop threads (`AwsEventLoop`) leak
+across test runs -- a known, upstream-tracked issue
+(github.com/awslabs/aws-crt-java/issues/905) with no clean fix, requiring the same
+`@ThreadLeakFilters` workaround `S3BlobStoreRepositoryTests` already carries. Verified stable
+across repeated runs. `plugins/serverless-storage/build.gradle` gained two new
+`internalClusterTestImplementation` dependencies (`:plugins:repository-s3`,
+`:test:fixtures:s3-fixture`) to support this -- test-scoped only, no production-jar impact.
 
 **Phase 2 — Writer engine (WAL format, translog adapter, commit publishing, head CAS wiring,
 durability-driven local-disk retention, and crash recovery via WAL replay all done).** WAL chunk
