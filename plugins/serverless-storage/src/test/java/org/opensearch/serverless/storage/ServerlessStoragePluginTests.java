@@ -340,7 +340,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
         ServerlessStoragePlugin plugin = new ServerlessStoragePlugin();
         plugin.createComponents(null, null, null, null, null, null, environment, null, null, null, null);
 
-        InMemoryPlaintextBundleCache sharedCache = plugin.sharedBundleCacheForTesting();
+        InMemoryPlaintextBundleCache sharedCache = plugin.sharedBundleCache();
         assertNotNull("createComponents must construct the shared cache", sharedCache);
 
         // Two different "shards" (distinguished by bundle name, which is already index/shard-scoped

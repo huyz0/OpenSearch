@@ -332,6 +332,40 @@ public class LocalDiskCachingBundleStoreTests extends OpenSearchTestCase {
         assertEquals(0, cache.evictedCount());
     }
 
+    public void testAverageColdReadLatencyIsZeroWithNoMisses() throws Exception {
+        LocalDiskCachingBundleStore cache = new LocalDiskCachingBundleStore(inMemoryReader(writeSampleBundle()), createTempDir());
+        assertEquals("no read has happened at all yet", 0L, cache.averageColdReadLatencyMillis());
+    }
+
+    public void testAverageColdReadLatencyReflectsRealTimeSpentInTheDelegate() throws Exception {
+        SegmentBundle bundle = writeSampleBundle();
+        BundleFileEntry entry = bundle.entries().get("a.bin");
+        // A delegate that deliberately sleeps on every call, so a real elapsed-time measurement
+        // must reflect (at least) that sleep -- distinguishing a genuine timer from one that always
+        // reports 0 or a constant regardless of how long the delegate actually took.
+        BundleFileReader slowDelegate = (bundleName, e) -> {
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new IOException(interrupted);
+            }
+            return inMemoryReader(bundle).readFile(bundleName, e);
+        };
+        LocalDiskCachingBundleStore cache = new LocalDiskCachingBundleStore(slowDelegate, createTempDir());
+
+        cache.readFile("bundle-1", entry);
+        // A second read is a disk-cache hit, not a further delegate call -- must not dilute the
+        // average toward a fast/zero value.
+        cache.readFile("bundle-1", entry);
+
+        assertEquals(1, cache.missCount());
+        assertTrue(
+            "average cold-read latency must reflect the delegate's real ~50ms sleep, not read as 0",
+            cache.averageColdReadLatencyMillis() >= 40L
+        );
+    }
+
     public void testUnencryptedCacheStillWorksWithNoKeyProvider() throws Exception {
         // The 2-arg constructor must remain equivalent to passing a null key provider.
         SegmentBundle bundle = writeSampleBundle();

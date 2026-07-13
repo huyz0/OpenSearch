@@ -689,6 +689,11 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     // manifest-generation-lag lookups (&sect;10's "search tier: manifest-generation lag" hook).
     private final org.opensearch.serverless.storage.readerengine.ReaderShardActivityRegistry readerShardActivityRegistry =
         new org.opensearch.serverless.storage.readerengine.ReaderShardActivityRegistry();
+    // Every reader shard's local disk cache on this node registers into this one, closing
+    // &sect;9's "cache hit-rate and cold-read latency are first-class metrics" gap the same way
+    // readerShardActivityRegistry above closed the manifest-generation-lag one.
+    private final org.opensearch.serverless.storage.format.CacheStatsRegistry cacheStatsRegistry =
+        new org.opensearch.serverless.storage.format.CacheStatsRegistry();
 
     @Override
     public List<Setting<?>> getSettings() {
@@ -1022,12 +1027,13 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                     // shard -- see InMemoryPlaintextBundleCache's javadoc) is what keeps the
                     // actually-hot working set decrypted, so most reads never pay that decrypt cost
                     // repeatedly; only a disk-cache hit that missed this layer does.
-                    BundleFileReader diskCache = new LocalDiskCachingBundleStore(
+                    LocalDiskCachingBundleStore diskCache = new LocalDiskCachingBundleStore(
                         readPath,
                         shardCacheDir,
                         encryptionKeyProvider,
                         localCacheMaxBytesPerShard
                     );
+                    cacheStatsRegistry.register(indexUuid, shardIdValue, diskCache);
                     readPath = new CachingBundleFileReader(sharedBundleCache, diskCache);
                 }
                 CompactionSchedulerConfig compactionConfig = compactionInterval == null
@@ -1494,6 +1500,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 org.opensearch.serverless.storage.readerengine.action.TransportNodeManifestLagAction.class
             ),
             new ActionHandler<>(
+                org.opensearch.serverless.storage.format.action.NodeCacheStatsAction.INSTANCE,
+                org.opensearch.serverless.storage.format.action.TransportNodeCacheStatsAction.class
+            ),
+            new ActionHandler<>(
                 org.opensearch.serverless.storage.readerengine.action.WaitForGenerationAction.INSTANCE,
                 org.opensearch.serverless.storage.readerengine.action.TransportWaitForGenerationAction.class
             ),
@@ -1581,6 +1591,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new org.opensearch.serverless.storage.writerengine.action.RestNodeIdleShardsAction(),
             new org.opensearch.serverless.storage.writerengine.action.RestRealtimeGetAction(),
             new org.opensearch.serverless.storage.readerengine.action.RestNodeManifestLagAction(),
+            new org.opensearch.serverless.storage.format.action.RestNodeCacheStatsAction(),
             new org.opensearch.serverless.storage.readerengine.action.RestWaitForGenerationAction(),
             new org.opensearch.serverless.storage.readerengine.action.RestPollNowAction(),
             new org.opensearch.serverless.storage.scaletozero.action.RestScaleToZeroCandidatesAction(),
@@ -1601,9 +1612,23 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         );
     }
 
-    /** The node-shared bundle cache {@link #createComponents} built -- test-only visibility, not part of the plugin's contract. */
-    InMemoryPlaintextBundleCache sharedBundleCacheForTesting() {
+    /**
+     * The node-shared in-memory bundle cache {@link #createComponents} built -- {@code null} until
+     * that runs, and always {@code null} on a node with no {@code localCacheRoot} configured, since
+     * the cache is only ever built for reader shards; public since {@code
+     * TransportNodeCacheStatsAction}, not just tests, needs to reach it via {@code @Inject}.
+     */
+    public InMemoryPlaintextBundleCache sharedBundleCache() {
         return sharedBundleCache;
+    }
+
+    /**
+     * The node-shared registry every reader shard's local disk cache on this node registers itself
+     * into -- used by {@code TransportNodeCacheStatsAction} to answer cache hit-rate/cold-read-
+     * latency queries; public for the same reason as {@link #shardActivityRegistry()}.
+     */
+    public org.opensearch.serverless.storage.format.CacheStatsRegistry cacheStatsRegistry() {
+        return cacheStatsRegistry;
     }
 
     /**

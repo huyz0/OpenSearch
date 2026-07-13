@@ -78,6 +78,11 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
     private final ConcurrentMap<String, Object> locksByKey = new ConcurrentHashMap<>();
     private final AtomicLong hitCount = new AtomicLong();
     private final AtomicLong missCount = new AtomicLong();
+    // Total wall-clock nanos spent in the delegate.readFile call below, across every miss --
+    // rfc-serverless-opensearch.md &sect;9's "cold-read latency" metric, divided by missCount() for
+    // the running average. Deliberately just a running total, not a histogram/percentile tracker --
+    // same "simple estimate, not a tuned instrument" posture as ManifestSegmentMetrics#deleteRatio.
+    private final AtomicLong coldReadNanos = new AtomicLong();
 
     /** {@code <= 0} means unbounded -- see this class's own javadoc. */
     private final long maxBytesOnDisk;
@@ -158,7 +163,9 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
                 // legitimately stale cache entry) -- fall through and re-fetch rather than trust it.
             }
             missCount.incrementAndGet();
+            long start = System.nanoTime();
             byte[] fresh = delegate.readFile(bundleName, entry);
+            coldReadNanos.addAndGet(System.nanoTime() - start);
             writeAtomically(cachedPath, encryptIfNeeded(fresh));
             maybeEvict();
             return fresh;
@@ -270,6 +277,12 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
     /** Number of reads that missed the local disk cache and fell through to the delegate. */
     public long missCount() {
         return missCount.get();
+    }
+
+    /** Average wall-clock time, in milliseconds, spent fetching from the delegate on a cache miss so far -- 0 if there have been no misses yet. */
+    public long averageColdReadLatencyMillis() {
+        long misses = missCount.get();
+        return misses == 0 ? 0 : (coldReadNanos.get() / misses) / 1_000_000L;
     }
 
     private Path cachePathFor(String bundleName, BundleFileEntry entry) {

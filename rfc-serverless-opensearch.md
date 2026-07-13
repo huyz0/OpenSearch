@@ -1393,6 +1393,23 @@ now checks `ReaderShardAdmissionController#isOverBudgetForRefresh` before materi
 generation, skipping an over-budget tick entirely rather than pulling more segment bytes into an
 already-over-budget cache; the next poll tick retries automatically once pressure eases.
 
+**Cache hit-rate and cold-read latency are now real, queryable metrics, closing this section's own
+"first-class metrics" goal for the two caches actually built so far (`LocalDiskCachingBundleStore`/
+`InMemoryPlaintextBundleCache`; the lazy-directory `FileCache` above is core's own, already
+instrumented by core).** Both caches already tracked hit/miss counts internally; what was missing
+was a way to reach them from outside the process. `LocalDiskCachingBundleStore` additionally now
+times its own delegate call on every miss (`averageColdReadLatencyMillis()`), and a new
+`CacheStatsRegistry` -- same node-local, `WeakReference`-keyed shape as
+`ReaderShardActivityRegistry` -- lets every reader shard's disk cache register itself for lookup.
+`NodeCacheStatsAction` (`GET /_plugins/_serverless/storage/_cache_stats`) reports the node-shared
+in-memory cache's hit/miss counts plus every reader shard's disk cache stats on the receiving node,
+mirroring `NodeManifestLagAction`'s own single-node-scope shape exactly. Verified end-to-end in a
+real cluster: a search-only reader shard's real object-store reads are visible over transport, not
+just reachable via a direct unit-level registry call (a single materialization is necessarily all
+misses -- `ObjectStoreCommitMaterializer` skips any file already present locally without ever
+touching the cache at all, so a real hit only occurs across two independent materializations sharing
+the same on-disk cache directory, which the unit-level cold-read-latency test covers instead).
+
 ## 10. Allocation, Topology, and Autoscaling
 
 - **Node roles**: `ingest-compute` (hosts writer shards), `search-compute` (hosts reader
