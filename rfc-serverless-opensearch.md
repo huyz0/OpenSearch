@@ -346,11 +346,16 @@ being unconditional). Two replay strategies checked side by side, same pattern a
   states, search depth 16, 0 states left on the queue).
 
 **The fencing snapshot itself is now implemented** -- but not as originally sketched. `ShardHead`
-was not the right place for it: `ShardHead#withNewLease` has no caller anywhere in the codebase
-today (lease acquisition is not yet wired into any real activation/failover path; term authority is
-still borrowed from core cluster coordination, per &sect;7.1's own "term authority bridge" note).
-The real "this node just became the writer under a new term" event today is
-`ObjectStoreWriterEngine`'s own construction, not a not-yet-existing metadata-plane lease grant.
+was not the right place for it: at the time this design was written, `ShardHead#withNewLease` had
+no caller anywhere in the codebase (lease acquisition was not yet wired into any real
+activation/failover path; term authority was still borrowed from core cluster coordination). That
+gap has since closed -- see &sect;12's "real lease acquisition/renewal" status note: the method was
+renamed `withRenewedLease` and is now called from `ObjectStoreCommitHeadPublisher#acquireOrRenewLease`,
+itself invoked synchronously during `ObjectStoreWriterEngine`'s own construction -- but the design
+conclusion here is unaffected: `withRenewedLease` only ever renews `leaseHolderNodeId`/`leaseExpiryMillis`,
+it still carries no WAL-position field, so a fencing snapshot still has nowhere to live on
+`ShardHead` itself. The real "this node just became the writer under a new term" event remains
+`ObjectStoreWriterEngine`'s own construction, not any metadata-plane lease grant.
 `WalChunkService#currentChunkSequenceUpperBound()` exposes the real-world analogue of the model's
 `Len(wal)`, and `ObjectStoreWriterEngine#activationWalPosition` snapshots it as early as possible --
 before `super(engineConfig)` even runs, ahead of any of this engine's own construction work
