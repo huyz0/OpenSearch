@@ -38,6 +38,7 @@ import org.opensearch.action.bulk.BulkShardRequest;
 import org.opensearch.action.support.ActiveShardCount;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.rest.BaseRestHandler;
+import org.opensearch.rest.RestHandler.ServerlessScope;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.rest.action.RestStatusToXContentListener;
 import org.opensearch.search.fetch.subphase.FetchSourceContext;
@@ -81,6 +82,12 @@ public class RestBulkAction extends BaseRestHandler {
     @Override
     public String getName() {
         return "bulk_action";
+    }
+
+    /** See rfc-serverless-opensearch.md &sect;15's "operational caveat" note. */
+    @Override
+    public ServerlessScope serverlessScope() {
+        return ServerlessScope.AVAILABLE;
     }
 
     @Override

@@ -38,6 +38,7 @@ import org.opensearch.action.support.ActiveShardCount;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.index.VersionType;
 import org.opensearch.rest.BaseRestHandler;
+import org.opensearch.rest.RestHandler.ServerlessScope;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.rest.action.RestActions;
 import org.opensearch.rest.action.RestStatusToXContentListener;
@@ -68,6 +69,16 @@ public class RestIndexAction extends BaseRestHandler {
     @Override
     public String getName() {
         return "document_index_action";
+    }
+
+    /**
+     * See rfc-serverless-opensearch.md &sect;15's "operational caveat" note. Both {@link
+     * CreateHandler} and {@link AutoIdHandler} extend this class without overriding {@link
+     * #serverlessScope()}, so they inherit {@code AVAILABLE} from here too.
+     */
+    @Override
+    public ServerlessScope serverlessScope() {
+        return ServerlessScope.AVAILABLE;
     }
 
     /**

@@ -38,6 +38,7 @@ import org.opensearch.core.common.Strings;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.index.VersionType;
 import org.opensearch.rest.BaseRestHandler;
+import org.opensearch.rest.RestHandler.ServerlessScope;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.rest.action.RestActions;
 import org.opensearch.rest.action.RestToXContentListener;
@@ -64,6 +65,12 @@ public class RestGetAction extends BaseRestHandler {
     @Override
     public String getName() {
         return "document_get_action";
+    }
+
+    /** See rfc-serverless-opensearch.md &sect;15's "operational caveat" note. */
+    @Override
+    public ServerlessScope serverlessScope() {
+        return ServerlessScope.AVAILABLE;
     }
 
     @Override

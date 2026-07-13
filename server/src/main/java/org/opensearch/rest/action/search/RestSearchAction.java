@@ -49,6 +49,7 @@ import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.rest.BaseRestHandler;
+import org.opensearch.rest.RestHandler.ServerlessScope;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.rest.action.RestActions;
 import org.opensearch.rest.action.RestCancellableNodeClient;
@@ -116,6 +117,17 @@ public class RestSearchAction extends BaseRestHandler {
     @Override
     public String getName() {
         return "search_action";
+    }
+
+    /**
+     * A serverless deployment needs {@code _search} to function at all -- see
+     * rfc-serverless-opensearch.md &sect;15's "operational caveat" note for why this and the
+     * handful of other core APIs it names are annotated explicitly rather than left to default to
+     * {@code UNAVAILABLE} alongside everything else in core.
+     */
+    @Override
+    public ServerlessScope serverlessScope() {
+        return ServerlessScope.AVAILABLE;
     }
 
     @Override

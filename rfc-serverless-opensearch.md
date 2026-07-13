@@ -2015,16 +2015,29 @@ RFC claims them deliberately rather than leaving them implicit:
    into). A full sweep of this repository for other `RestHandler`-composing classes (`grep`-based,
    not just these two) found no other case.
 
-   **Operational caveat worth stating plainly, not just implying**: zero core (`server`,
-   `modules/*`) `RestHandler`s have been annotated `AVAILABLE` yet -- only this plugin's own 9.
-   Turning on `rest.serverless_mode.enabled` on a real cluster today would refuse essentially every
-   built-in API (`_search`, `_cluster/health`, everything) alongside the genuinely-unwanted ones
-   §11 was written to gate, since an unannotated handler is indistinguishable from a deliberately-
-   `UNAVAILABLE` one. That is the intended, by-design behavior of "new APIs must opt in
-   consciously" -- but annotating the actual set of core APIs a serverless deployment needs
-   (search, index, bulk, cluster health, ...) is real, separate, follow-on work this pass
-   deliberately did not attempt, and the setting should not be flipped in any real deployment until
-   that annotation sweep happens.
+   **Operational caveat worth stating plainly, not just implying**: this pass deliberately
+   annotated only this plugin's own 9 handlers -- zero core (`server`, `modules/*`) `RestHandler`s
+   were, meaning turning on `rest.serverless_mode.enabled` on a real cluster would have refused
+   essentially every built-in API (`_search`, `_cluster/health`, everything) alongside the
+   genuinely-unwanted ones §11 was written to gate, since an unannotated handler is
+   indistinguishable from a deliberately-`UNAVAILABLE` one.
+
+   **A narrow, defensible slice of that gap is now closed**: the five handlers a serverless
+   deployment cannot function at all without -- `RestSearchAction` (`_search`), `RestGetAction`
+   (`_doc` GET/HEAD), `RestIndexAction` (`_doc`/`_create` PUT/POST, and its `CreateHandler`/
+   `AutoIdHandler` subclasses, which inherit the override without needing their own -- neither
+   overrides `serverlessScope()` on its own), `RestBulkAction` (`_bulk`), and
+   `RestClusterHealthAction` (`_cluster/health`) -- now declare `ServerlessScope.AVAILABLE`
+   explicitly, each covered by a `testServerlessScopeIsAvailable`-shaped unit test matching this
+   plugin's own annotation-coverage test pattern (verified meaningfully: temporarily reverting
+   `RestGetAction`'s override reproduces the exact `expected:<AVAILABLE> but was:<UNAVAILABLE>`
+   failure the test exists to catch). **Deciding the full set of core APIs a serverless deployment
+   should expose remains deliberate, separate, follow-on work** -- this slice was chosen narrowly
+   (the handful of APIs with no plausible argument for staying unavailable) specifically so it
+   doesn't quietly make that broader product decision by default; a real deployment turning on
+   `rest.serverless_mode.enabled` still needs its own sweep for everything else (mapping updates,
+   aliases, snapshots, node/cluster admin APIs, ...), where "should this be available" is a genuine
+   design question, not a mechanical annotation exercise.
 7. ✅ Node WAL service registration point: no core change needed here either -- confirmed
    `createComponents` is exactly the right lifecycle point, already in production use.
    `ServerlessStoragePlugin#createComponents` builds one `WalChunkService` per node incarnation

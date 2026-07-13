@@ -40,6 +40,7 @@ import org.opensearch.common.Priority;
 import org.opensearch.common.logging.DeprecationLogger;
 import org.opensearch.core.common.Strings;
 import org.opensearch.rest.BaseRestHandler;
+import org.opensearch.rest.RestHandler.ServerlessScope;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.rest.action.RestStatusToXContentListener;
 import org.opensearch.transport.client.node.NodeClient;
@@ -72,6 +73,12 @@ public class RestClusterHealthAction extends BaseRestHandler {
     @Override
     public String getName() {
         return "cluster_health_action";
+    }
+
+    /** See rfc-serverless-opensearch.md &sect;15's "operational caveat" note. */
+    @Override
+    public ServerlessScope serverlessScope() {
+        return ServerlessScope.AVAILABLE;
     }
 
     @Override
