@@ -3816,8 +3816,30 @@ head untouched, and that naming a nonexistent index fails with a clear precondit
   survived the kill. Verified meaningfully: temporarily disabling the injected fault makes the test
   fail with "no exception was thrown," confirming it genuinely depends on exercising the fault path.
 
-  Broader probabilistic multi-operation throttling/5xx-storm injection across the whole plugin
-  remains open.
+  **A first slice of broader probabilistic multi-operation injection is now done too, closing part
+  of this gap.** Every prior fault-injection fixture in this plugin is one-shot: it fails exactly one
+  targeted call, once, then passes every subsequent call through untouched -- a much narrower shape
+  than a genuinely flaky object store, which can fail *any* call, repeatedly, throughout a whole
+  run. `ProbabilisticFailingBlobContainer` (new, `e2e` package) extends that shape: every
+  `writeBlob`/`writeBlobAtomic`/`deleteBlobsIgnoringIfNotExists`/`compareAndSwapRegister` call it
+  serves independently rolls the dice against a configured failure probability and may throw, for as
+  long as the container is used -- reads/lists are deliberately never faulted, so a caller can always
+  at least observe current state to decide how to retry (throttling, as opposed to a clean call
+  failure, and partial-write corruption are both explicitly out of scope for this slice).
+  `ChaosMultiOperationRegressionTests#testSustainedIngestConvergesDespiteRandomizedMultiOperationFaults`
+  runs 15 real sequential commits (each a real Lucene commit, published, then CAS-activated as the
+  shard's new head) through a 30%-failure-probability instance of it, retrying each faulted step the
+  same way a real caller would, then verifies real convergence: the final shard head references the
+  real last manifest, all 15 commits are still listable (none silently lost), and every bundle
+  every manifest references reads back checksum-clean (nothing corrupted). Verified meaningful two
+  ways: stable across 5 repeated runs with fresh seeds, and by temporarily reintroducing the exact
+  `BlobContainerBundleStore#writeBundle` retry-idempotency bug this section's own earlier chaos work
+  had already found and fixed (see this section's status note above) -- the sustained, randomized
+  fault pattern reproduces that bug's exact `FileAlreadyExistsException` failure mode reliably,
+  confirming this new fixture genuinely exercises the multi-call retry path the one-shot fixtures
+  structurally cannot reach. **Explicitly out of scope for this slice**: compaction-under-chaos,
+  GC-sweep-under-chaos, and genuinely concurrent (as opposed to this test's sequential) multi-operation
+  chaos all remain open, real follow-up work.
 - **Staleness/consistency**: linearizability-style checker for the RYW path (indexed doc with
   generation token must be visible to a routed search); monotonicity checker for readers.
   **Status: implemented and tested, now that the RYW primitive itself exists (see &sect;8).**
