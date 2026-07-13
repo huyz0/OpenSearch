@@ -33,8 +33,13 @@ import java.util.List;
  * to verify an arbitrary block range against. A caller that needs end-to-end integrity for
  * partially-fetched files still gets it for free from the transport layer ({@code BlobContainer}
  * implementations themselves checksum their own transfers) but not from this plugin's own format
- * the way a fully-materialized read does -- a known, documented tradeoff of this first lazy-read
- * slice, not yet closed.
+ * the way a fully-materialized read does. Investigated for closure (rfc-serverless-opensearch.md
+ * &sect;9's own status note has the full writeup): adding the checksums to the bundle format
+ * itself is easy, but making them available to {@link #fetchBlock} without either an extra
+ * per-bundle header GET (in tension with this plugin's own request-minimization discipline) or
+ * bloating every manifest with one checksum per 1&nbsp;MiB block of every file it references is a
+ * real, undecided cost/integrity tradeoff -- deliberately left open rather than picked
+ * unilaterally.
  */
 public class LazyBundleIndexInput extends AbstractBlockIndexInput {
 

@@ -1294,6 +1294,28 @@ bundle format has no sub-file checksum an arbitrary block range can be verified 
 gap this slice does not close, distinct from (and smaller than) the block-granularity/node-sharing/
 eviction-policy gaps `LocalDiskCachingBundleStore` above still has.
 
+**Investigated for closure, deliberately not implemented -- a real request-cost-vs-integrity
+tradeoff, not a small fix.** Adding per-block checksums to the bundle format itself
+(`BundleWriter`/`BundleReader` format version bump, one CRC32C per 1&nbsp;MiB region alongside each
+file's existing whole-file checksum) is the easy half. The hard half is getting that checksum data
+to `LazyBundleIndexInput#fetchBlock` cheaply: `LazyBundleDirectory` only ever holds the manifest's
+own `FileReference`s (offset/length/whole-file-checksum), never the bundle's own header, and
+deliberately so -- this class's own javadoc calls out "opening one requires no upfront I/O at all"
+as a load-bearing property, exactly what the eager `ObjectStoreCommitMaterializer` path does not
+have. Making block checksums available without breaking that property means one of: (a) fetching
+and caching each distinct bundle's header the first time any of its files is lazily opened -- a
+real, additional GET per bundle beyond what happens today, in tension with this plugin's own
+strong object-store-request-minimization discipline (&sect;18 risk #1's own cost-accounting gates
+exist precisely to catch this class of regression); or (b) denormalizing block checksums into the
+manifest itself alongside the existing whole-file checksum -- avoids the extra request, but bloats
+manifest size roughly linearly with total block count (a multi-hundred-MB segment file could add
+hundreds of checksum entries to its own manifest record), a real cost for every manifest write and
+read, not just lazy-directory opens. Neither option is obviously "just do it" -- this needs a
+genuine cost/integrity tradeoff decision (and ideally real production request-cost/manifest-size
+data to make it with) rather than a unilateral implementation choice. Left open, with this concrete
+option space recorded rather than the previous vaguer "not yet closed" note, so whoever picks this
+up next doesn't have to re-derive it.
+
 Verified with three tests (`LazyBundleDirectoryTests`) against a real object store (no mocks): a
 real Lucene `DirectoryReader`/`IndexSearcher` opened directly against a `LazyBundleDirectory`
 returns correct search results with zero upfront materialization; `listAll()`/`fileLength()` are
