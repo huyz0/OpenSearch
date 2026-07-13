@@ -166,9 +166,74 @@ public class ServerlessStorageRepositoryBackedContainerIT extends ServerlessStor
             "nothing must have been written under the local base_path's own wal-dedicated/ prefix -- "
                 + "the repository setting must take precedence for the dedicated WAL container too, "
                 + "not just the regular shard container (the shared, node-scoped WAL container's own "
-                + "wal/ prefix is deliberately excluded from this check -- it remains "
-                + "local-filesystem-only regardless of this setting, a separate, still-open gap)",
+                + "wal/ prefix is now covered too, by "
+                + "testSharedWalContainerLandsInTheRegisteredRepositoryNotTheLocalBasePath below)",
             hasAnyFileUnder(unusedLocalBasePath.resolve("wal-dedicated"))
+        );
+    }
+
+    /**
+     * Closes rfc-serverless-opensearch.md &sect;16's own remaining "shared WAL container... remains
+     * local-filesystem-only" note: {@code ServerlessStoragePlugin#resolveSharedWalChunkService} now
+     * resolves the node-shared {@code wal/} container through the exact same {@code resolveContainer}
+     * seam the dedicated-stream and regular per-shard containers already use, deferred to first real
+     * writer-shard use (see that method's own javadoc for why eager, {@code createComponents}-time
+     * resolution couldn't do this safely). With {@code serverless_storage.repository} configured and
+     * WAL mirroring enabled (no dedicated stream opted into -- this is the shared-container path,
+     * not the one {@link #testDedicatedWalChunksLandInTheRegisteredRepositoryNotTheLocalBasePath}
+     * already covers), real shared WAL chunk bytes must land under the registered repository, not
+     * the local {@code base_path}.
+     */
+    public void testSharedWalContainerLandsInTheRegisteredRepositoryNotTheLocalBasePath() throws Exception {
+        Path repoPath = createTempDir("serverless-storage-repo-backed-shared-wal-it-repo");
+        Path unusedLocalBasePath = createTempDir("serverless-storage-repo-backed-shared-wal-it-unused-local");
+        Settings nodeSettings = Settings.builder()
+            .putList("path.repo", repoPath.toString(), unusedLocalBasePath.toString())
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey(), unusedLocalBasePath.toString())
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_REPOSITORY_SETTING.getKey(), REPO_NAME)
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING.getKey(), true)
+            .build();
+
+        internalCluster().startClusterManagerOnlyNode(nodeSettings);
+        internalCluster().startDataOnlyNode(nodeSettings);
+
+        assertTrue(
+            "repository registration must be acknowledged before it's usable",
+            client().admin()
+                .cluster()
+                .preparePutRepository(REPO_NAME)
+                .setType(FsRepository.TYPE)
+                .setSettings(Settings.builder().put(FsRepository.LOCATION_SETTING.getKey(), repoPath.toString()))
+                .get()
+                .isAcknowledged()
+        );
+
+        createIndex(
+            INDEX_NAME,
+            Settings.builder()
+                .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+                .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+                .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey(), true)
+                .build()
+        );
+        ensureGreen(INDEX_NAME);
+
+        // WalMirroringTranslog#add flushes its WAL mirror after every single operation, so an
+        // ordinary indexed document is enough to force a real chunk write through the shared
+        // container -- no need to bypass the translog path the way ServerlessStorageNodeWalBacklogActionIT
+        // does to observe unflushed backlog.
+        client().prepareIndex(INDEX_NAME).setId("1").setSource("field", "value1").get();
+
+        assertTrue(
+            "real shared WAL chunk bytes must exist under the registered repository's own wal/ prefix",
+            hasAnyFileUnder(repoPath.resolve("serverless_storage").resolve("wal"))
+        );
+        assertFalse(
+            "nothing must have been written under the local base_path's own wal/ prefix -- the "
+                + "repository setting must take precedence for the shared WAL container too, now that "
+                + "its resolution is deferred to first real writer-shard use instead of happening "
+                + "eagerly (and unavoidably local-filesystem-only) at node startup",
+            hasAnyFileUnder(unusedLocalBasePath.resolve("wal"))
         );
     }
 

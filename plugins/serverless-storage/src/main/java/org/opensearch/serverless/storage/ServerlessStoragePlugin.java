@@ -659,6 +659,16 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     private volatile long pitrWindowMillis = -1;
     private volatile ReaderShardAdmissionController readerShardAdmissionController;
     private volatile WalChunkService sharedWalChunkService;
+    // Resolved once in createComponents (same "read the NodeScope setting where Environment is
+    // actually available" reasoning as every other field in this group), consumed lazily by
+    // resolveSharedWalChunkService() -- see that method's own javadoc for why sharedWalChunkService
+    // itself is no longer built eagerly here.
+    private volatile boolean walMirroringEnabled;
+    private volatile long walPerShardBudgetBytes;
+    // Guards resolveSharedWalChunkService()'s double-checked-locking build -- a plain Object, not
+    // `this`, so a caller synchronizing on the plugin instance for an unrelated reason can never
+    // accidentally contend with (or deadlock against) this specific lazy-init path.
+    private final Object walChunkServiceLock = new Object();
     private volatile org.opensearch.serverless.storage.wal.WalGcSchedulerTask walGcSchedulerTask;
     private volatile TimeValue compactionInterval;
     private volatile TimeValue partitionRewriteInterval;
@@ -910,62 +920,14 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 encryptionKeyProvider = StaticEncryptionKeyProvider.fromRawKeyBytes(rawKeyBytes);
             }
         }
-        if (basePath != null && SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING.get(environment.settings())) {
-            try {
-                // A dedicated top-level container, separate from every index/shard's own
-                // <indexUuid>/<shardId>/ path -- the WAL chunk stream is node-scoped, spanning
-                // every writer shard (and index) on this node, not any one shard's storage
-                // (rfc-serverless-opensearch.md &sect;6.4, see WalChunkService's own javadoc).
-                //
-                // Deliberately still local-filesystem-only, unlike resolveDedicatedWalContainer
-                // and blobContainerFor below: this container (and sharedWalChunkService itself) is
-                // resolved exactly once here, synchronously inside createComponents at node
-                // startup -- before RepositoriesService necessarily has any repository registered
-                // yet, since repository registration happens later via the _snapshot API, well
-                // after this method returns. Routing this through resolveContainer would try the
-                // repository-backed branch (SERVERLESS_STORAGE_REPOSITORY_SETTING configured) too
-                // early and fail loudly at startup instead of lazily like every other container
-                // this plugin resolves -- caught by a real internalClusterTest reproducing exactly
-                // that failure, not reasoned out in advance. Making this genuinely lazy (matching
-                // the per-shard containers' own on-demand resolution) needs sharedWalChunkService's
-                // construction itself deferred to first real writer-shard use, a larger, separate
-                // change from the WAL container repository-backing this pass otherwise closes.
-                FsBlobStore walBlobStore = new FsBlobStore(1024 * 1024, basePath, false);
-                BlobContainer walBlobContainer = new RequestCountingBlobContainer(
-                    walBlobStore.blobContainer(BlobPath.cleanPath().add("wal")),
-                    requestCounter
-                );
-                // A fresh epoch per node incarnation (see WalChunkService's own javadoc for what
-                // this identifies) -- fencing during replay is a per-record primaryTerm filter, not
-                // an epoch-directory one, so nothing depends on this value being stable across
-                // restarts; it only needs to be unique enough that this process's chunk sequence
-                // numbering never collides with a prior incarnation's.
-                sharedWalChunkService = new WalChunkService(
-                    walBlobContainer,
-                    UUIDs.base64UUID(),
-                    SERVERLESS_STORAGE_WAL_PER_SHARD_BUDGET_SETTING.get(environment.settings()).getBytes()
-                );
-
-                TimeValue configuredWalGcInterval = SERVERLESS_STORAGE_WAL_GC_INTERVAL_SETTING.get(environment.settings());
-                this.walGcInterval = configuredWalGcInterval;
-                if (configuredWalGcInterval.millis() > 0) {
-                    walGcSchedulerTask = new org.opensearch.serverless.storage.wal.WalGcSchedulerTask(
-                        threadPool,
-                        configuredWalGcInterval,
-                        walBlobContainer,
-                        new org.opensearch.serverless.storage.wal.WalShardRegistry(walBlobContainer),
-                        (indexUuid, shardId) -> {
-                            try {
-                                return resolveBlobContainer(indexUuid, shardId);
-                            } catch (IOException e) {
-                                throw new UncheckedIOException(e);
-                            }
-                        }
-                    );
-                }
-            } catch (IOException e) {
-                throw new UncheckedIOException(e);
-            }
+        // Only the config is resolved here (same "read the NodeScope setting where Environment is
+        // actually available" reasoning as every other field in this group); the shared WAL
+        // container and sharedWalChunkService itself are no longer built eagerly -- see
+        // resolveSharedWalChunkService()'s own javadoc for why.
+        walMirroringEnabled = SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING.get(environment.settings());
+        if (walMirroringEnabled) {
+            walPerShardBudgetBytes = SERVERLESS_STORAGE_WAL_PER_SHARD_BUDGET_SETTING.get(environment.settings()).getBytes();
+            walGcInterval = SERVERLESS_STORAGE_WAL_GC_INTERVAL_SETTING.get(environment.settings());
         }
         // This plugin instance itself, so TransportShardCloneAction (the only consumer) can be
         // constructor-injected with it and reach blobContainerForDirectoryFactory -- the same
@@ -1156,12 +1118,15 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             // at a container scoped to exactly this (indexUuid, shardId) -- never the node-shared
             // one -- so its WAL bytes can never land in the same object as any other index's,
             // independent of the per-record encryption every WAL record already gets regardless.
-            // Only meaningful when WAL mirroring itself is on at all (sharedWalChunkService != null);
-            // an index requesting a dedicated stream on a node with WAL mirroring off gets none,
-            // same as every other WAL-dependent feature already degrades in that case.
-            org.opensearch.serverless.storage.wal.WalChunkService writerWalChunkService = sharedWalChunkService;
+            // Only meaningful when WAL mirroring itself is on at all (resolveSharedWalChunkService()
+            // returning null); an index requesting a dedicated stream on a node with WAL mirroring
+            // off gets none, same as every other WAL-dependent feature already degrades in that
+            // case. This is the "first real writer-shard use" resolveSharedWalChunkService()'s own
+            // javadoc names -- the shared container and sharedWalChunkService itself are actually
+            // built here, on this call, the first time any writer shard on this node needs one.
+            org.opensearch.serverless.storage.wal.WalChunkService writerWalChunkService = resolveSharedWalChunkService();
             org.opensearch.serverless.storage.wal.DedicatedWalGcConfig dedicatedWalGcConfig = null;
-            if (sharedWalChunkService != null && SERVERLESS_STORAGE_WAL_DEDICATED_STREAM_SETTING.get(indexSettings.getSettings())) {
+            if (writerWalChunkService != null && SERVERLESS_STORAGE_WAL_DEDICATED_STREAM_SETTING.get(indexSettings.getSettings())) {
                 BlobContainer dedicatedWalContainer = resolveDedicatedWalContainer(indexUuid, shardIdValue);
                 // No per-shard budget needed here (0, disabled): that budget exists to siphon one
                 // noisy shard's buffer out from under others sharing the SAME WalChunkService --
@@ -1352,6 +1317,77 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 + SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey()
                 + "] resolved to a usable container"
         );
+    }
+
+    /**
+     * The node-shared WAL container this node's writer shards mirror into
+     * (rfc-serverless-opensearch.md &sect;6.4), and {@link #sharedWalChunkService} itself, resolved
+     * lazily on first real writer-shard use rather than eagerly at {@code createComponents} time --
+     * closing the gap that method's own status note previously left open. Eager resolution used to
+     * always go straight to a local {@link FsBlobStore}, deliberately never through {@link
+     * #resolveContainer} (unlike {@link #resolveDedicatedWalContainer}/{@link #blobContainerFor}):
+     * {@code createComponents} runs at node startup, before an operator has necessarily registered
+     * any repository via the {@code _snapshot} API, so routing this through the repository-backed
+     * branch that early would fail loudly at startup instead of lazily like every other container
+     * this plugin resolves -- a real internalClusterTest failure this design avoided by staying
+     * local-filesystem-only, at the cost of never actually being repository-backed regardless of
+     * {@link #SERVERLESS_STORAGE_REPOSITORY_SETTING}. Deferring to first writer-shard use (this
+     * method's only caller) sidesteps that startup-ordering problem entirely: a writer shard is
+     * only ever created well after node startup completes, by which point an operator wanting a
+     * repository-backed WAL has had every opportunity to register it.
+     *
+     * <p>Double-checked-locking, matching the shape every other lazily-resolved container in this
+     * class already uses ({@link #resolveContainer}'s own repository lookup, for instance) -- cheap
+     * to re-check the already-populated field on every subsequent writer-shard creation, only ever
+     * synchronizing on the one node incarnation's first call. {@code sharedWalChunkService()} (the
+     * public getter {@code TransportNodeWalBacklogAction} and tests use) deliberately still just
+     * reads the raw field rather than calling this method -- see that getter's own javadoc for why
+     * it must stay a pure, no-I/O read.
+     */
+    private WalChunkService resolveSharedWalChunkService() throws IOException {
+        if (walMirroringEnabled == false) {
+            return null;
+        }
+        WalChunkService existing = sharedWalChunkService;
+        if (existing != null) {
+            return existing;
+        }
+        synchronized (walChunkServiceLock) {
+            if (sharedWalChunkService != null) {
+                return sharedWalChunkService;
+            }
+            BlobContainer walBlobContainer = resolveContainer(
+                BlobPath.cleanPath().add("wal"),
+                "the shared WAL container needs either ["
+                    + SERVERLESS_STORAGE_REPOSITORY_SETTING.getKey()
+                    + "] or ["
+                    + SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey()
+                    + "] configured"
+            );
+            // A fresh epoch per node incarnation (see WalChunkService's own javadoc for what this
+            // identifies) -- fencing during replay is a per-record primaryTerm filter, not an
+            // epoch-directory one, so nothing depends on this value being stable across restarts;
+            // it only needs to be unique enough that this process's chunk sequence numbering never
+            // collides with a prior incarnation's.
+            WalChunkService built = new WalChunkService(walBlobContainer, UUIDs.base64UUID(), walPerShardBudgetBytes);
+            if (walGcInterval != null && walGcInterval.millis() > 0) {
+                walGcSchedulerTask = new org.opensearch.serverless.storage.wal.WalGcSchedulerTask(
+                    threadPool,
+                    walGcInterval,
+                    walBlobContainer,
+                    new org.opensearch.serverless.storage.wal.WalShardRegistry(walBlobContainer),
+                    (indexUuid, shardId) -> {
+                        try {
+                            return resolveBlobContainer(indexUuid, shardId);
+                        } catch (IOException e) {
+                            throw new UncheckedIOException(e);
+                        }
+                    }
+                );
+            }
+            sharedWalChunkService = built;
+            return built;
+        }
     }
 
     @Override
@@ -1795,9 +1831,17 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     }
 
     /**
-     * The node-shared WAL chunk service {@link #createComponents} built, or {@code null} if WAL
-     * mirroring is off; public since {@code TransportNodeWalBacklogAction}, not just tests, needs
-     * to reach it via {@code @Inject}.
+     * The node-shared WAL chunk service, or {@code null} if WAL mirroring is off <em>or</em> no
+     * writer shard on this node has triggered {@link #resolveSharedWalChunkService()} yet -- see
+     * that method's own javadoc for why construction is now deferred there rather than happening
+     * unconditionally in {@code createComponents}. Deliberately a raw, non-resolving field read,
+     * not a call to {@link #resolveSharedWalChunkService()}: {@code TransportNodeWalBacklogAction}
+     * documents itself as doing "no I/O, no dispatch needed," and this getter is its only dependency
+     * -- forcing real container resolution (and its real I/O failure modes) from a stats-reporting
+     * call would break that contract. {@code null} here honestly means "nothing has ever gone
+     * through the shared WAL container on this node," which is exactly the state a genuine zero
+     * backlog should report anyway. Public since {@code TransportNodeWalBacklogAction}, not just
+     * tests, needs to reach it via {@code @Inject}.
      */
     public WalChunkService sharedWalChunkService() {
         return sharedWalChunkService;

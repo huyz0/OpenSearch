@@ -2384,18 +2384,31 @@ Verified the same way: `ServerlessStorageRepositoryBackedContainerIT#testDedicat
 proves real dedicated WAL chunk bytes land under the registered repository's `wal-dedicated/` prefix,
 not the local `base_path`'s.
 
-**The shared, node-scoped WAL container is not, and this is a newly-identified, concrete reason, not
-just residual caution.** Unlike every other container this plugin resolves, `createComponents` builds
-the shared WAL container (and `sharedWalChunkService` itself) exactly once, synchronously, at node
-startup -- before `RepositoriesService` necessarily has any repository registered at all, since
-repository registration happens later via the `_snapshot` API. Routing this through `resolveContainer`
-was tried and caught a real failure, not a hypothetical one: a real `internalClusterTest` reproduced
-`IOException: ... that repository is not currently registered` at node startup the moment this path
-was made repository-aware, before the test ever got to register one. Making this container genuinely
-lazy needs `sharedWalChunkService`'s own construction deferred to first real writer-shard use (a
-`volatile` field several call sites already null-check as WAL mirroring's on/off switch) -- a larger,
-separate change from the container-resolution seam this pass otherwise closes, left open rather than
-rushed in under this pass.
+**The shared, node-scoped WAL container is now repository-backed too, closing this gap.**
+`ServerlessStoragePlugin#resolveSharedWalChunkService` defers both the shared WAL container's
+resolution and `sharedWalChunkService` itself's construction to first real writer-shard use --
+`createComponents` now only reads and stores the config (`walMirroringEnabled`,
+`walPerShardBudgetBytes`, `walGcInterval`) a writer engine's own `getEngineFactory` call later needs.
+A writer shard is only ever created well after node startup completes, by which point an operator
+wanting a repository-backed WAL has had every opportunity to register it via the `_snapshot` API --
+sidestepping the startup-ordering problem that previously forced this container to stay
+local-filesystem-only, the same way `resolveDedicatedWalContainer`/`blobContainerFor` already avoid
+it by resolving lazily at real shard-open time. Double-checked locking around a dedicated lock object
+(not the plugin instance itself) makes this safe for concurrent writer-shard creation on one node
+without paying synchronization cost on every subsequent call once resolved. The public
+`sharedWalChunkService()` getter `TransportNodeWalBacklogAction` depends on deliberately still does a
+raw, non-resolving field read rather than calling the lazy resolver -- that getter documents itself as
+doing "no I/O, no dispatch needed," and forcing real container resolution from a stats-reporting call
+would break that contract; `null` there now honestly means "nothing has ever gone through the shared
+WAL container on this node," which is exactly the state a genuine zero backlog should report anyway.
+Verified: `ServerlessStorageRepositoryBackedContainerIT#testSharedWalContainerLandsInTheRegisteredRepositoryNotTheLocalBasePath`
+proves real shared WAL chunk bytes land under the registered repository's `wal/` prefix, not the
+local `base_path`'s, confirmed meaningful by reverting to the old eager-local-only construction and
+observing the test fail exactly as expected before restoring the fix. `ServerlessStoragePluginTests`'
+two per-shard-budget tests, which previously read `sharedWalChunkService()` immediately after
+`createComponents` alone, were updated to first drive a real writer `EngineFactory` build (the only
+production path that now triggers resolution), matching how every other test already proving
+writer-engine construction in that file does it.
 
 **`compareAndSwapRegister` backends: FS done; S3 done; GCS done; Azure done -- all four planned
 backends now implemented.**

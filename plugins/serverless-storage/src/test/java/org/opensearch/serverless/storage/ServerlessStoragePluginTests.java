@@ -211,6 +211,10 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
             .build();
         Environment environment = TestEnvironment.newEnvironment(nodeSettings);
         plugin.createComponents(null, null, null, null, null, null, environment, null, null, null, null);
+        // sharedWalChunkService is no longer built eagerly by createComponents -- it's resolved
+        // lazily on first real writer-shard use (see resolveSharedWalChunkService()'s own javadoc),
+        // so a writer EngineFactory must actually be requested first to trigger construction.
+        triggerSharedWalChunkServiceResolution(plugin);
 
         assertEquals(0L, plugin.sharedWalChunkService().perShardBudgetBytesForTesting());
     }
@@ -227,8 +231,18 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
             .build();
         Environment environment = TestEnvironment.newEnvironment(nodeSettings);
         plugin.createComponents(null, null, null, null, null, null, environment, null, null, null, null);
+        triggerSharedWalChunkServiceResolution(plugin);
 
         assertEquals(512L * 1024, plugin.sharedWalChunkService().perShardBudgetBytesForTesting());
+    }
+
+    /** Drives a real writer EngineFactory build, the only production path that resolves sharedWalChunkService -- see that method's own javadoc. */
+    private void triggerSharedWalChunkServiceResolution(ServerlessStoragePlugin plugin) {
+        IndexSettings settings = indexSettings(true);
+        ShardId shardId = new ShardId(settings.getIndex(), 0);
+        ShardRouting primaryRouting = TestShardRouting.newShardRouting(shardId, "node-1", true, ShardRoutingState.STARTED);
+        Optional<EngineFactory> factory = plugin.getEngineFactory(settings, primaryRouting);
+        assertTrue("test setup must actually produce a writer EngineFactory", factory.isPresent());
     }
 
     public void testLazyDirectoryFileCacheIsNotConstructedByDefault() {
