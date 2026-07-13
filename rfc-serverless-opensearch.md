@@ -3590,14 +3590,14 @@ shards over the transport layer in a running cluster, confirming every document 
 sources survives the merge with none lost or duplicated. Full plugin quality gate and the entire
 `internalClusterTest` suite pass clean.
 
-**Explicitly out of scope, real follow-up work still remaining**: an automatic background scheduler
-for the rewrite (on-demand only for now, mirroring compaction's own history); deleting/deprecating a
+**Explicitly out of scope, real follow-up work still remaining**: deleting/deprecating a
 shrink's source shards afterward (this call only ever creates the merged target -- retiring the
 sources it merged is a separate, deliberately-not-automatic operator decision, the same "never
 auto-deletes anything it didn't itself just create" caution `ShardCloner#deleteClone` already
 applies). Chaos suite (§17) including full object-store outage modes (§13), performance tuning of
 bundle/WAL batch parameters, API gating audit, and autoscaling signal calibration remain separately
-ongoing Phase 5 work.
+ongoing Phase 5 work. (The rewrite's own background scheduler is no longer on this list --
+`PartitionRewriteSchedulerTask` closed it, see above.)
 
 **Phase 6 — Migration tooling. The packaging mechanism both migration directions ultimately need
 is implemented and tested; one direction's per-direction orchestration -- resolving a real,
