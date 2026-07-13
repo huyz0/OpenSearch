@@ -3593,8 +3593,8 @@ head untouched, and that naming a nonexistent index fails with a clear precondit
   mid-refresh; object store fault injection (throttling, 5xx storms, elevated latency) — the
   mock repository infrastructure in-repo already supports much of this. **Status: elevated latency,
   the GC-sweep fault-injection case, kill-mid-bundle-upload/mid-manifest-write on the writer path,
-  and kill-mid-WAL-chunk are all implemented and tested; kill-mid-refresh on the reader path and
-  broader throttling/5xx-storm coverage are not.** `LatencyInjectingBlobContainer` (`benchmark`
+  kill-mid-WAL-chunk, and kill-mid-refresh on the reader path are all implemented and tested;
+  broader throttling/5xx-storm coverage is not.** `LatencyInjectingBlobContainer` (`benchmark`
   package) already covers elevated latency, exercised by `ServerlessStorageReactivationUnderLatencyIT`.
   `GcSchedulerTaskTests#testSweepIsSafeToRetryAfterAnInjectedTransientObjectStoreFault`
   adds a real throttling/5xx-storm-style case: a `FaultInjectingBlobContainer` (a `FilterBlobContainer`
@@ -3645,8 +3645,28 @@ head untouched, and that naming a nonexistent index fails with a clear precondit
   fault path, not vacuously passing) and now locked in as a proven invariant rather than an
   accidental property, closing this specific open chaos-suite line item.
 
-  Kill-mid-refresh on the reader path and broader probabilistic multi-operation throttling/5xx-storm
-  injection across the whole plugin remain open.
+  **Kill-mid-refresh on the reader path, closed.** `ObjectStoreCommitMaterializer#materialize` --
+  the reader engine's own multi-file analogue of `ObjectStoreCommitPublisher#publishCommit`'s
+  two-step write and `WalChunkService#writeChunk`'s claim-then-write -- fetches every one of a
+  manifest's files in a loop, so a kill partway through leaves some files already written to the
+  target `Directory` and others not, while `ObjectStoreReaderEngine#pollForNewerManifest` only
+  advances `currentManifestGeneration` after the whole call returns successfully (a failure there
+  is already caught, logged, and left for the next poll tick, "never worth failing an
+  already-open, still-serving engine over" per that method's own javadoc) -- so a reader killed
+  mid-refresh must keep serving its last-good generation and a retry must converge cleanly.
+  `ObjectStoreCommitMaterializerTests#testAKilledMaterializeLeavesOnlyThePriorFilesWrittenAndARetryCompletesTheRest`
+  injects a one-shot hard `IOException` on the second of three file fetches, confirms exactly the
+  one file fetched before the kill is present (never a partial write of the file the kill happened
+  on, never a file past the kill point even attempted), then confirms a retry against the same
+  manifest and directory completes correctly and -- proving `materialize`'s own documented
+  "safe to call more than once... every file already present is skipped" property holds even when
+  the *first* call was itself killed, not just when it's a second call for a genuinely different
+  manifest (the only case its existing javadoc already covered) -- skips re-fetching the file that
+  survived the kill. Verified meaningfully: temporarily disabling the injected fault makes the test
+  fail with "no exception was thrown," confirming it genuinely depends on exercising the fault path.
+
+  Broader probabilistic multi-operation throttling/5xx-storm injection across the whole plugin
+  remains open.
 - **Staleness/consistency**: linearizability-style checker for the RYW path (indexed doc with
   generation token must be visible to a routed search); monotonicity checker for readers.
   **Status: implemented and tested, now that the RYW primitive itself exists (see &sect;8).**
