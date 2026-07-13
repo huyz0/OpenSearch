@@ -9,12 +9,14 @@
 package org.opensearch.serverless.storage.format;
 
 import org.opensearch.common.blobstore.BlobContainer;
+import org.opensearch.common.blobstore.BlobMetadata;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -58,14 +60,52 @@ public final class BlobContainerBundleStore implements BundleFileReader {
      * writing the exact same bundle name a previous, partially-successful attempt had already
      * uploaded.
      *
+     * <p><b>That idempotency assumption only holds if a retry always packs byte-identical content
+     * under the same name</b> -- true for a plain writer-engine retry (it re-reads the same
+     * already-durable local commit), but <b>not</b> true for {@code LuceneMergeCompactionPublisher},
+     * whose {@code computeNewHead} redoes a real Lucene merge on every call: two merges of the same
+     * logical source produce different bytes (fresh random segment IDs), yet compute the exact same
+     * deterministic target {@code bundleName} whenever retried against an unchanged {@code
+     * currentHead}. Silently returning the freshly-packed (but not actually re-uploaded) bundle in
+     * that case would build a manifest whose checksums/offsets describe content that was never
+     * written -- a real corrupted-manifest bug, caught by a sustained multi-operation chaos test
+     * before this existed, not by a hand-written failure sequence. This method now compares the
+     * existing blob's real per-file entries (read back via {@link #readHeader}) against the
+     * freshly-packed ones before trusting the short-circuit -- <b>a length-only check was tried
+     * first and found insufficient</b>: Lucene's random segment IDs are fixed-width, so two
+     * independent merges of the same logical documents routinely pack to the exact same total
+     * length while still differing byte-for-byte, which the same chaos test caught directly. A
+     * mismatch throws loudly (never silently returned, never blindly overwritten -- overwriting
+     * could also destroy a legitimate concurrent writer's own already-published content) rather
+     * than risk corruption. See rfc-serverless-opensearch.md &sect;17's own status note for this
+     * section for the larger, deliberately-deferred follow-up: this converts the failure from
+     * silent corruption to a loud, detectable one, but does not itself give compaction a way to
+     * unstick a permanently-colliding target generation (that needs either delete permission this
+     * tier deliberately doesn't have, or a compaction-specific bundle-naming scheme change -- real,
+     * separate follow-up work).
+     *
      * @param bundleName the name to upload the bundle under.
      * @param files the files to pack into the bundle, in bundle order.
      * @return the packed bundle, with its parsed file-entry map.
+     * @throws IOException if the write fails, or if a blob already exists under {@code bundleName}
+     *                      whose real entries don't match the content just packed (see above).
      */
     public SegmentBundle writeBundle(String bundleName, List<BundleFileContent> files) throws IOException {
         SegmentBundle bundle = BundleWriter.write(files);
-        if (blobContainer.blobExists(bundleName)) {
-            return bundle;
+        Map<String, BlobMetadata> existing = blobContainer.listBlobsByPrefix(bundleName);
+        BlobMetadata existingMetadata = existing.get(bundleName);
+        if (existingMetadata != null) {
+            BundleHeader existingHeader = readHeader(bundleName, existingMetadata.length());
+            if (existingHeader.entries().equals(bundle.entries())) {
+                return bundle;
+            }
+            throw new IOException(
+                "bundle ["
+                    + bundleName
+                    + "] already exists with different real content than what was just packed -- "
+                    + "refusing to silently trust the mismatch or overwrite it; "
+                    + "see BlobContainerBundleStore#writeBundle's own javadoc"
+            );
         }
         try (InputStream in = new ByteArrayInputStream(bundle.bytes())) {
             blobContainer.writeBlobAtomic(bundleName, in, bundle.length(), true);

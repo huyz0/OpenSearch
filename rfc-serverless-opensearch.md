@@ -3853,9 +3853,43 @@ head untouched, and that naming a nonexistent index fails with a clear precondit
   had already found and fixed (see this section's status note above) -- the sustained, randomized
   fault pattern reproduces that bug's exact `FileAlreadyExistsException` failure mode reliably,
   confirming this new fixture genuinely exercises the multi-call retry path the one-shot fixtures
-  structurally cannot reach. **Explicitly out of scope for this slice**: compaction-under-chaos,
-  GC-sweep-under-chaos, and genuinely concurrent (as opposed to this test's sequential) multi-operation
-  chaos all remain open, real follow-up work.
+  structurally cannot reach.
+
+  **Extended to compaction and GC sweep, closing two of the three follow-ups this slice originally
+  left open** (genuinely concurrent, as opposed to sequential, multi-operation chaos remains real
+  follow-up work). `ChaosMultiOperationRegressionTests#testCompactionConvergesDespiteRandomizedMultiOperationFaults`
+  drives `LuceneMergeCompactionPublisher`/`CompactionRebaseExecutor` through the same sustained,
+  randomized-fault container -- and caught a real, previously-undiscovered production bug doing so:
+  `LuceneMergeCompactionPublisher#computeNewHead` redoes a genuine Lucene merge on every retry
+  attempt, and two merges of the same logical source produce different bytes (fresh random segment
+  IDs) while computing the exact same deterministic target `bundleName` whenever retried against an
+  unchanged shard head -- so a "bundle upload succeeded, manifest write then faulted" sequence left
+  `writeBundle`'s own retry-idempotency short-circuit silently trusting mismatched content, building
+  a manifest whose checksums describe bytes that were never actually written. **Fixed at the root**:
+  `writeBundle` now reads back the existing blob's real header and compares its entries against the
+  freshly-packed ones before trusting the short-circuit, throwing loudly on any mismatch rather than
+  ever silently returning or overwriting it (overwriting could also destroy a legitimate concurrent
+  writer's own already-published content). A length-only comparison was tried first and found
+  insufficient -- Lucene's random segment IDs are fixed-width, so two independent merges routinely
+  pack to the exact same total length while still differing byte-for-byte, caught by the same chaos
+  test and proven with a dedicated deterministic unit test (same length, deliberately different
+  bytes, still detected). This converts the failure from silent corruption to a loud, detectable one,
+  but does not by itself give compaction a way to unstick a permanently-colliding target generation
+  on a quiescent shard that never gets a fresh writer commit to move its head past the collision --
+  that needs either delete permission compaction deliberately doesn't have (&sect;15), or a
+  compaction-specific bundle-naming scheme change, both real, separate, deliberately-deferred
+  follow-up work. The chaos test itself was adjusted to match this real safety contract: it accepts
+  either a genuine successful publish *or* a safe abort via the documented collision guard as a
+  passing outcome, and always verifies no corruption occurred either way -- matching "compaction is
+  always safe, at worst wasted work, never a lost or corrupted update" as this fix now actually makes
+  true, rather than merely asserting unconditional success chaos can't actually guarantee.
+  `GcSchedulerTaskChaosTests#testSweepConvergesDespiteSustainedRandomizedFaults` (new, `gc` package,
+  needs package-private access to `sweepForTesting()`) proved the simpler GC-sweep case: since a
+  sweep's own writes are nothing but idempotent `deleteBlobsIgnoringIfNotExists` calls, sustained
+  chaos there converges unconditionally, no safety-abort case needed -- verified meaningfully by
+  disabling the test's own retry loop and confirming roughly half of single-attempt runs then fail,
+  proving the retry genuinely does real work rather than the sweep already being unconditionally
+  fault-tolerant on the first try.
 - **Staleness/consistency**: linearizability-style checker for the RYW path (indexed doc with
   generation token must be visible to a routed search); monotonicity checker for readers.
   **Status: implemented and tested, now that the RYW primitive itself exists (see &sect;8).**

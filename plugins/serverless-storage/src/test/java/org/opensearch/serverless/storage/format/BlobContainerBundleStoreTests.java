@@ -14,6 +14,7 @@ import org.opensearch.common.blobstore.fs.FsBlobContainer;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -87,6 +88,44 @@ public class BlobContainerBundleStoreTests extends OpenSearchTestCase {
         );
         BundleHeader header = store.readHeader("bundle-retry", second.length());
         assertEquals(1, header.entries().size());
+    }
+
+    public void testWritingDifferentContentUnderAnAlreadyUsedNameThrowsRatherThanSilentlyTrustingIt() throws Exception {
+        // The real bug this guards: LuceneMergeCompactionPublisher#computeNewHead redoes a real
+        // Lucene merge on every retry, so two independent attempts against the same unchanged
+        // source compute the exact same deterministic bundleName but pack genuinely different
+        // bytes (fresh random segment IDs each time) -- caught by a real sustained chaos test
+        // before this guard existed, reproduced here directly and deterministically instead of
+        // relying on chance.
+        BlobContainerBundleStore store = new BlobContainerBundleStore(newFsBlobContainer());
+        List<BundleFileContent> first = List.of(new BundleFileContent("_0.si", randomByteArrayOfLength(256)));
+        List<BundleFileContent> second = List.of(new BundleFileContent("_0.si", randomByteArrayOfLength(256)));
+
+        store.writeBundle("bundle-collision", first);
+
+        IOException thrown = expectThrows(IOException.class, () -> store.writeBundle("bundle-collision", second));
+        assertTrue(
+            "the exception must clearly identify this as a content mismatch, not some other failure",
+            thrown.getMessage().contains("already exists with different real content")
+        );
+    }
+
+    public void testWritingDifferentContentThatHappensToBeTheSameLengthIsStillCaught() throws Exception {
+        // A length-only check was tried first and found insufficient: fixed-width fields (like
+        // Lucene's random segment IDs) mean two different real contents can share the exact same
+        // total byte length. This test forces that exact case -- same length, different bytes --
+        // proving the guard compares real content, not just size.
+        BlobContainerBundleStore store = new BlobContainerBundleStore(newFsBlobContainer());
+        byte[] contentA = new byte[64];
+        byte[] contentB = contentA.clone();
+        contentB[0] ^= 0xFF; // one bit flipped -- identical length, genuinely different content.
+        List<BundleFileContent> first = List.of(new BundleFileContent("_0.si", contentA));
+        List<BundleFileContent> second = List.of(new BundleFileContent("_0.si", contentB));
+
+        store.writeBundle("bundle-same-length-collision", first);
+
+        IOException thrown = expectThrows(IOException.class, () -> store.writeBundle("bundle-same-length-collision", second));
+        assertTrue(thrown.getMessage().contains("already exists with different real content"));
     }
 
     public void testCorruptedBundleDetectedOnRead() throws Exception {
