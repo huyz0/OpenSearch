@@ -3710,13 +3710,29 @@ head untouched, and that naming a nonexistent index fails with a clear precondit
   Verified stable across 5 repeated runs with no flakes.
 - **Cost accounting**: per-workload object-store request counts as a regression metric —
   a change that doubles PUT count is a failed build, same as a latency regression.
-  **Status: implemented for the publish path.** `CostAccountingRegressionTests` wraps a real `FsBlobContainer`
-  in a request-counting `FilterBlobContainer` and asserts `ObjectStoreCommitPublisher#publishCommit`
-  costs exactly 2 PUTs per commit (one bundle write, one manifest write) regardless of how many
-  documents or underlying segment files that commit packages -- a future change that starts writing
-  bundle files individually, or adds an extra manifest write, fails this assertion outright, exactly
-  the gate this bullet asks for. Scoped to the publish path only, the workload every other write
-  eventually reduces to; GC/compaction/PITR's own request-cost profiles are not separately gated yet.
+  **Status: implemented for the publish and compaction publish paths.** `CostAccountingRegressionTests`
+  wraps a real `FsBlobContainer` in a request-counting `RegisterDelegatingBlobContainer` and asserts
+  `ObjectStoreCommitPublisher#publishCommit` costs exactly 2 PUTs per commit (one bundle write, one
+  manifest write) regardless of how many documents or underlying segment files that commit packages
+  -- a future change that starts writing bundle files individually, or adds an extra manifest write,
+  fails this assertion outright, exactly the gate this bullet asks for.
+
+  **Extended to the compaction publish path**, closing part of the "GC/compaction/PITR's own
+  request-cost profiles are not separately gated yet" gap this status note previously left open:
+  `testCompactionPublishingStaysWithinItsExpectedPutBudget` runs a real 5-segment source commit
+  through `LuceneMergeCompactionPublisher` + `CompactionRebaseExecutor` (not just `publishCommit`
+  directly) and asserts the exact same 2-PUT budget holds -- proving compaction's own orchestration
+  (materialize, merge, rebase-CAS the head) adds no extra PUT-shaped requests of its own, rather than
+  assuming it from `LuceneMergeCompactionPublisher` reusing `publishCommit` internally. Verified
+  meaningfully: temporarily injecting one spurious write into the counted region reproduces the
+  exact "got 3... likely added extra object-store requests" failure the assertion exists to catch.
+  Caught and fixed a real latent defect along the way, not just added a new test: the counting
+  container extended a bare `FilterBlobContainer`, which -- per this same section's own
+  `RegisterDelegatingBlobContainer` extraction note -- does not delegate `readRegister`/
+  `compareAndSwapRegister` by default, so it would have thrown `UnsupportedOperationException` the
+  moment the compaction path's own head CAS reached it; switching the base class to
+  `RegisterDelegatingBlobContainer` fixed this before it ever surfaced as a confusing test failure.
+  GC sweep and PITR reconciliation's own request-cost profiles remain ungated.
 
 ## 18. Risks and Open Questions
 
