@@ -212,7 +212,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
         Environment environment = TestEnvironment.newEnvironment(nodeSettings);
         plugin.createComponents(null, null, null, null, null, null, environment, null, null, null, null);
 
-        assertEquals(0L, plugin.sharedWalChunkServiceForTesting().perShardBudgetBytesForTesting());
+        assertEquals(0L, plugin.sharedWalChunkService().perShardBudgetBytesForTesting());
     }
 
     public void testWalPerShardBudgetSettingIsThreadedIntoTheSharedWalChunkService() {
@@ -228,7 +228,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
         Environment environment = TestEnvironment.newEnvironment(nodeSettings);
         plugin.createComponents(null, null, null, null, null, null, environment, null, null, null, null);
 
-        assertEquals(512L * 1024, plugin.sharedWalChunkServiceForTesting().perShardBudgetBytesForTesting());
+        assertEquals(512L * 1024, plugin.sharedWalChunkService().perShardBudgetBytesForTesting());
     }
 
     public void testLazyDirectoryFileCacheIsNotConstructedByDefault() {

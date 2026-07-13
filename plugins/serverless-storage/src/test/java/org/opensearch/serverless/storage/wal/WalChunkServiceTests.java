@@ -55,6 +55,26 @@ public class WalChunkServiceTests extends OpenSearchTestCase {
         assertEquals(2, records.size());
     }
 
+    public void testTotalBufferedBytesReflectsRealPayloadSizesAcrossShardsAndResetsAfterFlush() throws Exception {
+        // Deliberately the 2-arg, no-fairness-budget constructor -- the default production shape.
+        // bufferedBytesByShard is only ever populated when perShardBudgetBytes is configured, so a
+        // naive totalBufferedBytes() built on that map alone would read 0 here despite 35 real
+        // bytes being buffered; this is the case that actually caught that bug while writing this test.
+        WalChunkService service = new WalChunkService(newBlobContainer(), "epoch-0");
+        assertEquals("nothing buffered yet", 0L, service.totalBufferedBytes());
+
+        service.append(new WalRecord("idx-a", 0, 1, 0, new byte[10]));
+        service.append(new WalRecord("idx-b", 0, 1, 0, new byte[25]));
+        assertEquals("must sum real payload bytes across both shards, not just count records", 35L, service.totalBufferedBytes());
+
+        service.flush();
+        assertEquals(
+            "a flush must clear the buffered-bytes total the same way it clears bufferedRecordCount()",
+            0L,
+            service.totalBufferedBytes()
+        );
+    }
+
     public void testSuccessiveFlushesGetIncreasingChunkSequences() throws Exception {
         WalChunkService service = new WalChunkService(newBlobContainer(), "epoch-0");
         service.append(new WalRecord("idx", 0, 1, 0, "a".getBytes("UTF-8")));

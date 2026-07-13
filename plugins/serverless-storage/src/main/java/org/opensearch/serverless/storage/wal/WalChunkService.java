@@ -196,6 +196,23 @@ public final class WalChunkService implements WalAppendTarget {
         return buffered.size();
     }
 
+    /**
+     * Total payload bytes currently buffered (since the last {@link #flush}), summed across every
+     * shard -- rfc-serverless-opensearch.md &sect;10's still-open "ingest tier: WAL upload backlog"
+     * autoscaling signal, the byte-weighted counterpart to {@link #bufferedRecordCount()}. Computed
+     * directly from {@link #buffered}, not {@link #bufferedBytesByShard} -- that map is only ever
+     * populated when {@link #perShardBudgetBytes} is configured (the fairness-budget feature, off
+     * by default), so summing it would silently read as zero for every node running with the
+     * default no-budget configuration despite records genuinely being buffered.
+     */
+    public synchronized long totalBufferedBytes() {
+        long total = 0;
+        for (WalRecord record : buffered) {
+            total += record.payload().length;
+        }
+        return total;
+    }
+
     /** The epoch every chunk this service writes is keyed under -- see this class's own javadoc for what it identifies. */
     public String writerEpoch() {
         return writerEpoch;

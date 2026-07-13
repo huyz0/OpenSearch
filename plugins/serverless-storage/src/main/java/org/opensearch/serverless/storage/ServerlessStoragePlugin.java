@@ -1521,6 +1521,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 org.opensearch.serverless.storage.security.action.TransportNodeObjectStoreRequestStatsAction.class
             ),
             new ActionHandler<>(
+                org.opensearch.serverless.storage.wal.action.NodeWalBacklogAction.INSTANCE,
+                org.opensearch.serverless.storage.wal.action.TransportNodeWalBacklogAction.class
+            ),
+            new ActionHandler<>(
                 org.opensearch.serverless.storage.readerengine.action.WaitForGenerationAction.INSTANCE,
                 org.opensearch.serverless.storage.readerengine.action.TransportWaitForGenerationAction.class
             ),
@@ -1610,6 +1614,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new org.opensearch.serverless.storage.readerengine.action.RestNodeManifestLagAction(),
             new org.opensearch.serverless.storage.format.action.RestNodeCacheStatsAction(),
             new org.opensearch.serverless.storage.security.action.RestNodeObjectStoreRequestStatsAction(),
+            new org.opensearch.serverless.storage.wal.action.RestNodeWalBacklogAction(),
             new org.opensearch.serverless.storage.readerengine.action.RestWaitForGenerationAction(),
             new org.opensearch.serverless.storage.readerengine.action.RestPollNowAction(),
             new org.opensearch.serverless.storage.scaletozero.action.RestScaleToZeroCandidatesAction(),
@@ -1765,8 +1770,12 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         return gcRetentionWindowMillis;
     }
 
-    /** The node-shared WAL chunk service {@link #createComponents} built, or {@code null} if WAL mirroring is off -- test-only visibility. */
-    WalChunkService sharedWalChunkServiceForTesting() {
+    /**
+     * The node-shared WAL chunk service {@link #createComponents} built, or {@code null} if WAL
+     * mirroring is off; public since {@code TransportNodeWalBacklogAction}, not just tests, needs
+     * to reach it via {@code @Inject}.
+     */
+    public WalChunkService sharedWalChunkService() {
         return sharedWalChunkService;
     }
 

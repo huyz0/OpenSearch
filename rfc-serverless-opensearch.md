@@ -1429,7 +1429,9 @@ the same on-disk cache directory, which the unit-level cold-read-latency test co
   state and the bridge between the two.
 
 **Status: node-role placement done as a real `AllocationDecider`, now symmetric in both
-directions; cost model, autoscaling hooks, and mandatory remote cluster state not started.**
+directions; cost model and mandatory remote cluster state now implemented too (see below);
+autoscaling hooks substantially implemented, one signal (ingest-tier WAL upload backlog) closed
+most recently.**
 `ReaderShardPlacementAllocationDecider` is the "new decider" the first bullet calls for. A node
 opts in to hosting reader shards via `node.attr.serverless_storage_reader: "true"` (the same
 node-attribute mechanism `cluster.routing.allocation.require.*` filters already use), and reader
@@ -1515,6 +1517,25 @@ for the four IT classes that couldn't extend it because they already extend core
 `RemoteStoreBaseIntegTestCase`, by adding the setting directly to those four classes' own
 `nodeSettings` overrides) so every test cluster this plugin's IT suite starts satisfies its own new
 prerequisite.
+
+**Autoscaling hooks, ingest-tier "WAL upload backlog" sub-signal now closed too.** `WalChunkService`
+already tracked `bufferedRecordCount()` internally (used by the per-shard fairness budget, &sect;18
+risk #4) but nothing outside the process could reach it, and there was no byte-weighted counterpart
+at all. `WalChunkService#totalBufferedBytes()` (new) sums real payload bytes across every shard's
+currently-buffered records; `NodeWalBacklogAction` (`GET /_plugins/_serverless/storage/_wal_backlog`)
+reports both, mirroring `NodeCacheStatsAction`'s single-node-scope shape, reading zero for both
+fields on a node with WAL mirroring off rather than failing. **A real bug caught while building
+this**: the first cut of `totalBufferedBytes()` summed the existing `bufferedBytesByShard` map, which
+turned out to be populated only when the per-shard fairness budget is configured (off by default) --
+so the signal would have silently read zero on every node running the default configuration despite
+records genuinely being buffered. Fixed to sum real payload bytes directly off the buffered-records
+list instead, caught by a test using the same default, no-budget constructor as production. Verified
+end-to-end in a real cluster against the node's own live `WalChunkService` instance (`WalMirroringTranslog#add`
+flushes after every single operation by design -- see its own javadoc -- so ordinary indexing never
+leaves real backlog to observe; this test instead appends directly to the shared instance, bypassing
+the translog's auto-flush, to prove the transport action reflects live state rather than a stale or
+disconnected copy). The remaining autoscaling-hook sub-signals (indexing queue depth, writer CPU,
+query queue depth) remain open.
 
 **Moved to a real `IndexCreationValidator`, closing a design gap code review caught.** Originally
 built on `ServerlessStorageIndexSettingProvider` -- the same seam that translates the
