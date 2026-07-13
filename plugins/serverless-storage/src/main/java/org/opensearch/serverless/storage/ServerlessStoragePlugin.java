@@ -517,6 +517,25 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * How many consecutive over-threshold evaluation ticks a shard must be flagged a candidate on,
+     * back to back, before {@code ReaderReplicaExpansionCoordinator} actually expands its index --
+     * closes {@link #SERVERLESS_STORAGE_SCALE_UP_QPM_THRESHOLD_SETTING}'s own javadoc note that this
+     * "would need multiple consecutive over-threshold ticks to avoid reacting to one noisy
+     * evaluation." Defaulted <em>on</em> at a small positive value (unlike most optional-feature
+     * settings in this plugin, which default off) for the same reason {@link
+     * #SERVERLESS_STORAGE_SCALE_TO_ZERO_COOLDOWN_SETTING} defaults on: without it, a single noisy
+     * tick could trigger a real index expansion the moment {@link
+     * #SERVERLESS_STORAGE_SCALE_UP_ENABLED_SETTING} is turned on, exactly the flapping risk this
+     * setting exists to prevent. A value of 1 restores the original single-tick behavior.
+     */
+    public static final Setting<Integer> SERVERLESS_STORAGE_SCALE_UP_REQUIRED_CONSECUTIVE_TICKS_SETTING = Setting.intSetting(
+        "serverless_storage.scale_up.required_consecutive_ticks",
+        2,
+        1,
+        Setting.Property.NodeScope
+    );
+
+    /**
      * Per-shard fairness budget for the one node-shared {@code WalChunkService}
      * (rfc-serverless-opensearch.md &sect;18 risk #4, "WAL multiplexing fairness") -- a shard whose
      * own buffered payload bytes since its last flush cross this budget is immediately siphoned
@@ -734,6 +753,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_SCALE_UP_MAX_SEARCH_REPLICAS_SETTING,
             SERVERLESS_STORAGE_SCALE_UP_EVAL_INTERVAL_SETTING,
             SERVERLESS_STORAGE_SCALE_UP_ENABLED_SETTING,
+            SERVERLESS_STORAGE_SCALE_UP_REQUIRED_CONSECUTIVE_TICKS_SETTING,
             SERVERLESS_STORAGE_RESHARDING_SPLIT_CANDIDATE_WPM_THRESHOLD_SETTING,
             SERVERLESS_STORAGE_REPOSITORY_SETTING
         );
@@ -832,7 +852,11 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 client,
                 clusterService,
                 scaleUpEnabled
-                    ? new org.opensearch.serverless.storage.scaleup.ReaderReplicaExpansionCoordinator(client, scaleUpMaxSearchReplicas)
+                    ? new org.opensearch.serverless.storage.scaleup.ReaderReplicaExpansionCoordinator(
+                        client,
+                        scaleUpMaxSearchReplicas,
+                        SERVERLESS_STORAGE_SCALE_UP_REQUIRED_CONSECUTIVE_TICKS_SETTING.get(environment.settings())
+                    )
                     : null
             );
         }

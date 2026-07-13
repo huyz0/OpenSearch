@@ -147,7 +147,10 @@ public class ServerlessStorageReaderScaleUpIT extends RemoteStoreBaseIntegTestCa
             }
             assertTrue("the busy reader shard must eventually be flagged a scale-up candidate", anyCandidate);
 
-            ReaderReplicaExpansionCoordinator coordinator = new ReaderReplicaExpansionCoordinator(client(), 5);
+            // requiredConsecutiveTicks=1: this IT proves the mechanism wires end to end, not the
+            // hysteresis policy (ReaderReplicaExpansionCoordinatorTests covers that directly) -- a
+            // fresh coordinator instance every assertBusy retry could never accumulate a streak anyway.
+            ReaderReplicaExpansionCoordinator coordinator = new ReaderReplicaExpansionCoordinator(client(), 5, 1);
             coordinator.expandCandidates(response.candidates());
             // ObjectStoreReaderEngine#queriesPerMinute() only ever reports the previous *completed*
             // 60-second window (see its own javadoc for why), so this assertBusy genuinely needs

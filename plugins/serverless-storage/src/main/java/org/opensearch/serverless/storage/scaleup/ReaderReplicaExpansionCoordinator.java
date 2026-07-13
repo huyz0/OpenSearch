@@ -20,6 +20,8 @@ import org.opensearch.transport.client.Client;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 
 /**
  * The "do the work" half of scale-up (see the RFC's scale-up autoscaling subsection), consuming
@@ -40,6 +42,15 @@ import java.util.Set;
  * index-wide setting, so one busy shard's candidacy expands every shard's search-replica count for
  * that index together -- {@link #expandCandidates} dedupes multiple candidate shards of the same
  * index down to a single settings update.
+ *
+ * <p><b>Sustained-duration hysteresis</b> (rfc-serverless-opensearch.md &sect;10's own "would need
+ * multiple consecutive over-threshold ticks to avoid reacting to one noisy evaluation" gap,
+ * previously left open): {@link #expandCandidates} tracks, per {@code (indexUuid, shardId)}, how
+ * many *consecutive* evaluations in a row have flagged that shard a candidate. A shard only
+ * actually triggers expansion once that streak reaches {@link #requiredConsecutiveTicks}; any tick
+ * where it is not flagged a candidate resets its streak to zero, so the requirement really means
+ * "sustained," not "N times ever." A shard no longer reported at all (relocated, deleted, or its
+ * index no longer exists) has its tracked streak dropped rather than left to leak forever.
  */
 public final class ReaderReplicaExpansionCoordinator {
 
@@ -47,6 +58,8 @@ public final class ReaderReplicaExpansionCoordinator {
 
     private final Client client;
     private final int maxSearchReplicas;
+    private final int requiredConsecutiveTicks;
+    private final ConcurrentMap<String, Integer> consecutiveCandidateTicks = new ConcurrentHashMap<>();
 
     /**
      * Creates a coordinator.
@@ -56,33 +69,50 @@ public final class ReaderReplicaExpansionCoordinator {
      *                          even if called repeatedly -- normally already enforced by {@link
      *                          ScaleUpCandidateEntry#candidate()} itself, this is a second,
      *                          coordinator-local guard against acting on a stale entry.
+     * @param requiredConsecutiveTicks how many consecutive evaluations in a row a shard must be
+     *                                 flagged a candidate on before its index is actually expanded --
+     *                                 see this class's own "Sustained-duration hysteresis" javadoc.
+     *                                 Values {@code <= 1} restore the original single-tick behavior.
      */
-    public ReaderReplicaExpansionCoordinator(Client client, int maxSearchReplicas) {
+    public ReaderReplicaExpansionCoordinator(Client client, int maxSearchReplicas, int requiredConsecutiveTicks) {
         this.client = client;
         this.maxSearchReplicas = maxSearchReplicas;
+        this.requiredConsecutiveTicks = Math.max(1, requiredConsecutiveTicks);
     }
 
     /**
-     * Bumps every distinct {@link ScaleUpCandidateEntry#candidate()} index's {@code
-     * index.number_of_search_replicas} by one, capped at {@link #maxSearchReplicas} -- idempotent
-     * in the sense that calling this on every scheduled evaluation tick is safe, since each call
-     * only ever bumps by one step past whatever {@link ScaleUpCandidateEntry#currentSearchReplicaCount()}
-     * the evaluation itself observed.
+     * Bumps every distinct sustained candidate index's {@code index.number_of_search_replicas} by
+     * one, capped at {@link #maxSearchReplicas} -- idempotent in the sense that calling this on
+     * every scheduled evaluation tick is safe, since each call only ever bumps by one step past
+     * whatever {@link ScaleUpCandidateEntry#currentSearchReplicaCount()} the evaluation itself
+     * observed.
      *
-     * @param candidates one evaluation's worth of scale-up candidates; only entries with {@link
-     *                   ScaleUpCandidateEntry#candidate()} {@code true} are acted on.
+     * @param candidates one evaluation's full merged shard list -- every shard this evaluation
+     *                   observed, not just the ones currently flagged a candidate, so this method
+     *                   can correctly reset the streak of a shard that stopped qualifying and drop
+     *                   the streak of a shard no longer reported at all.
      */
     public void expandCandidates(List<ScaleUpCandidateEntry> candidates) {
         Set<String> alreadyExpanded = new HashSet<>();
+        Set<String> observedKeys = new HashSet<>();
         for (ScaleUpCandidateEntry entry : candidates) {
+            String key = entry.indexUuid() + "/" + entry.shardId();
+            observedKeys.add(key);
             if (entry.candidate() == false) {
+                consecutiveCandidateTicks.remove(key);
                 continue;
             }
+            int streak = consecutiveCandidateTicks.merge(key, 1, Integer::sum);
+            if (streak < requiredConsecutiveTicks) {
+                continue; // flagged, but not sustained long enough yet -- wait for the next tick.
+            }
+            consecutiveCandidateTicks.remove(key); // acted on -- start counting fresh for any future expansion.
             if (alreadyExpanded.add(entry.indexName()) == false) {
                 continue; // another shard of the same index already triggered this index's expansion this tick.
             }
             expandIndex(entry.indexName(), entry.currentSearchReplicaCount());
         }
+        consecutiveCandidateTicks.keySet().retainAll(observedKeys);
     }
 
     private void expandIndex(String indexName, int currentSearchReplicaCount) {

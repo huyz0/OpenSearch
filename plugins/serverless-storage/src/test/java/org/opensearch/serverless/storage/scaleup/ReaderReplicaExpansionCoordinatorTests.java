@@ -41,7 +41,8 @@ public class ReaderReplicaExpansionCoordinatorTests extends OpenSearchTestCase {
     }
 
     public void testExpandsOnlyCandidatesByOneStep() {
-        ReaderReplicaExpansionCoordinator coordinator = new ReaderReplicaExpansionCoordinator(client, 5);
+        // requiredConsecutiveTicks=1 -- this test is about which entries get acted on, not hysteresis.
+        ReaderReplicaExpansionCoordinator coordinator = new ReaderReplicaExpansionCoordinator(client, 5, 1);
         ScaleUpCandidateEntry candidate = new ScaleUpCandidateEntry("uuid-1", 0, "my-index", 900L, 1, true);
         ScaleUpCandidateEntry notCandidate = new ScaleUpCandidateEntry("uuid-2", 0, "other-index", 10L, 1, false);
 
@@ -51,7 +52,7 @@ public class ReaderReplicaExpansionCoordinatorTests extends OpenSearchTestCase {
     }
 
     public void testDedupesMultipleShardsOfSameIndexIntoOneUpdate() {
-        ReaderReplicaExpansionCoordinator coordinator = new ReaderReplicaExpansionCoordinator(client, 5);
+        ReaderReplicaExpansionCoordinator coordinator = new ReaderReplicaExpansionCoordinator(client, 5, 1);
         ScaleUpCandidateEntry shard0 = new ScaleUpCandidateEntry("uuid-1", 0, "my-index", 900L, 1, true);
         ScaleUpCandidateEntry shard1 = new ScaleUpCandidateEntry("uuid-1", 1, "my-index", 700L, 1, true);
 
@@ -61,7 +62,7 @@ public class ReaderReplicaExpansionCoordinatorTests extends OpenSearchTestCase {
     }
 
     public void testNeverExceedsConfiguredCap() {
-        ReaderReplicaExpansionCoordinator coordinator = new ReaderReplicaExpansionCoordinator(client, 3);
+        ReaderReplicaExpansionCoordinator coordinator = new ReaderReplicaExpansionCoordinator(client, 3, 1);
         // Already at the cap: candidate() should never have been true for this in real use, but the
         // coordinator's own second guard must still refuse to act on it.
         ScaleUpCandidateEntry atCap = new ScaleUpCandidateEntry("uuid-1", 0, "my-index", 900L, 3, true);
@@ -72,7 +73,7 @@ public class ReaderReplicaExpansionCoordinatorTests extends OpenSearchTestCase {
     }
 
     public void testUpdateRequestTargetsCorrectIndexAndReplicaCount() {
-        ReaderReplicaExpansionCoordinator coordinator = new ReaderReplicaExpansionCoordinator(client, 5);
+        ReaderReplicaExpansionCoordinator coordinator = new ReaderReplicaExpansionCoordinator(client, 5, 1);
         ScaleUpCandidateEntry candidate = new ScaleUpCandidateEntry("uuid-1", 0, "my-index", 900L, 1, true);
 
         coordinator.expandCandidates(List.of(candidate));
@@ -82,5 +83,51 @@ public class ReaderReplicaExpansionCoordinatorTests extends OpenSearchTestCase {
         UpdateSettingsRequest request = captor.getValue();
         assertArrayEquals(new String[] { "my-index" }, request.indices());
         assertEquals("2", request.settings().get(IndexMetadata.SETTING_NUMBER_OF_SEARCH_REPLICAS));
+    }
+
+    public void testASingleOverThresholdTickDoesNotTriggerExpansionWhenHysteresisIsConfigured() {
+        ReaderReplicaExpansionCoordinator coordinator = new ReaderReplicaExpansionCoordinator(client, 5, 3);
+        ScaleUpCandidateEntry candidate = new ScaleUpCandidateEntry("uuid-1", 0, "my-index", 900L, 1, true);
+
+        coordinator.expandCandidates(List.of(candidate));
+        coordinator.expandCandidates(List.of(candidate));
+
+        verify(indicesAdminClient, never()).updateSettings(any(UpdateSettingsRequest.class), any());
+    }
+
+    public void testExpandsOnlyOnceTheStreakReachesTheRequiredConsecutiveTickCount() {
+        ReaderReplicaExpansionCoordinator coordinator = new ReaderReplicaExpansionCoordinator(client, 5, 3);
+        ScaleUpCandidateEntry candidate = new ScaleUpCandidateEntry("uuid-1", 0, "my-index", 900L, 1, true);
+
+        coordinator.expandCandidates(List.of(candidate));
+        coordinator.expandCandidates(List.of(candidate));
+        verify(indicesAdminClient, never()).updateSettings(any(UpdateSettingsRequest.class), any());
+
+        coordinator.expandCandidates(List.of(candidate));
+        verify(indicesAdminClient, times(1)).updateSettings(any(UpdateSettingsRequest.class), any());
+    }
+
+    public void testAGapInCandidacyResetsTheStreak() {
+        ReaderReplicaExpansionCoordinator coordinator = new ReaderReplicaExpansionCoordinator(client, 5, 3);
+        ScaleUpCandidateEntry candidate = new ScaleUpCandidateEntry("uuid-1", 0, "my-index", 900L, 1, true);
+        ScaleUpCandidateEntry notCandidate = new ScaleUpCandidateEntry("uuid-1", 0, "my-index", 10L, 1, false);
+
+        coordinator.expandCandidates(List.of(candidate));
+        coordinator.expandCandidates(List.of(candidate));
+        coordinator.expandCandidates(List.of(notCandidate)); // resets the streak
+        coordinator.expandCandidates(List.of(candidate));
+        coordinator.expandCandidates(List.of(candidate));
+
+        // Two more candidate ticks after the reset is only a streak of 2, still short of 3.
+        verify(indicesAdminClient, never()).updateSettings(any(UpdateSettingsRequest.class), any());
+    }
+
+    public void testDefaultConstructorArgumentOfOneRestoresOriginalSingleTickBehavior() {
+        ReaderReplicaExpansionCoordinator coordinator = new ReaderReplicaExpansionCoordinator(client, 5, 1);
+        ScaleUpCandidateEntry candidate = new ScaleUpCandidateEntry("uuid-1", 0, "my-index", 900L, 1, true);
+
+        coordinator.expandCandidates(List.of(candidate));
+
+        verify(indicesAdminClient, times(1)).updateSettings(any(UpdateSettingsRequest.class), any());
     }
 }

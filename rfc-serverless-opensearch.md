@@ -2881,10 +2881,27 @@ isolation. A full `internalClusterTest` regression sweep stayed green throughout
 **Scale-up (reader replica expansion) is now a first, minimal increment, mirroring scale-to-zero's
 own "policy, then mechanism" shape but for the opposite direction.** Everything above suspends idle
 copies; nothing until now expanded a busy one back out, the other still-open half of &sect;10's
-autoscaling story. This increment is deliberately narrow: a per-tick threshold check against a
+autoscaling story. This increment started deliberately narrow: a per-tick threshold check against a
 query-rate estimate, no sustained-duration tracking (a shard that spikes for one evaluation tick and
-drops back down is treated the same as one under real sustained load) -- a real cost model, or even
-just "N consecutive over-threshold ticks before acting," is future work, not attempted here.
+drops back down was treated the same as one under real sustained load). A real cost model remains
+future work; the "N consecutive over-threshold ticks before acting" half is now closed (see below).
+
+**Sustained-duration hysteresis, closing the gap this section's own status note previously left
+open.** `ReaderReplicaExpansionCoordinator#expandCandidates` now tracks, per `(indexUuid, shardId)`,
+how many *consecutive* evaluations in a row have flagged that shard a candidate, and only actually
+expands the index once that streak reaches `serverless_storage.scale_up.required_consecutive_ticks`
+(new node setting, default 2). Any tick where the shard is not flagged a candidate resets its streak
+to zero, so the requirement genuinely means "sustained," not "N times ever" -- and a shard no longer
+reported at all (relocated, deleted) has its tracked streak dropped rather than leaked forever.
+Deliberately defaulted *on* at a small positive value, unlike most optional-feature settings in this
+plugin, the same reasoning `serverless_storage.scale_to_zero.cooldown` already defaults on for: without
+it, a single noisy tick could trigger a real index expansion the moment `serverless_storage.scale_up.enabled`
+is turned on -- exactly the flapping risk this setting exists to prevent. A value of 1 restores the
+original single-tick behavior. Verified with real unit tests (a single over-threshold tick does not
+trigger when hysteresis is configured; expansion fires only once the streak reaches the required
+count; a gap in candidacy resets the streak rather than merely pausing it; a value of 1 restores the
+exact original behavior) -- confirmed meaningful by disabling the streak-length check and watching
+three of the new tests fail with the exact "expansion fired too early" mismatch.
 
 The query-rate signal is new: `ObjectStoreReaderEngine` gained a deliberately crude two-window
 (previous/current) `queriesPerMinute()` counter, updated alongside `lastQueryMillis` in the same
