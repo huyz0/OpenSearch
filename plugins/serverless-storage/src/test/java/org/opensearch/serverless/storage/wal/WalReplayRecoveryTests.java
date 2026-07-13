@@ -16,12 +16,15 @@ import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.index.translog.Translog;
 import org.opensearch.serverless.storage.manifest.WalPosition;
+import org.opensearch.serverless.storage.security.RegisterDelegatingBlobContainer;
 import org.opensearch.serverless.storage.security.StaticEncryptionKeyProvider;
 import org.opensearch.test.OpenSearchTestCase;
 
 import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;
 
+import java.io.IOException;
+import java.io.InputStream;
 import java.util.List;
 
 public class WalReplayRecoveryTests extends OpenSearchTestCase {
@@ -176,5 +179,68 @@ public class WalReplayRecoveryTests extends OpenSearchTestCase {
         }
         List<Long> sequences = WalReplayRecovery.listChunkSequencesInRange(blobContainer, 1, 4);
         assertEquals(List.of(1L, 2L, 3L), sequences);
+    }
+
+    // Kill-mid-WAL-chunk (rfc-serverless-opensearch.md &sect;17): WalChunkService#writeChunk is a
+    // two-step write -- claimNextChunkSequence() durably advances the shared CAS register first,
+    // then writeBlob() writes the chunk's actual content -- so a kill (or any hard fault) between
+    // those two steps permanently orphans the claimed sequence: the register generation has already
+    // advanced, but no blob ever lands at that sequence, and claimNextChunkSequence never reuses a
+    // number once claimed. Recovery must tolerate that gap cleanly, the same "before-state
+    // untouched, retry succeeds" shape ObjectStoreCommitHeadPublisherTests' kill-mid-bundle-upload/
+    // kill-mid-manifest-write tests already established for the writer's other two-step writes.
+    public void testReplaySkipsAnOrphanedChunkSequenceLeftByAKilledMidChunkWrite() throws Exception {
+        BlobContainer blobContainer = newBlobContainer();
+        OneShotFailingOnWriteBlobContainer faulty = new OneShotFailingOnWriteBlobContainer(blobContainer);
+        WalChunkService service = new WalChunkService(faulty, "epoch-0");
+
+        Translog.Index op0 = new Translog.Index("doc0", 0, 1, "src0".getBytes("UTF-8"));
+        service.append(new WalRecord("idx", 0, 1, 0, serialize(op0)));
+
+        // The killed attempt: claimNextChunkSequence() durably claims sequence 0, then writeBlob()
+        // is hit by the injected fault -- sequence 0 is now permanently orphaned.
+        expectThrows(IOException.class, service::flush);
+        assertFalse(
+            "a killed write must never leave a partial/torn blob behind",
+            blobContainer.blobExists(WalChunkNaming.blobName("epoch-0", 0))
+        );
+
+        // A retry (matching WalMirroringTranslog#flushWithRetry's own shape): flush() only clears
+        // the buffer on success, so the same record is still buffered and this must succeed,
+        // claiming the *next* sequence rather than reusing the orphaned one.
+        long chunkSequence = service.flush();
+        assertEquals("the retry must claim a fresh sequence, never reuse the orphaned one", 1, chunkSequence);
+
+        List<Translog.Operation> operations = WalReplayRecovery.replayOperations(blobContainer, "idx", 0, 1, null, 2);
+        assertEquals(
+            "recovery must skip the orphaned gap at sequence 0 and recover exactly the operation that actually landed",
+            1,
+            operations.size()
+        );
+        assertEquals(0L, operations.get(0).seqNo());
+    }
+
+    /** Fails the first {@code writeBlob} call, then delegates normally -- simulates a kill exactly between the CAS claim and the blob write. */
+    private static final class OneShotFailingOnWriteBlobContainer extends RegisterDelegatingBlobContainer {
+
+        private boolean failed;
+
+        OneShotFailingOnWriteBlobContainer(BlobContainer delegate) {
+            super(delegate);
+        }
+
+        @Override
+        protected BlobContainer wrapChild(BlobContainer child) {
+            return new OneShotFailingOnWriteBlobContainer(child);
+        }
+
+        @Override
+        public void writeBlob(String blobName, InputStream inputStream, long blobSize, boolean failIfAlreadyExists) throws IOException {
+            if (failed == false) {
+                failed = true;
+                throw new IOException("injected kill-mid-WAL-chunk failure writing " + blobName);
+            }
+            super.writeBlob(blobName, inputStream, blobSize, failIfAlreadyExists);
+        }
     }
 }

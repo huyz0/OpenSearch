@@ -3592,8 +3592,8 @@ head untouched, and that naming a nonexistent index fails with a clear precondit
 - **Chaos**: kill writer mid-bundle-upload, mid-manifest-write, mid-WAL-chunk; kill readers
   mid-refresh; object store fault injection (throttling, 5xx storms, elevated latency) — the
   mock repository infrastructure in-repo already supports much of this. **Status: elevated latency,
-  the GC-sweep fault-injection case, and kill-mid-bundle-upload/mid-manifest-write on the writer
-  path are all implemented and tested; kill-mid-WAL-chunk, kill-mid-refresh on the reader path, and
+  the GC-sweep fault-injection case, kill-mid-bundle-upload/mid-manifest-write on the writer path,
+  and kill-mid-WAL-chunk are all implemented and tested; kill-mid-refresh on the reader path and
   broader throttling/5xx-storm coverage are not.** `LatencyInjectingBlobContainer` (`benchmark`
   package) already covers elevated latency, exercised by `ServerlessStorageReactivationUnderLatencyIT`.
   `GcSchedulerTaskTests#testSweepIsSafeToRetryAfterAnInjectedTransientObjectStoreFault`
@@ -3625,8 +3625,28 @@ head untouched, and that naming a nonexistent index fails with a clear precondit
   existence-check idempotency exactly. Verified meaningfully, not just added: reverting the fix
   reproduces the exact `FileAlreadyExistsException` the chaos test was written to catch.
 
-  Kill-mid-WAL-chunk on the writer path, kill-mid-refresh on the reader path, and broader
-  probabilistic multi-operation throttling/5xx-storm injection across the whole plugin remain open.
+  **Kill-mid-WAL-chunk, closed.** `WalChunkService#writeChunk` is itself a two-step write, the same
+  shape as `ObjectStoreCommitPublisher#publishCommit` above: `claimNextChunkSequence()` durably
+  advances the shared CAS register first, then `writeBlob` writes the chunk's actual content. A
+  kill between those two steps permanently orphans the claimed sequence -- the register generation
+  has already moved on, no blob ever lands there, and (unlike the bundle-name case above)
+  `claimNextChunkSequence` never reuses a number once claimed, so there is no idempotency bug to
+  find here, only a gap to prove is harmless. `WalReplayRecoveryTests#testReplaySkipsAnOrphanedChunkSequenceLeftByAKilledMidChunkWrite`
+  injects a one-shot hard `IOException` on exactly the `writeBlob` call (`OneShotFailingOnWriteBlobContainer`,
+  same shape as the other chaos tests' fault injectors), confirms the killed attempt leaves no
+  partial/torn blob behind, confirms a bare retry claims the *next* sequence rather than reusing the
+  orphaned one, and then confirms `WalReplayRecovery#replayOperations` -- the real recovery/replay
+  path, not just `WalChunkService` in isolation -- cleanly skips the orphaned gap and recovers
+  exactly the one operation that actually landed. Unlike the bundle/manifest case, this test didn't
+  catch a new bug: `WalReplayRecovery#listChunkSequencesInRange` already lists actual blobs by
+  prefix rather than assuming a contiguous range, so gap-tolerance was already correct by
+  construction -- verified meaningfully anyway (temporarily disabling the injected fault makes the
+  test fail with "no exception was thrown," confirming the test genuinely depends on exercising the
+  fault path, not vacuously passing) and now locked in as a proven invariant rather than an
+  accidental property, closing this specific open chaos-suite line item.
+
+  Kill-mid-refresh on the reader path and broader probabilistic multi-operation throttling/5xx-storm
+  injection across the whole plugin remain open.
 - **Staleness/consistency**: linearizability-style checker for the RYW path (indexed doc with
   generation token must be visible to a routed search); monotonicity checker for readers.
   **Status: implemented and tested, now that the RYW primitive itself exists (see &sect;8).**
