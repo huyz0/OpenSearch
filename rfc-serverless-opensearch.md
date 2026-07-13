@@ -3827,7 +3827,20 @@ head untouched, and that naming a nonexistent index fails with a clear precondit
   `compareAndSwapRegister` by default, so it would have thrown `UnsupportedOperationException` the
   moment the compaction path's own head CAS reached it; switching the base class to
   `RegisterDelegatingBlobContainer` fixed this before it ever surfaced as a confusing test failure.
-  GC sweep and PITR reconciliation's own request-cost profiles remain ungated.
+  **Extended further to GC sweep and PITR reconciliation, closing this status note's own remaining
+  gap.** `GcSchedulerTaskCostAccountingTests#testSweepDeletingManyGenerationsStaysWithinItsExpectedDeleteBudget`
+  sweeps 10 real deletable generations (plus one surviving current-latest) and asserts the DELETE-shaped
+  request cost stays flat at exactly 2 (one batched bundle delete, one batched manifest delete) --
+  the same "regardless of N" shape as the compaction gate above, adapted to GC's own delete-heavy
+  workload. `PitrRetentionReconcilerCostAccountingTests` pins down `PitrRetentionReconciler#reconcile`'s
+  different shape instead: unlike the batched deletes above, `BlobContainerDurablePinRegistry#addPin`/
+  `#removePin` are each an independent read-modify-CAS cycle, so the real, honest budget is 1 initial
+  read plus one GET+PUT pair *per pin actually added or removed* -- proven both for a first
+  reconciliation adding several pins at once (cost scales with pins changed, not with how many
+  manifests were handed in) and for a steady-state no-op reconcile (costs only its own initial read,
+  writes nothing). Verified meaningfully for both: temporarily breaking `deleteManifests`' batching
+  into a one-delete-per-item loop, and separately injecting one spurious extra read into `mutate`,
+  each reproduces the expected "got more than budgeted" failure.
 
 ## 18. Risks and Open Questions
 
