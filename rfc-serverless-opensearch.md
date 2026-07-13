@@ -1534,8 +1534,19 @@ end-to-end in a real cluster against the node's own live `WalChunkService` insta
 flushes after every single operation by design -- see its own javadoc -- so ordinary indexing never
 leaves real backlog to observe; this test instead appends directly to the shared instance, bypassing
 the translog's auto-flush, to prove the transport action reflects live state rather than a stale or
-disconnected copy). The remaining autoscaling-hook sub-signals (indexing queue depth, writer CPU,
-query queue depth) remain open.
+disconnected copy). **The remaining three sub-signals this bullet names (indexing queue depth,
+writer CPU, query queue depth) turn out not to need any plugin-specific work at all, unlike WAL
+backlog/cache hit rate/manifest-generation lag above.** All three are already real, per-node,
+already-exposed core `_nodes/stats` metrics with no aggregation loss: indexing queue depth is
+`ThreadPoolStats.Stats#getQueue()` for `ThreadPool.Names.WRITE` (`nodes.<id>.thread_pool.write.queue`);
+query queue depth is the same mechanism for `ThreadPool.Names.SEARCH`
+(`nodes.<id>.thread_pool.search.queue`); writer CPU is `ProcessStats.Cpu#percent`
+(`nodes.<id>.process.cpu.percent`, this node's own JVM process) or `OsStats.Cpu#percent`
+(`nodes.<id>.os.cpu.percent`, whole-machine) depending on which an autoscaling policy layer actually
+wants. An external policy layer can poll `GET _nodes/stats/thread_pool,process,os` directly today --
+building bespoke serverless-storage-specific actions to re-expose data core already serves would be
+pure duplication, not a real gap closed. Confirmed by reading `ThreadPool.java`, `ThreadPoolStats.java`,
+`ProcessStats.java`, `OsStats.java`, and `RestNodesStatsAction.java` directly rather than assumed.
 
 **Moved to a real `IndexCreationValidator`, closing a design gap code review caught.** Originally
 built on `ServerlessStorageIndexSettingProvider` -- the same seam that translates the
