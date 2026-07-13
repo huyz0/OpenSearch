@@ -26,27 +26,32 @@ import java.util.Map;
  * grouping this manifest's files by which segment they belong to without needing to open any of
  * them.
  *
- * <p>Soft-delete ratio is <b>not</b> derivable this way -- it lives inside a segment's doc-values
- * data, not its file name or size -- so this always reports {@code estimatedDeleteRatio = 0.0}. Per
- * {@link CompactionRebaseExecutor}'s own safety argument ("at worst, wasted work, never a lost or
- * corrupted update"), underestimating delete ratio only means the delete-reclaim trigger in {@link
- * CompactionPolicy#shouldCompact} never fires from this estimator -- a missed optimization, not a
- * correctness issue; the segment-count/size triggers are unaffected and remain accurate.
- *
- * <p><b>Confirmed empirically, not just asserted from reading Lucene's source</b>: a per-segment
- * live-docs file (Lucene's {@code .liv}) looked like a plausible manifest-metadata-only proxy for
- * "this segment has deletions" -- but it is not, because it only ever gets written for *hard*
- * deletes. A real {@code ObjectStoreWriterEngine}, indexing two documents then soft-deleting one
- * (the default deletion path every OpenSearch index actually uses, {@code
+ * <p>Soft-delete ratio is <b>not</b> derivable from the file map alone -- it lives inside a
+ * segment's doc-values data, not its file name or size. A per-segment live-docs file (Lucene's
+ * {@code .liv}) looked like a plausible manifest-metadata-only proxy for "this segment has
+ * deletions," and was confirmed empirically, not just assumed from reading Lucene's source, to
+ * <em>not</em> work: a real {@code ObjectStoreWriterEngine}, indexing two documents then
+ * soft-deleting one (the default deletion path every OpenSearch index actually uses, {@code
  * index.soft_deletes.enabled=true}) and flushing, produces a manifest with <em>no</em> {@code .liv}
  * file at all -- the soft-delete instead shows up only as a doc-values field-generation update
  * ({@code SegmentCommitInfo#getSoftDelCount()} is 1, {@code hasDeletions()} is {@code false}). A
  * {@code .liv}-presence heuristic would therefore silently do nothing for the dominant real-world
- * deletion path while looking like real logic -- worse than the honest {@code 0.0} this class
- * already returns. No other manifest-metadata-only signal for soft-delete count was found that
- * doesn't share this same blind spot or a worse one (e.g. a doc-values generation bump is not
- * specific to deletions at all), so this remains unimplemented rather than shipped as something
- * that looks like it works but mostly doesn't.
+ * deletion path while looking like real logic.
+ *
+ * <p><b>{@link CommitManifest#deleteRatio()} closes this instead, by carrying the real doc counts
+ * in the manifest itself</b> rather than trying to re-derive them from the file map: {@link
+ * org.opensearch.serverless.storage.writerengine.ObjectStoreCommitPublisher#publishCommit} computes
+ * {@code totalDocCount}/{@code deletedDocCount} directly from the {@code SegmentInfos} it already
+ * has in hand at publish time (summing each segment's {@code maxDoc} and {@code getSoftDelCount() +
+ * getDelCount()}), so no manifest-metadata-only proxy is needed -- the real Lucene truth is recorded
+ * once, at the one point it's cheaply available, instead of reconstructed later from artifacts that
+ * don't reliably carry it. A manifest built through an older constructor overload that never
+ * recorded doc counts reports {@code deleteRatio() == 0.0}, the same honest "unknown, treat as no
+ * deletions" default this class used to return unconditionally -- see {@link
+ * CompactionRebaseExecutor}'s own safety argument ("at worst, wasted work, never a lost or corrupted
+ * update") for why collapsing "unknown" into "zero" here only ever means the delete-reclaim trigger
+ * in {@link CompactionPolicy#shouldCompact} doesn't fire when it perhaps should, never the reverse;
+ * the segment-count/size triggers, which don't depend on it, are unaffected either way.
  */
 public final class ManifestSegmentMetrics {
 
@@ -56,7 +61,11 @@ public final class ManifestSegmentMetrics {
     public final long totalBytes;
     /** Size of the single largest segment, 0 if there are no segments. */
     public final long largestSingleSegmentBytes;
-    /** Always {@code 0.0} -- soft-delete ratio cannot be derived from manifest file metadata alone. */
+    /**
+     * {@link CommitManifest#deleteRatio()}, carried through unchanged -- {@code 0.0} both for a
+     * genuinely delete-free commit and for a manifest that never recorded doc counts at all (an
+     * older manifest, or one built through a doc-count-less constructor overload in a test).
+     */
     public final double estimatedDeleteRatio;
 
     private ManifestSegmentMetrics(int segmentCount, long totalBytes, long largestSingleSegmentBytes, double estimatedDeleteRatio) {
@@ -67,10 +76,12 @@ public final class ManifestSegmentMetrics {
     }
 
     /**
-     * Derives segment-level metrics from a manifest's file map alone, without opening any segment.
+     * Derives segment-level metrics from a manifest's file map, plus {@code estimatedDeleteRatio}
+     * from the manifest's own recorded doc counts ({@link CommitManifest#deleteRatio()}) -- no
+     * segment needs to be opened for either.
      *
      * @param manifest the commit manifest to derive metrics from
-     * @return the derived metrics, with {@code estimatedDeleteRatio} always {@code 0.0}
+     * @return the derived metrics
      */
     public static ManifestSegmentMetrics from(CommitManifest manifest) {
         Map<String, Long> bytesBySegment = new HashMap<>();
@@ -93,6 +104,6 @@ public final class ManifestSegmentMetrics {
             largest = Math.max(largest, segmentBytes);
         }
 
-        return new ManifestSegmentMetrics(bytesBySegment.size(), totalBytes, largest, 0.0);
+        return new ManifestSegmentMetrics(bytesBySegment.size(), totalBytes, largest, manifest.deleteRatio());
     }
 }

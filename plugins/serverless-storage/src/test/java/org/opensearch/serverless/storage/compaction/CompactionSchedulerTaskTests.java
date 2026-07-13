@@ -232,6 +232,99 @@ public class CompactionSchedulerTaskTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * Closes rfc-serverless-opensearch.md &sect;7.4's "genuinely unimplemented" delete-ratio gap
+     * end to end, not just at the {@code ManifestSegmentMetrics} unit level: a shard with only a
+     * couple of segments (nowhere near the segment-count threshold) but a real, heavily
+     * soft-deleted single segment must still get compacted, proving the delete-ratio trigger this
+     * class's own {@code shouldCompact} call has always had actually fires now that {@link
+     * ManifestSegmentMetrics} feeds it a real ratio instead of an unconditional {@code 0.0}.
+     */
+    public void testMaybeCompactReturnsTrueWhenTheShardIsOnlyOverTheDeleteRatioThreshold() throws Exception {
+        try (Directory directory = new ByteBuffersDirectory()) {
+            String softDeletesField = org.opensearch.common.lucene.Lucene.SOFT_DELETES_FIELD;
+            org.apache.lucene.index.IndexWriterConfig config = new org.apache.lucene.index.IndexWriterConfig();
+            config.setSoftDeletesField(softDeletesField);
+            // Prevents an auto-merge on close from superseding the exact commit generation captured
+            // below (readLatestCommit is read before the writer closes, but a default merge policy
+            // can still merge in the background/on close and delete that generation's files out
+            // from under this test).
+            config.setMergePolicy(NoMergePolicy.INSTANCE);
+            SegmentInfos infos;
+            try (IndexWriter writer = new IndexWriter(directory, config)) {
+                for (int i = 0; i < 4; i++) {
+                    Document doc = new Document();
+                    doc.add(new StringField("id", "doc-" + i, Field.Store.YES));
+                    writer.addDocument(doc);
+                }
+                writer.commit();
+                // Soft-delete 3 of the 4 documents -- a heavily-deleted single segment, well under
+                // any segment-count threshold, so only the delete-ratio trigger can explain a
+                // compaction firing here.
+                for (int i = 0; i < 3; i++) {
+                    Document tombstone = new Document();
+                    tombstone.add(new StringField("id", "doc-" + i, Field.Store.YES));
+                    writer.softUpdateDocument(
+                        new org.apache.lucene.index.Term("id", "doc-" + i),
+                        tombstone,
+                        new org.apache.lucene.document.NumericDocValuesField(softDeletesField, 1)
+                    );
+                }
+                writer.commit();
+                infos = SegmentInfos.readLatestCommit(directory);
+            }
+            // softUpdateDocument buffers each tombstone into a new segment before commit, so this
+            // ends up as the original (now soft-delete-marked) segment plus one small tombstone
+            // segment -- still nowhere near the 1000-segment threshold below, which is the only
+            // thing that matters for isolating the delete-ratio trigger.
+            assertTrue("test setup should stay well under the segment-count policy threshold", infos.size() < 10);
+
+            CommitManifest manifest = commitPublisher.publishCommit(
+                directory,
+                infos,
+                INDEX_UUID,
+                SHARD_ID,
+                1,
+                infos.getGeneration(),
+                3,
+                3,
+                new WalPosition("epoch-0", 0),
+                0,
+                PruningStats.empty()
+            );
+            ManifestSegmentMetrics metrics = ManifestSegmentMetrics.from(manifest);
+            // 4 original docs (3 soft-deleted) + 3 tombstone docs (each softUpdateDocument call
+            // adds a live replacement doc alongside marking the old one deleted) = 7 total docs, 3
+            // deleted, ratio ~0.43 -- well above the 0.3 policy threshold below, with real margin.
+            assertTrue("test setup must produce a real, meaningfully nonzero delete ratio", metrics.estimatedDeleteRatio > 0.3);
+
+            ShardHead head = new ShardHead(1, "node-1", 1L, manifest.generation());
+            assertEquals(CasResult.SUCCESS, shardStateStore.compareAndSet(INDEX_UUID, SHARD_ID, Optional.empty(), head));
+
+            // A high segment-count threshold (this single-segment manifest never crosses it) and a
+            // low delete-ratio threshold (this manifest's real ratio does) -- isolates the
+            // delete-ratio trigger specifically, not conflated with the segment-count one.
+            CompactionPolicy deleteRatioOnlyPolicy = new CompactionPolicy(1000, Long.MAX_VALUE, 0.3);
+            boolean attempted = CompactionSchedulerTask.maybeCompact(
+                INDEX_UUID,
+                SHARD_ID,
+                shardStateStore,
+                manifestStore,
+                new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer)),
+                commitPublisher,
+                deleteRatioOnlyPolicy,
+                new CompactionRebaseExecutor(shardStateStore, 10)
+            );
+
+            assertTrue("a shard whose real delete ratio crosses the policy's threshold must be a candidate", attempted);
+            ShardHead afterCompaction = shardStateStore.get(INDEX_UUID, SHARD_ID).orElseThrow().head();
+            assertTrue(
+                "the attempt reported as made must have actually published a newer generation",
+                afterCompaction.latestManifestGeneration() > manifest.generation()
+            );
+        }
+    }
+
     public void testMaybeCompactReturnsFalseWhenTheShardIsUnderThreshold() throws Exception {
         try (Directory directory = new ByteBuffersDirectory()) {
             // Well under CompactionPolicy.withDefaults()'s 10-segment threshold.

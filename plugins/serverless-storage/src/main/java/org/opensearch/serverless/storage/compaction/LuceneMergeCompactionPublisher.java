@@ -13,6 +13,7 @@ import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
+import org.opensearch.common.lucene.Lucene;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.manifest.CommitManifest;
 import org.opensearch.serverless.storage.manifest.FileReference;
@@ -98,7 +99,16 @@ public final class LuceneMergeCompactionPublisher implements CompactionPublisher
             try (Directory sourceDirectory = new ByteBuffersDirectory(); Directory mergedDirectory = new ByteBuffersDirectory()) {
                 materializer.materialize(sourceManifest, sourceDirectory);
 
-                try (IndexWriter writer = new IndexWriter(mergedDirectory, new IndexWriterConfig())) {
+                // The soft-deletes field must be configured here (matching the constant every real
+                // OpenSearch index actually indexes with, per Lucene.SOFT_DELETES_FIELD) even though
+                // this writer never itself soft-deletes anything -- addIndexes below throws
+                // IllegalArgumentException ("this index has [...] as soft-deletes already but
+                // soft-deletes field is not configured in IWC") the moment the source segments it's
+                // copying in carry that field and this config doesn't acknowledge it. A real,
+                // previously latent bug: no existing test exercised compaction against any
+                // soft-deleted source content, so this had never been caught before.
+                IndexWriterConfig mergeConfig = new IndexWriterConfig().setSoftDeletesField(Lucene.SOFT_DELETES_FIELD);
+                try (IndexWriter writer = new IndexWriter(mergedDirectory, mergeConfig)) {
                     writer.addIndexes(sourceDirectory);
                     writer.forceMerge(targetSegmentCount);
                     writer.commit();

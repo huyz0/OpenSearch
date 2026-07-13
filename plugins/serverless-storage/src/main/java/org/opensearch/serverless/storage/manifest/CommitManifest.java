@@ -41,11 +41,18 @@ public final class CommitManifest implements Writeable {
     private final PruningStats pruningStats;
     private final long createdAtMillis;
     private final boolean quiescent;
+    private final long totalDocCount;
+    private final long deletedDocCount;
 
     /**
      * Creates a non-quiescent manifest for one immutable Lucene commit -- equivalent to the
-     * fuller constructor with {@code quiescent = false}, kept so every pre-existing caller (the
-     * ordinary hot commit path) is unaffected by {@link #quiescent}'s addition.
+     * fuller constructor with {@code quiescent = false} and both doc-count fields {@code 0}, kept
+     * so every pre-existing caller (the ordinary hot commit path, and every test that never cared
+     * about delete-ratio accounting) is unaffected by {@link #quiescent}'s or {@link
+     * #deleteRatio()}'s addition. {@code deleteRatio()} on a manifest built this way is always
+     * {@code 0.0} -- the same honest "unknown, treated as no deletions" default {@link
+     * org.opensearch.serverless.storage.compaction.ManifestSegmentMetrics} itself used to report
+     * unconditionally before real doc counts existed to derive it from.
      *
      * @param indexUuid the UUID of the index this shard belongs to
      * @param shardId the shard number
@@ -88,12 +95,16 @@ public final class CommitManifest implements Writeable {
             mappingVersion,
             pruningStats,
             createdAtMillis,
-            false
+            false,
+            0,
+            0
         );
     }
 
     /**
-     * Creates a manifest for one immutable Lucene commit.
+     * Same as the twelve-argument constructor, additionally marking the published manifest {@link
+     * #quiescent()}. Both doc-count fields default to {@code 0} -- see that constructor's own
+     * javadoc for what that means for {@link #deleteRatio()}.
      *
      * @param indexUuid the UUID of the index this shard belongs to
      * @param shardId the shard number
@@ -127,6 +138,71 @@ public final class CommitManifest implements Writeable {
         long createdAtMillis,
         boolean quiescent
     ) {
+        this(
+            indexUuid,
+            shardId,
+            primaryTerm,
+            generation,
+            segmentsFileName,
+            files,
+            maxSeqNo,
+            localCheckpoint,
+            walPosition,
+            mappingVersion,
+            pruningStats,
+            createdAtMillis,
+            quiescent,
+            0,
+            0
+        );
+    }
+
+    /**
+     * Creates a manifest for one immutable Lucene commit.
+     *
+     * @param indexUuid the UUID of the index this shard belongs to
+     * @param shardId the shard number
+     * @param primaryTerm the primary term this commit was written under
+     * @param generation the generation of this commit, unique within {@code primaryTerm}
+     * @param segmentsFileName the name of the Lucene segments file for this commit, which must be
+     *                         a key of {@code files}
+     * @param files the manifest's file map, keyed by file name
+     * @param maxSeqNo the maximum sequence number included in this commit
+     * @param localCheckpoint the local checkpoint at this commit
+     * @param walPosition the write-ahead log position folded into this commit, or {@code null}
+     * @param mappingVersion the mapping version in effect at this commit
+     * @param pruningStats summary statistics used to decide whether this shard can be pruned
+     * @param createdAtMillis the wall-clock time this manifest was created, in epoch millis
+     * @param quiescent whether this is a writer's deliberate final commit before scale-to-zero
+     *                  suspension (rfc-serverless-opensearch.md &sect;7.3) -- {@code true} means no
+     *                  further commit is expected from this writer until it is reactivated.
+     * @param totalDocCount the total document count (live + deleted) across every segment in this
+     *                      commit, i.e. the sum of each segment's {@code maxDoc} -- {@code 0} means
+     *                      unknown, not "zero documents" (see {@link #deleteRatio()}).
+     * @param deletedDocCount the total soft- plus hard-deleted document count across every segment
+     *                        in this commit, i.e. the sum of each segment's {@code getSoftDelCount()
+     *                        + getDelCount()} -- meaningless on its own without {@code totalDocCount}
+     *                        to compare it against, which is why both travel together rather than a
+     *                        single precomputed ratio (a future consumer needing the raw counts,
+     *                        e.g. an exact reclaimable-bytes estimate, doesn't need a schema change).
+     */
+    public CommitManifest(
+        String indexUuid,
+        int shardId,
+        long primaryTerm,
+        long generation,
+        String segmentsFileName,
+        Map<String, FileReference> files,
+        long maxSeqNo,
+        long localCheckpoint,
+        WalPosition walPosition,
+        long mappingVersion,
+        PruningStats pruningStats,
+        long createdAtMillis,
+        boolean quiescent,
+        long totalDocCount,
+        long deletedDocCount
+    ) {
         this.indexUuid = Objects.requireNonNull(indexUuid, "indexUuid");
         if (shardId < 0) {
             throw new IllegalArgumentException("shardId must be >= 0, got " + shardId);
@@ -136,6 +212,14 @@ public final class CommitManifest implements Writeable {
         }
         if (generation < 0) {
             throw new IllegalArgumentException("generation must be >= 0, got " + generation);
+        }
+        if (totalDocCount < 0) {
+            throw new IllegalArgumentException("totalDocCount must be >= 0, got " + totalDocCount);
+        }
+        if (deletedDocCount < 0 || deletedDocCount > totalDocCount) {
+            throw new IllegalArgumentException(
+                "deletedDocCount must be in [0, totalDocCount=" + totalDocCount + "], got " + deletedDocCount
+            );
         }
         this.shardId = shardId;
         this.primaryTerm = primaryTerm;
@@ -152,6 +236,8 @@ public final class CommitManifest implements Writeable {
         this.pruningStats = Objects.requireNonNull(pruningStats, "pruningStats");
         this.createdAtMillis = createdAtMillis;
         this.quiescent = quiescent;
+        this.totalDocCount = totalDocCount;
+        this.deletedDocCount = deletedDocCount;
     }
 
     /**
@@ -173,6 +259,8 @@ public final class CommitManifest implements Writeable {
         this.pruningStats = new PruningStats(in);
         this.createdAtMillis = in.readVLong();
         this.quiescent = in.readBoolean();
+        this.totalDocCount = in.readVLong();
+        this.deletedDocCount = in.readVLong();
     }
 
     @Override
@@ -190,6 +278,8 @@ public final class CommitManifest implements Writeable {
         pruningStats.writeTo(out);
         out.writeVLong(createdAtMillis);
         out.writeBoolean(quiescent);
+        out.writeVLong(totalDocCount);
+        out.writeVLong(deletedDocCount);
     }
 
     /** The UUID of the index this shard belongs to. */
@@ -261,6 +351,40 @@ public final class CommitManifest implements Writeable {
         return quiescent;
     }
 
+    /**
+     * The total document count (live + deleted) across every segment in this commit, i.e. the sum
+     * of each segment's {@code maxDoc}. {@code 0} means unknown (a manifest built through a
+     * constructor overload that doesn't take doc counts), not literally zero documents -- see
+     * {@link #deleteRatio()}.
+     */
+    public long totalDocCount() {
+        return totalDocCount;
+    }
+
+    /**
+     * The total soft- plus hard-deleted document count across every segment in this commit. Only
+     * meaningful together with {@link #totalDocCount()} -- see {@link #deleteRatio()}.
+     */
+    public long deletedDocCount() {
+        return deletedDocCount;
+    }
+
+    /**
+     * The fraction of this commit's documents that are soft- or hard-deleted, derived from {@link
+     * #totalDocCount()}/{@link #deletedDocCount()} rather than stored as a single precomputed
+     * field. {@code 0.0} both for a genuinely delete-free commit and for one built through a
+     * constructor overload that never recorded doc counts at all (an honest "unknown, treat as no
+     * deletions" default, the same one {@link org.opensearch.serverless.storage.compaction.ManifestSegmentMetrics}
+     * itself used to report unconditionally before this field existed) -- {@link
+     * org.opensearch.serverless.storage.compaction.CompactionRebaseExecutor}'s own safety argument
+     * ("at worst, wasted work, never a lost or corrupted update") is exactly why collapsing "unknown"
+     * into "zero" here is safe: it only ever means the delete-reclaim compaction trigger doesn't
+     * fire when it perhaps should, never the reverse.
+     */
+    public double deleteRatio() {
+        return totalDocCount == 0 ? 0.0 : (double) deletedDocCount / totalDocCount;
+    }
+
     /** Every manifest blob name starts with this -- the prefix {@link org.opensearch.serverless.storage.manifest.BlobContainerManifestStore#listManifests} lists by. */
     public static final String NAME_PREFIX = "manifest-";
 
@@ -318,6 +442,8 @@ public final class CommitManifest implements Writeable {
             && mappingVersion == that.mappingVersion
             && createdAtMillis == that.createdAtMillis
             && quiescent == that.quiescent
+            && totalDocCount == that.totalDocCount
+            && deletedDocCount == that.deletedDocCount
             && indexUuid.equals(that.indexUuid)
             && segmentsFileName.equals(that.segmentsFileName)
             && files.equals(that.files)
@@ -340,7 +466,9 @@ public final class CommitManifest implements Writeable {
             mappingVersion,
             pruningStats,
             createdAtMillis,
-            quiescent
+            quiescent,
+            totalDocCount,
+            deletedDocCount
         );
     }
 

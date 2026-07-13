@@ -3036,11 +3036,9 @@ or has never published anything, the tick is a no-op. Otherwise it reads the man
 generation and evaluates `CompactionPolicy#shouldCompact` against `ManifestSegmentMetrics` --
 segment count and size derived straight from the manifest's file map via
 `IndexFileNames#parseSegmentName` (no bundle opened), matching &sect;7.4's "readable without opening
-the shard" requirement exactly. Delete ratio is not derivable this way (it lives inside a segment's
-doc-values data, not its file name or size) and is always reported as `0.0`; per
-`CompactionRebaseExecutor`'s own safety argument this only means the delete-reclaim trigger never
-fires from this estimator, a missed optimization rather than a correctness issue -- the
-segment-count/size triggers, which don't depend on it, are unaffected.
+the shard" requirement exactly. Delete ratio is not derivable from the file map this way (it lives
+inside a segment's doc-values data, not its file name or size) -- see the status note below for how
+this is now closed by carrying real doc counts in the manifest itself instead.
 
 **Checked for a manifest-metadata-only proxy signal, and confirmed empirically that none of the
 obvious ones work.** A per-segment live-docs file (Lucene's `.liv`) looked like a plausible
@@ -3052,7 +3050,38 @@ only shows up as a doc-values field-generation update (`SegmentCommitInfo#getSof
 would silently do nothing for the dominant real-world deletion path while looking like real logic
 -- worse than the honest `0.0` already returned, not better. No other manifest-metadata-only signal
 found avoids this same blind spot (or a worse one -- a doc-values generation bump isn't specific to
-deletions at all), so this remains genuinely unimplemented, not merely unattempted.
+deletions at all).
+
+**Closed instead by carrying the real doc counts in the manifest itself**, rather than continuing to
+search for a metadata-only proxy that fundamentally can't exist: `CommitManifest` gained two new
+fields, `totalDocCount`/`deletedDocCount`, populated by `ObjectStoreCommitPublisher#publishCommit`
+directly from the `SegmentInfos` it already has in hand at publish time (`totalMaxDoc()`, and each
+segment's `getSoftDelCount() + getDelCount()` summed) -- no manifest-metadata-only signal is needed
+because the real Lucene truth is recorded once, at the one point it's cheaply available, rather than
+reconstructed later from artifacts (like `.liv` presence) that don't reliably carry it. Backward
+compatible the same way `quiescent` was: older constructor overloads default both fields to `0`,
+and `CommitManifest#deleteRatio()` treats `totalDocCount == 0` as the same honest "unknown, treat as
+no deletions" `0.0` this whole subsystem already tolerated -- per `CompactionRebaseExecutor`'s own
+safety argument, collapsing "unknown" into "zero" only ever means the trigger doesn't fire when it
+perhaps should, never the reverse. `ManifestSegmentMetrics.from` now returns `manifest.deleteRatio()`
+instead of a hardcoded `0.0`. Verified two ways, not just at the unit level: `ManifestSegmentMetricsTests#testEstimatedDeleteRatioReflectsARealSoftDeletedDocument`
+proves a real soft-deleted document produces a nonzero ratio from the manifest alone, and
+`CompactionSchedulerTaskTests#testMaybeCompactReturnsTrueWhenTheShardIsOnlyOverTheDeleteRatioThreshold`
+closes the loop end to end -- a shard with only two segments (nowhere near the segment-count
+threshold) but a heavily soft-deleted one still gets compacted, proving the delete-reclaim trigger
+`CompactionPolicy#shouldCompact` has always had actually fires now, not just that the number
+computes correctly in isolation.
+
+**That end-to-end test caught a real, previously latent bug, not a hypothetical one**:
+`LuceneMergeCompactionPublisher`'s own merge `IndexWriter` never configured a soft-deletes field, so
+compacting *any* real soft-delete-enabled index (i.e. virtually every real OpenSearch index, since
+soft deletes are on by default) would have failed outright with `IllegalArgumentException: this
+index has [__soft_deletes] as soft-deletes already but soft-deletes field is not configured in IWC`
+the moment `addIndexes` encountered the source segments' own soft-deletes field. No existing test
+had ever exercised compaction against soft-deleted source content before this one. Fixed by
+configuring `IndexWriterConfig#setSoftDeletesField(Lucene.SOFT_DELETES_FIELD)` on the merge writer,
+matching the fixed constant every real index actually uses. Verified meaningfully: reverting the fix
+reproduces the exact `IllegalArgumentException` above.
 
 **Real lease acquisition/renewal, closing a dormant fencing bug found while investigating this**:
 `ShardHead.leaseHolderNodeId`/`leaseExpiryMillis` existed from the start, but nothing ever wrote

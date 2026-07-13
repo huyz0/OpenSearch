@@ -8,6 +8,7 @@
 
 package org.opensearch.serverless.storage.writerengine;
 
+import org.apache.lucene.index.SegmentCommitInfo;
 import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
@@ -166,6 +167,12 @@ public final class ObjectStoreCommitPublisher {
         bundle.entries()
             .forEach((name, entry) -> files.put(name, new FileReference(bundleName, entry.offset(), entry.length(), entry.checksum())));
 
+        long totalDocCount = segmentInfos.totalMaxDoc();
+        long deletedDocCount = 0;
+        for (SegmentCommitInfo segmentCommitInfo : segmentInfos.asList()) {
+            deletedDocCount += segmentCommitInfo.getDelCount() + segmentCommitInfo.getSoftDelCount();
+        }
+
         CommitManifest manifest = new CommitManifest(
             indexUuid,
             shardId,
@@ -179,7 +186,9 @@ public final class ObjectStoreCommitPublisher {
             mappingVersion,
             pruningStats,
             System.currentTimeMillis(),
-            quiescent
+            quiescent,
+            totalDocCount,
+            deletedDocCount
         );
         manifestStore.writeManifest(manifest);
         return manifest;

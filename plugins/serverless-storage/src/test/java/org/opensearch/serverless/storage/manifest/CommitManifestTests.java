@@ -177,6 +177,107 @@ public class CommitManifestTests extends OpenSearchTestCase {
         );
     }
 
+    public void testDocCountsDefaultToZeroAndDeleteRatioIsZero() {
+        CommitManifest manifest = randomManifest(1, 5);
+        assertEquals(0, manifest.totalDocCount());
+        assertEquals(0, manifest.deletedDocCount());
+        assertEquals(0.0, manifest.deleteRatio(), 0.0);
+    }
+
+    public void testDeleteRatioReflectsRealDocCounts() {
+        CommitManifest manifest = new CommitManifest(
+            "idx",
+            0,
+            1,
+            0,
+            "segments_1",
+            Map.of("segments_1", new FileReference("bundle-A", 0, 10, 1L)),
+            0,
+            0,
+            null,
+            0,
+            PruningStats.empty(),
+            0L,
+            false,
+            100,
+            25
+        );
+        assertEquals(100, manifest.totalDocCount());
+        assertEquals(25, manifest.deletedDocCount());
+        assertEquals(0.25, manifest.deleteRatio(), 0.0);
+    }
+
+    public void testDocCountsRoundTripThroughSerializationAndParticipateInEquality() throws Exception {
+        CommitManifest withDeletes = new CommitManifest(
+            "idx",
+            0,
+            1,
+            0,
+            "segments_1",
+            Map.of("segments_1", new FileReference("bundle-A", 0, 10, 1L)),
+            0,
+            0,
+            null,
+            0,
+            PruningStats.empty(),
+            0L,
+            false,
+            100,
+            25
+        );
+
+        BytesStreamOutput out = new BytesStreamOutput();
+        withDeletes.writeTo(out);
+        CommitManifest deserialized = new CommitManifest(out.bytes().streamInput());
+
+        assertEquals(100, deserialized.totalDocCount());
+        assertEquals(25, deserialized.deletedDocCount());
+        assertEquals(0.25, deserialized.deleteRatio(), 0.0);
+        assertEquals(withDeletes, deserialized);
+
+        CommitManifest withoutDeletes = new CommitManifest(
+            "idx",
+            0,
+            1,
+            0,
+            "segments_1",
+            Map.of("segments_1", new FileReference("bundle-A", 0, 10, 1L)),
+            0,
+            0,
+            null,
+            0,
+            PruningStats.empty(),
+            0L,
+            false,
+            100,
+            0
+        );
+        assertNotEquals("differing deletedDocCount must participate in equality", withDeletes, withoutDeletes);
+    }
+
+    public void testConstructorRejectsDeletedDocCountAboveTotalDocCount() {
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> new CommitManifest(
+                "idx",
+                0,
+                1,
+                0,
+                "segments_1",
+                Map.of("segments_1", new FileReference("bundle-A", 0, 10, 1L)),
+                0,
+                0,
+                null,
+                0,
+                PruningStats.empty(),
+                0L,
+                false,
+                10,
+                11
+            )
+        );
+    }
+
     public void testConstructorRejectsInvalidPrimaryTerm() {
         expectThrows(
             IllegalArgumentException.class,

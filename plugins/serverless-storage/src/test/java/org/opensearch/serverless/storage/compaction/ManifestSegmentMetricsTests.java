@@ -10,11 +10,14 @@ package org.opensearch.serverless.storage.compaction;
 
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
+import org.apache.lucene.document.NumericDocValuesField;
 import org.apache.lucene.document.StringField;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.NoMergePolicy;
+import org.apache.lucene.index.SegmentCommitInfo;
 import org.apache.lucene.index.SegmentInfos;
+import org.apache.lucene.index.Term;
 import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
 import org.opensearch.common.blobstore.BlobContainer;
@@ -91,7 +94,7 @@ public class ManifestSegmentMetricsTests extends OpenSearchTestCase {
                 "estimator must not count the top-level segments_N file as a segment",
                 metrics.segmentCount < manifest.files().size()
             );
-            assertEquals("delete ratio is not derivable from manifest metadata alone", 0.0, metrics.estimatedDeleteRatio, 0.0);
+            assertEquals("no documents were deleted, so the ratio is genuinely zero", 0.0, metrics.estimatedDeleteRatio, 0.0);
         }
     }
 
@@ -127,6 +130,68 @@ public class ManifestSegmentMetricsTests extends OpenSearchTestCase {
             // segment, so it's strictly >= the one segment's own size, not necessarily equal.
             assertTrue(metrics.largestSingleSegmentBytes <= metrics.totalBytes);
             assertTrue(metrics.largestSingleSegmentBytes > 0);
+        }
+    }
+
+    /**
+     * Closes rfc-serverless-opensearch.md &sect;7.4's "genuinely unimplemented" gap: a real,
+     * non-hypothetical soft delete (the dominant real-world deletion path, matching this section's
+     * own investigation) must now produce a nonzero {@code estimatedDeleteRatio}, not the honest but
+     * unconditional {@code 0.0} this class used to always return.
+     */
+    public void testEstimatedDeleteRatioReflectsARealSoftDeletedDocument() throws Exception {
+        try (Directory directory = new ByteBuffersDirectory()) {
+            String softDeletesField = org.opensearch.common.lucene.Lucene.SOFT_DELETES_FIELD;
+            IndexWriterConfig config = new IndexWriterConfig();
+            config.setSoftDeletesField(softDeletesField);
+            SegmentInfos infos;
+            try (IndexWriter writer = new IndexWriter(directory, config)) {
+                for (int i = 0; i < 4; i++) {
+                    Document doc = new Document();
+                    doc.add(new StringField("id", "doc-" + i, Field.Store.YES));
+                    writer.addDocument(doc);
+                }
+                writer.commit();
+
+                // Soft-delete one of the four documents -- the same "re-index the tombstone with a
+                // soft-deletes doc-value" path every OpenSearch index actually uses by default.
+                Document tombstone = new Document();
+                tombstone.add(new StringField("id", "doc-0", Field.Store.YES));
+                writer.softUpdateDocument(new Term("id", "doc-0"), tombstone, new NumericDocValuesField(softDeletesField, 1));
+                writer.commit();
+                infos = SegmentInfos.readLatestCommit(directory);
+            }
+
+            long realSoftDeleteCount = infos.asList().stream().mapToLong(SegmentCommitInfo::getSoftDelCount).sum();
+            assertTrue("test setup must produce a real soft-deleted document", realSoftDeleteCount > 0);
+
+            CommitManifest manifest = commitPublisher.publishCommit(
+                directory,
+                infos,
+                INDEX_UUID,
+                SHARD_ID,
+                1,
+                infos.getGeneration(),
+                3,
+                3,
+                new WalPosition("epoch-0", 0),
+                0,
+                PruningStats.empty()
+            );
+
+            assertEquals(
+                "the manifest must carry the exact real soft-delete count computed from SegmentInfos",
+                realSoftDeleteCount,
+                manifest.deletedDocCount()
+            );
+            assertTrue("the manifest's totalDocCount must reflect every indexed document", manifest.totalDocCount() >= 4);
+
+            ManifestSegmentMetrics metrics = ManifestSegmentMetrics.from(manifest);
+            assertTrue(
+                "estimatedDeleteRatio must now be nonzero, reflecting the real soft delete rather than " + "the old unconditional 0.0",
+                metrics.estimatedDeleteRatio > 0.0
+            );
+            assertEquals(manifest.deleteRatio(), metrics.estimatedDeleteRatio, 0.0);
         }
     }
 }
