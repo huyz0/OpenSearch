@@ -29,6 +29,9 @@ import org.opensearch.serverless.storage.gc.GcSchedulerTask;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.manifest.CommitManifest;
 import org.opensearch.serverless.storage.resharding.PartitionFilteringDirectoryReader;
+import org.opensearch.serverless.storage.resharding.PartitionRewritePublisher;
+import org.opensearch.serverless.storage.resharding.PartitionRewriteSchedulerConfig;
+import org.opensearch.serverless.storage.resharding.PartitionRewriteSchedulerTask;
 import org.opensearch.serverless.storage.resharding.ShardPartitionDescriptor;
 import org.opensearch.serverless.storage.shardstate.ShardHead;
 import org.opensearch.serverless.storage.shardstate.ShardStateStore;
@@ -122,6 +125,7 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
     private final ReaderShardAdmissionController admissionController;
     private final CompactionSchedulerTask compactionSchedulerTask;
     private final GcSchedulerTask gcSchedulerTask;
+    private final PartitionRewriteSchedulerTask partitionRewriteSchedulerTask;
 
     /**
      * The wall-clock time of this engine's own last real query-serving searcher acquisition
@@ -174,7 +178,8 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
         ReaderShardAdmissionController admissionController,
         CompactionSchedulerConfig compactionConfig,
         GcSchedulerConfig gcConfig,
-        ShardPartitionDescriptor partitionDescriptor
+        ShardPartitionDescriptor partitionDescriptor,
+        PartitionRewriteSchedulerConfig partitionRewriteConfig
     ) {
         super(config, seqNoStats, new TranslogStats(), true, readerWrapperFunction(partitionDescriptor), false);
         this.indexUuid = config.getShardId().getIndex().getUUID();
@@ -222,6 +227,27 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
         this.gcSchedulerTask = gcConfig == null
             ? null
             : new GcSchedulerTask(config.getThreadPool(), gcConfig.interval(), indexUuid, shardId, gcConfig);
+        // §16 Phase 5's "no automatic background scheduler for physical partition rewrite" gap,
+        // closed the same way compaction's own equivalent gap was: only meaningful for a split
+        // target (partitionDescriptor != null is what PartitionRewritePublisher#rewrite itself
+        // checks on every tick anyway, but there's no reason to schedule a task that would only
+        // ever no-op for every other shard). Same redundancy-is-safe argument as the other two
+        // schedulers above -- a rewrite is idempotent and safe to call speculatively.
+        this.partitionRewriteSchedulerTask = (partitionRewriteConfig == null || partitionDescriptor == null)
+            ? null
+            : new PartitionRewriteSchedulerTask(
+                config.getThreadPool(),
+                partitionRewriteConfig.interval(),
+                new PartitionRewritePublisher(
+                    indexUuid,
+                    shardId,
+                    partitionRewriteConfig.shardStateStore(),
+                    partitionRewriteConfig.manifestStore(),
+                    partitionRewriteConfig.materializer(),
+                    partitionRewriteConfig.commitPublisher(),
+                    partitionRewriteConfig.partitionStore()
+                )
+            );
     }
 
     /**
@@ -603,6 +629,9 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
         if (gcSchedulerTask != null) {
             gcSchedulerTask.close();
         }
+        if (partitionRewriteSchedulerTask != null) {
+            partitionRewriteSchedulerTask.close();
+        }
         if (admissionController != null) {
             admissionController.release();
         }
@@ -744,6 +773,66 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
         GcSchedulerConfig gcConfig,
         ShardPartitionDescriptor partitionDescriptor
     ) throws IOException {
+        return open(
+            config,
+            manifest,
+            materializer,
+            primaryTerm,
+            shardStateStore,
+            manifestStore,
+            shardDirectory,
+            localNodeId,
+            admissionController,
+            compactionConfig,
+            gcConfig,
+            partitionDescriptor,
+            null
+        );
+    }
+
+    /**
+     * Same as {@link #open(EngineConfig, CommitManifest, ObjectStoreCommitMaterializer, long,
+     * ShardStateStore, BlobContainerManifestStore, ShardDirectory, String, ReaderShardAdmissionController,
+     * CompactionSchedulerConfig, GcSchedulerConfig, ShardPartitionDescriptor)}, with this shard's
+     * own optional &sect;16 Phase 5 background partition-rewrite scheduler.
+     *
+     * @param config the engine configuration, whose {@link EngineConfig#getStore()} directory is materialized into
+     * @param manifest the commit manifest to open the engine against
+     * @param materializer applies the manifest's files to the engine's store directory
+     * @param primaryTerm the primary term the manifest was published under
+     * @param shardStateStore used to poll for a newer published head
+     * @param manifestStore used to read newer manifest generations found via polling
+     * @param shardDirectory the shard-directory-tier client this engine reports its entry to
+     * @param localNodeId this node's id, reported as part of the shard directory entry
+     * @param admissionController {@code null} to disable the admission cap entirely -- see its own javadoc.
+     * @param compactionConfig {@code null} to disable this reader's own background compaction
+     *        scheduler entirely -- see {@link CompactionSchedulerConfig}'s own javadoc.
+     * @param gcConfig {@code null} to disable this reader's own background GC sweep entirely --
+     *        see {@link GcSchedulerConfig}'s own javadoc.
+     * @param partitionDescriptor {@code null} unless this shard is a &sect;16 Phase 5 split
+     *        target -- see {@link PartitionFilteringDirectoryReader}'s own javadoc for what
+     *        supplying one does.
+     * @param partitionRewriteConfig {@code null} to disable this reader's own background
+     *        partition-rewrite scheduler -- see {@link PartitionRewriteSchedulerConfig}'s own
+     *        javadoc. Only meaningful together with a non-null {@code partitionDescriptor}.
+     * @return an open reader engine, with directory-tier reporting and manifest polling running
+     * @throws IOException if materializing the manifest into the store directory fails
+     */
+    public static ObjectStoreReaderEngine open(
+        EngineConfig config,
+        CommitManifest manifest,
+        ObjectStoreCommitMaterializer materializer,
+        long primaryTerm,
+        ShardStateStore shardStateStore,
+        BlobContainerManifestStore manifestStore,
+        ShardDirectory shardDirectory,
+        String localNodeId,
+        ReaderShardAdmissionController admissionController,
+        CompactionSchedulerConfig compactionConfig,
+        GcSchedulerConfig gcConfig,
+        ShardPartitionDescriptor partitionDescriptor,
+        PartitionRewriteSchedulerConfig partitionRewriteConfig
+    ) throws IOException {
         if (admissionController != null) {
             // Acquire before any I/O: rejecting an over-capacity open should never pay for a
             // materialization that's just going to be thrown away.
@@ -769,7 +858,8 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
                 admissionController,
                 compactionConfig,
                 gcConfig,
-                partitionDescriptor
+                partitionDescriptor,
+                partitionRewriteConfig
             );
         } catch (Exception e) {
             // The engine that would have owned releasing this permit in close() never got built --

@@ -287,6 +287,20 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * How often a split-target reader shard's own background {@code PartitionRewriteSchedulerTask}
+     * attempts a physical partition rewrite (rfc-serverless-opensearch.md &sect;16 Phase 5). Same
+     * reader-shard-is-the-home rationale as {@link #SERVERLESS_STORAGE_COMPACTION_INTERVAL_SETTING}.
+     * Non-positive (the default) disables the background scheduler entirely -- a split target then
+     * only ever gets physically rewritten via the on-demand {@code ShardPartitionRewriteAction}
+     * trigger, exactly this feature's original, narrower scope before this scheduler existed.
+     */
+    public static final Setting<TimeValue> SERVERLESS_STORAGE_PARTITION_REWRITE_INTERVAL_SETTING = Setting.timeSetting(
+        "serverless_storage.partition_rewrite.interval",
+        TimeValue.MINUS_ONE,
+        Setting.Property.NodeScope
+    );
+
+    /**
      * How often a reader shard's own background {@code GcSchedulerTask} sweeps for deletable
      * manifests/bundles (rfc-serverless-opensearch.md &sect;6.5). Same reader-shard-is-the-home
      * rationale as {@link #SERVERLESS_STORAGE_COMPACTION_INTERVAL_SETTING}. Non-positive (the
@@ -626,6 +640,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     private volatile WalChunkService sharedWalChunkService;
     private volatile org.opensearch.serverless.storage.wal.WalGcSchedulerTask walGcSchedulerTask;
     private volatile TimeValue compactionInterval;
+    private volatile TimeValue partitionRewriteInterval;
     private volatile TimeValue gcInterval;
     // Reused by getEngineFactory to schedule a dedicated-WAL-stream shard's own sweep at the same
     // configured cadence as the shared WAL container's node-level WalGcSchedulerTask -- non-positive
@@ -687,6 +702,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_MAX_FILE_CACHE_USAGE_RATIO_SETTING,
             SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING,
             SERVERLESS_STORAGE_COMPACTION_INTERVAL_SETTING,
+            SERVERLESS_STORAGE_PARTITION_REWRITE_INTERVAL_SETTING,
             SERVERLESS_STORAGE_GC_INTERVAL_SETTING,
             SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING,
             SERVERLESS_STORAGE_WAL_GC_INTERVAL_SETTING,
@@ -838,6 +854,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         pitrWindowMillis = SERVERLESS_STORAGE_PITR_WINDOW_SETTING.get(environment.settings()).millis();
         TimeValue configuredCompactionInterval = SERVERLESS_STORAGE_COMPACTION_INTERVAL_SETTING.get(environment.settings());
         compactionInterval = configuredCompactionInterval.millis() > 0 ? configuredCompactionInterval : null;
+        TimeValue configuredPartitionRewriteInterval = SERVERLESS_STORAGE_PARTITION_REWRITE_INTERVAL_SETTING.get(environment.settings());
+        partitionRewriteInterval = configuredPartitionRewriteInterval.millis() > 0 ? configuredPartitionRewriteInterval : null;
         TimeValue configuredGcInterval = SERVERLESS_STORAGE_GC_INTERVAL_SETTING.get(environment.settings());
         gcInterval = configuredGcInterval.millis() > 0 ? configuredGcInterval : null;
         gcRetentionWindowMillis = SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING.get(environment.settings()).millis();
@@ -1044,14 +1062,36 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                         new BlobContainerBundleStore(blobContainer),
                         pinRegistry
                     );
+                org.opensearch.serverless.storage.resharding.BlobContainerShardPartitionStore rawPartitionStore =
+                    new org.opensearch.serverless.storage.resharding.BlobContainerShardPartitionStore(blobContainer);
                 org.opensearch.serverless.storage.resharding.ShardPartitionDescriptor partitionDescriptor;
                 try {
-                    partitionDescriptor = new org.opensearch.serverless.storage.resharding.BlobContainerShardPartitionStore(blobContainer)
-                        .readDescriptor()
-                        .orElse(null);
+                    partitionDescriptor = rawPartitionStore.readDescriptor().orElse(null);
                 } catch (IOException e) {
                     throw new UncheckedIOException(e);
                 }
+                // §16 Phase 5's own background-scheduler gap: same shape as compactionConfig/gcConfig
+                // above, but deliberately built against the *unrestricted* blobContainer, not
+                // scopedContainer -- PartitionRewritePublisher#rewrite's own last step
+                // (clearDescriptor) is a real delete (rfc-serverless-opensearch.md &sect;15's
+                // credential-scoping model would deny it through the delete-denying container every
+                // other reader-shard store here uses), the same reasoning
+                // TransportShardPartitionRewriteAction's own on-demand trigger already established
+                // for this exact action.
+                org.opensearch.serverless.storage.resharding.PartitionRewriteSchedulerConfig partitionRewriteConfig =
+                    partitionRewriteInterval == null
+                        ? null
+                        : new org.opensearch.serverless.storage.resharding.PartitionRewriteSchedulerConfig(
+                            partitionRewriteInterval,
+                            new BlobContainerShardStateStore(blobContainer),
+                            new BlobContainerManifestStore(blobContainer),
+                            new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer)),
+                            new ObjectStoreCommitPublisher(
+                                new BlobContainerBundleStore(blobContainer),
+                                new BlobContainerManifestStore(blobContainer)
+                            ),
+                            rawPartitionStore
+                        );
                 return Optional.of(
                     new ReaderEngineFactory(
                         readerShardStateStore,
@@ -1063,7 +1103,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                         compactionConfig,
                         gcConfig,
                         readerShardActivityRegistry,
-                        partitionDescriptor
+                        partitionDescriptor,
+                        partitionRewriteConfig
                     )
                 );
             }

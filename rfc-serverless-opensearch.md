@@ -3498,9 +3498,34 @@ New `ShardPartitionRewriteAction`/`ShardPartitionRewriteRequest`/`ShardPartition
 `TransportShardPartitionRewriteAction`/`RestShardPartitionRewriteAction` (REST at `POST
 /_plugins/_serverless/storage/_partition_rewrite`) expose it as an on-demand trigger, the same shape
 `CompactionTriggerAction` already established for triggering an immediate attempt without waiting
-out a background schedule (this increment does not add its own background scheduler for rewrite --
-on-demand only, matching the "narrower than originally scoped" precedent §16 Phase 4.5 already set
-for compaction's own on-demand trigger before its scheduler existed).
+out a background schedule -- originally on-demand only, matching the "narrower than originally
+scoped" precedent §16 Phase 4.5 set for compaction's own on-demand trigger before its scheduler
+existed.
+
+**Background scheduler now closes that gap too, mirroring `CompactionSchedulerTask`'s own shape
+directly.** New `PartitionRewriteSchedulerTask`/`PartitionRewriteSchedulerConfig` (`resharding`
+package) run `PartitionRewritePublisher#rewrite` on a fixed schedule -- `serverless_storage.partition_rewrite.interval`
+(node setting, non-positive/default disables it, same shape as `serverless_storage.compaction.interval`)
+-- for a split-target reader shard, closing the "this increment does not add its own background
+scheduler for rewrite" gap the same way `CompactionSchedulerTask` itself closed the equivalent
+compaction gap. Wired into `ObjectStoreReaderEngine`/`ReaderEngineFactory` as one more optional
+(nullable) config, alongside `compactionConfig`/`gcConfig`/`partitionDescriptor` -- only meaningful
+together with a non-null `partitionDescriptor` (a shard that was never split has nothing to
+rewrite, so no reason to schedule a task that would only ever no-op). Deliberately built against
+the *unrestricted* `blobContainer`, not the delete-denying `scopedContainer` every other
+reader-shard store here uses: `PartitionRewritePublisher#rewrite`'s own last step (`clearDescriptor`)
+is a real delete (rfc-serverless-opensearch.md &sect;15's credential-scoping model would deny it
+through the delete-denying container), the same reasoning `TransportShardPartitionRewriteAction`'s
+own on-demand trigger already established for this exact action.
+
+Verified two ways: `PartitionRewriteSchedulerTaskTests#testSchedulerEventuallyRewritesASplitTargetWithNoOnDemandTriggerInvolved`
+proves the background scheduler, with no on-demand call involved, actually clears a real split
+target's partition descriptor on its own schedule; a second test, matching `CompactionSchedulerTaskTests`'
+own documented finding that core's `Scheduler.ReschedulingRunnable` already tolerates an escaping
+exception and keeps rescheduling regardless (confirmed empirically while writing this test, not
+just assumed from that precedent), calls `rewriteSafely()` directly to isolate this class's own
+catch behavior from that outer resilience -- verified meaningfully by temporarily removing the
+catch and confirming the direct call then throws.
 
 Landing this caught a real bug via its own integration test, not by inspection: the first version's
 materializer read only from the target's own container, but a split target's manifest can reference
