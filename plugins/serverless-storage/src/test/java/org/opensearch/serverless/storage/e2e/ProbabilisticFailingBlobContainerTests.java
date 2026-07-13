@@ -63,7 +63,13 @@ public class ProbabilisticFailingBlobContainerTests extends OpenSearchTestCase {
         try (var in = container.readBlob("blob")) {
             assertArrayEquals(bytes, in.readAllBytes());
         }
-        assertEquals(1, container.listBlobs().size());
+        // Not assertEquals(1, ...size()): createTempDir() deliberately, randomly salts the
+        // directory it returns with extra junk entries (e.g. "extra0") to catch code that wrongly
+        // assumes a pristine directory -- confirmed by a real flake this test's own first version
+        // hit (listBlobs().size() was 2, not 1, purely from that injected junk file, not from any
+        // fault the container actually introduced). listBlobs() succeeding at all (no exception)
+        // and containing exactly the one blob this test wrote is the real property under test.
+        assertTrue(container.listBlobs().containsKey("blob"));
     }
 
     public void testRejectsAnOutOfRangeProbability() throws Exception {

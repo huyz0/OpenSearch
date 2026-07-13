@@ -21,6 +21,7 @@ import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.fs.FsBlobContainer;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.serverless.storage.compaction.CompactionPolicy;
 import org.opensearch.serverless.storage.compaction.CompactionRebaseExecutor;
 import org.opensearch.serverless.storage.compaction.LuceneMergeCompactionPublisher;
@@ -45,7 +46,9 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.List;
 import java.util.Optional;
+import java.util.Random;
 import java.util.concurrent.Callable;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * rfc-serverless-opensearch.md &sect;17's "broader probabilistic multi-operation throttling/5xx-storm
@@ -63,9 +66,15 @@ import java.util.concurrent.Callable;
  * for the write/delete/register-write-only fault scope): this class covers the ingest (publish +
  * shard-head CAS) path and, separately, the compaction (merge + rebase-publish) path. GC-sweep-under-chaos
  * is covered by {@code org.opensearch.serverless.storage.gc.GcSchedulerTaskChaosTests} instead, since
- * it needs package-private access to {@code GcSchedulerTask#sweepForTesting()}. Genuinely concurrent
- * (as opposed to this test's sequential, single-threaded) multi-operation chaos remains explicitly
- * out of scope, left as real follow-up work rather than silently assumed covered.
+ * it needs package-private access to {@code GcSchedulerTask#sweepForTesting()}.
+ *
+ * <p><b>Genuinely concurrent multi-operation chaos is now also covered</b>, closing what was
+ * previously this class's own explicitly-left-open follow-up: {@link
+ * #testConcurrentShardsConvergeDespiteSustainedRandomizedMultiOperationFaults} runs several shards'
+ * ingest workloads on real, genuinely concurrent threads against one shared {@link
+ * ProbabilisticFailingBlobContainer} instance, rather than this class's other tests' sequential,
+ * single-threaded shape -- exercising real concurrent access to the shared fault injector and the
+ * underlying blob store, not just sequential retries.
  */
 public class ChaosMultiOperationRegressionTests extends OpenSearchTestCase {
 
@@ -194,6 +203,197 @@ public class ChaosMultiOperationRegressionTests extends OpenSearchTestCase {
                 assertNotNull(
                     "bundle file [" + entry.getKey() + "] in manifest generation " + manifest.generation() + " must read back cleanly",
                     bytes
+                );
+            }
+        }
+    }
+
+    /**
+     * The genuinely-concurrent half of this class's own "broader probabilistic multi-operation"
+     * chaos gap: closes the follow-up this class's own javadoc previously left explicitly open
+     * ("genuinely concurrent... multi-operation chaos remains explicitly out of scope"). Runs
+     * {@code shardCount} independent shards' ingest workloads on real, genuinely concurrent
+     * {@link Thread}s. Each shard gets its own sub-{@link BlobContainer} (via {@code
+     * blobContainer(BlobPath)}, the same per-shard isolation a real deployment always has --
+     * {@code ServerlessStoragePlugin#resolveBlobContainer} never shares one container across
+     * shards either), but every one of those sub-containers is still wrapped by the *same*
+     * {@link ProbabilisticFailingBlobContainer} instance and shares the *same* underlying {@link
+     * FsBlobStore}, so this genuinely stresses the shared fault injector's and the underlying
+     * blob store's own thread-safety under real concurrent access from multiple shards at once --
+     * not just safe when called sequentially the way every other test in this class exercises it.
+     *
+     * <p><b>A real test-design bug, not a production bug, caught by this test's own first
+     * draft</b>: an earlier version shared one flat container across all shards, relying only on
+     * {@code shardId} being embedded in blob names to keep them apart. {@link
+     * CommitManifest#manifestName} is deliberately just {@code manifest-<primaryTerm>-<generation>}
+     * with no {@code indexUuid}/{@code shardId} in it at all -- safe in every real deployment
+     * because a manifest name only ever needs to be unique *within* one shard's own dedicated
+     * container, never across shards sharing one container, which no production code path ever
+     * does ({@code resolveBlobContainer} always returns a distinct container per shard). Sharing
+     * one container across simulated shards in this test violated that assumption and caused real
+     * cross-shard manifest name collisions (shard B's generation-3 manifest silently overwriting
+     * shard A's own), reproducibly losing manifests -- fixed by giving each shard its own
+     * sub-container here, matching how every real caller of this store already isolates shards.
+     *
+     * <p>The {@link Random} instance is obtained once via {@link #randomLong()} on the main test
+     * thread <em>before</em> any worker thread starts, then shared across threads by calling only
+     * its own thread-safe {@link Random#nextDouble()} -- calling this test framework's own {@link
+     * #random()} from more than one thread is not supported (confirmed by this test's own first
+     * draft, which hit a real {@code IllegalStateException} -- "this Random was created for/by
+     * another thread" -- the moment a worker thread called it directly), but a plain {@link
+     * Random} instance obtained from a single {@code long} seed has no such thread affinity.
+     */
+    public void testConcurrentShardsConvergeDespiteSustainedRandomizedMultiOperationFaults() throws Exception {
+        int shardCount = 4;
+        int roundsPerShard = 5;
+
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        // One shared Random instance (safe to call nextDouble() on concurrently, see this method's
+        // own javadoc) backs every shard's own ProbabilisticFailingBlobContainer wrapper below --
+        // genuinely one shared fault injector under concurrent stress, not shardCount independent
+        // ones that would each roll their own dice in isolation.
+        Random sharedRandom = new Random(randomLong());
+
+        List<AtomicReference<Throwable>> failures = new java.util.ArrayList<>();
+        List<Thread> threads = new java.util.ArrayList<>();
+        List<BlobContainerManifestStore> perShardManifestStores = new java.util.ArrayList<>();
+        List<BlobContainerBundleStore> perShardBundleStores = new java.util.ArrayList<>();
+        List<ShardStateStore> perShardStateStores = new java.util.ArrayList<>();
+        for (int s = 0; s < shardCount; s++) {
+            int shardId = s;
+            // Each shard's own sub-container (from the one shared FsBlobStore, matching real
+            // physical isolation -- see this method's own javadoc for the collision this avoids),
+            // each independently wrapped in a ProbabilisticFailingBlobContainer sharing the same
+            // Random instance, so the fault injection itself is still genuinely shared/contended.
+            BlobContainer rawShardContainer = blobStore.blobContainer(BlobPath.cleanPath().add("shard-" + shardId));
+            BlobContainer shardContainer = new ProbabilisticFailingBlobContainer(rawShardContainer, sharedRandom, 0.3);
+            BlobContainerBundleStore bundleStore = new BlobContainerBundleStore(shardContainer);
+            BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(shardContainer);
+            ShardStateStore shardStateStore = new BlobContainerShardStateStore(shardContainer);
+            ObjectStoreCommitPublisher publisher = new ObjectStoreCommitPublisher(bundleStore, manifestStore);
+            perShardBundleStores.add(bundleStore);
+            perShardManifestStores.add(manifestStore);
+            perShardStateStores.add(shardStateStore);
+
+            AtomicReference<Throwable> failure = new AtomicReference<>();
+            failures.add(failure);
+            threads.add(new Thread(() -> {
+                try {
+                    runShardIngestWorkload(publisher, shardStateStore, shardId, roundsPerShard);
+                } catch (Throwable t) {
+                    failure.set(t);
+                }
+            }));
+        }
+        for (Thread t : threads) {
+            t.start();
+        }
+        for (Thread t : threads) {
+            t.join(TimeValue.timeValueMinutes(2).millis());
+        }
+        for (int s = 0; s < shardCount; s++) {
+            assertNull("shard " + s + "'s concurrent ingest workload must converge without error", failures.get(s).get());
+        }
+
+        // Convergence check, per shard: each shard's own head really points at its own real latest
+        // manifest, every one of its rounds is listable, and every bundle its manifests reference
+        // reads back checksum-clean -- proving the genuinely concurrent run left no shard's state
+        // corrupted or interleaved with another shard's, despite every shard's threads racing
+        // against the same shared fault injector and underlying blob store the whole time.
+        for (int s = 0; s < shardCount; s++) {
+            int shardId = s;
+            BlobContainerManifestStore manifestStore = perShardManifestStores.get(s);
+            BlobContainerBundleStore bundleStore = perShardBundleStores.get(s);
+            VersionedShardHead finalHead = perShardStateStores.get(s).get(INDEX_UUID, shardId).orElseThrow();
+            List<CommitManifest> shardManifests = manifestStore.listManifests();
+            assertEquals(
+                "shard " + s + " must have exactly " + roundsPerShard + " listable manifests, none lost",
+                roundsPerShard,
+                shardManifests.size()
+            );
+            CommitManifest latest = shardManifests.stream()
+                .max(java.util.Comparator.comparingLong(CommitManifest::generation))
+                .orElseThrow();
+            assertEquals(
+                "shard " + s + "'s final head must reference its own real latest manifest",
+                latest.generation(),
+                finalHead.head().latestManifestGeneration()
+            );
+            for (CommitManifest manifest : shardManifests) {
+                for (var entry : manifest.files().entrySet()) {
+                    FileReference ref = entry.getValue();
+                    byte[] bytes = bundleStore.readFile(
+                        ref.bundleName(),
+                        new BundleFileEntry(entry.getKey(), ref.offset(), ref.length(), ref.checksum())
+                    );
+                    assertNotNull(
+                        "shard "
+                            + s
+                            + " bundle file ["
+                            + entry.getKey()
+                            + "] in generation "
+                            + manifest.generation()
+                            + " must read back cleanly",
+                        bytes
+                    );
+                }
+            }
+        }
+    }
+
+    /** One shard's own sequential ingest workload -- run concurrently with other shards' own calls of this same method against the same shared publisher/shardStateStore/container. */
+    private void runShardIngestWorkload(ObjectStoreCommitPublisher publisher, ShardStateStore shardStateStore, int shardId, int rounds)
+        throws Exception {
+        assertEquals(
+            "shard " + shardId + "'s activation itself must also converge under chaos",
+            CasResult.SUCCESS,
+            retryUnderChaos(() -> shardStateStore.compareAndSet(INDEX_UUID, shardId, Optional.empty(), ShardHead.initial()))
+        );
+
+        for (int round = 1; round <= rounds; round++) {
+            long generation = round;
+            int docCount = round;
+            try (Directory writerDirectory = new ByteBuffersDirectory()) {
+                try (IndexWriter writer = new IndexWriter(writerDirectory, new IndexWriterConfig())) {
+                    for (int i = 0; i < docCount; i++) {
+                        Document doc = new Document();
+                        doc.add(new StringField("id", "shard-" + shardId + "-round-" + generation + "-doc-" + i, Field.Store.YES));
+                        writer.addDocument(doc);
+                    }
+                    writer.commit();
+                }
+                SegmentInfos segmentInfos = SegmentInfos.readLatestCommit(writerDirectory);
+
+                CommitManifest manifest = retryUnderChaos(
+                    () -> publisher.publishCommit(
+                        writerDirectory,
+                        segmentInfos,
+                        INDEX_UUID,
+                        shardId,
+                        1L,
+                        generation,
+                        docCount,
+                        docCount,
+                        new WalPosition("epoch-0", generation),
+                        0,
+                        PruningStats.empty()
+                    )
+                );
+
+                VersionedShardHead current = shardStateStore.get(INDEX_UUID, shardId).orElseThrow();
+                long expectedVersion = current.version();
+                CasResult casResult = retryUnderChaos(
+                    () -> shardStateStore.compareAndSet(
+                        INDEX_UUID,
+                        shardId,
+                        Optional.of(expectedVersion),
+                        new ShardHead(1, "node-1", Long.MAX_VALUE, manifest.generation())
+                    )
+                );
+                assertEquals(
+                    "shard " + shardId + " round " + round + "'s head CAS must eventually succeed once retried past any injected faults",
+                    CasResult.SUCCESS,
+                    casResult
                 );
             }
         }

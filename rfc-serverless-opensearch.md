@@ -883,11 +883,15 @@ be called by a cluster state applier"`). Fixed by resolving the local node id fr
 its `DiscoveryNode#getId()` once cluster state exists), available immediately at `createComponents`
 time with no cluster-state dependency at all.
 
-What remains, tracked in &sect;16 Phase 2, is no longer a design gap and no longer missing
-end-to-end proof: it's the residual, already-documented limitation on `activationWalPosition`'s
-atomicity (&sect;6.4) -- a metadata-plane term-authority migration, explicitly out of scope for this
-effort -- and broadening `ServerlessStorageWriterFailoverIT` itself (WAL-only, unflushed data;
-encryption enabled; more than one shard) rather than any further unproven piece.
+**No longer open**: `ServerlessStorageWriterFailoverIT` broadening (WAL-only unflushed data,
+encryption enabled, more than one shard) is done -- `testWriterShardSurvivesItsNodeBeingKilled`
+covers a mixed flushed/WAL-only-durable doc pair, `testWriterShardSurvivesItsNodeBeingKilledWithEncryptionEnabled`
+repeats it with every store this plugin writes encrypted, and
+`testMultipleShardsEachIndependentlySurviveTheirOwnPrimarysNodeBeingKilled` proves the recovery
+is scoped to exactly the shard whose primary died, not the whole index. What remains, tracked in
+&sect;16 Phase 2, is no longer a design gap and no longer missing end-to-end proof: it's only the
+residual, already-documented limitation on `activationWalPosition`'s atomicity (&sect;6.4) -- a
+metadata-plane term-authority migration, explicitly out of scope for this effort.
 
 ### 7.2 Reader engine
 
@@ -3890,6 +3894,28 @@ head untouched, and that naming a nonexistent index fails with a clear precondit
   disabling the test's own retry loop and confirming roughly half of single-attempt runs then fail,
   proving the retry genuinely does real work rather than the sweep already being unconditionally
   fault-tolerant on the first try.
+
+  **Genuinely concurrent multi-operation chaos is now covered too, closing this section's own last
+  remaining follow-up.** `ChaosMultiOperationRegressionTests#testConcurrentShardsConvergeDespiteSustainedRandomizedMultiOperationFaults`
+  runs several shards' ingest workloads on real, genuinely concurrent threads (as opposed to every
+  other test in this section's sequential, single-threaded shape), each shard through its own
+  sub-container but all sharing one `ProbabilisticFailingBlobContainer` instance and one underlying
+  `FsBlobStore`, genuinely stressing the shared fault injector and blob store under real concurrent
+  access. Caught two real bugs along the way, both in test infrastructure rather than production
+  code: (1) this test framework's own `random()` is thread-affined and throws `IllegalStateException`
+  ("this Random was created for/by another thread") the moment a worker thread calls it -- fixed by
+  seeding one plain `java.util.Random` from `randomLong()` on the main thread instead, whose own
+  `nextDouble()` has no such affinity; (2) `CommitManifest#manifestName()` is deliberately just
+  `manifest-<primaryTerm>-<generation>` with no `indexUuid`/`shardId` in it, safe in every real
+  deployment only because `ServerlessStoragePlugin#resolveBlobContainer` always gives each shard its
+  own dedicated container -- this test's first draft shared one flat container across all simulated
+  shards, causing real cross-shard manifest name collisions that silently lost manifests, fixed by
+  giving each shard its own sub-container the same way production always does. A third, genuinely
+  pre-existing flaky test was found and fixed while verifying this one's own stability across
+  repeated runs: `ProbabilisticFailingBlobContainerTests#testReadsAndListsAreNeverFaulted` asserted
+  an exact `listBlobs().size()`, not accounting for `createTempDir()`'s own deliberate, randomized
+  habit of salting returned directories with extra junk entries (to catch code that wrongly assumes
+  a pristine directory) -- fixed by asserting the one written blob is present, not the total count.
 - **Staleness/consistency**: linearizability-style checker for the RYW path (indexed doc with
   generation token must be visible to a routed search); monotonicity checker for readers.
   **Status: implemented and tested, now that the RYW primitive itself exists (see &sect;8).**
