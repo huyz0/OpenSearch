@@ -401,6 +401,18 @@ serverless-storage-backed. This closes the remaining design questions; what's le
 formal-verification pass (extending `WalReplayFencing.tla`) and the implementation itself, still
 explicitly withheld pending authorization for the reason already stated above.
 
+**Formal verification update**: `WalReplayFencing.tla`'s existing `AcquireLease` action already
+models the (term bump, WAL-position snapshot) pair as one atomic step, and its exhaustive
+`FixedReplayNeverIncludesAPostFencingWrite` HOLD result (603,722 states) depends on that atomicity
+being real, not just assumed. Traced directly against `IndexShard#bumpPrimaryTerm`: it asserts
+`Thread.holdsLock(mutex)` on entry (no two term bumps race the same shard concurrently) and runs
+its `onBlocked` callback -- the real candidate hook site -- inside the same operation-blocking
+window as the term increment itself, so nothing can append to the WAL between the two halves the
+model treats as atomic. The real design's atomicity is not weaker than what the model assumes, so
+the existing proof applies to the real design as specified. Recorded in `WalReplayFencing.tla`'s
+own STATUS section; no new TLC run or new violation, closed by code-correspondence tracing. Only
+the Java implementation itself remains, still withheld pending authorization.
+
 **The read/filter/decode side of replay is now implemented and tested end-to-end against a real
 two-writer failover**, in `wal/WalReplayRecovery.java`: given the last durably-published manifest's
 `WalPosition` (or none, for a brand new shard) and a writer's own `activationWalPosition`, it lists

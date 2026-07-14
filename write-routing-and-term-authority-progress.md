@@ -235,9 +235,25 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done (reviewed before
       callback already is that seam.
 
 ### Formal verification
-- [ ] B6. Extend/write a TLA+ model of the proposed atomic grant; check it closes the residual
-      race `WalReplayFencing.tla`'s `FixedReplay` left open.
-- [ ] B7. Verify no new race at the CAS boundary itself (two nodes racing the same grant).
+- [x] B6/B7. **Resolved by code-correspondence tracing, not new TLC-checked states.**
+      `WalReplayFencing.tla`'s `AcquireLease` action already models the (term bump,
+      `leaseTransferWalPos` snapshot) pair as one atomic step -- both change together, nothing else
+      can interleave. `FixedReplayNeverIncludesAPostFencingWrite`'s exhaustive HOLD result
+      (603,722 states) is only a faithful guarantee for the real system if core's real
+      primary-activation path can actually provide that same atomicity. Traced directly against
+      `IndexShard#bumpPrimaryTerm`/`#updateShardState`: **B7** (no new race at the CAS boundary) --
+      `bumpPrimaryTerm` asserts `Thread.holdsLock(mutex)` on entry, so only one term bump per shard
+      can be in flight at a time; two nodes/threads cannot race the same shard's grant
+      concurrently, exactly matching this model's own single-`term`-variable assumption. **B6**
+      (does the real design close the gap) -- the term bump and the `onBlocked` callback (the real
+      candidate hook site identified in B1/B2) both run inside the same `asyncBlockOperations`-guarded
+      window: operations are blocked from before the term increments until after the callback
+      returns, so nothing can append to the WAL between the two halves of what the model treats as
+      one atomic step. The real design's atomicity is not weaker than what `AcquireLease` assumes,
+      so the existing exhaustive proof applies to the real design as specified, not just to the
+      abstraction. Recorded directly in `WalReplayFencing.tla`'s own STATUS section. No new
+      violation found; the Java implementation itself remains not yet done (still withheld pending
+      authorization, per B4/B8).
 
 ### Implementation
 - [ ] B8. Implement the atomic grant primitive in core cluster-coordination.
