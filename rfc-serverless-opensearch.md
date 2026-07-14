@@ -618,6 +618,26 @@ invariant). Given that:
    needs a local-commit snapshot lock, but a operator-triggered legacy snapshot to a non-serverless
    repository (if ever allowed on a serverless index, which is a separate open question) would.
 
+   **That open question is now decided: never allowed, unconditionally.** `ServerlessStorageLegacySnapshotActionFilter`
+   (new, registered via `getActionFilters()`) intercepts `CreateSnapshotAction` and rejects the whole
+   request the moment any of its indices (resolved through wildcards/aliases via
+   `IndexNameExpressionResolver#concreteIndexNames`, not a literal name match a `"*"` or alias could
+   trivially route around) has `serverless_storage.enabled=true` — regardless of which repository the
+   snapshot targets. This isn't merely "not yet implemented": classic snapshot/restore is built
+   entirely on `CombinedDeletionPolicy#acquireIndexCommit` pinning a real local Lucene commit, an
+   assumption this plugin's shard model breaks outright in more than one place (reader shards
+   materialize lazily and may have no complete local `Directory` at all; both writer and reader
+   shards can be fully suspended with zero local footprint), and even where a shard happens to have a
+   pinnable local commit, honoring the request would silently duplicate this plugin's own dedicated,
+   credential-scoped PITR/clone mechanism with a second, entirely ungoverned backup path that
+   bypasses every one of §15's tiered credential-scoping guarantees. `ServerlessStorageLegacySnapshotActionFilterTests`
+   proves this against a real (test-seam-started) `ClusterService`/`IndexNameExpressionResolver`,
+   including the wildcard-resolution case specifically (a literal check alone would miss it) —
+   verified meaningfully by temporarily disabling the check and confirming both the direct-name and
+   wildcard tests fail exactly as they would have before this filter existed. Restoring a legacy
+   snapshot *into* a serverless-storage index is a related but distinct question deliberately left
+   out of this pass's scope, not yet analyzed.
+
 **Two-part mechanism, gated by what's actually pluggable today.**
 
 - **Translog retention — implemented.** `InternalEngine.getTranslogDeletionPolicy(EngineConfig)`

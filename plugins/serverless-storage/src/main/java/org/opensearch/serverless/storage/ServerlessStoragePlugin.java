@@ -123,6 +123,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     private final org.opensearch.serverless.storage.scaletozero.ShardReactivationActionFilter shardReactivationActionFilter =
         new org.opensearch.serverless.storage.scaletozero.ShardReactivationActionFilter();
 
+    /** Constructed eagerly for the same reason as {@link #shardReactivationActionFilter}. */
+    private final ServerlessStorageLegacySnapshotActionFilter legacySnapshotActionFilter =
+        new ServerlessStorageLegacySnapshotActionFilter();
+
     /**
      * Constructed eagerly for the same reason as {@link #shardReactivationActionFilter}: {@link
      * #getExistingShardsAllocators()} is called before {@link #createComponents} runs, and this is
@@ -830,6 +834,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             threadPool,
             SERVERLESS_STORAGE_SCALE_TO_ZERO_SEARCH_REACTIVATION_WAIT_SETTING.get(environment.settings())
         );
+        legacySnapshotActionFilter.setDependencies(clusterService, indexNameExpressionResolver);
         serverlessStorageExistingShardsAllocator.setDependencies(
             clusterService,
             SERVERLESS_STORAGE_READER_CACHE_AFFINITY_TTL_SETTING.get(environment.settings()).millis()
@@ -1425,11 +1430,12 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     /**
      * Registers {@link org.opensearch.serverless.storage.scaletozero.ShardReactivationActionFilter}
      * -- the cold-start-reactivation-on-access half of scale-to-zero (rfc-serverless-opensearch.md
-     * &sect;7.3), see that class's own javadoc.
+     * &sect;7.3), see that class's own javadoc -- and {@link ServerlessStorageLegacySnapshotActionFilter},
+     * which vetoes legacy snapshot requests against serverless-storage-enabled indices (&sect;7.1.1).
      */
     @Override
     public List<org.opensearch.action.support.ActionFilter> getActionFilters() {
-        return Collections.singletonList(shardReactivationActionFilter);
+        return List.of(shardReactivationActionFilter, legacySnapshotActionFilter);
     }
 
     /**
