@@ -22,19 +22,40 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done (reviewed before
       `ClusterService#state()` (already held by every node) and computes the hash locally --
       exactly the same cost profile as any other cluster-state-based request classification
       already done in this plugin (e.g. `ShardReactivationActionFilter`).
-- [ ] A3. Decide the consistency window between "rewrite finished" and "routing map updated" for
-      writes (search-only cutover doesn't have this problem; writes do). Not yet addressed: this
-      first increment's `EnableWritePartitionRoutingAction` is a single atomic cluster-state
-      update across all targets at once, so there's no *partial* assignment window within one
-      call, but the window between "physical rewrite finishes" and "operator calls this action"
-      is still manual/operator-timed, not automated. Real answer needs the auto-split controller
-      (A14-A17).
-- [ ] A4. Decide the re-split story: how the routing map versions/migrates if a target splits again.
-      Not yet addressed -- `WritePartitionRoutingMetadata.withAssignment` would simply overwrite,
-      but nothing yet enforces in-flight writes drain before a reassignment; flagged as a real gap
-      for a re-split scenario, not silently unsafe today since re-split isn't wired to anything yet.
-- [ ] A5. Decide the rollback story: how misrouted writes are reconciled if a split is aborted
-      after write-cutover. Not yet addressed.
+- [x] A3. Decide the consistency window between "rewrite finished" and "routing map updated" for
+      writes. **Resolved: deliberately operator-timed, no automation yet, and that's fine for this
+      increment.** `EnableWritePartitionRoutingAction` is a single atomic cluster-state update
+      across all targets at once, so there's no *partial* assignment window within one call. The
+      window between "physical rewrite finishes" and "operator calls this action" is real but
+      identical in shape to the window `CutoverSplitRoutingAction` already has for search-only
+      cutover -- both are explicit, sequenced, operator-triggered steps by design (rewrite -> search
+      cutover -> write cutover), not automated. Automating that sequencing is exactly what the
+      auto-split controller (A14-A17) is for; this increment correctly leaves it manual.
+- [x] A4. Decide the re-split story. **Resolved: not reachable today, so not unsafely handled --
+      genuinely out of scope until re-split itself exists.** Nothing in this plugin currently
+      re-splits an already-split target (`ShardSplitter`/`PartitionRewriteSchedulerTask` only
+      operate against a fresh source, and a split target's own `ShardPartitionDescriptor` is
+      documented as write-once). `WritePartitionRoutingMetadata.withAssignment` would silently
+      overwrite an existing assignment if called twice for the same target, with no drain-in-flight
+      step -- a real gap, but one with no current caller, so it cannot fire today. If re-split is
+      ever built, the fix is a two-step reassignment (block new writes against the old assignment,
+      wait for in-flight completion, then reassign) analogous to `ShardSuspensionCoordinator`'s
+      existing drain-before-mutate pattern elsewhere in this plugin -- deferred until re-split
+      itself is designed, not implemented speculatively against a mechanism that doesn't exist.
+- [x] A5. Decide the rollback story. **Resolved by finding and closing a real, smaller gap than
+      originally framed: there was no way to *disable* write-routing once enabled at all.** A full
+      "reconcile already-written documents back to a different target" is a genuine data-migration
+      problem (documents already correctly landed in their assigned partition per the routing
+      function in effect at write time -- there is nothing to "fix" about where they landed, only
+      about whether new writes should keep going through routing). The actual missing piece was
+      simpler and more urgent: no symmetric action existed to turn write-routing back off, so an
+      operator who enabled it had no supported way to revert to ordinary single-index writes.
+      Closed by adding `DisableWritePartitionRoutingAction` (see A6/A9 update below) -- clears the
+      write-routing assignment from every named target, after which `WritePartitionRoutingActionFilter`
+      naturally stops rewriting or fencing against them (no assignment left to match). This is the
+      right-sized rollback primitive for this increment; broader reconciliation tooling (if writes
+      need to move between partitions after the fact) remains explicitly out of scope, same
+      category as A4's re-split gap.
 
 ### Implementation
 - [x] A6. Model and expose the partition-routing function/map as first-class cluster-state metadata.

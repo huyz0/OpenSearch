@@ -15,6 +15,8 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.serverless.storage.resharding.action.CutoverSplitRoutingAction;
 import org.opensearch.serverless.storage.resharding.action.CutoverSplitRoutingRequest;
+import org.opensearch.serverless.storage.resharding.action.DisableWritePartitionRoutingAction;
+import org.opensearch.serverless.storage.resharding.action.DisableWritePartitionRoutingRequest;
 import org.opensearch.serverless.storage.resharding.action.EnableWritePartitionRoutingAction;
 import org.opensearch.serverless.storage.resharding.action.EnableWritePartitionRoutingRequest;
 import org.opensearch.test.OpenSearchIntegTestCase;
@@ -154,5 +156,48 @@ public class ServerlessStorageWritePartitionRoutingActionIT extends ServerlessSt
             }
         }
         return false;
+    }
+
+    public void testDisablingWriteRoutingRestoresOrdinaryDirectWrites() throws Exception {
+        internalCluster().startClusterManagerOnlyNode();
+        internalCluster().startDataOnlyNode();
+
+        createIndex(
+            "disable-target-a",
+            Settings.builder().put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1).put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0).build()
+        );
+        createIndex(
+            "disable-target-b",
+            Settings.builder().put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1).put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0).build()
+        );
+        ensureGreen("disable-target-a", "disable-target-b");
+
+        List<String> targets = List.of("disable-target-a", "disable-target-b");
+        client().execute(CutoverSplitRoutingAction.INSTANCE, new CutoverSplitRoutingRequest("disable-alias", targets)).get();
+        client().execute(EnableWritePartitionRoutingAction.INSTANCE, new EnableWritePartitionRoutingRequest("disable-alias", targets))
+            .get();
+
+        // While enabled, a direct write to a target is refused (already proven above) -- confirm
+        // it here too, immediately before disabling, so the "restored" half of this test is a real
+        // before/after comparison, not just an assumption.
+        expectThrows(
+            Exception.class,
+            () -> client().prepareIndex("disable-target-a").setId("before-disable").setSource("field", "value").get()
+        );
+
+        AcknowledgedResponse disableResponse = client().execute(
+            DisableWritePartitionRoutingAction.INSTANCE,
+            new DisableWritePartitionRoutingRequest(targets)
+        ).get();
+        assertTrue("disabling write-partition-routing must be acknowledged", disableResponse.isAcknowledged());
+
+        // A direct write to the same target index, by the same real name, must now succeed --
+        // this is the actual rollback this action exists to provide.
+        client().prepareIndex("disable-target-a").setId("after-disable").setSource("field", "value").get();
+        refresh("disable-target-a");
+        assertTrue(
+            "a direct write must succeed again once write-routing is disabled",
+            client().prepareGet("disable-target-a", "after-disable").get().isExists()
+        );
     }
 }

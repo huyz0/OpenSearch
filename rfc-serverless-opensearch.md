@@ -3239,6 +3239,22 @@ meaningful by disabling the fencing check and watching the test fail with "no ex
 thrown," then restoring. Full plugin quality gate and the entire `internalClusterTest` suite pass
 clean.
 
+**Status: write-routing can now be disabled again, closing the last real gap this increment left
+open.** Investigating the rollback question directly (see `write-routing-and-term-authority-progress.md`,
+Effort A5) found the actual missing piece was smaller and more urgent than a full "reconcile
+already-written documents" feature: once enabled, every document a client wrote already landed
+correctly in its assigned partition, so there was nothing to reconcile -- but no action existed to
+turn routing back *off* at all, leaving an operator who enabled it with no supported path back to
+ordinary single-index writes. `DisableWritePartitionRoutingAction` (REST-exposed as `POST
+.../_resharding/_disable_write_routing?target_indices=a,b,c`) closes exactly that: it clears the
+write-routing assignment from every named target via a new `WritePartitionRoutingMetadata#withoutAssignment`,
+after which `WritePartitionRoutingActionFilter` naturally stops both rewriting and fencing against
+those targets, since there's no assignment left to match. Tested in
+`testDisablingWriteRoutingRestoresOrdinaryDirectWrites` -- a direct write that's refused while
+enabled succeeds once disabled; confirmed meaningful by disabling `withoutAssignment` itself and
+watching the same write stay incorrectly refused, then restoring. Full plugin quality gate and the
+entire `internalClusterTest` suite pass clean.
+
 **`writesPerMinute()` now has its first consumer, but still deliberately no auto-action.**
 `ShardSplitCandidatesAction` (`resharding/action` package) fans `writesPerMinute()` out across every
 data node via `ShardActivityRegistry.snapshotWritesPerMinute()`, merges the highest reading per

@@ -74,6 +74,27 @@ public final class WritePartitionRoutingMetadata {
         return builder.build();
     }
 
+    /**
+     * Returns {@code indexMetadata} with its write-routing assignment cleared, if it had one -- the
+     * rollback primitive {@link org.opensearch.serverless.storage.resharding.action.DisableWritePartitionRoutingAction}
+     * uses. Once cleared, {@link #isWriteRoutingTarget} is {@code false} again, and {@code
+     * WritePartitionRoutingActionFilter} naturally stops rewriting or fencing against this index --
+     * it simply has no assignment left to match.
+     *
+     * @param indexMetadata the target index to unassign; a no-op (returns the same instance) if
+     *                       it carries no write-routing assignment already.
+     */
+    public static IndexMetadata withoutAssignment(IndexMetadata indexMetadata) {
+        if (isWriteRoutingTarget(indexMetadata) == false) {
+            return indexMetadata;
+        }
+        IndexMetadata.Builder builder = IndexMetadata.builder(indexMetadata);
+        builder.removeCustom(ALIAS_CUSTOM_TYPE);
+        builder.removeCustom(PARTITION_INDEX_CUSTOM_TYPE);
+        builder.removeCustom(NUM_PARTITIONS_CUSTOM_TYPE);
+        return builder.build();
+    }
+
     /** The write-routing alias {@code indexMetadata} is assigned to, or {@code null} if unassigned. */
     public static String writeRoutingAlias(IndexMetadata indexMetadata) {
         Map<String, String> custom = indexMetadata.getCustomData(ALIAS_CUSTOM_TYPE);
