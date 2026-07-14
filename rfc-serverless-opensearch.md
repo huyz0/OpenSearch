@@ -4315,6 +4315,24 @@ head untouched, and that naming a nonexistent index fails with a clear precondit
    writable engine). Decision needed: converge warm onto the reader-engine + bundle layout in
    the long term, or keep both. Recommendation: converge — two remote formats is one too many
    (§5, principle 1) — but only after Phase 3 proves the reader path.
+
+   **Phase 3's own reader path is now genuinely proven, by real evidence accumulated across this
+   whole effort, not by assumption**: `ObjectStoreCommitMaterializer` (materialize-from-manifest),
+   the lazy, real-1MB-block-cache-backed `LazyBundleDirectory` (§9), byte-budget-aware
+   `ReaderShardAdmissionController` (§7.2, both the count-cap and per-refresh-deferral halves), and
+   real cold-start p95/p99 benchmarking (§16 Phase 4) are all implemented and tested end-to-end,
+   including under simulated HIGH object-store latency and many-segment shards (see this document's
+   own status notes for each). The gate this recommendation was waiting on has been met.
+
+   **The convergence itself remains correctly out of scope for this repo, though -- not a stale
+   gate, a real boundary.** Writable warm's own `TieredDirectory`/`CompositeDirectory` machinery is
+   a separate, pre-existing core feature this plugin has never touched, built and owned outside
+   this effort. Converging it onto this plugin's reader-engine/bundle layout means modifying or
+   replacing that other feature's own implementation, not adding a new capability to this plugin --
+   a cross-team core-engineering decision and project, not something closable by scoping this
+   plugin's own code further. This document's recommendation (converge, now that the gate is met)
+   stands as the documented position for whoever owns that follow-up decision; actually doing it is
+   not this repo's call to make unilaterally.
 7. **Segment replication compatibility.** Serverless mode supersedes segrep (publication *is*
    segment replication via storage). Indices can't mix modes; enforce at index-settings
    validation. **Status: implemented and tested.** `ServerlessStorageIndexSettingProvider` now
