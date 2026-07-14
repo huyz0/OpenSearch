@@ -2985,6 +2985,25 @@ query-rate estimate, no sustained-duration tracking (a shard that spikes for one
 drops back down was treated the same as one under real sustained load). A real cost model remains
 future work; the "N consecutive over-threshold ticks before acting" half is now closed (see below).
 
+**The "real cost model" note is now closed too, deliberately not as a dollar-cost model.** This repo
+has no real cloud pricing data to calibrate one, the same reasoning that kept it out of scope when
+this gap was first identified. Instead, `ReaderReplicaExpansionCoordinator` gained an illustrative
+per-tick expansion budget (`serverless_storage.scale_up.max_expansions_per_tick`, default 10,
+non-positive means unlimited): without one, a single evaluation tick that finds many sustained
+candidates at once (a cluster-wide traffic spike touching dozens of indices) fans out an unbounded
+burst of `UpdateSettingsRequest` calls in one go -- exactly the kind of stampede this plugin already
+guards against elsewhere via its cost-accounting PUT-budget gates (&sect;17), just applied to
+cluster-state-mutation calls instead of object-store requests. When more distinct indices are
+sustained candidates than the budget allows, the busiest ones (by `queriesPerMinute`) win the budget
+first; candidates that lose out keep their sustained-duration streak intact rather than being reset,
+so they carry top priority into the very next tick instead of re-qualifying from scratch. Verified
+with real unit tests (the budget genuinely caps the number of `updateSettings` calls in one tick; the
+busiest shard wins when budget is tight; a losing candidate's streak survives to the next tick;
+non-positive restores the original unbounded behavior) -- confirmed meaningful by disabling the
+budget check and watching all three budget-specific tests fail with the exact "too many/unexpected
+invocation" mismatch a real cap violation would produce. A full `internalClusterTest` regression
+sweep stayed green throughout.
+
 **Sustained-duration hysteresis, closing the gap this section's own status note previously left
 open.** `ReaderReplicaExpansionCoordinator#expandCandidates` now tracks, per `(indexUuid, shardId)`,
 how many *consecutive* evaluations in a row have flagged that shard a candidate, and only actually

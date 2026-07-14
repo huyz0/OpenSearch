@@ -540,6 +540,21 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * The illustrative per-tick cost-model cap this section's own "a real cost model remains
+     * future work" note was closed with -- see {@code ReaderReplicaExpansionCoordinator}'s own
+     * "Illustrative per-tick expansion budget" javadoc for why this is a call-rate limit, not a
+     * dollar-cost model. Deliberately defaulted <em>on</em> at a small positive value, the same
+     * "protect against a stampede by default" reasoning {@link
+     * #SERVERLESS_STORAGE_SCALE_UP_REQUIRED_CONSECUTIVE_TICKS_SETTING} already uses. A
+     * non-positive value restores the original unbounded behavior.
+     */
+    public static final Setting<Integer> SERVERLESS_STORAGE_SCALE_UP_MAX_EXPANSIONS_PER_TICK_SETTING = Setting.intSetting(
+        "serverless_storage.scale_up.max_expansions_per_tick",
+        10,
+        Setting.Property.NodeScope
+    );
+
+    /**
      * Per-shard fairness budget for the one node-shared {@code WalChunkService}
      * (rfc-serverless-opensearch.md &sect;18 risk #4, "WAL multiplexing fairness") -- a shard whose
      * own buffered payload bytes since its last flush cross this budget is immediately siphoned
@@ -768,6 +783,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_SCALE_UP_EVAL_INTERVAL_SETTING,
             SERVERLESS_STORAGE_SCALE_UP_ENABLED_SETTING,
             SERVERLESS_STORAGE_SCALE_UP_REQUIRED_CONSECUTIVE_TICKS_SETTING,
+            SERVERLESS_STORAGE_SCALE_UP_MAX_EXPANSIONS_PER_TICK_SETTING,
             SERVERLESS_STORAGE_RESHARDING_SPLIT_CANDIDATE_WPM_THRESHOLD_SETTING,
             SERVERLESS_STORAGE_REPOSITORY_SETTING
         );
@@ -870,7 +886,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                     ? new org.opensearch.serverless.storage.scaleup.ReaderReplicaExpansionCoordinator(
                         client,
                         scaleUpMaxSearchReplicas,
-                        SERVERLESS_STORAGE_SCALE_UP_REQUIRED_CONSECUTIVE_TICKS_SETTING.get(environment.settings())
+                        SERVERLESS_STORAGE_SCALE_UP_REQUIRED_CONSECUTIVE_TICKS_SETTING.get(environment.settings()),
+                        SERVERLESS_STORAGE_SCALE_UP_MAX_EXPANSIONS_PER_TICK_SETTING.get(environment.settings())
                     )
                     : null
             );
