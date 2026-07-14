@@ -3269,6 +3269,18 @@ enabled succeeds once disabled; confirmed meaningful by disabling `withoutAssign
 watching the same write stay incorrectly refused, then restoring. Full plugin quality gate and the
 entire `internalClusterTest` suite pass clean.
 
+**Status: writes racing the exact moment write-routing is enabled are proven safe too.**
+`testConcurrentWritesRacingEnableAreNeverMisroutedOrDuplicated` runs 8 threads issuing 25 writes
+each against the alias concurrently with a single `EnableWritePartitionRoutingAction` call landing
+partway through. Writes before the enable takes effect are allowed to fail (core's own
+multi-index-alias guard rejects them, the same safe failure mode already proven elsewhere), but
+every write that *succeeds* is checked against the real cluster state afterward: routed to exactly
+the one real partition its id's hash predicts, never present in both targets, and the total
+successful-write count matches exactly what's found across both real targets combined -- no loss,
+no duplication. Re-run 3 additional times with different random seeds to rule out flakiness before
+trusting the result. Full plugin quality gate and the entire `internalClusterTest` suite pass
+clean.
+
 **`writesPerMinute()` now has its first consumer, but still deliberately no auto-action.**
 `ShardSplitCandidatesAction` (`resharding/action` package) fans `writesPerMinute()` out across every
 data node via `ShardActivityRegistry.snapshotWritesPerMinute()`, merges the highest reading per

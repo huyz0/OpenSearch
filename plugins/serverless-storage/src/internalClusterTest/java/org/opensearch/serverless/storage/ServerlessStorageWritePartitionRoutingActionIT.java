@@ -23,6 +23,12 @@ import org.opensearch.test.OpenSearchIntegTestCase;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertHitCount;
 
@@ -199,5 +205,103 @@ public class ServerlessStorageWritePartitionRoutingActionIT extends ServerlessSt
             "a direct write must succeed again once write-routing is disabled",
             client().prepareGet("disable-target-a", "after-disable").get().isExists()
         );
+    }
+
+    public void testConcurrentWritesRacingEnableAreNeverMisroutedOrDuplicated() throws Exception {
+        internalCluster().startClusterManagerOnlyNode();
+        internalCluster().startDataOnlyNode();
+
+        createIndex(
+            "race-target-a",
+            Settings.builder().put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1).put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0).build()
+        );
+        createIndex(
+            "race-target-b",
+            Settings.builder().put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1).put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0).build()
+        );
+        ensureGreen("race-target-a", "race-target-b");
+
+        List<String> targets = List.of("race-target-a", "race-target-b");
+        client().execute(CutoverSplitRoutingAction.INSTANCE, new CutoverSplitRoutingRequest("race-alias", targets)).get();
+
+        // Writer threads hammer the alias with unique ids concurrently with a single call to
+        // EnableWritePartitionRoutingAction landing partway through -- some writes before the
+        // enable takes effect are expected to fail (no write-routing assignment yet, so core's own
+        // multi-index-alias guard rejects them, the same safe failure mode proven in the main test
+        // above), but every write that *succeeds* must be correct: routed to exactly the one real
+        // partition its id's hash predicts, never duplicated across both targets, never lost.
+        int writerThreads = 8;
+        int writesPerThread = 25;
+        Set<String> succeededIds = ConcurrentHashMap.newKeySet();
+        CountDownLatch startLatch = new CountDownLatch(1);
+        ExecutorService executor = Executors.newFixedThreadPool(writerThreads + 1);
+        try {
+            List<java.util.concurrent.Future<?>> futures = new ArrayList<>();
+            for (int t = 0; t < writerThreads; t++) {
+                int threadIndex = t;
+                futures.add(executor.submit(() -> {
+                    try {
+                        startLatch.await();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                    for (int i = 0; i < writesPerThread; i++) {
+                        String id = "race-doc-" + threadIndex + "-" + i;
+                        try {
+                            client().prepareIndex("race-alias").setId(id).setSource("field", "value").get();
+                            succeededIds.add(id);
+                        } catch (Exception expectedBeforeEnableTakesEffect) {
+                            // Fine -- covered by the assertion below that only checks successes.
+                        }
+                    }
+                }));
+            }
+            futures.add(executor.submit(() -> {
+                try {
+                    startLatch.await();
+                    client().execute(
+                        EnableWritePartitionRoutingAction.INSTANCE,
+                        new EnableWritePartitionRoutingRequest("race-alias", targets)
+                    ).get();
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            }));
+            startLatch.countDown();
+            for (java.util.concurrent.Future<?> future : futures) {
+                future.get(60, TimeUnit.SECONDS);
+            }
+        } finally {
+            executor.shutdownNow();
+        }
+
+        // Every write issued after this point is guaranteed to have write-routing active, so it
+        // must succeed -- confirms the race window closed cleanly, not just "some things happened."
+        client().prepareIndex("race-alias").setId("race-doc-final").setSource("field", "value").get();
+        succeededIds.add("race-doc-final");
+
+        refresh("race-target-a", "race-target-b");
+
+        int foundInA = 0;
+        int foundInB = 0;
+        for (String id : succeededIds) {
+            int expectedPartition = Math.floorMod(Murmur3HashFunction.hash(id), 2);
+            boolean existsInA = client().prepareGet("race-target-a", id).get().isExists();
+            boolean existsInB = client().prepareGet("race-target-b", id).get().isExists();
+            assertFalse("doc [" + id + "] must never land in both targets at once", existsInA && existsInB);
+            assertTrue("doc [" + id + "] that succeeded must exist in exactly one target", existsInA || existsInB);
+            if (expectedPartition == 0) {
+                assertTrue("doc [" + id + "] must land in its predicted partition (race-target-a)", existsInA);
+            } else {
+                assertTrue("doc [" + id + "] must land in its predicted partition (race-target-b)", existsInB);
+            }
+            if (existsInA) {
+                foundInA++;
+            } else {
+                foundInB++;
+            }
+        }
+        assertEquals("no document must be duplicated or lost across targets", succeededIds.size(), foundInA + foundInB);
     }
 }

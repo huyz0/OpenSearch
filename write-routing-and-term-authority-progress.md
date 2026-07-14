@@ -108,7 +108,17 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done (reviewed before
       alias" error (proving the filter -- not some other mechanism -- is what makes this work),
       restored, reran clean. Full plugin quality gate and the entire `internalClusterTest` suite
       (every other test in the plugin) pass clean with this change in place.
-- [ ] A12. Concurrency IT: writes racing the exact cutover moment. Not yet done.
+- [x] A12. Concurrency IT: writes racing the exact cutover moment. **Done**:
+      `testConcurrentWritesRacingEnableAreNeverMisroutedOrDuplicated` -- 8 threads x 25 writes each
+      hammer the alias with unique explicit ids concurrently with a single
+      `EnableWritePartitionRoutingAction` call landing partway through. Writes issued before the
+      enable takes effect are expected (and allowed) to fail -- core's own multi-index-alias guard
+      rejects them, the same safe failure mode already proven elsewhere -- but every write that
+      *succeeds* is checked: routed to exactly the one real partition its id's hash predicts, never
+      present in both targets, and the total successful-write count matches exactly what's found
+      across both targets (no loss, no duplication). Re-ran 3 additional times with different
+      random seeds to rule out flakiness before trusting the result -- all passed. Full plugin
+      quality gate and the entire `internalClusterTest` suite pass clean.
 - [ ] A13. Chaos test: node death mid-cutover, routing map state survives intact. Not yet done --
       likely already covered in spirit by cluster-state's own general replication/failover
       guarantees (this metadata rides the same mechanism as `SuspendedShardsMetadata`, which chaos
