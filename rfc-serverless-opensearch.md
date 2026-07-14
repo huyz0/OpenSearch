@@ -3769,14 +3769,32 @@ shards over the transport layer in a running cluster, confirming every document 
 sources survives the merge with none lost or duplicated. Full plugin quality gate and the entire
 `internalClusterTest` suite pass clean.
 
-**Explicitly out of scope, real follow-up work still remaining**: deleting/deprecating a
-shrink's source shards afterward (this call only ever creates the merged target -- retiring the
-sources it merged is a separate, deliberately-not-automatic operator decision, the same "never
-auto-deletes anything it didn't itself just create" caution `ShardCloner#deleteClone` already
-applies). Chaos suite (§17) including full object-store outage modes (§13), performance tuning of
-bundle/WAL batch parameters, API gating audit, and autoscaling signal calibration remain separately
-ongoing Phase 5 work. (The rewrite's own background scheduler is no longer on this list --
-`PartitionRewriteSchedulerTask` closed it, see above.)
+**Source-shard retirement is now a real, opt-in, verified action, closing that half of the
+follow-up.** `RetireShrinkSourceAction`/`TransportRetireShrinkSourceAction`/`RestRetireShrinkSourceAction`
+(`POST /_plugins/_serverless/storage/_shrink/{source_index}/_retire?target_index_uuid=...&target_shard_id=...`)
+give operators a real, sanctioned path to retire a shrink's source index -- deliberately not a bare
+`DELETE /source-index`, which would let an operator delete a source before the shrink genuinely
+completed. The transport action verifies two things before ever deleting anything: the source is
+really a `serverless_storage.enabled=true` index (this action never touches an ordinary index), and
+the claimed shrink target genuinely has a published manifest (`ShardStateStore#get` against the
+target's own blob container) -- only once both hold does it issue the real `DeleteIndexRequest`,
+the same sanctioned core deletion path any operator's own call would use. This still leaves
+retirement entirely manual and explicit, matching `ShardCloner#deleteClone`'s own "never
+auto-deletes anything it didn't itself just create" caution -- extended here to "never deletes
+anything without first confirming its own replacement genuinely exists." Verified with a real
+end-to-end integration test (`ServerlessStorageRetireShrinkSourceActionIT`) over a real cluster:
+retiring a source with no published target is refused and the source survives; retiring a source
+once a real target manifest is published succeeds and genuinely deletes the index; retiring an
+ordinary (non-serverless-storage) index is refused outright. Confirmed meaningful by temporarily
+disabling the target-verification guard and watching the "must be refused" test fail because the
+source got deleted anyway. Full plugin quality gate and the entire `internalClusterTest` suite pass
+clean.
+
+**Remaining out of scope, real follow-up work still remaining**: chaos suite (§17) including full
+object-store outage modes (§13), performance tuning of bundle/WAL batch parameters, API gating
+audit, and autoscaling signal calibration remain separately ongoing Phase 5 work. (The rewrite's own
+background scheduler is no longer on this list -- `PartitionRewriteSchedulerTask` closed it, see
+above.)
 
 **Phase 6 — Migration tooling. The packaging mechanism both migration directions ultimately need
 is implemented and tested; one direction's per-direction orchestration -- resolving a real,
