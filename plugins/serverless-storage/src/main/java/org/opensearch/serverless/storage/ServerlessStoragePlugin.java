@@ -127,6 +127,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     private final ServerlessStorageLegacySnapshotActionFilter legacySnapshotActionFilter =
         new ServerlessStorageLegacySnapshotActionFilter();
 
+    /** Constructed eagerly for the same reason as {@link #shardReactivationActionFilter}. */
+    private final org.opensearch.serverless.storage.resharding.WritePartitionRoutingActionFilter writePartitionRoutingActionFilter =
+        new org.opensearch.serverless.storage.resharding.WritePartitionRoutingActionFilter();
+
     /**
      * Constructed eagerly for the same reason as {@link #shardReactivationActionFilter}: {@link
      * #getExistingShardsAllocators()} is called before {@link #createComponents} runs, and this is
@@ -851,6 +855,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_SCALE_TO_ZERO_SEARCH_REACTIVATION_WAIT_SETTING.get(environment.settings())
         );
         legacySnapshotActionFilter.setDependencies(clusterService, indexNameExpressionResolver);
+        writePartitionRoutingActionFilter.setDependencies(clusterService);
         serverlessStorageExistingShardsAllocator.setDependencies(
             clusterService,
             SERVERLESS_STORAGE_READER_CACHE_AFFINITY_TTL_SETTING.get(environment.settings()).millis()
@@ -1452,7 +1457,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      */
     @Override
     public List<org.opensearch.action.support.ActionFilter> getActionFilters() {
-        return List.of(shardReactivationActionFilter, legacySnapshotActionFilter);
+        return List.of(shardReactivationActionFilter, legacySnapshotActionFilter, writePartitionRoutingActionFilter);
     }
 
     /**
@@ -1682,6 +1687,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new ActionHandler<>(
                 org.opensearch.serverless.storage.resharding.action.CutoverSplitRoutingAction.INSTANCE,
                 org.opensearch.serverless.storage.resharding.action.TransportCutoverSplitRoutingAction.class
+            ),
+            new ActionHandler<>(
+                org.opensearch.serverless.storage.resharding.action.EnableWritePartitionRoutingAction.INSTANCE,
+                org.opensearch.serverless.storage.resharding.action.TransportEnableWritePartitionRoutingAction.class
             )
         );
     }
@@ -1724,7 +1733,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new org.opensearch.serverless.storage.retention.action.RestIndexSnapshotRestoreAction(),
             new org.opensearch.serverless.storage.migration.action.RestMigrateShardAction(),
             new org.opensearch.serverless.storage.resharding.action.RestRetireShrinkSourceAction(),
-            new org.opensearch.serverless.storage.resharding.action.RestCutoverSplitRoutingAction()
+            new org.opensearch.serverless.storage.resharding.action.RestCutoverSplitRoutingAction(),
+            new org.opensearch.serverless.storage.resharding.action.RestEnableWritePartitionRoutingAction()
         );
     }
 

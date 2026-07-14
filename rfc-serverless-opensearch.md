@@ -3175,6 +3175,37 @@ see &sect;16 Phase 4 above). What remains out of scope is exactly what's named a
 auto-split controller wiring `writesPerMinute()` to trigger rewrite *and* cutover together, and
 write-side partition routing. Both are separate, larger efforts than this first cutover primitive.
 
+**Status: a first, deliberately scoped write-side partition-routing primitive now exists too.**
+`EnableWritePartitionRoutingAction` (`resharding/action` package, REST-exposed as `POST
+/_plugins/_serverless/storage/_resharding/_enable_write_routing/{alias}?target_indices=a,b,c`) is a
+separate, explicit opt-in step from the search-only cutover above: it assigns each named target
+index a partition slot for an alias, recorded as ordinary `IndexMetadata` custom data via the new
+`WritePartitionRoutingMetadata` (same `Map<String, String>`-backed extension point `SuspendedShardsMetadata`
+already uses -- no new `ClusterState.Custom`/diffable type needed). The actual routing decision is
+made by a new `WritePartitionRoutingActionFilter`, which intercepts an `IndexRequest`/`DeleteRequest`/
+`UpdateRequest`/`BulkRequest` naming a write-routing-enabled alias and rewrites its target to the one
+real partition a document's id belongs to, using the exact same `RoutingPartitionFilter` Murmur3 hash
+already used read-side -- entirely locally, from cluster state already held by the coordinating node,
+with no remote lookup added to the hot indexing path. This closes the "where does the routing map
+live" and "how does a coordinator resolve it cheaply" design questions this section's own gap note
+raised: the answer turned out to be "nowhere new" -- cluster-state custom data plus the pre-existing
+partition hash function were already the right shape, reused rather than invented.
+
+**Deliberately narrower than the full gap, by design, not by oversight.** Two things remain
+out of scope for this first increment: (1) requests with no explicit id (core generates the id
+deeper in the indexing path, after this filter has already run -- correctly routing that case needs
+either generating the id here or deferring the routing decision, real additional design work); (2)
+fencing a target index's direct, alias-bypassing writes (distinguishing this filter's own
+already-rewritten request from a client writing to that same target index name directly requires
+information not available at this point in the filter chain). Neither degrades correctness for the
+cases this increment does handle -- an unhandled request either passes through unmodified (and core's
+own multi-index-alias guard rejects it, never silently misrouting a document) or is out of this
+increment's stated scope entirely. Proven end-to-end in `ServerlessStorageWritePartitionRoutingActionIT`
+against a real two-node cluster: 20 documents indexed against the alias by explicit id land in exactly
+the target partition their id's hash predicts, and never in the other; confirmed meaningful by
+disabling the filter's rewrite and watching the test fail with core's own "no write index is
+defined for alias" error, then restoring it.
+
 **`writesPerMinute()` now has its first consumer, but still deliberately no auto-action.**
 `ShardSplitCandidatesAction` (`resharding/action` package) fans `writesPerMinute()` out across every
 data node via `ShardActivityRegistry.snapshotWritesPerMinute()`, merges the highest reading per
