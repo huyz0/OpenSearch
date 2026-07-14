@@ -16,6 +16,7 @@ import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.ByteArrayInputStream;
+import java.util.Arrays;
 import java.util.List;
 
 public class ProbabilisticFailingBlobContainerTests extends OpenSearchTestCase {
@@ -84,5 +85,52 @@ public class ProbabilisticFailingBlobContainerTests extends OpenSearchTestCase {
 
         expectThrows(java.io.IOException.class, () -> container.compareAndSwapRegister("register", 0L, new BytesArray("v")));
         expectThrows(java.io.IOException.class, () -> container.deleteBlobsIgnoringIfNotExists(List.of("blob")));
+    }
+
+    public void testCorruptionProbabilityFlipsAByteButStillReportsSuccess() throws Exception {
+        BlobContainer raw = newRawContainer();
+        // failureProbability=0.0 isolates corruption's own effect: this call must never throw,
+        // unlike maybeFail's clean failure -- the whole point of this fault mode is that the
+        // store *lies* about success while persisting different bytes than it was given.
+        BlobContainer container = new ProbabilisticFailingBlobContainer(raw, random(), 0.0, 1.0);
+        byte[] original = "some real content, long enough to make a flipped byte reliably detectable".getBytes(
+            java.nio.charset.StandardCharsets.UTF_8
+        );
+        container.writeBlob("blob", new ByteArrayInputStream(original), original.length, true);
+
+        byte[] actuallyStored;
+        try (var in = raw.readBlob("blob")) {
+            actuallyStored = in.readAllBytes();
+        }
+        assertEquals("corruption must never change the byte length, only flip a byte in place", original.length, actuallyStored.length);
+        assertFalse(
+            "with corruptionProbability=1.0 the persisted bytes must differ from what was written",
+            Arrays.equals(original, actuallyStored)
+        );
+    }
+
+    public void testZeroCorruptionProbabilityNeverCorrupts() throws Exception {
+        BlobContainer raw = newRawContainer();
+        BlobContainer container = new ProbabilisticFailingBlobContainer(raw, random(), 0.0, 0.0);
+        byte[] original = "unmodified content".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        for (int i = 0; i < 50; i++) {
+            container.writeBlob("blob-" + i, new ByteArrayInputStream(original), original.length, true);
+            byte[] stored;
+            try (var in = raw.readBlob("blob-" + i)) {
+                stored = in.readAllBytes();
+            }
+            assertArrayEquals("0.0 must genuinely mean never corrupted, not rarely", original, stored);
+        }
+    }
+
+    public void testCorruptionProbabilityOutOfRangeIsRejected() throws Exception {
+        BlobContainer raw = newRawContainer();
+        expectThrows(IllegalArgumentException.class, () -> new ProbabilisticFailingBlobContainer(raw, random(), 0.0, 1.5));
+        expectThrows(IllegalArgumentException.class, () -> new ProbabilisticFailingBlobContainer(raw, random(), 0.0, -0.1));
+    }
+
+    public void testRejectsProbabilitiesThatTogetherExceedOne() throws Exception {
+        BlobContainer raw = newRawContainer();
+        expectThrows(IllegalArgumentException.class, () -> new ProbabilisticFailingBlobContainer(raw, random(), 0.6, 0.6));
     }
 }

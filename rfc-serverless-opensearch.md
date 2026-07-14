@@ -3909,8 +3909,9 @@ head untouched, and that naming a nonexistent index fails with a clear precondit
   `writeBlob`/`writeBlobAtomic`/`deleteBlobsIgnoringIfNotExists`/`compareAndSwapRegister` call it
   serves independently rolls the dice against a configured failure probability and may throw, for as
   long as the container is used -- reads/lists are deliberately never faulted, so a caller can always
-  at least observe current state to decide how to retry (throttling, as opposed to a clean call
-  failure, and partial-write corruption are both explicitly out of scope for this slice).
+  at least observe current state to decide how to retry (throttling and partial-write corruption were
+  both out of scope for this initial slice; see this section's own later status note for how each was
+  subsequently closed).
   `ChaosMultiOperationRegressionTests#testSustainedIngestConvergesDespiteRandomizedMultiOperationFaults`
   runs 15 real sequential commits (each a real Lucene commit, published, then CAS-activated as the
   shard's new head) through a 30%-failure-probability instance of it, retrying each faulted step the
@@ -3981,6 +3982,39 @@ head untouched, and that naming a nonexistent index fails with a clear precondit
   an exact `listBlobs().size()`, not accounting for `createTempDir()`'s own deliberate, randomized
   habit of salting returned directories with extra junk entries (to catch code that wrongly assumes
   a pristine directory) -- fixed by asserting the one written blob is present, not the total count.
+
+  **Throttling and silent write-time corruption -- the two fault modes this section's earlier slice
+  explicitly left out -- are now covered too, via two different mechanisms, deliberately not one.**
+  Throttling (a slow-but-eventually-successful response) is achieved by *composing*
+  `ProbabilisticFailingBlobContainer` with the existing `LatencyInjectingBlobContainer` rather than
+  building a second sleep-before-delegating implementation into the fault injector itself --
+  `ChaosMultiOperationRegressionTests#testSustainedIngestConvergesDespiteSustainedRandomizedFaultsAndSimulatedLatency`
+  layers both decorators on the same container and proves a real ingest workload still converges
+  when every call is both fault-prone and simulated-latency-afflicted at once, not either property
+  in isolation. Silent corruption -- a write call that reports success while persisting a flipped
+  byte, the "the store lied" failure mode a thrown exception can never model -- is new logic:
+  `ProbabilisticFailingBlobContainer` gained a `corruptionProbability` parameter (independent of
+  `failureProbability`) that buffers and flips one random byte of a surviving `writeBlob`/`writeBlobAtomic`
+  call's payload before it's ever persisted.
+  `ChaosMultiOperationRegressionTests#testMaterializationDetectsRatherThanSilentlyAcceptsWriteTimeCorruption`
+  runs 15 rounds of growing multi-file commits through a 40%-corruption instance and materializes
+  every one with the exact same `ObjectStoreCommitMaterializer#materialize` path a fresh node's
+  ordinary shard startup uses, asserting the property this plugin has maintained everywhere else in
+  this format (see `BlobContainerBundleStore#writeBundle`'s own collision guard above): a corrupted
+  bundle either materializes byte-correctly (the flip landed somewhere this read path doesn't
+  re-verify -- see below) or fails loudly with a checksum-mismatch `IOException`, never silently
+  returning different bytes than what was published. **A genuine, if narrow, characteristic of this
+  read path was surfaced while designing this test, not a bug it fixes**: `readFile` only
+  checksum-verifies a file's own content range, and `BlobContainerBundleStore#readHeader` -- the
+  only thing that would re-verify the bundle *header's* own trailer checksum -- is never called from
+  production's ordinary materialization path at all (only from `writeBundle`'s own collision-retry
+  check and from tests/benchmarks). This is harmless in practice: every file's real offset/length/
+  checksum already comes from the manifest, never re-derived from the header, so a corrupted header
+  byte can't misdirect a read or corrupt a materialized file -- but it does mean a corruption event
+  landing purely in header bytes goes undetected on this path, which is why the test asserts at
+  least one detection across many rounds/files rather than requiring every single injected corruption
+  to be caught, the same statistical tolerance `BundleWriterReaderTests`'s own randomized single-byte
+  test already accepts.
 - **Staleness/consistency**: linearizability-style checker for the RYW path (indexed doc with
   generation token must be visible to a routed search); monotonicity checker for readers.
   **Status: implemented and tested, now that the RYW primitive itself exists (see &sect;8).**

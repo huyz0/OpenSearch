@@ -22,6 +22,8 @@ import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.fs.FsBlobContainer;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.serverless.storage.benchmark.LatencyInjectingBlobContainer;
+import org.opensearch.serverless.storage.benchmark.LatencyProfile;
 import org.opensearch.serverless.storage.compaction.CompactionPolicy;
 import org.opensearch.serverless.storage.compaction.CompactionRebaseExecutor;
 import org.opensearch.serverless.storage.compaction.LuceneMergeCompactionPublisher;
@@ -45,6 +47,7 @@ import org.opensearch.test.OpenSearchTestCase;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.List;
+import java.util.Locale;
 import java.util.Optional;
 import java.util.Random;
 import java.util.concurrent.Callable;
@@ -206,6 +209,202 @@ public class ChaosMultiOperationRegressionTests extends OpenSearchTestCase {
                 );
             }
         }
+    }
+
+    /**
+     * The "throttling" half of &sect;17's chaos gap, closed via composition rather than duplicating
+     * {@code LatencyInjectingBlobContainer}'s own sleep-before-delegating logic inside {@link
+     * ProbabilisticFailingBlobContainer} itself (see that class's own javadoc for why): every call
+     * in this run is both independently fault-prone <em>and</em> simulated-latency-afflicted at
+     * once -- a real flaky, slow object store, not either property tested in isolation the way
+     * this class's other ingest test and {@code ServerlessStorageReactivationUnderLatencyIT}'s own
+     * latency-only tests each do separately.
+     */
+    public void testSustainedIngestConvergesDespiteSustainedRandomizedFaultsAndSimulatedLatency() throws Exception {
+        int rounds = 8;
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer rawContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        BlobContainer faultyContainer = new ProbabilisticFailingBlobContainer(rawContainer, random(), 0.2);
+        // Composed, not duplicated: the exact same LatencyInjectingBlobContainer this plugin's
+        // other latency benchmarks/ITs already use, just layered on top of the fault injector here
+        // instead of a clean delegate. LOW (not HIGH) on purpose -- keeping this test's real
+        // wall-clock reasonable given retryUnderChaos may re-issue several of these already-slowed
+        // calls per round.
+        BlobContainer faultyAndSlowContainer = new LatencyInjectingBlobContainer(faultyContainer, LatencyProfile.LOW);
+
+        BlobContainerBundleStore bundleStore = new BlobContainerBundleStore(faultyAndSlowContainer);
+        BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(faultyAndSlowContainer);
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(faultyAndSlowContainer);
+        ObjectStoreCommitPublisher publisher = new ObjectStoreCommitPublisher(bundleStore, manifestStore);
+
+        assertEquals(
+            "activation itself must also converge under combined faults and latency",
+            CasResult.SUCCESS,
+            retryUnderChaos(() -> shardStateStore.compareAndSet(INDEX_UUID, SHARD_ID, Optional.empty(), ShardHead.initial()))
+        );
+
+        CommitManifest lastPublishedManifest = null;
+        for (int round = 1; round <= rounds; round++) {
+            long generation = round;
+            int docCount = round;
+            try (Directory writerDirectory = new ByteBuffersDirectory()) {
+                try (IndexWriter writer = new IndexWriter(writerDirectory, new IndexWriterConfig())) {
+                    for (int i = 0; i < docCount; i++) {
+                        Document doc = new Document();
+                        doc.add(new StringField("id", "round-" + generation + "-doc-" + i, Field.Store.YES));
+                        writer.addDocument(doc);
+                    }
+                    writer.commit();
+                }
+                SegmentInfos segmentInfos = SegmentInfos.readLatestCommit(writerDirectory);
+
+                CommitManifest manifest = retryUnderChaos(
+                    () -> publisher.publishCommit(
+                        writerDirectory,
+                        segmentInfos,
+                        INDEX_UUID,
+                        SHARD_ID,
+                        1L,
+                        generation,
+                        docCount,
+                        docCount,
+                        new WalPosition("epoch-0", generation),
+                        0,
+                        PruningStats.empty()
+                    )
+                );
+
+                VersionedShardHead current = shardStateStore.get(INDEX_UUID, SHARD_ID).orElseThrow();
+                long expectedVersion = current.version();
+                CasResult casResult = retryUnderChaos(
+                    () -> shardStateStore.compareAndSet(
+                        INDEX_UUID,
+                        SHARD_ID,
+                        Optional.of(expectedVersion),
+                        new ShardHead(1, "node-1", Long.MAX_VALUE, manifest.generation())
+                    )
+                );
+                assertEquals(
+                    "round " + round + "'s head CAS must eventually succeed once retried past faults and latency alike",
+                    CasResult.SUCCESS,
+                    casResult
+                );
+                lastPublishedManifest = manifest;
+            }
+        }
+
+        VersionedShardHead finalHead = shardStateStore.get(INDEX_UUID, SHARD_ID).orElseThrow();
+        assertEquals(
+            "the final shard head must reference the very last round's manifest generation",
+            lastPublishedManifest.generation(),
+            finalHead.head().latestManifestGeneration()
+        );
+        List<CommitManifest> allManifests = manifestStore.listManifests();
+        assertEquals("every one of the " + rounds + " rounds' commits must still be listable, none lost", rounds, allManifests.size());
+        for (CommitManifest manifest : allManifests) {
+            for (var entry : manifest.files().entrySet()) {
+                FileReference ref = entry.getValue();
+                byte[] bytes = bundleStore.readFile(
+                    ref.bundleName(),
+                    new BundleFileEntry(entry.getKey(), ref.offset(), ref.length(), ref.checksum())
+                );
+                assertNotNull(
+                    "bundle file [" + entry.getKey() + "] in manifest generation " + manifest.generation() + " must read back cleanly",
+                    bytes
+                );
+            }
+        }
+    }
+
+    /**
+     * The "silent object-store corruption" half of this class's own broader chaos-injection gap:
+     * {@link ProbabilisticFailingBlobContainer}'s corruption mode lets a write-shaped call succeed
+     * while silently persisting a flipped byte, exactly the failure mode a clean thrown exception
+     * (the only fault shape this class's other tests inject) can never model. Runs the exact same
+     * real materialization path a fresh node's ordinary shard startup uses ({@link
+     * ObjectStoreCommitMaterializer#materialize}) against every published manifest and asserts the
+     * property this plugin has always maintained elsewhere (see {@code
+     * BlobContainerBundleStore#writeBundle}'s own "never silently corrupt" collision guard): a
+     * corrupted bundle either materializes byte-correctly (the flipped byte happened to land in a
+     * region nothing on this read path re-verifies, e.g. the bundle header -- this format's
+     * manifest-carried offsets make production reads independent of it, see {@code
+     * BlobContainerBundleStore#readHeader}'s own javadoc) or it fails loudly with a
+     * checksum-shaped {@link IOException} -- it must never silently hand back different bytes
+     * than what was actually published.
+     *
+     * <p>Deliberately not asserting corruption is detected on every single round: with the flip
+     * landing anywhere in the whole packed bundle (header included), a single trial isn't
+     * guaranteed to hit file content specifically. Asserting at least one detection across many
+     * rounds of growing, multi-file commits is the same statistical tolerance {@code
+     * BundleWriterReaderTests#testRandomizedSingleByteCorruptionAlwaysFailsClosedAcrossManyTrials}
+     * already accepts, just exercised through the real container + materializer path instead of
+     * directly against {@code BundleWriter}/{@code BundleReader}.
+     */
+    public void testMaterializationDetectsRatherThanSilentlyAcceptsWriteTimeCorruption() throws Exception {
+        int rounds = 15;
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer rawContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        // failureProbability=0.0 isolates corruption's own effect from the clean-failure
+        // convergence property this class's other tests already cover.
+        BlobContainer faultyContainer = new ProbabilisticFailingBlobContainer(rawContainer, random(), 0.0, 0.4);
+
+        BlobContainerBundleStore bundleStore = new BlobContainerBundleStore(faultyContainer);
+        BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(faultyContainer);
+        ObjectStoreCommitPublisher publisher = new ObjectStoreCommitPublisher(bundleStore, manifestStore);
+        ObjectStoreCommitMaterializer materializer = new ObjectStoreCommitMaterializer(bundleStore);
+
+        boolean anyCorruptionDetected = false;
+        for (int round = 1; round <= rounds; round++) {
+            long generation = round;
+            int docCount = round;
+            try (Directory writerDirectory = new ByteBuffersDirectory()) {
+                try (IndexWriter writer = new IndexWriter(writerDirectory, new IndexWriterConfig())) {
+                    for (int i = 0; i < docCount; i++) {
+                        Document doc = new Document();
+                        doc.add(new StringField("id", "round-" + generation + "-doc-" + i, Field.Store.YES));
+                        writer.addDocument(doc);
+                    }
+                    writer.commit();
+                }
+                SegmentInfos segmentInfos = SegmentInfos.readLatestCommit(writerDirectory);
+                CommitManifest manifest = publisher.publishCommit(
+                    writerDirectory,
+                    segmentInfos,
+                    INDEX_UUID,
+                    SHARD_ID,
+                    1L,
+                    generation,
+                    docCount,
+                    docCount,
+                    new WalPosition("epoch-0", generation),
+                    0,
+                    PruningStats.empty()
+                );
+
+                try (Directory targetDirectory = new ByteBuffersDirectory()) {
+                    materializer.materialize(manifest, targetDirectory);
+                    // Materialized cleanly: either nothing was corrupted this round, or the
+                    // flipped byte landed somewhere this read path doesn't re-verify (see javadoc).
+                } catch (IOException corruptionDetected) {
+                    anyCorruptionDetected = true;
+                    assertTrue(
+                        "a detected corruption must fail with a checksum-shaped message, not some unrelated I/O error: "
+                            + corruptionDetected,
+                        corruptionDetected.getMessage() != null
+                            && corruptionDetected.getMessage().toLowerCase(Locale.ROOT).contains("checksum")
+                    );
+                }
+            }
+        }
+
+        assertTrue(
+            "with corruptionProbability=0.4 across "
+                + rounds
+                + " rounds of growing multi-file commits, at least one real file-content corruption "
+                + "must have been injected and detected -- otherwise this test isn't exercising the "
+                + "property it claims to",
+            anyCorruptionDetected
+        );
     }
 
     /**
