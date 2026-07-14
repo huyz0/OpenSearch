@@ -13,6 +13,7 @@ import org.opensearch.serverless.storage.format.BlobContainerBundleStore;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.manifest.CommitManifest;
 import org.opensearch.serverless.storage.retention.DurablePinRegistry;
+import org.opensearch.serverless.storage.scheduling.JitteredScheduling;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 
@@ -67,7 +68,10 @@ public final class GcSchedulerTask implements Closeable {
      * Schedules a recurring GC sweep for one shard.
      *
      * @param threadPool the node's thread pool, used to schedule the recurring sweep.
-     * @param interval how often to run the sweep.
+     * @param interval how often to run the sweep -- jittered once per instance (see {@link
+     *                 JitteredScheduling}) before being handed to the scheduler, so many shards'
+     *                 sweeps starting around the same moment (e.g. after a coordinated outage
+     *                 recovery, rfc-serverless-opensearch.md &sect;13) don't tick in lockstep forever.
      * @param indexUuid the UUID of the index the shard belongs to.
      * @param shardId the shard's numeric id within the index.
      * @param config the shard's manifest/bundle stores, pin registry, and retention window.
@@ -79,7 +83,7 @@ public final class GcSchedulerTask implements Closeable {
         this.bundleStore = config.bundleStore();
         this.pinRegistry = config.pinRegistry();
         this.retentionWindowMillis = config.retentionWindowMillis();
-        this.task = threadPool.scheduleWithFixedDelay(this::sweepSafely, interval, ThreadPool.Names.GENERIC);
+        this.task = threadPool.scheduleWithFixedDelay(this::sweepSafely, JitteredScheduling.jitter(interval), ThreadPool.Names.GENERIC);
     }
 
     private void sweepSafely() {

@@ -14,6 +14,7 @@ import org.opensearch.common.unit.TimeValue;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.manifest.CommitManifest;
 import org.opensearch.serverless.storage.readerengine.ObjectStoreCommitMaterializer;
+import org.opensearch.serverless.storage.scheduling.JitteredScheduling;
 import org.opensearch.serverless.storage.shardstate.ShardHead;
 import org.opensearch.serverless.storage.shardstate.ShardStateStore;
 import org.opensearch.serverless.storage.shardstate.VersionedShardHead;
@@ -109,7 +110,14 @@ public final class CompactionSchedulerTask implements Closeable {
         this.commitPublisher = commitPublisher;
         this.policy = policy;
         this.rebaseExecutor = rebaseExecutor;
-        this.task = threadPool.scheduleWithFixedDelay(this::maybeCompactSafely, interval, ThreadPool.Names.GENERIC);
+        // Jittered once per instance (rfc-serverless-opensearch.md §13's own "recovery stampede"
+        // requirement) -- see JitteredScheduling's own javadoc for why a one-time offset is what
+        // actually prevents lockstep ticking after a coordinated outage recovery.
+        this.task = threadPool.scheduleWithFixedDelay(
+            this::maybeCompactSafely,
+            JitteredScheduling.jitter(interval),
+            ThreadPool.Names.GENERIC
+        );
     }
 
     /** Package-private, not private, purely so this task's own catch behavior is directly testable without reflection. */

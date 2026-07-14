@@ -1932,6 +1932,40 @@ include a full object-store outage with assertions on all three behaviors, plus 
 stampede after restoration (WAL backlogs, deferred publications, and queued activations must
 drain with jittered backoff, not synchronized thundering herd).
 
+**Status: both halves are now implemented and tested.** `OutageInjectingBlobContainer` (new,
+`e2e` package test-only fixture) is a genuinely binary on/off switch -- every call fails while an
+outage flag is set, every call succeeds once cleared -- unlike `ProbabilisticFailingBlobContainer`'s
+own per-call dice roll, since a full outage is a real binary state, not a flaky one.
+`ObjectStoreOutageRecoveryChaosTests` (`gc` package, needs package-private access to `GcSchedulerTask#sweepForTesting()`,
+same reason `GcSchedulerTaskChaosTests` already lives there) asserts all three degraded-mode
+behaviors directly: a `LazyBundleDirectory` read of an already-cached file survives a full outage
+unaffected, while a read of a never-before-touched file fails fast rather than hanging or silently
+misbehaving (reads degrade to staleness, never unavailability, for anything already cached); a
+writer's `publishCommit` during an outage throws and leaves no manifest behind at all, not a
+partial one (writes degrade to rejection, never silent un-durability); a `GcSchedulerTask` sweep
+during an outage halts with nothing deleted, neither the manifest nor its bundle, confirmed by
+reading real store state through a second, never-outage-wrapped view of the same underlying store
+(GC halts rather than acting on partial information). All three recover cleanly and converge
+correctly once the outage flag clears.
+
+The "jittered backoff, not synchronized thundering herd" half is `JitteredScheduling` (new,
+`scheduling` package): `GcSchedulerTask`, `WalGcSchedulerTask`, and `CompactionSchedulerTask` --
+exactly the "GC / compaction / reconcilers" row this section's own table names -- now jitter their
+configured interval once, per task instance, before handing it to `ThreadPool#scheduleWithFixedDelay`
+(which only ever takes one fixed delay for a task's whole lifetime, not a per-tick recomputed one).
+A one-time per-instance offset, not a per-tick one, is the real fix for the actual failure mode:
+after a coordinated cluster-wide outage (or node restart), many shards' scheduler tasks tend to
+start at the same wall-clock moment, and a shared start time plus an identical fixed delay is a
+permanently shared cadence forever afterward -- a one-time randomized offset per instance
+permanently de-synchronizes them from each other instead. Deliberately conservative: jitter only
+ever extends the configured interval (drawn uniformly from `[interval, interval * 1.2]` by
+default), never shortens it, so no shard's own configured reconciliation cadence is undercut.
+Verified with real unit tests (`JitteredSchedulingTests`: never shorter than configured, never
+exceeds the configured fraction, genuinely produces different values across trials, zero fraction
+and non-positive/disabled intervals both pass through unchanged) -- confirmed meaningful by
+temporarily making the jitter function a no-op and watching the "produces different values" test
+fail. A full plugin quality gate and the entire `internalClusterTest` suite pass clean throughout.
+
 ## 14. Snapshots, Clones, and Point-in-Time Recovery
 
 The manifest mechanism makes several traditionally expensive operations nearly free, and this

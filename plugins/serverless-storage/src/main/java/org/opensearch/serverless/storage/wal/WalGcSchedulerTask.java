@@ -13,6 +13,7 @@ import org.opensearch.common.unit.TimeValue;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.manifest.CommitManifest;
 import org.opensearch.serverless.storage.manifest.WalPosition;
+import org.opensearch.serverless.storage.scheduling.JitteredScheduling;
 import org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore;
 import org.opensearch.serverless.storage.shardstate.ShardHead;
 import org.opensearch.serverless.storage.shardstate.ShardStateStore;
@@ -76,7 +77,10 @@ public final class WalGcSchedulerTask implements Closeable {
         this.walBlobContainer = walBlobContainer;
         this.registry = registry;
         this.shardContainerResolver = shardContainerResolver;
-        this.task = threadPool.scheduleWithFixedDelay(this::sweepSafely, interval, ThreadPool.Names.GENERIC);
+        // Jittered once per instance (rfc-serverless-opensearch.md §13's own "recovery stampede"
+        // requirement) -- see JitteredScheduling's own javadoc for why a one-time offset is what
+        // actually prevents lockstep ticking after a coordinated outage recovery.
+        this.task = threadPool.scheduleWithFixedDelay(this::sweepSafely, JitteredScheduling.jitter(interval), ThreadPool.Names.GENERIC);
     }
 
     private void sweepSafely() {
