@@ -3140,6 +3140,23 @@ gap (see &sect;16 Phase 4's own split-target routing note). Wiring a threshold-t
 signal is already being tracked -- the same incremental shape `millisSinceLastActivity()` was built
 in -- ready for whenever a future controller can actually act on it.
 
+**Status: a first, deliberately scoped routing-cutover primitive now exists.**
+`CutoverSplitRoutingAction` (`resharding/action` package, REST-exposed as
+`POST /_plugins/_serverless/storage/_resharding/_cutover/{alias}?target_indices=a,b,c`) lets an
+operator point a single alias at every split target once `PartitionRewritePublisher` has finished
+rewriting them, using core's own native multi-index alias mechanism -- one alias spanning several
+indices already correctly fans searches out and unions results, which is exactly right since split
+targets hold disjoint doc partitions. This is search-only, not write-routing: nothing here gives a
+document a specific target-partition destination on write, since that needs per-document custom
+routing information this plugin doesn't yet expose, and remains explicitly out of scope. It is also
+purely additive -- the action verifies every named target index actually exists before touching
+anything, and never deletes or renames the original source index; fully reclaiming the source's own
+name (which requires deleting it, since core forbids alias/index name collision) is a separate,
+already-existing, explicit opt-in action (`RetireShrinkSourceAction`'s "verify then delete" pattern,
+see &sect;16 Phase 4 above). What remains out of scope is exactly what's named above: a real
+auto-split controller wiring `writesPerMinute()` to trigger rewrite *and* cutover together, and
+write-side partition routing. Both are separate, larger efforts than this first cutover primitive.
+
 **`writesPerMinute()` now has its first consumer, but still deliberately no auto-action.**
 `ShardSplitCandidatesAction` (`resharding/action` package) fans `writesPerMinute()` out across every
 data node via `ShardActivityRegistry.snapshotWritesPerMinute()`, merges the highest reading per
