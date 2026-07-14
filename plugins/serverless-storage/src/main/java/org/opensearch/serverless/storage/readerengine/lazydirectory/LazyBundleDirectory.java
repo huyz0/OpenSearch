@@ -24,6 +24,7 @@ import java.util.Collection;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executor;
 
 /**
  * A read-only Lucene {@link Directory} whose "files" are {@code (bundle, offset, length)} ranges
@@ -79,6 +80,41 @@ public final class LazyBundleDirectory extends Directory {
      */
     public void advanceToManifest(CommitManifest manifest) {
         filesByName.putAll(manifest.files());
+    }
+
+    /**
+     * Illustrative "boot-set" prefetch (rfc-serverless-opensearch.md &sect;18 risk #2, "cold-query
+     * latency... mitigation: boot-set prefetch"): warms this directory's local block cache by
+     * fetching just the first block of every currently-known file, concurrently, on {@code
+     * executor} -- <em>not</em> on the calling thread, so this method itself returns immediately
+     * and never reintroduces the upfront-I/O cost this whole directory exists to avoid (see this
+     * class's own javadoc). The actual win is reordering, not reducing, request count: Lucene's own
+     * {@code DirectoryReader}/{@code SegmentInfos} open sequence would fetch these same first
+     * blocks anyway, one at a time, serially, as it opens each file in turn -- this fires them all
+     * at once instead, so by the time Lucene actually asks, the fetch is already in flight or done
+     * rather than starting cold.
+     *
+     * <p>Deliberately best-effort: a failed or slow prefetch of one file must never block or fail
+     * this method, nor the real read that follows -- that real read (via the ordinary {@link
+     * #openInput} path) still correctly (re)fetches on its own if the prefetch never completed or
+     * hit a transient fault, exactly the same fault-tolerance the on-demand path always had.
+     *
+     * @param executor runs each file's own prefetch task; must not run tasks synchronously on the
+     *                  calling thread (see above).
+     */
+    public void prefetchBootSet(Executor executor) {
+        for (String name : filesByName.keySet()) {
+            executor.execute(() -> {
+                try (IndexInput input = openInput(name, IOContext.READONCE)) {
+                    if (input.length() > 0) {
+                        input.readByte();
+                    }
+                } catch (IOException | RuntimeException prefetchFailure) {
+                    // Best-effort only -- the real read still happens (and still correctly
+                    // fetches) through the ordinary openInput path regardless of this outcome.
+                }
+            });
+        }
     }
 
     private FileReference resolve(String name) throws IOException {

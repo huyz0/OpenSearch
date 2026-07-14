@@ -124,7 +124,13 @@ public final class ServerlessStorageLazyDirectoryFactory implements IndexStorePl
             fileCache,
             plugin.threadPoolForDirectoryFactory()
         );
-        return new LazyBundleDirectory(manifest, cacheDirectory, transferManager);
+        LazyBundleDirectory directory = new LazyBundleDirectory(manifest, cacheDirectory, transferManager);
+        // Illustrative boot-set prefetch (rfc-serverless-opensearch.md &sect;18 risk #2) -- fired
+        // on the shared GENERIC pool, never on this call's own thread, so directory construction
+        // itself still returns with no upfront I/O of its own, matching this whole lazy-directory
+        // design's own "no upfront I/O at all" property (see LazyBundleDirectory's own javadoc).
+        directory.prefetchBootSet(plugin.threadPoolForDirectoryFactory().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC));
+        return directory;
     }
 
     /**
