@@ -145,24 +145,38 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done (reviewed before
       synchronously as part of the same state transition that bumps the term, letting a
       serverless-storage shard snapshot its WAL position atomically with the term bump rather than
       afterward in the engine constructor as today. No such seam exists in `IndexShard` today.
-- [ ] B2. Decide where the combined (term, WAL position) record lives in cluster state. Still
-      open pending B4's seam-design answer: if the fix is a synchronous hook fired from
-      `bumpPrimaryTerm` rather than a cluster-state CAS per se, the WAL position may not need to
-      live in cluster state at all -- it could be captured into the same in-memory path that
-      today constructs the engine, just earlier (at the hook callback, not the constructor). This
-      would be a much smaller change than originally framed (B1's initial framing assumed a
-      cluster-state-level CAS was required) -- worth exploring before committing to the
-      heavier design.
-- [ ] B3. Determine the failure-mode story if the hook fires but engine construction later fails
-      (a real risk already known from &sect;12's dedicated-WAL-stream leak-risk precedent in this
-      same codebase -- see rfc-serverless-opensearch.md &sect;12's "self-review pass caught a real
-      leak risk" note). Not yet resolved.
-- [ ] B5. Decide backward compatibility for classic (non-serverless) shards. Likely low-risk given
-      B1's finding: a synchronous hook fired from `bumpPrimaryTerm` with a default no-op
-      implementation (the same "hook exists, does nothing unless a plugin implements it" shape
-      `Engine#engineRecoveryOperations()` already uses in this codebase, per &sect;7.1's "Engine-only
-      approach... rejected" design note nearby) would cost classic shards nothing. Not yet
-      confirmed against `IndexShard`'s actual call sites.
+- [x] B2. Decide where the combined (term, WAL position) record lives. **Resolved: nowhere new --
+      no cluster-state record needed at all.** Read `IndexShard#bumpPrimaryTerm`'s real call site
+      (`updateShardState`, the primary-promotion path, `IndexShard.java` around line 880): the term
+      bump already takes an `onBlocked` callback that runs *after* operations are blocked but
+      *before* they're unblocked -- and that exact callback is already where core resets/promotes
+      the shard's engine on promotion today ("Resetting engine on promotion of shard... to
+      primary"). This is a real, already-existing seam, atomic with respect to the term bump by
+      construction (no operation can observe the new term until this callback finishes). A
+      serverless-storage hook piggybacking on this same callback could snapshot
+      `activationWalPosition` in-memory, at exactly the right atomic instant, with zero new
+      cluster-state schema.
+- [x] B3. Determine the failure-mode story. **Resolved, reusing existing machinery, no new failure
+      surface needed.** `bumpPrimaryTerm`'s existing `onFailure`/`innerFail`/`failShard` path
+      already exists for exactly this callback's own failures -- a hook's WAL-position-snapshot
+      call throwing would flow through the same already-tested shard-failure path, not a new one.
+      The one real residual risk, by direct analogy to &sect;12's own "self-review pass caught a
+      real leak risk" lesson (deferred `DedicatedWalGcConfig` construction to avoid a resource leak
+      if construction fails after partial setup): if the hook's snapshot succeeds but engine
+      construction fails for an unrelated reason afterward, the snapshotted position must not be
+      treated as durably valid until the engine it belongs to actually exists -- the same
+      "construct late, at the exact moment the resource is needed" discipline already applied
+      there should apply here too.
+- [x] B5. Decide backward compatibility. **Resolved: confirmed genuinely free for classic shards.**
+      The `onBlocked` callback `bumpPrimaryTerm` already takes is a plain `CheckedRunnable`
+      supplied by the caller (`IndexShard` itself, not the engine/plugin layer) -- it already runs
+      unconditionally for every shard, classic or serverless, doing whatever that specific
+      promotion path needs (segment-replication engine reset, translog resync, etc.). Adding one
+      more optional step to that existing callback -- gated behind "is this a
+      serverless-storage-backed shard," the same kind of check `EnginePlugin#getEngineFactory`
+      already makes today -- costs a classic shard nothing extra: the check itself is cheap and the
+      new step is skipped entirely. No default-no-op interface needs inventing; the existing
+      callback already is that seam.
 
 ### Formal verification
 - [ ] B6. Extend/write a TLA+ model of the proposed atomic grant; check it closes the residual

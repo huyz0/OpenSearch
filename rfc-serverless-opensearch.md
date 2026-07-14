@@ -387,6 +387,20 @@ implemented -- `bumpPrimaryTerm` is private, deep, every-shard-in-the-cluster ma
 hook fired mid-transition there needs its own careful failure-mode analysis before any real patch,
 consistent with why this remains explicitly out of scope for now.
 
+**Design investigation update #2**: the hook site isn't hypothetical -- `bumpPrimaryTerm`'s real
+call site (`IndexShard#updateShardState`, the primary-promotion path) already takes an `onBlocked`
+callback, and that exact callback is already where core resets/promotes the shard's engine on
+promotion today. This is a real, pre-existing, atomic-with-the-term-bump seam (no operation can
+observe the new term until the callback finishes), not one that needs inventing from scratch.
+Failure handling can reuse `bumpPrimaryTerm`'s own existing `onFailure`/`failShard` path rather
+than a new one, following the same "defer construction until the resource is actually needed"
+discipline this plugin already applied once for `DedicatedWalGcConfig` (&sect;12). Backward
+compatibility for classic shards is genuinely free: the callback already runs unconditionally for
+every shard today, so one more conditionally-skipped step costs nothing when the shard isn't
+serverless-storage-backed. This closes the remaining design questions; what's left is the
+formal-verification pass (extending `WalReplayFencing.tla`) and the implementation itself, still
+explicitly withheld pending authorization for the reason already stated above.
+
 **The read/filter/decode side of replay is now implemented and tested end-to-end against a real
 two-writer failover**, in `wal/WalReplayRecovery.java`: given the last durably-published manifest's
 `WalPosition` (or none, for a brand new shard) and a writer's own `activationWalPosition`, it lists
