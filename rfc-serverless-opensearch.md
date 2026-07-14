@@ -3953,6 +3953,25 @@ head untouched, and that naming a nonexistent index fails with a clear precondit
   passing outcome, and always verifies no corruption occurred either way -- matching "compaction is
   always safe, at worst wasted work, never a lost or corrupted update" as this fix now actually makes
   true, rather than merely asserting unconditional success chaos can't actually guarantee.
+
+  **The unstick follow-up is now closed too, via the bundle-naming-scheme option, not the
+  delete-permission one** (deliberately -- see &sect;15's own credential-scoping rationale for why
+  giving compaction delete access was never seriously on the table). `ObjectStoreCommitPublisher`
+  gained a `bundleNameSuffix` overload (defaulting to `""` for every existing caller, so every other
+  publish path is byte-for-byte unaffected) that appends a caller-supplied suffix to the otherwise
+  deterministic `(indexUuid, shardId, primaryTerm, generation)` bundle name.
+  `LuceneMergeCompactionPublisher#publishWithBundleNameCollisionRetry` uses it: on the specific
+  `writeBundle` collision message (never any other fault), it retries the *upload only* -- not the
+  merge, since a bundle-name collision has nothing to do with the shard head having changed, so the
+  already-merged bytes are reused as-is -- under a fresh random suffix, up to 5 times before giving
+  up. `LuceneMergeCompactionPublisherTests#testCompactionUnsticksAPermanentlyCollidingTargetGeneration`
+  reproduces the exact scenario directly: writes a real mismatched bundle straight to the blob
+  container under the deterministic name a subsequent compaction would target (simulating a previous
+  attempt's "upload succeeded, manifest write never landed" crash), then proves a single
+  `CompactionRebaseExecutor#publish` call now genuinely succeeds -- unstuck on the very first
+  attempt, no manual operator action needed. Verified meaningfully by temporarily capping the retry
+  loop at zero extra attempts and confirming the test fails exactly as it would have before this fix
+  existed.
   `GcSchedulerTaskChaosTests#testSweepConvergesDespiteSustainedRandomizedFaults` (new, `gc` package,
   needs package-private access to `sweepForTesting()`) proved the simpler GC-sweep case: since a
   sweep's own writes are nothing but idempotent `deleteBlobsIgnoringIfNotExists` calls, sustained

@@ -13,6 +13,7 @@ import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
+import org.opensearch.common.Randomness;
 import org.opensearch.common.lucene.Lucene;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.manifest.CommitManifest;
@@ -53,8 +54,32 @@ import java.util.Optional;
  * just wrote -- a correctness bug, not just a missed optimization. Redoing the full sequence each
  * time is what keeps every attempt an independent, correct merge-and-publish against the actual
  * current state.
+ *
+ * <p><b>Unsticks a permanently-colliding target generation on its own, without needing delete
+ * permission or a manual operator action.</b> {@code ObjectStoreCommitPublisher#publishCommit}'s
+ * bundle name is deterministic per {@code (indexUuid, shardId, primaryTerm, generation)}; on a
+ * quiescent shard whose head never advances (no writer commit ever moves it past the collision),
+ * every future compaction attempt recomputes the exact same target name. If an earlier attempt's
+ * bundle upload succeeded but a later step (the manifest write, or the shard-head CAS) faulted
+ * before that attempt could complete, {@code writeBundle}'s own collision guard correctly refuses
+ * to trust or overwrite the mismatched leftover -- but on its own, that just converts the failure
+ * from silent corruption to a loud, permanently-repeating one. This class now catches exactly that
+ * collision and retries the upload (not the merge -- the already-merged bytes are reused as-is,
+ * since a bundle-name retry has nothing to do with the shard head having changed) under a fresh
+ * random suffix via {@code ObjectStoreCommitPublisher}'s {@code bundleNameSuffix} overload, up to
+ * {@link #MAX_BUNDLE_NAME_COLLISION_RETRIES} times. This doesn't need compaction's own delete
+ * permission (deliberately withheld, see rfc-serverless-opensearch.md &sect;15) because it never
+ * touches the stuck leftover at all -- it just stops targeting it.
  */
 public final class LuceneMergeCompactionPublisher implements CompactionPublisher {
+
+    /**
+     * Bounds the bundle-name-collision retry loop in {@link #computeNewHead}. A fresh random
+     * 64-bit suffix colliding with a previous attempt's own random suffix is astronomically
+     * unlikely; this bound exists only so a (hypothetical, never-observed) run of bad luck fails
+     * loudly rather than looping forever.
+     */
+    private static final int MAX_BUNDLE_NAME_COLLISION_RETRIES = 5;
 
     private final String indexUuid;
     private final int shardId;
@@ -114,20 +139,14 @@ public final class LuceneMergeCompactionPublisher implements CompactionPublisher
                     writer.commit();
                 }
                 SegmentInfos mergedInfos = SegmentInfos.readLatestCommit(mergedDirectory);
-
                 long newGeneration = currentHead.latestManifestGeneration() + 1;
-                CommitManifest newManifest = commitPublisher.publishCommit(
+
+                CommitManifest newManifest = publishWithBundleNameCollisionRetry(
                     mergedDirectory,
                     mergedInfos,
-                    indexUuid,
-                    shardId,
                     currentHead.primaryTerm(),
                     newGeneration,
-                    sourceManifest.maxSeqNo(),
-                    sourceManifest.localCheckpoint(),
-                    sourceManifest.walPosition(),
-                    sourceManifest.mappingVersion(),
-                    sourceManifest.pruningStats()
+                    sourceManifest
                 );
 
                 return Optional.of(currentHead.withPublishedGeneration(newManifest.generation()));
@@ -135,5 +154,61 @@ public final class LuceneMergeCompactionPublisher implements CompactionPublisher
         } catch (IOException e) {
             throw new UncheckedIOException("compaction merge failed for " + indexUuid + "/" + shardId, e);
         }
+    }
+
+    /**
+     * Publishes the already-merged {@code mergedDirectory}/{@code mergedInfos} under the normal
+     * deterministic bundle name first; if and only if that fails with {@code writeBundle}'s own
+     * documented collision message (a previous attempt's mismatched leftover permanently occupying
+     * that name), retries the exact same already-merged bytes under a fresh random suffix instead
+     * of redoing the merge -- a bundle-name collision has nothing to do with the shard head having
+     * changed, so there's nothing to re-materialize or re-merge. Any other {@link IOException}
+     * (a genuine fault, not this specific collision) propagates immediately, unretried, exactly as
+     * before this method existed.
+     */
+    private CommitManifest publishWithBundleNameCollisionRetry(
+        Directory mergedDirectory,
+        SegmentInfos mergedInfos,
+        long primaryTerm,
+        long newGeneration,
+        CommitManifest sourceManifest
+    ) throws IOException {
+        String bundleNameSuffix = "";
+        for (int attempt = 0; attempt <= MAX_BUNDLE_NAME_COLLISION_RETRIES; attempt++) {
+            try {
+                return commitPublisher.publishCommit(
+                    mergedDirectory,
+                    mergedInfos,
+                    indexUuid,
+                    shardId,
+                    primaryTerm,
+                    newGeneration,
+                    sourceManifest.maxSeqNo(),
+                    sourceManifest.localCheckpoint(),
+                    sourceManifest.walPosition(),
+                    sourceManifest.mappingVersion(),
+                    sourceManifest.pruningStats(),
+                    false,
+                    bundleNameSuffix
+                );
+            } catch (IOException e) {
+                if (attempt == MAX_BUNDLE_NAME_COLLISION_RETRIES || isBundleNameCollision(e) == false) {
+                    throw e;
+                }
+                bundleNameSuffix = "-r" + Long.toHexString(Randomness.get().nextLong());
+            }
+        }
+        // Unreachable: the loop above always either returns or throws.
+        throw new IllegalStateException("unreachable");
+    }
+
+    /** Walks {@code error}'s cause chain looking for {@code BlobContainerBundleStore#writeBundle}'s own documented collision-safety message. */
+    private static boolean isBundleNameCollision(Throwable error) {
+        for (Throwable cause = error; cause != null; cause = cause.getCause()) {
+            if (cause.getMessage() != null && cause.getMessage().contains("already exists with different real content")) {
+                return true;
+            }
+        }
+        return false;
     }
 }

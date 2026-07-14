@@ -150,6 +150,68 @@ public final class ObjectStoreCommitPublisher {
         PruningStats pruningStats,
         boolean quiescent
     ) throws IOException {
+        return publishCommit(
+            directory,
+            segmentInfos,
+            indexUuid,
+            shardId,
+            primaryTerm,
+            generation,
+            maxSeqNo,
+            localCheckpoint,
+            walPosition,
+            mappingVersion,
+            pruningStats,
+            quiescent,
+            ""
+        );
+    }
+
+    /**
+     * Same as {@link #publishCommit(Directory, SegmentInfos, String, int, long, long, long, long,
+     * WalPosition, long, PruningStats, boolean)}, additionally appending {@code bundleNameSuffix}
+     * to the otherwise-deterministic {@code (indexUuid, shardId, primaryTerm, generation)} bundle
+     * name. Every ordinary caller passes {@code ""} (via the other overloads) and gets the exact
+     * same deterministic name as before -- this exists only for {@code
+     * org.opensearch.serverless.storage.compaction.LuceneMergeCompactionPublisher}'s own retry path,
+     * which needs a fresh, never-yet-written bundle name when the deterministic one is permanently
+     * stuck colliding with a previous failed attempt's mismatched content (see that class's own
+     * javadoc for why compaction, unlike a writer's retry, can never assume re-publishing the same
+     * generation produces byte-identical content). The manifest-existence idempotency check above
+     * is keyed on {@code (primaryTerm, generation)} alone, never on {@code bundleNameSuffix}, so this
+     * parameter cannot affect whether an already-fully-published generation short-circuits.
+     *
+     * @param directory the local Lucene {@link Directory} holding the files referenced by {@code segmentInfos}
+     * @param segmentInfos the local Lucene commit to package
+     * @param indexUuid the index this shard belongs to
+     * @param shardId the shard this commit belongs to
+     * @param primaryTerm the primary term this commit is published under
+     * @param generation the manifest generation this commit is published at
+     * @param maxSeqNo the maximum sequence number covered by this commit
+     * @param localCheckpoint the local checkpoint covered by this commit
+     * @param walPosition the WAL position this commit's manifest should record
+     * @param mappingVersion the mapping version in effect for this commit
+     * @param pruningStats pruning statistics to record in the manifest
+     * @param quiescent whether to mark the published manifest as this writer's final commit before suspension.
+     * @param bundleNameSuffix appended verbatim to the deterministic bundle name; {@code ""} for the
+     *                         normal deterministic name every other caller uses.
+     * @return the manifest describing the packaged commit
+     */
+    public CommitManifest publishCommit(
+        Directory directory,
+        SegmentInfos segmentInfos,
+        String indexUuid,
+        int shardId,
+        long primaryTerm,
+        long generation,
+        long maxSeqNo,
+        long localCheckpoint,
+        WalPosition walPosition,
+        long mappingVersion,
+        PruningStats pruningStats,
+        boolean quiescent,
+        String bundleNameSuffix
+    ) throws IOException {
         if (manifestStore.manifestExists(primaryTerm, generation)) {
             return manifestStore.readManifest(primaryTerm, generation);
         }
@@ -160,7 +222,15 @@ public final class ObjectStoreCommitPublisher {
             contents.add(new BundleFileContent(fileName, readFile(directory, fileName)));
         }
 
-        String bundleName = BlobContainerBundleStore.NAME_PREFIX + indexUuid + "-" + shardId + "-" + primaryTerm + "-" + generation;
+        String bundleName = BlobContainerBundleStore.NAME_PREFIX
+            + indexUuid
+            + "-"
+            + shardId
+            + "-"
+            + primaryTerm
+            + "-"
+            + generation
+            + bundleNameSuffix;
         SegmentBundle bundle = bundleStore.writeBundle(bundleName, contents);
 
         Map<String, FileReference> files = new LinkedHashMap<>();

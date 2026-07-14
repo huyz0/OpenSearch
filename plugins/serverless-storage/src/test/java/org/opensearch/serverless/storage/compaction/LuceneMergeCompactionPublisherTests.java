@@ -278,4 +278,98 @@ public class LuceneMergeCompactionPublisherTests extends OpenSearchTestCase {
             );
         }
     }
+
+    /**
+     * Reproduces the exact "permanently stuck" scenario this class's own javadoc describes: a
+     * previous attempt's bundle upload succeeded under the deterministic target name, but that
+     * attempt never got as far as writing a manifest for it (simulated here by writing a bundle
+     * directly, bypassing {@code commitPublisher} entirely, under the exact name {@code
+     * ObjectStoreCommitPublisher} would target for {@code initialHead}'s next generation). On a
+     * quiescent shard (no writer commit ever moves the head past this), every compaction attempt
+     * would recompute the same target name and collide forever before this class's own
+     * bundle-name-collision retry existed. With it, a single {@link CompactionRebaseExecutor#publish}
+     * call now succeeds by retrying under a fresh suffix, no manual intervention or delete
+     * permission needed.
+     */
+    public void testCompactionUnsticksAPermanentlyCollidingTargetGeneration() throws Exception {
+        try (Directory sourceDirectory = new ByteBuffersDirectory()) {
+            SegmentInfos sourceInfos = commitSeparateSegments(sourceDirectory, 3);
+
+            CommitManifest sourceManifest = commitPublisher.publishCommit(
+                sourceDirectory,
+                sourceInfos,
+                INDEX_UUID,
+                SHARD_ID,
+                1,
+                sourceInfos.getGeneration(),
+                2,
+                2,
+                new WalPosition("epoch-0", 0),
+                0,
+                PruningStats.empty()
+            );
+            ShardHead initialHead = new ShardHead(1, "node-1", Long.MAX_VALUE, sourceManifest.generation());
+            assertEquals(CasResult.SUCCESS, shardStateStore.compareAndSet(INDEX_UUID, SHARD_ID, Optional.empty(), initialHead));
+
+            // Simulates a previous compaction attempt whose bundle upload succeeded but whose
+            // manifest write never landed: a real bundle, under the exact deterministic name this
+            // shard's next compaction will target, with content that could never match a real
+            // merge's own packed bytes (a single tiny made-up file) -- guaranteeing writeBundle's
+            // collision guard fires on the very first real attempt below, exactly like a genuine
+            // stuck leftover would.
+            long targetGeneration = initialHead.latestManifestGeneration() + 1;
+            String stuckBundleName = BlobContainerBundleStore.NAME_PREFIX + INDEX_UUID + "-" + SHARD_ID + "-" + 1 + "-" + targetGeneration;
+            new BlobContainerBundleStore(blobContainer).writeBundle(
+                stuckBundleName,
+                java.util.List.of(
+                    new org.opensearch.serverless.storage.format.BundleFileContent("not-a-real-segment-file", new byte[] { 1, 2, 3 })
+                )
+            );
+            assertFalse(
+                "test setup must not have accidentally also published a manifest for the target generation",
+                manifestStore.manifestExists(1, targetGeneration)
+            );
+
+            LuceneMergeCompactionPublisher compactionPublisher = new LuceneMergeCompactionPublisher(
+                INDEX_UUID,
+                SHARD_ID,
+                manifestStore,
+                new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer)),
+                commitPublisher,
+                CompactionPolicy.withDefaults()
+            );
+            CompactionRebaseExecutor rebaseExecutor = new CompactionRebaseExecutor(shardStateStore, 10);
+
+            RebaseResult result = rebaseExecutor.publish(INDEX_UUID, SHARD_ID, compactionPublisher);
+            assertEquals(
+                "compaction must unstick itself past the colliding leftover and genuinely publish, "
+                    + "not merely abort via the collision guard",
+                RebaseResult.Outcome.PUBLISHED,
+                result.outcome()
+            );
+
+            ShardHead compactedHead = shardStateStore.get(INDEX_UUID, SHARD_ID).orElseThrow().head();
+            CommitManifest compactedManifest = manifestStore.readManifest(
+                compactedHead.primaryTerm(),
+                compactedHead.latestManifestGeneration()
+            );
+            assertNotEquals(
+                "the published bundle must have landed under an alternate (suffixed) name, not the "
+                    + "permanently-stuck deterministic one",
+                stuckBundleName,
+                compactedManifest.files().values().iterator().next().bundleName()
+            );
+
+            try (Directory materializedDirectory = new ByteBuffersDirectory()) {
+                new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer)).materialize(
+                    compactedManifest,
+                    materializedDirectory
+                );
+                try (DirectoryReader reader = DirectoryReader.open(materializedDirectory)) {
+                    assertEquals("compaction must still merge into a single segment", 1, reader.leaves().size());
+                    assertEquals("compaction must not lose or duplicate documents", 3, reader.numDocs());
+                }
+            }
+        }
+    }
 }
