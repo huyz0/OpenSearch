@@ -372,6 +372,21 @@ coordination has *already* decided this node holds the new term, so there's a sm
 between the true term change and this snapshot that a fully atomic metadata-plane lease-grant CAS
 (still future work, per &sect;7.1) would close but this cannot.
 
+**Design investigation update (see `write-routing-and-term-authority-progress.md`, Effort B, for
+full detail)**: traced the term this gap actually needs to fence to core's own
+`EngineConfig#getPrimaryTermSupplier()` -- the same primary term `IndexShard#bumpPrimaryTerm`
+(`server/src/main/java/org/opensearch/index/shard/IndexShard.java`) grants during shard
+allocation/promotion -- confirming this is not a plugin-level fix but a real core cluster-
+coordination change, exactly as this note already said. The investigation also found the fix is
+likely smaller than "a cluster-state CAS" implies: `bumpPrimaryTerm` is a synchronous,
+mutex-held, operation-blocking transition already, so the natural shape is a synchronous
+primary-activation hook fired from inside it (default no-op, the same "hook exists, does nothing
+unless a plugin implements it" pattern `Engine#engineRecoveryOperations()` already uses in this
+codebase) rather than a new cluster-state-replicated record. Not yet designed in full or
+implemented -- `bumpPrimaryTerm` is private, deep, every-shard-in-the-cluster machinery, and a
+hook fired mid-transition there needs its own careful failure-mode analysis before any real patch,
+consistent with why this remains explicitly out of scope for now.
+
 **The read/filter/decode side of replay is now implemented and tested end-to-end against a real
 two-writer failover**, in `wal/WalReplayRecovery.java`: given the last durably-published manifest's
 `WalPosition` (or none, for a brand new shard) and a writer's own `activationWalPosition`, it lists

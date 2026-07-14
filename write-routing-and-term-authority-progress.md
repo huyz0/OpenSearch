@@ -87,14 +87,46 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done (reviewed before
 ## Effort B: Metadata-plane term-authority migration
 
 ### Design
-- [ ] B1. Specify the atomic primitive: single CAS granting a new primary term *and* recording
-      the WAL position of that grant.
-- [ ] B2. Decide where the combined (term, WAL position) record lives in cluster state.
-- [ ] B3. Determine the failure-mode story if the CAS's two halves (term grant, WAL-position
-      write) partially fail or race.
-- [ ] B4. Assess blast radius -- this changes primary-term grant for every shard, not just
-      serverless-storage ones; needs core cluster-coordination review.
-- [ ] B5. Decide backward compatibility for classic (non-serverless) shards.
+- [x] B1/B4 investigated together -- **the term this effort must fence is core's own
+      `IndexShard`/`Engine` primary term, not this plugin's separate `ShardHead.primaryTerm`.**
+      Traced `ObjectStoreWriterEngine#replayWalOperations`'s `ReplayFloor = currentTerm - 1`
+      (`WalReplayFencing.tla`'s own floor) directly to `engineConfig.getPrimaryTermSupplier().getAsLong()`
+      -- core's `EngineConfig`, the same primary term core's own shard-allocation/failover
+      machinery grants. `ShardHead.primaryTerm` (this plugin's own `shardstate` package) is a
+      distinct, unrelated counter that only advances on `withPublishedGeneration` (a real manifest
+      publish), explicitly *not* on lease acquisition/activation (`withRenewedLease`'s own javadoc
+      is explicit: "term advancement is deliberately not this method's job"). This resolves B1's
+      original framing: there is no plugin-level term-grant CAS to design, because the term this
+      effort needs to fence is core's, not this plugin's own. B4's blast-radius concern is
+      therefore not hypothetical -- traced core's own term-bump entry point to
+      `IndexShard#bumpPrimaryTerm` (`server/src/main/java/org/opensearch/index/shard/IndexShard.java`,
+      called from at least two sites, including primary-relocation/promotion), deep, shared,
+      every-shard-in-the-cluster machinery, not something reachable from a plugin-level engine
+      seam (the term bump happens during cluster-state application, before any `Engine` --
+      serverless or classic -- is even swapped in). **Conclusion: the atomic (term, WAL-position)
+      CAS this effort wants would have to be built inside or immediately alongside
+      `bumpPrimaryTerm` itself** -- e.g. a pluggable "primary-activation hook" core seam that fires
+      synchronously as part of the same state transition that bumps the term, letting a
+      serverless-storage shard snapshot its WAL position atomically with the term bump rather than
+      afterward in the engine constructor as today. No such seam exists in `IndexShard` today.
+- [ ] B2. Decide where the combined (term, WAL position) record lives in cluster state. Still
+      open pending B4's seam-design answer: if the fix is a synchronous hook fired from
+      `bumpPrimaryTerm` rather than a cluster-state CAS per se, the WAL position may not need to
+      live in cluster state at all -- it could be captured into the same in-memory path that
+      today constructs the engine, just earlier (at the hook callback, not the constructor). This
+      would be a much smaller change than originally framed (B1's initial framing assumed a
+      cluster-state-level CAS was required) -- worth exploring before committing to the
+      heavier design.
+- [ ] B3. Determine the failure-mode story if the hook fires but engine construction later fails
+      (a real risk already known from &sect;12's dedicated-WAL-stream leak-risk precedent in this
+      same codebase -- see rfc-serverless-opensearch.md &sect;12's "self-review pass caught a real
+      leak risk" note). Not yet resolved.
+- [ ] B5. Decide backward compatibility for classic (non-serverless) shards. Likely low-risk given
+      B1's finding: a synchronous hook fired from `bumpPrimaryTerm` with a default no-op
+      implementation (the same "hook exists, does nothing unless a plugin implements it" shape
+      `Engine#engineRecoveryOperations()` already uses in this codebase, per &sect;7.1's "Engine-only
+      approach... rejected" design note nearby) would cost classic shards nothing. Not yet
+      confirmed against `IndexShard`'s actual call sites.
 
 ### Formal verification
 - [ ] B6. Extend/write a TLA+ model of the proposed atomic grant; check it closes the residual
@@ -133,5 +165,17 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done (reviewed before
   changes, so no security-classifier-style review needed for this piece. A9/A10 (fencing) and A3-A5
   (consistency/re-split/rollback stories) remain open, documented in code and here rather than
   rushed. Full plugin quality gate + entire internalClusterTest suite pass clean. RFC §16 Phase 4
-  updated with a status note. Committing and pushing this increment next, then continuing to A14-A17
-  (auto-split controller) or Effort B's design/formal-verification tasks (B1-B7).
+  updated with a status note. Committed and pushed as e6a8ba72130.
+- Effort A increment pushed; moved to Effort B design work (B1-B5) since it's pure investigation --
+  no code changes, so no security-classifier review needed yet. Real finding: traced the term this
+  effort must fence to core's own `EngineConfig#getPrimaryTermSupplier()` / `IndexShard#bumpPrimaryTerm`,
+  NOT this plugin's own `ShardHead.primaryTerm` (a separate, manifest-generation-scoped counter that
+  doesn't advance on activation at all). This reframes B1 from "design a plugin-level CAS" to "core's
+  own bumpPrimaryTerm is where a fix would need to live" -- confirms B4's blast-radius concern is real
+  and precisely locates it, and suggests the actual fix may be a smaller, more surgical synchronous
+  hook rather than a new cluster-state-replicated record (B2 potentially simplifies). RFC §7.1 updated
+  with this finding. B8 (implementing the hook inside `bumpPrimaryTerm`, private/every-shard/mutex-held
+  core machinery) remains explicitly not attempted without explicit human authorization -- same bar
+  the REST-scope-widening precedent set earlier in this project, and for the same reason: this is a
+  cross-cutting core change to shared primary-term-grant machinery, not a plugin-local decision.
+  B6/B7 (TLA+ model extension) not yet started -- next candidate task.
