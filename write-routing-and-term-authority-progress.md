@@ -138,10 +138,43 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done (reviewed before
       Only the auto-split controller itself (A14-A17) remains.
 
 ### Auto-split controller
-- [ ] A14. Design trigger policy off `writesPerMinute()` (thresholds + hysteresis).
-- [ ] A15. Wire controller: rewrite -> write-cutover as one coordinated, resumable state machine.
-- [ ] A16. Observability: REST stats for auto-split decisions/progress.
-- [ ] A17. RFC update: close out §16 Phase 4's routing-cutover gap note.
+- [!] A14-A17 investigated together -- **genuinely blocked, not by authorization but by a missing
+      foundational mechanism that doesn't exist anywhere in this plugin yet.** Read
+      `ShardSplitter#split`'s real signature directly: it takes a `targetIndexUuid` documented as
+      "the brand-new index this split target creates" -- meaning the real OpenSearch index (with
+      its own settings, shard count, mapping) must already have been created via ordinary
+      `_create_index` *before* this plugin's object-store-level split can run against it. Nothing
+      in this plugin creates that index automatically; `ShardSplitCandidatesAction`'s own
+      `ShardSplitCandidateEntry` javadoc says this explicitly and un-defensively: "`ShardSplitter#split`
+      only re-points an already-provisioned target shard identity; it does not create new
+      indices/shards, allocate them, or cut over routing from the source shard to the split
+      targets. None of that orchestration exists in this plugin yet, so there is no automated
+      action this signal could safely drive today." That sentence, written when the candidate
+      signal itself was built, is still accurate after this session's write-routing work: A15's
+      "wire rewrite -> write-cutover as one resumable state machine" implicitly assumed the target
+      indices already exist, which was the wrong assumption -- the real missing piece is target
+      *index* auto-provisioning, not orchestration of already-existing mechanism.
+
+      **Why this isn't safely buildable without new product/design decisions, not just more
+      code**: auto-creating a target index means deciding, with no operator in the loop, a naming
+      convention (collision-safe, discoverable, reversible), how many partitions to split into
+      (itself a policy question -- 2? scaled to current write rate?), what settings/mapping the new
+      index inherits from the source, and what happens if creation succeeds but the rest of the
+      pipeline (rewrite, cutover) later fails, leaving an orphan index behind. Every one of those
+      is a product decision this RFC's own scoping notes have repeatedly deferred rather than
+      guessed at (see A4/A5's own "not reachable, don't build against a mechanism that doesn't
+      exist" reasoning, and the REST-scope-widening precedent for "needs explicit sign-off, not
+      inference"). Building A14-A17 today would mean inventing that policy unilaterally.
+
+      **What's actually done and doesn't need redoing**: `ShardSplitCandidatesAction` (fully built,
+      tested, and shipped in an earlier session) already is the correct-shaped "detection" half --
+      cluster-wide `writesPerMinute()` aggregation, threshold + sustained-duration hysteresis,
+      surfaced via REST for an operator (or, once target-provisioning policy exists, a future
+      controller) to consult. A14's "design trigger policy" is therefore already resolved by that
+      existing signal; A16's "observability" is already `ShardSplitCandidatesAction`'s own REST
+      surface. What remains open is specifically A15 (the orchestration across rewrite + both
+      cutover steps) and, as a hard precondition for it, target-index auto-provisioning policy --
+      neither attempted here.
 
 ## Effort B: Metadata-plane term-authority migration
 

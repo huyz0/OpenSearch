@@ -3295,6 +3295,23 @@ Full plugin quality gate and the entire `internalClusterTest` suite pass clean. 
 of Effort A's write-side partition routing design, implementation, and testing work -- only the
 auto-split controller itself (wiring `writesPerMinute()` to trigger this automatically) remains.**
 
+**Status: the auto-split controller is genuinely blocked, not by authorization but by a missing
+foundational mechanism.** `ShardSplitter#split`'s own signature requires a `targetIndexUuid`
+documented as "the brand-new index this split target creates" -- the real OpenSearch index must
+already exist, created via ordinary `_create_index`, before this plugin's object-store-level split
+can run against it. Nothing in this plugin auto-creates that index; `ShardSplitCandidateEntry`'s
+own javadoc already said so when the candidate signal itself was built: "`ShardSplitter#split` only
+re-points an already-provisioned target shard identity... None of that orchestration exists in this
+plugin yet, so there is no automated action this signal could safely drive today." A controller
+that auto-created target indices would have to unilaterally decide a naming convention, partition
+count, and inherited settings/mapping with no operator in the loop -- real product-policy
+decisions this RFC has consistently deferred rather than guessed at (see this section's own A4/A5
+"don't build against a mechanism that doesn't exist" reasoning). What already exists and needs no
+further work is the detection half: `ShardSplitCandidatesAction`'s cluster-wide `writesPerMinute()`
+aggregation with threshold and sustained-duration hysteresis, REST-exposed for an operator to
+consult today. Full detail in `write-routing-and-term-authority-progress.md`, Effort A's
+auto-split-controller section.
+
 **`writesPerMinute()` now has its first consumer, but still deliberately no auto-action.**
 `ShardSplitCandidatesAction` (`resharding/action` package) fans `writesPerMinute()` out across every
 data node via `ShardActivityRegistry.snapshotWritesPerMinute()`, merges the highest reading per
