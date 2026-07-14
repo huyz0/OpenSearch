@@ -1635,6 +1635,24 @@ is meaningful only when serverless storage is enabled for the target index -- un
 or shard-store APIs, nothing this plugin exposes assumes local-disk shard state disaggregation
 invalidates.
 
+**Status: four more core read-only metadata endpoints are now explicitly annotated `AVAILABLE`.**
+`RestGetMappingAction`, `RestGetSettingsAction`, and `RestGetAliasesAction`
+(`server/src/main/java/org/opensearch/rest/action/admin/indices/`), and
+`RestClusterGetSettingsAction`
+(`server/src/main/java/org/opensearch/rest/action/admin/cluster/`) previously defaulted to
+`UNAVAILABLE` under serverless mode, meaning `GET _mapping`, `GET _settings`, `GET _alias`, and
+`GET _cluster/settings` -- all pure reads a client legitimately needs against a serverless-storage
+index (e.g. to discover its own mapping before indexing, or confirm a dynamic setting took effect)
+-- were unreachable. All four are read-only, take no request body, and mutate nothing; none of them
+assume local-disk shard state the way `_forcemerge` or shard-store APIs do, so the same reasoning
+this section already applied to this plugin's own handlers applies here too. Each handler gained a
+`serverlessScope()` override returning `ServerlessScope.AVAILABLE`, plus a unit test asserting it;
+confirmed meaningful by temporarily reverting one override to `UNAVAILABLE` and watching its own
+test fail with the expected assertion mismatch, then restoring it. This is a deliberately narrow,
+security-reviewed slice -- write/mutating cluster and index admin endpoints remain `UNAVAILABLE` by
+default and are out of scope for this pass; any further widening should go through the same
+explicit, one-endpoint-at-a-time review this batch did.
+
 ## 12. Security and Encryption Boundaries
 
 Disaggregation moves the trust boundary: today a shard's bytes live on nodes an operator

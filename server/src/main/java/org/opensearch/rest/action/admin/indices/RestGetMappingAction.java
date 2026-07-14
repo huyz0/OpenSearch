@@ -45,6 +45,7 @@ import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
+import org.opensearch.rest.RestHandler.ServerlessScope;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.rest.RestResponse;
 import org.opensearch.rest.action.RestActionListener;
@@ -76,6 +77,12 @@ public class RestGetMappingAction extends BaseRestHandler {
 
     public RestGetMappingAction(ThreadPool threadPool) {
         this.threadPool = threadPool;
+    }
+
+    /** Read-only metadata lookup, safe to expose under serverless mode (rfc-serverless-opensearch.md &sect;11). */
+    @Override
+    public ServerlessScope serverlessScope() {
+        return ServerlessScope.AVAILABLE;
     }
 
     @Override
