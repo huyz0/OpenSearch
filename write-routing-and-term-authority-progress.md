@@ -176,6 +176,77 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done (reviewed before
       cutover steps) and, as a hard precondition for it, target-index auto-provisioning policy --
       neither attempted here.
 
+- [x] **The target-index auto-provisioning blocker above is now closed, the safe way.** An earlier
+      attempt (`AutoSplitPlanner`, algorithmic naming) was blocked by the security classifier as
+      unilateral policy invention, correctly -- see the log entry documenting that denial. Grounded
+      the redo in core's own real, existing `_split` API (researched directly against
+      `TransportResizeAction`/`RestResizeHandler`, not assumed) before rebuilding: core's own
+      `_split` always requires the caller to supply the target index name in the URL path, and
+      core's own code explicitly *refuses* to auto-calculate a split's shard count (`assert
+      resizeRequest.getResizeType() != ResizeType.SPLIT : "split must specify the number of shards
+      explicitly"`, `TransportResizeAction`) even though it does auto-calculate for shrink -- a
+      real signal from core's own maintainers that naming and partition count for a split are
+      always the caller's decision. `ProvisionSplitTargetsAction` (new files:
+      `ProvisionSplitTargetsRequest`/`Action`/`TransportProvisionSplitTargetsAction`/
+      `RestProvisionSplitTargetsAction`, REST-exposed as `POST
+      .../_resharding/_provision_split_targets/{source}?target_indices=a,b`) follows that same
+      contract exactly: every target name is caller-supplied, every call, zero naming algorithm.
+      `number_of_shards` fixed at 1 per target (this plugin's own per-shard split model, distinct
+      from core's single-multi-shard-index resize); `number_of_replicas` and (if set)
+      serverless-storage opt-in inherited from the source; mapping inherited from the source.
+      Refuses cleanly (no partial creation) if a named target already exists or if the source is
+      itself already a split target. Tested in `ServerlessStorageProvisionSplitTargetsActionIT`
+      (2 tests): settings/mapping inheritance proven correct and targets proven independently
+      writable/searchable; a name-collision refusal proven atomic. Confirmed meaningful by
+      disabling mapping inheritance and watching the test fail on the missing field, then
+      restoring. Full plugin quality gate and the entire `internalClusterTest` suite pass clean.
+      Still deliberately a separate, explicit, operator-triggered action -- not wired to
+      `ShardSplitCandidatesAction`'s threshold/hysteresis signal, same "signal exists, no auto
+      action" boundary this plugin already draws elsewhere.
+
+      **What A15 (real end-to-end orchestration) still needs, now that the precondition is
+      closed**: chaining `ProvisionSplitTargetsAction` -> the existing per-partition
+      `ShardSplitAction` calls -> `CutoverSplitRoutingAction` -> `EnableWritePartitionRoutingAction`
+      into one resumable sequence, still explicitly operator-triggered (this action deliberately
+      does not do that chaining itself). Not attempted here.
+
+- [ ] **Elasticsearch-Serverless-style write-load autosharding, investigated, not yet built --
+      real missing piece identified precisely, grounded in code.** Elastic Cloud Serverless's own
+      "autosharding" (researched directly, not assumed) never live-splits an existing shard: it
+      tracks a `write_load` metric per data stream and uses it only to decide the shard count for
+      the data stream's *next rollover generation* -- the old backing index is never touched again
+      once rollover happens, so there is no live-split consistency window to solve at all. This is
+      directly buildable on OpenSearch core's own existing machinery, confirmed by tracing the real
+      code: `MetadataRolloverService.rolloverDataStream` creates every new data-stream backing
+      index via the exact same `MetadataCreateIndexService.applyCreateIndexRequest` path any index
+      creation uses, which invokes every registered `IndexSettingProvider.getAdditionalIndexSettings`
+      (`MetadataCreateIndexService.java:1159-1161`), *including* on data-stream rollover -- and this
+      plugin already implements that exact interface
+      (`ServerlessStorageIndexSettingProvider`), just not yet for `number_of_shards`.
+
+      **The real, precise blocker**: `IndexSettingProvider.getAdditionalIndexSettings(String
+      indexName, boolean isDataStreamIndex, Settings templateAndRequestSettings)` has **no
+      `ClusterState` parameter** (confirmed at the real call site,
+      `MetadataCreateIndexService.java:1159`) -- it cannot synchronously read the cluster-wide
+      `writesPerMinute()` aggregation `ShardSplitCandidatesAction` computes, since that aggregation
+      requires a network fan-out to every data node, which this hook cannot perform (it runs
+      inline during cluster-state processing, no I/O). So the write-load signal cannot reach this
+      hook directly, no matter how it's wired.
+
+      **What actually needs building, precisely scoped**: a new periodic background task (matching
+      this plugin's own existing scheduled-task shape, e.g. `PitrRetentionSchedulerTask`) that
+      periodically recomputes, per serverless-storage-enabled data stream, a "recommended
+      next-generation shard count" from the same `writesPerMinute()` aggregation
+      `ShardSplitCandidatesAction` already computes, and caches the result in a small in-memory map
+      keyed by data stream name (parseable from a new backing index's own name via
+      `DataStream.getDefaultBackingIndexName`'s fixed `.ds-{name}-%06d` format, confirmed reversible
+      since the generation suffix is always exactly 6 digits). `ServerlessStorageIndexSettingProvider`
+      would then consult that cache synchronously (a plain in-memory read, no I/O) when
+      `isDataStreamIndex` is true, and inject `number_of_shards` accordingly. This is a real,
+      buildable design with a precisely identified missing component -- not attempted yet, since it
+      is a second real feature (a new scheduler + cache + name-parsing utility), not a small
+      follow-on to Part 1 above. Awaiting explicit go-ahead before building.
+
 ## Effort B: Metadata-plane term-authority migration
 
 ### Design

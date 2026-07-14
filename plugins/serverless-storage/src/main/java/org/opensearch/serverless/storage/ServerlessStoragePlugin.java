@@ -1695,6 +1695,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new ActionHandler<>(
                 org.opensearch.serverless.storage.resharding.action.DisableWritePartitionRoutingAction.INSTANCE,
                 org.opensearch.serverless.storage.resharding.action.TransportDisableWritePartitionRoutingAction.class
+            ),
+            new ActionHandler<>(
+                org.opensearch.serverless.storage.resharding.action.ProvisionSplitTargetsAction.INSTANCE,
+                org.opensearch.serverless.storage.resharding.action.TransportProvisionSplitTargetsAction.class
             )
         );
     }
@@ -1739,7 +1743,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new org.opensearch.serverless.storage.resharding.action.RestRetireShrinkSourceAction(),
             new org.opensearch.serverless.storage.resharding.action.RestCutoverSplitRoutingAction(),
             new org.opensearch.serverless.storage.resharding.action.RestEnableWritePartitionRoutingAction(),
-            new org.opensearch.serverless.storage.resharding.action.RestDisableWritePartitionRoutingAction()
+            new org.opensearch.serverless.storage.resharding.action.RestDisableWritePartitionRoutingAction(),
+            new org.opensearch.serverless.storage.resharding.action.RestProvisionSplitTargetsAction()
         );
     }
 

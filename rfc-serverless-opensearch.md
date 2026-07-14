@@ -3324,6 +3324,30 @@ aggregation with threshold and sustained-duration hysteresis, REST-exposed for a
 consult today. Full detail in `write-routing-and-term-authority-progress.md`, Effort A's
 auto-split-controller section.
 
+**Status: the missing provisioning primitive now exists, built to mirror core's own contract
+exactly, closing the blocker above.** `ProvisionSplitTargetsAction`
+(`resharding/action` package, REST-exposed as `POST
+.../_resharding/_provision_split_targets/{source}?target_indices=a,b`) creates the real target
+indices a split needs, inheriting settings and mapping from the source. It is deliberately built to
+mirror core's own `POST /{index}/_split/{target}` contract exactly rather than an earlier draft
+that generated target names algorithmically: core's own `TransportResizeAction` always requires the
+caller to supply the target index name, and its own code explicitly refuses to auto-calculate a
+split's target shard count (`assert resizeRequest.getResizeType() != ResizeType.SPLIT : "split must
+specify the number of shards explicitly"`) even though it does auto-calculate for shrink -- a real
+signal from core's own maintainers that naming and partition count for a split are the caller's
+decision, not something core (or this plugin) should guess. Every target name in
+`ProvisionSplitTargetsAction` is caller-supplied, every call; there is no naming algorithm and no
+partition-count policy invented by this plugin. `number_of_shards` is fixed at 1 per target
+(matching `ShardSplitter`'s own per-shard model, structurally different from core's
+single-multi-shard-index resize), `number_of_replicas` and (if set) the serverless-storage opt-in
+are inherited from the source. Tested end-to-end: target indices are created with correct
+inherited settings/mapping and are immediately independently writable and searchable; a second test
+proves a name collision is refused outright, atomically (no partial creation). Confirmed meaningful
+by disabling mapping inheritance and watching the first test fail on a missing mapping field, then
+restoring. Full plugin quality gate and the entire `internalClusterTest` suite pass clean. Still
+deliberately a separate, explicit, operator-triggered action, not wired to any threshold or
+scheduler -- the same boundary `ShardSplitCandidatesAction`'s own advisory signal already draws.
+
 **`writesPerMinute()` now has its first consumer, but still deliberately no auto-action.**
 `ShardSplitCandidatesAction` (`resharding/action` package) fans `writesPerMinute()` out across every
 data node via `ShardActivityRegistry.snapshotWritesPerMinute()`, merges the highest reading per
