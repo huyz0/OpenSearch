@@ -210,42 +210,77 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done (reviewed before
       into one resumable sequence, still explicitly operator-triggered (this action deliberately
       does not do that chaining itself). Not attempted here.
 
-- [ ] **Elasticsearch-Serverless-style write-load autosharding, investigated, not yet built --
-      real missing piece identified precisely, grounded in code.** Elastic Cloud Serverless's own
-      "autosharding" (researched directly, not assumed) never live-splits an existing shard: it
-      tracks a `write_load` metric per data stream and uses it only to decide the shard count for
-      the data stream's *next rollover generation* -- the old backing index is never touched again
-      once rollover happens, so there is no live-split consistency window to solve at all. This is
-      directly buildable on OpenSearch core's own existing machinery, confirmed by tracing the real
-      code: `MetadataRolloverService.rolloverDataStream` creates every new data-stream backing
+- [x] **Elasticsearch-Serverless-style write-load autosharding -- built and verified.** Elastic
+      Cloud Serverless's own "autosharding" (researched directly, not assumed) never live-splits an
+      existing shard: it tracks a `write_load` metric per data stream and uses it only to decide
+      the shard count for the data stream's *next rollover generation* -- the old backing index is
+      never touched again once rollover happens, so there is no live-split consistency window to
+      solve at all. Built on OpenSearch core's own existing machinery, confirmed by tracing the
+      real code: `MetadataRolloverService.rolloverDataStream` creates every new data-stream backing
       index via the exact same `MetadataCreateIndexService.applyCreateIndexRequest` path any index
       creation uses, which invokes every registered `IndexSettingProvider.getAdditionalIndexSettings`
       (`MetadataCreateIndexService.java:1159-1161`), *including* on data-stream rollover -- and this
-      plugin already implements that exact interface
-      (`ServerlessStorageIndexSettingProvider`), just not yet for `number_of_shards`.
+      plugin already implements that exact interface (`ServerlessStorageIndexSettingProvider`).
 
-      **The real, precise blocker**: `IndexSettingProvider.getAdditionalIndexSettings(String
-      indexName, boolean isDataStreamIndex, Settings templateAndRequestSettings)` has **no
-      `ClusterState` parameter** (confirmed at the real call site,
-      `MetadataCreateIndexService.java:1159`) -- it cannot synchronously read the cluster-wide
+      **The real, precise blocker this design works around**: `IndexSettingProvider
+      .getAdditionalIndexSettings(String indexName, boolean isDataStreamIndex, Settings
+      templateAndRequestSettings)` has **no `ClusterState` parameter** (confirmed at the real call
+      site, `MetadataCreateIndexService.java:1159`) -- it cannot synchronously read the cluster-wide
       `writesPerMinute()` aggregation `ShardSplitCandidatesAction` computes, since that aggregation
       requires a network fan-out to every data node, which this hook cannot perform (it runs
-      inline during cluster-state processing, no I/O). So the write-load signal cannot reach this
-      hook directly, no matter how it's wired.
+      inline during cluster-state processing, no I/O).
 
-      **What actually needs building, precisely scoped**: a new periodic background task (matching
-      this plugin's own existing scheduled-task shape, e.g. `PitrRetentionSchedulerTask`) that
-      periodically recomputes, per serverless-storage-enabled data stream, a "recommended
-      next-generation shard count" from the same `writesPerMinute()` aggregation
-      `ShardSplitCandidatesAction` already computes, and caches the result in a small in-memory map
-      keyed by data stream name (parseable from a new backing index's own name via
-      `DataStream.getDefaultBackingIndexName`'s fixed `.ds-{name}-%06d` format, confirmed reversible
-      since the generation suffix is always exactly 6 digits). `ServerlessStorageIndexSettingProvider`
-      would then consult that cache synchronously (a plain in-memory read, no I/O) when
-      `isDataStreamIndex` is true, and inject `number_of_shards` accordingly. This is a real,
-      buildable design with a precisely identified missing component -- not attempted yet, since it
-      is a second real feature (a new scheduler + cache + name-parsing utility), not a small
-      follow-on to Part 1 above. Awaiting explicit go-ahead before building.
+      **What was built**: `DataStreamShardCountAdvisorSchedulerTask` -- a new periodic background
+      task matching this plugin's own existing scheduled-task shape (mirrors
+      `ScaleUpCandidatesSchedulerTask`), gated behind a disabled-by-default node setting
+      (`serverless_storage.resharding.shard_count_advisor.eval_interval`, `TimeValue.MINUS_ONE` by
+      default). On each cluster-manager-only evaluation it calls `ShardSplitCandidatesAction` once
+      (the existing `writesPerMinute()` aggregation) and, for each serverless-storage-enabled data
+      stream whose current write index is a sustained-high candidate, records a recommended
+      next-generation shard count (current count doubled, capped at 32) into
+      `DataStreamShardCountAdvisorCache` -- a small thread-safe in-memory map keyed by data stream
+      name. `ServerlessStorageIndexSettingProvider.getAdditionalIndexSettings` now consults that
+      cache synchronously (plain in-memory read, no I/O) whenever `isDataStreamIndex` is true and
+      the template/request left `number_of_shards` unset, injecting the cached recommendation --
+      unconditional on serverless-storage being enabled on the index itself, since the signal is
+      purely about data-stream shard topology, not the storage engine. Data stream name is
+      recovered from the about-to-be-created backing index's own name via the new
+      `DataStreamBackingIndexNames.parseDataStreamName`, reversing core's
+      `.ds-<streamName>-<generation:%06d>` format.
+
+      **A real bug found and fixed by the plugin's own unit test, before any integration testing**:
+      the first `DataStreamBackingIndexNames` regex assumed the generation suffix was always
+      exactly 6 digits; core's `%06d` is a *minimum* width, not exact, so a generation >= 1,000,000
+      produces a wider, still-all-digit suffix that the exact-6-digit pattern would parse
+      incorrectly. Caught by `testHandlesAHighGenerationNumberBeyondSixDigits`; fixed by widening
+      the pattern to `-\d{6,}$`.
+
+      **Tests**: `DataStreamBackingIndexNamesTests` (6 unit tests) and
+      `DataStreamShardCountAdvisorSchedulerTaskTests` (4 unit tests, package-private
+      `evaluateDataStream` invoked directly to avoid the network round-trip `evaluate()` itself
+      requires) cover the parsing and decision logic in isolation. The new
+      `ServerlessStorageDataStreamShardCountAdvisorIT` (2 tests, using the plugin's own test-only
+      `dataStreamShardCountAdvisorCacheForTesting()` accessor to seed a recommendation directly
+      rather than wait on a real sustained-write-rate evaluation) proves the one thing the unit
+      tests can't: a real core data-stream rollover genuinely picks up the cached recommendation
+      for its new backing index, and behaves as an untouched no-op when nothing is cached. Verified
+      meaningful by temporarily disabling the cache-consultation branch in
+      `ServerlessStorageIndexSettingProvider` and confirming the seeded-recommendation test fails
+      (`expected:<5> but was:<1>`), then restoring. Full plugin quality gate and the entire
+      `internalClusterTest` suite pass clean (incidentally also fixed a pre-existing
+      `missingJavadoc` gap in `WritePartitionRoutingMetadata`'s four accessor methods, unrelated to
+      this feature, hit while running the same gate).
+
+      Same safety property as Part 1 and as Elastic's own real design: this only ever influences a
+      **not-yet-created** index -- it never live-splits or otherwise touches an index that already
+      exists, so there is no write-loss/consistency window to solve, unlike a live-split controller
+      would have.
+
+      **What A15 (real end-to-end orchestration for operator-triggered splits) still needs**:
+      chaining `ProvisionSplitTargetsAction` -> the existing per-partition `ShardSplitAction` calls
+      -> `CutoverSplitRoutingAction` -> `EnableWritePartitionRoutingAction` into one resumable
+      sequence, still explicitly operator-triggered. Not attempted here -- deliberately out of
+      scope for this increment.
 
 ## Effort B: Metadata-plane term-authority migration
 

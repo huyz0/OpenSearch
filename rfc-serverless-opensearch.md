@@ -3348,6 +3348,39 @@ restoring. Full plugin quality gate and the entire `internalClusterTest` suite p
 deliberately a separate, explicit, operator-triggered action, not wired to any threshold or
 scheduler -- the same boundary `ShardSplitCandidatesAction`'s own advisory signal already draws.
 
+**Status: write-load-driven "autosharding" for data streams -- the Elasticsearch-Serverless-style
+half of the write-scaling story -- is now built too, and it is deliberately a different mechanism
+from a live-split controller, not a smaller version of one.** Real Elastic Cloud Serverless
+"autosharding" (researched directly, not assumed) never live-splits an existing shard: it tracks a
+`write_load` metric per data stream and uses it only to pick the shard count for the data stream's
+*next rollover generation*, so the already-written-to backing index is never touched again -- there
+is no live-split consistency window to solve at all, unlike the auto-split controller two
+paragraphs above, which remains genuinely blocked on missing orchestration. This is why the two
+features are not the same thing wearing different names: one would need to safely migrate live
+writes off a shard being split; the other only ever decides a setting for an index that does not
+exist yet. Built on core's own real rollover machinery, confirmed by tracing the code:
+`MetadataRolloverService.rolloverDataStream` creates every new backing index through the exact same
+`MetadataCreateIndexService.applyCreateIndexRequest` path any index creation uses, which invokes
+every registered `IndexSettingProvider.getAdditionalIndexSettings` -- and this plugin already
+implements that interface (`ServerlessStorageIndexSettingProvider`) for other settings. The one real
+obstacle is that this hook has no `ClusterState` parameter, so it cannot itself fan out to compute
+`writesPerMinute()` (that requires network I/O this synchronous, inline-during-cluster-state-apply
+hook cannot perform). Worked around with a new `DataStreamShardCountAdvisorSchedulerTask`
+(mirroring `ScaleUpCandidatesSchedulerTask`'s shape, gated behind a disabled-by-default eval
+interval) that periodically calls `ShardSplitCandidatesAction` and records a recommended
+next-generation shard count (doubled, capped at 32) into a small in-memory
+`DataStreamShardCountAdvisorCache`, keyed by data stream name recovered from a new backing index's
+own about-to-be-created name via `DataStreamBackingIndexNames.parseDataStreamName` (a real bug --
+assuming core's `%06d` generation suffix was always exactly 6 digits rather than a minimum width --
+was caught by this utility's own unit test before any integration testing, and fixed). The provider
+then consults that cache synchronously, a plain in-memory read. Proven end-to-end by
+`ServerlessStorageDataStreamShardCountAdvisorIT`: a real data-stream rollover picks up a
+cache-seeded recommendation for its new backing index, and leaves the template's own shard count
+alone when nothing is cached. Confirmed meaningful by disabling the cache-consultation branch and
+watching the seeded-recommendation test fail, then restoring. Full plugin quality gate and the
+entire `internalClusterTest` suite pass clean. Full detail in
+`write-routing-and-term-authority-progress.md`, Effort A's auto-split-controller section.
+
 **`writesPerMinute()` now has its first consumer, but still deliberately no auto-action.**
 `ShardSplitCandidatesAction` (`resharding/action` package) fans `writesPerMinute()` out across every
 data node via `ShardActivityRegistry.snapshotWritesPerMinute()`, merges the highest reading per

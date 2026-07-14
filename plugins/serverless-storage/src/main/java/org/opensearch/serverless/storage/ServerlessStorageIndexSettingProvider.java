@@ -15,6 +15,11 @@ import org.opensearch.index.IndexModule;
 import org.opensearch.index.shard.IndexSettingProvider;
 import org.opensearch.indices.replication.common.ReplicationType;
 import org.opensearch.serverless.storage.allocation.ServerlessStorageExistingShardsAllocator;
+import org.opensearch.serverless.storage.resharding.DataStreamBackingIndexNames;
+import org.opensearch.serverless.storage.resharding.DataStreamShardCountAdvisorCache;
+
+import java.util.Optional;
+import java.util.OptionalInt;
 
 /**
  * Automatically selects {@link ServerlessStorageExistingShardsAllocator} for every index that opts
@@ -53,16 +58,56 @@ import org.opensearch.serverless.storage.allocation.ServerlessStorageExistingSha
  * to reject -- rejecting it anyway would make reader-shard creation via {@code
  * index.number_of_search_replicas} impossible for every serverless-storage index, closing off this
  * plugin's only entry point into that path (rfc-serverless-opensearch.md &sect;18 risk #10).
+ *
+ * <p><b>Also injects a write-load-driven {@code number_of_shards} for a new data-stream backing
+ * index, the Elasticsearch-Serverless-style "autosharding" half of this plugin's write-scaling
+ * story</b> (rfc-serverless-opensearch.md &sect;16 Phase 4): when {@link DataStreamShardCountAdvisorCache}
+ * (populated off the hot path by {@code DataStreamShardCountAdvisorSchedulerTask}) has a
+ * recommendation for the data stream this new backing index belongs to (parsed from the index's
+ * own about-to-be-created name via {@link DataStreamBackingIndexNames#parseDataStreamName}), that
+ * recommendation is injected here. This hook is deliberately the only place that can safely act on
+ * the signal: it has no {@code ClusterState} access and cannot itself compute the signal (see the
+ * cache class's own javadoc), but it is exactly where core already lets a plugin influence a new
+ * index's settings without any new core seam, and it never touches an index that already exists --
+ * the same "only ever influence what's not created yet" safety property real Elastic Cloud
+ * Serverless autosharding has.
  */
 public final class ServerlessStorageIndexSettingProvider implements IndexSettingProvider {
+
+    private volatile DataStreamShardCountAdvisorCache shardCountAdvisorCache;
 
     /** Creates a provider with no configuration state; all decisions are derived from the settings passed to it. */
     public ServerlessStorageIndexSettingProvider() {}
 
+    /**
+     * Supplies the cache this provider consults for a new data-stream backing index's recommended
+     * shard count, once available -- this provider is constructed and registered before {@code
+     * createComponents} runs, the same "instantiate early, wire in late" shape other
+     * eagerly-constructed components in this plugin already use.
+     *
+     * @param shardCountAdvisorCache the shared cache {@code DataStreamShardCountAdvisorSchedulerTask} publishes into.
+     */
+    public void setDependencies(DataStreamShardCountAdvisorCache shardCountAdvisorCache) {
+        this.shardCountAdvisorCache = shardCountAdvisorCache;
+    }
+
     @Override
     public Settings getAdditionalIndexSettings(String indexName, boolean isDataStreamIndex, Settings templateAndRequestSettings) {
+        Settings.Builder dataStreamSettings = Settings.builder();
+        if (isDataStreamIndex) {
+            DataStreamShardCountAdvisorCache currentCache = this.shardCountAdvisorCache;
+            if (currentCache != null && templateAndRequestSettings.hasValue(IndexMetadata.SETTING_NUMBER_OF_SHARDS) == false) {
+                Optional<String> dataStreamName = DataStreamBackingIndexNames.parseDataStreamName(indexName);
+                if (dataStreamName.isPresent()) {
+                    OptionalInt recommendedShardCount = currentCache.recommendedShardCount(dataStreamName.get());
+                    if (recommendedShardCount.isPresent()) {
+                        dataStreamSettings.put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, recommendedShardCount.getAsInt());
+                    }
+                }
+            }
+        }
         if (ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.get(templateAndRequestSettings) == false) {
-            return Settings.EMPTY;
+            return dataStreamSettings.build();
         }
         int numberOfWriterReplicas = IndexMetadata.INDEX_NUMBER_OF_REPLICAS_SETTING.get(templateAndRequestSettings);
         if (numberOfWriterReplicas > 0
@@ -88,6 +133,7 @@ public final class ServerlessStorageIndexSettingProvider implements IndexSetting
             );
         }
         Settings.Builder settings = Settings.builder()
+            .put(dataStreamSettings.build())
             .put(ExistingShardsAllocator.EXISTING_SHARDS_ALLOCATOR_SETTING.getKey(), ServerlessStorageExistingShardsAllocator.NAME);
         if (ServerlessStoragePlugin.SERVERLESS_STORAGE_LAZY_DIRECTORY_ENABLED_SETTING.get(templateAndRequestSettings)) {
             settings.put(IndexModule.INDEX_STORE_TYPE_SETTING.getKey(), ServerlessStoragePlugin.LAZY_DIRECTORY_STORE_TYPE);

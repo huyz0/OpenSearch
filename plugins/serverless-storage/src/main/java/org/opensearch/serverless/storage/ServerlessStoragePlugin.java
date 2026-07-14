@@ -132,6 +132,16 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         new org.opensearch.serverless.storage.resharding.WritePartitionRoutingActionFilter();
 
     /**
+     * Constructed eagerly for the same reason as {@link #serverlessStorageExistingShardsAllocator}:
+     * {@link #getAdditionalIndexSettingProviders()} is called before {@link #createComponents} runs.
+     */
+    private final ServerlessStorageIndexSettingProvider serverlessStorageIndexSettingProvider = new ServerlessStorageIndexSettingProvider();
+
+    /** Shared with {@link #serverlessStorageIndexSettingProvider} once available; populated by {@link #dataStreamShardCountAdvisorSchedulerTask}. */
+    private final org.opensearch.serverless.storage.resharding.DataStreamShardCountAdvisorCache dataStreamShardCountAdvisorCache =
+        new org.opensearch.serverless.storage.resharding.DataStreamShardCountAdvisorCache();
+
+    /**
      * Constructed eagerly for the same reason as {@link #shardReactivationActionFilter}: {@link
      * #getExistingShardsAllocators()} is called before {@link #createComponents} runs, and this is
      * the instance returned from there, so the one {@link #createComponents} later calls {@code
@@ -513,6 +523,21 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * How often {@code DataStreamShardCountAdvisorSchedulerTask} re-evaluates {@code
+     * ShardSplitCandidatesAction} to refresh its data-stream next-generation shard-count
+     * recommendations -- same "background schedule mirrors an on-demand trigger, off by default"
+     * shape as {@link #SERVERLESS_STORAGE_SCALE_UP_EVAL_INTERVAL_SETTING}. Non-positive (the
+     * default) disables the scheduled evaluation entirely; {@code
+     * ServerlessStorageIndexSettingProvider} simply never has a recommendation to inject, the same
+     * safe "no cache entry -> no opinion" behavior as an evaluation that just hasn't run yet.
+     */
+    public static final Setting<TimeValue> SERVERLESS_STORAGE_SHARD_COUNT_ADVISOR_EVAL_INTERVAL_SETTING = Setting.timeSetting(
+        "serverless_storage.resharding.shard_count_advisor.eval_interval",
+        TimeValue.MINUS_ONE,
+        Setting.Property.NodeScope
+    );
+
+    /**
      * Deliberately separate from {@link #SERVERLESS_STORAGE_SCALE_UP_EVAL_INTERVAL_SETTING} and
      * defaulting to {@code false}, same reasoning as {@link #SERVERLESS_STORAGE_SCALE_TO_ZERO_SUSPEND_ENABLED_SETTING}:
      * turning on the scheduled evaluation alone must stay purely observational, never a silent
@@ -729,6 +754,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     private volatile long reshardingSplitCandidateWritesPerMinuteThreshold =
         SERVERLESS_STORAGE_RESHARDING_SPLIT_CANDIDATE_WPM_THRESHOLD_SETTING.getDefault(Settings.EMPTY);
     private volatile org.opensearch.serverless.storage.scaleup.ScaleUpCandidatesSchedulerTask scaleUpCandidatesSchedulerTask;
+    private volatile org.opensearch.serverless.storage.resharding.DataStreamShardCountAdvisorSchedulerTask dataStreamShardCountAdvisorSchedulerTask;
     // One node-local directory instance shared by every shard on this node -- matches the target
     // design's "one node block cache" shape (&sect;9) rather than a per-shard instance, and needs
     // no I/O to construct, so it's safe to build eagerly rather than threading through createComponents.
@@ -785,6 +811,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_SCALE_UP_QPM_THRESHOLD_SETTING,
             SERVERLESS_STORAGE_SCALE_UP_MAX_SEARCH_REPLICAS_SETTING,
             SERVERLESS_STORAGE_SCALE_UP_EVAL_INTERVAL_SETTING,
+            SERVERLESS_STORAGE_SHARD_COUNT_ADVISOR_EVAL_INTERVAL_SETTING,
             SERVERLESS_STORAGE_SCALE_UP_ENABLED_SETTING,
             SERVERLESS_STORAGE_SCALE_UP_REQUIRED_CONSECUTIVE_TICKS_SETTING,
             SERVERLESS_STORAGE_SCALE_UP_MAX_EXPANSIONS_PER_TICK_SETTING,
@@ -856,6 +883,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         );
         legacySnapshotActionFilter.setDependencies(clusterService, indexNameExpressionResolver);
         writePartitionRoutingActionFilter.setDependencies(clusterService, threadPool);
+        serverlessStorageIndexSettingProvider.setDependencies(dataStreamShardCountAdvisorCache);
         serverlessStorageExistingShardsAllocator.setDependencies(
             clusterService,
             SERVERLESS_STORAGE_READER_CACHE_AFFINITY_TTL_SETTING.get(environment.settings()).millis()
@@ -896,6 +924,17 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                     )
                     : null
             );
+        }
+        TimeValue shardCountAdvisorEvalInterval = SERVERLESS_STORAGE_SHARD_COUNT_ADVISOR_EVAL_INTERVAL_SETTING.get(environment.settings());
+        if (shardCountAdvisorEvalInterval.millis() > 0) {
+            this.dataStreamShardCountAdvisorSchedulerTask =
+                new org.opensearch.serverless.storage.resharding.DataStreamShardCountAdvisorSchedulerTask(
+                    threadPool,
+                    shardCountAdvisorEvalInterval,
+                    client,
+                    clusterService,
+                    dataStreamShardCountAdvisorCache
+                );
         }
         String configuredBasePath = SERVERLESS_STORAGE_BASE_PATH_SETTING.get(environment.settings());
         if (configuredBasePath.isEmpty() == false) {
@@ -1436,7 +1475,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
 
     @Override
     public Collection<IndexSettingProvider> getAdditionalIndexSettingProviders() {
-        return Collections.singletonList(new ServerlessStorageIndexSettingProvider());
+        return Collections.singletonList(serverlessStorageIndexSettingProvider);
     }
 
     /**
@@ -1913,6 +1952,22 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     /** The scale-up candidate scheduler task {@link #createComponents} built, or {@code null} if disabled -- test-only visibility. */
     org.opensearch.serverless.storage.scaleup.ScaleUpCandidatesSchedulerTask scaleUpCandidatesSchedulerTaskForTesting() {
         return scaleUpCandidatesSchedulerTask;
+    }
+
+    /** The data-stream shard-count advisor scheduler task {@link #createComponents} built, or {@code null} if disabled -- test-only visibility. */
+    org.opensearch.serverless.storage.resharding.DataStreamShardCountAdvisorSchedulerTask
+        dataStreamShardCountAdvisorSchedulerTaskForTesting() {
+        return dataStreamShardCountAdvisorSchedulerTask;
+    }
+
+    /**
+     * The shared cache {@link ServerlessStorageIndexSettingProvider} reads from, always
+     * non-{@code null} regardless of whether the scheduler task itself is enabled -- test-only
+     * visibility, lets a test seed a recommendation directly without needing a real, sustained
+     * write-load-driven evaluation to actually occur.
+     */
+    org.opensearch.serverless.storage.resharding.DataStreamShardCountAdvisorCache dataStreamShardCountAdvisorCacheForTesting() {
+        return dataStreamShardCountAdvisorCache;
     }
 
     /** The reader-shard admission controller {@link #createComponents} built, or {@code null} if disabled -- test-only visibility. */

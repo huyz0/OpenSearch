@@ -95,23 +95,39 @@ public final class WritePartitionRoutingMetadata {
         return builder.build();
     }
 
-    /** The write-routing alias {@code indexMetadata} is assigned to, or {@code null} if unassigned. */
+    /**
+     * The write-routing alias {@code indexMetadata} is assigned to, or {@code null} if unassigned.
+     *
+     * @param indexMetadata the index metadata to read the assignment from.
+     */
     public static String writeRoutingAlias(IndexMetadata indexMetadata) {
         Map<String, String> custom = indexMetadata.getCustomData(ALIAS_CUSTOM_TYPE);
         return custom == null ? null : custom.get(ALIAS_MAP_KEY);
     }
 
-    /** Which partition {@code indexMetadata} serves for its write-routing alias, if assigned. */
+    /**
+     * Which partition {@code indexMetadata} serves for its write-routing alias, if assigned.
+     *
+     * @param indexMetadata the index metadata to read the assignment from.
+     */
     public static OptionalInt partitionIndex(IndexMetadata indexMetadata) {
         return readInt(indexMetadata, PARTITION_INDEX_CUSTOM_TYPE, PARTITION_INDEX_MAP_KEY);
     }
 
-    /** How many partitions {@code indexMetadata}'s write-routing alias is divided into, if assigned. */
+    /**
+     * How many partitions {@code indexMetadata}'s write-routing alias is divided into, if assigned.
+     *
+     * @param indexMetadata the index metadata to read the assignment from.
+     */
     public static OptionalInt numPartitions(IndexMetadata indexMetadata) {
         return readInt(indexMetadata, NUM_PARTITIONS_CUSTOM_TYPE, NUM_PARTITIONS_MAP_KEY);
     }
 
-    /** Whether {@code indexMetadata} currently carries a write-routing assignment at all. */
+    /**
+     * Whether {@code indexMetadata} currently carries a write-routing assignment at all.
+     *
+     * @param indexMetadata the index metadata to check.
+     */
     public static boolean isWriteRoutingTarget(IndexMetadata indexMetadata) {
         return writeRoutingAlias(indexMetadata) != null;
     }
