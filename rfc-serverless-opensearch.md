@@ -3206,20 +3206,38 @@ live" and "how does a coordinator resolve it cheaply" design questions this sect
 raised: the answer turned out to be "nowhere new" -- cluster-state custom data plus the pre-existing
 partition hash function were already the right shape, reused rather than invented.
 
-**Deliberately narrower than the full gap, by design, not by oversight.** Two things remain
-out of scope for this first increment: (1) requests with no explicit id (core generates the id
-deeper in the indexing path, after this filter has already run -- correctly routing that case needs
-either generating the id here or deferring the routing decision, real additional design work); (2)
-fencing a target index's direct, alias-bypassing writes (distinguishing this filter's own
-already-rewritten request from a client writing to that same target index name directly requires
-information not available at this point in the filter chain). Neither degrades correctness for the
-cases this increment does handle -- an unhandled request either passes through unmodified (and core's
-own multi-index-alias guard rejects it, never silently misrouting a document) or is out of this
-increment's stated scope entirely. Proven end-to-end in `ServerlessStorageWritePartitionRoutingActionIT`
-against a real two-node cluster: 20 documents indexed against the alias by explicit id land in exactly
-the target partition their id's hash predicts, and never in the other; confirmed meaningful by
-disabling the filter's rewrite and watching the test fail with core's own "no write index is
-defined for alias" error, then restoring it.
+**Deliberately narrower than the full gap, by design, not by oversight.** One thing remains out of
+scope for this first increment: requests with no explicit id (core generates the id deeper in the
+indexing path, after this filter has already run -- correctly routing that case needs either
+generating the id here or deferring the routing decision, real additional design work). This does
+not degrade correctness for the cases this increment does handle -- an unhandled request passes
+through unmodified and core's own multi-index-alias guard rejects it, never silently misrouting a
+document. Proven end-to-end in `ServerlessStorageWritePartitionRoutingActionIT` against a real
+two-node cluster: 20 documents indexed against the alias by explicit id land in exactly the target
+partition their id's hash predicts, and never in the other; confirmed meaningful by disabling the
+filter's rewrite and watching the test fail with core's own "no write index is defined for alias"
+error, then restoring it.
+
+**Status: direct (alias-bypassing) writes to an assigned target index are now fenced too.** At the
+point `WritePartitionRoutingActionFilter#apply` first reads a request's target index name, that
+value is still the client's own original one -- if it directly names an index carrying a
+write-routing assignment, the write is rejected with `IllegalArgumentException` before any
+rewriting happens later in the same call, rather than silently allowed to write into just one
+partition's worth of documents behind the alias's back. **A real re-entrancy bug found and fixed
+while building this**: a single-item `client().prepareIndex(alias)` call does not traverse this
+filter chain once -- core's `TransportSingleItemBulkWriteAction` wraps it into a `BulkRequest` and
+dispatches that through the *same* filter chain a second time, synchronously, on the same thread.
+By that second pass, this filter's own first-pass rewrite had already replaced the alias name with
+the real target index name, which a naive fencing check then misidentified as a client writing to
+that target directly -- caught because the new fencing test's very first run broke the *existing*
+legitimate-write test, not a hypothetical. Fixed with a `ThreadContext` transient marker: an
+identity-based `Set` of requests this filter has itself rewritten, stashed once per thread-context
+and consulted (not re-created) on re-entry -- the same "transient, not wire-serialized, survives
+nested synchronous calls on one thread" property `ThreadContext` transients are already used for
+elsewhere in core. Tested in `testDirectWritesToAnAssignedTargetIndexAreRefused`; confirmed
+meaningful by disabling the fencing check and watching the test fail with "no exception was
+thrown," then restoring. Full plugin quality gate and the entire `internalClusterTest` suite pass
+clean.
 
 **`writesPerMinute()` now has its first consumer, but still deliberately no auto-action.**
 `ShardSplitCandidatesAction` (`resharding/action` package) fans `writesPerMinute()` out across every

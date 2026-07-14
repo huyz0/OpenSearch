@@ -53,13 +53,28 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done (reviewed before
       `TransportEnableWritePartitionRoutingAction`/`RestEnableWritePartitionRoutingAction`,
       REST-exposed as `POST .../_resharding/_enable_write_routing/{alias}?target_indices=a,b,c`,
       deliberately a separate explicit opt-in step, not a flag on the search-only action.
-- [ ] A9. Fence writes arriving at the source index after write-cutover. **Not done, documented as
-      a known gap**: distinguishing this filter's own already-rewritten request from a client
-      writing to the same target index name directly needs information not available at this
-      point in the filter chain -- real follow-up design work (see the filter's own javadoc).
-- [ ] A10. Fence writes arriving at a target before write-cutover completes. Same gap as A9 --
-      not done, documented, not silently unsafe (a target accepting a direct write before
-      write-routing is enabled is no different from writing to any ordinary index today).
+- [x] A9/A10. Fence a target index's direct (alias-bypassing) writes. **Done, combined into one
+      check**: at the point `WritePartitionRoutingActionFilter#apply` first reads a request's
+      `index()`, that value is still the client's own original target -- if it directly names an
+      index carrying a write-routing assignment, the write is rejected outright with
+      `IllegalArgumentException` before any rewriting happens later in the same call. This turned
+      out to subsume both A9 (fencing the source after cutover isn't applicable in this design --
+      the source keeps its own name and was never itself assigned a partition) and A10 (fencing a
+      target before/after write-routing is enabled): any direct write to an *assigned* target index
+      is refused, unconditionally, regardless of timing relative to cutover.
+      **A real re-entrancy bug found and fixed while building this**: a single-item
+      `client().prepareIndex(alias)` call doesn't traverse this filter chain once -- core's
+      `TransportSingleItemBulkWriteAction` wraps it into a `BulkRequest` and dispatches that
+      through the *same* filter chain a second time, synchronously, on the same thread. By the
+      second pass, this filter's own first-pass rewrite had already replaced the alias name with
+      the real target index name, which the naive fencing check then misidentified as a client
+      writing to that target directly -- confirmed by the new fencing IT genuinely failing the
+      *legitimate* alias-write test until fixed. Fixed with a `ThreadContext` transient marker: an
+      identity-based `Set` of requests this filter has itself rewritten, stashed once per
+      thread-context, consulted (not re-created) on re-entry. Tested end-to-end in
+      `testDirectWritesToAnAssignedTargetIndexAreRefused`; confirmed meaningful by disabling the
+      fencing check and watching the test fail with "no exception was thrown," then restoring.
+      Full plugin quality gate + entire `internalClusterTest` suite pass clean.
 
 ### Testing
 - [x] A11 (narrowed to this increment's scope). **Done**:

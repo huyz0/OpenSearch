@@ -108,4 +108,51 @@ public class ServerlessStorageWritePartitionRoutingActionIT extends ServerlessSt
 
         assertHitCount(client().prepareSearch("write-routing-alias").setSize(0).get(), 20);
     }
+
+    public void testDirectWritesToAnAssignedTargetIndexAreRefused() throws Exception {
+        internalCluster().startClusterManagerOnlyNode();
+        internalCluster().startDataOnlyNode();
+
+        createIndex(
+            "fenced-target-a",
+            Settings.builder().put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1).put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0).build()
+        );
+        createIndex(
+            "fenced-target-b",
+            Settings.builder().put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1).put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0).build()
+        );
+        ensureGreen("fenced-target-a", "fenced-target-b");
+
+        List<String> targets = List.of("fenced-target-a", "fenced-target-b");
+        client().execute(CutoverSplitRoutingAction.INSTANCE, new CutoverSplitRoutingRequest("fenced-alias", targets)).get();
+        client().execute(EnableWritePartitionRoutingAction.INSTANCE, new EnableWritePartitionRoutingRequest("fenced-alias", targets)).get();
+
+        // A direct write to one of the two real assigned targets -- naming it by its own real
+        // index name, not through the alias -- must be refused, since it would silently write into
+        // just one partition's worth of documents behind the alias's back.
+        Exception failure = expectThrows(
+            Exception.class,
+            () -> client().prepareIndex("fenced-target-a").setId("doc-1").setSource("field", "value").get()
+        );
+        assertTrue(
+            "the refusal must be this plugin's own fencing check, not some other failure: " + failure,
+            causedByFencingCheck(failure)
+        );
+
+        // The fenced write must never have partially applied.
+        refresh("fenced-target-a");
+        assertFalse(
+            "a refused direct write must never actually land in the target index",
+            client().prepareGet("fenced-target-a", "doc-1").get().isExists()
+        );
+    }
+
+    private static boolean causedByFencingCheck(Throwable error) {
+        for (Throwable cause = error; cause != null; cause = cause.getCause()) {
+            if (cause.getMessage() != null && cause.getMessage().contains("writes must go through the alias")) {
+                return true;
+            }
+        }
+        return false;
+    }
 }

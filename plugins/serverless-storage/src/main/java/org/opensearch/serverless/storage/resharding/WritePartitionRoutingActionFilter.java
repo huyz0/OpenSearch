@@ -23,12 +23,17 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.routing.Murmur3HashFunction;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.tasks.Task;
+import org.opensearch.threadpool.ThreadPool;
 
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.OptionalInt;
+import java.util.Set;
 
 /**
  * The write-side counterpart to {@link RoutingPartitionFilter}: rewrites an {@link
@@ -59,31 +64,53 @@ import java.util.OptionalInt;
  * which core will then reject with its own "more than one index" error -- a safe, if unhelpful,
  * failure mode: it never silently misroutes a document.
  *
- * <p><b>Deliberately does not fence a target index's direct (alias-bypassing) writes yet</b>: doing
- * so safely requires distinguishing this filter's own already-rewritten requests (which legitimately
- * target one specific target index directly, by design) from a client writing to that same target
- * index name directly without going through the alias -- both look identical to this filter once
- * rewriting has already happened earlier in the same filter chain invocation. That distinction is
- * real follow-up work, not implemented here; see the progress-tracking doc.
+ * <p><b>Fences a target index's direct (alias-bypassing) writes.</b> The distinction this needs --
+ * "did the client name the alias (legitimate, gets rewritten below) or the target index directly
+ * (illegitimate once that target is write-routing-assigned)" -- is available for free: {@link
+ * DocWriteRequest#index()} still holds the client's own original value the first time this filter
+ * reads it in one {@link #apply} invocation, before any rewriting happens later in that same call.
+ * A request naming an assigned target index directly is rejected outright rather than silently
+ * allowed to write into just one partition's worth of documents behind the alias's back. For a
+ * {@link BulkRequest}, any single offending item fails the whole request rather than only that item
+ * -- blunter than per-item rejection, but simple and safe: a bulk request half fenced and half not
+ * would be a worse failure mode than an oversized, uniform rejection.
+ *
+ * <p><b>A real re-entrancy bug this fencing check's own integration test caught</b>: a single-item
+ * {@code client().prepareIndex(alias)} call does not run through this filter chain once -- core's
+ * {@code TransportSingleItemBulkWriteAction} wraps it into a {@code BulkRequest} and dispatches
+ * that through the very same filter chain a second time, on the same thread, synchronously. By the
+ * second pass, this filter's own first-pass rewrite has already replaced the request's alias name
+ * with the real target index name -- indistinguishable, by {@link DocWriteRequest#index()} alone,
+ * from a client writing to that target directly. Fixed with a {@link ThreadContext} transient
+ * marker: an identity-based {@link Set} of requests this filter has itself rewritten, stashed once
+ * per thread-context and consulted (not re-populated) on re-entry, the same "transient, not
+ * wire-serialized, survives nested synchronous calls on one thread" property {@code ThreadContext}
+ * transients are already used for elsewhere in core.
  */
 public final class WritePartitionRoutingActionFilter implements ActionFilter {
 
     private static final Logger logger = LogManager.getLogger(WritePartitionRoutingActionFilter.class);
 
+    private static final String REWRITTEN_MARKER_KEY = "serverless_storage_write_partition_routing_rewritten";
+
     private volatile ClusterService clusterService;
+    private volatile ThreadPool threadPool;
 
     /** Creates the filter with no dependencies yet -- see {@link #setDependencies}. */
     public WritePartitionRoutingActionFilter() {}
 
     /**
-     * Supplies the dependency this filter needs, once available -- see {@link
+     * Supplies the dependencies this filter needs, once available -- see {@link
      * org.opensearch.serverless.storage.scaletozero.ShardReactivationActionFilter#setDependencies}
      * for why this indirection exists.
      *
      * @param clusterService used to read each candidate target's write-routing assignment.
+     * @param threadPool used to stash the already-rewritten marker across this filter's own re-entrant
+     *                   invocations within one request (see this class's own javadoc).
      */
-    public void setDependencies(ClusterService clusterService) {
+    public void setDependencies(ClusterService clusterService, ThreadPool threadPool) {
         this.clusterService = clusterService;
+        this.threadPool = threadPool;
     }
 
     @Override
@@ -101,21 +128,83 @@ public final class WritePartitionRoutingActionFilter implements ActionFilter {
         ActionFilterChain<Request, Response> chain
     ) {
         ClusterService currentClusterService = this.clusterService;
-        if (currentClusterService != null) {
+        ThreadPool currentThreadPool = this.threadPool;
+        if (currentClusterService != null && currentThreadPool != null) {
+            ClusterState state = currentClusterService.state();
+            Set<DocWriteRequest<?>> alreadyRewritten = rewrittenMarkerSet(currentThreadPool.getThreadContext());
             if (request instanceof DocWriteRequest<?> docWriteRequest) {
-                rewriteIfAssigned(currentClusterService.state(), docWriteRequest);
+                String rejection = rejectIfDirectTargetWrite(state, docWriteRequest, alreadyRewritten);
+                if (rejection != null) {
+                    listener.onFailure(new IllegalArgumentException(rejection));
+                    return;
+                }
+                rewriteIfAssigned(state, docWriteRequest, alreadyRewritten);
             } else if (request instanceof BulkRequest bulkRequest) {
-                ClusterState state = currentClusterService.state();
-                List<DocWriteRequest<?>> requests = bulkRequest.requests();
-                for (DocWriteRequest<?> item : requests) {
-                    rewriteIfAssigned(state, item);
+                for (DocWriteRequest<?> item : bulkRequest.requests()) {
+                    String rejection = rejectIfDirectTargetWrite(state, item, alreadyRewritten);
+                    if (rejection != null) {
+                        listener.onFailure(new IllegalArgumentException(rejection));
+                        return;
+                    }
+                }
+                for (DocWriteRequest<?> item : bulkRequest.requests()) {
+                    rewriteIfAssigned(state, item, alreadyRewritten);
                 }
             }
         }
         chain.proceed(task, action, request, listener);
     }
 
-    private static void rewriteIfAssigned(ClusterState state, DocWriteRequest<?> request) {
+    /**
+     * The identity-based set of requests this filter has itself rewritten during the current
+     * request's lifetime, stashed once per {@link ThreadContext} and reused (never re-created) on
+     * this filter's own re-entrant invocations -- see this class's own javadoc.
+     */
+    @SuppressWarnings("unchecked")
+    private static Set<DocWriteRequest<?>> rewrittenMarkerSet(ThreadContext threadContext) {
+        Object existing = threadContext.getTransient(REWRITTEN_MARKER_KEY);
+        if (existing instanceof Set) {
+            return (Set<DocWriteRequest<?>>) existing;
+        }
+        Set<DocWriteRequest<?>> created = Collections.newSetFromMap(new IdentityHashMap<>());
+        threadContext.putTransient(REWRITTEN_MARKER_KEY, created);
+        return created;
+    }
+
+    /**
+     * @return a rejection message if {@code request} names a write-routing-assigned target index
+     *         directly (bypassing its alias), or {@code null} if the request is fine to proceed --
+     *         including because it's this filter's own already-rewritten request re-entering on a
+     *         nested dispatch (see this class's own javadoc).
+     */
+    private static String rejectIfDirectTargetWrite(
+        ClusterState state,
+        DocWriteRequest<?> request,
+        Set<DocWriteRequest<?>> alreadyRewritten
+    ) {
+        if (alreadyRewritten.contains(request)) {
+            return null;
+        }
+        String indexName = request.index();
+        if (indexName == null) {
+            return null;
+        }
+        IndexMetadata directMetadata = state.metadata().index(indexName);
+        if (directMetadata == null) {
+            return null;
+        }
+        String assignedAlias = WritePartitionRoutingMetadata.writeRoutingAlias(directMetadata);
+        if (assignedAlias == null) {
+            return null;
+        }
+        return "index ["
+            + indexName
+            + "] is a write-routing partition target of alias ["
+            + assignedAlias
+            + "] -- writes must go through the alias, not the target index directly";
+    }
+
+    private static void rewriteIfAssigned(ClusterState state, DocWriteRequest<?> request, Set<DocWriteRequest<?>> alreadyRewritten) {
         String aliasName = request.index();
         String id = request.id();
         if (aliasName == null || id == null) {
@@ -133,6 +222,7 @@ public final class WritePartitionRoutingActionFilter implements ActionFilter {
         String resolvedTargetIndexName = resolvePartitionTarget(metadata, aliasName, targetIndexNames, id);
         if (resolvedTargetIndexName != null) {
             request.index(resolvedTargetIndexName);
+            alreadyRewritten.add(request);
         }
     }
 

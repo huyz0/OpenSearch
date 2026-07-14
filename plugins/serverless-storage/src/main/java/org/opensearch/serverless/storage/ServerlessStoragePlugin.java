@@ -855,7 +855,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_SCALE_TO_ZERO_SEARCH_REACTIVATION_WAIT_SETTING.get(environment.settings())
         );
         legacySnapshotActionFilter.setDependencies(clusterService, indexNameExpressionResolver);
-        writePartitionRoutingActionFilter.setDependencies(clusterService);
+        writePartitionRoutingActionFilter.setDependencies(clusterService, threadPool);
         serverlessStorageExistingShardsAllocator.setDependencies(
             clusterService,
             SERVERLESS_STORAGE_READER_CACHE_AFFINITY_TTL_SETTING.get(environment.settings()).millis()
