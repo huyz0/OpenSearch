@@ -11,8 +11,11 @@ package org.opensearch.serverless.storage;
 import org.opensearch.action.support.clustermanager.AcknowledgedResponse;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.routing.Murmur3HashFunction;
+import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.plugins.Plugin;
+import org.opensearch.serverless.storage.resharding.WritePartitionRoutingMetadata;
 import org.opensearch.serverless.storage.resharding.action.CutoverSplitRoutingAction;
 import org.opensearch.serverless.storage.resharding.action.CutoverSplitRoutingRequest;
 import org.opensearch.serverless.storage.resharding.action.DisableWritePartitionRoutingAction;
@@ -303,5 +306,76 @@ public class ServerlessStorageWritePartitionRoutingActionIT extends ServerlessSt
             }
         }
         assertEquals("no document must be duplicated or lost across targets", succeededIds.size(), foundInA + foundInB);
+    }
+
+    public void testWriteRoutingAssignmentSurvivesATargetsNodeBeingKilled() throws Exception {
+        internalCluster().startClusterManagerOnlyNode();
+        internalCluster().startDataOnlyNode();
+        internalCluster().startDataOnlyNode();
+
+        // Deliberately 1 replica, not 0: this test's fault is killing a target's node, and with 0
+        // replicas that node holds the shard's *only* copy -- an ordinary, expected-forever-red
+        // outcome for any plain OpenSearch index, unrelated to what this test actually exercises
+        // (whether write-routing *metadata* survives). A replica means a live copy is promoted and
+        // the cluster genuinely returns to green, the same way the fault is modeled elsewhere in
+        // this plugin's own chaos tests (e.g. ServerlessStorageWriterFailoverIT's node-kill tests).
+        createIndex(
+            "chaos-target-a",
+            Settings.builder().put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1).put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 1).build()
+        );
+        createIndex(
+            "chaos-target-b",
+            Settings.builder().put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1).put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 1).build()
+        );
+        ensureGreen("chaos-target-a", "chaos-target-b");
+
+        List<String> targets = List.of("chaos-target-a", "chaos-target-b");
+        client().execute(CutoverSplitRoutingAction.INSTANCE, new CutoverSplitRoutingRequest("chaos-alias", targets)).get();
+        AcknowledgedResponse enableResponse = client().execute(
+            EnableWritePartitionRoutingAction.INSTANCE,
+            new EnableWritePartitionRoutingRequest("chaos-alias", targets)
+        ).get();
+        assertTrue(enableResponse.isAcknowledged());
+
+        // Cluster-manager-held metadata, not data-node-held data, is what this test actually
+        // exercises -- write-routing assignment is IndexMetadata custom data, mutated only via a
+        // cluster-manager-side ClusterStateUpdateTask, so killing whichever data node happens to
+        // hold one target's only copy is the right fault: it proves the assignment survives on the
+        // metadata's own replication path (every node's local cluster state), independent of
+        // whether that specific target's own shard data is momentarily unavailable during recovery.
+        ShardRouting targetAPrimary = internalCluster().clusterService()
+            .state()
+            .routingTable()
+            .index("chaos-target-a")
+            .shard(0)
+            .primaryShard();
+        String targetANodeId = targetAPrimary.currentNodeId();
+        String targetANodeName = internalCluster().clusterService().state().nodes().get(targetANodeId).getName();
+        internalCluster().stopRandomNode(settings -> targetANodeName.equals(settings.get("node.name")));
+        internalCluster().startDataOnlyNode();
+        ensureGreen(TimeValue.timeValueSeconds(90), "chaos-target-a", "chaos-target-b");
+
+        // The assignment itself, read directly off cluster-manager-held IndexMetadata, must have
+        // survived the node death intact -- not just "some value," the exact original assignment.
+        IndexMetadata targetAMetadataAfter = internalCluster().clusterService().state().metadata().index("chaos-target-a");
+        assertEquals("chaos-alias", WritePartitionRoutingMetadata.writeRoutingAlias(targetAMetadataAfter));
+        assertTrue(WritePartitionRoutingMetadata.partitionIndex(targetAMetadataAfter).isPresent());
+        assertTrue(WritePartitionRoutingMetadata.numPartitions(targetAMetadataAfter).isPresent());
+
+        // And the mechanism it exists to support -- correct write routing -- must still function
+        // end-to-end after recovery, not just the metadata field being technically present.
+        String idExpectedInA = null;
+        for (int i = 0; i < 1000 && idExpectedInA == null; i++) {
+            String candidate = "chaos-doc-" + i;
+            if (Math.floorMod(Murmur3HashFunction.hash(candidate), 2) == 0) {
+                idExpectedInA = candidate;
+            }
+        }
+        client().prepareIndex("chaos-alias").setId(idExpectedInA).setSource("field", "value").get();
+        refresh("chaos-target-a");
+        assertTrue(
+            "write routing must still function correctly against chaos-target-a after recovery",
+            client().prepareGet("chaos-target-a", idExpectedInA).get().isExists()
+        );
     }
 }

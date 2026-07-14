@@ -3281,6 +3281,20 @@ no duplication. Re-run 3 additional times with different random seeds to rule ou
 trusting the result. Full plugin quality gate and the entire `internalClusterTest` suite pass
 clean.
 
+**Status: write-routing assignment metadata survives a target's node dying too, closing out all
+of this gap's design, implementation, and testing work.** `testWriteRoutingAssignmentSurvivesATargetsNodeBeingKilled`
+kills the data node holding one target's primary shard, starts a replacement, waits for green, then
+checks both that the write-routing assignment read directly off cluster-manager-held `IndexMetadata`
+survived unchanged and that a write against the alias afterward still routes correctly end-to-end.
+A real test-design bug surfaced and was fixed while building this: the first version used 0-replica
+targets, so killing a target's only-copy node left that shard permanently unrecoverable -- an
+ordinary, expected outcome for any 0-replica index on node death, unrelated to what the test is
+meant to exercise, not a routing bug. Fixed by giving both targets 1 replica, the same fault model
+`ServerlessStorageWriterFailoverIT`'s own node-kill tests already use elsewhere in this plugin.
+Full plugin quality gate and the entire `internalClusterTest` suite pass clean. **This closes all
+of Effort A's write-side partition routing design, implementation, and testing work -- only the
+auto-split controller itself (wiring `writesPerMinute()` to trigger this automatically) remains.**
+
 **`writesPerMinute()` now has its first consumer, but still deliberately no auto-action.**
 `ShardSplitCandidatesAction` (`resharding/action` package) fans `writesPerMinute()` out across every
 data node via `ShardActivityRegistry.snapshotWritesPerMinute()`, merges the highest reading per

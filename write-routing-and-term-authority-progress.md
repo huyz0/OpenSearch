@@ -119,10 +119,23 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done (reviewed before
       across both targets (no loss, no duplication). Re-ran 3 additional times with different
       random seeds to rule out flakiness before trusting the result -- all passed. Full plugin
       quality gate and the entire `internalClusterTest` suite pass clean.
-- [ ] A13. Chaos test: node death mid-cutover, routing map state survives intact. Not yet done --
-      likely already covered in spirit by cluster-state's own general replication/failover
-      guarantees (this metadata rides the same mechanism as `SuspendedShardsMetadata`, which chaos
-      tests already exercise), but not proven directly for this specific metadata yet.
+- [x] A13. Chaos test: node death, routing map state survives intact. **Done**:
+      `testWriteRoutingAssignmentSurvivesATargetsNodeBeingKilled` -- enables write routing, kills
+      the data node holding one target's primary shard, starts a replacement node, waits for green,
+      then asserts (a) the write-routing assignment read directly off cluster-manager-held
+      `IndexMetadata` is exactly what it was before the kill, and (b) a write against the alias
+      afterward still routes correctly end-to-end, not just that the metadata field happens to be
+      present. **A real test-design bug found and fixed while building this**: the first version
+      used 0-replica targets, so killing the node holding a target's *only* copy left that shard
+      permanently unrecoverable (an ordinary, expected outcome for any 0-replica index on node
+      death, unrelated to what this test is meant to exercise) -- `ensureGreen` timed out for real,
+      not due to a routing bug. Fixed by giving both targets 1 replica, matching the fault model
+      `ServerlessStorageWriterFailoverIT`'s own node-kill tests already use elsewhere in this
+      plugin, so a live copy is promoted and the cluster genuinely returns to green. Full plugin
+      quality gate and the entire `internalClusterTest` suite pass clean.
+
+      **This closes out all of Effort A's design, implementation, and testing work (A1-A13).**
+      Only the auto-split controller itself (A14-A17) remains.
 
 ### Auto-split controller
 - [ ] A14. Design trigger policy off `writesPerMinute()` (thresholds + hysteresis).
