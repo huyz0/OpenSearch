@@ -1245,6 +1245,32 @@ public abstract class Engine implements LifecycleAware, Closeable {
     }
 
     /**
+     * Called synchronously by {@link org.opensearch.index.shard.IndexShard#bumpPrimaryTerm} the
+     * moment this shard's primary term is durably advanced on an already-open engine (the live
+     * promotion of an existing shard copy to primary) -- fired inside the same window write
+     * operations are already blocked in, strictly after the new term is set and strictly before
+     * operations resume, so an override observes exactly one atomic instant: "this engine is now
+     * definitely operating under {@code newPrimaryTerm}, and nothing has written under it yet."
+     *
+     * <p>No-op by default; every classic engine is unaffected. Exists purely as an extension seam
+     * for engine implementations (e.g. a plugin-supplied {@link EngineFactory}) that need to
+     * capture activation-time state atomically with the term bump itself, rather than merely at
+     * this engine's own constructor time -- which, for an engine object that already existed
+     * before promotion (as opposed to one freshly constructed to serve as this shard's first-ever
+     * primary), can observe the term only as it was before this exact promotion.
+     *
+     * <p>This is <em>not</em> called for a brand-new engine's own construction (e.g. this shard's
+     * primary being freshly allocated to a node that never held a copy before) -- there,
+     * {@link EngineConfig#getPrimaryTermSupplier()} already reflects the correct term by the time
+     * the engine's constructor runs, since {@code IndexShard}'s own constructor sets
+     * {@code pendingPrimaryTerm} from cluster metadata before anything about engine construction
+     * begins; no atomicity gap exists for that path, so no additional call is needed there.
+     *
+     * @param newPrimaryTerm the primary term this engine is now operating under.
+     */
+    public void onPrimaryTermBumped(long newPrimaryTerm) {}
+
+    /**
      * Synchronously refreshes the engine for new search operations to reflect the latest
      * changes.
      */

@@ -63,6 +63,12 @@ public class EngineBackedIndexer implements Indexer {
         return engine instanceof NRTReplicationEngine;
     }
 
+    /** Delegates to the wrapped {@link Engine}'s own {@link Engine#onPrimaryTermBumped(long)}. */
+    @Override
+    public void onPrimaryTermBumped(long newPrimaryTerm) {
+        engine.onPrimaryTermBumped(newPrimaryTerm);
+    }
+
     @Override
     public Engine.IndexResult index(Engine.Index index) throws IOException {
         return engine.index(index);

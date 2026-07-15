@@ -998,6 +998,72 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
         }
     }
 
+    public void testOnPrimaryTermBumpedReSnapshotsActivationWalPositionToTheLiveBound() throws Exception {
+        // The B8/B9 core hook this test proves: for an already-constructed engine (a writer
+        // replica later promoted to primary, as opposed to a shard freshly recovering from
+        // scratch), the constructor-time snapshot alone is stale -- see Engine#onPrimaryTermBumped's
+        // own javadoc for exactly why. This engine is constructed with WAL mirroring on but with
+        // no chunks written yet, then chunks are appended (simulating this engine, as a live
+        // writer replica, replaying ops shipped from the then-primary) strictly after
+        // construction and strictly before the term bump this test fires -- proving the
+        // re-snapshot picks up activity the constructor could not have seen.
+        FsBlobStore walBlobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer walBlobContainer = new FsBlobContainer(walBlobStore, BlobPath.cleanPath(), walBlobStore.path());
+        org.opensearch.serverless.storage.wal.WalChunkService walChunkService = new org.opensearch.serverless.storage.wal.WalChunkService(
+            walBlobContainer,
+            "shared-epoch"
+        );
+
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+
+        Store store = createStore();
+        lastOpenedStore = store;
+        store.createEmpty(defaultSettings.getIndexVersionCreated().luceneVersion);
+        java.nio.file.Path translogPath = createTempDir();
+        String translogUuid = Translog.createEmptyTranslog(translogPath, SequenceNumbers.NO_OPS_PERFORMED, shardId, primaryTerm.get());
+        store.associateIndexWithNewTranslog(translogUuid);
+        EngineConfig engineConfig = config(defaultSettings, store, translogPath, newMergePolicy(), null);
+
+        ObjectStoreWriterEngine engine = new ObjectStoreWriterEngine(
+            engineConfig,
+            new ObjectStoreCommitHeadPublisher(commitPublisher, shardStateStore),
+            shardDirectory,
+            LOCAL_NODE_ID,
+            null,
+            walChunkService
+        );
+        try {
+            long snapshotAtConstruction = engine.activationWalPositionForTesting();
+            assertEquals("nothing had been appended before construction", 0L, snapshotAtConstruction);
+
+            // Simulates real activity landing in this engine's WAL stream after it was constructed
+            // as a replica but before its own promotion to primary -- the exact gap a
+            // constructor-only snapshot cannot see.
+            walChunkService.append(
+                new org.opensearch.serverless.storage.wal.WalRecord(INDEX_UUID, 0, 1, 0, "post-construction".getBytes("UTF-8"))
+            );
+            walChunkService.flush();
+            long liveBoundBeforeBump = walChunkService.currentChunkSequenceUpperBound();
+            assertTrue("test setup should have produced a later chunk", liveBoundBeforeBump > snapshotAtConstruction);
+
+            engine.onPrimaryTermBumped(primaryTerm.get() + 1);
+
+            assertEquals(
+                "the hook must re-snapshot to the live bound at the moment of the term bump, not leave the stale constructor-time value",
+                liveBoundBeforeBump,
+                engine.activationWalPositionForTesting()
+            );
+        } finally {
+            IOUtils.close(engine, lastOpenedStore);
+        }
+    }
+
     public void testActivationWalPositionIsMinusOneWhenWalMirroringIsDisabled() throws Exception {
         FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
         BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());

@@ -85,6 +85,16 @@ public interface Indexer
     }
 
     /**
+     * See {@link org.opensearch.index.engine.Engine#onPrimaryTermBumped(long)} -- this is the
+     * {@link Indexer}-level counterpart of that same seam, called by {@code IndexShard} at the
+     * exact same atomic instant regardless of which concrete indexer implementation is currently
+     * active for this shard. No-op by default.
+     *
+     * @param newPrimaryTerm the primary term this indexer is now operating under.
+     */
+    default void onPrimaryTermBumped(long newPrimaryTerm) {}
+
+    /**
      * Returns information about the safe commit point.
      * The safe commit represents a consistent state that can be used for recovery.
      *

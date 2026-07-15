@@ -361,20 +361,88 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done (reviewed before
       violation found; the Java implementation itself remains not yet done (still withheld pending
       authorization, per B4/B8).
 
+### A new finding that reframed B8's real scope, before implementing it
+- [x] **Traced the real code for the freshly-initializing-primary path (0 writer replicas, node
+      dies, shard reallocated to a new node) -- confirmed race-free, no core change needed for
+      that specific case.** `IndexShard`'s own constructor (`IndexShard.java:516-517`) sets
+      `pendingPrimaryTerm` directly from `IndexMetadata.primaryTerm(shardId)` -- already the
+      post-reroute, correctly-bumped value, since cluster-manager bumps that term as part of the
+      same cluster-state update that reroutes the new primary copy, before any node ever applies
+      that state. `newEngineConfig`'s `primaryTermSupplier` (`IndexShard.java:4853`, delegating to
+      `getOperationPrimaryTerm()`/`replicationTracker`) reads that already-correct value, and
+      `Engine` construction happens strictly later, during `markAsRecovering`'s own recovery flow.
+      There is no window on this path where an engine could observe a stale term -- this is the
+      **realistic common case** for a typical 0-writer-replica serverless-storage shard (durability
+      via manifest publication, not replica copies), and it needs nothing new in core.
+      `bumpPrimaryTerm`'s own live-promotion branch is provably irrelevant to this path -- it
+      explicitly asserts `newRouting.initializing() == false` (`IndexShard.java:850`, "a started
+      primary shard should never update its term"), i.e. it only ever fires for a shard that is
+      already an active, already-constructed engine transitioning terms in place.
+- [x] **The real residual gap is narrower than B1-B7 framed it, and lives in the >0-writer-replica
+      live-promotion case, not a fundamental absence of fencing.** This plugin's own object-store
+      CAS (`ObjectStoreCommitHeadPublisher#publishCommitAsHead`, via `ShardHead#withPublishedGeneration`)
+      already refuses any publish under a term strictly older than the head's current stored term
+      -- self-healing fencing that closes the gap the moment the newly-promoted primary publishes
+      once. The narrow window that remained open: between a live promotion and that new primary's
+      *first* publish, a genuinely isolated old primary (reachable by the object store even while
+      partitioned from the OpenSearch cluster itself, since object-store credentials are a
+      separate network path) could still successfully publish under its old, not-yet-superseded
+      term, since nothing durably records the new term at promotion time, only at first publish.
+      Confirmed this is a live-writer-replica scenario, not a hypothetical: `getEngineFactory`
+      selects `ObjectStoreWriterEngine` based on `ShardRouting#isSearchOnly()`, not `primary()` --
+      an ordinary (non-search-only) writer replica genuinely runs the same engine class and is a
+      genuine promotion candidate via core's standard replica-promotion path.
+
 ### Implementation
-- [ ] B8. Implement the atomic grant primitive in core cluster-coordination.
-- [ ] B9. Replace `ObjectStoreWriterEngine`'s constructor-time `activationWalPosition` snapshot
-      with a read of the atomically-recorded position.
-- [ ] B10. Update/remove the "honest limitation" javadoc once the gap is closed.
+- [x] B8. **Implemented, scoped smaller than originally proposed.** Rather than the originally
+      floated `EnginePlugin` SPI (a new per-plugin extension point resolved at engine-factory-selection
+      time), the actual seam landed directly on the existing `Engine` abstract class (`server/src/main/java/org/opensearch/index/engine/Engine.java`):
+      a new `public void onPrimaryTermBumped(long newPrimaryTerm) {}`, no-op by default, so every
+      classic engine is completely unaffected. Mirrored on the `Indexer` interface (`server/src/main/java/org/opensearch/index/engine/exec/Indexer.java`,
+      this fork's own pluggable-engine-per-shard-role abstraction) as a matching `default` no-op,
+      with `EngineBackedIndexer` delegating straight through to the wrapped `Engine`. `IndexShard#bumpPrimaryTerm`'s
+      live-promotion `onResponse` callback now calls `getIndexerOrNull().onPrimaryTermBumped(newPrimaryTerm)`
+      immediately after `replicationTracker.setOperationPrimaryTerm(newPrimaryTerm)` and strictly
+      before `onBlocked.run()` -- inside the exact same operations-blocked window B6/B7's
+      formal-verification tracing already proved atomic with respect to the term bump itself, so no
+      new TLC re-check was needed; the atomicity property `AcquireLease` assumed already covers
+      this real call site. Smaller blast radius than the originally-proposed SPI: one new
+      no-op-default method on an existing abstract class plus one new call site inside an existing,
+      already-tested method, rather than a new plugin extension-point surface.
+- [x] B9. **`ObjectStoreWriterEngine.activationWalPosition` now genuinely re-snapshots.** Changed
+      from `private final long` to `private volatile long`; the constructor-time snapshot is kept
+      unchanged (still correct for the freshly-initializing-primary path, per the finding above),
+      and a new `onPrimaryTermBumped` override re-reads `walChunkService.currentChunkSequenceUpperBound()`
+      and writes it into the field whenever this already-constructed engine's term is live-bumped.
+- [x] B10. **"Honest limitation" javadoc updated.** `activationWalPosition`'s own field javadoc no
+      longer describes this as an open gap -- it now documents which of the two real activation
+      paths each half of the mechanism (constructor snapshot vs. `onPrimaryTermBumped` re-snapshot)
+      covers, and why each is sufficient for its own path.
 
 ### Testing
-- [ ] B11. Regression test reproducing the original race under the old approach, confirming the
-      new grant closes it.
-- [ ] B12. Extend dual-writer fencing tests (§17) to exercise the new grant path under real failover.
-- [ ] B13. Chaos test: node death exactly at grant time.
+- [x] B11 (partial; regression-style, not literally reproducing the pre-fix race under the old
+      code path, since the "old code path" for the live-promotion case never had a way to observe
+      this at all). `ObjectStoreWriterEngineTests#testOnPrimaryTermBumpedReSnapshotsActivationWalPositionToTheLiveBound`:
+      constructs a real `ObjectStoreWriterEngine` via `EngineTestCase`, appends WAL chunks *after*
+      construction (simulating replicated activity landing on this engine while it was still a
+      live replica), calls `onPrimaryTermBumped` directly, and asserts `activationWalPositionForTesting()`
+      picks up the post-construction chunk rather than staying stuck at the stale, construction-time
+      value. Confirmed meaningful by temporarily short-circuiting `onPrimaryTermBumped` to a no-op
+      and watching the test fail (`expected:<1> but was:<0>`), then restoring. The full core
+      `IndexShardTests` suite and every existing promotion-path test in it
+      (`testPrimaryPromotionDelaysOperations`, `testPrimaryFillsSeqNoGapsOnPromotion`,
+      `testPrimaryPromotionRollsGeneration`, `testRestoreLocalHistoryFromTranslogOnPromotion`,
+      `testRollbackReplicaEngineOnPromotion`, `testPublishingOrderOnPromotion`) still pass clean,
+      confirming the new no-op-by-default call site introduces no regression to classic shards.
+- [ ] B12/B13 not attempted -- a real multi-writer-replica live-promotion IT (kill the primary node
+      specifically, wait for the replica to be promoted rather than a fresh shard recovering from
+      scratch, and directly observe the promoted node's own `activationWalPositionForTesting()`)
+      would be the natural next increment, distinct from `ServerlessStorageWriterFailoverIT`'s
+      existing coverage (which is entirely the already-race-free 0-replica fresh-recovery path).
+      Not attempted in this session -- scoped out for time, not because it's unneeded.
 
 ### Documentation
-- [ ] B14. RFC update: close out §6.4/§7.1's "still future work" notes.
+- [x] B14. RFC updated with the full finding and the actual (smaller-than-proposed) implementation.
 
 ## Log
 

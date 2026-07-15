@@ -5074,6 +5074,16 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
                     // in the order submitted. We need to guard against another term bump
                     if (getOperationPrimaryTerm() < newPrimaryTerm) {
                         replicationTracker.setOperationPrimaryTerm(newPrimaryTerm);
+                        // Fires strictly after the term above is set, strictly before onBlocked's
+                        // own engine-reset work and before operations unblock -- see
+                        // Engine#onPrimaryTermBumped's own javadoc for exactly what atomicity this
+                        // guarantees a listener. getIndexerOrNull(), not getIndexer(): an engine
+                        // that hasn't been constructed yet (still mid-recovery) has nothing to
+                        // notify, and that is not an error here.
+                        Indexer currentIndexer = getIndexerOrNull();
+                        if (currentIndexer != null) {
+                            currentIndexer.onPrimaryTermBumped(newPrimaryTerm);
+                        }
                         onBlocked.run();
                     }
                 } catch (final Exception e) {

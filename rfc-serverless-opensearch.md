@@ -413,6 +413,41 @@ the existing proof applies to the real design as specified. Recorded in `WalRepl
 own STATUS section; no new TLC run or new violation, closed by code-correspondence tracing. Only
 the Java implementation itself remains, still withheld pending authorization.
 
+**Status: the core hook is implemented, and it's smaller than the earlier design notes above
+proposed -- and a fresh trace found the gap is narrower than originally framed too.** Before
+implementing anything, re-traced the *other* real activation path this effort's earlier design
+notes hadn't distinguished from live promotion: a shard freshly allocated to a node that never
+held a copy before (the realistic failure mode for a typical 0-writer-replica serverless-storage
+shard, whose durability comes from manifest publication, not replica copies). That path is
+provably race-free already, with no core change needed: `IndexShard`'s own constructor
+(`IndexShard.java:516-517`) sets `pendingPrimaryTerm` directly from cluster metadata's
+already-bumped value before any engine construction begins, and `bumpPrimaryTerm`'s live-promotion
+branch explicitly excludes a freshly-initializing shard by assertion (`newRouting.initializing()
+== false`). The real residual gap lives specifically in the >0-writer-replica live-promotion case
+-- confirmed real, not hypothetical, since `getEngineFactory` selects `ObjectStoreWriterEngine`
+based on `ShardRouting#isSearchOnly()`, not `primary()`, so an ordinary writer replica is a genuine
+promotion candidate through core's standard mechanism.
+
+For that case, the actual patch landed as one new no-op-default method on `Engine`
+(`onPrimaryTermBumped(long newPrimaryTerm)`), mirrored as a `default` no-op on the `Indexer`
+interface this fork's own pluggable-engine-per-shard-role abstraction already provides, with
+`EngineBackedIndexer` delegating straight through -- smaller than the `EnginePlugin` SPI floated
+earlier, since it needed no new plugin extension-point surface, just one method on an
+already-existing abstract class. `IndexShard#bumpPrimaryTerm` calls it on the shard's current
+indexer immediately after the term is set and strictly before `onBlocked.run()`, inside the exact
+window already proven atomic above. `ObjectStoreWriterEngine#activationWalPosition` (`private
+final long` until now) became `private volatile long`, re-snapshotted by a new
+`onPrimaryTermBumped` override for the live-promotion case, while the constructor-time snapshot
+stays exactly as it was for the already-race-free fresh-allocation case. Proven with a real
+`EngineTestCase`-provisioned engine (`ObjectStoreWriterEngineTests#testOnPrimaryTermBumpedReSnapshotsActivationWalPositionToTheLiveBound`):
+WAL chunks appended after construction but before the term bump are picked up by the re-snapshot,
+not left stale; confirmed meaningful by disabling the override and watching the assertion fail,
+then restoring. The full core `IndexShardTests` suite, including every existing promotion-path
+test, stays green, confirming the new no-op-by-default call site costs classic shards nothing.
+Full detail, including what a real multi-writer-replica live-promotion IT covering B12/B13 would
+still need (not attempted this session), in `write-routing-and-term-authority-progress.md`, Effort
+B's own implementation section.
+
 **The read/filter/decode side of replay is now implemented and tested end-to-end against a real
 two-writer failover**, in `wal/WalReplayRecovery.java`: given the last durably-published manifest's
 `WalPosition` (or none, for a brand new shard) and a writer's own `activationWalPosition`, it lists

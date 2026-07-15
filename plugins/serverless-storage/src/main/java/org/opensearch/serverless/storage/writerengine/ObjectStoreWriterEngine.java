@@ -175,19 +175,22 @@ public class ObjectStoreWriterEngine extends InternalEngine {
      * #replayWalOperations()} as the exclusive upper bound {@link WalReplayRecovery#replayOperations}
      * filters WAL chunk replay against.
      *
-     * <p><b>Honest limitation, not yet closed</b>: this narrows the race the TLA+ model's
-     * {@code AcquireLease} action captures atomically with the term change itself, but isn't
-     * perfectly equivalent to it -- by the time this engine's constructor runs, core's cluster
-     * coordination has already decided this node holds the new term (see &sect;7.1's "term
-     * authority bridge": term authority is still borrowed from core cluster coordination today, not
-     * yet a metadata-plane CAS event with its own natural place to capture this atomically). A
-     * fully atomic capture needs lease acquisition to migrate to the metadata plane, which is
-     * separately still-open future work, not something this snapshot alone closes.
+     * <p><b>Closed for the live-promotion case, via {@link #onPrimaryTermBumped}</b>: this field is
+     * re-snapshotted, atomically with the term bump itself, whenever {@code IndexShard} calls
+     * {@link Engine#onPrimaryTermBumped(long)} on an already-constructed engine transitioning to a
+     * new primary term -- see that method's own javadoc for exactly what atomicity core now
+     * guarantees. The constructor-time snapshot below remains correct and untouched for the other
+     * real activation path (a shard's primary being freshly allocated to a node that never held a
+     * copy before): there, {@code EngineConfig#getPrimaryTermSupplier()} already reflects the
+     * correct term by the time this constructor runs (traced directly against {@code
+     * IndexShard}'s own constructor, which sets {@code pendingPrimaryTerm} from cluster metadata
+     * before any engine construction begins), so no atomicity gap exists on that path and
+     * {@link #onPrimaryTermBumped} is never even called for it.
      *
      * <p>{@code -1} when WAL mirroring is disabled ({@link #walChunkService} is {@code null}) --
      * there is no WAL chunk stream to bound in that case.
      */
-    private final long activationWalPosition;
+    private volatile long activationWalPosition;
 
     /**
      * Wall-clock time of this engine's last {@link #index} or {@link #delete} call -- the
@@ -874,6 +877,41 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     /** See {@link #activationWalPosition}'s own javadoc -- test-only visibility. */
     long activationWalPositionForTesting() {
         return activationWalPosition;
+    }
+
+    /**
+     * Re-snapshots {@link #activationWalPosition} atomically with a live term bump on this
+     * already-constructed engine -- see that field's own javadoc for the full "closes the
+     * live-promotion case" rationale, and {@link org.opensearch.index.engine.Engine#onPrimaryTermBumped(long)}'s
+     * own javadoc for the exact atomicity core now guarantees this is called under.
+     *
+     * <p>Deliberately does not itself trigger a replay: {@link #replayWalOperations()} already runs
+     * once, during this engine's own construction; this only tightens the bound {@link
+     * #activationWalPosition} holds for any future replay this engine performs (e.g. a resync),
+     * consistent with the rest of this class's own "capture as early/atomically as possible, ahead
+     * of anything that would consume it" discipline.
+     *
+     * @param newPrimaryTerm the primary term this engine is now operating under.
+     */
+    @Override
+    public void onPrimaryTermBumped(long newPrimaryTerm) {
+        if (walChunkService == null) {
+            return;
+        }
+        try {
+            this.activationWalPosition = walChunkService.currentChunkSequenceUpperBound();
+        } catch (IOException e) {
+            // Matches beginConstruction's own "must not activate under a wrong bound" reasoning,
+            // but this fires deep inside IndexShard#bumpPrimaryTerm's own onResponse callback,
+            // which itself has no checked-exception escape hatch -- failing the shard outright
+            // here (rather than silently keeping a now-possibly-stale bound) is the honest
+            // response to a live read failing at exactly the moment correctness depends on it.
+            throw new org.opensearch.index.engine.EngineException(
+                engineConfig.getShardId(),
+                "failed to re-snapshot activationWalPosition on primary term bump to " + newPrimaryTerm,
+                e
+            );
+        }
     }
 
     /**
