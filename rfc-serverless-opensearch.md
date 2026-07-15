@@ -444,9 +444,19 @@ WAL chunks appended after construction but before the term bump are picked up by
 not left stale; confirmed meaningful by disabling the override and watching the assertion fail,
 then restoring. The full core `IndexShardTests` suite, including every existing promotion-path
 test, stays green, confirming the new no-op-by-default call site costs classic shards nothing.
-Full detail, including what a real multi-writer-replica live-promotion IT covering B12/B13 would
-still need (not attempted this session), in `write-routing-and-term-authority-progress.md`, Effort
-B's own implementation section.
+**Status: the real multi-writer-replica live-promotion IT (B12/B13) is now closed too.** New
+`ServerlessStorageWriterReplicaPromotionIT` runs a genuine 2-data-node, 1-shard/1-replica
+serverless-storage cluster (both copies really are `ObjectStoreWriterEngine`, since engine
+selection keys off `ShardRouting#isSearchOnly()`, not `primary()`), kills the primary's node
+specifically, and directly observes the promoted replica's own re-snapshotted
+`activationWalPosition` strictly increase across the kill -- not merely that nothing crashed.
+Needed one small, clearly-labeled new core surface (`IndexShard#getIndexerOrNullForTesting()`, a
+public delegate to the existing protected accessor) since a plugin `internalClusterTest` cannot
+reach it otherwise and this build's own `forbiddenApisInternalClusterTest` check forbids reflection
+as a workaround. Confirmed meaningful twice independently -- once via `ObjectStoreWriterEngine`'s
+own override, once via the `IndexShard#bumpPrimaryTerm` call site itself -- both showing the exact
+same clean failure signature (`before=0, after=0`) when disabled. Full detail in
+`write-routing-and-term-authority-progress.md`, Effort B's own implementation section.
 
 **The read/filter/decode side of replay is now implemented and tested end-to-end against a real
 two-writer failover**, in `wal/WalReplayRecovery.java`: given the last durably-published manifest's

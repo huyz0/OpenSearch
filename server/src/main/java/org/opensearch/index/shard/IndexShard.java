@@ -4508,6 +4508,13 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         return this.currentEngineReference.get();
     }
 
+    // Visible for testing -- a plugin internalClusterTest (a different Gradle source set/package
+    // than this class) has no other way to reach the live Indexer instance, and reflection is
+    // forbidden by this build's own forbiddenApisInternalClusterTest check.
+    public Indexer getIndexerOrNullForTesting() {
+        return getIndexerOrNull();
+    }
+
     // Only used for initializing segment replication CopyState
     public long getLastRefreshedCheckpoint() {
         Indexer engine = getIndexer();

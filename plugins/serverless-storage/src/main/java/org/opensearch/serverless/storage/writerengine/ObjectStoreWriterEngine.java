@@ -874,8 +874,14 @@ public class ObjectStoreWriterEngine extends InternalEngine {
         return walMirroringTranslog;
     }
 
-    /** See {@link #activationWalPosition}'s own javadoc -- test-only visibility. */
-    long activationWalPositionForTesting() {
+    /**
+     * See {@link #activationWalPosition}'s own javadoc -- test-only visibility. Public, not
+     * package-private like this class's other test-only accessors, specifically so a real
+     * multi-node {@code internalClusterTest} (a different Gradle source set/package than this
+     * class's own unit tests) can observe it after a genuine live promotion, not just via a
+     * same-package unit test.
+     */
+    public long activationWalPositionForTesting() {
         return activationWalPosition;
     }
 

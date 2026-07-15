@@ -434,12 +434,36 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done (reviewed before
       `testPrimaryPromotionRollsGeneration`, `testRestoreLocalHistoryFromTranslogOnPromotion`,
       `testRollbackReplicaEngineOnPromotion`, `testPublishingOrderOnPromotion`) still pass clean,
       confirming the new no-op-by-default call site introduces no regression to classic shards.
-- [ ] B12/B13 not attempted -- a real multi-writer-replica live-promotion IT (kill the primary node
-      specifically, wait for the replica to be promoted rather than a fresh shard recovering from
-      scratch, and directly observe the promoted node's own `activationWalPositionForTesting()`)
-      would be the natural next increment, distinct from `ServerlessStorageWriterFailoverIT`'s
-      existing coverage (which is entirely the already-race-free 0-replica fresh-recovery path).
-      Not attempted in this session -- scoped out for time, not because it's unneeded.
+- [x] B12/B13. **Real multi-writer-replica live-promotion IT, closed.** New
+      `ServerlessStorageWriterReplicaPromotionIT`: 2 data nodes, a 1-shard/1-replica
+      serverless-storage index (both copies genuinely run `ObjectStoreWriterEngine` --
+      `getEngineFactory` selects it off `ShardRouting#isSearchOnly()`, not `primary()`), indexes
+      and flushes a doc, indexes a second WAL-only doc, reads the replica's own
+      `activationWalPositionForTesting()` *before* killing anything (the stale, construction-time
+      value), kills the primary's node specifically, waits for `ensureYellow` (this 2-node/1-replica
+      cluster can never reach green again after a node dies, so yellow is the correct
+      fully-recovered target here, not a weaker substitute), then reads the same promoted engine's
+      `activationWalPositionForTesting()` again and asserts it strictly increased -- proving a
+      genuine live re-snapshot, not merely "didn't crash." Also indexes a third doc post-promotion
+      and confirms it's searchable, proving the promoted engine keeps working correctly, not just
+      that its internal field changed.
+
+      Needed one small new core surface: `IndexShard#getIndexerOrNullForTesting()`, a public,
+      clearly-"Visible for testing"-labeled delegate to the existing protected
+      `getIndexerOrNull()` -- a plugin `internalClusterTest` lives in a different Gradle source
+      set/package than `IndexShard`, and reflection (the first draft's approach) is explicitly
+      forbidden by this build's own `forbiddenApisInternalClusterTest` check. Also made
+      `ObjectStoreWriterEngine#activationWalPositionForTesting()` `public` (was package-private),
+      for the same cross-package reason.
+
+      Confirmed meaningful twice, independently: once by disabling `ObjectStoreWriterEngine`'s own
+      `onPrimaryTermBumped` override (watching the assertion fail with `before=0, after=0`, since
+      no re-snapshot happened at all), and separately by disabling the `IndexShard#bumpPrimaryTerm`
+      call site itself (the actual core wiring, not just the plugin-side logic B11's unit test
+      already covers) -- same failure, `before=0, after=0`, confirming the core call site itself is
+      load-bearing, not merely that `ObjectStoreWriterEngine`'s own override works in isolation.
+      Both restored afterward. Full core `IndexShardTests` suite and the entire plugin
+      `internalClusterTest` suite pass clean.
 
 ### Documentation
 - [x] B14. RFC updated with the full finding and the actual (smaller-than-proposed) implementation.
