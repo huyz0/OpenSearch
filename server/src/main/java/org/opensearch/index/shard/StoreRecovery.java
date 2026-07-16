@@ -707,12 +707,14 @@ final class StoreRecovery {
         indexShard.preRecovery();
         final RecoveryState recoveryState = indexShard.recoveryState();
         final boolean isInPlaceSplitChild = recoveryState.getRecoverySource().getType() == RecoverySource.Type.IN_PLACE_SPLIT_SHARD;
-        // An in-place split's child shard starts exactly as empty on disk as a brand-new EMPTY_STORE
-        // shard: core does no data copying of its own for IN_PLACE_SPLIT_SHARD. Unlike EMPTY_STORE
-        // though, it may become non-empty below -- see recoverInPlaceSplitFromEngine and
-        // inPlaceSplitMaterialized.
+        final boolean isInPlaceMergeParent = recoveryState.getRecoverySource().getType() == RecoverySource.Type.IN_PLACE_MERGE_SHARD;
+        // An in-place split's child shard (or an in-place merge's revived parent) starts exactly as
+        // empty on disk as a brand-new EMPTY_STORE shard: core does no data copying of its own for
+        // either. Unlike EMPTY_STORE though, they may become non-empty below -- see
+        // recoverInPlaceSplitFromEngine / recoverInPlaceMergeFromEngine and inPlaceSplitMaterialized.
         final boolean indexShouldExists = recoveryState.getRecoverySource().getType() != RecoverySource.Type.EMPTY_STORE
-            && isInPlaceSplitChild == false;
+            && isInPlaceSplitChild == false
+            && isInPlaceMergeParent == false;
         boolean inPlaceSplitMaterialized = false;
         indexShard.prepareForIndexRecovery();
         SegmentInfos si = null;
@@ -737,6 +739,15 @@ final class StoreRecovery {
                         // to its share of a split parent's data, not "recovering" pre-existing state
                         // (see EngineFactory#recoverInPlaceSplitLocalStore's own javadoc for why this
                         // must happen here, before a local translog exists, not later).
+                        si = store.readLastCommittedSegmentsInfo();
+                        inPlaceSplitMaterialized = true;
+                    } else if (isInPlaceMergeParent && recoverInPlaceMergeFromEngine(indexShard, store)) {
+                        // Symmetric to the split branch above, but for a parent shard revived by an
+                        // in-place merge -- reviving the parent from its (now-retired) children's data
+                        // (see EngineFactory#recoverInPlaceMergeLocalStore's own javadoc, which also
+                        // documents why no engine overrides it yet -- so in practice this branch is
+                        // not taken today and a merge parent falls through to plain-empty recovery
+                        // below; an in-place merge is not yet end-to-end functional).
                         si = store.readLastCommittedSegmentsInfo();
                         inPlaceSplitMaterialized = true;
                     } else {
@@ -888,6 +899,23 @@ final class StoreRecovery {
             return engineFactory.recoverInPlaceSplitLocalStore(indexShard, store);
         } catch (IOException e) {
             throw new IndexShardRecoveryException(shardId, "engine failed to recover in-place split local store", e);
+        }
+    }
+
+    /**
+     * See {@link EngineFactory#recoverInPlaceMergeLocalStore} for the full contract (and for why no
+     * engine overrides it yet). Same resolution shape as {@link #recoverInPlaceSplitFromEngine}.
+     */
+    private boolean recoverInPlaceMergeFromEngine(IndexShard indexShard, Store store) throws IndexShardRecoveryException {
+        IndexerFactory indexerFactory = indexShard.getIndexerFactory();
+        if (!(indexerFactory instanceof EngineBackedIndexerFactory)) {
+            return false;
+        }
+        EngineFactory engineFactory = ((EngineBackedIndexerFactory) indexerFactory).getEngineFactory();
+        try {
+            return engineFactory.recoverInPlaceMergeLocalStore(indexShard, store);
+        } catch (IOException e) {
+            throw new IndexShardRecoveryException(shardId, "engine failed to recover in-place merge local store", e);
         }
     }
 

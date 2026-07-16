@@ -103,6 +103,37 @@ public interface EngineFactory {
     }
 
     /**
+     * Called by {@code StoreRecovery#internalRecoverFromStore} exactly once, only for a shard
+     * recovering via {@code RecoverySource.Type.IN_PLACE_MERGE_SHARD} (a parent shard revived by an
+     * in-place merge, dynamic-partitioning-plan.md Phase 2 item 2.1) -- the reverse of
+     * {@link #recoverInPlaceSplitLocalStore} and, like it, called before this shard's local translog
+     * is created or its engine is opened, for the same stale-translog-UUID-ordering reason. Default
+     * {@code false}: this engine has nothing to revive the parent from.
+     *
+     * <p><b>No engine overrides this yet, on purpose.</b> The in-place-merge design spike
+     * (dynamic-partitioning-progress.md, "Phase 2 item 2.1") proposed that a full-sibling-pair merge
+     * could revive the parent for free by taking one surviving child's own already-full local Lucene
+     * state and simply dropping its range filter, since both children were cloned from the same
+     * parent bundle. That premise holds only at the instant a split commits, with zero post-split
+     * writes: once the children start serving traffic, each accepts its own disjoint writes into its
+     * own separate bundle/manifest (routing sends each document to exactly one child by hash), so
+     * neither child's local store is a full copy of the union any longer. A correct merge must fold
+     * both children's current segment sets together -- including reconciling per-child deletes/updates
+     * against the shared, immutable base segments (divergent {@code liveDocs}), which a plain
+     * manifest concatenation cannot express. That reconciliation is a real, unspiked design problem;
+     * this seam is deliberately left as a no-op default until it is resolved, so an in-place merge is
+     * <em>not</em> yet end-to-end functional (exactly as {@code IN_PLACE_SPLIT_SHARD}'s own recovery
+     * source was landed no-op before its materialization existed). See the progress doc's "What's
+     * still open" subsection for the full analysis.
+     *
+     * @throws IOException if the revive/materialize attempt was made but failed -- surfaced as this
+     *                      shard's own recovery failure, not silently downgraded to plain-empty.
+     */
+    default boolean recoverInPlaceMergeLocalStore(IndexShard indexShard, Store store) throws IOException {
+        return false;
+    }
+
+    /**
      * Whether this engine already provides its own durable, remote copy of every segment it
      * writes, independent of core's own remote-store upload path ({@code
      * RemoteStoreRefreshListener}, engaged whenever {@code index.remote_store.enabled} is {@code

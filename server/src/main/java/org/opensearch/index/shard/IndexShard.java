@@ -4551,6 +4551,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
             case EMPTY_STORE:
             case EXISTING_STORE:
             case IN_PLACE_SPLIT_SHARD:
+            case IN_PLACE_MERGE_SHARD:
                 executeRecovery("from store", recoveryState, recoveryListener, this::recoverFromStore);
                 break;
             case REMOTE_STORE:
