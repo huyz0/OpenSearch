@@ -93,6 +93,8 @@ public abstract class RecoverySource implements Writeable, ToXContentObject {
                 return LocalShardsRecoverySource.INSTANCE;
             case IN_PLACE_SPLIT_SHARD:
                 return InPlaceSplitShardRecoverySource.INSTANCE;
+            case IN_PLACE_MERGE_SHARD:
+                return InPlaceMergeShardRecoverySource.INSTANCE;
             case REMOTE_STORE:
                 return new RemoteStoreRecoverySource(in);
             default:
@@ -126,7 +128,8 @@ public abstract class RecoverySource implements Writeable, ToXContentObject {
         SNAPSHOT,
         LOCAL_SHARDS,
         REMOTE_STORE,
-        IN_PLACE_SPLIT_SHARD
+        IN_PLACE_SPLIT_SHARD,
+        IN_PLACE_MERGE_SHARD
     }
 
     public abstract Type getType();
@@ -270,6 +273,37 @@ public abstract class RecoverySource implements Writeable, ToXContentObject {
         @Override
         public String toString() {
             return "in-place shard split";
+        }
+
+        @Override
+        public boolean expectEmptyRetentionLeases() {
+            return false;
+        }
+    }
+
+    /**
+     * Recovery of a parent shard revived on the same node during an in-place shard merge -- the
+     * reverse of {@link InPlaceSplitShardRecoverySource}. A merge retires the (up to N, exactly 2 in
+     * the sibling-pair scope) children of one earlier split and revives the single parent shard;
+     * that revived parent's primary recovers via this source. Shaped exactly like {@link
+     * InPlaceSplitShardRecoverySource} -- singleton {@link #INSTANCE}, no extra wire fields.
+     *
+     * @opensearch.experimental
+     */
+    public static class InPlaceMergeShardRecoverySource extends RecoverySource {
+
+        public static final InPlaceMergeShardRecoverySource INSTANCE = new InPlaceMergeShardRecoverySource();
+
+        private InPlaceMergeShardRecoverySource() {}
+
+        @Override
+        public Type getType() {
+            return Type.IN_PLACE_MERGE_SHARD;
+        }
+
+        @Override
+        public String toString() {
+            return "in-place shard merge";
         }
 
         @Override
