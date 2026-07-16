@@ -54,6 +54,27 @@ public class MetadataInPlaceSplitShardCommitServiceTests extends OpenSearchTestC
         }
     }
 
+    public void testApplyCommitRetiresParentShardRoutingAtomically() {
+        ClusterState state = createStateWithInProgressSplit(3, 1, 2);
+        Set<Integer> childIds = state.metadata().index("test-index").getSplitShardsMetadata().getChildShardIdsOfParent(0);
+        ClusterState stateWithStartedChildren = startChildShards(state, childIds);
+
+        ClusterState afterCommit = MetadataInPlaceSplitShardCommitService.applyCommit(stateWithStartedChildren, "test-index", 0);
+
+        IndexRoutingTable indexRoutingTable = afterCommit.routingTable().index("test-index");
+        assertNull(
+            "the parent's own routing entry must be retired in the same update that promotes its children, "
+                + "so parent and children are never simultaneously search-visible over the same data",
+            indexRoutingTable.shard(0)
+        );
+        // siblings untouched
+        assertNotNull(indexRoutingTable.shard(1));
+        assertNotNull(indexRoutingTable.shard(2));
+        for (int childId : childIds) {
+            assertNotNull("child routing entry must still be present after commit", indexRoutingTable.shard(childId));
+        }
+    }
+
     public void testApplyCommitIsANoOpIfSplitAlreadyCommitted() {
         ClusterState state = createStateWithInProgressSplit(3, 1, 2);
         Set<Integer> childIds = state.metadata().index("test-index").getSplitShardsMetadata().getChildShardIdsOfParent(0);

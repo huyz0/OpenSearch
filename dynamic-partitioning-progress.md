@@ -457,6 +457,58 @@ object-store request-count metrics). That real-workload verification is the next
 of Phase 0 work, along with Part 3's still-open read-path-correctness design questions (double-
 counting during the transition window) that item 0.7 explicitly depends on resolving first.
 
+## Part 3 read-path correctness — parent retirement at commit
+
+Status: **done**, commit follows this entry. Resolves the first of Part 3's three flagged
+correctness questions (read-path double-counting during the split transition window), which the
+plan explicitly required be answered before any further Phase 0 work depending on it (item 0.7)
+could be meaningful.
+
+### The gap
+
+Task 8.5's original commit driver promoted children to active in `SplitShardsMetadata` but left
+the parent's own `ShardRouting` entries untouched — flagged honestly at the time as a known,
+deliberately-deferred limitation. In practice this meant a committed split would leave **both**
+the parent and its children simultaneously `STARTED` and therefore both search-visible over the
+same underlying data (a child's manifest, until a not-yet-built physical bundle rewrite happens,
+references the exact same bundle files the parent's manifest does — this plugin's own
+logical-first, physical-later split model). Every document would be counted twice: once via the
+parent's full pre-split view, once via whichever child its hash falls into.
+
+### The fix
+
+`MetadataInPlaceSplitShardCommitService.applyCommit` now removes the parent's `ShardRouting`
+entries (primary and every replica) from the routing table **in the same cluster-state update**
+that promotes the children in `SplitShardsMetadata` — resolving Part 3's question as option (a):
+a partition is owned by exactly one visible shard at a time, even across the split boundary,
+matching the plan's own "DynamoDB-like" framing. This is safe because the parent's manifest bytes
+remain referenced (and pinned against GC by `ShardCloner.clone`, invoked from each child's
+`Engine#recoverFromInPlaceSplit`) by the children that just took over its range — removing its
+routing entry only shuts down its now-redundant `IndexShard`, it does not touch any data.
+
+### Tests + verification discipline
+
+New unit test `testApplyCommitRetiresParentShardRoutingAtomically` in
+`MetadataInPlaceSplitShardCommitServiceTests`. Verified meaningfulness by reverting the retirement
+loop to always re-add the parent's shard table, confirming the test failed with the parent's
+routing entry still present, then restoring.
+
+New end-to-end IT `testInPlaceSplitShardActionCommitsAndRetiresParentRouting` in
+`InPlaceSplitShardActionIT`: real single-node cluster, triggers a real split via the REST/transport
+action, `assertBusy`-waits for the async commit driver to actually fire, then asserts the parent's
+routing entry is gone and exactly the 2 child shards are reported active. This is the first test in
+this plan's execution that exercises the full chain from REST request through to a *committed*
+(not just in-progress) split with real shard recovery on a real single-node cluster.
+
+Regression sweep across `cluster.metadata.*` and `missingJavadoc` — both clean.
+
+### Scope note
+
+This closes Part 3's read-path question. The other two Part 3 questions — replica coordination
+during a split, and WAL/term-authority interaction across the split boundary — remain open and are
+the next concrete design units before Phase 0 item 0.7 (the full real-workload IT with actual
+document indexing and `OperationRouting` hash-resolution verification) can be attempted honestly.
+
 ## Tasks 10-11 — `RecoverySource` dispatch seam for `InPlaceSplitShardRecoverySource`
 
 Status: **done**, commit follows this entry.

@@ -65,6 +65,41 @@ public class InPlaceSplitShardActionIT extends OpenSearchIntegTestCase {
         }
     }
 
+    public void testInPlaceSplitShardActionCommitsAndRetiresParentRouting() throws Exception {
+        internalCluster().startNode();
+        createIndex(INDEX_NAME, Settings.builder().put(SETTING_NUMBER_OF_SHARDS, 1).put(SETTING_NUMBER_OF_REPLICAS, 0).build());
+        ensureGreen(INDEX_NAME);
+
+        client().execute(InPlaceSplitShardAction.INSTANCE, new InPlaceSplitShardAction.Request(INDEX_NAME, 0, 2)).actionGet();
+
+        ClusterService clusterService = internalCluster().clusterService();
+        // The commit driver (MetadataInPlaceSplitShardCommitService) fires asynchronously off
+        // cluster-state-changed events once the children reach STARTED -- wait for it rather than
+        // asserting synchronously right after the split request returns.
+        assertBusy(() -> {
+            IndexMetadata indexMetadata = clusterService.state().metadata().index(INDEX_NAME);
+            assertFalse("split should have committed by now", indexMetadata.getSplitShardsMetadata().isSplitOfShardInProgress(0));
+        });
+
+        IndexRoutingTable indexRoutingTable = clusterService.state().routingTable().index(INDEX_NAME);
+        assertNull(
+            "the parent shard's routing entry must be retired once the split commits -- otherwise "
+                + "parent and children would be simultaneously search-visible over the same data",
+            indexRoutingTable.shard(0)
+        );
+
+        SplitShardsMetadata committedMetadata = clusterService.state().metadata().index(INDEX_NAME).getSplitShardsMetadata();
+        java.util.Set<Integer> activeShardIds = new java.util.HashSet<>();
+        for (java.util.Iterator<Integer> it = committedMetadata.getActiveShardIterator(); it.hasNext();) {
+            activeShardIds.add(it.next());
+        }
+        assertFalse("shard 0 (the now-retired parent) must not be reported active", activeShardIds.contains(0));
+        assertEquals("exactly the 2 child shards should be active post-commit", 2, activeShardIds.size());
+        for (int childId : activeShardIds) {
+            assertNotNull("child shard should still be routed", indexRoutingTable.shard(childId));
+        }
+    }
+
     public void testInPlaceSplitShardActionRejectsInvalidSplitInto() {
         internalCluster().startNode();
         createIndex(INDEX_NAME, Settings.builder().put(SETTING_NUMBER_OF_SHARDS, 1).put(SETTING_NUMBER_OF_REPLICAS, 0).build());
