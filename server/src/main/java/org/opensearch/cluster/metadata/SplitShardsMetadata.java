@@ -198,6 +198,36 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
      * rootShardsToAllChildren} lineage for that case instead; this method only serves the recovery
      * window between a child's {@link ShardRange} being reserved and the split being committed).
      */
+    /**
+     * The hash range of {@code shardId}, if it is a split child -- in progress or already committed --
+     * or {@code null} if it is not a split child at all (an ordinary, never-split shard). Unlike
+     * {@link #getParentAndRangeOfChild(int)} (deliberately scoped to only the in-progress window, for
+     * recovery), this covers a child's entire lifetime: the read path needs a committed child's own
+     * range for as long as its bundles remain logically-filtered rather than physically rewritten
+     * (see this plugin's own {@code InPlaceSplitFilteringDirectoryReader}), which is indefinitely in
+     * this increment, not just until commit.
+     */
+    public ShardRange getRangeOfShard(int shardId) {
+        for (ShardRange[] childRanges : parentToChildShards.values()) {
+            for (ShardRange childRange : childRanges) {
+                if (childRange.shardId() == shardId) {
+                    return childRange;
+                }
+            }
+        }
+        for (ShardRange[] childRanges : rootShardsToAllChildren) {
+            if (childRanges == null) {
+                continue;
+            }
+            for (ShardRange childRange : childRanges) {
+                if (childRange.shardId() == shardId) {
+                    return childRange;
+                }
+            }
+        }
+        return null;
+    }
+
     public Tuple<Integer, ShardRange> getParentAndRangeOfChild(int childShardId) {
         for (Map.Entry<Integer, ShardRange[]> entry : parentToChildShards.entrySet()) {
             if (inProgressSplitShardIds.contains(entry.getKey()) == false) {

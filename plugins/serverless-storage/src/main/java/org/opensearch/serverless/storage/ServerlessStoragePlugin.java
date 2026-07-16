@@ -1532,6 +1532,23 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      */
     @Override
     public void onIndexModule(org.opensearch.index.IndexModule indexModule) {
+        indexModule.setReaderWrapper(indexService -> directoryReader -> {
+            org.opensearch.common.lucene.index.OpenSearchDirectoryReader openSearchDirectoryReader =
+                org.opensearch.common.lucene.index.OpenSearchDirectoryReader.getOpenSearchDirectoryReader(directoryReader);
+            if (openSearchDirectoryReader == null) {
+                return directoryReader;
+            }
+            org.opensearch.cluster.metadata.SplitShardsMetadata splitShardsMetadata = indexService.getIndexSettings()
+                .getIndexMetadata()
+                .getSplitShardsMetadata();
+            org.opensearch.cluster.metadata.ShardRange range = splitShardsMetadata.getRangeOfShard(
+                openSearchDirectoryReader.shardId().id()
+            );
+            if (range == null) {
+                return directoryReader;
+            }
+            return new org.opensearch.serverless.storage.resharding.InPlaceSplitFilteringDirectoryReader(directoryReader, range);
+        });
         indexModule.addIndexEventListener(new org.opensearch.index.shard.IndexEventListener() {
             @Override
             public void afterIndexRemoved(

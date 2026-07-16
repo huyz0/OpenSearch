@@ -5,13 +5,16 @@ section per completed task. Numbering matches the task list handed to the user
 (1-40), cross-referenced to the plan's own `0.x`/`1.x`/... item numbers where
 applicable.
 
-## Task 20 (new, found while attempting item 0.7) — `IndexMetadata.numberOfShards` invariant breaks for split children, NOT fixed
+## Task 20 (new, found while attempting item 0.7) — `IndexMetadata.numberOfShards` invariant breaks for split children, FIXED
 
-Status: **found and documented, not fixed** — this is a genuine, previously-hidden core bug, not a
-test artifact, but the correct fix touches `IndexMetadata`'s foundational per-shard invariants
-(`numberOfShards`/`primaryTerms` wire format/`inSyncAllocationIds` sizing), which are load-bearing
-for far more than split. Flagged deliberately rather than rushing a narrow patch to a structure
-this central without the design-and-test rigor it deserves.
+Status: **fixed and verified, Phase 0.7's full real-workload IT now passes**. The initial analysis
+below (kept verbatim) turned out to be right that this needed real care, but the actual fix was
+narrower than first feared once a key fact came to light: this fork's in-place split already gates
+on `Version.V_3_7_0`+ for every node, and `primaryTermsMap`/`inSyncAllocationIds` have used a real
+`Map`-based wire format (not the legacy `long[numberOfShards]` array) since `V_3_6_0` — the
+backward-compatibility wire-format redesign the original analysis worried about was already done
+upstream and simply didn't need touching. Three separate fixes were required in total, found one at
+a time as each one unblocked the next real error; see "The three fixes" below.
 
 ### The bug
 
@@ -109,6 +112,112 @@ zero-copy-copy assertion) remains valid and is recorded here for that purpose.
 in-place split without requiring `numberOfShards` itself to grow.** This is now the single
 highest-priority remaining item for Phase 0 — without it, `AllocationService.reroute` cannot safely
 process a post-split routing table at all, in or out of a test.
+
+### The three fixes
+
+**Fix 1 — `IndexMetadata`'s per-shard-keyed structures.** `inSyncAllocationIds(int shardId)`'s
+assertion relaxed to `shardId >= 0` (dropped the `< numberOfShards` upper bound) with a
+`getOrDefault(shardId, emptySet())` read instead of a raw `.get()`. `IndexMetadata`'s constructor
+assertion loosened from `primaryTermsMap.size() == numberOfShards` to `>= numberOfShards`.
+`IndexMetadata.Builder.build()`'s two per-shard-sizing blocks were rewritten to the same shape: for
+`inSyncAllocationIds`, every existing entry (base shard or split child) is preserved verbatim, and
+only base-shard gaps `[0, numberOfShards)` get filled with an empty set (previously the fill loop
+only ever *copied* entries in that range, silently dropping anything a caller had added beyond it);
+for `primaryTermsMap`, the check became "every base shard `< numberOfShards` must have an explicit
+entry" rather than "the map's size must exactly equal `numberOfShards`" — extra entries for split
+children are allowed and preserved. `MetadataInPlaceSplitShardService.applySplitShardRequest` now
+proactively seeds both maps for each new child (`putInSyncAllocationIds(childId, emptySet())`,
+`primaryTerm(childId, UNASSIGNED_PRIMARY_TERM)`) at the moment the child's `ShardRange` is reserved,
+rather than relying solely on a later `IndexMetadataUpdater` update to add them lazily.
+
+**Fix 2 — `IndexRoutingTable.validate`.** Fixing #1 traded the hang for a fast, clean
+`IllegalStateException: Wrong number of shards in routing table, missing: []` — a second, structurally
+identical invariant: `IndexRoutingTable.validate` hard-required
+`indexMetadata.getNumberOfShards() == shards().size()`, which a post-split routing table (fewer base
+shards once the parent retires, plus children beyond `numberOfShards`) can never satisfy again. Fixed
+by changing the check from "routing table size must exactly equal `numberOfShards`" to "every base
+shard `< numberOfShards` must have a routing entry, *unless* `SplitShardsMetadata.isSplitParent(i)`
+says it was legitimately retired by a split" — no longer requires exact size equality, only that
+nothing is unaccountably missing.
+
+Both fixes together were verified against the full `org.opensearch.cluster.metadata.*`/
+`org.opensearch.cluster.routing.*`/`org.opensearch.cluster.routing.allocation.*` test sweep (clean,
+zero regressions) before moving on, exactly as fixes 1 and 2 were confirmed individually at each
+step.
+
+**Fix 3 — read-path double-counting (a genuinely new, third bug, found only once 1 and 2 let the
+split actually complete in a real cluster).** With the cluster-manager-crash and routing-validation
+bugs fixed, Phase 0.7's IT ran to completion for the first time — and failed with `Count is 80 hits
+but 40 was expected`. Root cause: `ShardCloner.clone` (Task 12/19) attaches a child to its parent's
+data by manifest *reference*, never physically copying only the child's share of documents — so
+every document from the parent's full manifest is still physically present in **every** child's
+directory, exactly the same situation `PartitionFilteringDirectoryReader`/`ShardPartitionDescriptor`
+(Task 35, this plugin's *other*, pre-existing equal-partition resharding-by-copy mechanism) already
+solved for its own sibling case — but nothing analogous existed yet for in-place split's real
+`ShardRange`-shaped children. Without a query-time filter, each of the 2 children returned every one
+of the 40 documents, hence 80 total hits.
+
+Fixed by adding the same pattern for this mechanism, as a new sibling rather than a generalization
+of the existing one (their id-partitioning schemes are deliberately incompatible: the old one's
+`(partitionIndex, numPartitions)` shape can't represent an arbitrary hash range, and its own hash
+doesn't need to agree with core's real routing hash the way an in-place split child's does — GET-by-id
+uses `OperationRouting`'s real `Murmur3HashFunction`/`ShardRange` resolution, so the read-path filter
+has to reproduce that exact same decision, not invent its own self-consistent one):
+
+- `SplitShardsMetadata.getRangeOfShard(int shardId)` (new): unlike the pre-existing
+  `getParentAndRangeOfChild` (deliberately scoped to only the in-progress window, for recovery), this
+  finds a child's range for its *entire* lifetime, in-progress or already committed — scans both
+  `parentToChildShards` and `rootShardsToAllChildren`. Needed because filtering has to keep working
+  indefinitely (until a physical bundle rewrite happens, not done by this increment), not just until
+  commit.
+- `InPlaceSplitPartitionFilter.matches(String id, ShardRange range)` (new, plugin): `Murmur3HashFunction.hash(id)`
+  compared against `range.contains(hash)` — deliberately core's own real routing hash, not a
+  reinvented scheme, so a document visible via search is also reachable via GET and vice versa.
+- `InPlaceSplitFilteringDirectoryReader` (new, plugin): copies `PartitionFilteringDirectoryReader`'s
+  `FilterDirectoryReader`/`FilterLeafReader` shape verbatim (see that class's own javadoc for the
+  design rationale, unchanged here), substituting the new hash-range matcher.
+- Wired into `ServerlessStoragePlugin.onIndexModule` via `IndexModule#setReaderWrapper` — a different,
+  and in retrospect more correct, seam than `PartitionFilteringDirectoryReader`'s own wiring (inside
+  `ObjectStoreReaderEngine`'s internal reference manager): `setReaderWrapper` is core's standard,
+  shard-identity-aware (`OpenSearchDirectoryReader#shardId()`), engine-agnostic hook, so this filter
+  applies uniformly whether the child's queries are served by `ObjectStoreWriterEngine` (the common
+  case in this session's own IT, a single-writer/no-replica setup) or `ObjectStoreReaderEngine`,
+  without needing separate wiring in each.
+
+**A fourth bug found while wiring fix 3**: the first version of
+`InPlaceSplitFilteringDirectoryReader.getReaderCacheHelper()` copied
+`PartitionFilteringDirectoryReader`'s own choice of returning `null` (that class's own javadoc:
+"unlike the wrapped reader's own core cache helper... no stable reader-level cache key exists here")
+— correct for that class's own wiring, but `IndexModule#setReaderWrapper`'s contract (enforced by
+`IndexShard#wrapSearcher`) is stricter: it requires the wrapped reader's `getReaderCacheHelper()` to
+be **identical** to the original, unwrapped reader's, throwing `IllegalStateException: wrapped
+directory reader doesn't delegate IndexReader#getCoreCacheKey` otherwise. Fixed by delegating
+(`return in.getReaderCacheHelper();`) instead of returning `null` — correct here specifically because
+this filter's bitset is a deterministic, unchanging-for-the-child's-whole-lifetime function of the
+wrapped reader's own live docs: two cache lookups against the same underlying reader generation
+always see the same filtered result, so sharing that generation's cache identity is safe.
+
+### Verification
+
+New IT `ServerlessStorageInPlaceSplitDocumentReachabilityIT` (real 2-node cluster, real
+`ObjectStoreWriterEngine`, 40 documents with real padding content, a real `InPlaceSplitShardAction`
+call) — the exact test whose repeated failures drove fixes 1 through 4 — now passes cleanly. It
+checks: (a) the parent's routing entry is retired and both children are routed once the split
+commits, (b) all 40 pre-split documents are reachable post-split via both scatter-gather search and
+single-shard real `GET`-by-id routing (not a plugin-side reimplementation), (c) the object-store PUT
+count increase from the split stays under 40 (document-count-independent, proving `ShardCloner.clone`
+genuinely didn't copy bundle bytes).
+
+Full verification sweep before commit: `:plugins:serverless-storage:check -x internalClusterTest`
+(clean), `:plugins:serverless-storage:internalClusterTest` full suite, no filter (clean — confirms
+the new `setReaderWrapper` wiring doesn't regress any other plugin IT), `:server:test` on
+`org.opensearch.cluster.metadata.*`/`org.opensearch.cluster.routing.*`/
+`org.opensearch.cluster.routing.allocation.*` plus `:server:missingJavadoc` (clean).
+
+**Phase 0 item 0.7 is now done.** In-place split is genuinely end-to-end for the first time this
+session: metadata bookkeeping (Tasks 1-9), routing-table wiring (Tasks 5-9, this task), local Lucene
+materialization (Task 19), and read-path correctness (this task's fix 3) all verified together in one
+real cluster, not just at each individual layer.
 
 ## Task 1 — Read `MetadataInPlaceSplitShardService` et al., document the real transition sequence
 

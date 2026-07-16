@@ -31,7 +31,9 @@ import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.index.seqno.SequenceNumbers;
 
+import java.util.Collections;
 import java.util.function.BiFunction;
 
 /**
@@ -172,6 +174,15 @@ public class MetadataInPlaceSplitShardService {
         int numberOfReplicas = curIndexMetadata.getNumberOfReplicas();
         for (ShardRange childRange : updatedSplitShardsMetadata.getChildShardsOfParent(shardId)) {
             ShardId childShardId = new ShardId(index, childRange.shardId());
+            // A child's shard id is >= curIndexMetadata.getNumberOfShards() by construction (SplitShardsMetadata
+            // reserves child ids beyond the original shard count, deliberately without growing numberOfShards --
+            // see IndexMetadata#inSyncAllocationIds's own javadoc for why). Seed both maps explicitly here so
+            // IndexMetadata.Builder#build's per-shard validation (which only requires entries for shards
+            // < numberOfShards, but preserves anything else verbatim) has real, present entries for the child
+            // from the moment it's reserved, rather than relying on a later IndexMetadataUpdater update to add
+            // them lazily.
+            indexMetadataBuilder.putInSyncAllocationIds(childRange.shardId(), Collections.emptySet());
+            indexMetadataBuilder.primaryTerm(childRange.shardId(), SequenceNumbers.UNASSIGNED_PRIMARY_TERM);
             indexRoutingTableBuilder.addShard(
                 ShardRouting.newUnassigned(
                     childShardId,
