@@ -18,15 +18,18 @@ import java.io.IOException;
 import java.util.Objects;
 
 /**
- * One shard's raw writes-per-minute estimate, as reported by a single node -- the split-candidate
+ * One shard's raw split-candidate signals, as reported by a single node -- the split-candidate
  * counterpart to {@code org.opensearch.serverless.storage.scaleup.action.ShardQueryRateEntry},
- * carrying {@code ObjectStoreWriterEngine#writesPerMinute()} instead of a query rate.
+ * carrying both {@code ObjectStoreWriterEngine#writesPerMinute()} (split-for-heat) and {@code
+ * ObjectStoreWriterEngine#shardSizeInBytes()} (split-for-size, dynamic-partitioning-plan.md Phase 1
+ * item 1.1) instead of a single query rate.
  */
 public final class ShardWriteRateEntry implements Writeable, ToXContentObject {
 
     private final String indexUuid;
     private final int shardId;
     private final long writesPerMinute;
+    private final long shardSizeInBytes;
 
     /**
      * Creates an entry.
@@ -35,11 +38,14 @@ public final class ShardWriteRateEntry implements Writeable, ToXContentObject {
      * @param shardId the shard number within {@code indexUuid}.
      * @param writesPerMinute this shard's writer engine's own {@code writesPerMinute()} estimate,
      *                        on the node that reported this entry.
+     * @param shardSizeInBytes this shard's writer engine's own {@code shardSizeInBytes()}, on the
+     *                         node that reported this entry.
      */
-    public ShardWriteRateEntry(String indexUuid, int shardId, long writesPerMinute) {
+    public ShardWriteRateEntry(String indexUuid, int shardId, long writesPerMinute, long shardSizeInBytes) {
         this.indexUuid = indexUuid;
         this.shardId = shardId;
         this.writesPerMinute = writesPerMinute;
+        this.shardSizeInBytes = shardSizeInBytes;
     }
 
     /**
@@ -51,6 +57,7 @@ public final class ShardWriteRateEntry implements Writeable, ToXContentObject {
         this.indexUuid = in.readString();
         this.shardId = in.readVInt();
         this.writesPerMinute = in.readZLong();
+        this.shardSizeInBytes = in.readZLong();
     }
 
     /** @param out stream to write this entry's fields to. */
@@ -59,6 +66,7 @@ public final class ShardWriteRateEntry implements Writeable, ToXContentObject {
         out.writeString(indexUuid);
         out.writeVInt(shardId);
         out.writeZLong(writesPerMinute);
+        out.writeZLong(shardSizeInBytes);
     }
 
     /** UUID of the index the shard belongs to. */
@@ -76,6 +84,11 @@ public final class ShardWriteRateEntry implements Writeable, ToXContentObject {
         return writesPerMinute;
     }
 
+    /** This shard's writer engine's own size-in-bytes estimate. */
+    public long shardSizeInBytes() {
+        return shardSizeInBytes;
+    }
+
     /**
      * @param builder the builder to append this entry's fields to.
      * @param params unused.
@@ -86,6 +99,7 @@ public final class ShardWriteRateEntry implements Writeable, ToXContentObject {
             .field("index_uuid", indexUuid)
             .field("shard_id", shardId)
             .field("writes_per_minute", writesPerMinute)
+            .field("shard_size_in_bytes", shardSizeInBytes)
             .endObject();
     }
 
@@ -98,11 +112,14 @@ public final class ShardWriteRateEntry implements Writeable, ToXContentObject {
             return false;
         }
         ShardWriteRateEntry that = (ShardWriteRateEntry) o;
-        return shardId == that.shardId && writesPerMinute == that.writesPerMinute && Objects.equals(indexUuid, that.indexUuid);
+        return shardId == that.shardId
+            && writesPerMinute == that.writesPerMinute
+            && shardSizeInBytes == that.shardSizeInBytes
+            && Objects.equals(indexUuid, that.indexUuid);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(indexUuid, shardId, writesPerMinute);
+        return Objects.hash(indexUuid, shardId, writesPerMinute, shardSizeInBytes);
     }
 }

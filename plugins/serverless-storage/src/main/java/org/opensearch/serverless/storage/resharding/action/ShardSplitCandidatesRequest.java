@@ -21,26 +21,46 @@ import java.io.IOException;
  */
 public class ShardSplitCandidatesRequest extends BaseNodesRequest<ShardSplitCandidatesRequest> {
 
-    /** Sentinel meaning "use {@code ServerlessStoragePlugin.SERVERLESS_STORAGE_RESHARDING_SPLIT_CANDIDATE_WRITES_PER_MINUTE_THRESHOLD_SETTING}'s current value." */
+    /** Sentinel meaning "use {@code ServerlessStoragePlugin.SERVERLESS_STORAGE_RESHARDING_SPLIT_CANDIDATE_WPM_THRESHOLD_SETTING}'s current value." */
     public static final long USE_DEFAULT_WPM_THRESHOLD = -1L;
 
-    private final long writesPerMinuteThreshold;
+    /** Sentinel meaning "use {@code ServerlessStoragePlugin.SERVERLESS_STORAGE_RESHARDING_SPLIT_CANDIDATE_SIZE_THRESHOLD_BYTES_SETTING}'s current value." */
+    public static final long USE_DEFAULT_SIZE_THRESHOLD_BYTES = -1L;
 
-    /** Requests an evaluation using this node's currently configured default threshold. */
+    private final long writesPerMinuteThreshold;
+    private final long sizeThresholdBytes;
+
+    /** Requests an evaluation using this node's currently configured default thresholds. */
     public ShardSplitCandidatesRequest() {
-        this(USE_DEFAULT_WPM_THRESHOLD);
+        this(USE_DEFAULT_WPM_THRESHOLD, USE_DEFAULT_SIZE_THRESHOLD_BYTES);
     }
 
     /**
-     * Requests an evaluation using a caller-supplied threshold, overriding this node's configured default.
+     * Requests an evaluation using a caller-supplied write-rate threshold, overriding this node's
+     * configured default write-rate threshold while leaving the size threshold at its default.
      *
      * @param writesPerMinuteThreshold the writes-per-minute a writer copy must exceed to count
-     *                                 toward {@link ShardSplitCandidateEntry#candidate()}, or
-     *                                 {@link #USE_DEFAULT_WPM_THRESHOLD}.
+     *                                 toward {@link ShardSplitCandidateEntry#writeRateCandidate()},
+     *                                 or {@link #USE_DEFAULT_WPM_THRESHOLD}.
      */
     public ShardSplitCandidatesRequest(long writesPerMinuteThreshold) {
+        this(writesPerMinuteThreshold, USE_DEFAULT_SIZE_THRESHOLD_BYTES);
+    }
+
+    /**
+     * Requests an evaluation using caller-supplied thresholds, overriding this node's configured defaults.
+     *
+     * @param writesPerMinuteThreshold the writes-per-minute a writer copy must exceed to count
+     *                                 toward {@link ShardSplitCandidateEntry#writeRateCandidate()},
+     *                                 or {@link #USE_DEFAULT_WPM_THRESHOLD}.
+     * @param sizeThresholdBytes the size in bytes a writer copy must exceed to count toward {@link
+     *                           ShardSplitCandidateEntry#sizeCandidate()}, or {@link
+     *                           #USE_DEFAULT_SIZE_THRESHOLD_BYTES}.
+     */
+    public ShardSplitCandidatesRequest(long writesPerMinuteThreshold, long sizeThresholdBytes) {
         super(new String[0]);
         this.writesPerMinuteThreshold = writesPerMinuteThreshold;
+        this.sizeThresholdBytes = sizeThresholdBytes;
     }
 
     /**
@@ -51,6 +71,7 @@ public class ShardSplitCandidatesRequest extends BaseNodesRequest<ShardSplitCand
     public ShardSplitCandidatesRequest(StreamInput in) throws IOException {
         super(in);
         this.writesPerMinuteThreshold = in.readZLong();
+        this.sizeThresholdBytes = in.readZLong();
     }
 
     /** @param out stream to write this request's fields to. */
@@ -58,10 +79,16 @@ public class ShardSplitCandidatesRequest extends BaseNodesRequest<ShardSplitCand
     public void writeTo(StreamOutput out) throws IOException {
         super.writeTo(out);
         out.writeZLong(writesPerMinuteThreshold);
+        out.writeZLong(sizeThresholdBytes);
     }
 
     /** The caller-supplied write-rate threshold override, or {@link #USE_DEFAULT_WPM_THRESHOLD}. */
     public long writesPerMinuteThreshold() {
         return writesPerMinuteThreshold;
+    }
+
+    /** The caller-supplied size threshold override, or {@link #USE_DEFAULT_SIZE_THRESHOLD_BYTES}. */
+    public long sizeThresholdBytes() {
+        return sizeThresholdBytes;
     }
 }

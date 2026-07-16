@@ -36,7 +36,15 @@ public class DataStreamShardCountAdvisorSchedulerTaskTests extends OpenSearchTes
         ClusterState state = clusterStateWithDataStream(dataStreamName, writeIndex, 2);
 
         List<ShardSplitCandidateEntry> candidates = List.of(
-            new ShardSplitCandidateEntry(writeIndex.getUUID(), 0, writeIndex.getName(), 999_999L, true)
+            new ShardSplitCandidateEntry(
+                writeIndex.getUUID(),
+                0,
+                writeIndex.getName(),
+                999_999L,
+                ShardSplitCandidateEntry.UNKNOWN,
+                true,
+                false
+            )
         );
 
         DataStreamShardCountAdvisorCache cache = new DataStreamShardCountAdvisorCache();
@@ -52,7 +60,7 @@ public class DataStreamShardCountAdvisorSchedulerTaskTests extends OpenSearchTes
         ClusterState state = clusterStateWithDataStream(dataStreamName, writeIndex, 3);
 
         List<ShardSplitCandidateEntry> candidates = List.of(
-            new ShardSplitCandidateEntry(writeIndex.getUUID(), 0, writeIndex.getName(), 10L, false)
+            new ShardSplitCandidateEntry(writeIndex.getUUID(), 0, writeIndex.getName(), 10L, ShardSplitCandidateEntry.UNKNOWN, false, false)
         );
 
         DataStreamShardCountAdvisorCache cache = new DataStreamShardCountAdvisorCache();
@@ -72,7 +80,15 @@ public class DataStreamShardCountAdvisorSchedulerTaskTests extends OpenSearchTes
         );
 
         List<ShardSplitCandidateEntry> candidates = List.of(
-            new ShardSplitCandidateEntry(writeIndex.getUUID(), 0, writeIndex.getName(), 999_999L, true)
+            new ShardSplitCandidateEntry(
+                writeIndex.getUUID(),
+                0,
+                writeIndex.getName(),
+                999_999L,
+                ShardSplitCandidateEntry.UNKNOWN,
+                true,
+                false
+            )
         );
 
         DataStreamShardCountAdvisorCache cache = new DataStreamShardCountAdvisorCache();
@@ -91,7 +107,15 @@ public class DataStreamShardCountAdvisorSchedulerTaskTests extends OpenSearchTes
         ClusterState state = clusterStateWithDataStream(dataStreamName, writeIndex, 2, false);
 
         List<ShardSplitCandidateEntry> candidates = List.of(
-            new ShardSplitCandidateEntry(writeIndex.getUUID(), 0, writeIndex.getName(), 999_999L, true)
+            new ShardSplitCandidateEntry(
+                writeIndex.getUUID(),
+                0,
+                writeIndex.getName(),
+                999_999L,
+                ShardSplitCandidateEntry.UNKNOWN,
+                true,
+                false
+            )
         );
 
         DataStreamShardCountAdvisorCache cache = new DataStreamShardCountAdvisorCache();

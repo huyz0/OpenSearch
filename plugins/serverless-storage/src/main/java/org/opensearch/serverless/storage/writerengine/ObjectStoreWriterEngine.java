@@ -729,6 +729,30 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     }
 
     /**
+     * This shard's current on-object-store size, in bytes, from the total file size of its own
+     * latest published manifest ({@code ManifestSegmentMetrics#totalBytes}) -- the split-for-size
+     * counterpart to {@link #writesPerMinute()}'s split-for-heat signal
+     * (dynamic-partitioning-plan.md Phase 1 item 1.1). No local I/O and no bundle needs opening:
+     * {@code ManifestSegmentMetrics#from} derives it entirely from the manifest's own file map,
+     * already fetched here via {@link #headPublisher}, the same manifest-metadata-only approach
+     * {@code CompactionSchedulerTask} uses for its own size-based triggers.
+     *
+     * @return the latest published manifest's total file size in bytes, or {@code 0} if this shard
+     *         has never published a manifest yet or the read failed -- a best-effort advisory
+     *         signal, same tolerance {@link #writesPerMinute()}'s own callers already have for a
+     *         momentarily-unavailable estimate.
+     */
+    public long shardSizeInBytes() {
+        try {
+            return headPublisher.readLatestManifest(indexUuid, shardId)
+                .map(manifest -> org.opensearch.serverless.storage.compaction.ManifestSegmentMetrics.from(manifest).totalBytes)
+                .orElse(0L);
+        } catch (IOException e) {
+            return 0L;
+        }
+    }
+
+    /**
      * A real-time existence/version/seqNo check against this engine's own live version map
      * (rfc-serverless-opensearch.md &sect;8: "{@code _get} by document id can optionally route to
      * the writer shard for true realtime gets"). Delegates straight to the inherited {@link

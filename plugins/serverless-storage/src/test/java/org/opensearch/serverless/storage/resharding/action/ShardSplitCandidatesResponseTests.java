@@ -24,6 +24,7 @@ public class ShardSplitCandidatesResponseTests extends OpenSearchTestCase {
 
     private static final String INDEX_NAME = "my-index";
     private static final String INDEX_UUID = "idx-uuid";
+    private static final long DEFAULT_SIZE_THRESHOLD_BYTES = 1_000_000_000L;
 
     private DiscoveryNode node(String id) {
         return new DiscoveryNode(id, buildNewFakeTransportAddress(), Version.CURRENT);
@@ -50,17 +51,20 @@ public class ShardSplitCandidatesResponseTests extends OpenSearchTestCase {
     public void testAShardOverThresholdIsACandidate() {
         NodeShardSplitCandidatesResponse writerNode = new NodeShardSplitCandidatesResponse(
             node("writer"),
-            List.of(new ShardWriteRateEntry(INDEX_UUID, 0, 20_000L))
+            List.of(new ShardWriteRateEntry(INDEX_UUID, 0, 20_000L, 0L))
         );
         ShardSplitCandidatesResponse response = new ShardSplitCandidatesResponse(
             new ClusterName("test"),
             List.of(writerNode),
             List.of(),
             10_000L,
+            DEFAULT_SIZE_THRESHOLD_BYTES,
             metadataWith(INDEX_NAME, INDEX_UUID)
         );
         ShardSplitCandidateEntry entry = findEntry(response, INDEX_UUID, 0).orElseThrow();
         assertTrue(entry.candidate());
+        assertTrue(entry.writeRateCandidate());
+        assertFalse(entry.sizeCandidate());
         assertEquals(20_000L, entry.writesPerMinute());
         assertEquals(INDEX_NAME, entry.indexName());
     }
@@ -68,33 +72,55 @@ public class ShardSplitCandidatesResponseTests extends OpenSearchTestCase {
     public void testAShardUnderThresholdIsNotACandidate() {
         NodeShardSplitCandidatesResponse writerNode = new NodeShardSplitCandidatesResponse(
             node("writer"),
-            List.of(new ShardWriteRateEntry(INDEX_UUID, 0, 5_000L))
+            List.of(new ShardWriteRateEntry(INDEX_UUID, 0, 5_000L, 0L))
         );
         ShardSplitCandidatesResponse response = new ShardSplitCandidatesResponse(
             new ClusterName("test"),
             List.of(writerNode),
             List.of(),
             10_000L,
+            DEFAULT_SIZE_THRESHOLD_BYTES,
             metadataWith(INDEX_NAME, INDEX_UUID)
         );
         ShardSplitCandidateEntry entry = findEntry(response, INDEX_UUID, 0).orElseThrow();
         assertFalse(entry.candidate());
     }
 
+    public void testAShardOverSizeThresholdIsASizeCandidateEvenWithLowWriteRate() {
+        NodeShardSplitCandidatesResponse writerNode = new NodeShardSplitCandidatesResponse(
+            node("writer"),
+            List.of(new ShardWriteRateEntry(INDEX_UUID, 0, 5L, 5_000_000_000L))
+        );
+        ShardSplitCandidatesResponse response = new ShardSplitCandidatesResponse(
+            new ClusterName("test"),
+            List.of(writerNode),
+            List.of(),
+            10_000L,
+            DEFAULT_SIZE_THRESHOLD_BYTES,
+            metadataWith(INDEX_NAME, INDEX_UUID)
+        );
+        ShardSplitCandidateEntry entry = findEntry(response, INDEX_UUID, 0).orElseThrow();
+        assertTrue(entry.candidate());
+        assertFalse(entry.writeRateCandidate());
+        assertTrue(entry.sizeCandidate());
+        assertEquals(5_000_000_000L, entry.shardSizeInBytes());
+    }
+
     public void testTheHighestSignalAcrossMultipleNodesWinsForTheSameShard() {
         NodeShardSplitCandidatesResponse nodeA = new NodeShardSplitCandidatesResponse(
             node("a"),
-            List.of(new ShardWriteRateEntry(INDEX_UUID, 0, 3_000L))
+            List.of(new ShardWriteRateEntry(INDEX_UUID, 0, 3_000L, 0L))
         );
         NodeShardSplitCandidatesResponse nodeB = new NodeShardSplitCandidatesResponse(
             node("b"),
-            List.of(new ShardWriteRateEntry(INDEX_UUID, 0, 15_000L))
+            List.of(new ShardWriteRateEntry(INDEX_UUID, 0, 15_000L, 0L))
         );
         ShardSplitCandidatesResponse response = new ShardSplitCandidatesResponse(
             new ClusterName("test"),
             List.of(nodeA, nodeB),
             List.of(),
             10_000L,
+            DEFAULT_SIZE_THRESHOLD_BYTES,
             metadataWith(INDEX_NAME, INDEX_UUID)
         );
         ShardSplitCandidateEntry entry = findEntry(response, INDEX_UUID, 0).orElseThrow();
@@ -105,13 +131,14 @@ public class ShardSplitCandidatesResponseTests extends OpenSearchTestCase {
     public void testAShardWhoseIndexHasSinceBeenDeletedIsDroppedFromTheMergedList() {
         NodeShardSplitCandidatesResponse writerNode = new NodeShardSplitCandidatesResponse(
             node("writer"),
-            List.of(new ShardWriteRateEntry(INDEX_UUID, 0, 20_000L))
+            List.of(new ShardWriteRateEntry(INDEX_UUID, 0, 20_000L, 0L))
         );
         ShardSplitCandidatesResponse response = new ShardSplitCandidatesResponse(
             new ClusterName("test"),
             List.of(writerNode),
             List.of(),
             10_000L,
+            DEFAULT_SIZE_THRESHOLD_BYTES,
             Metadata.builder().build()
         );
         assertTrue(response.candidates().isEmpty());
@@ -120,13 +147,14 @@ public class ShardSplitCandidatesResponseTests extends OpenSearchTestCase {
     public void testFailuresDoNotPreventCandidatesFromNonFailingNodesBeingReported() {
         NodeShardSplitCandidatesResponse writerNode = new NodeShardSplitCandidatesResponse(
             node("writer"),
-            List.of(new ShardWriteRateEntry(INDEX_UUID, 0, 20_000L))
+            List.of(new ShardWriteRateEntry(INDEX_UUID, 0, 20_000L, 0L))
         );
         ShardSplitCandidatesResponse response = new ShardSplitCandidatesResponse(
             new ClusterName("test"),
             List.of(writerNode),
             List.of(new FailedNodeException("other-node", "boom", new RuntimeException("boom"))),
             10_000L,
+            DEFAULT_SIZE_THRESHOLD_BYTES,
             metadataWith(INDEX_NAME, INDEX_UUID)
         );
         assertTrue(response.hasFailures());

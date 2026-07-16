@@ -18,6 +18,62 @@ core-level sweep — `org.opensearch.index.shard.*`, `org.opensearch.index.engin
 phase's changes touch `AllocationService`/`IndexShard`. Proceeding to Phase 1 (automatic split
 triggering).
 
+## Phase 1 item 1.1 — Extend `ShardSplitCandidatesAction` with a shard-size (split-for-size) signal
+
+Status: **done**. `ShardSplitCandidatesAction` (Task 56) previously surfaced only a
+`writesPerMinute()`-based split-for-heat signal; this adds the DynamoDB-style split-for-size
+counterpart the plan's own item 1.1 calls for, reusing an existing manifest-metadata-only size
+computation rather than inventing a new one.
+
+### Implementation
+
+- `ObjectStoreWriterEngine.shardSizeInBytes()` (new): `headPublisher.readLatestManifest(indexUuid,
+  shardId)` (already used elsewhere in this class, e.g. WAL replay) piped through
+  `ManifestSegmentMetrics.from(manifest).totalBytes` — no local I/O, no bundle opened, the same
+  manifest-metadata-only approach `CompactionSchedulerTask` already uses for its own size-based
+  triggers. Returns `0` if the shard has never published a manifest, or on a read failure
+  (best-effort, same tolerance `writesPerMinute()`'s own callers already have).
+- `ShardActivityRegistry.snapshotShardSizes()` (new): the size counterpart to the existing
+  `snapshotWritesPerMinute()`, same `WeakReference`-tolerant shape.
+- `ShardWriteRateEntry`/`ShardSplitCandidateEntry` (both extended, not replaced): now carry
+  `shardSizeInBytes` alongside `writesPerMinute`. `ShardSplitCandidateEntry` splits its old single
+  `candidate` boolean into `writeRateCandidate()`/`sizeCandidate()`, with `candidate()` becoming
+  `writeRateCandidate() || sizeCandidate()` — a shard can be flagged for either reason, and a caller
+  that only cares about one signal can still ask for it specifically.
+- `ShardSplitCandidatesResponse.merge` now merges both signals (`Math::max` across nodes, same as
+  before) and evaluates both thresholds independently.
+- `ShardSplitCandidatesRequest`/`RestShardSplitCandidatesAction`: new optional
+  `size_threshold_bytes` override alongside the existing `writes_per_minute_threshold`, same
+  per-request-override shape.
+- `ServerlessStoragePlugin.SERVERLESS_STORAGE_RESHARDING_SPLIT_CANDIDATE_SIZE_THRESHOLD_BYTES_SETTING`
+  (new, `NodeScope`, default 10 GiB): mirrors the existing WPM threshold setting's exact shape
+  (`volatile` field resolved once in `createComponents`, getter, request-override precedence).
+  Same "illustrative default, untuned against a real workload" caveat as the WPM threshold already
+  carries.
+
+### Tests + verification discipline
+
+New test `ObjectStoreWriterEngineTests#testShardSizeInBytesReportsZeroBeforeAnyPublishAndRealTotalAfter`
+(mirrors the existing `writesPerMinute` test's shape): asserts `0` before any publish, then a real
+positive value after indexing and flushing two documents. Verified meaningfulness by temporarily
+replacing the real implementation with `return 0L;` and re-running — failed exactly as expected
+(`shardSizeInBytes must report the real total file size...`); restored, re-ran clean.
+
+`ShardSplitCandidatesResponseTests` extended with a new
+`testAShardOverSizeThresholdIsASizeCandidateEvenWithLowWriteRate` case (proving the two signals are
+independently evaluated, not just OR'd blindly at the wrong layer) plus updated existing cases to
+the new constructor shape. `ShardSplitCandidateEntryTests` extended similarly, plus a new
+`testCandidateIsTrueWhenEitherSignalTriggers` case. `DataStreamShardCountAdvisorSchedulerTaskTests`
+(an existing consumer of `ShardSplitCandidateEntry`) updated to the new constructor shape,
+unchanged in behavior.
+
+Full verification sweep before commit: `:plugins:serverless-storage:check -x internalClusterTest`
+(one unrelated failure on the first run, `CompactionRebaseExecutorTests.testConcurrentRebaseExecutorsNeverLoseAnUpdate`
+— confirmed flaky, not caused by this change, by re-running that single test in isolation clean;
+the full gate re-ran clean afterward), `:plugins:serverless-storage:internalClusterTest` full
+suite, no filter (clean — confirms no regression in `ServerlessStorageShardSplitCandidatesIT` or
+any other IT).
+
 ## Task 20 (new, found while attempting item 0.7) — `IndexMetadata.numberOfShards` invariant breaks for split children, FIXED
 
 Status: **fixed and verified, Phase 0.7's full real-workload IT now passes**. The initial analysis

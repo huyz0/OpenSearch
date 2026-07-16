@@ -506,6 +506,21 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * The split-for-size counterpart to {@link #SERVERLESS_STORAGE_RESHARDING_SPLIT_CANDIDATE_WPM_THRESHOLD_SETTING}
+     * (dynamic-partitioning-plan.md Phase 1 item 1.1): the shard size, in bytes (from the writer
+     * engine's own latest published manifest, via {@code ManifestSegmentMetrics#totalBytes}), a
+     * writer copy must exceed to count as a split candidate. Same "illustrative default, untuned
+     * against a real workload" caveat as the write-rate threshold -- 10 GiB is a round, plausible
+     * DynamoDB-style split-for-size number, not a measured one.
+     */
+    public static final Setting<Long> SERVERLESS_STORAGE_RESHARDING_SPLIT_CANDIDATE_SIZE_THRESHOLD_BYTES_SETTING = Setting.longSetting(
+        "serverless_storage.resharding.split_candidate_size_threshold_bytes",
+        10L * 1024 * 1024 * 1024,
+        0L,
+        Setting.Property.NodeScope
+    );
+
+    /**
      * How often {@code ScaleUpCandidatesSchedulerTask} re-evaluates {@code ScaleUpCandidatesAction}
      * in the background -- same "background schedule mirrors an on-demand trigger" shape as {@link
      * #SERVERLESS_STORAGE_SCALE_TO_ZERO_EVAL_INTERVAL_SETTING}, but deliberately its own setting
@@ -753,6 +768,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     private volatile int scaleUpMaxSearchReplicas = SERVERLESS_STORAGE_SCALE_UP_MAX_SEARCH_REPLICAS_SETTING.getDefault(Settings.EMPTY);
     private volatile long reshardingSplitCandidateWritesPerMinuteThreshold =
         SERVERLESS_STORAGE_RESHARDING_SPLIT_CANDIDATE_WPM_THRESHOLD_SETTING.getDefault(Settings.EMPTY);
+    private volatile long reshardingSplitCandidateSizeThresholdBytes =
+        SERVERLESS_STORAGE_RESHARDING_SPLIT_CANDIDATE_SIZE_THRESHOLD_BYTES_SETTING.getDefault(Settings.EMPTY);
     private volatile org.opensearch.serverless.storage.scaleup.ScaleUpCandidatesSchedulerTask scaleUpCandidatesSchedulerTask;
     private volatile org.opensearch.serverless.storage.resharding.DataStreamShardCountAdvisorSchedulerTask dataStreamShardCountAdvisorSchedulerTask;
     // One node-local directory instance shared by every shard on this node -- matches the target
@@ -816,6 +833,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_SCALE_UP_REQUIRED_CONSECUTIVE_TICKS_SETTING,
             SERVERLESS_STORAGE_SCALE_UP_MAX_EXPANSIONS_PER_TICK_SETTING,
             SERVERLESS_STORAGE_RESHARDING_SPLIT_CANDIDATE_WPM_THRESHOLD_SETTING,
+            SERVERLESS_STORAGE_RESHARDING_SPLIT_CANDIDATE_SIZE_THRESHOLD_BYTES_SETTING,
             SERVERLESS_STORAGE_REPOSITORY_SETTING
         );
     }
@@ -905,6 +923,9 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         this.scaleUpQpmThreshold = SERVERLESS_STORAGE_SCALE_UP_QPM_THRESHOLD_SETTING.get(environment.settings());
         this.scaleUpMaxSearchReplicas = SERVERLESS_STORAGE_SCALE_UP_MAX_SEARCH_REPLICAS_SETTING.get(environment.settings());
         this.reshardingSplitCandidateWritesPerMinuteThreshold = SERVERLESS_STORAGE_RESHARDING_SPLIT_CANDIDATE_WPM_THRESHOLD_SETTING.get(
+            environment.settings()
+        );
+        this.reshardingSplitCandidateSizeThresholdBytes = SERVERLESS_STORAGE_RESHARDING_SPLIT_CANDIDATE_SIZE_THRESHOLD_BYTES_SETTING.get(
             environment.settings()
         );
         TimeValue scaleUpEvalInterval = SERVERLESS_STORAGE_SCALE_UP_EVAL_INTERVAL_SETTING.get(environment.settings());
@@ -1939,6 +1960,14 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      */
     public long reshardingSplitCandidateWritesPerMinuteThreshold() {
         return reshardingSplitCandidateWritesPerMinuteThreshold;
+    }
+
+    /**
+     * This node's currently configured default size-in-bytes threshold for {@code
+     * ShardSplitCandidatesAction} -- see {@link #SERVERLESS_STORAGE_RESHARDING_SPLIT_CANDIDATE_SIZE_THRESHOLD_BYTES_SETTING}.
+     */
+    public long reshardingSplitCandidateSizeThresholdBytes() {
+        return reshardingSplitCandidateSizeThresholdBytes;
     }
 
     /**

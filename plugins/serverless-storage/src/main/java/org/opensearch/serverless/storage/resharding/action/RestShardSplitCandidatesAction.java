@@ -22,9 +22,10 @@ import static org.opensearch.rest.RestRequest.Method.GET;
 
 /**
  * {@code GET /_plugins/_serverless/storage/_resharding/split_candidates} -- the REST surface for
- * {@link ShardSplitCandidatesAction}. Optional query parameter {@code writes_per_minute_threshold}
- * (a non-negative integer) overrides this node's configured default for one request, mirroring
- * {@code org.opensearch.serverless.storage.scaleup.action.RestScaleUpCandidatesAction}'s own override.
+ * {@link ShardSplitCandidatesAction}. Optional query parameters {@code writes_per_minute_threshold}
+ * and {@code size_threshold_bytes} (non-negative integers) override this node's configured defaults
+ * for one request, mirroring {@code org.opensearch.serverless.storage.scaleup.action.RestScaleUpCandidatesAction}'s
+ * own override.
  */
 public class RestShardSplitCandidatesAction extends BaseRestHandler {
 
@@ -55,7 +56,8 @@ public class RestShardSplitCandidatesAction extends BaseRestHandler {
     }
 
     /**
-     * @param request the incoming REST request; may carry a {@code writes_per_minute_threshold} override.
+     * @param request the incoming REST request; may carry {@code writes_per_minute_threshold}
+     *                and/or {@code size_threshold_bytes} overrides.
      * @param client used to dispatch the parsed {@link ShardSplitCandidatesRequest} across the cluster.
      */
     @Override
@@ -64,7 +66,8 @@ public class RestShardSplitCandidatesAction extends BaseRestHandler {
             "writes_per_minute_threshold",
             ShardSplitCandidatesRequest.USE_DEFAULT_WPM_THRESHOLD
         );
-        ShardSplitCandidatesRequest splitCandidatesRequest = new ShardSplitCandidatesRequest(writesPerMinuteThreshold);
+        long sizeThresholdBytes = request.paramAsLong("size_threshold_bytes", ShardSplitCandidatesRequest.USE_DEFAULT_SIZE_THRESHOLD_BYTES);
+        ShardSplitCandidatesRequest splitCandidatesRequest = new ShardSplitCandidatesRequest(writesPerMinuteThreshold, sizeThresholdBytes);
         return channel -> client.execute(
             ShardSplitCandidatesAction.INSTANCE,
             splitCandidatesRequest,

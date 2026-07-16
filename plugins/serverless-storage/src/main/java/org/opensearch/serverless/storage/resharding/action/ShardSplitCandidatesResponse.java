@@ -53,12 +53,15 @@ public class ShardSplitCandidatesResponse extends BaseNodesResponse<NodeShardSpl
 
     /**
      * Creates a response, computing {@link #candidates()} by merging every node's raw
-     * writes-per-minute signals with {@code metadata} and applying the given threshold.
+     * split-candidate signals with {@code metadata} and applying the given thresholds.
      *
      * @param clusterName this cluster's name, required by {@link BaseNodesResponse}.
      * @param nodes every node's raw {@link NodeShardSplitCandidatesResponse}.
      * @param failures any per-node failures encountered while fanning out.
-     * @param writesPerMinuteThreshold the writes-per-minute a writer copy must exceed to count as a candidate.
+     * @param writesPerMinuteThreshold the writes-per-minute a writer copy must exceed to count as
+     *                                 a split-for-heat candidate.
+     * @param sizeThresholdBytes the size in bytes a writer copy must exceed to count as a
+     *                           split-for-size candidate.
      * @param metadata the cluster state's index metadata, used to resolve each shard's index name.
      */
     public ShardSplitCandidatesResponse(
@@ -66,22 +69,26 @@ public class ShardSplitCandidatesResponse extends BaseNodesResponse<NodeShardSpl
         List<NodeShardSplitCandidatesResponse> nodes,
         List<FailedNodeException> failures,
         long writesPerMinuteThreshold,
+        long sizeThresholdBytes,
         Metadata metadata
     ) {
         super(clusterName, nodes, failures);
-        this.candidates = merge(nodes, writesPerMinuteThreshold, metadata);
+        this.candidates = merge(nodes, writesPerMinuteThreshold, sizeThresholdBytes, metadata);
     }
 
     private static List<ShardSplitCandidateEntry> merge(
         List<NodeShardSplitCandidatesResponse> nodes,
         long writesPerMinuteThreshold,
+        long sizeThresholdBytes,
         Metadata metadata
     ) {
         Map<String, Long> highestWpmByShard = new LinkedHashMap<>();
+        Map<String, Long> highestSizeByShard = new LinkedHashMap<>();
         for (NodeShardSplitCandidatesResponse node : nodes) {
             for (ShardWriteRateEntry entry : node.writeRates()) {
                 String key = key(entry.indexUuid(), entry.shardId());
                 highestWpmByShard.merge(key, entry.writesPerMinute(), Math::max);
+                highestSizeByShard.merge(key, entry.shardSizeInBytes(), Math::max);
             }
         }
 
@@ -96,6 +103,7 @@ public class ShardSplitCandidatesResponse extends BaseNodesResponse<NodeShardSpl
             String indexUuid = entry.getKey().substring(0, separator);
             int shardId = Integer.parseInt(entry.getKey().substring(separator + 1));
             long writesPerMinute = entry.getValue();
+            long shardSizeInBytes = highestSizeByShard.getOrDefault(entry.getKey(), ShardSplitCandidateEntry.UNKNOWN);
 
             IndexMetadata indexMetadata = byUuid.get(indexUuid);
             if (indexMetadata == null) {
@@ -105,8 +113,19 @@ public class ShardSplitCandidatesResponse extends BaseNodesResponse<NodeShardSpl
                 continue;
             }
             String indexName = indexMetadata.getIndex().getName();
-            boolean candidate = writesPerMinute > writesPerMinuteThreshold;
-            result.add(new ShardSplitCandidateEntry(indexUuid, shardId, indexName, writesPerMinute, candidate));
+            boolean writeRateCandidate = writesPerMinute > writesPerMinuteThreshold;
+            boolean sizeCandidate = shardSizeInBytes > sizeThresholdBytes;
+            result.add(
+                new ShardSplitCandidateEntry(
+                    indexUuid,
+                    shardId,
+                    indexName,
+                    writesPerMinute,
+                    shardSizeInBytes,
+                    writeRateCandidate,
+                    sizeCandidate
+                )
+            );
         }
         return result;
     }

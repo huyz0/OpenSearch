@@ -92,11 +92,15 @@ public class TransportShardSplitCandidatesAction extends TransportNodesAction<
         long writesPerMinuteThreshold = request.writesPerMinuteThreshold() == ShardSplitCandidatesRequest.USE_DEFAULT_WPM_THRESHOLD
             ? plugin.reshardingSplitCandidateWritesPerMinuteThreshold()
             : request.writesPerMinuteThreshold();
+        long sizeThresholdBytes = request.sizeThresholdBytes() == ShardSplitCandidatesRequest.USE_DEFAULT_SIZE_THRESHOLD_BYTES
+            ? plugin.reshardingSplitCandidateSizeThresholdBytes()
+            : request.sizeThresholdBytes();
         return new ShardSplitCandidatesResponse(
             clusterService.getClusterName(),
             responses,
             failures,
             writesPerMinuteThreshold,
+            sizeThresholdBytes,
             clusterService.state().metadata()
         );
     }
@@ -118,12 +122,14 @@ public class TransportShardSplitCandidatesAction extends TransportNodesAction<
     @Override
     protected NodeShardSplitCandidatesResponse nodeOperation(NodeRequest request) {
         Map<String, Long> wpmSnapshot = plugin.shardActivityRegistry().snapshotWritesPerMinute();
+        Map<String, Long> sizeSnapshot = plugin.shardActivityRegistry().snapshotShardSizes();
         List<ShardWriteRateEntry> entries = new ArrayList<>(wpmSnapshot.size());
         for (Map.Entry<String, Long> entry : wpmSnapshot.entrySet()) {
             int separator = entry.getKey().lastIndexOf('/');
             String indexUuid = entry.getKey().substring(0, separator);
             int shardId = Integer.parseInt(entry.getKey().substring(separator + 1));
-            entries.add(new ShardWriteRateEntry(indexUuid, shardId, entry.getValue()));
+            long shardSizeInBytes = sizeSnapshot.getOrDefault(entry.getKey(), 0L);
+            entries.add(new ShardWriteRateEntry(indexUuid, shardId, entry.getValue(), shardSizeInBytes));
         }
         return new NodeShardSplitCandidatesResponse(clusterService.localNode(), entries);
     }

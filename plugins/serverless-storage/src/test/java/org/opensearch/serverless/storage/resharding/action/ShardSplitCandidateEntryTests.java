@@ -17,7 +17,7 @@ import org.opensearch.test.OpenSearchTestCase;
 public class ShardSplitCandidateEntryTests extends OpenSearchTestCase {
 
     public void testSerializationRoundTrip() throws Exception {
-        ShardSplitCandidateEntry original = new ShardSplitCandidateEntry("idx-uuid", 2, "my-index", 15_000L, true);
+        ShardSplitCandidateEntry original = new ShardSplitCandidateEntry("idx-uuid", 2, "my-index", 15_000L, 500L, true, false);
 
         BytesStreamOutput out = new BytesStreamOutput();
         original.writeTo(out);
@@ -28,6 +28,9 @@ public class ShardSplitCandidateEntryTests extends OpenSearchTestCase {
         assertEquals(2, deserialized.shardId());
         assertEquals("my-index", deserialized.indexName());
         assertEquals(15_000L, deserialized.writesPerMinute());
+        assertEquals(500L, deserialized.shardSizeInBytes());
+        assertTrue(deserialized.writeRateCandidate());
+        assertFalse(deserialized.sizeCandidate());
         assertTrue(deserialized.candidate());
     }
 
@@ -37,6 +40,8 @@ public class ShardSplitCandidateEntryTests extends OpenSearchTestCase {
             0,
             "my-index",
             ShardSplitCandidateEntry.UNKNOWN,
+            ShardSplitCandidateEntry.UNKNOWN,
+            false,
             false
         );
 
@@ -46,11 +51,19 @@ public class ShardSplitCandidateEntryTests extends OpenSearchTestCase {
 
         assertEquals(original, deserialized);
         assertEquals(ShardSplitCandidateEntry.UNKNOWN, deserialized.writesPerMinute());
+        assertEquals(ShardSplitCandidateEntry.UNKNOWN, deserialized.shardSizeInBytes());
         assertFalse(deserialized.candidate());
     }
 
+    public void testCandidateIsTrueWhenEitherSignalTriggers() {
+        ShardSplitCandidateEntry sizeOnly = new ShardSplitCandidateEntry("idx-uuid", 0, "my-index", 10L, 999_999_999L, false, true);
+        assertTrue(sizeOnly.candidate());
+        assertFalse(sizeOnly.writeRateCandidate());
+        assertTrue(sizeOnly.sizeCandidate());
+    }
+
     public void testToXContent() throws Exception {
-        ShardSplitCandidateEntry entry = new ShardSplitCandidateEntry("idx-uuid", 2, "my-index", 15_000L, true);
+        ShardSplitCandidateEntry entry = new ShardSplitCandidateEntry("idx-uuid", 2, "my-index", 15_000L, 500L, true, false);
 
         XContentBuilder builder = XContentFactory.jsonBuilder();
         entry.toXContent(builder, ToXContent.EMPTY_PARAMS);
@@ -60,13 +73,16 @@ public class ShardSplitCandidateEntryTests extends OpenSearchTestCase {
         assertTrue(json.contains("\"shard_id\":2"));
         assertTrue(json.contains("\"index_name\":\"my-index\""));
         assertTrue(json.contains("\"writes_per_minute\":15000"));
+        assertTrue(json.contains("\"shard_size_in_bytes\":500"));
+        assertTrue(json.contains("\"write_rate_candidate\":true"));
+        assertTrue(json.contains("\"size_candidate\":false"));
         assertTrue(json.contains("\"candidate\":true"));
     }
 
     public void testEqualsAndHashCode() {
-        ShardSplitCandidateEntry a = new ShardSplitCandidateEntry("idx-uuid", 2, "my-index", 15_000L, true);
-        ShardSplitCandidateEntry sameValues = new ShardSplitCandidateEntry("idx-uuid", 2, "my-index", 15_000L, true);
-        ShardSplitCandidateEntry differentShard = new ShardSplitCandidateEntry("idx-uuid", 3, "my-index", 15_000L, true);
+        ShardSplitCandidateEntry a = new ShardSplitCandidateEntry("idx-uuid", 2, "my-index", 15_000L, 500L, true, false);
+        ShardSplitCandidateEntry sameValues = new ShardSplitCandidateEntry("idx-uuid", 2, "my-index", 15_000L, 500L, true, false);
+        ShardSplitCandidateEntry differentShard = new ShardSplitCandidateEntry("idx-uuid", 3, "my-index", 15_000L, 500L, true, false);
 
         assertEquals(a, sameValues);
         assertEquals(a.hashCode(), sameValues.hashCode());

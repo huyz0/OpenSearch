@@ -19,30 +19,31 @@ import java.util.Objects;
 
 /**
  * One shard's merged split-candidate policy view: the cluster-wide join of every node's {@code
- * ObjectStoreWriterEngine#writesPerMinute()} for the same {@code (indexUuid, shardId)}, plus the
- * threshold evaluation a real split controller would otherwise have to reimplement itself.
+ * ObjectStoreWriterEngine#writesPerMinute()}/{@code ObjectStoreWriterEngine#shardSizeInBytes()}
+ * for the same {@code (indexUuid, shardId)}, plus the threshold evaluation a real split controller
+ * would otherwise have to reimplement itself -- a DynamoDB-style split-for-heat trigger ({@link
+ * #writeRateCandidate()}) and split-for-size trigger ({@link #sizeCandidate()}), per
+ * dynamic-partitioning-plan.md Phase 1 item 1.1.
  *
  * <p>Mirrors {@code org.opensearch.serverless.storage.scaleup.action.ScaleUpCandidateEntry}'s
- * shape, but signals a write-throughput split candidate rather than a query-rate replica-expansion
- * candidate, and -- unlike that class -- is deliberately not paired with any mechanism half.
- * {@link org.opensearch.serverless.storage.resharding.ShardSplitter#split} only re-points an
- * already-provisioned target shard identity; it does not create new indices/shards, allocate them,
- * or cut over routing from the source shard to the split targets. None of that orchestration exists
- * in this plugin yet, so there is no automated action this signal could safely drive today.
- * {@link #candidate()} is purely advisory, surfaced for an operator or a future controller to act
- * on manually via the existing {@code ShardSplitAction}, not something this plugin ever acts on
- * itself.
+ * shape, but signals a split candidate rather than a query-rate replica-expansion candidate, and --
+ * unlike that class -- is deliberately not paired with any mechanism half yet, beyond the manual
+ * {@code InPlaceSplitShardAction} an operator can already trigger directly. {@link #candidate()} is
+ * purely advisory, surfaced for an operator or a future controller (Phase 1 item 1.2's scheduler
+ * task) to act on, not something this action ever acts on itself.
  */
 public final class ShardSplitCandidateEntry implements Writeable, ToXContentObject {
 
-    /** Sentinel used for {@link #writesPerMinute()} when no node reported that signal. */
+    /** Sentinel used for {@link #writesPerMinute()}/{@link #shardSizeInBytes()} when no node reported that signal. */
     public static final long UNKNOWN = -1L;
 
     private final String indexUuid;
     private final int shardId;
     private final String indexName;
     private final long writesPerMinute;
-    private final boolean candidate;
+    private final long shardSizeInBytes;
+    private final boolean writeRateCandidate;
+    private final boolean sizeCandidate;
 
     /**
      * Creates an entry.
@@ -53,15 +54,29 @@ public final class ShardSplitCandidateEntry implements Writeable, ToXContentObje
      *                   would need to address the index by name.
      * @param writesPerMinute the highest writes-per-minute estimate any writer copy of this shard
      *                        reported across the cluster, or {@link #UNKNOWN} if no node reported one.
-     * @param candidate whether this plugin's policy considers this shard's sustained write rate
-     *                  high enough to be worth an operator's attention as a possible split target.
+     * @param shardSizeInBytes the highest size-in-bytes estimate any writer copy of this shard
+     *                         reported across the cluster, or {@link #UNKNOWN} if no node reported one.
+     * @param writeRateCandidate whether this plugin's policy considers this shard's sustained
+     *                           write rate high enough to be worth an operator's attention.
+     * @param sizeCandidate whether this plugin's policy considers this shard's size large enough
+     *                      to be worth an operator's attention.
      */
-    public ShardSplitCandidateEntry(String indexUuid, int shardId, String indexName, long writesPerMinute, boolean candidate) {
+    public ShardSplitCandidateEntry(
+        String indexUuid,
+        int shardId,
+        String indexName,
+        long writesPerMinute,
+        long shardSizeInBytes,
+        boolean writeRateCandidate,
+        boolean sizeCandidate
+    ) {
         this.indexUuid = indexUuid;
         this.shardId = shardId;
         this.indexName = indexName;
         this.writesPerMinute = writesPerMinute;
-        this.candidate = candidate;
+        this.shardSizeInBytes = shardSizeInBytes;
+        this.writeRateCandidate = writeRateCandidate;
+        this.sizeCandidate = sizeCandidate;
     }
 
     /**
@@ -74,7 +89,9 @@ public final class ShardSplitCandidateEntry implements Writeable, ToXContentObje
         this.shardId = in.readVInt();
         this.indexName = in.readString();
         this.writesPerMinute = in.readZLong();
-        this.candidate = in.readBoolean();
+        this.shardSizeInBytes = in.readZLong();
+        this.writeRateCandidate = in.readBoolean();
+        this.sizeCandidate = in.readBoolean();
     }
 
     /** @param out stream to write this entry's fields to. */
@@ -84,7 +101,9 @@ public final class ShardSplitCandidateEntry implements Writeable, ToXContentObje
         out.writeVInt(shardId);
         out.writeString(indexName);
         out.writeZLong(writesPerMinute);
-        out.writeBoolean(candidate);
+        out.writeZLong(shardSizeInBytes);
+        out.writeBoolean(writeRateCandidate);
+        out.writeBoolean(sizeCandidate);
     }
 
     /** UUID of the index the shard belongs to. */
@@ -107,9 +126,24 @@ public final class ShardSplitCandidateEntry implements Writeable, ToXContentObje
         return writesPerMinute;
     }
 
-    /** Whether this plugin's policy considers this shard's write rate a split candidate. */
+    /** The highest size-in-bytes estimate any writer copy of this shard reported across the cluster, or {@link #UNKNOWN}. */
+    public long shardSizeInBytes() {
+        return shardSizeInBytes;
+    }
+
+    /** Whether this plugin's policy considers this shard's write rate a split-for-heat candidate. */
+    public boolean writeRateCandidate() {
+        return writeRateCandidate;
+    }
+
+    /** Whether this plugin's policy considers this shard's size a split-for-size candidate. */
+    public boolean sizeCandidate() {
+        return sizeCandidate;
+    }
+
+    /** Whether either signal makes this shard a split candidate -- {@link #writeRateCandidate()} or {@link #sizeCandidate()}. */
     public boolean candidate() {
-        return candidate;
+        return writeRateCandidate || sizeCandidate;
     }
 
     /**
@@ -123,7 +157,10 @@ public final class ShardSplitCandidateEntry implements Writeable, ToXContentObje
             .field("shard_id", shardId)
             .field("index_name", indexName)
             .field("writes_per_minute", writesPerMinute)
-            .field("candidate", candidate)
+            .field("shard_size_in_bytes", shardSizeInBytes)
+            .field("write_rate_candidate", writeRateCandidate)
+            .field("size_candidate", sizeCandidate)
+            .field("candidate", candidate())
             .endObject();
     }
 
@@ -138,13 +175,15 @@ public final class ShardSplitCandidateEntry implements Writeable, ToXContentObje
         ShardSplitCandidateEntry that = (ShardSplitCandidateEntry) o;
         return shardId == that.shardId
             && writesPerMinute == that.writesPerMinute
-            && candidate == that.candidate
+            && shardSizeInBytes == that.shardSizeInBytes
+            && writeRateCandidate == that.writeRateCandidate
+            && sizeCandidate == that.sizeCandidate
             && Objects.equals(indexUuid, that.indexUuid)
             && Objects.equals(indexName, that.indexName);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(indexUuid, shardId, indexName, writesPerMinute, candidate);
+        return Objects.hash(indexUuid, shardId, indexName, writesPerMinute, shardSizeInBytes, writeRateCandidate, sizeCandidate);
     }
 }

@@ -543,6 +543,37 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
         }
     }
 
+    public void testShardSizeInBytesReportsZeroBeforeAnyPublishAndRealTotalAfter() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+
+        ObjectStoreWriterEngine engine = openWriterEngine(shardStateStore, commitPublisher);
+        try {
+            assertEquals(
+                "an engine that has never published a manifest must report 0 bytes -- dynamic-partitioning-plan.md Phase 1 item 1.1",
+                0L,
+                engine.shardSizeInBytes()
+            );
+
+            index(engine, "1");
+            index(engine, "2");
+            engine.flush(true, true);
+
+            assertTrue(
+                "shardSizeInBytes must report the real total file size of the latest published manifest, "
+                    + "not stay 0 once real segment data exists",
+                engine.shardSizeInBytes() > 0
+            );
+        } finally {
+            IOUtils.close(engine, lastOpenedStore);
+        }
+    }
+
     public void testWritesPerMinuteReportsZeroWhileStillInsideTheFirstWindow() throws Exception {
         FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
         BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());

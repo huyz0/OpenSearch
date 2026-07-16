@@ -159,4 +159,25 @@ public final class ShardActivityRegistry {
         }
         return snapshot;
     }
+
+    /**
+     * A point-in-time snapshot of every tracked writer engine's own {@link
+     * ObjectStoreWriterEngine#shardSizeInBytes()} -- the split-for-size counterpart to {@link
+     * #snapshotWritesPerMinute()}'s split-for-heat signal, silently skipping any entry whose {@link
+     * WeakReference} has already been collected, same as {@link #snapshotWritesPerMinute()} does.
+     *
+     * @return every (indexUuid, shardId) key (see {@link #key}'s {@code "indexUuid/shardId"} format)
+     *         together with that shard's writer engine's own {@link
+     *         ObjectStoreWriterEngine#shardSizeInBytes()}, for every entry whose engine is still live
+     */
+    public Map<String, Long> snapshotShardSizes() {
+        Map<String, Long> snapshot = new java.util.HashMap<>();
+        for (Map.Entry<String, WeakReference<ObjectStoreWriterEngine>> entry : engines.entrySet()) {
+            ObjectStoreWriterEngine engine = entry.getValue().get();
+            if (engine != null) {
+                snapshot.put(entry.getKey(), engine.shardSizeInBytes());
+            }
+        }
+        return snapshot;
+    }
 }
