@@ -121,6 +121,27 @@ wiring) and task 10 (`RecoverySource` dispatch seam), since the commit driver
 and the recovery-source hook are two halves of the same completion signal and
 should be designed together.
 
+## Task 2-3 — Audit `SplitShardsMetadataTests`/`ShardRangeTests` coverage
+
+Status: **done** (research only, no code changes).
+
+Enumerated every `test*` method in both suites (`ShardRangeTests`: 22 tests;
+`SplitShardsMetadataTests`: 68 tests). Coverage is thorough for the data
+model itself: range comparison/containment/serde (`ShardRangeTests`),
+`getShardIdOfHash` for no-children/in-progress/completed/consecutive splits,
+`splitShard` including nested splits and hole-reuse after a cancelled split,
+`updateSplitMetadataForChildShards` (commit) success and every validation
+failure mode, `cancelSplit`, active-shard iteration, and full
+stream/XContent serde round-trips for every state combination
+(`SplitShardsMetadataTests`).
+
+**No test in either suite touches `IndexRoutingTable`, `RoutingTable`,
+`AllocationService`, or `ShardRouting`** — confirms this is purely a
+metadata-model test suite with zero coverage of (and therefore zero
+implicit design guidance for) the routing/allocation side. This matches
+Task 1's finding exactly: the gap is entirely in the routing layer, not
+hidden test debt in the metadata model. No new tasks added by this pass.
+
 ### Answer to the key open question
 
 **Does `IndexRoutingTable`/`RoutingNodes` gain `ShardRouting` entries for
