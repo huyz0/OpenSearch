@@ -213,11 +213,60 @@ work was attempted) is the honest, grounded first cut, not a shortcut around the
 Item 2.2 (whether `ShardShrinker`'s physical-merge approach is reusable) is now answered by the
 above: **no, and it doesn't need to be** for the sibling-pair case -- `ShardShrinker` remains the
 right tool for merging unrelated shard identities (its own existing, already-shipped use case),
-while in-place merge needs none of its machinery. Item 2.3 (merge trigger policy) and the actual
-implementation + tests + commit (this design's own next increment) are left for a future pass:
-this spike's purpose was to establish the data model is sound and inexpensive before committing to
-building the full transport action / recovery-source / read-path wiring around it, the same
-judgment call Task 12 made for split's own manifest-identity question before Task 13-14 built it.
+while in-place merge needs none of its machinery.
+
+### Update: the metadata primitive itself is now implemented and tested
+
+The design above turned out cheap enough to build immediately rather than leaving purely as a
+paper design: `SplitShardsMetadata.Builder.mergeChildrenBackToParent(int parentShardId)` is now
+real, following exactly the proposed shape. Three preconditions, each with its own
+`IllegalArgumentException`:
+
+1. `parentShardId` must be an original root shard id (`0 <= parentShardId < rootShardsToAllChildren.length`)
+   -- the flat, non-nested scope this spike deliberately chose.
+2. The split must not still be in-progress (`inProgressSplitShardIds`).
+3. **Every direct child must still be an active, unsplit leaf** -- checked against
+   `parentToChildShards.get(parentShardId)` (the *original* direct-children list a split recorded),
+   not `rootShardsToAllChildren[parentShardId]` (which a nested split of one of those children
+   silently grows with that child's own grandchildren). A real bug caught by
+   `testMergeChildrenBackToParentRejectsAFurtherSplitChild`: the first draft validated against
+   `rootShardsToAllChildren` and the test's "split one child further, then try to merge the
+   parent" case passed with no exception, because the grandchildren it introduced were themselves
+   active and looked like valid, mergeable children. A second bug the same test line of
+   investigation caught: checking only `activeShardIds.contains(child)` missed a child that had
+   been split but not yet *committed* (still in `inProgressSplitShardIds`, so still counted
+   active) -- fixed by also rejecting a child that's `inProgressSplitShardIds`.
+
+Effect: every child is removed from `activeShardIds`, the parent is added back,
+`rootShardsToAllChildren[parentShardId]` is cleared to `null` (its pre-split state), and
+`parentToChildShards` no longer records the (now-reversed) split.
+
+New tests in `SplitShardsMetadataTests` (6): a full round-trip (split, commit, merge back --
+parent active again, children inactive, root's child-list `null`), confirmation that
+`getShardIdOfHash` needs zero code changes and correctly resolves a former child's whole hash
+range back to the parent post-merge, and four rejection cases (in-progress split, never-split
+shard, non-root/child shard id, and the further-split-child case above that caught the two real
+bugs).
+
+Verified meaningfulness by commenting out the `rootShardsToAllChildren[parentShardId] = null;`
+line and re-running `testGetShardIdOfHashResolvesToParentAfterMerge` /
+`testMergeChildrenBackToParentReversesACommittedSplit` -- the hash-resolution test failed exactly
+as expected (`expected:<0> but was:<3>`, resolving to a stale child id instead of the parent);
+restored, both tests passed clean again. Full regression sweep before commit:
+`org.opensearch.cluster.metadata.*`/`org.opensearch.cluster.routing.*` plus
+`:server:missingJavadoc`, all clean.
+
+### What's still open (deliberately, honestly, not attempted here)
+
+Item 2.3 (merge trigger policy) and the rest of the write path this metadata primitive needs to
+actually be reachable -- `MetadataInPlaceMergeShardService`, `InPlaceMergeShardRecoverySource`,
+`IndexRoutingTable` retirement of the two children's routing entries and revival of the parent's,
+a REST/transport action, and the plugin-side `EngineFactory` hook that drops a survivor child's
+`InPlaceSplitFilteringDirectoryReader` wrapping -- are left for a future pass. This mirrors the
+exact staged approach split itself used across this whole session (Tasks 1/12 design first, then
+5-9 routing, then 13-14 the engine hook, each landed and verified independently before the next):
+landing the metadata primitive alone, real and tested, is a complete, honest increment in its own
+right, not a partial one.
 
 ## Task 20 (new, found while attempting item 0.7) — `IndexMetadata.numberOfShards` invariant breaks for split children, FIXED
 

@@ -505,6 +505,99 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
     }
 
     /**
+     * mergeChildrenBackToParent reverses an already-committed, flat (non-nested) split: the parent
+     * shard becomes active again, both children become inactive, and the root reverts to its
+     * pre-split (null) state -- dynamic-partitioning-plan.md Phase 2 item 2.1's first increment.
+     */
+    public void testMergeChildrenBackToParentReversesACommittedSplit() {
+        int numberOfShards = 3;
+        int parentShardId = 0;
+        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(numberOfShards);
+        List<ShardRange> children = builder.splitShard(parentShardId, 2);
+        Set<Integer> childIds = new HashSet<>();
+        children.forEach(c -> childIds.add(c.shardId()));
+        builder.updateSplitMetadataForChildShards(parentShardId, childIds);
+
+        builder.mergeChildrenBackToParent(parentShardId);
+        SplitShardsMetadata metadata = builder.build();
+
+        Set<Integer> activeShardIds = new HashSet<>();
+        metadata.getActiveShardIterator().forEachRemaining(activeShardIds::add);
+        assertTrue("the parent shard must be active again after the merge", activeShardIds.contains(parentShardId));
+        for (Integer childId : childIds) {
+            assertFalse("a merged-away child must no longer be active", activeShardIds.contains(childId));
+        }
+        assertNull("the root must revert to its pre-split (unsplit) state", metadata.getChildShardsOfParent(parentShardId));
+        assertEquals(numberOfShards, metadata.getNumberOfShards());
+    }
+
+    /**
+     * Once merged back, the parent's own hash range must resolve to itself again -- the same
+     * pre-split behavior getShardIdOfHash was already written to handle, requiring zero routing
+     * code changes (see dynamic-partitioning-progress.md's "Phase 2 item 2.1" entry).
+     */
+    public void testGetShardIdOfHashResolvesToParentAfterMerge() {
+        int numberOfShards = 3;
+        int parentShardId = 0;
+        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(numberOfShards);
+        List<ShardRange> children = builder.splitShard(parentShardId, 2);
+        Set<Integer> childIds = new HashSet<>();
+        children.forEach(c -> childIds.add(c.shardId()));
+        builder.updateSplitMetadataForChildShards(parentShardId, childIds);
+        builder.mergeChildrenBackToParent(parentShardId);
+        SplitShardsMetadata metadata = builder.build();
+
+        for (ShardRange formerChild : children) {
+            assertEquals(
+                "every hash formerly owned by a merged-away child must resolve back to the parent",
+                parentShardId,
+                metadata.getShardIdOfHash(parentShardId, formerChild.start(), false)
+            );
+        }
+    }
+
+    public void testMergeChildrenBackToParentRejectsAnInProgressSplit() {
+        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
+        builder.splitShard(0, 2);
+
+        expectThrows(IllegalArgumentException.class, () -> builder.mergeChildrenBackToParent(0));
+    }
+
+    public void testMergeChildrenBackToParentRejectsAnUnsplitShard() {
+        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
+
+        expectThrows(IllegalArgumentException.class, () -> builder.mergeChildrenBackToParent(1));
+    }
+
+    public void testMergeChildrenBackToParentRejectsANonRootShardId() {
+        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
+        List<ShardRange> children = builder.splitShard(0, 2);
+        Set<Integer> childIds = new HashSet<>();
+        children.forEach(c -> childIds.add(c.shardId()));
+        builder.updateSplitMetadataForChildShards(0, childIds);
+
+        // A committed child's shard id is >= numberOfShards, deliberately outside
+        // rootShardsToAllChildren's own [0, numberOfShards) index range.
+        int aChildShardId = childIds.iterator().next();
+        expectThrows(IllegalArgumentException.class, () -> builder.mergeChildrenBackToParent(aChildShardId));
+    }
+
+    public void testMergeChildrenBackToParentRejectsAFurtherSplitChild() {
+        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
+        List<ShardRange> children = builder.splitShard(0, 2);
+        Set<Integer> childIds = new HashSet<>();
+        children.forEach(c -> childIds.add(c.shardId()));
+        builder.updateSplitMetadataForChildShards(0, childIds);
+
+        // Split one of the two children further -- it's no longer a simple, unsplit leaf, so the
+        // parent's children no longer form a flat, mergeable partition.
+        int aChildShardId = childIds.iterator().next();
+        builder.splitShard(aChildShardId, 2);
+
+        expectThrows(IllegalArgumentException.class, () -> builder.mergeChildrenBackToParent(0));
+    }
+
+    /**
      * Test that getInProgressSplitShardId returns the correct shard ID
      */
     public void testGetInProgressSplitShardId() {

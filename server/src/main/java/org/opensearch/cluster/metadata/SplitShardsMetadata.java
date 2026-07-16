@@ -527,6 +527,59 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
             parentToChildShards.remove(sourceShardId);
         }
 
+        /**
+         * Reverses an already-committed split, merging every one of {@code parentShardId}'s children
+         * back into a single active shard again -- dynamic-partitioning-plan.md Phase 2 item 2.1's
+         * "undo my own split" in-place merge, deliberately scoped to exactly the flat, non-nested case
+         * a first increment can support: {@code parentShardId} must itself be an original root shard
+         * (not itself a child produced by an earlier split), and every one of its children must still
+         * be active and unsplit -- if any child has itself been split further, this shard's children no
+         * longer form a simple contiguous partition of the parent's own original range, and reversing
+         * that would require the harder, not-yet-designed nested-merge case (see
+         * dynamic-partitioning-progress.md's "Phase 2 item 2.1" entry for why that's explicitly out of
+         * scope here). Unlike {@link #cancelSplit}, which only ever undoes a still-*in-progress* split
+         * (this plugin's own allocation-failure rollback path), this undoes a split that has already
+         * committed and been serving traffic.
+         *
+         * @param parentShardId the root shard whose full, unsplit-further child set should be merged
+         *                      back into it.
+         * @throws IllegalArgumentException if {@code parentShardId} isn't a root shard, isn't currently
+         *                                  split, is still mid-split, or has a child that's itself been
+         *                                  split further.
+         */
+        public void mergeChildrenBackToParent(int parentShardId) {
+            if (parentShardId < 0 || parentShardId >= rootShardsToAllChildren.length) {
+                throw new IllegalArgumentException(
+                    "Shard [" + parentShardId + "] is not an original root shard; nested in-place merge is not supported"
+                );
+            }
+            if (inProgressSplitShardIds.contains(parentShardId)) {
+                throw new IllegalArgumentException("Split of shard [" + parentShardId + "] is still in progress");
+            }
+            // parentToChildShards records exactly the *direct* children this shard's own split
+            // produced, unaffected by any later split of one of those children -- rootShardsToAllChildren
+            // is the wrong list to validate/remove against here, since a nested split of one direct
+            // child grows *this* root's entry with that child's own grandchildren too.
+            ShardRange[] children = parentToChildShards.get(parentShardId);
+            if (children == null || children.length == 0) {
+                throw new IllegalArgumentException("Shard [" + parentShardId + "] has not been split");
+            }
+            for (ShardRange child : children) {
+                if (activeShardIds.contains(child.shardId()) == false || inProgressSplitShardIds.contains(child.shardId())) {
+                    throw new IllegalArgumentException(
+                        "Child shard [" + child.shardId() + "] of [" + parentShardId + "] has itself been split further (or is "
+                            + "mid-split); nested in-place merge is not supported"
+                    );
+                }
+            }
+            for (ShardRange child : children) {
+                activeShardIds.remove(child.shardId());
+            }
+            activeShardIds.add(parentShardId);
+            rootShardsToAllChildren[parentShardId] = null;
+            parentToChildShards.remove(parentShardId);
+        }
+
         public SplitShardsMetadata build() {
             return new SplitShardsMetadata(
                 this.rootShardsToAllChildren,
