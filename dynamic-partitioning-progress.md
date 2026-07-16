@@ -5,6 +5,111 @@ section per completed task. Numbering matches the task list handed to the user
 (1-40), cross-referenced to the plan's own `0.x`/`1.x`/... item numbers where
 applicable.
 
+## Task 20 (new, found while attempting item 0.7) — `IndexMetadata.numberOfShards` invariant breaks for split children, NOT fixed
+
+Status: **found and documented, not fixed** — this is a genuine, previously-hidden core bug, not a
+test artifact, but the correct fix touches `IndexMetadata`'s foundational per-shard invariants
+(`numberOfShards`/`primaryTerms` wire format/`inSyncAllocationIds` sizing), which are load-bearing
+for far more than split. Flagged deliberately rather than rushing a narrow patch to a structure
+this central without the design-and-test rigor it deserves.
+
+### The bug
+
+Writing the real Phase 0.7 IT (a genuine 2-node cluster, the plugin's real writer engine, 40
+documents, a real `InPlaceSplitShardAction` call) surfaced an uncaught `AssertionError` on the
+**cluster-manager apply thread itself**, inside `AllocationService.reroute` →
+`RoutingAllocation.updateMetadataWithRoutingChanges` → `IndexMetadataUpdater.updateInSyncAllocations`
+→ `IndexMetadata.inSyncAllocationIds(int shardId)`:
+
+```
+assert shardId >= 0 && shardId < numberOfShards;
+```
+
+`MetadataInPlaceSplitShardService.applySplitShardRequest` (Tasks 5-9) adds real child
+`ShardRouting` entries to the `IndexRoutingTable` for shard ids at or beyond the index's original
+`numberOfShards` (e.g. splitting shard 0 of a 1-shard index into 2 children reserves shard ids 1
+and 2) — but never touches `IndexMetadata.numberOfShards` itself, by design: Task 1's own note
+that `SplitShardsMetadata`'s active-shard bookkeeping and `IndexMetadata.numberOfShards`
+"intentionally diverge" is exactly why `OperationRouting.generateShardId` can keep resolving hashes
+via the original, over-provisioned `routingNumShards`/`routingFactor` without rehashing. The very
+next `AllocationService.reroute` call, though, walks the routing table's *real* shards (now
+including the children) and asserts every shard id it touches is `< numberOfShards` — which no
+longer holds.
+
+**In a real cluster, this is worse than a test-only assertion failure.** `internalClusterTest` runs
+with `-ea`; production JVMs typically do not. With assertions disabled, the same code path calls
+`inSyncAllocationIds.get(shardId)` for the out-of-range child shard id, gets `null` back (the map
+was only ever filled for `[0, numberOfShards)` by `IndexMetadata.Builder.build()`'s "fill missing
+slots" loop), and the caller immediately calls `.isEmpty()`/`.contains(...)` on that `null` —
+a `NullPointerException` on the cluster-manager's single-threaded apply executor. That executor
+processes all cluster-state updates for the whole cluster; an uncaught exception there does not
+cleanly fail the one pending request — as observed, the client's `actionGet()` on the split action
+simply **hangs forever** (no response is ever sent, since the task that would have completed it
+crashed mid-execution). This reproduced as a real 20-minute test-suite timeout, not a fast,
+diagnosable test failure.
+
+### Why this is deeper than a one-line patch
+
+Relaxing `inSyncAllocationIds(int)`'s assertion and falling back to `getOrDefault(shardId,
+emptySet())` only fixes the symptom at that one call site. The same `numberOfShards`-bounded shape
+recurs at real invariants elsewhere in `IndexMetadata`:
+
+- `IndexMetadata.Builder.build()`'s "fill missing slots in inSyncAllocationIds" loop only fills
+  `[0, numberOfShards)` — entries a caller adds for a child shard id beyond that range would
+  currently be silently dropped at build time, not just unread.
+- `primaryTermsMap`'s build-time check is a hard equality: `primaryTermsMap.size() != numberOfShards`
+  throws `IllegalStateException` once *any* explicit primary term has been recorded (which happens
+  almost immediately once a shard is promoted/its term bumped) — so recording a child's own primary
+  term (needed the moment its primary activates, exactly as
+  `InPlaceSplitLocalStoreRecoveryTests`'s own unit test had to do by hand via
+  `.primaryTerm(childShardId, 1)`) would make every subsequent build of that `IndexMetadata` throw.
+- `primaryTermsMap` also has a *wire-format* representation as a plain `long[numberOfShards]` array
+  (`IndexMetadata.Builder#writeTo`/`readFrom` and the `IndexMetadataDiff` codec), for backward
+  compatibility with pre-map-based versions — extending it to cover child shard ids needs either a
+  version-gated wire format change or a deliberate decision to keep the array
+  `numberOfShards`-sized and carry child primary terms in a separate, already-map-shaped field.
+
+None of these are safe to guess at under this session's normal "implement → test → verify by
+breaking it" discipline in one pass — `IndexMetadata` is exercised by essentially every core
+subsystem (snapshot/restore, every `AllocationDecider`, remote cluster-state publication, stats
+aggregation), and an under-tested change here risks correctness far outside the scope of the split
+feature itself. This needs its own dedicated design pass: most likely, the real answer is that
+`IndexMetadata.numberOfShards` needs to stay meaning exactly what `OperationRouting` needs it to
+mean (the routing-hash denominator's origin count) while a **new, explicitly split-aware concept**
+carries the active/child shard set's own primary terms and in-sync allocation ids, keyed
+dynamically rather than pre-sized off `numberOfShards` — likely living alongside
+`SplitShardsMetadata` itself (which already tracks a `maxShardId` field, currently private with no
+public accessor, that a fix along these lines would need to expose).
+
+### What this blocks
+
+**Phase 0 item 0.7 (the full real-workload IT) cannot pass until this is fixed** — any real
+`AllocationService.reroute` after a split's routing-table children are added hits this assertion
+(or, in production, the NPE) as soon as the reroute pass processes those shards, which happens on
+essentially every subsequent cluster-state update, not just the split's own. This is very likely
+why `MetadataInPlaceSplitShardServiceTests`/`MetadataInPlaceSplitShardCommitServiceTests` (Tasks
+5-9, 8.5) never caught it: those tests call `applySplitShardRequest`/`evaluateSplitCompletion`
+directly with a hand-built `AllocationService`/`RoutingAllocation` fixture, not necessarily one that
+exercises `IndexMetadataUpdater.updateInSyncAllocations` for a shard that just transitioned from
+`UNASSIGNED` to `INITIALIZING` in a real reroute pass end to end — a real 2-node
+`internalClusterTest` was needed to surface it, exactly the gap Phase 0.7 exists to close.
+
+The new IT written to exercise item 0.7
+(`ServerlessStorageInPlaceSplitDocumentReachabilityIT`) was **not committed** — as written, it
+reliably hangs the whole test JVM for the full 20-minute suite timeout once it calls the split
+action, which would be actively harmful to land in the tree (any future full-suite run pays that
+20 minutes). It will be reinstated once this task is fixed; its design (real 2-node cluster, 40
+real documents, scatter-gather search + single-shard `GET` reachability check, PUT-count-based
+zero-copy-copy assertion) remains valid and is recorded here for that purpose.
+
+### New task added to the backlog (auto-added per `/goal` authorization)
+
+**Task 20 (this entry) — Make `IndexMetadata`'s per-shard-keyed structures
+(`inSyncAllocationIds`, `primaryTerms`, and their wire formats) tolerate shard ids introduced by an
+in-place split without requiring `numberOfShards` itself to grow.** This is now the single
+highest-priority remaining item for Phase 0 — without it, `AllocationService.reroute` cannot safely
+process a post-split routing table at all, in or out of a test.
+
 ## Task 1 — Read `MetadataInPlaceSplitShardService` et al., document the real transition sequence
 
 Status: **done** (research only, no code changes).
