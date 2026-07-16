@@ -121,6 +121,122 @@ wiring) and task 10 (`RecoverySource` dispatch seam), since the commit driver
 and the recovery-source hook are two halves of the same completion signal and
 should be designed together.
 
+## Task 12 — Manifest-identity design spike (§0.4)
+
+Status: **done** — design decision only, per the plan's own instruction not
+to guess this in isolation. No code changes in this entry; implementation
+is Task 13-14, scoped separately below.
+
+### What was investigated
+
+- **Today's manifest identity convention**: `ServerlessStoragePlugin.blobContainerFor(indexUuid,
+  shardId)` builds the container path as literally `BlobPath.cleanPath().add(indexUuid).add(String.valueOf(shardId))`
+  — flat `<indexUuid>/<shardId>`. `CommitManifest`'s identity fields are
+  exactly `(indexUuid, shardId, primaryTerm, generation)`; `ShardHead` is a
+  single scalar `(primaryTerm, leaseHolderNodeId, leaseExpiryMillis,
+  latestManifestGeneration)` pointer — one linear generation sequence per
+  shard, no branching/lineage field anywhere.
+- **`ShardCloner.clone`/`ShardSplitter.split`** (this plugin's existing,
+  unrelated zero-copy machinery, built for producing a brand-new *index* from
+  a source shard): both give the target a **whole new `(indexUuid, shardId)`
+  identity** with a full manifest at generation 1, whose `files()` simply
+  point at the *same* bundle names the source manifest already references —
+  zero-copy is achieved by not copying bytes, not by any stored reference
+  count. GC-safety comes from `DurablePinRegistry` pinning the exact source
+  `(primaryTerm, generation)` before the clone's manifest is even read, plus
+  a tiny `CloneLineage` record (`(sourceIndexUuid, sourceShardId)`) written
+  into the target's own container purely so `deleteClone` can find its way
+  back to release that pin later.
+- **`ShardPartitionDescriptor`**: a write-once `(partitionIndex, numPartitions)`
+  record, explicitly documented as lifetime-immutable ("a shard's partition
+  assignment never changes across its own lifetime... a further split would
+  create new target shards of its own"). Confirmed this matches the plan's
+  own claim exactly — no discrepancy found.
+- **No existing precedent anywhere** (`WalChunkService.ShardKey`,
+  `ManifestRetentionPolicy`, `ShardHead`) for multiple concurrent manifest
+  lineages, sub-shard IDs, or range/generation tags under one core `ShardId`
+  — confirmed via exhaustive grep across `shardstate/`, `manifest/`, `wal/`,
+  `gc/`, `clone/`, `resharding/`.
+
+### The decision
+
+**Reject both candidate shapes 0.4 originally proposed** ("synthetic
+sub-`ShardId`" and "new blob-path segment"). Neither is needed, because
+Task 5-9's `AllocationService`/`RoutingTable` wiring already gives every
+child shard a **real, ordinary core `ShardId`** — a genuinely new integer
+shard ID reserved by `SplitShardsMetadata.Builder.splitShard` (via
+`maxShardId`), not a synthetic or derived one. The child is, from the
+storage layer's point of view, just another shard of the *same index*
+(same `indexUuid`) that happens to have a new integer ID. That means the
+existing flat `<indexUuid>/<shardId>` convention **already accommodates
+it with zero changes** — `blobContainerFor`, `CommitManifest`, `ShardHead`,
+`WalChunkService.ShardKey`, and `ManifestRetentionPolicy` all continue to
+work completely unmodified, because none of them assumed anything about
+how a `shardId` integer came to exist.
+
+The genuinely new design problem was never "where do we put the child's
+manifest" — it was mis-scoped in the original plan wording. It's actually:
+**how does the child's first manifest reference a hash-range subset of the
+parent's bundle files without physically copying them or waiting for a
+real merge**. That problem already has a solved precedent one layer up:
+`ShardSplitter.split`'s exact recipe (clone the manifest's `files()`
+verbatim via `ShardCloner.clone`, protect them with a `DurablePinRegistry`
+pin on the source generation, attach a small write-once partition
+descriptor) — just retargeted from "new index, new shardId" to "same
+index, new shardId, source is a sibling shard of the same index instead of
+a cross-index source."
+
+**Concrete shape for Task 13-14's implementation** (not built in this
+entry):
+
+1. `Engine#recoverFromInPlaceSplit(ShardId childShardId)` (Task 10-11's
+   hook), on the plugin's `ObjectStoreWriterEngine`, resolves the parent
+   shard ID from `IndexMetadata.getSplitShardsMetadata()` (findable via a
+   reverse lookup — `getChildShardsOfParent` iterated over in-progress
+   parents, or a new small helper; exact lookup mechanics are Task 13's
+   detail, not blocked on anything found in this spike).
+2. Reuses `DurablePinRegistry` to pin the parent's current `(primaryTerm,
+   generation)`, exactly as `ShardCloner.clone` does today for a
+   cross-index source.
+3. Writes a full `CommitManifest` at `(indexUuid, childShardId,
+   primaryTerm=1, generation=1)` whose `files()` are the parent's current
+   manifest's `files()` verbatim — no bytes copied, same mechanism
+   `ShardCloner`/`ShardSplitter` already use.
+4. Writes a partition-descriptor-equivalent scoped to the child's
+   `ShardRange` (not `ShardPartitionDescriptor`'s `(partitionIndex,
+   numPartitions)` shape, since core's hash-range split model is a
+   different partitioning scheme than this plugin's existing equal-count
+   partition split — this is a genuinely new record type, small, following
+   `ShardPartitionDescriptor`'s own "write-once, separate from
+   `CommitManifest`" precedent).
+5. A `CloneLineage`-equivalent (or a straightforward reuse of the same
+   class, since its `(sourceIndexUuid, sourceShardId)` shape already fits —
+   `sourceIndexUuid` just happens to equal the child's own `indexUuid`) for
+   later pin release once the split fully commits or is cancelled (Task
+   8.5's driver already has the commit/cancel signal; wiring pin release
+   into it is Task 13-14 scope).
+6. `ShardPartitionDescriptor`'s own lifetime-immutable contract (flagged by
+   the plan as needing an update, Phase 0.5 / task in this breakdown) is
+   untouched by this decision — it's a separate, existing record for this
+   plugin's *own* equal-count split mechanism, not reused here.
+
+### Why this matters for Part 2d's reconciliation question
+
+This closes a real ambiguity Part 2d of the plan already flagged: whether
+`OrchestrateShardSplitAction` (this plugin's own operator-triggered
+split-and-clone action, built earlier this session) and the new in-place
+split mechanism are the same thing wearing two names, or two different
+things. They are now confirmed **architecturally sibling, not identical**:
+`OrchestrateShardSplitAction` produces a brand-new index (new `indexUuid`)
+via `ShardSplitter`/`ShardCloner`, while in-place split keeps the same
+`indexUuid` and only grows the shard count within it, via core's
+`SplitShardsMetadata`/routing machinery from Task 5-9 plus a manifest
+strategy that borrows `ShardCloner`'s zero-copy recipe but retargets it.
+Both are legitimate, coexisting tools for different scaling shapes (new
+index vs. more shards of the same index) — this was already Part 2d's own
+conclusion; this spike confirms the storage-layer mechanics support that
+conclusion without contradiction.
+
 ## Tasks 10-11 — `RecoverySource` dispatch seam for `InPlaceSplitShardRecoverySource`
 
 Status: **done**, commit follows this entry.
