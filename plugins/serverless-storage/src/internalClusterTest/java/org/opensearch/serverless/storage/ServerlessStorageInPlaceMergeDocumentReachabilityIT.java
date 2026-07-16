@@ -8,18 +8,14 @@
 
 package org.opensearch.serverless.storage;
 
-import org.opensearch.action.admin.indices.split.InPlaceMergeShardClusterStateUpdateRequest;
+import org.opensearch.action.admin.indices.split.InPlaceMergeShardAction;
 import org.opensearch.action.admin.indices.split.InPlaceSplitShardAction;
 import org.opensearch.action.get.GetResponse;
-import org.opensearch.action.support.PlainActionFuture;
-import org.opensearch.cluster.ack.ClusterStateUpdateResponse;
-import org.opensearch.cluster.metadata.MetadataInPlaceMergeShardService;
+import org.opensearch.action.support.clustermanager.AcknowledgedResponse;
 import org.opensearch.cluster.metadata.SplitShardsMetadata;
 import org.opensearch.cluster.routing.IndexRoutingTable;
-import org.opensearch.cluster.routing.allocation.AllocationService;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Settings;
-import org.opensearch.common.unit.TimeValue;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.test.OpenSearchIntegTestCase;
 
@@ -141,22 +137,13 @@ public class ServerlessStorageInPlaceMergeDocumentReachabilityIT extends Serverl
         int expectedFinalCount = PRE_SPLIT_COUNT - DELETE_COUNT + POST_SPLIT_COUNT;
         assertHitCount(client().prepareSearch(INDEX_NAME).setSize(0).get(), expectedFinalCount);
 
-        // Trigger the in-place merge of shard 0's two children back into the parent. The
-        // REST/transport entry point is built separately (step 3); here we drive the same
-        // cluster-manager service the action will delegate to.
-        MetadataInPlaceMergeShardService mergeService = new MetadataInPlaceMergeShardService(
-            clusterService,
-            internalCluster().getInstance(AllocationService.class, clusterManagerNode)
-        );
-        PlainActionFuture<ClusterStateUpdateResponse> mergeFuture = PlainActionFuture.newFuture();
-        InPlaceMergeShardClusterStateUpdateRequest mergeRequest = new InPlaceMergeShardClusterStateUpdateRequest(
-            "test-in-place-merge",
-            INDEX_NAME,
-            0
-        );
-        mergeRequest.ackTimeout(TimeValue.timeValueSeconds(30)).clusterManagerNodeTimeout(TimeValue.timeValueSeconds(30));
-        mergeService.merge(mergeRequest, mergeFuture);
-        assertTrue("merge cluster-state update must be acknowledged", mergeFuture.actionGet().isAcknowledged());
+        // Trigger the in-place merge of shard 0's two children back into the parent through the real
+        // operator action.
+        AcknowledgedResponse mergeResponse = client().execute(
+            InPlaceMergeShardAction.INSTANCE,
+            new InPlaceMergeShardAction.Request(INDEX_NAME, 0)
+        ).actionGet();
+        assertTrue("merge must be acknowledged", mergeResponse.isAcknowledged());
 
         // The parent is revived and both children are retired.
         assertBusy(() -> {

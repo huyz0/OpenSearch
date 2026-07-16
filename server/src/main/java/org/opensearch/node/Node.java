@@ -1759,6 +1759,12 @@ public class Node implements Closeable {
             final org.opensearch.cluster.metadata.MetadataInPlaceSplitShardService metadataInPlaceSplitShardService =
                 new org.opensearch.cluster.metadata.MetadataInPlaceSplitShardService(clusterService, clusterModule.getAllocationService());
 
+            // The service TransportInPlaceMergeShardAction calls to reverse a split in place -- the
+            // merge counterpart of metadataInPlaceSplitShardService above, likewise previously
+            // constructed nowhere, so the whole in-place merge feature was unreachable from any API.
+            final org.opensearch.cluster.metadata.MetadataInPlaceMergeShardService metadataInPlaceMergeShardService =
+                new org.opensearch.cluster.metadata.MetadataInPlaceMergeShardService(clusterService, clusterModule.getAllocationService());
+
             mergedSegmentWarmerFactory = new MergedSegmentWarmerFactory(transportService, recoverySettings, clusterService);
 
             final MappingTransformerRegistry mappingTransformerRegistry = new MappingTransformerRegistry(mapperPlugins, xContentRegistry);
@@ -1809,6 +1815,7 @@ public class Node implements Closeable {
                 b.bind(AliasValidator.class).toInstance(aliasValidator);
                 b.bind(MetadataCreateIndexService.class).toInstance(metadataCreateIndexService);
                 b.bind(org.opensearch.cluster.metadata.MetadataInPlaceSplitShardService.class).toInstance(metadataInPlaceSplitShardService);
+                b.bind(org.opensearch.cluster.metadata.MetadataInPlaceMergeShardService.class).toInstance(metadataInPlaceMergeShardService);
                 b.bind(AwarenessReplicaBalance.class).toInstance(awarenessReplicaBalance);
                 b.bind(MetadataCreateDataStreamService.class).toInstance(metadataCreateDataStreamService);
                 b.bind(ViewService.class).toInstance(viewService);
