@@ -5,6 +5,19 @@ section per completed task. Numbering matches the task list handed to the user
 (1-40), cross-referenced to the plan's own `0.x`/`1.x`/... item numbers where
 applicable.
 
+## Phase 0 — done (0.1 through 0.8)
+
+Every Phase 0 checklist item is complete: 0.1 (transition-sequence read), 0.2 (routing-table
+wiring), 0.3 (`InPlaceSplitShardRecoverySource` dispatch), 0.4 (manifest-identity spike →
+`ShardCloner.clone` reuse), 0.5 (n/a — `ShardPartitionDescriptor` unrelated to this mechanism, Task
+15), 0.6 (REST/transport action), 0.7 (full real-workload IT, Task 20 below), and now 0.8: beyond
+the plugin's own quality gate + `internalClusterTest` sweep (already run for Task 20), a broader
+core-level sweep — `org.opensearch.index.shard.*`, `org.opensearch.index.engine.*`,
+`org.opensearch.cluster.routing.allocation.decider.*`, `org.opensearch.action.admin.indices.split.*`
+— ran clean, closing out the "matching core-level test sweep" 0.8 explicitly calls for given this
+phase's changes touch `AllocationService`/`IndexShard`. Proceeding to Phase 1 (automatic split
+triggering).
+
 ## Task 20 (new, found while attempting item 0.7) — `IndexMetadata.numberOfShards` invariant breaks for split children, FIXED
 
 Status: **fixed and verified, Phase 0.7's full real-workload IT now passes**. The initial analysis
