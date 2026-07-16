@@ -15,15 +15,13 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.serverless.storage.scaleup.action.ScaleUpCandidateEntry;
+import org.opensearch.serverless.storage.util.SustainedCandidateTracker;
 import org.opensearch.transport.client.Client;
 
-import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 
 /**
  * The "do the work" half of scale-up (see the RFC's scale-up autoscaling subsection), consuming
@@ -49,7 +47,7 @@ import java.util.concurrent.ConcurrentMap;
  * multiple consecutive over-threshold ticks to avoid reacting to one noisy evaluation" gap,
  * previously left open): {@link #expandCandidates} tracks, per {@code (indexUuid, shardId)}, how
  * many *consecutive* evaluations in a row have flagged that shard a candidate. A shard only
- * actually triggers expansion once that streak reaches {@link #requiredConsecutiveTicks}; any tick
+ * actually triggers expansion once that streak reaches the configured {@code requiredConsecutiveTicks}; any tick
  * where it is not flagged a candidate resets its streak to zero, so the requirement really means
  * "sustained," not "N times ever." A shard no longer reported at all (relocated, deleted, or its
  * index no longer exists) has its tracked streak dropped rather than left to leak forever.
@@ -73,9 +71,8 @@ public final class ReaderReplicaExpansionCoordinator {
 
     private final Client client;
     private final int maxSearchReplicas;
-    private final int requiredConsecutiveTicks;
     private final int maxExpansionsPerTick;
-    private final ConcurrentMap<String, Integer> consecutiveCandidateTicks = new ConcurrentHashMap<>();
+    private final SustainedCandidateTracker<ScaleUpCandidateEntry> tracker;
 
     /**
      * Creates a coordinator.
@@ -97,8 +94,12 @@ public final class ReaderReplicaExpansionCoordinator {
     public ReaderReplicaExpansionCoordinator(Client client, int maxSearchReplicas, int requiredConsecutiveTicks, int maxExpansionsPerTick) {
         this.client = client;
         this.maxSearchReplicas = maxSearchReplicas;
-        this.requiredConsecutiveTicks = Math.max(1, requiredConsecutiveTicks);
         this.maxExpansionsPerTick = maxExpansionsPerTick;
+        this.tracker = new SustainedCandidateTracker<>(requiredConsecutiveTicks);
+    }
+
+    private static String key(ScaleUpCandidateEntry entry) {
+        return entry.indexUuid() + "/" + entry.shardId();
     }
 
     /**
@@ -116,45 +117,34 @@ public final class ReaderReplicaExpansionCoordinator {
      *                   the streak of a shard no longer reported at all.
      */
     public void expandCandidates(List<ScaleUpCandidateEntry> candidates) {
-        Set<String> observedKeys = new HashSet<>();
-        List<ScaleUpCandidateEntry> sustainedCandidates = new ArrayList<>();
-        for (ScaleUpCandidateEntry entry : candidates) {
-            String key = entry.indexUuid() + "/" + entry.shardId();
-            observedKeys.add(key);
-            if (entry.candidate() == false) {
-                consecutiveCandidateTicks.remove(key);
-                continue;
-            }
-            int streak = consecutiveCandidateTicks.merge(key, 1, Integer::sum);
-            if (streak < requiredConsecutiveTicks) {
-                continue; // flagged, but not sustained long enough yet -- wait for the next tick.
-            }
-            sustainedCandidates.add(entry);
-        }
-        consecutiveCandidateTicks.keySet().retainAll(observedKeys);
+        List<ScaleUpCandidateEntry> sustainedCandidates = tracker.filterSustained(
+            candidates,
+            ReaderReplicaExpansionCoordinator::key,
+            ScaleUpCandidateEntry::candidate
+        );
 
         // Busiest shard first, so a tight budget is spent on whichever candidates need it most.
         sustainedCandidates.sort(Comparator.comparingLong(ScaleUpCandidateEntry::queriesPerMinute).reversed());
 
+        // Budget exhausted for any *new* index this tick -- deliberately leave this (and every
+        // remaining) candidate's streak intact rather than clearing it, so it keeps its "already
+        // sustained" status and highest priority into the next tick instead of having to re-qualify
+        // from scratch. A candidate whose index another shard already triggered this tick never
+        // needs the budget at all -- it's always acted on (streak cleared) but never counted.
         Set<String> alreadyExpanded = new HashSet<>();
-        int expansionsIssuedThisTick = 0;
-        for (ScaleUpCandidateEntry entry : sustainedCandidates) {
-            if (alreadyExpanded.contains(entry.indexName()) == false
-                && maxExpansionsPerTick > 0
-                && expansionsIssuedThisTick >= maxExpansionsPerTick) {
-                // Budget exhausted for any *new* index this tick -- deliberately leave this (and
-                // every remaining) candidate's streak intact rather than clearing it, so it keeps
-                // its "already sustained" status and highest priority into the next tick instead
-                // of having to re-qualify from scratch.
-                break;
+        tracker.selectWithBudget(
+            sustainedCandidates,
+            maxExpansionsPerTick,
+            entry -> alreadyExpanded.contains(entry.indexName()) == false,
+            entry -> {
+                tracker.clearStreak(key(entry)); // acted on -- start counting fresh.
+                if (alreadyExpanded.add(entry.indexName()) == false) {
+                    return false; // another shard of the same index already triggered this index's expansion this tick.
+                }
+                expandIndex(entry.indexName(), entry.currentSearchReplicaCount());
+                return true;
             }
-            consecutiveCandidateTicks.remove(entry.indexUuid() + "/" + entry.shardId()); // acted on -- start counting fresh.
-            if (alreadyExpanded.add(entry.indexName()) == false) {
-                continue; // another shard of the same index already triggered this index's expansion this tick.
-            }
-            expandIndex(entry.indexName(), entry.currentSearchReplicaCount());
-            expansionsIssuedThisTick++;
-        }
+        );
     }
 
     private void expandIndex(String indexName, int currentSearchReplicaCount) {

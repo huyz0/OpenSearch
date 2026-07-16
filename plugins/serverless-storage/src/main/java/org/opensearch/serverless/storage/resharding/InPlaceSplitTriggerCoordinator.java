@@ -18,15 +18,12 @@ import org.opensearch.cluster.metadata.SplitShardsMetadata;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.serverless.storage.resharding.action.ShardSplitCandidateEntry;
 import org.opensearch.serverless.storage.resharding.action.ShardSplitCandidatesAction;
+import org.opensearch.serverless.storage.util.SustainedCandidateTracker;
 import org.opensearch.transport.client.Client;
 
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 
 /**
  * The "do the work" half of dynamic-partitioning-plan.md Phase 1 item 1.2: turns {@link
@@ -68,9 +65,8 @@ public final class InPlaceSplitTriggerCoordinator {
     public static final int SPLIT_INTO = 2;
 
     private final Client client;
-    private final int requiredConsecutiveTicks;
     private final int maxSplitsPerTick;
-    private final ConcurrentMap<String, Integer> consecutiveCandidateTicks = new ConcurrentHashMap<>();
+    private final SustainedCandidateTracker<ShardSplitCandidateEntry> tracker;
 
     /**
      * Creates a coordinator.
@@ -86,8 +82,12 @@ public final class InPlaceSplitTriggerCoordinator {
      */
     public InPlaceSplitTriggerCoordinator(Client client, int requiredConsecutiveTicks, int maxSplitsPerTick) {
         this.client = client;
-        this.requiredConsecutiveTicks = Math.max(1, requiredConsecutiveTicks);
         this.maxSplitsPerTick = maxSplitsPerTick;
+        this.tracker = new SustainedCandidateTracker<>(requiredConsecutiveTicks);
+    }
+
+    private static String key(ShardSplitCandidateEntry entry) {
+        return entry.indexUuid() + "/" + entry.shardId();
     }
 
     /**
@@ -104,44 +104,36 @@ public final class InPlaceSplitTriggerCoordinator {
      *              before issuing a real split request.
      */
     public void triggerCandidates(List<ShardSplitCandidateEntry> candidates, ClusterState state) {
-        Set<String> observedKeys = new HashSet<>();
-        List<ShardSplitCandidateEntry> sustainedCandidates = new ArrayList<>();
-        for (ShardSplitCandidateEntry entry : candidates) {
-            String key = entry.indexUuid() + "/" + entry.shardId();
-            observedKeys.add(key);
-            if (entry.candidate() == false) {
-                consecutiveCandidateTicks.remove(key);
-                continue;
-            }
-            int streak = consecutiveCandidateTicks.merge(key, 1, Integer::sum);
-            if (streak < requiredConsecutiveTicks) {
-                continue; // flagged, but not sustained long enough yet -- wait for the next tick.
-            }
-            sustainedCandidates.add(entry);
-        }
-        consecutiveCandidateTicks.keySet().retainAll(observedKeys);
+        List<ShardSplitCandidateEntry> sustainedCandidates = tracker.filterSustained(
+            candidates,
+            InPlaceSplitTriggerCoordinator::key,
+            ShardSplitCandidateEntry::candidate
+        );
 
         // Busiest shard first, so a tight budget is spent on whichever candidates need it most.
         sustainedCandidates.sort(Comparator.comparingLong(ShardSplitCandidateEntry::writesPerMinute).reversed());
 
-        int splitsIssuedThisTick = 0;
+        // Already-handled shards (in flight or already split) don't consume the per-tick budget at
+        // all -- filter them out (clearing their streak) before the budget-limited selection below,
+        // same as leaving them out of it entirely.
+        List<ShardSplitCandidateEntry> actionable = new ArrayList<>();
         for (ShardSplitCandidateEntry entry : sustainedCandidates) {
-            String key = entry.indexUuid() + "/" + entry.shardId();
             if (alreadySplitOrInFlight(state, entry)) {
-                consecutiveCandidateTicks.remove(key); // core has already handled this shard -- start fresh if it recurs.
-                continue;
+                tracker.clearStreak(key(entry)); // core has already handled this shard -- start fresh if it recurs.
+            } else {
+                actionable.add(entry);
             }
-            if (maxSplitsPerTick > 0 && splitsIssuedThisTick >= maxSplitsPerTick) {
-                // Budget exhausted for this tick -- deliberately leave this (and every remaining)
-                // candidate's streak intact rather than clearing it, so it keeps its "already
-                // sustained" status and highest priority into the next tick instead of having to
-                // re-qualify from scratch. Same choice ReaderReplicaExpansionCoordinator makes.
-                break;
-            }
-            consecutiveCandidateTicks.remove(key); // acted on -- start counting fresh.
-            triggerSplit(entry);
-            splitsIssuedThisTick++;
         }
+
+        // Budget exhausted for this tick -- deliberately leave the remaining candidates' streaks
+        // intact rather than clearing them, so they keep their "already sustained" status and
+        // highest priority into the next tick instead of having to re-qualify from scratch. Same
+        // choice ReaderReplicaExpansionCoordinator makes.
+        tracker.selectWithBudget(actionable, maxSplitsPerTick, entry -> true, entry -> {
+            tracker.clearStreak(key(entry)); // acted on -- start counting fresh.
+            triggerSplit(entry);
+            return true;
+        });
     }
 
     private boolean alreadySplitOrInFlight(ClusterState state, ShardSplitCandidateEntry entry) {
