@@ -110,21 +110,24 @@ public interface EngineFactory {
      * is created or its engine is opened, for the same stale-translog-UUID-ordering reason. Default
      * {@code false}: this engine has nothing to revive the parent from.
      *
-     * <p><b>No engine overrides this yet, on purpose.</b> The in-place-merge design spike
-     * (dynamic-partitioning-progress.md, "Phase 2 item 2.1") proposed that a full-sibling-pair merge
-     * could revive the parent for free by taking one surviving child's own already-full local Lucene
-     * state and simply dropping its range filter, since both children were cloned from the same
-     * parent bundle. That premise holds only at the instant a split commits, with zero post-split
-     * writes: once the children start serving traffic, each accepts its own disjoint writes into its
-     * own separate bundle/manifest (routing sends each document to exactly one child by hash), so
-     * neither child's local store is a full copy of the union any longer. A correct merge must fold
-     * both children's current segment sets together -- including reconciling per-child deletes/updates
-     * against the shared, immutable base segments (divergent {@code liveDocs}), which a plain
-     * manifest concatenation cannot express. That reconciliation is a real, unspiked design problem;
-     * this seam is deliberately left as a no-op default until it is resolved, so an in-place merge is
-     * <em>not</em> yet end-to-end functional (exactly as {@code IN_PLACE_SPLIT_SHARD}'s own recovery
-     * source was landed no-op before its materialization existed). See the progress doc's "What's
-     * still open" subsection for the full analysis.
+     * <p>An {@link EngineFactory} whose durability is addressed by its own manifest overrides this to
+     * fold <em>both</em> retired children's current, authoritative document sets back into {@code
+     * store}'s local Lucene commit and create a matching local translog, then return {@code true}. An
+     * early spike proposed reviving the parent for free by taking one surviving child's own local
+     * state and dropping its range filter, since both children were cloned from the same parent bundle;
+     * that holds only at the instant a split commits, with zero post-split writes. Once the children
+     * serve traffic each accepts its own disjoint writes into its own separate bundle/manifest (routing
+     * sends each document to exactly one child by hash), so neither child's local store is a full copy
+     * of the union any longer. The resolved approach folds both children together with a single {@code
+     * IndexWriter#addIndexes} over each child's own <em>range-filtered</em> reader: because hash routing
+     * partitions documents into disjoint ranges, each filtered reader contributes exactly that child's
+     * authoritative slice (respecting that child's own deletes via {@code liveDocs}), so the union has
+     * no double-counting and no cross-child version conflict to reconcile. Since the metadata is already
+     * de-committed by the time the parent recovers, the retired children's ranges are carried on the
+     * recovery source ({@code RecoverySource.InPlaceMergeShardRecoverySource}) rather than read from
+     * {@code SplitShardsMetadata}. Returning {@code true} without leaving {@code store} in a state
+     * {@link Store#readLastCommittedSegmentsInfo()} can read is a contract violation core cannot detect
+     * for you, exactly as {@link #recoverMissingLocalStore} warns.
      *
      * @throws IOException if the revive/materialize attempt was made but failed -- surfaced as this
      *                      shard's own recovery failure, not silently downgraded to plain-empty.

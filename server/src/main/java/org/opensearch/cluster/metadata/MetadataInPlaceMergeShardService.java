@@ -136,7 +136,12 @@ public class MetadataInPlaceMergeShardService {
 
         // The direct children this parent's own split produced (captured against the current
         // metadata, before the merge de-commits it below, so the routing retirement further down
-        // still knows which entries to retire).
+        // still knows which entries to retire). Each ShardRange carries its own child shard id
+        // alongside the hash range: the ids drive the routing retirement below, and the whole
+        // ShardRange list rides on the revived parent's InPlaceMergeShardRecoverySource so the
+        // engine hook can still find each child's blob container and hash range after this update
+        // has erased them from SplitShardsMetadata (see that recovery source's own javadoc).
+        ShardRange[] childRanges = splitShardsMetadata.getChildShardsOfParent(parentShardId);
         Set<Integer> childShardIds = splitShardsMetadata.getChildShardIdsOfParent(parentShardId);
 
         // De-commit the split first. This validates every split-level precondition (parent really is
@@ -207,7 +212,7 @@ public class MetadataInPlaceMergeShardService {
             ShardRouting.newUnassigned(
                 parentShard,
                 true,
-                RecoverySource.InPlaceMergeShardRecoverySource.INSTANCE,
+                new RecoverySource.InPlaceMergeShardRecoverySource(java.util.Arrays.asList(childRanges)),
                 new UnassignedInfo(
                     UnassignedInfo.Reason.INDEX_CREATED,
                     "primary of parent shard revived by in-place merge of shard [" + parentShardId + "]"

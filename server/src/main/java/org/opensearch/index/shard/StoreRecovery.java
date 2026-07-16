@@ -743,11 +743,11 @@ final class StoreRecovery {
                         inPlaceSplitMaterialized = true;
                     } else if (isInPlaceMergeParent && recoverInPlaceMergeFromEngine(indexShard, store)) {
                         // Symmetric to the split branch above, but for a parent shard revived by an
-                        // in-place merge -- reviving the parent from its (now-retired) children's data
-                        // (see EngineFactory#recoverInPlaceMergeLocalStore's own javadoc, which also
-                        // documents why no engine overrides it yet -- so in practice this branch is
-                        // not taken today and a merge parent falls through to plain-empty recovery
-                        // below; an in-place merge is not yet end-to-end functional).
+                        // in-place merge -- reviving the parent by folding its (now-retired) children's
+                        // authoritative data back together (see EngineFactory#recoverInPlaceMergeLocalStore's
+                        // own javadoc for the mechanism, and why the children's ranges ride on the
+                        // recovery source rather than SplitShardsMetadata, which is already de-committed
+                        // by the time this parent recovers).
                         si = store.readLastCommittedSegmentsInfo();
                         inPlaceSplitMaterialized = true;
                     } else {

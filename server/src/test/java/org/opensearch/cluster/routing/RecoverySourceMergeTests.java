@@ -8,11 +8,13 @@
 
 package org.opensearch.cluster.routing;
 
+import org.opensearch.cluster.metadata.ShardRange;
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;
+import java.util.List;
 
 public class RecoverySourceMergeTests extends OpenSearchTestCase {
 
@@ -33,7 +35,7 @@ public class RecoverySourceMergeTests extends OpenSearchTestCase {
         assertEquals("in-place shard merge", RecoverySource.InPlaceMergeShardRecoverySource.INSTANCE.toString());
     }
 
-    public void testSerializationRoundTrip() throws IOException {
+    public void testSerializationRoundTripOfEmptyInstance() throws IOException {
         RecoverySource source = RecoverySource.InPlaceMergeShardRecoverySource.INSTANCE;
 
         BytesStreamOutput out = new BytesStreamOutput();
@@ -41,7 +43,21 @@ public class RecoverySourceMergeTests extends OpenSearchTestCase {
         StreamInput in = out.bytes().streamInput();
         RecoverySource deserialized = RecoverySource.readFrom(in);
 
-        assertSame(RecoverySource.InPlaceMergeShardRecoverySource.INSTANCE, deserialized);
+        assertEquals(RecoverySource.InPlaceMergeShardRecoverySource.INSTANCE, deserialized);
+        assertTrue(((RecoverySource.InPlaceMergeShardRecoverySource) deserialized).children().isEmpty());
+    }
+
+    public void testSerializationRoundTripPreservesChildren() throws IOException {
+        List<ShardRange> children = List.of(new ShardRange(1, Integer.MIN_VALUE, -1), new ShardRange(2, 0, Integer.MAX_VALUE));
+        RecoverySource source = new RecoverySource.InPlaceMergeShardRecoverySource(children);
+
+        BytesStreamOutput out = new BytesStreamOutput();
+        source.writeTo(out);
+        StreamInput in = out.bytes().streamInput();
+        RecoverySource deserialized = RecoverySource.readFrom(in);
+
+        assertEquals(source, deserialized);
+        assertEquals(children, ((RecoverySource.InPlaceMergeShardRecoverySource) deserialized).children());
     }
 
     public void testTypeEnumOrdinalStability() {

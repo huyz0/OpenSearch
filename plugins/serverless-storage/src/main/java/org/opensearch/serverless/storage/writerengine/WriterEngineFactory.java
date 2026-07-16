@@ -26,6 +26,8 @@ import org.opensearch.serverless.storage.wal.WalGcSchedulerTask;
 import org.opensearch.serverless.storage.wal.WalShardRegistry;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 
 /** {@link EngineFactory} for writer shards: produces {@link ObjectStoreWriterEngine}s. */
@@ -667,6 +669,101 @@ public final class WriterEngineFactory implements EngineFactory {
         String translogUUID = Translog.createEmptyTranslog(
             indexShard.shardPath().resolveTranslog(),
             manifest.localCheckpoint(),
+            indexShard.shardId(),
+            indexShard.getPendingPrimaryTerm()
+        );
+        store.associateIndexWithNewTranslog(translogUUID);
+        return true;
+    }
+
+    /**
+     * The store-population half of an in-place shard <em>merge</em>'s revived-parent activation
+     * (dynamic-partitioning-plan.md Phase 2 item 2.1) -- the reverse of {@link
+     * #recoverInPlaceSplitLocalStore}, and, like it, called by {@code
+     * StoreRecovery#internalRecoverFromStore} before this shard's local translog is created or its
+     * engine is opened (the same stale-translog-UUID ordering constraint, see {@link
+     * #recoverMissingLocalStore}'s own javadoc).
+     *
+     * <p><b>Where the children come from.</b> Unlike a split child (which recovers <em>during</em> the
+     * in-progress window and can still resolve its own parent and range from {@code
+     * SplitShardsMetadata}), a merge's parent recovers <em>after</em> {@code
+     * MetadataInPlaceMergeShardService} has already de-committed the split in the same cluster-state
+     * update that revived this parent -- so the metadata no longer records which children it came from.
+     * The retired children's {@link org.opensearch.cluster.metadata.ShardRange}s (each carrying its own
+     * child shard id) are therefore carried on the recovery source itself ({@link
+     * org.opensearch.cluster.routing.RecoverySource.InPlaceMergeShardRecoverySource}), which this hook
+     * reads back from {@code indexShard.recoveryState()}.
+     *
+     * <p><b>What it does.</b> For each child: resolves its blob container, reads its current published
+     * manifest (via its own shard-head), and materializes it through a fallback read path (the child's
+     * own container first, the parent's as fallback for a pristine child that never published a
+     * post-split commit and so still references the parent's cloned-by-reference base bundle). It then
+     * folds every child's authoritative, range-filtered document slice into {@code store}'s directory
+     * via {@link org.opensearch.serverless.storage.resharding.InPlaceSiblingMerger#merge} (a real
+     * {@link org.apache.lucene.index.IndexWriter#addIndexes} of the filtered readers -- see that class's
+     * javadoc for why the union needs no bespoke delete/version reconciliation), and creates a matching
+     * local translog at the merged checkpoint. The revived parent's engine takes over from there,
+     * republishing this merged commit to the parent's own container on its first flush.
+     *
+     * @param indexShard the parent shard being revived from its (now-retired) children's data.
+     * @param store the (empty) local store to fold the merged commit into.
+     * @return {@code true} if the store was materialized and a new local translog bootstrapped;
+     *         {@code false} if no resolver is configured, or this shard is not recovering via an
+     *         {@link org.opensearch.cluster.routing.RecoverySource.InPlaceMergeShardRecoverySource}
+     *         carrying children (e.g. the empty-children {@code INSTANCE} used outside a real merge).
+     */
+    @Override
+    public boolean recoverInPlaceMergeLocalStore(IndexShard indexShard, Store store) throws IOException {
+        if (siblingShardBlobContainerResolver == null) {
+            return false;
+        }
+        org.opensearch.cluster.routing.RecoverySource recoverySource = indexShard.recoveryState().getRecoverySource();
+        if (recoverySource instanceof org.opensearch.cluster.routing.RecoverySource.InPlaceMergeShardRecoverySource == false) {
+            return false;
+        }
+        List<org.opensearch.cluster.metadata.ShardRange> children =
+            ((org.opensearch.cluster.routing.RecoverySource.InPlaceMergeShardRecoverySource) recoverySource).children();
+        if (children.isEmpty()) {
+            return false;
+        }
+
+        String indexUuid = indexShard.shardId().getIndex().getUUID();
+        int parentShardId = indexShard.shardId().getId();
+        org.opensearch.common.blobstore.BlobContainer parentContainer = resolveSiblingShardBlobContainer(parentShardId);
+        org.opensearch.serverless.storage.format.BlobContainerBundleStore parentBundleStore =
+            new org.opensearch.serverless.storage.format.BlobContainerBundleStore(parentContainer);
+
+        List<org.opensearch.serverless.storage.resharding.InPlaceSiblingMerger.MergeChild> mergeChildren = new ArrayList<>(children.size());
+        for (org.opensearch.cluster.metadata.ShardRange childRange : children) {
+            int childShardId = childRange.shardId();
+            org.opensearch.common.blobstore.BlobContainer childContainer = resolveSiblingShardBlobContainer(childShardId);
+            org.opensearch.serverless.storage.shardstate.ShardStateStore childShardStateStore =
+                new org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore(childContainer);
+            org.opensearch.serverless.storage.shardstate.VersionedShardHead childHead = childShardStateStore.get(indexUuid, childShardId)
+                .orElseThrow(
+                    () -> new IOException("in-place merge: child shard " + indexUuid + "/" + childShardId + " has no published head to merge")
+                );
+            org.opensearch.serverless.storage.manifest.BlobContainerManifestStore childManifestStore =
+                new org.opensearch.serverless.storage.manifest.BlobContainerManifestStore(childContainer);
+            CommitManifest childManifest = childManifestStore.readManifest(
+                childHead.head().primaryTerm(),
+                childHead.head().latestManifestGeneration()
+            );
+
+            org.opensearch.serverless.storage.format.BundleFileReader childReadPath =
+                new org.opensearch.serverless.storage.resharding.InPlaceSiblingMerger.FallbackBundleFileReader(
+                    List.of(new org.opensearch.serverless.storage.format.BlobContainerBundleStore(childContainer), parentBundleStore)
+                );
+            mergeChildren.add(
+                new org.opensearch.serverless.storage.resharding.InPlaceSiblingMerger.MergeChild(childManifest, childReadPath, childRange)
+            );
+        }
+
+        long mergedMaxSeqNo = org.opensearch.serverless.storage.resharding.InPlaceSiblingMerger.merge(mergeChildren, store.directory());
+
+        String translogUUID = Translog.createEmptyTranslog(
+            indexShard.shardPath().resolveTranslog(),
+            mergedMaxSeqNo,
             indexShard.shardId(),
             indexShard.getPendingPrimaryTerm()
         );
