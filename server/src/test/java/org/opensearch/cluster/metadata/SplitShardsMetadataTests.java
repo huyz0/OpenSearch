@@ -44,6 +44,57 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
         assertEquals(0, result);
     }
 
+    public void testGetParentAndRangeOfChild_inProgressSplit() {
+        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
+        List<ShardRange> children = builder.splitShard(0, 2);
+        SplitShardsMetadata metadata = builder.build();
+
+        for (ShardRange child : children) {
+            org.opensearch.common.collect.Tuple<Integer, ShardRange> parentAndRange = metadata.getParentAndRangeOfChild(
+                child.shardId()
+            );
+            assertNotNull(parentAndRange);
+            assertEquals(Integer.valueOf(0), parentAndRange.v1());
+            assertEquals(child, parentAndRange.v2());
+        }
+    }
+
+    public void testGetParentAndRangeOfChild_notAChild() {
+        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
+        builder.splitShard(0, 2);
+        SplitShardsMetadata metadata = builder.build();
+
+        assertNull(metadata.getParentAndRangeOfChild(1));
+        assertNull(metadata.getParentAndRangeOfChild(999));
+    }
+
+    public void testGetParentAndRangeOfChild_afterCommitReturnsNull() {
+        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
+        List<ShardRange> children = builder.splitShard(0, 2);
+        Set<Integer> childIds = new HashSet<>();
+        children.forEach(c -> childIds.add(c.shardId()));
+        builder.updateSplitMetadataForChildShards(0, childIds);
+        SplitShardsMetadata metadata = builder.build();
+
+        for (ShardRange child : children) {
+            assertNull(
+                "a committed child is no longer resolvable via the in-progress-only lookup",
+                metadata.getParentAndRangeOfChild(child.shardId())
+            );
+        }
+    }
+
+    public void testGetParentAndRangeOfChild_afterCancelReturnsNull() {
+        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
+        List<ShardRange> children = builder.splitShard(0, 2);
+        builder.cancelSplit(0);
+        SplitShardsMetadata metadata = builder.build();
+
+        for (ShardRange child : children) {
+            assertNull(metadata.getParentAndRangeOfChild(child.shardId()));
+        }
+    }
+
     public void testGetRootShards_splitInProgress() {
         SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
         builder.splitShard(0, 3);

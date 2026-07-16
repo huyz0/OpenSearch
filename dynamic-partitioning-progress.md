@@ -237,6 +237,65 @@ index vs. more shards of the same index) — this was already Part 2d's own
 conclusion; this spike confirms the storage-layer mechanics support that
 conclusion without contradiction.
 
+## Task 13 (started) — `SplitShardsMetadata.getParentAndRangeOfChild`
+
+Status: **first increment done and committed**; the remaining plugin-side
+engine wiring is a large, separately-scoped unit of work, tracked below as
+still-open.
+
+Task 12's implementation shape needs, as its first step, a way for a
+plugin engine to find "who is my parent, and what's my `ShardRange`" given
+only its own child shard ID — and Task 12's research pass found this was a
+genuine, previously-unnoticed gap: `SplitShardsMetadata` only exposed
+parent→children lookups (`getChildShardsOfParent`/`getChildShardIdsOfParent`),
+never the reverse. Added `SplitShardsMetadata.getParentAndRangeOfChild(int
+childShardId)` (`server/src/main/java/org/opensearch/cluster/metadata/SplitShardsMetadata.java`),
+returning `Tuple<Integer, ShardRange>` or `null`, scoped deliberately to
+only the in-progress-split window (matches the only case that actually
+needs it: `Engine#recoverFromInPlaceSplit` fires during initial child
+recovery, before the split commits).
+
+4 new tests in `SplitShardsMetadataTests`: resolves correctly during an
+in-progress split, returns `null` for a shard that isn't a child of
+anything, returns `null` once the split has committed (deliberately scoped
+— a committed child's lineage lives in `rootShardsToAllChildren`, a
+different, already-existing lookup path this method doesn't duplicate),
+and returns `null` after a cancelled split. Verified meaningfulness: forced
+the method to always return `null`, confirmed 1/4 test failed as expected
+(the two already-`null`-expecting tests trivially "passed" even when
+broken, which is why the positive-case test's independent failure is the
+real signal here), restored, confirmed clean.
+
+**Still open (the substantial remaining part of Task 13-14)**: wiring
+`ObjectStoreWriterEngine#recoverFromInPlaceSplit` to actually use this
+lookup plus `ShardCloner`'s zero-copy recipe. The research pass for this
+found real, non-trivial gaps that need their own follow-up design/implementation
+pass, not a quick addition:
+- `ObjectStoreWriterEngine` currently has no way to reach a `BlobContainer`/
+  `BlobContainerManifestStore`/`ShardStateStore`/`DurablePinRegistry` for
+  an arbitrary sibling shard ID within the same index — only its own. This
+  needs new constructor plumbing (e.g. an `IntFunction<BlobContainer>`
+  resolver, mirroring `ServerlessStoragePlugin#resolveBlobContainer`'s
+  existing shape) threaded through `WriterEngineFactory`.
+- Whether to call `ShardCloner.clone` directly (which unconditionally
+  writes a cross-index-shaped `CloneLineage` record) or replicate its
+  manifest-write body without the lineage write, since this is a
+  same-index case — an explicit design call Task 12 flagged but did not
+  make, correctly deferred to whoever implements the actual write path
+  since it depends on whether downstream lazy-directory fallback-read code
+  needs lineage presence.
+- `ShardPartitionDescriptor`'s `(partitionIndex, numPartitions)` shape
+  cannot represent a `ShardRange`; a new small write-once record type is
+  needed, following its "separate from `CommitManifest`, write-once"
+  precedent.
+
+Given the size of this remaining piece (new constructor surface across two
+classes, a new record type, a real design call on lineage semantics, plus
+its own test-and-verify pass), it is being left as explicitly open rather
+than rushed — consistent with the plan's own "Scale expectations, stated
+plainly" paragraph, which specifically calls out Phase 0 as deserving more
+caution and time than this session's usual pace, not less.
+
 ## Tasks 10-11 — `RecoverySource` dispatch seam for `InPlaceSplitShardRecoverySource`
 
 Status: **done**, commit follows this entry.

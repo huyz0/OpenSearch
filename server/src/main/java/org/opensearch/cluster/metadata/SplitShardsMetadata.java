@@ -189,6 +189,29 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         return childShards;
     }
 
+    /**
+     * Reverse of {@link #getChildShardsOfParent(int)}: given a shard ID that is currently a
+     * not-yet-committed child of an in-progress split, returns its parent's shard ID and its own
+     * {@link ShardRange}. Returns {@code null} if {@code childShardId} isn't a child of any
+     * currently in-progress split -- in particular, this does <em>not</em> resolve parentage for a
+     * child whose split has already committed (use {@link #getRootShards()}/the {@code
+     * rootShardsToAllChildren} lineage for that case instead; this method only serves the recovery
+     * window between a child's {@link ShardRange} being reserved and the split being committed).
+     */
+    public Tuple<Integer, ShardRange> getParentAndRangeOfChild(int childShardId) {
+        for (Map.Entry<Integer, ShardRange[]> entry : parentToChildShards.entrySet()) {
+            if (inProgressSplitShardIds.contains(entry.getKey()) == false) {
+                continue;
+            }
+            for (ShardRange childRange : entry.getValue()) {
+                if (childRange.shardId() == childShardId) {
+                    return new Tuple<>(entry.getKey(), childRange);
+                }
+            }
+        }
+        return null;
+    }
+
     public Set<Integer> getChildShardIdsOfParent(int shardId) {
         Set<Integer> childShardIds = new HashSet<>();
         if (parentToChildShards.containsKey(shardId) == false) {
