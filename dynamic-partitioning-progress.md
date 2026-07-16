@@ -138,6 +138,87 @@ Full verification sweep before commit: `:plugins:serverless-storage:check -x int
 
 **Phase 1 is now done** (items 1.1 through 1.4).
 
+## Phase 2 item 2.1 — In-place merge data-model design spike
+
+Status: **done** (research/design only, no code changes -- same "spike first, implement once the
+shape is grounded" discipline Task 12 used for split's own manifest-identity question).
+
+### Confirms the plan's own premise, more precisely
+
+Core genuinely has zero merge scaffold: `SplitShardsMetadata` has no method that de-commits an
+already-committed split. Its one existing "undo" operation, `Builder.cancelSplit`, only works on a
+still-*in-progress* split (`assert inProgressSplitShardIds.contains(sourceShardId)`) and doesn't
+touch `activeShardIds` at all -- it exists for `MetadataInPlaceSplitShardCommitService`'s own
+allocation-failure rollback path (Task 8.5), not for voluntarily reversing a split that already
+committed and has been serving traffic. A genuine merge feature needs a new
+`SplitShardsMetadata.Builder` method with different preconditions and a different effect, not a
+reuse of `cancelSplit`.
+
+### The key insight: a merge of exactly a split's own two full children is nearly free
+
+Every child shard's Lucene data is attached to its parent via `ShardCloner.clone` (Task 12/19) --
+a manifest-reference, not a physical copy. Both children of one split still point at the *same*
+underlying parent bundle files; the only thing that makes them logically distinct is
+`InPlaceSplitFilteringDirectoryReader`'s hash-range filter (Task 20's read-path fix) applied at
+query time. This means merging the two full, never-further-split children of one split back
+together doesn't need `ShardShrinker`'s real Lucene `IndexWriter#addIndexes` merge at all (unlike
+this plugin's existing cross-shard `shrink`, which fundamentally requires one because its sources
+are independent, unrelated shard identities with no shared lineage) -- it only needs to widen (or
+simply drop) the survivor's own range filter back to the parent's original full range, since the
+union of two sibling `ShardRange`s that came from the same split is, by construction, exactly the
+parent's own original range. **The data is already there; a full-sibling-pair merge is a metadata
+and routing operation, not a data operation** -- the same "logical-first" insight this whole effort
+found on the split side, now confirmed to hold symmetrically on the merge side too.
+
+This insight also bounds the design's honest scope: it only applies cleanly to merging *exactly*
+the full, unsplit-further child set of one original split back together (the "undo my own split"
+case). Merging two shards that are *not* siblings of the same split (e.g. two arbitrary adjacent
+leaves several splits and merges deep) is a fundamentally harder problem -- their data was never
+co-resident in one Lucene commit to begin with, and *that* case genuinely needs something closer to
+`ShardShrinker`'s real merge. Scoping Phase 2's first increment to the sibling-pair case (mirroring
+how split itself was first scoped to a flat, non-nested `SPLIT_INTO=2` case before any nested-split
+work was attempted) is the honest, grounded first cut, not a shortcut around the harder case.
+
+### Proposed data-model shape
+
+- New `SplitShardsMetadata.Builder.mergeChildrenBackToParent(int parentShardId)`: asserts
+  `rootShardsToAllChildren[parentShardId]` is non-null (a split happened), every recorded child is
+  in `activeShardIds` (no child has itself been further split -- the "full, unsplit-further child
+  set" precondition above), and the split is not still in-progress. Effect: removes every child
+  from `activeShardIds`, adds `parentShardId` back, clears `rootShardsToAllChildren[parentShardId]`
+  to `null`. Symmetric, in shape, to `Builder.splitShard`'s own effect in reverse -- reuses the
+  exact same underlying fields, no new metadata structure needed.
+- New `MetadataInPlaceMergeShardService` (mirrors `MetadataInPlaceSplitShardService`'s own shape):
+  submits a cluster-state-update task that, in one step, calls the new builder method above *and*
+  updates `IndexRoutingTable` -- removes both children's routing entries, adds back a single
+  `UNASSIGNED` primary `ShardRouting` for `parentShardId` with a new recovery source (see below).
+- New `InPlaceMergeShardRecoverySource` (mirrors `InPlaceSplitShardRecoverySource`'s own shape --
+  singleton `INSTANCE`, no extra fields): the parent's revived primary recovers via this. At the
+  `EngineFactory` seam (this plugin's `WriterEngineFactory.recoverInPlaceSplitLocalStore` is the
+  precedent), the plugin-side hook simply needs to materialize the survivor child's *own* already-full
+  local Lucene state (it already has one child's worth of live segments locally) and drop its
+  `InPlaceSplitFilteringDirectoryReader` wrapping -- no clone, no re-fetch, since one surviving
+  child's own local store, once unfiltered, already *is* correct: it was cloned from the same parent
+  bundle the other child was, and a full-pair merge's union is exactly that whole bundle.
+- `OperationRouting.getShardIdOfHash` degradation: once `rootShardsToAllChildren[parentShardId]`
+  is `null` again (merge committed), `getShardIdOfHash` already falls through to its own existing
+  `rootShardsToAllChildren[rootShardId] == null` branch and returns `rootShardId` directly -- **no
+  core routing-code change is needed at all**, since this exactly re-creates the pre-split state
+  `getShardIdOfHash` was already written to handle. This is the strongest evidence the "undo my own
+  split" framing is the right first cut: it doesn't just simplify the write path, it makes the read
+  path a complete no-op change.
+
+### What's still open (deliberately, honestly, not attempted here)
+
+Item 2.2 (whether `ShardShrinker`'s physical-merge approach is reusable) is now answered by the
+above: **no, and it doesn't need to be** for the sibling-pair case -- `ShardShrinker` remains the
+right tool for merging unrelated shard identities (its own existing, already-shipped use case),
+while in-place merge needs none of its machinery. Item 2.3 (merge trigger policy) and the actual
+implementation + tests + commit (this design's own next increment) are left for a future pass:
+this spike's purpose was to establish the data model is sound and inexpensive before committing to
+building the full transport action / recovery-source / read-path wiring around it, the same
+judgment call Task 12 made for split's own manifest-identity question before Task 13-14 built it.
+
 ## Task 20 (new, found while attempting item 0.7) — `IndexMetadata.numberOfShards` invariant breaks for split children, FIXED
 
 Status: **fixed and verified, Phase 0.7's full real-workload IT now passes**. The initial analysis
