@@ -521,6 +521,63 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * How often {@code InPlaceSplitTriggerSchedulerTask} re-evaluates {@code
+     * ShardSplitCandidatesAction} in the background -- dynamic-partitioning-plan.md Phase 1 item
+     * 1.2, same "background schedule mirrors an on-demand trigger, off by default" shape as {@link
+     * #SERVERLESS_STORAGE_SCALE_UP_EVAL_INTERVAL_SETTING}. Non-positive (the default) disables the
+     * scheduled evaluation entirely; the on-demand REST/transport action is unaffected either way.
+     */
+    public static final Setting<TimeValue> SERVERLESS_STORAGE_RESHARDING_AUTO_SPLIT_EVAL_INTERVAL_SETTING = Setting.timeSetting(
+        "serverless_storage.resharding.auto_split.eval_interval",
+        TimeValue.MINUS_ONE,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * Deliberately separate from {@link #SERVERLESS_STORAGE_RESHARDING_AUTO_SPLIT_EVAL_INTERVAL_SETTING}
+     * and defaulting to {@code false}, same two-gate reasoning as {@link
+     * #SERVERLESS_STORAGE_SCALE_UP_ENABLED_SETTING}: turning on the scheduled evaluation alone must
+     * stay purely observational, never a silent trigger for a real, irreversible-in-this-increment
+     * in-place split the first time an operator enables the eval interval.
+     */
+    public static final Setting<Boolean> SERVERLESS_STORAGE_RESHARDING_AUTO_SPLIT_ENABLED_SETTING = Setting.boolSetting(
+        "serverless_storage.resharding.auto_split.enabled",
+        false,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * How many consecutive over-threshold evaluation ticks a shard must be flagged a candidate on,
+     * back to back, before {@code InPlaceSplitTriggerCoordinator} actually splits it -- same
+     * "avoid reacting to one noisy evaluation" reasoning as {@link
+     * #SERVERLESS_STORAGE_SCALE_UP_REQUIRED_CONSECUTIVE_TICKS_SETTING}, defaulted to a slightly
+     * higher value than that setting's own default: an in-place split is a one-way, harder-to-undo
+     * action (no in-place merge exists yet in this plugin, per dynamic-partitioning-plan.md's Phase
+     * 2) than a reader replica-count bump, so this warrants a longer sustained-signal requirement
+     * before acting. A value of 1 restores the original single-tick behavior.
+     */
+    public static final Setting<Integer> SERVERLESS_STORAGE_RESHARDING_AUTO_SPLIT_REQUIRED_CONSECUTIVE_TICKS_SETTING = Setting.intSetting(
+        "serverless_storage.resharding.auto_split.required_consecutive_ticks",
+        5,
+        1,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * The illustrative per-tick rate-limit cap on how many distinct shards {@code
+     * InPlaceSplitTriggerCoordinator} will actually split in one evaluation -- same "protect
+     * against a stampede by default" reasoning as {@link
+     * #SERVERLESS_STORAGE_SCALE_UP_MAX_EXPANSIONS_PER_TICK_SETTING}, deliberately a smaller default
+     * given a split is a heavier, less reversible operation than a reader replica-count bump. A
+     * non-positive value restores the original unbounded behavior.
+     */
+    public static final Setting<Integer> SERVERLESS_STORAGE_RESHARDING_AUTO_SPLIT_MAX_SPLITS_PER_TICK_SETTING = Setting.intSetting(
+        "serverless_storage.resharding.auto_split.max_splits_per_tick",
+        2,
+        Setting.Property.NodeScope
+    );
+
+    /**
      * How often {@code ScaleUpCandidatesSchedulerTask} re-evaluates {@code ScaleUpCandidatesAction}
      * in the background -- same "background schedule mirrors an on-demand trigger" shape as {@link
      * #SERVERLESS_STORAGE_SCALE_TO_ZERO_EVAL_INTERVAL_SETTING}, but deliberately its own setting
@@ -772,6 +829,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         SERVERLESS_STORAGE_RESHARDING_SPLIT_CANDIDATE_SIZE_THRESHOLD_BYTES_SETTING.getDefault(Settings.EMPTY);
     private volatile org.opensearch.serverless.storage.scaleup.ScaleUpCandidatesSchedulerTask scaleUpCandidatesSchedulerTask;
     private volatile org.opensearch.serverless.storage.resharding.DataStreamShardCountAdvisorSchedulerTask dataStreamShardCountAdvisorSchedulerTask;
+    private volatile org.opensearch.serverless.storage.resharding.InPlaceSplitTriggerSchedulerTask inPlaceSplitTriggerSchedulerTask;
     // One node-local directory instance shared by every shard on this node -- matches the target
     // design's "one node block cache" shape (&sect;9) rather than a per-shard instance, and needs
     // no I/O to construct, so it's safe to build eagerly rather than threading through createComponents.
@@ -834,6 +892,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_SCALE_UP_MAX_EXPANSIONS_PER_TICK_SETTING,
             SERVERLESS_STORAGE_RESHARDING_SPLIT_CANDIDATE_WPM_THRESHOLD_SETTING,
             SERVERLESS_STORAGE_RESHARDING_SPLIT_CANDIDATE_SIZE_THRESHOLD_BYTES_SETTING,
+            SERVERLESS_STORAGE_RESHARDING_AUTO_SPLIT_EVAL_INTERVAL_SETTING,
+            SERVERLESS_STORAGE_RESHARDING_AUTO_SPLIT_ENABLED_SETTING,
+            SERVERLESS_STORAGE_RESHARDING_AUTO_SPLIT_REQUIRED_CONSECUTIVE_TICKS_SETTING,
+            SERVERLESS_STORAGE_RESHARDING_AUTO_SPLIT_MAX_SPLITS_PER_TICK_SETTING,
             SERVERLESS_STORAGE_REPOSITORY_SETTING
         );
     }
@@ -956,6 +1018,23 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                     clusterService,
                     dataStreamShardCountAdvisorCache
                 );
+        }
+        TimeValue autoSplitEvalInterval = SERVERLESS_STORAGE_RESHARDING_AUTO_SPLIT_EVAL_INTERVAL_SETTING.get(environment.settings());
+        if (autoSplitEvalInterval.millis() > 0) {
+            boolean autoSplitEnabled = SERVERLESS_STORAGE_RESHARDING_AUTO_SPLIT_ENABLED_SETTING.get(environment.settings());
+            this.inPlaceSplitTriggerSchedulerTask = new org.opensearch.serverless.storage.resharding.InPlaceSplitTriggerSchedulerTask(
+                threadPool,
+                autoSplitEvalInterval,
+                client,
+                clusterService,
+                autoSplitEnabled
+                    ? new org.opensearch.serverless.storage.resharding.InPlaceSplitTriggerCoordinator(
+                        client,
+                        SERVERLESS_STORAGE_RESHARDING_AUTO_SPLIT_REQUIRED_CONSECUTIVE_TICKS_SETTING.get(environment.settings()),
+                        SERVERLESS_STORAGE_RESHARDING_AUTO_SPLIT_MAX_SPLITS_PER_TICK_SETTING.get(environment.settings())
+                    )
+                    : null
+            );
         }
         String configuredBasePath = SERVERLESS_STORAGE_BASE_PATH_SETTING.get(environment.settings());
         if (configuredBasePath.isEmpty() == false) {

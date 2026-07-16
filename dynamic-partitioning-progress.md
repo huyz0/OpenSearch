@@ -74,6 +74,70 @@ the full gate re-ran clean afterward), `:plugins:serverless-storage:internalClus
 suite, no filter (clean — confirms no regression in `ServerlessStorageShardSplitCandidatesIT` or
 any other IT).
 
+## Phase 1 items 1.2/1.3/1.4 — Automatic split-trigger scheduler task
+
+Status: **done**. Turns item 1.1's advisory signal into a real, gated automatic trigger of Phase
+0's `InPlaceSplitShardAction` — the plan's own Phase 1 completes with this.
+
+### Implementation
+
+- `InPlaceSplitTriggerCoordinator` (new): the "do the work" half, mirroring `ReaderReplicaExpansionCoordinator`'s
+  shape closely — same sustained-duration hysteresis (a shard must be flagged a candidate on
+  `requiredConsecutiveTicks` consecutive evaluations before it's actually split, tracked per
+  `(indexUuid, shardId)` in a `ConcurrentHashMap`) and same illustrative per-tick budget
+  (rate-limits how many shards this splits in one evaluation, busiest by `writesPerMinute()` first,
+  losers keep their streak rather than resetting it). Guards against re-triggering a shard that's
+  already mid-split or already a split parent by checking `SplitShardsMetadata.isSplitOfShardInProgress`/
+  `isSplitParent` against a caller-supplied `ClusterState` before issuing the real `InPlaceSplitShardAction`
+  request.
+- `InPlaceSplitTriggerSchedulerTask` (new): the scheduling half, mirroring `ScaleUpCandidatesSchedulerTask`'s
+  two-constructor (policy-only vs. policy-and-mechanism) shape exactly — periodically calls
+  `ShardSplitCandidatesAction`, cluster-manager-only, and hands the result to the coordinator if one
+  was supplied.
+- Four new settings mirroring the scale-up settings' exact shape: `..._AUTO_SPLIT_EVAL_INTERVAL_SETTING`
+  (off by default), `..._AUTO_SPLIT_ENABLED_SETTING` (a second, independent gate — the scheduled
+  evaluation alone must stay observational, never a silent trigger the first time an operator turns
+  on the eval interval), `..._AUTO_SPLIT_REQUIRED_CONSECUTIVE_TICKS_SETTING` (defaults to 5, higher
+  than scale-up's own default of 2, since an in-place split is a one-way action with no in-place
+  merge existing yet to undo it), `..._AUTO_SPLIT_MAX_SPLITS_PER_TICK_SETTING` (defaults to 2).
+- **Item 1.3 (split-point selection)**: always bisects into exactly 2 children
+  (`InPlaceSplitTriggerCoordinator.SPLIT_INTO`), matching core's own default equal-subdivision
+  shape. No attempt at targeting a specific hot sub-range for split-for-heat — documented directly
+  in the class's own javadoc as a deliberate choice, per the plan's own item 1.3 guidance not to
+  guess at DynamoDB's undocumented real algorithm; hysteresis (wait, re-measure, split again next
+  tick if still hot) is the honest first cut.
+- **Item 1.4 (no silent policy)**: every new threshold/hysteresis/budget constant's javadoc states
+  it's illustrative and untuned against a real workload, same discipline every other threshold in
+  this plugin already carries.
+
+### A real bug the new test caught
+
+First draft of `alreadySplitOrInFlight` called `state.metadata().index(entry.indexUuid())` —
+`Metadata#index(String)` looks up by index **name**, not UUID, so every lookup returned `null` and
+every candidate was silently treated as "index gone, nothing to split." Every coordinator test that
+expected a real split call failed with "zero interactions with this mock" the first time they ran,
+which is exactly what caught it before it shipped. Fixed by looking up via `entry.indexName()`
+instead, with an explicit UUID cross-check afterward (guards against the name having since been
+reused by an unrelated index between the evaluation being computed and the coordinator acting on it).
+
+### Tests + verification discipline
+
+New `InPlaceSplitTriggerCoordinatorTests` (13 tests): candidate filtering, request shape
+(index/shard/splitInto), the in-progress-split/already-parent guard, the deleted-index guard,
+sustained-duration hysteresis (single tick doesn't trigger, streak reaching the threshold does, a
+gap resets it), per-tick budget (caps the count, prioritizes the busiest shard, losers keep their
+streak), and non-positive budget meaning unlimited — the same coverage shape
+`ReaderReplicaExpansionCoordinatorTests` already established for its sibling.
+
+Verified meaningfulness by temporarily replacing the real `alreadySplitOrInFlight` in-progress/parent
+check with `return false;` and re-running `testDoesNotReSplitAShardAlreadyMidSplit` — failed exactly
+as expected (an unwanted `client.execute` call was observed); restored, re-ran clean.
+
+Full verification sweep before commit: `:plugins:serverless-storage:check -x internalClusterTest`
+(clean) and `:plugins:serverless-storage:internalClusterTest` full suite, no filter (clean).
+
+**Phase 1 is now done** (items 1.1 through 1.4).
+
 ## Task 20 (new, found while attempting item 0.7) — `IndexMetadata.numberOfShards` invariant breaks for split children, FIXED
 
 Status: **fixed and verified, Phase 0.7's full real-workload IT now passes**. The initial analysis
