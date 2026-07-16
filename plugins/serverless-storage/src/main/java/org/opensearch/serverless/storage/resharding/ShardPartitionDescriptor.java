@@ -13,7 +13,6 @@ import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.common.io.stream.Writeable;
 
 import java.io.IOException;
-import java.util.Objects;
 
 /**
  * Marks a shard as one of {@code numPartitions} logical partitions of some other (pre-split)
@@ -78,21 +77,5 @@ public record ShardPartitionDescriptor(int partitionIndex, int numPartitions) im
     @Override
     public int numPartitions() {
         return numPartitions;
-    }
-
-    @Override
-    public boolean equals(Object o) {
-        if (this == o) {
-            return true;
-        }
-        if (!(o instanceof ShardPartitionDescriptor that)) {
-            return false;
-        }
-        return partitionIndex == that.partitionIndex && numPartitions == that.numPartitions;
-    }
-
-    @Override
-    public int hashCode() {
-        return Objects.hash(partitionIndex, numPartitions);
     }
 }

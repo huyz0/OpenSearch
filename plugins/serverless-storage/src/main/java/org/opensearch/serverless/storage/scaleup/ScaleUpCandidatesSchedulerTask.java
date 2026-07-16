@@ -22,8 +22,6 @@ import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
 
 import java.io.Closeable;
-import java.util.List;
-import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * The scale-up counterpart of {@code
@@ -53,7 +51,6 @@ public final class ScaleUpCandidatesSchedulerTask implements Closeable {
     private final ClusterService clusterService;
     private final ReaderReplicaExpansionCoordinator expansionCoordinator;
     private final Scheduler.Cancellable task;
-    private final AtomicReference<List<ScaleUpCandidateEntry>> latestCandidates = new AtomicReference<>(List.of());
 
     /**
      * Starts the scheduled evaluation without acting on its own candidates -- equivalent to calling
@@ -110,7 +107,6 @@ public final class ScaleUpCandidatesSchedulerTask implements Closeable {
         client.execute(ScaleUpCandidatesAction.INSTANCE, new ScaleUpCandidatesRequest(), new ActionListener<>() {
             @Override
             public void onResponse(ScaleUpCandidatesResponse response) {
-                latestCandidates.set(List.copyOf(response.candidates()));
                 long candidateCount = response.candidates().stream().filter(ScaleUpCandidateEntry::candidate).count();
                 logger.debug(
                     "scale-up evaluation: {} shard(s) observed, {} flagged as candidates",
@@ -129,20 +125,12 @@ public final class ScaleUpCandidatesSchedulerTask implements Closeable {
         });
     }
 
-    /**
-     * The most recently completed evaluation's merged candidate list, or an empty list if no
-     * evaluation has completed successfully yet.
-     */
-    public List<ScaleUpCandidateEntry> latestCandidates() {
-        return latestCandidates.get();
-    }
-
     /** Invokes {@link #evaluate()} synchronously, rather than waiting out the scheduled interval -- test-only visibility. */
     void evaluateForTesting() {
         evaluate();
     }
 
-    /** Cancels the scheduled evaluation; does not touch {@link #latestCandidates()}, which simply stops updating. */
+    /** Cancels the scheduled evaluation. */
     @Override
     public void close() {
         task.cancel();

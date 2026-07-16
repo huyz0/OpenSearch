@@ -13,7 +13,6 @@ import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.common.io.stream.Writeable;
 
 import java.io.IOException;
-import java.util.Objects;
 
 /**
  * The core-hash-range-split counterpart of {@link ShardPartitionDescriptor}: marks a shard as
@@ -83,21 +82,5 @@ public record InPlaceSplitRangeDescriptor(int parentShardId, int start, int end)
     @Override
     public int end() {
         return end;
-    }
-
-    @Override
-    public boolean equals(Object o) {
-        if (this == o) {
-            return true;
-        }
-        if (!(o instanceof InPlaceSplitRangeDescriptor that)) {
-            return false;
-        }
-        return parentShardId == that.parentShardId && start == that.start && end == that.end;
-    }
-
-    @Override
-    public int hashCode() {
-        return Objects.hash(parentShardId, start, end);
     }
 }
