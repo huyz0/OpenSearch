@@ -138,10 +138,14 @@ Full verification sweep before commit: `:plugins:serverless-storage:check -x int
 
 **Phase 1 is now done** (items 1.1 through 1.4).
 
-## Phase 2 item 2.1 — In-place merge data-model design spike
+## Phase 2 item 2.1 — In-place merge (full-sibling-pair)
 
-Status: **done** (research/design only, no code changes -- same "spike first, implement once the
-shape is grounded" discipline Task 12 used for split's own manifest-identity question).
+Status: **done and shippable**. Began as a research/design spike (same "spike first, implement once
+the shape is grounded" discipline Task 12 used for split's own manifest-identity question), which
+found a real data-freshness flaw in its own first premise; the resolved design is now fully
+implemented, tested end-to-end on a real cluster, and reachable through an operator action. See "The
+resolution" and "What is now built, tested, and shippable" below for the shipped state; the spike
+narrative is kept verbatim for the reasoning trail.
 
 ### Confirms the plan's own premise, more precisely
 
@@ -261,10 +265,12 @@ restored, both tests passed clean again. Full regression sweep before commit:
 Three more layers landed on top of the metadata primitive, each its own commit, each tested and
 swept the same way as everything else:
 
-1. **`InPlaceMergeShardRecoverySource`** -- a new `RecoverySource` shaped exactly like
-   `InPlaceSplitShardRecoverySource` (singleton `INSTANCE`, no wire fields), with a new
-   `IN_PLACE_MERGE_SHARD` `RecoverySource.Type` appended after `IN_PLACE_SPLIT_SHARD` so no existing
-   type's ordinal shifts. The revived parent's primary recovers via this source.
+1. **`InPlaceMergeShardRecoverySource`** -- a new `RecoverySource` shaped like
+   `InPlaceSplitShardRecoverySource`, with a new `IN_PLACE_MERGE_SHARD` `RecoverySource.Type` appended
+   after `IN_PLACE_SPLIT_SHARD` so no existing type's ordinal shifts. The revived parent's primary
+   recovers via this source. (It was landed with no wire fields; the resolution below later gave it a
+   `List<ShardRange>` of the retired children -- see "How the engine hook resolves the children" there
+   for why that channel, and not `SplitShardsMetadata`, is the one that survives to recovery time.)
 2. **`MetadataInPlaceMergeShardService`** -- mirrors `MetadataInPlaceSplitShardService` in reverse.
    One `AckedClusterStateUpdateTask` that, atomically, calls `mergeChildrenBackToParent` and rewrites
    the `IndexRoutingTable`: retires every child's routing entry (mirroring how the split *commit*
@@ -280,7 +286,7 @@ swept the same way as everything else:
    `EngineFactory.recoverInPlaceMergeLocalStore` hook before the local translog/engine open (the same
    ordering constraint Task 19 established), and `EngineFactory` gains that hook as a default no-op.
 
-### The design flaw: the spike's "revive the parent from one surviving child" premise does not hold
+### The design flaw that was found: the spike's "revive the parent from one surviving child" premise does not hold
 
 The spike above (see "Proposed data-model shape") claimed the plugin-side merge hook could revive the
 parent almost for free: take one surviving child's own already-full local Lucene state and just drop
@@ -297,35 +303,93 @@ bundle (all pre-split docs) plus child A's post-split writes, but you **lose chi
 entirely** -- silent data loss.
 
 A correct merge cannot be "drop one survivor's filter." It has to fold *both* children's current segment
-sets together: base bundle (shared) union child A's new segments union child B's new segments. That much
-is a manifest union. But post-split *updates and deletes* make even the union non-trivial: a post-split
+sets together. The one genuinely hard-looking part is post-split *updates and deletes*: a post-split
 delete/update of a pre-split doc that lives in a shared, immutable base segment is recorded as that
-child's own per-segment `liveDocs` against the shared segment. The two children therefore reference the
-same base segment with *divergent* `liveDocs`, and a plain manifest concatenation cannot express "a doc
-is deleted iff the child that owns its hash range deleted it." Reconciling those divergent delete sets is
-a real, unspiked design problem. It is exactly the "more subtle than expected" case the task framing
-anticipated, and the right call is to stop rather than ship a hook that silently corrupts data.
+child's own per-segment `liveDocs` against the shared segment, so the two children reference the same
+base segment with *divergent* `liveDocs`, which a plain manifest concatenation cannot express.
 
-**What this means for scope, honestly:** the metadata/routing/recovery-dispatch layers above are all
-sound and correct on their own terms (they are pure bookkeeping; a merge is genuinely a metadata-and-
-routing operation at that layer, and the `getShardIdOfHash` read path is genuinely a no-op change). They
-are landed as dormant infrastructure, not reachable by any operator action, exactly as split's own
-`IN_PLACE_SPLIT_SHARD` recovery source was landed no-op (Tasks 10-11) before its materialization existed.
-What is **not** built, on purpose:
+### The resolution: fold both children's already-filtered readers via one `addIndexes`
 
-- **`EngineFactory.recoverInPlaceMergeLocalStore` plugin implementation** -- blocked on the
-  delete-set/`liveDocs` reconciliation above. The core seam is a documented no-op default. This is the
-  single item that must be solved before a merge can serve a correct document.
-- **REST/transport action (`InPlaceMergeShardAction` trio)** -- deliberately *not* shipped. Unlike a
-  split (whose no-op recovery source merely left children not-yet-serving, losing nothing), an
-  operator-reachable merge with a no-op engine hook would revive the parent against an *empty* local
-  store and retire the children that hold the only live copies -- destroying data on the first real use.
-  Shipping the operator entry point before the correct engine hook exists is the one thing that turns
-  dormant, safe infrastructure into a live data-loss path, so it is held back until the hook is real.
-- **Item 2.3 (merge trigger policy)** and an end-to-end real-workload IT (a merge equivalent of
-  `ServerlessStorageInPlaceSplitDocumentReachabilityIT`, asserting docs survive a split-then-merge round
-  trip) -- both blocked on the same engine hook, since neither can assert a correct result until a merge
-  actually materializes correct data. Not attempted.
+The divergent-`liveDocs` problem dissolves once you stop trying to concatenate manifests at all. The key
+fact is that hash routing partitions every document into exactly one child's `ShardRange`, so there is no
+cross-child version conflict to reconcile the way normal concurrent-update merging has -- each document
+has one authoritative owner by hash. So the merge materializes each child, wraps it in **that child's own
+`InPlaceSplitFilteringDirectoryReader`** (the same filter the read path already uses, Task 20 fix 3), and
+folds the *filtered* readers together with a single `IndexWriter#addIndexes(CodecReader...)`. Each filtered
+reader contributes exactly that child's authoritative slice: a base document survives only through the one
+child whose range owns its hash (respecting that child's own deletes, because the reader is wrapped in
+Lucene's `SoftDeletesDirectoryReaderWrapper` first so a superseded old version is already excluded from
+`getLiveDocs()` before the range filter runs), and every post-split document is in-range in exactly the
+child that wrote it. The union therefore has no double-counting and needs no bespoke delete-set
+reconciliation. This is the same physical-merge precedent `ShardShrinker` (Task 37) and
+`LuceneMergeCompactionPublisher` (compaction) already established -- including that the merge writer's
+`IndexWriterConfig` must `setSoftDeletesField(Lucene.SOFT_DELETES_FIELD)`, or `addIndexes` throws the
+moment it copies soft-deleted source content (the exact latent bug compaction already had to fix).
+
+The pure Lucene work lives in a new `InPlaceSiblingMerger.merge(...)` (mirroring `ShardShrinker`'s shape,
+so it is unit-testable with `FsBlobContainer` fixtures exactly like `ShardShrinkerTests`); the plugin's
+`WriterEngineFactory.recoverInPlaceMergeLocalStore` does only the blob-store resolution around it and the
+translog bootstrap, mirroring `recoverInPlaceSplitLocalStore`'s exact contract. Merged
+`maxSeqNo`/`localCheckpoint` is the max across children (a monotonic watermark, exactly as `ShardShrinker`
+treats independent sources' seq-no spaces); a fresh `HISTORY_UUID` is minted since the revived parent is a
+new history, not a continuation of either child's.
+
+**How the engine hook resolves the children.** The step-1 implementation surfaced a real plumbing gap the
+spike had not anticipated: `MetadataInPlaceMergeShardService` de-commits the split in the *same*
+cluster-state update that revives the parent, so by the time the parent recovers, `SplitShardsMetadata`
+no longer records which children it came from -- the accessor the task assumed (`getChildShardsOfParent`)
+returns nothing. Unlike a split child, which recovers *during* the in-progress window and can still read
+its own parent/range from metadata, a merge's parent recovers *after* the erasure. The fix carries the
+retired children's `ShardRange`s (each already encoding its own child shard id) on the
+`InPlaceMergeShardRecoverySource` itself, populated before de-commit -- the one channel that survives to
+recovery time. The hook reads them back via `indexShard.recoveryState()`.
+
+**Two more real bugs the end-to-end IT caught, neither visible to the mock-reroute service unit tests:**
+
+- *Stale-in-sync assertion hang.* A revived parent reuses its pre-split shard id, so its
+  `inSyncAllocationIds` still carried the stale pre-split primary's allocation id. With a fresh
+  `InPlaceMergeShardRecoverySource` primary whose new allocation id is absent from that non-empty set,
+  `IndexMetadataUpdater#updateInSyncAllocations` mistook it for a forced *stale-primary* allocation and
+  threw an `AssertionError` on the cluster-manager thread -- an `Error`, not an `Exception`, so the
+  cluster-state task machinery never completed the request and it *hung* rather than failing (the same
+  failure shape Task 20 first hit). Fixed by resetting the revived parent's in-sync set to empty in
+  `applyMergeShardRequest`, mirroring how the split service seeds each child's set empty. Regression-guarded
+  by `InPlaceMergeRealRerouteTests`, which drives a *real* `AllocationService` reroute + shard-start cycle
+  -- the coverage `MetadataInPlaceMergeShardServiceTests` lacked, since it drives an identity-function
+  reroute. Verified real: that test fails with exactly this `AssertionError` when the reset is removed.
+- *Leftover-store bypass.* A revived parent can find a stale leftover local store from before it was split;
+  `readLastCommittedSegmentsInfo` then succeeds on it, so `StoreRecovery` never reaches the engine-materialize
+  branch (a split child's brand-new shard id has no leftover) and the stale store is cleaned to empty --
+  silently reviving the parent with zero documents. Fixed by invoking the merge (and split) engine hook
+  after cleaning such a leftover.
+
+### What is now built, tested, and shippable
+
+- **`InPlaceSiblingMerger` + `WriterEngineFactory.recoverInPlaceMergeLocalStore`** -- the real engine hook.
+  `InPlaceSiblingMergerTests` exercises the merge directly against `FsBlobContainer`-published children with
+  disjoint post-split writes and per-child updates against the shared base segment. Verified real by breaking
+  the fix: removing `setSoftDeletesField` makes `addIndexes` throw on soft-deleted content; removing
+  `addIndexes` drops every document. Both restored, green.
+- **The recovery source now carries the children**, and `MetadataInPlaceMergeShardService` populates them
+  before de-commit and resets the revived parent's in-sync set.
+- **End-to-end IT** -- `ServerlessStorageInPlaceMergeDocumentReachabilityIT`: a real 2-node cluster,
+  40 pre-split docs, split into 2, 20 post-split docs, 5 pre-split updates and 3 pre-split deletes routed to
+  the owning children (so the children genuinely diverge on `liveDocs`), then merge, asserting every
+  document's correct final state (updated values win, deleted docs gone, all post-split writes present) via
+  both scatter-gather search and real single-shard `GET`-by-id routing. This is the test that proves the
+  design, not just that it compiles.
+- **Operator entry point** -- the `InPlaceMergeShardAction`/`TransportInPlaceMergeShardAction`/
+  `RestInPlaceMergeShardAction` trio (`POST /{index}/_merge_in_place/{parent_shard_id}`), mirroring the split
+  trio exactly, flushing the index first (the merge counterpart of the split's Task-18 pre-flush, so a
+  child's un-published writes aren't dropped) and surfacing precondition violations as a clean 400. Held back
+  until the hook was real and the round trip proven, exactly as planned -- the IT now drives it end to end.
+
+Still open (deliberately, not blocked on anything above): **item 2.3 (an automatic merge trigger policy)**,
+the merge counterpart of Phase 1's split-trigger scheduler -- not attempted here; the operator action is the
+honest first cut, same as split was before its own auto-trigger. And the honest scope bound from the spike
+still holds: all of this is the **full-sibling-pair** merge (undo one flat `SPLIT_INTO=2` split). Merging
+shards that are not siblings of the same split remains the harder, unspiked problem `ShardShrinker`'s
+cross-identity machinery is the right tool for.
 
 ## Task 20 (new, found while attempting item 0.7) — `IndexMetadata.numberOfShards` invariant breaks for split children, FIXED
 
