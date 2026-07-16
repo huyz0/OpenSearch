@@ -77,6 +77,32 @@ public interface EngineFactory {
     }
 
     /**
+     * Called by {@code StoreRecovery#internalRecoverFromStore} exactly once, only for a shard
+     * recovering via {@code RecoverySource.Type.IN_PLACE_SPLIT_SHARD} (a child shard of an in-place
+     * split, dynamic-partitioning-plan.md Phase 0) -- before this shard's local translog is created
+     * or its engine is opened, the same careful ordering {@link #recoverMissingLocalStore} already
+     * requires and for the identical reason (see that method's own javadoc on the stale
+     * translog-UUID trap of materializing too late). Default {@code false}: this engine has nothing
+     * to attach this child to.
+     *
+     * <p>An {@link EngineFactory} whose durability is addressed by its own manifest (the same kind
+     * {@link #recoverMissingLocalStore} already describes) can override this to, in order: attach
+     * this child's identity to its share of the parent shard's data by whatever mechanism it uses
+     * (e.g. writing its own first manifest generation referencing the parent's data without copying
+     * bytes), materialize the resulting state into {@code store}'s local Lucene commit, and create a
+     * matching local translog -- then return {@code true} so recovery proceeds normally instead of
+     * treating this shard as a plain new empty index. Returning {@code true} without leaving {@code
+     * store} in a state {@link Store#readLastCommittedSegmentsInfo()} can read is a contract
+     * violation core cannot detect for you, exactly as {@link #recoverMissingLocalStore} warns.
+     *
+     * @throws IOException if the attach/materialize attempt was made but failed -- surfaced as this
+     *                      shard's own recovery failure, not silently downgraded to plain-empty.
+     */
+    default boolean recoverInPlaceSplitLocalStore(IndexShard indexShard, Store store) throws IOException {
+        return false;
+    }
+
+    /**
      * Whether this engine already provides its own durable, remote copy of every segment it
      * writes, independent of core's own remote-store upload path ({@code
      * RemoteStoreRefreshListener}, engaged whenever {@code index.remote_store.enabled} is {@code

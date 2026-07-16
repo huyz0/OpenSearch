@@ -610,11 +610,12 @@ plan could not be completed here. Flagged rather than silently omitted.
 
 Full IT class (4 tests) passes with the real fix in place. `spotlessApply`/`missingJavadoc` clean.
 
-## Task 19 (new, found while scoping item 0.7) — Local Lucene materialization gap, NOT fixed
+## Task 19 (new, found while scoping item 0.7) — Local Lucene materialization gap, FIXED
 
-Status: **found and documented, not fixed** — flagged deliberately rather than shipping a rushed
-fix, since the correct fix touches the same delicate engine-open/translog-association ordering
-this plugin's own `recoverMissingLocalStore` javadoc already warns is easy to get subtly wrong.
+Status: **fixed and verified**. Initially documented without a fix (see the original analysis
+below, kept verbatim); the fix followed the same delicate engine-open/translog-association
+ordering this plugin's own `recoverMissingLocalStore` javadoc already warns is easy to get subtly
+wrong, mirroring that seam exactly rather than inventing a new shape.
 
 ### The gap
 
@@ -665,6 +666,85 @@ bookkeeping layer, not yet true at the actual queryable-engine layer) until reso
 the single highest-priority remaining item for Phase 0 — without it, an in-place split cannot
 actually serve a single real document to a real query, regardless of how correct the
 metadata/routing/manifest bookkeeping built in Tasks 1-18 is.
+
+### The fix
+
+Added `EngineFactory.recoverInPlaceSplitLocalStore(IndexShard, Store)`, a new default (`return
+false`) core seam mirroring `recoverMissingLocalStore` exactly: `StoreRecovery.internalRecoverFromStore`
+now calls it *before* the local translog is created / the engine is opened, for shards whose
+recovery source is `IN_PLACE_SPLIT_SHARD`. This closes the ordering gap the analysis above
+identified — the same class of bug `recoverMissingLocalStore`'s own javadoc warns about
+("materializing at the `EngineFactory` level" after engine construction leaves a stale
+translog-UUID reference) is avoided by using the exact same "before engine construction" seam,
+not a new one.
+
+Restructured `StoreRecovery.internalRecoverFromStore`: added an `isInPlaceSplitChild` flag and an
+`inPlaceSplitMaterialized` flag; on read failure of the segment info, a new branch calls
+`engineFactory.recoverInPlaceSplitLocalStore(...)` (parallel to the existing
+`recoverMissingLocalStoreFromEngine` branch) and re-reads `si` on success. The
+`indexShouldExists`-driven branching was widened to `indexShouldExists || inPlaceSplitMaterialized`
+so the in-place-split path skips `bootstrapNewHistory` and local translog creation — the
+`EngineFactory` hook already created the translog, matching `recoverMissingLocalStore`'s own
+contract exactly.
+
+`IndexShard.startRecovery`'s `IN_PLACE_SPLIT_SHARD` case now shares the ordinary
+`EMPTY_STORE`/`EXISTING_STORE` dispatch to `recoverFromStore` (since `StoreRecovery` now branches
+internally), replacing Task 10-11's separate `recoverFromInPlaceSplit(...)` wrapper method, which
+called `recoverFromStore` first and only *afterward* invoked `Engine#recoverFromInPlaceSplit` —
+architecturally the wrong order, and the actual root cause of the gap. That wrapper, and the
+now-superseded `Engine#recoverFromInPlaceSplit`/`Indexer#recoverFromInPlaceSplit` seam (Task
+13-14), were removed entirely.
+
+On the plugin side, the `ShardCloner.clone` attach logic moved from `ObjectStoreWriterEngine`
+(instance-level, ran after engine open — Task 13-14's original, now-wrong-ordering placement) to
+`WriterEngineFactory.recoverInPlaceSplitLocalStore` (factory-level, runs before engine
+construction). It looks up the parent shard id and hash range via
+`SplitShardsMetadata.getParentAndRangeOfChild`, clones via `ShardCloner.clone` into the child's
+own manifest/lineage stores, reads the resulting manifest, and materializes it into the child's
+local `Store` directory.
+
+**A second bug found while implementing this**: materialization must read bundle bytes from the
+**parent's** blob container, not the pre-configured `WriterEngineFactory.materializer` field —
+that field is fixed to the shard's own (still-empty) container, correct only for
+`recoverMissingLocalStore`'s "re-read my own past publish" case. Since `ShardCloner.clone` never
+copies bundle bytes (only references), a fresh `ObjectStoreCommitMaterializer` pointed at the
+parent's container is required. Fixed by constructing one specifically for this step and dropping
+the irrelevant `materializer == null` guard.
+
+### Tests + verification discipline
+
+New test `InPlaceSplitLocalStoreRecoveryTests#testChildEngineActuallyServesParentsDocumentAfterInPlaceSplitRecovery`
+(plugin, `IndexShardTestCase`-based since it needs a real `IndexShard`/`IndexMetadata`, unlike the
+`EngineTestCase`-based tests this plugin otherwise uses): starts a real parent writer shard,
+indexes and flushes one document, builds real `SplitShardsMetadata` reserving a child shard id,
+constructs a child `IndexShard` with `InPlaceSplitShardRecoverySource`, recovers it via
+`recoverFromStore`, and asserts the child's own Lucene reader (not the object-store manifest)
+actually contains the parent's document.
+
+Two test-setup bugs found and fixed while writing it: (1) the child `IndexMetadata`'s
+`SETTING_NUMBER_OF_SHARDS` must cover the child shard id, since `IndexMetadata`'s per-shard
+`primaryTerm` array is fixed-size at construction from that setting; (2) the child `IndexMetadata`
+needs an explicit `.primaryTerm(childShardId, 1)` matching `ShardCloner.clone`'s own hardcoded
+target primary term, otherwise core's engine construction acquires a writer lease under term `0`
+against a `ShardHead` already CAS'd to term `1`, and fails with "a newer primary term already
+holds this shard's head".
+
+Verified meaningfulness by commenting out `parentBundleMaterializer.materialize(manifest,
+directory)` in `WriterEngineFactory` and re-running: failed as expected with
+`IndexNotFoundException: no segments* file found`. Restored, re-ran clean.
+
+Full verification sweep run before commit: `:plugins:serverless-storage:check
+-x internalClusterTest` (`BUILD SUCCESSFUL`), `:plugins:serverless-storage:internalClusterTest`
+(`BUILD SUCCESSFUL`, zero `failures="[1-9]`/`errors="[1-9]` in the result XML),
+`:server:test --tests "org.opensearch.index.shard.*" --tests "org.opensearch.index.engine.*"
+:server:missingJavadoc` (`BUILD SUCCESSFUL`, zero failing XML).
+
+Compilation cascade from removing `Engine#recoverFromInPlaceSplit`: `ObjectStoreWriterEngineTests`'s
+now-broken `testRecoverFromInPlaceSplitAttachesChildToParentsData` was removed (superseded by the
+new end-to-end test above, which actually catches the bug the old one missed — it only asserted
+object-store state, never the local engine's document count). `InPlaceSplitShardRecoveryTests`
+(core) updated to call `recoverFromStore` directly and its javadoc rewritten to point at
+`EngineFactory#recoverInPlaceSplitLocalStore` for the real attach logic.
 
 ## Tasks 10-11 — `RecoverySource` dispatch seam for `InPlaceSplitShardRecoverySource`
 

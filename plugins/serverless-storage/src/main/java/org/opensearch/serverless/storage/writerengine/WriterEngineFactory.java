@@ -488,8 +488,7 @@ public final class WriterEngineFactory implements EngineFactory {
                 encryptionKeyProvider,
                 dedicatedWalGcSchedulerTask,
                 publicationRateLimitMillis,
-                publicationNotifier,
-                siblingShardBlobContainerResolver
+                publicationNotifier
             );
             if (activityRegistry != null) {
                 activityRegistry.register(config.getShardId().getIndex().getUUID(), config.getShardId().getId(), engine);
@@ -566,6 +565,128 @@ public final class WriterEngineFactory implements EngineFactory {
         );
         store.associateIndexWithNewTranslog(translogUUID);
         return true;
+    }
+
+    /**
+     * The store-population half of an in-place split's child shard activation
+     * (dynamic-partitioning-plan.md Phase 0), analogous to {@link #recoverMissingLocalStore} but for
+     * a shard with no manifest of its own <em>yet</em> rather than one whose manifest merely isn't
+     * locally materialized. Called by {@code StoreRecovery#internalRecoverFromStore} before this
+     * shard's local translog is created or its engine is opened -- the same careful ordering {@link
+     * #recoverMissingLocalStore} itself requires (see this class's earlier "Task 19" note in
+     * dynamic-partitioning-progress.md for the bug this ordering fixes: a first attempt at this
+     * attached the child to the parent's data only in the <em>object store</em>, after the engine had
+     * already opened against an empty local Lucene index, leaving the two permanently out of sync).
+     *
+     * <p>In order: resolves this child's parent and hash range from {@code SplitShardsMetadata}
+     * (core cluster metadata, reachable via {@code indexShard.indexSettings()} without any
+     * additional plumbing), reuses {@link org.opensearch.serverless.storage.clone.ShardCloner#clone}'s
+     * existing zero-copy recipe verbatim -- retargeted from "brand-new index" to "same index, sibling
+     * shard ID already reserved by core's {@code SplitShardsMetadata}," needing no new manifest-write
+     * logic since {@code CloneLineage}'s {@code (sourceIndexUuid, sourceShardId)} shape already
+     * tolerates a same-index source -- to attach this child's manifest to the parent's data, then
+     * materializes that manifest into {@code store}'s local Lucene commit and creates a matching
+     * local translog, exactly as {@link #recoverMissingLocalStore} does for its own case.
+     *
+     * @param indexShard the child shard whose local store is empty and being attached to its parent's data
+     * @param store the (empty) local store to materialize the newly-cloned manifest into
+     * @return {@code true} if the store was materialized and a new local translog bootstrapped;
+     *         {@code false} if no resolver is configured, or {@code indexShard} isn't a
+     *         recognized in-progress split child (e.g. a retried recovery after the split already
+     *         committed via {@code MetadataInPlaceSplitShardCommitService})
+     */
+    @Override
+    public boolean recoverInPlaceSplitLocalStore(IndexShard indexShard, Store store) throws IOException {
+        if (siblingShardBlobContainerResolver == null) {
+            return false;
+        }
+
+        String indexUuid = indexShard.shardId().getIndex().getUUID();
+        int childShardId = indexShard.shardId().getId();
+        org.opensearch.cluster.metadata.IndexMetadata indexMetadata = indexShard.indexSettings().getIndexMetadata();
+        org.opensearch.common.collect.Tuple<Integer, org.opensearch.cluster.metadata.ShardRange> parentAndRange = indexMetadata
+            .getSplitShardsMetadata()
+            .getParentAndRangeOfChild(childShardId);
+        if (parentAndRange == null) {
+            return false;
+        }
+        int parentShardId = parentAndRange.v1();
+        org.opensearch.cluster.metadata.ShardRange childRange = parentAndRange.v2();
+
+        org.opensearch.common.blobstore.BlobContainer parentContainer = resolveSiblingShardBlobContainer(parentShardId);
+        org.opensearch.serverless.storage.manifest.BlobContainerManifestStore parentManifestStore =
+            new org.opensearch.serverless.storage.manifest.BlobContainerManifestStore(parentContainer);
+        org.opensearch.serverless.storage.shardstate.ShardStateStore parentShardStateStore =
+            new org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore(parentContainer);
+        org.opensearch.serverless.storage.retention.DurablePinRegistry parentPinRegistry =
+            new org.opensearch.serverless.storage.retention.BlobContainerDurablePinRegistry(parentContainer);
+
+        org.opensearch.common.blobstore.BlobContainer childContainer = resolveSiblingShardBlobContainer(childShardId);
+        org.opensearch.serverless.storage.manifest.BlobContainerManifestStore childManifestStore =
+            new org.opensearch.serverless.storage.manifest.BlobContainerManifestStore(childContainer);
+        org.opensearch.serverless.storage.shardstate.ShardStateStore childShardStateStore =
+            new org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore(childContainer);
+        org.opensearch.serverless.storage.clone.BlobContainerCloneLineageStore childLineageStore =
+            new org.opensearch.serverless.storage.clone.BlobContainerCloneLineageStore(childContainer);
+        org.opensearch.serverless.storage.resharding.BlobContainerInPlaceSplitRangeStore childRangeStore =
+            new org.opensearch.serverless.storage.resharding.BlobContainerInPlaceSplitRangeStore(childContainer);
+        org.opensearch.serverless.storage.resharding.InPlaceSplitRangeDescriptor descriptor =
+            new org.opensearch.serverless.storage.resharding.InPlaceSplitRangeDescriptor(
+                parentShardId,
+                childRange.start(),
+                childRange.end()
+            );
+
+        org.opensearch.serverless.storage.clone.ShardCloner.clone(
+            indexUuid,
+            parentShardId,
+            parentManifestStore,
+            parentShardStateStore,
+            parentPinRegistry,
+            indexUuid,
+            childShardId,
+            childManifestStore,
+            childShardStateStore,
+            childLineageStore,
+            System.currentTimeMillis(),
+            () -> childRangeStore.writeDescriptor(descriptor)
+        );
+
+        CommitManifest manifest = childManifestStore.readManifest(1, 1);
+        Directory directory = store.directory();
+        // The manifest's bundle files physically live in the PARENT's container -- ShardCloner never
+        // copies bytes, only references -- so materialization must read from there, not from this
+        // factory's own `materializer` field (which is fixed to THIS shard's own, still-empty
+        // container, appropriate for #recoverMissingLocalStore's very different "re-read my own past
+        // publish" case, not this one).
+        ObjectStoreCommitMaterializer parentBundleMaterializer = new ObjectStoreCommitMaterializer(
+            new org.opensearch.serverless.storage.format.BlobContainerBundleStore(parentContainer)
+        );
+        parentBundleMaterializer.materialize(manifest, directory);
+
+        String translogUUID = Translog.createEmptyTranslog(
+            indexShard.shardPath().resolveTranslog(),
+            manifest.localCheckpoint(),
+            indexShard.shardId(),
+            indexShard.getPendingPrimaryTerm()
+        );
+        store.associateIndexWithNewTranslog(translogUUID);
+        return true;
+    }
+
+    /**
+     * Unwraps {@link #siblingShardBlobContainerResolver}'s {@link java.io.UncheckedIOException}
+     * back into a checked one -- it has no checked-exception escape hatch (it's an {@code
+     * IntFunction}), but {@code ServerlessStoragePlugin}'s own resolver wraps {@link IOException}
+     * this way, and this method's own contract (via {@link EngineFactory#recoverInPlaceSplitLocalStore})
+     * is honestly checked.
+     */
+    private org.opensearch.common.blobstore.BlobContainer resolveSiblingShardBlobContainer(int shardId) throws IOException {
+        try {
+            return siblingShardBlobContainerResolver.apply(shardId);
+        } catch (java.io.UncheckedIOException e) {
+            throw e.getCause();
+        }
     }
 
     /**

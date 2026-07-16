@@ -706,13 +706,14 @@ final class StoreRecovery {
     private void internalRecoverFromStore(IndexShard indexShard) throws IndexShardRecoveryException {
         indexShard.preRecovery();
         final RecoveryState recoveryState = indexShard.recoveryState();
-        // An in-place split's child shard is, from this method's point of view, exactly as empty as a
-        // brand-new EMPTY_STORE shard -- core does no data copying for IN_PLACE_SPLIT_SHARD (see
-        // IndexShard#recoverFromInPlaceSplit); the plugin engine attaches the child to its share of the
-        // parent's data afterward, via Engine#recoverFromInPlaceSplit, not by placing segments in this
-        // shard's local Store before this method runs.
+        final boolean isInPlaceSplitChild = recoveryState.getRecoverySource().getType() == RecoverySource.Type.IN_PLACE_SPLIT_SHARD;
+        // An in-place split's child shard starts exactly as empty on disk as a brand-new EMPTY_STORE
+        // shard: core does no data copying of its own for IN_PLACE_SPLIT_SHARD. Unlike EMPTY_STORE
+        // though, it may become non-empty below -- see recoverInPlaceSplitFromEngine and
+        // inPlaceSplitMaterialized.
         final boolean indexShouldExists = recoveryState.getRecoverySource().getType() != RecoverySource.Type.EMPTY_STORE
-            && recoveryState.getRecoverySource().getType() != RecoverySource.Type.IN_PLACE_SPLIT_SHARD;
+            && isInPlaceSplitChild == false;
+        boolean inPlaceSplitMaterialized = false;
         indexShard.prepareForIndexRecovery();
         SegmentInfos si = null;
         final Store store = indexShard.store();
@@ -730,6 +731,14 @@ final class StoreRecovery {
                         // node's local disk is ever the shard's authoritative copy, so finding
                         // nothing here is the expected, not exceptional, starting state).
                         si = store.readLastCommittedSegmentsInfo();
+                    } else if (isInPlaceSplitChild && recoverInPlaceSplitFromEngine(indexShard, store)) {
+                        // Symmetric to the branch above, but for a shard that has never had ANY prior
+                        // durable state of its own -- this is its first-ever activation, attaching it
+                        // to its share of a split parent's data, not "recovering" pre-existing state
+                        // (see EngineFactory#recoverInPlaceSplitLocalStore's own javadoc for why this
+                        // must happen here, before a local translog exists, not later).
+                        si = store.readLastCommittedSegmentsInfo();
+                        inPlaceSplitMaterialized = true;
                     } else {
                         String files = "_unknown_";
                         try {
@@ -747,7 +756,7 @@ final class StoreRecovery {
                         }
                     }
                 }
-                if (si != null && indexShouldExists == false) {
+                if (si != null && indexShouldExists == false && inPlaceSplitMaterialized == false) {
                     // it exists on the directory, but shouldn't exist on the FS, its a leftover (possibly dangling)
                     // its a "new index create" API, we have to do something, so better to clean it than use same data
                     logger.trace("cleaning existing shard, shouldn't exists");
@@ -761,12 +770,15 @@ final class StoreRecovery {
                 assert indexShouldExists;
                 bootstrap(indexShard, store);
                 writeEmptyRetentionLeasesFile(indexShard);
-            } else if (indexShouldExists) {
-                if (recoveryState.getRecoverySource().shouldBootstrapNewHistoryUUID()) {
+            } else if (indexShouldExists || inPlaceSplitMaterialized) {
+                if (indexShouldExists && recoveryState.getRecoverySource().shouldBootstrapNewHistoryUUID()) {
                     store.bootstrapNewHistory();
                     writeEmptyRetentionLeasesFile(indexShard);
+                } else if (inPlaceSplitMaterialized) {
+                    writeEmptyRetentionLeasesFile(indexShard);
                 }
-                // since we recover from local, just fill the files and size
+                // since we recover from local (or, for an in-place split child, from what the engine
+                // just materialized locally), just fill the files and size
                 final ReplicationLuceneIndex index = recoveryState.getIndex();
                 try {
                     if (si != null) {
@@ -859,6 +871,23 @@ final class StoreRecovery {
             return engineFactory.recoverMissingLocalStore(indexShard, store);
         } catch (IOException e) {
             throw new IndexShardRecoveryException(shardId, "engine failed to recover missing local store", e);
+        }
+    }
+
+    /**
+     * See {@link EngineFactory#recoverInPlaceSplitLocalStore} for the full contract. Same resolution
+     * shape as {@link #recoverMissingLocalStoreFromEngine}.
+     */
+    private boolean recoverInPlaceSplitFromEngine(IndexShard indexShard, Store store) throws IndexShardRecoveryException {
+        IndexerFactory indexerFactory = indexShard.getIndexerFactory();
+        if (!(indexerFactory instanceof EngineBackedIndexerFactory)) {
+            return false;
+        }
+        EngineFactory engineFactory = ((EngineBackedIndexerFactory) indexerFactory).getEngineFactory();
+        try {
+            return engineFactory.recoverInPlaceSplitLocalStore(indexShard, store);
+        } catch (IOException e) {
+            throw new IndexShardRecoveryException(shardId, "engine failed to recover in-place split local store", e);
         }
     }
 

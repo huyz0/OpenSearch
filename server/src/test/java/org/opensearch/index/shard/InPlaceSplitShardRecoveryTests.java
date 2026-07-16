@@ -17,10 +17,15 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.indices.recovery.RecoveryState;
 
 /**
- * Verifies core's {@code IN_PLACE_SPLIT_SHARD} recovery-source dispatch seam
- * ({@link IndexShard#recoverFromInPlaceSplit}), added to close the gap where a child shard routed with
- * {@link RecoverySource.InPlaceSplitShardRecoverySource} had no handling at all and would have failed
- * recovery with "Unknown recovery source" via {@link IndexShard#startRecovery}'s {@code default:} case.
+ * Verifies core's {@code IN_PLACE_SPLIT_SHARD} recovery-source dispatch seam: a child shard routed
+ * with {@link RecoverySource.InPlaceSplitShardRecoverySource} shares {@link IndexShard#startRecovery}'s
+ * {@code EMPTY_STORE}/{@code EXISTING_STORE} case (both dispatch to {@link IndexShard#recoverFromStore}),
+ * closing the gap where it previously had no handling at all and would have failed recovery with
+ * "Unknown recovery source" via that method's {@code default:} case. See {@code
+ * org.opensearch.index.engine.EngineFactory#recoverInPlaceSplitLocalStore} for where a plugin engine
+ * actually attaches this shard to a split parent's data -- covered by that plugin's own tests, not
+ * here, since this test's own engine factory (core's default) has nothing to attach to and is only
+ * verifying dispatch doesn't throw.
  */
 public class InPlaceSplitShardRecoveryTests extends IndexShardTestCase {
 
@@ -41,7 +46,7 @@ public class InPlaceSplitShardRecoveryTests extends IndexShardTestCase {
             );
 
             PlainActionFuture<Boolean> future = new PlainActionFuture<>();
-            shard.recoverFromInPlaceSplit(future);
+            shard.recoverFromStore(future);
             assertTrue("recovery from an in-place split recovery source must succeed with core's no-op default engine hook", future.get());
 
             updateRoutingEntry(shard, ShardRoutingHelper.moveToStarted(shard.routingEntry()));

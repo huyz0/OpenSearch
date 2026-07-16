@@ -3578,30 +3578,6 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         }
     }
 
-    /**
-     * Recovers a child shard created by an in-place split ({@link RecoverySource.Type#IN_PLACE_SPLIT_SHARD}).
-     * Unlike {@link #recoverFromLocalShards}, core performs no data copying of its own here: the engine is
-     * opened exactly as an {@code EMPTY_STORE} recovery would (empty local Lucene index, no segments), and
-     * {@link Engine#recoverFromInPlaceSplit} then gives the concrete engine implementation -- typically a
-     * plugin's -- the opportunity to attach this shard to its share of the parent's data by whatever
-     * mechanism that engine understands (e.g. a manifest-level partition filter), without core needing to
-     * know what that mechanism is. See that method's javadoc for the full rationale.
-     */
-    public void recoverFromInPlaceSplit(ActionListener<Boolean> listener) throws IOException {
-        assert shardRouting.primary() : "recover from in-place split only makes sense if the shard is a primary shard";
-        assert recoveryState.getRecoverySource().getType() == RecoverySource.Type.IN_PLACE_SPLIT_SHARD : "invalid recovery type: "
-            + recoveryState.getRecoverySource();
-        recoverFromStore(ActionListener.wrap(success -> {
-            if (success) {
-                Indexer currentIndexer = getIndexerOrNull();
-                if (currentIndexer != null) {
-                    currentIndexer.recoverFromInPlaceSplit(shardId());
-                }
-            }
-            listener.onResponse(success);
-        }, listener::onFailure));
-    }
-
     public void recoverFromStore(ActionListener<Boolean> listener) {
         // we are the first primary, recover from the gateway
         // if its post api allocation, the index should exists
@@ -4574,6 +4550,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         switch (recoveryState.getRecoverySource().getType()) {
             case EMPTY_STORE:
             case EXISTING_STORE:
+            case IN_PLACE_SPLIT_SHARD:
                 executeRecovery("from store", recoveryState, recoveryListener, this::recoverFromStore);
                 break;
             case REMOTE_STORE:
@@ -4665,9 +4642,6 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
                     }
                     throw e;
                 }
-                break;
-            case IN_PLACE_SPLIT_SHARD:
-                executeRecovery("from in-place split", recoveryState, recoveryListener, this::recoverFromInPlaceSplit);
                 break;
             default:
                 throw new IllegalArgumentException("Unknown recovery source " + recoveryState.getRecoverySource());

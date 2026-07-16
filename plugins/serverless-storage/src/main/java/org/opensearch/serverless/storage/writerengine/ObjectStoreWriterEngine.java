@@ -151,18 +151,6 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     private final WriterPublicationNotifier publicationNotifier;
 
     /**
-     * Resolves this engine's own container -- one blob container per {@code (indexUuid, shardId)},
-     * per {@code ServerlessStoragePlugin#resolveBlobContainer}'s convention -- for an arbitrary
-     * shard ID within the *same* index. {@code null} disables in-place split recovery entirely
-     * (same shape as every other optional feature in this plugin): {@link #recoverFromInPlaceSplit}
-     * becomes a no-op, matching core's own default. Needed because, unlike every other store this
-     * engine reaches through {@link #headPublisher}, in-place split recovery must read/write a
-     * *sibling* shard's container (the parent being split), which {@link #headPublisher} has no way
-     * to resolve -- see dynamic-partitioning-progress.md's "Task 13" entry for why this seam exists.
-     */
-    private final java.util.function.IntFunction<org.opensearch.common.blobstore.BlobContainer> siblingShardBlobContainerResolver;
-
-    /**
      * Set (via {@link java.util.concurrent.atomic.AtomicLong#compareAndSet}, so two concurrent
      * refreshes can't both win) to {@code engineConfig.getThreadPool().relativeTimeInMillis()}
      * every time {@link #maybePublishOnRefresh} actually attempts a publish. {@code 0} initially,
@@ -530,60 +518,6 @@ public class ObjectStoreWriterEngine extends InternalEngine {
             dedicatedWalGcSchedulerTask,
             publicationRateLimitMillis,
             publicationNotifier,
-            null
-        );
-    }
-
-    /**
-     * Creates a fully-configured writer engine, additionally able to recover an in-place split
-     * child shard (dynamic-partitioning-plan.md Phase 0) by attaching it to a sibling shard's data.
-     *
-     * @param engineConfig the core engine configuration for this shard
-     * @param headPublisher publishes commits and manages lease acquisition/renewal for this shard's head
-     * @param shardDirectory the shard's directory-registry entry, refreshed periodically while this engine is active
-     * @param localNodeId the id of the node this engine is activating on
-     * @param pitrRetentionConfig {@code null} disables the periodic PITR retention reconciliation task; non-null schedules it
-     * @param walChunkService {@code null} disables WAL mirroring entirely, same shape as every other optional feature in this plugin.
-     * @param encryptionKeyProvider {@code null} leaves WAL-mirrored records unencrypted; non-null
-     *                              wraps {@code walChunkService} in an {@code EncryptingWalChunkService}.
-     * @param dedicatedWalGcSchedulerTask {@code null} for a shard sharing the node-level WAL
-     *                                    container; non-null for a shard on a dedicated WAL stream.
-     * @param publicationRateLimitMillis non-positive (the default) disables rate limiting.
-     * @param publicationNotifier {@code null} disables writer-side publication notification.
-     * @param siblingShardBlobContainerResolver {@code null} disables in-place split recovery
-     *                                          entirely (same shape as every other optional feature
-     *                                          in this plugin); non-null resolves an arbitrary
-     *                                          sibling shard ID's own {@link
-     *                                          org.opensearch.common.blobstore.BlobContainer} within
-     *                                          this engine's own index, used by {@link
-     *                                          #recoverFromInPlaceSplit} to reach a split's parent
-     *                                          shard.
-     */
-    public ObjectStoreWriterEngine(
-        EngineConfig engineConfig,
-        ObjectStoreCommitHeadPublisher headPublisher,
-        ShardDirectory shardDirectory,
-        String localNodeId,
-        PitrRetentionConfig pitrRetentionConfig,
-        WalChunkService walChunkService,
-        org.opensearch.serverless.storage.security.EncryptionKeyProvider encryptionKeyProvider,
-        WalGcSchedulerTask dedicatedWalGcSchedulerTask,
-        long publicationRateLimitMillis,
-        WriterPublicationNotifier publicationNotifier,
-        java.util.function.IntFunction<org.opensearch.common.blobstore.BlobContainer> siblingShardBlobContainerResolver
-    ) {
-        this(
-            engineConfig,
-            headPublisher,
-            shardDirectory,
-            localNodeId,
-            pitrRetentionConfig,
-            walChunkService,
-            encryptionKeyProvider,
-            dedicatedWalGcSchedulerTask,
-            publicationRateLimitMillis,
-            publicationNotifier,
-            siblingShardBlobContainerResolver,
             beginConstruction(walChunkService, encryptionKeyProvider)
         );
     }
@@ -600,13 +534,11 @@ public class ObjectStoreWriterEngine extends InternalEngine {
         WalGcSchedulerTask dedicatedWalGcSchedulerTask,
         long publicationRateLimitMillis,
         WriterPublicationNotifier publicationNotifier,
-        java.util.function.IntFunction<org.opensearch.common.blobstore.BlobContainer> siblingShardBlobContainerResolver,
         Void ignored
     ) {
         super(engineConfig);
         this.publicationRateLimitMillis = publicationRateLimitMillis;
         this.publicationNotifier = publicationNotifier;
-        this.siblingShardBlobContainerResolver = siblingShardBlobContainerResolver;
         CONSTRUCTION_WAL_CHUNK_SERVICE.remove();
         CONSTRUCTION_ENCRYPTION_KEY_PROVIDER.remove();
         this.activationWalPosition = CONSTRUCTION_ACTIVATION_WAL_POSITION.get();
@@ -985,97 +917,6 @@ public class ObjectStoreWriterEngine extends InternalEngine {
                 "failed to re-snapshot activationWalPosition on primary term bump to " + newPrimaryTerm,
                 e
             );
-        }
-    }
-
-    /**
-     * Attaches this (child) shard to its share of the parent shard's data, per
-     * {@link Engine#recoverFromInPlaceSplit}'s own javadoc: fired by core once this engine has been
-     * opened exactly as an {@code EMPTY_STORE} recovery would (empty local Lucene index, no
-     * segments) -- core does no data copying of its own for this recovery source.
-     *
-     * <p>Reuses {@link org.opensearch.serverless.storage.clone.ShardCloner#clone}'s existing
-     * zero-copy recipe verbatim (this plugin's own, already-tested/formally-verified mechanism for
-     * "a shard's first manifest references another shard's bundles without copying bytes"),
-     * retargeted from "brand-new index" to "same index, sibling shard ID already reserved by core's
-     * {@code SplitShardsMetadata}" -- see dynamic-partitioning-progress.md's "Task 12"/"Task 13"
-     * entries for the design decision this implements. A no-op if in-place split support wasn't
-     * configured ({@link #siblingShardBlobContainerResolver} is {@code null}), matching every other
-     * optional feature's default-disabled shape in this plugin.
-     *
-     * @param shardId this (child) shard's own {@code ShardId} -- always equal to {@code
-     *                 engineConfig.getShardId()}, passed by core rather than read from this engine
-     *                 so the seam matches {@link Engine}'s own no-op-default declaration exactly.
-     */
-    @Override
-    public void recoverFromInPlaceSplit(org.opensearch.core.index.shard.ShardId shardId) throws IOException {
-        if (siblingShardBlobContainerResolver == null) {
-            return;
-        }
-
-        org.opensearch.cluster.metadata.IndexMetadata indexMetadata = engineConfig.getIndexSettings().getIndexMetadata();
-        org.opensearch.common.collect.Tuple<Integer, org.opensearch.cluster.metadata.ShardRange> parentAndRange = indexMetadata
-            .getSplitShardsMetadata()
-            .getParentAndRangeOfChild(shardId.getId());
-        if (parentAndRange == null) {
-            // Not (or no longer) a recognized in-place split child -- nothing to attach to. Not an
-            // error: core dispatches to this hook purely off the recovery source on this shard's own
-            // routing entry, independent of whether SplitShardsMetadata still considers the split
-            // in-progress by the time this runs (e.g. a retried recovery after the split already
-            // committed via MetadataInPlaceSplitShardCommitService).
-            logger.warn(
-                "recoverFromInPlaceSplit called for shard [{}] but it is not a recognized in-progress split child; leaving empty",
-                shardId
-            );
-            return;
-        }
-        int parentShardId = parentAndRange.v1();
-        org.opensearch.cluster.metadata.ShardRange childRange = parentAndRange.v2();
-
-        try {
-            org.opensearch.common.blobstore.BlobContainer parentContainer = siblingShardBlobContainerResolver.apply(parentShardId);
-            org.opensearch.serverless.storage.manifest.BlobContainerManifestStore parentManifestStore =
-                new org.opensearch.serverless.storage.manifest.BlobContainerManifestStore(parentContainer);
-            org.opensearch.serverless.storage.shardstate.ShardStateStore parentShardStateStore =
-                new org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore(parentContainer);
-            org.opensearch.serverless.storage.retention.DurablePinRegistry parentPinRegistry =
-                new org.opensearch.serverless.storage.retention.BlobContainerDurablePinRegistry(parentContainer);
-
-            org.opensearch.common.blobstore.BlobContainer childContainer = siblingShardBlobContainerResolver.apply(shardId.getId());
-            org.opensearch.serverless.storage.manifest.BlobContainerManifestStore childManifestStore =
-                new org.opensearch.serverless.storage.manifest.BlobContainerManifestStore(childContainer);
-            org.opensearch.serverless.storage.shardstate.ShardStateStore childShardStateStore =
-                new org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore(childContainer);
-            org.opensearch.serverless.storage.clone.BlobContainerCloneLineageStore childLineageStore =
-                new org.opensearch.serverless.storage.clone.BlobContainerCloneLineageStore(childContainer);
-            org.opensearch.serverless.storage.resharding.BlobContainerInPlaceSplitRangeStore childRangeStore =
-                new org.opensearch.serverless.storage.resharding.BlobContainerInPlaceSplitRangeStore(childContainer);
-            org.opensearch.serverless.storage.resharding.InPlaceSplitRangeDescriptor descriptor =
-                new org.opensearch.serverless.storage.resharding.InPlaceSplitRangeDescriptor(
-                    parentShardId,
-                    childRange.start(),
-                    childRange.end()
-                );
-
-            org.opensearch.serverless.storage.clone.ShardCloner.clone(
-                indexUuid,
-                parentShardId,
-                parentManifestStore,
-                parentShardStateStore,
-                parentPinRegistry,
-                indexUuid,
-                shardId.getId(),
-                childManifestStore,
-                childShardStateStore,
-                childLineageStore,
-                System.currentTimeMillis(),
-                () -> childRangeStore.writeDescriptor(descriptor)
-            );
-        } catch (UncheckedIOException e) {
-            // siblingShardBlobContainerResolver has no checked-exception escape hatch (it's an
-            // IntFunction) -- ServerlessStoragePlugin's own resolver wraps IOException this way,
-            // unwrapped back here so this method's own IOException contract stays honest.
-            throw e.getCause();
         }
     }
 

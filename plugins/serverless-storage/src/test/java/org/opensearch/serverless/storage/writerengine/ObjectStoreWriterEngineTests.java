@@ -41,7 +41,6 @@ import org.opensearch.serverless.storage.shardstate.ShardHead;
 import org.opensearch.serverless.storage.shardstate.ShardStateStore;
 import org.opensearch.serverless.storage.shardstate.VersionedShardHead;
 
-import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
@@ -111,120 +110,12 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
         engine.index(index);
     }
 
-    public void testRecoverFromInPlaceSplitAttachesChildToParentsData() throws Exception {
-        java.nio.file.Path baseDir = createTempDir();
-        java.util.Map<Integer, BlobContainer> containersByShardId = new java.util.HashMap<>();
-        java.util.function.IntFunction<BlobContainer> resolver = shardIdValue -> containersByShardId.computeIfAbsent(shardIdValue, id -> {
-            try {
-                FsBlobStore blobStore = new FsBlobStore(1024, baseDir.resolve(String.valueOf(id)), false);
-                return new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
-            } catch (java.io.IOException e) {
-                throw new java.io.UncheckedIOException(e);
-            }
-        });
-
-        // Parent (shard 0): publish a real manifest/head directly -- this test only needs the
-        // parent to already have published data for recoverFromInPlaceSplit to attach to; it
-        // doesn't need a full parent engine.
-        BlobContainer parentContainer = resolver.apply(0);
-        BlobContainerManifestStore parentManifestStore = new BlobContainerManifestStore(parentContainer);
-        ShardStateStore parentShardStateStore = new BlobContainerShardStateStore(parentContainer);
-        CommitManifest parentManifest = new CommitManifest(
-            shardId.getIndex().getUUID(),
-            0,
-            1,
-            1,
-            "segments_1",
-            Map.of("segments_1", new org.opensearch.serverless.storage.manifest.FileReference("bundle-abc", 0, 100, 12345L)),
-            5L,
-            5L,
-            null,
-            0L,
-            org.opensearch.serverless.storage.manifest.PruningStats.empty(),
-            System.currentTimeMillis()
-        );
-        parentManifestStore.writeManifest(parentManifest);
-        parentShardStateStore.compareAndSet(shardId.getIndex().getUUID(), 0, Optional.empty(), new ShardHead(1, null, 0L, 1));
-
-        // Real SplitShardsMetadata recording shard 0 (root) split into 2 children -- gives us a
-        // real child ShardRange to resolve, exactly as core's own routing wiring would produce.
-        org.opensearch.cluster.metadata.SplitShardsMetadata.Builder splitBuilder =
-            new org.opensearch.cluster.metadata.SplitShardsMetadata.Builder(1);
-        java.util.List<org.opensearch.cluster.metadata.ShardRange> children = splitBuilder.splitShard(0, 2);
-        org.opensearch.cluster.metadata.ShardRange childRange = children.get(0);
-
-        org.opensearch.common.settings.Settings indexSettingsSettings = org.opensearch.common.settings.Settings.builder()
-            .put(org.opensearch.cluster.metadata.IndexMetadata.SETTING_VERSION_CREATED, org.opensearch.Version.CURRENT)
-            .put(org.opensearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
-            .put(org.opensearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
-            .put(org.opensearch.cluster.metadata.IndexMetadata.SETTING_INDEX_UUID, shardId.getIndex().getUUID())
-            .build();
-        org.opensearch.cluster.metadata.IndexMetadata indexMetadataWithSplit = org.opensearch.cluster.metadata.IndexMetadata.builder(
-            shardId.getIndexName()
-        ).settings(indexSettingsSettings).splitShardsMetadata(splitBuilder.build()).build();
-        org.opensearch.index.IndexSettings splitAwareIndexSettings = new org.opensearch.index.IndexSettings(
-            indexMetadataWithSplit,
-            org.opensearch.common.settings.Settings.EMPTY
-        );
-
-        BlobContainer childContainer = resolver.apply(childRange.shardId());
-        ShardStateStore childShardStateStore = new BlobContainerShardStateStore(childContainer);
-        ObjectStoreCommitPublisher childCommitPublisher = new ObjectStoreCommitPublisher(
-            new BlobContainerBundleStore(childContainer),
-            new BlobContainerManifestStore(childContainer)
-        );
-
-        Store store = createStore();
-        lastOpenedStore = store;
-        store.createEmpty(splitAwareIndexSettings.getIndexVersionCreated().luceneVersion);
-        java.nio.file.Path translogPath = createTempDir();
-        String translogUuid = Translog.createEmptyTranslog(translogPath, SequenceNumbers.NO_OPS_PERFORMED, shardId, primaryTerm.get());
-        store.associateIndexWithNewTranslog(translogUuid);
-
-        EngineConfig engineConfig = config(splitAwareIndexSettings, store, translogPath, newMergePolicy(), null);
-        ObjectStoreWriterEngine engine = new ObjectStoreWriterEngine(
-            engineConfig,
-            new ObjectStoreCommitHeadPublisher(childCommitPublisher, childShardStateStore),
-            shardDirectory,
-            LOCAL_NODE_ID,
-            null,
-            null,
-            null,
-            null,
-            0L,
-            null,
-            resolver
-        );
-        try {
-            engine.translogManager().recoverFromTranslog(translogHandler, engine.getProcessedLocalCheckpoint(), Long.MAX_VALUE);
-
-            engine.recoverFromInPlaceSplit(new org.opensearch.core.index.shard.ShardId(shardId.getIndex(), childRange.shardId()));
-
-            Optional<org.opensearch.serverless.storage.shardstate.VersionedShardHead> childHead = childShardStateStore.get(
-                shardId.getIndex().getUUID(),
-                childRange.shardId()
-            );
-            assertTrue("the child shard should have a published head after recoverFromInPlaceSplit", childHead.isPresent());
-            assertEquals(1, childHead.get().head().latestManifestGeneration());
-
-            CommitManifest childManifest = new BlobContainerManifestStore(childContainer).readManifest(1, 1);
-            assertEquals(
-                "the child's manifest must reference the SAME bundle files as the parent's, not copy them",
-                parentManifest.files(),
-                childManifest.files()
-            );
-            assertEquals(parentManifest.segmentsFileName(), childManifest.segmentsFileName());
-
-            Optional<org.opensearch.serverless.storage.resharding.InPlaceSplitRangeDescriptor> descriptor =
-                new org.opensearch.serverless.storage.resharding.BlobContainerInPlaceSplitRangeStore(childContainer).readDescriptor();
-            assertTrue("a range descriptor must be written before the child becomes visible", descriptor.isPresent());
-            assertEquals(0, descriptor.get().parentShardId());
-            assertEquals(childRange.start(), descriptor.get().start());
-            assertEquals(childRange.end(), descriptor.get().end());
-        } finally {
-            IOUtils.close(engine, lastOpenedStore);
-        }
-    }
+    // In-place split recovery (attaching a child shard to its parent's data, then materializing
+    // that into the child's LOCAL Lucene store) is now covered by InPlaceSplitLocalStoreRecoveryTests
+    // -- moved there because dynamic-partitioning-progress.md's "Task 19" fix relocated the whole
+    // seam from Engine#recoverFromInPlaceSplit (this class) to WriterEngineFactory
+    // #recoverInPlaceSplitLocalStore, which needs a real IndexShard (IndexShardTestCase), not just
+    // an Engine (EngineTestCase, this class's own base).
 
     public void testFlushPublishesAManifestOntoTheShardHead() throws Exception {
         FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);

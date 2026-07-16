@@ -69,12 +69,6 @@ public class EngineBackedIndexer implements Indexer {
         engine.onPrimaryTermBumped(newPrimaryTerm);
     }
 
-    /** Delegates to the wrapped {@link Engine}'s own {@link Engine#recoverFromInPlaceSplit}. */
-    @Override
-    public void recoverFromInPlaceSplit(org.opensearch.core.index.shard.ShardId shardId) throws IOException {
-        engine.recoverFromInPlaceSplit(shardId);
-    }
-
     @Override
     public Engine.IndexResult index(Engine.Index index) throws IOException {
         return engine.index(index);
