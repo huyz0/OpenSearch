@@ -81,6 +81,7 @@ import org.opensearch.cluster.metadata.IndexTemplateMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.metadata.MetadataCreateDataStreamService;
 import org.opensearch.cluster.metadata.MetadataCreateIndexService;
+import org.opensearch.cluster.metadata.MetadataInPlaceSplitShardCommitService;
 import org.opensearch.cluster.metadata.MetadataIndexUpgradeService;
 import org.opensearch.cluster.metadata.SystemIndexMetadataUpgradeService;
 import org.opensearch.cluster.metadata.TemplateUpgradeService;
@@ -1746,6 +1747,11 @@ public class Node implements Closeable {
             );
             resourcesToClose.add(persistentTasksClusterService);
             final PersistentTasksService persistentTasksService = new PersistentTasksService(clusterService, threadPool, client);
+
+            // Finalizes or aborts in-place shard splits once their child shards converge -- see
+            // MetadataInPlaceSplitShardCommitService's javadoc for why this can't reuse
+            // PersistentTasksClusterService itself despite the similar shape.
+            new MetadataInPlaceSplitShardCommitService(settings, clusterService);
 
             mergedSegmentWarmerFactory = new MergedSegmentWarmerFactory(transportService, recoverySettings, clusterService);
 

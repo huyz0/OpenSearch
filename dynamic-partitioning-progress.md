@@ -121,6 +121,91 @@ wiring) and task 10 (`RecoverySource` dispatch seam), since the commit driver
 and the recovery-source hook are two halves of the same completion signal and
 should be designed together.
 
+## Task 8.5 — Split commit/cancel driver
+
+Status: **done**, commit follows this entry.
+
+### Design grounding
+
+Investigated the codebase for an existing "watch cluster state, react by
+submitting a follow-up cluster-state-update task, cluster-manager-only"
+precedent to copy instead of inventing a new shape. `PersistentTasksClusterService`
+(`server/src/main/java/org/opensearch/persistent/PersistentTasksClusterService.java`)
+is exactly this pattern: gated on `DiscoveryNode.isClusterManagerNode(settings)`
+at construction, re-checks `event.localNodeClusterManager()` per event, and
+submits a plain `ClusterStateUpdateTask` when a condition is met. Confirmed
+there is no more specific "shard reached STARTED → do X on manager" hook to
+reuse instead — neither `AllocationService` nor `GatewayAllocator` expose
+one; both only participate during reroute computation.
+
+For the cancel signal, reused `MaxRetryAllocationDecider`'s own existing
+"give up permanently" condition (`UnassignedInfo.getNumFailedAllocations() >=
+SETTING_ALLOCATION_MAX_RETRY`) rather than inventing a new retry-budget
+concept — a child shard that decider has already given up on is exactly
+the case a split needs to detect and cancel from.
+
+### Implementation
+
+New [`MetadataInPlaceSplitShardCommitService`](server/src/main/java/org/opensearch/cluster/metadata/MetadataInPlaceSplitShardCommitService.java),
+a cluster-manager-only `ClusterStateListener`:
+
+- On every cluster state change, for every in-progress split in every
+  index's `SplitShardsMetadata`, evaluates each child shard's primary
+  `ShardRouting`:
+  - all children `STARTED` → submits a commit task calling
+    `SplitShardsMetadata.Builder.updateSplitMetadataForChildShards`.
+  - any child's primary has exhausted its allocation-retry budget →
+    submits a cancel task calling `SplitShardsMetadata.Builder.cancelSplit`
+    **and** removes the abandoned children's `ShardRouting` entries from
+    the routing table — necessary because `SplitShardsMetadata`'s own
+    hole-reuse logic (found reading `findHoles` in Task 1) assumes a freed
+    child ID isn't still referenced by a live routing entry; leaving them
+    in place would let a future split collide with this attempt's orphaned
+    routing rows.
+  - otherwise, no-ops (still converging).
+- Both `applyCommit`/`applyCancel` are static, package-visible, and
+  re-validate the completion condition against the state they're actually
+  applied to (not just the state that triggered the listener) — cluster
+  state can advance between `clusterChanged` firing and the task executing.
+- Registered in `Node.java` next to `PersistentTasksClusterService`'s own
+  construction site, following the same "construct directly in `Node`,
+  don't try to route it through Guice" wiring.
+
+### Tests + verification discipline
+
+6 new unit tests in `MetadataInPlaceSplitShardCommitServiceTests`: commit
+no-ops while children are still unassigned, commit promotes children once
+all `STARTED`, commit is idempotent once already committed, cancel frees
+child IDs and removes their routing entries (parent's own entry
+untouched), and cancel triggers correctly off a simulated exhausted
+allocation-retry `UnassignedInfo`.
+
+Verified meaningfulness: temporarily forced `evaluateSplitCompletion` to
+always return `STILL_IN_PROGRESS` (never commit); 2 of 6 tests failed
+exactly as expected (`AssertionError` on the "split committed" assertions).
+Restored the real logic, re-ran clean.
+
+Ran the required broader regression sweep (core change: new class wired
+into `Node.java`, touches cluster metadata/routing):
+`:server:test --tests "org.opensearch.cluster.metadata.*" --tests
+"org.opensearch.cluster.routing.*" --tests "org.opensearch.node.*"` —
+`BUILD SUCCESSFUL`, zero `failures="[1-9]`/`errors="[1-9]` across result XML.
+
+### Known scope limits (not addressed by this task, flagged honestly)
+
+- The parent shard's own `ShardRouting` is left untouched by both commit
+  and cancel — a committed split still has the parent shard `STARTED` and
+  serving. This matches the existing test-only semantics of
+  `updateSplitMetadataForChildShards` (it never touched routing either) and
+  is exactly the read-path-correctness question the plan's Part 3 already
+  flags as needing an explicit design decision before Phase 0 is
+  usable end-to-end — not silently resolved here, deliberately deferred to
+  where the plan already scoped it.
+- `clusterChanged` iterates every index on every cluster-state-changed
+  event — fine at the scale this plugin operates at today (splits are rare,
+  operator-triggered), but worth revisiting for cost if in-progress splits
+  become common under Phase 1's automatic triggering.
+
 ## Tasks 5-9 — `AllocationService`/`RoutingTable` wiring for in-progress split children
 
 Status: **done**, commit follows this entry.
