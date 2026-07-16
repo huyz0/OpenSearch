@@ -509,6 +509,62 @@ during a split, and WAL/term-authority interaction across the split boundary —
 the next concrete design units before Phase 0 item 0.7 (the full real-workload IT with actual
 document indexing and `OperationRouting` hash-resolution verification) can be attempted honestly.
 
+## Part 3 read-path correctness — replica coordination and WAL/term-authority interaction
+
+Status: **done** (design resolution only; one real gap found and flagged, not yet fixed).
+
+### Replica coordination — resolved, no new code needed
+
+Investigated whether a split's replicas need special coordination logic (each replica
+independently deriving `SplitShardsMetadata`'s transition, vs. the primary's split being
+explicitly propagated). Answer: **no special coordination is needed, by construction** —
+Task 5-9's routing wiring already gives every child shard ordinary replica `ShardRouting` entries
+(`PeerRecoverySource.INSTANCE`), so a child's replicas recover the completely normal way, via peer
+recovery from the child's own primary, which itself already has the correct data via
+`Engine#recoverFromInPlaceSplit`'s zero-copy attach. Replicas never read `SplitShardsMetadata`
+directly and don't need to. Symmetrically, the parent's replicas need no special handling at
+retirement either — removing the parent's `ShardRouting` entries (primary and replicas) in the
+same commit update (previous entry) shuts them down exactly like any other shard removal; a
+replica has no independent state to reconcile since it only ever mirrors its primary.
+
+### WAL/term-authority interaction — resolved with a real gap found, not fixed
+
+Investigated whether WAL mirroring (per-`ShardId` stream, `WalChunkService` keyed by
+`(indexUuid, shardId)`) needs to become partition-aware for a split. Two parts to this:
+
+- **Forward-going WAL, post-split**: no special handling needed. Each child gets a genuinely new
+  `ShardId`, so it naturally gets its own independent WAL stream from its own first write onward
+  — nothing to inherit or partition, by the same "real shard ID, ordinary machinery" reasoning
+  Task 12 already established for manifests.
+- **The parent's WAL history at the moment of cloning**: **a real, unaddressed correctness gap**,
+  found by tracing the actual code, not assumed away. `ShardCloner.clone` (reused verbatim by
+  `Engine#recoverFromInPlaceSplit`, per Task 13-14) clones whatever the parent's `ShardStateStore`
+  reports as `latestManifestGeneration` **at the moment the child recovers** —
+  `sourceHead.get().head().latestManifestGeneration()`, no forced flush precondition anywhere in
+  the call chain. If the parent has WAL-mirrored writes that landed *after* its last published
+  manifest generation but *before* the split (an entirely ordinary situation — this plugin's own
+  `_refresh`/publish-rate-limiting design, §8, deliberately does not publish on every single
+  write), those writes are **not captured in the cloned manifest at all**. They exist in the
+  parent's WAL stream, but a child never replays the parent's WAL (only its own, which starts
+  empty) — so those documents would be silently absent from every child, a real, silent data-loss
+  window, not a theoretical one.
+
+**Not fixed in this pass** — flagged honestly rather than papered over. The correct fix shape
+(not yet implemented, needs its own careful design + test pass): `MetadataInPlaceSplitShardService.applySplitShardRequest`
+or the REST/transport layer should force a real flush/publish on the parent (synchronously,
+before the split's cluster-state update is even submitted, or as a precondition the split waits
+on) so `latestManifestGeneration` is guaranteed to reflect every write that had already returned
+success to a client by the time the split was requested. This needs care around exactly this
+plugin's own `_refresh`/publish semantics (§8) and the writer-lease/fencing model (B1-B13 earlier
+this session) to get the ordering right, not a one-line change.
+
+### New task added to the backlog (auto-added per `/goal` authorization)
+
+**Task 18 (new) — Force-flush the parent before an in-place split clones its manifest.** Fixes
+the WAL/manifest-generation gap identified above. Blocks Phase 0 item 0.7 (the full real-workload
+IT) from being trustworthy — that IT would need to index documents right up to the split and
+verify none are lost, which will fail today until this is fixed.
+
 ## Tasks 10-11 — `RecoverySource` dispatch seam for `InPlaceSplitShardRecoverySource`
 
 Status: **done**, commit follows this entry.
