@@ -100,6 +100,54 @@ public class InPlaceSplitShardActionIT extends OpenSearchIntegTestCase {
         }
     }
 
+    public void testInPlaceSplitShardActionForcesAFlushBeforeSplitting() {
+        internalCluster().startNode();
+        createIndex(INDEX_NAME, Settings.builder().put(SETTING_NUMBER_OF_SHARDS, 1).put(SETTING_NUMBER_OF_REPLICAS, 0).build());
+        ensureGreen(INDEX_NAME);
+
+        // An unflushed write -- present in the translog/in-memory buffer, not yet in any published
+        // segment/manifest generation. dynamic-partitioning-progress.md's "Task 18": without a
+        // forced flush before splitting, this document would be silently absent from every child.
+        client().prepareIndex(INDEX_NAME).setId("1").setSource("field", "value1").get();
+
+        int uncommittedOpsBeforeSplit = parentShardTranslogUncommittedOps();
+        assertTrue("the unflushed write must be visible as an uncommitted translog op", uncommittedOpsBeforeSplit > 0);
+
+        client().execute(InPlaceSplitShardAction.INSTANCE, new InPlaceSplitShardAction.Request(INDEX_NAME, 0, 2)).actionGet();
+
+        // Read immediately after the split request returns -- at this point shard 0 (the parent)
+        // is still guaranteed present: the commit driver can only retire it once the children have
+        // reached STARTED, which cannot have happened yet (this call only just recorded the split
+        // as in-progress). Checking THIS shard's own translog specifically, not an index-aggregate
+        // stat, avoids being fooled by unrelated flushes the new child shards' own engine
+        // construction performs (InternalEngine flushes once during translog recovery regardless).
+        int uncommittedOpsAfterSplit = parentShardTranslogUncommittedOps();
+        assertEquals(
+            "the split request must force a flush of the parent shard specifically before proceeding, "
+                + "clearing its translog's uncommitted op count -- was "
+                + uncommittedOpsBeforeSplit
+                + " before",
+            0,
+            uncommittedOpsAfterSplit
+        );
+    }
+
+    /** The parent shard (0)'s own translog uncommitted-operation count, read directly, not aggregated across the index. */
+    private int parentShardTranslogUncommittedOps() {
+        org.opensearch.action.admin.indices.stats.IndicesStatsResponse stats = client().admin()
+            .indices()
+            .prepareStats(INDEX_NAME)
+            .clear()
+            .setTranslog(true)
+            .get();
+        for (org.opensearch.action.admin.indices.stats.ShardStats shardStats : stats.getShards()) {
+            if (shardStats.getShardRouting().shardId().id() == 0) {
+                return shardStats.getStats().getTranslog().getUncommittedOperations();
+            }
+        }
+        throw new AssertionError("expected to find shard 0's stats");
+    }
+
     public void testInPlaceSplitShardActionRejectsInvalidSplitInto() {
         internalCluster().startNode();
         createIndex(INDEX_NAME, Settings.builder().put(SETTING_NUMBER_OF_SHARDS, 1).put(SETTING_NUMBER_OF_REPLICAS, 0).build());

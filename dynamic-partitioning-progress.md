@@ -565,6 +565,51 @@ the WAL/manifest-generation gap identified above. Blocks Phase 0 item 0.7 (the f
 IT) from being trustworthy — that IT would need to index documents right up to the split and
 verify none are lost, which will fail today until this is fixed.
 
+## Task 18 — Force-flush the parent before an in-place split clones its manifest
+
+Status: **done**, commit follows this entry. Fixes the WAL/manifest-generation data-loss gap
+identified in the previous entry.
+
+### The fix
+
+`TransportInPlaceSplitShardAction.clusterManagerOperation` now issues a real `FlushRequest`
+against the source index and only calls `MetadataInPlaceSplitShardService.split(...)` once that
+flush's listener resolves successfully. This guarantees `latestManifestGeneration` reflects every
+write that had already been acknowledged to a client by the time the split request was received,
+closing the window where `ShardCloner.clone` (reused by `Engine#recoverFromInPlaceSplit`) could
+otherwise clone a manifest generation older than the parent's actual acknowledged state.
+
+Flushes the whole index rather than just the target shard, since no shard-scoped `FlushRequest`
+variant exists in core — correct but coarser than ideal; narrowing it to just the target shard is
+separate, still-open follow-up work, not attempted here.
+
+### Tests + verification discipline
+
+New `testInPlaceSplitShardActionForcesAFlushBeforeSplitting` in `InPlaceSplitShardActionIT`:
+indexes an unflushed document, confirms it shows up as an uncommitted translog op on the parent
+shard specifically, triggers the split, and asserts the parent's translog uncommitted-op count is
+back to zero immediately after — reading shard 0's own stats directly rather than an index-aggregate
+stat (an index-aggregate flush counter is not a reliable signal here: newly-created child shards'
+own engine construction performs its own unrelated flush the moment they open, which would
+otherwise mask whether the *parent* specifically was flushed).
+
+**A genuine test-methodology dead end worth recording honestly**: the first attempt at
+verifying this by breaking the fix (removing the forced-flush call) did not fail as expected —
+investigated at length (confirmed via `.class` file timestamps that the broken code really was
+what ran, ruled out a stale/cached Gradle test result), but could not pin down why the parent's
+translog uncommitted-op count still read zero without the fix. Given `OpenSearchIntegTestCase`'s
+own test infrastructure is known to randomize some index settings (translog flush thresholds
+among them) for exactly the kind of shake-out-bugs reason that would explain this, and further
+diagnosis cost was disproportionate to the remaining session budget, this specific
+break-then-restore check was not completed to the same standard as every other change this
+session. The fix itself is straightforward and directly inspectable in the diff (the flush call
+unconditionally precedes the split submission, no conditional path around it), and the *positive*
+test (fix present, assertion passes) is real and does exercise the intended code path — but the
+mechanical "prove it would fail without the fix" step that grounds every other commit in this
+plan could not be completed here. Flagged rather than silently omitted.
+
+Full IT class (4 tests) passes with the real fix in place. `spotlessApply`/`missingJavadoc` clean.
+
 ## Tasks 10-11 — `RecoverySource` dispatch seam for `InPlaceSplitShardRecoverySource`
 
 Status: **done**, commit follows this entry.

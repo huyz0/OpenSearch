@@ -8,6 +8,8 @@
 
 package org.opensearch.action.admin.indices.split;
 
+import org.opensearch.action.admin.indices.flush.FlushRequest;
+import org.opensearch.action.admin.indices.flush.FlushResponse;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.clustermanager.AcknowledgedResponse;
 import org.opensearch.action.support.clustermanager.TransportClusterManagerNodeAction;
@@ -23,6 +25,7 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
+import org.opensearch.transport.client.Client;
 
 import java.io.IOException;
 
@@ -31,6 +34,16 @@ import java.io.IOException;
  * API for {@link MetadataInPlaceSplitShardService} -- see that class's own javadoc for what the
  * split itself actually does; this action is only the reachability seam.
  *
+ * <p>Before submitting the split's cluster-state update, forces a real flush of the source index
+ * (dynamic-partitioning-progress.md's "Task 18": {@code ShardCloner} (in the serverless-storage
+ * plugin), reused verbatim by a child's {@code Engine#recoverFromInPlaceSplit}, clones
+ * whatever the parent's latest <em>published</em> manifest generation happens to be at the moment
+ * of cloning -- without a preceding flush, writes acknowledged to a client after the parent's last
+ * publish but before the split would be silently absent from every child). This flushes the whole
+ * index rather than just the target shard (no shard-scoped {@link FlushRequest} variant exists),
+ * a correct but coarser-than-ideal mitigation -- narrowing it to just the target shard is separate,
+ * still-open follow-up work, not attempted here.
+ *
  * @opensearch.internal
  */
 public class TransportInPlaceSplitShardAction extends TransportClusterManagerNodeAction<
@@ -38,6 +51,7 @@ public class TransportInPlaceSplitShardAction extends TransportClusterManagerNod
     AcknowledgedResponse> {
 
     private final MetadataInPlaceSplitShardService metadataInPlaceSplitShardService;
+    private final Client client;
 
     @Inject
     public TransportInPlaceSplitShardAction(
@@ -46,7 +60,8 @@ public class TransportInPlaceSplitShardAction extends TransportClusterManagerNod
         ThreadPool threadPool,
         MetadataInPlaceSplitShardService metadataInPlaceSplitShardService,
         ActionFilters actionFilters,
-        IndexNameExpressionResolver indexNameExpressionResolver
+        IndexNameExpressionResolver indexNameExpressionResolver,
+        Client client
     ) {
         super(
             InPlaceSplitShardAction.NAME,
@@ -58,6 +73,7 @@ public class TransportInPlaceSplitShardAction extends TransportClusterManagerNod
             indexNameExpressionResolver
         );
         this.metadataInPlaceSplitShardService = metadataInPlaceSplitShardService;
+        this.client = client;
     }
 
     @Override
@@ -81,6 +97,15 @@ public class TransportInPlaceSplitShardAction extends TransportClusterManagerNod
         final ClusterState state,
         final ActionListener<AcknowledgedResponse> listener
     ) {
+        client.admin()
+            .indices()
+            .flush(
+                new FlushRequest(request.index()),
+                ActionListener.wrap((FlushResponse flushResponse) -> submitSplit(request, listener), listener::onFailure)
+            );
+    }
+
+    private void submitSplit(InPlaceSplitShardAction.Request request, ActionListener<AcknowledgedResponse> listener) {
         InPlaceSplitShardClusterStateUpdateRequest updateRequest = new InPlaceSplitShardClusterStateUpdateRequest(
             "in-place split via REST/transport action",
             request.index(),
