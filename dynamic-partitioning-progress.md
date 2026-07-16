@@ -121,6 +121,104 @@ wiring) and task 10 (`RecoverySource` dispatch seam), since the commit driver
 and the recovery-source hook are two halves of the same completion signal and
 should be designed together.
 
+## Tasks 10-11 — `RecoverySource` dispatch seam for `InPlaceSplitShardRecoverySource`
+
+Status: **done**, commit follows this entry.
+
+### Design grounding
+
+Investigated where core actually dispatches on `RecoverySource.Type` to decide
+how a shard recovers: `IndexShard.startRecovery`'s `switch` (the single
+dispatch point) had cases for `EMPTY_STORE`/`EXISTING_STORE`, `REMOTE_STORE`,
+`PEER`, `SNAPSHOT`, `LOCAL_SHARDS` — and no case for `IN_PLACE_SPLIT_SHARD`,
+which fell into `default:` and threw `IllegalArgumentException("Unknown
+recovery source ...")`. Any child shard created by Task 5-9's routing wiring
+would have failed recovery immediately.
+
+Studied `LOCAL_SHARDS` (classic resize's recovery path) as the closest
+precedent: `IndexShard.recoverFromLocalShards` → `StoreRecovery.recoverFromLocalShards`
+→ real Lucene `IndexWriter.addIndexes`-based segment merge from sibling
+shards' directories, entirely local (no `RecoveryTarget`/`PeerRecoveryTargetService`
+involvement — those are `PEER`-only). Confirmed `RecoveryTarget`/
+`PeerRecoveryTargetService` are irrelevant here for the same reason.
+
+### Implementation
+
+Followed the `Engine#onPrimaryTermBumped` seam shape exactly (per the
+research recommendation) rather than doing real segment-level work in core:
+
+- [`Engine.java`](server/src/main/java/org/opensearch/index/engine/Engine.java):
+  new no-op-default `recoverFromInPlaceSplit(ShardId shardId)`, documented as
+  firing once, after the engine is opened exactly as an `EMPTY_STORE`
+  recovery would (empty local Lucene index) — core does no data copying of
+  its own for this recovery source, giving a plugin engine the chance to
+  attach the child to its share of the parent's data however it understands
+  that (e.g. manifest-level partition filter, not a physical copy).
+- [`Indexer.java`](server/src/main/java/org/opensearch/index/engine/exec/Indexer.java) /
+  [`EngineBackedIndexer.java`](server/src/main/java/org/opensearch/index/engine/EngineBackedIndexer.java):
+  matching default method + delegating override, mirroring the
+  `onPrimaryTermBumped` triplet exactly.
+- [`IndexShard.java`](server/src/main/java/org/opensearch/index/shard/IndexShard.java):
+  new `case IN_PLACE_SPLIT_SHARD:` in `startRecovery`'s switch, dispatching to
+  a new `recoverFromInPlaceSplit(ActionListener<Boolean>)` method that calls
+  the existing `recoverFromStore(...)` (reusing its exact machinery, same as
+  `EMPTY_STORE` does) and then, on success, invokes the new
+  `Indexer#recoverFromInPlaceSplit` hook via the same null-safe
+  `getIndexerOrNull()` pattern `onPrimaryTermBumped`'s call site uses.
+
+### A real bug found and fixed while writing the first real test
+
+Reusing `recoverFromStore(...)` as-is doesn't work: `StoreRecovery.internalRecoverFromStore`
+gates its entire "should this shard's local store already contain data"
+decision on a single `indexShouldExists` boolean, computed as `recoverySource().getType()
+!= EMPTY_STORE` (`StoreRecovery.java:709`) — every other recovery source type,
+including our new `IN_PLACE_SPLIT_SHARD`, was treated as "should already have
+segments on disk," which fails immediately since a freshly-allocated child
+shard's local directory is empty. Fixed by widening that condition to also
+treat `IN_PLACE_SPLIT_SHARD` as not-should-exist, matching the design intent
+("opened exactly like `EMPTY_STORE`"). This is exactly the kind of gap the
+session's "implement → real test → verify meaningfulness by breaking it"
+discipline exists to catch — it was found by the first real test actually
+exercising the new recovery path, not by inspection.
+
+### Tests + verification discipline
+
+New [`InPlaceSplitShardRecoveryTests`](server/src/test/java/org/opensearch/index/shard/InPlaceSplitShardRecoveryTests.java):
+builds a real primary `IndexShard` with an initializing `ShardRouting` whose
+recovery source is `InPlaceSplitShardRecoverySource.INSTANCE`, calls the new
+`recoverFromInPlaceSplit` directly, and asserts recovery succeeds and the
+shard reaches `STARTED` — a scenario that, before this task, would have
+either thrown "Unknown recovery source" (if reached via the switch) or the
+`indexShouldExists` `IndexShardRecoveryException` found above (once the
+switch case was added but before the `StoreRecovery` fix).
+
+Verified meaningfulness twice: (1) removed the new `StoreRecovery` fix,
+confirmed the test fails with exactly the `IndexShardRecoveryException`
+described above, restored, confirmed clean. (2) Confirmed via the test's own
+prior failing run (before the `StoreRecovery` fix was written) that the test
+genuinely exercises the new code path end-to-end, not a mocked shortcut.
+
+Ran the required broader regression sweep (core recovery-path change):
+`:server:test --tests "org.opensearch.index.shard.*" --tests
+"org.opensearch.index.engine.*"` — `BUILD SUCCESSFUL`, zero
+`failures="[1-9]`/`errors="[1-9]` across result XML. Also confirmed the
+plugin (`serverless-storage`) still compiles clean against the widened
+`Engine`/`Indexer` surface (both new methods are additive, no-op-default).
+
+### Known scope limits (flagged honestly, not silently resolved)
+
+- No test exercises the actual `switch` case in `IndexShard.startRecovery`
+  end-to-end (that requires full `PeerRecoveryTargetService`/`RepositoriesService`/
+  `IndicesService` wiring, heavier than this task's scope) — the new test
+  calls `recoverFromInPlaceSplit` directly. The switch-case addition itself
+  is a single trivial line, low-risk relative to the two behaviors that
+  *were* verified (the `StoreRecovery` gate and the `Engine` hook delegation).
+- `Engine#recoverFromInPlaceSplit` is still a no-op in every engine,
+  including this plugin's `ObjectStoreWriterEngine` — that's deliberately
+  Task 12-14's scope (the manifest-identity design spike), not this task's.
+  A real in-place split is not yet end-to-end functional; this task only
+  ensures core no longer *rejects* the recovery source.
+
 ## Task 8.5 — Split commit/cancel driver
 
 Status: **done**, commit follows this entry.

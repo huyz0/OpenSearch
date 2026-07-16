@@ -706,7 +706,13 @@ final class StoreRecovery {
     private void internalRecoverFromStore(IndexShard indexShard) throws IndexShardRecoveryException {
         indexShard.preRecovery();
         final RecoveryState recoveryState = indexShard.recoveryState();
-        final boolean indexShouldExists = recoveryState.getRecoverySource().getType() != RecoverySource.Type.EMPTY_STORE;
+        // An in-place split's child shard is, from this method's point of view, exactly as empty as a
+        // brand-new EMPTY_STORE shard -- core does no data copying for IN_PLACE_SPLIT_SHARD (see
+        // IndexShard#recoverFromInPlaceSplit); the plugin engine attaches the child to its share of the
+        // parent's data afterward, via Engine#recoverFromInPlaceSplit, not by placing segments in this
+        // shard's local Store before this method runs.
+        final boolean indexShouldExists = recoveryState.getRecoverySource().getType() != RecoverySource.Type.EMPTY_STORE
+            && recoveryState.getRecoverySource().getType() != RecoverySource.Type.IN_PLACE_SPLIT_SHARD;
         indexShard.prepareForIndexRecovery();
         SegmentInfos si = null;
         final Store store = indexShard.store();

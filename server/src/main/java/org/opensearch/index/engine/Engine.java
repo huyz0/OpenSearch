@@ -1271,6 +1271,25 @@ public abstract class Engine implements LifecycleAware, Closeable {
     public void onPrimaryTermBumped(long newPrimaryTerm) {}
 
     /**
+     * Extension seam for a child shard created by an in-place split ({@code RecoverySource.Type.IN_PLACE_SPLIT_SHARD})
+     * to attach itself to its share of the parent shard's data, without core needing to know how that
+     * attachment actually works. Fired once, from {@code IndexShard#recoverFromInPlaceSplit}, immediately
+     * after this engine has been opened the same way an {@code EMPTY_STORE} recovery would (an empty local
+     * Lucene index, no segments) -- core does no data copying of its own for this recovery source, exactly
+     * as it does none of the plugin-specific manifest/zero-copy work {@code LOCAL_SHARDS} recovery's
+     * {@code StoreRecovery#recoverFromLocalShards} performs at the Lucene-segment level for classic resize.
+     *
+     * <p>No-op by default; every classic engine is unaffected -- only a plugin {@link EngineFactory} whose
+     * engine implementation understands the split's data model (e.g. a manifest-level partition filter
+     * rather than a physical segment copy) needs to override this. Mirrors {@link #onPrimaryTermBumped}'s
+     * shape as the established pattern in this codebase for this kind of no-op-default lifecycle seam.
+     *
+     * @param shardId the child shard's own {@code ShardId}, as reserved by {@code SplitShardsMetadata} for
+     *                 the in-progress split this recovery is completing.
+     */
+    public void recoverFromInPlaceSplit(ShardId shardId) throws IOException {}
+
+    /**
      * Synchronously refreshes the engine for new search operations to reflect the latest
      * changes.
      */

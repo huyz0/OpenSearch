@@ -95,6 +95,14 @@ public interface Indexer
     default void onPrimaryTermBumped(long newPrimaryTerm) {}
 
     /**
+     * See {@link org.opensearch.index.engine.Engine#recoverFromInPlaceSplit(org.opensearch.core.index.shard.ShardId)}
+     * -- this is the {@link Indexer}-level counterpart of that same seam. No-op by default.
+     *
+     * @param shardId the child shard's own {@code ShardId}, as reserved by {@code SplitShardsMetadata}.
+     */
+    default void recoverFromInPlaceSplit(org.opensearch.core.index.shard.ShardId shardId) throws java.io.IOException {}
+
+    /**
      * Returns information about the safe commit point.
      * The safe commit represents a consistent state that can be used for recovery.
      *

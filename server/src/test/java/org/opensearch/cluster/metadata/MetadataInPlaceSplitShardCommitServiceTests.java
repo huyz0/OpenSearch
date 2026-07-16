@@ -141,9 +141,7 @@ public class MetadataInPlaceSplitShardCommitServiceTests extends OpenSearchTestC
         for (IndexShardRoutingTable shardTable : currentIndexRoutingTable) {
             if (childIds.contains(shardTable.shardId().id())) {
                 IndexShardRoutingTable.Builder builder = new IndexShardRoutingTable.Builder(shardTable.shardId());
-                builder.addShard(
-                    TestShardRouting.newShardRouting(shardTable.shardId(), "node1", true, ShardRoutingState.STARTED)
-                );
+                builder.addShard(TestShardRouting.newShardRouting(shardTable.shardId(), "node1", true, ShardRoutingState.STARTED));
                 indexRoutingBuilder.addIndexShard(builder.build());
             } else {
                 indexRoutingBuilder.addIndexShard(shardTable);
@@ -157,9 +155,7 @@ public class MetadataInPlaceSplitShardCommitServiceTests extends OpenSearchTestC
     public void testApplyCancelTriggeredByExhaustedAllocationRetries() {
         ClusterState state = createStateWithInProgressSplit(3, 0, 2);
         Set<Integer> childIds = state.metadata().index("test-index").getSplitShardsMetadata().getChildShardIdsOfParent(0);
-        int maxRetries = MaxRetryAllocationDecider.SETTING_ALLOCATION_MAX_RETRY.get(
-            state.metadata().index("test-index").getSettings()
-        );
+        int maxRetries = MaxRetryAllocationDecider.SETTING_ALLOCATION_MAX_RETRY.get(state.metadata().index("test-index").getSettings());
 
         ClusterState exhausted = failChildAllocation(state, childIds, maxRetries);
 
