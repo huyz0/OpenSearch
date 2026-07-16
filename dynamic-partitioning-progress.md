@@ -121,6 +121,80 @@ wiring) and task 10 (`RecoverySource` dispatch seam), since the commit driver
 and the recovery-source hook are two halves of the same completion signal and
 should be designed together.
 
+## Tasks 5-9 — `AllocationService`/`RoutingTable` wiring for in-progress split children
+
+Status: **done**, commit follows this entry.
+
+### Design grounding (research pass before implementing)
+
+Investigated classic core `_split`/`_shrink` (RESIZE) as the closest precedent:
+
+- `MetadataCreateIndexService.clusterStateCreateIndex` builds the new index's
+  metadata and `IndexRoutingTable` **in the same cluster-state-update task**
+  (`RoutingTable.builder(...).addAsNew(indexMetadata)` →
+  `IndexRoutingTable.initializeAsNew` → `initializeEmpty`), then calls
+  `AllocationService.reroute()` afterward. Reroute is what turns the
+  `UNASSIGNED` entries created there into real allocations — it does not
+  itself create routing entries.
+- For a resize target, `initializeEmpty` assigns
+  `RecoverySource.LocalShardsRecoverySource.INSTANCE` to each new primary
+  when `IndexMetadata.getResizeSourceIndex() != null`.
+- `IndexRoutingTable.validate(Metadata)` is the only place that checks
+  `IndexMetadata.getNumberOfShards() == routingTable.shards().size()`, and
+  nothing in the production commit path actually calls it — so nothing
+  strictly *requires* metadata and routing to update atomically, but every
+  real precedent (resize, and every other index-lifecycle op) does it that
+  way regardless, and other code generally assumes the two stay in lockstep.
+  Followed that precedent rather than relying on the unenforced invariant.
+- `RecoverySource.Type.IN_PLACE_SPLIT_SHARD` /
+  `RecoverySource.InPlaceSplitShardRecoverySource` already exist in this
+  fork (shaped like `LocalShardsRecoverySource`: singleton `INSTANCE`, no
+  extra fields) and are already wired into `RecoverySource`'s deserialization
+  switch and `ShardRouting`'s primary/replica-recovery-source assertion —
+  but nothing constructs a `ShardRouting` with it yet. This is exactly the
+  recovery source to use for the child primary.
+
+### Implementation
+
+[`MetadataInPlaceSplitShardService.applySplitShardRequest`](server/src/main/java/org/opensearch/cluster/metadata/MetadataInPlaceSplitShardService.java)
+now, in the same cluster-state-update task that records the split in
+`SplitShardsMetadata`:
+
+1. Copies every existing `IndexShardRoutingTable` entry for the index
+   unchanged into a fresh `IndexRoutingTable.Builder`.
+2. For each child `ShardRange` reserved by `SplitShardsMetadata.Builder.splitShard(...)`
+   (read back via `getChildShardsOfParent(shardId)`), adds:
+   - a primary `ShardRouting`, `UNASSIGNED`, recovery source
+     `InPlaceSplitShardRecoverySource.INSTANCE`.
+   - `numberOfReplicas` replica `ShardRouting`s, `UNASSIGNED`, recovery
+     source `PeerRecoverySource.INSTANCE` (ordinary peer recovery from the
+     new primary once it's up, same as any other replica).
+3. Attaches the resulting `IndexRoutingTable` via `RoutingTable.Builder.add(...)`
+   before calling `rerouteRoutingTable.apply(...)` — so the very next reroute
+   pass (already invoked at the end of this method) has real unassigned
+   shards to allocate, exactly like the resize precedent.
+
+This closes the gap Task 1 found: before this change, a split only ever
+touched `IndexMetadata`; the routing table was a byte-for-byte copy. Now a
+split produces real, schedulable child shards.
+
+### Tests + verification discipline
+
+Added 3 new tests to `MetadataInPlaceSplitShardServiceTests`:
+`testApplySplitShardRequestCreatesUnassignedChildShardRouting` (primary/replica
+recovery-source + state assertions), `testApplySplitShardRequestPreservesExistingShardRoutingEntries`
+(parent/siblings untouched), `testApplySplitShardRequestChildRoutingHasCorrectParentIndex`.
+
+Verified meaningfulness by commenting out the `routingTableBuilder.add(...)`
+call and re-running: 2 of the 3 new tests failed with a
+`NullPointerException`/`AssertionError` exactly where expected, confirming
+they'd catch a regression. Restored the real code, re-ran clean.
+
+Ran the required broader regression sweep (core change, not plugin-only):
+`:server:test --tests "org.opensearch.cluster.metadata.*" --tests
+"org.opensearch.cluster.routing.*"` — `BUILD SUCCESSFUL`, zero
+`failures="[1-9]` / `errors="[1-9]` across the result XML.
+
 ## Task 2-3 — Audit `SplitShardsMetadataTests`/`ShardRangeTests` coverage
 
 Status: **done** (research only, no code changes).

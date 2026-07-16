@@ -16,6 +16,7 @@ import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
+import org.opensearch.cluster.routing.RecoverySource;
 import org.opensearch.cluster.routing.RoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.ShardRoutingState;
@@ -105,6 +106,63 @@ public class MetadataInPlaceSplitShardServiceTests extends OpenSearchTestCase {
         allChildIds.addAll(splitMetadata.getChildShardIdsOfParent(0));
         allChildIds.addAll(splitMetadata.getChildShardIdsOfParent(1));
         assertEquals(5, allChildIds.size()); // 3 + 2, all unique
+    }
+
+    // --- applySplitShardRequest: routing table wiring for child shards ---
+
+    public void testApplySplitShardRequestCreatesUnassignedChildShardRouting() {
+        ClusterState state = createClusterState("test-index", 3, 1);
+        Index index = state.metadata().index("test-index").getIndex();
+
+        ClusterState updatedState = applyRequest(state, newRequest("test-index", 0, 2));
+
+        SplitShardsMetadata splitMetadata = updatedState.metadata().index("test-index").getSplitShardsMetadata();
+        Set<Integer> childIds = splitMetadata.getChildShardIdsOfParent(0);
+        assertEquals(2, childIds.size());
+
+        IndexRoutingTable indexRoutingTable = updatedState.routingTable().index("test-index");
+        for (int childId : childIds) {
+            IndexShardRoutingTable childShardTable = indexRoutingTable.shard(childId);
+            assertNotNull("expected a routing table entry for child shard [" + childId + "]", childShardTable);
+
+            ShardRouting childPrimary = childShardTable.primaryShard();
+            assertEquals(ShardRoutingState.UNASSIGNED, childPrimary.state());
+            assertTrue(childPrimary.recoverySource() instanceof RecoverySource.InPlaceSplitShardRecoverySource);
+
+            // numberOfReplicas == 1 for this fixture
+            assertEquals(1, childShardTable.replicaShards().size());
+            ShardRouting childReplica = childShardTable.replicaShards().get(0);
+            assertEquals(ShardRoutingState.UNASSIGNED, childReplica.state());
+            assertTrue(childReplica.recoverySource() instanceof RecoverySource.PeerRecoverySource);
+        }
+    }
+
+    public void testApplySplitShardRequestPreservesExistingShardRoutingEntries() {
+        ClusterState state = createClusterState("test-index", 3, 1);
+
+        ClusterState updatedState = applyRequest(state, newRequest("test-index", 0, 2));
+
+        IndexRoutingTable indexRoutingTable = updatedState.routingTable().index("test-index");
+        // The original 3 shards (0, 1, 2) must still be present and untouched -- only the split
+        // adds new child entries, it must not disturb the parent or sibling shards' own routing.
+        for (int shardId = 0; shardId < 3; shardId++) {
+            IndexShardRoutingTable shardTable = indexRoutingTable.shard(shardId);
+            assertNotNull(shardTable);
+            assertEquals(ShardRoutingState.STARTED, shardTable.primaryShard().state());
+        }
+    }
+
+    public void testApplySplitShardRequestChildRoutingHasCorrectParentIndex() {
+        ClusterState state = createClusterState("test-index", 3, 0);
+        Index index = state.metadata().index("test-index").getIndex();
+
+        ClusterState updatedState = applyRequest(state, newRequest("test-index", 1, 2));
+
+        SplitShardsMetadata splitMetadata = updatedState.metadata().index("test-index").getSplitShardsMetadata();
+        for (int childId : splitMetadata.getChildShardIdsOfParent(1)) {
+            IndexShardRoutingTable childShardTable = updatedState.routingTable().index("test-index").shard(childId);
+            assertEquals(index, childShardTable.shardId().getIndex());
+        }
     }
 
     // --- applySplitShardRequest: error cases ---

@@ -16,8 +16,12 @@ import org.opensearch.action.admin.indices.split.InPlaceSplitShardClusterStateUp
 import org.opensearch.cluster.AckedClusterStateUpdateTask;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.ack.ClusterStateUpdateResponse;
+import org.opensearch.cluster.routing.IndexRoutingTable;
+import org.opensearch.cluster.routing.IndexShardRoutingTable;
+import org.opensearch.cluster.routing.RecoverySource;
 import org.opensearch.cluster.routing.RoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
+import org.opensearch.cluster.routing.UnassignedInfo;
 import org.opensearch.cluster.routing.allocation.AllocationService;
 import org.opensearch.cluster.service.ClusterManagerTask;
 import org.opensearch.cluster.service.ClusterManagerTaskThrottler;
@@ -25,6 +29,8 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.Priority;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.core.index.Index;
+import org.opensearch.core.index.shard.ShardId;
 
 import java.util.function.BiFunction;
 
@@ -148,7 +154,50 @@ public class MetadataInPlaceSplitShardService {
 
         SplitShardsMetadata.Builder splitMetadataBuilder = new SplitShardsMetadata.Builder(splitShardsMetadata);
         splitMetadataBuilder.splitShard(shardId, request.getSplitInto());
-        indexMetadataBuilder.splitShardsMetadata(splitMetadataBuilder.build());
+        SplitShardsMetadata updatedSplitShardsMetadata = splitMetadataBuilder.build();
+        indexMetadataBuilder.splitShardsMetadata(updatedSplitShardsMetadata);
+
+        // Give each reserved child shard ID a real, UNASSIGNED ShardRouting in the same cluster-state-update
+        // task that records the split in SplitShardsMetadata, mirroring how classic resize (split/shrink/clone)
+        // commits its new index's IndexMetadata and IndexRoutingTable together in one step
+        // (MetadataCreateIndexService#clusterStateCreateIndex) rather than growing the routing table
+        // incrementally across multiple cluster-state updates. The child primary recovers via
+        // InPlaceSplitShardRecoverySource (an existing, previously-unused recovery source shaped after
+        // LocalShardsRecoverySource); replicas recover from that primary the ordinary way, via PEER.
+        Index index = curIndexMetadata.getIndex();
+        IndexRoutingTable.Builder indexRoutingTableBuilder = IndexRoutingTable.builder(index);
+        for (IndexShardRoutingTable existingShardTable : currentState.routingTable().index(index.getName())) {
+            indexRoutingTableBuilder.addIndexShard(existingShardTable);
+        }
+        int numberOfReplicas = curIndexMetadata.getNumberOfReplicas();
+        for (ShardRange childRange : updatedSplitShardsMetadata.getChildShardsOfParent(shardId)) {
+            ShardId childShardId = new ShardId(index, childRange.shardId());
+            indexRoutingTableBuilder.addShard(
+                ShardRouting.newUnassigned(
+                    childShardId,
+                    true,
+                    RecoverySource.InPlaceSplitShardRecoverySource.INSTANCE,
+                    new UnassignedInfo(
+                        UnassignedInfo.Reason.INDEX_CREATED,
+                        "primary of child shard created by in-place split of shard [" + shardId + "]"
+                    )
+                )
+            );
+            for (int replica = 0; replica < numberOfReplicas; replica++) {
+                indexRoutingTableBuilder.addShard(
+                    ShardRouting.newUnassigned(
+                        childShardId,
+                        false,
+                        RecoverySource.PeerRecoverySource.INSTANCE,
+                        new UnassignedInfo(
+                            UnassignedInfo.Reason.INDEX_CREATED,
+                            "replica of child shard created by in-place split of shard [" + shardId + "]"
+                        )
+                    )
+                );
+            }
+        }
+        routingTableBuilder.add(indexRoutingTableBuilder);
 
         RoutingTable routingTable = routingTableBuilder.build();
         metadataBuilder.put(indexMetadataBuilder);
