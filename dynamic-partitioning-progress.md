@@ -610,6 +610,62 @@ plan could not be completed here. Flagged rather than silently omitted.
 
 Full IT class (4 tests) passes with the real fix in place. `spotlessApply`/`missingJavadoc` clean.
 
+## Task 19 (new, found while scoping item 0.7) — Local Lucene materialization gap, NOT fixed
+
+Status: **found and documented, not fixed** — flagged deliberately rather than shipping a rushed
+fix, since the correct fix touches the same delicate engine-open/translog-association ordering
+this plugin's own `recoverMissingLocalStore` javadoc already warns is easy to get subtly wrong.
+
+### The gap
+
+While scoping Phase 0 item 0.7 (the full real-workload IT), traced exactly what a child shard's
+*local* Lucene engine actually contains after `Engine#recoverFromInPlaceSplit` finishes — not just
+what the *object store* contains, which Task 13-14's own test already verified. Finding: **they
+diverge, and the divergence means a child would return zero documents to any real query**, not the
+parent's data.
+
+Task 10-11's `IndexShard.recoverFromInPlaceSplit` calls `recoverFromStore(...)` first (which fully
+opens the engine against a **locally empty** Lucene index and empty translog — that's the entire
+point of Task 10-11's `StoreRecovery` fix, treating `IN_PLACE_SPLIT_SHARD` like `EMPTY_STORE`), and
+only *after* that succeeds does it invoke `Engine#recoverFromInPlaceSplit` (Task 13-14), which
+writes the cloned manifest to the **object store**. Nothing re-opens or refreshes the already-open
+local engine against that new object-store state. The local Lucene directory the open
+`IndexWriter`/reader is actually pointed at never receives the parent's segment files at all.
+
+This plugin already has the exact mechanism this needs —
+`WriterEngineFactory#recoverMissingLocalStore` / `ObjectStoreCommitMaterializer#materialize` — used
+today for cross-node writer failover (§7.1.2: "no node's local disk is ever authoritative"). But
+it's invoked by `StoreRecovery` at a specific point *before* the engine opens and *before* a local
+translog is created, specifically so materialized segments and the fresh translog agree with each
+other. `recoverMissingLocalStore`'s own javadoc explicitly documents a prior failed attempt at
+materializing "at the `EngineFactory` level" (i.e., after engine construction) leaving "a stale
+translog-UUID reference behind" — the exact class of bug Task 10-11/13-14's current ordering would
+reproduce if patched naively (e.g., by just adding a materializer call inside
+`Engine#recoverFromInPlaceSplit` without also re-sequencing when the local translog is created).
+
+### Why not fixed in this pass
+
+The correct fix requires restructuring *when* in the recovery sequence materialization happens —
+before `StoreRecovery.internalRecoverFromStore` creates the local translog and opens the engine,
+not after, mirroring `recoverMissingLocalStore`'s own careful ordering. That means either: (a)
+teaching `StoreRecovery.internalRecoverFromStore`'s existing `indexShouldExists`-driven branching
+to also attempt in-place-split materialization in its "should not exist" branch (parallel to how
+it already calls `recoverMissingLocalStoreFromEngine` in the other branch), or (b) a structurally
+different seam entirely. Either shape needs its own careful design-and-test pass, including
+verifying the translog-UUID/local-checkpoint association is correct, which is exactly the kind of
+verification this session's "implement → test → verify by breaking it" discipline exists for — not
+something to bolt on quickly at the end of an already-long session.
+
+### New task added to the backlog (auto-added per `/goal` authorization)
+
+**Task 19 (this entry) — Materialize the parent's segments into the child's local Lucene store,
+correctly ordered relative to translog/engine-open.** Blocks Phase 0 item 0.7 (and, transitively,
+makes Task 13-14's own "child is attached to parent's data" claim only true at the object-store
+bookkeeping layer, not yet true at the actual queryable-engine layer) until resolved. This is now
+the single highest-priority remaining item for Phase 0 — without it, an in-place split cannot
+actually serve a single real document to a real query, regardless of how correct the
+metadata/routing/manifest bookkeeping built in Tasks 1-18 is.
+
 ## Tasks 10-11 — `RecoverySource` dispatch seam for `InPlaceSplitShardRecoverySource`
 
 Status: **done**, commit follows this entry.
