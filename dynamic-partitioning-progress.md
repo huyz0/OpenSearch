@@ -237,6 +237,33 @@ index vs. more shards of the same index) — this was already Part 2d's own
 conclusion; this spike confirms the storage-layer mechanics support that
 conclusion without contradiction.
 
+## Task 15 — `ShardPartitionDescriptor` lifetime-immutable contract
+
+Status: **resolved as not-applicable, no code change** — superseded by
+Task 12's finding.
+
+The original task list (written before Task 12's design spike) assumed
+`ShardPartitionDescriptor`'s "never re-split" contract would need updating
+for the new in-place split feature. Task 12 found this doesn't apply:
+`ShardPartitionDescriptor`'s `(partitionIndex, numPartitions)` shape is
+specific to *this plugin's own, pre-existing* equal-count split mechanism
+(`ShardSplitter`/`ShardCloner`, which produces a brand-new index), and
+cannot represent core's hash-range `ShardRange` model at all. Task 12's
+decision was that in-place split needs its own new, separate range-scoped
+record — it does not read, write, or touch `ShardPartitionDescriptor`.
+
+Re-examined the original task's premise directly: does *this plugin's own*
+split mechanism actually need to support re-splitting a target in place?
+No — `ShardSplitter`/`ShardCloner`'s whole design is "produce a brand-new
+index/shard identity," and a target needing further splitting would, under
+that same design, just get split again into further brand-new targets
+(exactly what the existing javadoc already says: *"a further split would
+create new target shards of its own"*). That's not a limitation to fix —
+it's consistent with how that mechanism already works, and changing it
+would be unrelated scope creep relative to the actual goal (in-place
+growing shard count via core's new mechanism), not a real gap. Closing
+this task without a code change; flagging it so it isn't silently dropped.
+
 ## Task 13 (started) — `SplitShardsMetadata.getParentAndRangeOfChild`
 
 Status: **first increment done and committed**; the remaining plugin-side
