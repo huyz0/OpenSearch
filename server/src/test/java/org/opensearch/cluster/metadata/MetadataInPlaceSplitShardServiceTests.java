@@ -219,7 +219,7 @@ public class MetadataInPlaceSplitShardServiceTests extends OpenSearchTestCase {
     public void testApplySplitShardRequestThrowsForSplitIntoZero() {
         ClusterState state = createClusterState("test-index", 3, 0);
 
-        expectThrows(ArithmeticException.class, () -> applyRequest(state, newRequest("test-index", 0, 0)));
+        expectThrows(IllegalArgumentException.class, () -> applyRequest(state, newRequest("test-index", 0, 0)));
     }
 
     public void testApplySplitShardRequestThrowsIfVirtualShardsEnabled() {
