@@ -256,17 +256,76 @@ restored, both tests passed clean again. Full regression sweep before commit:
 `org.opensearch.cluster.metadata.*`/`org.opensearch.cluster.routing.*` plus
 `:server:missingJavadoc`, all clean.
 
-### What's still open (deliberately, honestly, not attempted here)
+### Update: the cluster-state and recovery-dispatch layers are now built too (and a design flaw found)
 
-Item 2.3 (merge trigger policy) and the rest of the write path this metadata primitive needs to
-actually be reachable -- `MetadataInPlaceMergeShardService`, `InPlaceMergeShardRecoverySource`,
-`IndexRoutingTable` retirement of the two children's routing entries and revival of the parent's,
-a REST/transport action, and the plugin-side `EngineFactory` hook that drops a survivor child's
-`InPlaceSplitFilteringDirectoryReader` wrapping -- are left for a future pass. This mirrors the
-exact staged approach split itself used across this whole session (Tasks 1/12 design first, then
-5-9 routing, then 13-14 the engine hook, each landed and verified independently before the next):
-landing the metadata primitive alone, real and tested, is a complete, honest increment in its own
-right, not a partial one.
+Three more layers landed on top of the metadata primitive, each its own commit, each tested and
+swept the same way as everything else:
+
+1. **`InPlaceMergeShardRecoverySource`** -- a new `RecoverySource` shaped exactly like
+   `InPlaceSplitShardRecoverySource` (singleton `INSTANCE`, no wire fields), with a new
+   `IN_PLACE_MERGE_SHARD` `RecoverySource.Type` appended after `IN_PLACE_SPLIT_SHARD` so no existing
+   type's ordinal shifts. The revived parent's primary recovers via this source.
+2. **`MetadataInPlaceMergeShardService`** -- mirrors `MetadataInPlaceSplitShardService` in reverse.
+   One `AckedClusterStateUpdateTask` that, atomically, calls `mergeChildrenBackToParent` and rewrites
+   the `IndexRoutingTable`: retires every child's routing entry (mirroring how the split *commit*
+   service retires the parent's entry) and revives a single `UNASSIGNED` parent primary recovering
+   via `InPlaceMergeShardRecoverySource`. Split-level preconditions come from the metadata primitive
+   (clean `IllegalArgumentException`s); an added per-child routing-liveness check rejects a merge whose
+   children are relocating or not started. Real unit tests mirror `MetadataInPlaceSplitShardServiceTests`,
+   including a split-then-merge round trip. Verified the routing-revival test is real by commenting out
+   the parent-primary `addShard` and confirming the revival test fails (parent primary null), then
+   restoring.
+3. **The core recovery-dispatch seam** -- `IndexShard.startRecovery` routes `IN_PLACE_MERGE_SHARD`
+   through `recoverFromStore`, `StoreRecovery` treats it as not-should-exist and offers a new
+   `EngineFactory.recoverInPlaceMergeLocalStore` hook before the local translog/engine open (the same
+   ordering constraint Task 19 established), and `EngineFactory` gains that hook as a default no-op.
+
+### The design flaw: the spike's "revive the parent from one surviving child" premise does not hold
+
+The spike above (see "Proposed data-model shape") claimed the plugin-side merge hook could revive the
+parent almost for free: take one surviving child's own already-full local Lucene state and just drop
+its `InPlaceSplitFilteringDirectoryReader` range filter, since both children were cloned from the same
+parent bundle, so "one surviving child's own local store, once unfiltered, already *is* correct."
+
+That is true only at the instant a split commits, with **zero post-split writes**. It breaks the moment
+the children start serving traffic. After a split commits, each child is an independent writer primary
+with its own blob container/manifest (`WriterEngineFactory.recoverInPlaceSplitLocalStore` resolves a
+*per-shard* container via `resolveSiblingShardBlobContainer(childShardId)`), and routing sends each new
+document to exactly one child by hash. So each child accumulates its own disjoint post-split segments in
+its own bundle. Pick child A as the survivor and drop its filter and you get: the shared parent base
+bundle (all pre-split docs) plus child A's post-split writes, but you **lose child B's post-split writes
+entirely** -- silent data loss.
+
+A correct merge cannot be "drop one survivor's filter." It has to fold *both* children's current segment
+sets together: base bundle (shared) union child A's new segments union child B's new segments. That much
+is a manifest union. But post-split *updates and deletes* make even the union non-trivial: a post-split
+delete/update of a pre-split doc that lives in a shared, immutable base segment is recorded as that
+child's own per-segment `liveDocs` against the shared segment. The two children therefore reference the
+same base segment with *divergent* `liveDocs`, and a plain manifest concatenation cannot express "a doc
+is deleted iff the child that owns its hash range deleted it." Reconciling those divergent delete sets is
+a real, unspiked design problem. It is exactly the "more subtle than expected" case the task framing
+anticipated, and the right call is to stop rather than ship a hook that silently corrupts data.
+
+**What this means for scope, honestly:** the metadata/routing/recovery-dispatch layers above are all
+sound and correct on their own terms (they are pure bookkeeping; a merge is genuinely a metadata-and-
+routing operation at that layer, and the `getShardIdOfHash` read path is genuinely a no-op change). They
+are landed as dormant infrastructure, not reachable by any operator action, exactly as split's own
+`IN_PLACE_SPLIT_SHARD` recovery source was landed no-op (Tasks 10-11) before its materialization existed.
+What is **not** built, on purpose:
+
+- **`EngineFactory.recoverInPlaceMergeLocalStore` plugin implementation** -- blocked on the
+  delete-set/`liveDocs` reconciliation above. The core seam is a documented no-op default. This is the
+  single item that must be solved before a merge can serve a correct document.
+- **REST/transport action (`InPlaceMergeShardAction` trio)** -- deliberately *not* shipped. Unlike a
+  split (whose no-op recovery source merely left children not-yet-serving, losing nothing), an
+  operator-reachable merge with a no-op engine hook would revive the parent against an *empty* local
+  store and retire the children that hold the only live copies -- destroying data on the first real use.
+  Shipping the operator entry point before the correct engine hook exists is the one thing that turns
+  dormant, safe infrastructure into a live data-loss path, so it is held back until the hook is real.
+- **Item 2.3 (merge trigger policy)** and an end-to-end real-workload IT (a merge equivalent of
+  `ServerlessStorageInPlaceSplitDocumentReachabilityIT`, asserting docs survive a split-then-merge round
+  trip) -- both blocked on the same engine hook, since neither can assert a correct result until a merge
+  actually materializes correct data. Not attempted.
 
 ## Task 20 (new, found while attempting item 0.7) — `IndexMetadata.numberOfShards` invariant breaks for split children, FIXED
 
