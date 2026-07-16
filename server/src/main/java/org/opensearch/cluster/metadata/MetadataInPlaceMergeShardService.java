@@ -190,6 +190,19 @@ public class MetadataInPlaceMergeShardService {
 
         IndexMetadata.Builder indexMetadataBuilder = IndexMetadata.builder(curIndexMetadata)
             .splitShardsMetadata(updatedSplitShardsMetadata);
+        // Reset the revived parent's in-sync allocation set to empty, mirroring how the split service
+        // seeds each new child's set empty. The parent was a live, started primary before it was
+        // split and retired, so its in-sync set still carries that stale pre-split primary's
+        // allocation id. Left in place, IndexMetadataUpdater#updateInSyncAllocations would see a
+        // brand-new primary (recovering via InPlaceMergeShardRecoverySource) whose fresh allocation
+        // id is absent from a non-empty in-sync set, mistake it for a forced *stale-primary*
+        // allocation, and assert -- an AssertionError on the cluster-manager thread, which (being an
+        // Error, not an Exception) is not caught by the cluster-state task machinery and hangs the
+        // request rather than failing it. The revived parent is a genuinely fresh local copy the
+        // engine materializes by folding both children together, not a continuation of the stale
+        // pre-split primary, so an empty in-sync set (repopulated when the revived primary starts) is
+        // correct, not merely a workaround.
+        indexMetadataBuilder.putInSyncAllocationIds(parentShardId, java.util.Collections.emptySet());
         Metadata.Builder metadataBuilder = Metadata.builder(currentState.metadata()).put(indexMetadataBuilder);
 
         // Rebuild the IndexRoutingTable retiring every child's routing entry (mirroring how

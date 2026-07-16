@@ -773,6 +773,20 @@ final class StoreRecovery {
                     logger.trace("cleaning existing shard, shouldn't exists");
                     Lucene.cleanLuceneIndex(store.directory());
                     si = null;
+                    // A revived in-place-merge parent reuses its pre-split shard id, so it can find a
+                    // stale leftover local store from before it was split -- readLastCommittedSegmentsInfo
+                    // above then succeeds on that stale commit and the engine-materialize branch in the
+                    // catch clause is never reached (unlike a split child, whose shard id is brand new
+                    // and has no leftover). That stale store is never authoritative: the authoritative
+                    // data is folded from the retired children by the engine hook. Now that the leftover
+                    // is cleaned, give the merge hook its chance, exactly as the catch clause would have.
+                    if (isInPlaceMergeParent && recoverInPlaceMergeFromEngine(indexShard, store)) {
+                        si = store.readLastCommittedSegmentsInfo();
+                        inPlaceSplitMaterialized = true;
+                    } else if (isInPlaceSplitChild && recoverInPlaceSplitFromEngine(indexShard, store)) {
+                        si = store.readLastCommittedSegmentsInfo();
+                        inPlaceSplitMaterialized = true;
+                    }
                 }
             } catch (Exception e) {
                 throw new IndexShardRecoveryException(shardId, "failed to fetch index version after copying it over", e);
