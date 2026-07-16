@@ -50,9 +50,7 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
         SplitShardsMetadata metadata = builder.build();
 
         for (ShardRange child : children) {
-            org.opensearch.common.collect.Tuple<Integer, ShardRange> parentAndRange = metadata.getParentAndRangeOfChild(
-                child.shardId()
-            );
+            org.opensearch.common.collect.Tuple<Integer, ShardRange> parentAndRange = metadata.getParentAndRangeOfChild(child.shardId());
             assertNotNull(parentAndRange);
             assertEquals(Integer.valueOf(0), parentAndRange.v1());
             assertEquals(child, parentAndRange.v2());

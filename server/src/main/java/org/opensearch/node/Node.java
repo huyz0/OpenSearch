@@ -1753,6 +1753,12 @@ public class Node implements Closeable {
             // PersistentTasksClusterService itself despite the similar shape.
             new MetadataInPlaceSplitShardCommitService(settings, clusterService);
 
+            // The service TransportInPlaceSplitShardAction actually calls to trigger a split --
+            // previously constructed nowhere, making the whole in-place split feature unreachable
+            // from any user-facing API despite MetadataInPlaceSplitShardService itself existing.
+            final org.opensearch.cluster.metadata.MetadataInPlaceSplitShardService metadataInPlaceSplitShardService =
+                new org.opensearch.cluster.metadata.MetadataInPlaceSplitShardService(clusterService, clusterModule.getAllocationService());
+
             mergedSegmentWarmerFactory = new MergedSegmentWarmerFactory(transportService, recoverySettings, clusterService);
 
             final MappingTransformerRegistry mappingTransformerRegistry = new MappingTransformerRegistry(mapperPlugins, xContentRegistry);
@@ -1802,6 +1808,7 @@ public class Node implements Closeable {
                 }
                 b.bind(AliasValidator.class).toInstance(aliasValidator);
                 b.bind(MetadataCreateIndexService.class).toInstance(metadataCreateIndexService);
+                b.bind(org.opensearch.cluster.metadata.MetadataInPlaceSplitShardService.class).toInstance(metadataInPlaceSplitShardService);
                 b.bind(AwarenessReplicaBalance.class).toInstance(awarenessReplicaBalance);
                 b.bind(MetadataCreateDataStreamService.class).toInstance(metadataCreateDataStreamService);
                 b.bind(ViewService.class).toInstance(viewService);

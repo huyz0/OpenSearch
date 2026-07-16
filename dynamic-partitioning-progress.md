@@ -401,6 +401,62 @@ explicitly out of scope for this task: 0.5 (n/a per Task 15's resolution),
 via the REST action, assert reads/writes survive and route correctly).
 Those remain the next concrete units of Phase 0 work.
 
+## Task 17 (0.6) — Operator REST/transport action to trigger an in-place split
+
+Status: **done**, commit follows this entry. Closes core's own missing public-API gap Task 1's
+research first identified: `MetadataInPlaceSplitShardService` existed with no REST/transport action
+reaching it at all, and was never even constructed in `Node.java` (unreachable via Guice).
+
+### What was built
+
+- `InPlaceSplitShardAction` (`ActionType<AcknowledgedResponse>` + `Request` extending
+  `AcknowledgedRequest`) — new core action, `indices:admin/shards/split_in_place`.
+- `TransportInPlaceSplitShardAction` (`TransportClusterManagerNodeAction`) — calls
+  `MetadataInPlaceSplitShardService.split(...)` directly, mapping its
+  `ClusterStateUpdateResponse` to `AcknowledgedResponse`.
+- `RestInPlaceSplitShardAction` — `POST /{index}/_split_in_place/{shard_id}?split_into=N`,
+  deliberately operator-only with no invented auto-triggering policy, matching this fork's
+  established discipline for early-phase resharding actions (`TransportOrchestrateShardSplitAction`
+  set the same precedent for this plugin's separate, older split mechanism).
+- Registered in `ActionModule.java` (action + REST handler), following the exact pattern
+  `DeleteComponentTemplateAction`/`RestDeleteComponentTemplateAction` already use.
+- `Node.java`: constructed `MetadataInPlaceSplitShardService` (previously never instantiated
+  anywhere in production code) and bound it via Guice, next to `MetadataCreateIndexService`'s
+  own construction site — this is the reachability fix; the service itself was already correct
+  from Task 1 onward, just unreachable.
+
+### Tests + verification discipline
+
+New `InPlaceSplitShardActionIT` (`server/src/internalClusterTest`): creates a real single-shard
+index, calls the action, and asserts the whole chain end-to-end — acknowledged response,
+`SplitShardsMetadata` recording the split in progress, and (critically) real routing-table
+entries for both child shards with the correct `InPlaceSplitShardRecoverySource`. Plus a
+validation-rejection test (`splitInto < 2`).
+
+**A real environment lesson, not a code bug**: the first version of this IT used
+`OpenSearchIntegTestCase`'s default `TEST` scope (`numDataNodes = 2`, which also bootstraps 3
+dedicated cluster-manager nodes) and hung for the full 20-minute suite timeout during plain
+`createIndex`/`ensureGreen` — before the new action was even invoked. Rewrote to
+`numDataNodes = 0` with a single manually-started node (the same lighter pattern this session's
+plugin ITs already used), which fixed it immediately and cut runtime to seconds. Verified
+meaningfulness on the *lighter* version: removed the routing-table wiring, confirmed the IT
+failed with the correct assertion (`expected a real routing entry for child shard [1]`) in under
+a minute, restored, confirmed clean.
+
+Ran a broader regression sweep (`cluster.metadata.*` + `action.admin.indices.*`) and
+`missingJavadoc` — both clean.
+
+### Scope note
+
+Phase 0's remaining item is 0.7: the full end-to-end IT already partially covered by this task's
+own `InPlaceSplitShardActionIT` (real cluster, real writer index, trigger a split, assert reads/
+writes survive) — what's not yet covered is indexing documents before/after the split and
+verifying `OperationRouting`'s real hash resolution finds every pre-split document via the
+correct child, and confirming no bundle bytes are physically copied (§18 risk #1's existing
+object-store request-count metrics). That real-workload verification is the next concrete unit
+of Phase 0 work, along with Part 3's still-open read-path-correctness design questions (double-
+counting during the transition window) that item 0.7 explicitly depends on resolving first.
+
 ## Tasks 10-11 — `RecoverySource` dispatch seam for `InPlaceSplitShardRecoverySource`
 
 Status: **done**, commit follows this entry.
