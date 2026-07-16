@@ -323,6 +323,84 @@ than rushed — consistent with the plan's own "Scale expectations, stated
 plainly" paragraph, which specifically calls out Phase 0 as deserving more
 caution and time than this session's usual pace, not less.
 
+## Task 13-14 — `ObjectStoreWriterEngine#recoverFromInPlaceSplit` implementation
+
+Status: **done**, commit follows this entry. Closes the "still open" item flagged at the end of
+Task 13's earlier increment.
+
+### What was built
+
+1. [`InPlaceSplitRangeDescriptor`](plugins/serverless-storage/src/main/java/org/opensearch/serverless/storage/resharding/InPlaceSplitRangeDescriptor.java) +
+   [`BlobContainerInPlaceSplitRangeStore`](plugins/serverless-storage/src/main/java/org/opensearch/serverless/storage/resharding/BlobContainerInPlaceSplitRangeStore.java) —
+   the new, separate write-once record Task 12 concluded was needed (a
+   `(parentShardId, start, end)` triple), mirroring `ShardPartitionDescriptor`/
+   `BlobContainerShardPartitionStore`'s shape exactly without reusing them,
+   since the older record can't represent a hash range at all.
+2. `ObjectStoreWriterEngine` gained a new field, `siblingShardBlobContainerResolver`
+   (`IntFunction<BlobContainer>`, nullable = feature disabled, same shape as
+   every other optional feature in this class), threaded through one new
+   telescoping constructor overload, and a real `recoverFromInPlaceSplit`
+   override:
+   - reads `engineConfig.getIndexSettings().getIndexMetadata().getSplitShardsMetadata()`
+     and calls Task 13's `getParentAndRangeOfChild` to find the parent shard
+     ID and this child's `ShardRange`. `null` (not a recognized in-progress
+     child) logs a warning and no-ops rather than throwing — the hook can
+     legitimately fire for a shard whose split already committed by the time
+     recovery runs.
+   - resolves both the parent's and this shard's own manifest/head/pin/lineage
+     stores via the resolver, then calls **`ShardCloner.clone` directly,
+     unmodified** — this is the design call Task 12 flagged as open: since
+     `CloneLineage`'s `(sourceIndexUuid, sourceShardId)` shape already
+     accommodates `sourceIndexUuid == targetIndexUuid` (a same-index source
+     is not a case `ShardCloner` forbids or mishandles), reusing it verbatim
+     needed no new manifest-writing code and keeps the exact same
+     formally-verified pin-before-read ordering (`formal/CloneGc.tla`)
+     `ShardCloner`'s own javadoc documents — retargeting was purely a
+     parameter change, not new logic.
+   - passes a `beforeActivation` closure writing the new
+     `InPlaceSplitRangeDescriptor`, following `ShardSplitter.split`'s own
+     established "descriptor durable before the target becomes visible"
+     ordering precedent exactly.
+3. `WriterEngineFactory` gained the matching new field + telescoping
+   constructor overload, threading the resolver into
+   `ObjectStoreWriterEngine`'s construction.
+4. `ServerlessStoragePlugin.getEngineFactory` now passes a real resolver —
+   `siblingShardId -> resolveBlobContainer(indexUuid, siblingShardId)` — so
+   the feature is actually reachable in production, not just plumbed and
+   left disabled.
+
+### Tests + verification discipline
+
+New `testRecoverFromInPlaceSplitAttachesChildToParentsData` in
+`ObjectStoreWriterEngineTests`: publishes a real parent manifest/head
+directly via the stores (no need for a full parent engine), builds a real
+`SplitShardsMetadata` via the actual `Builder.splitShard` API (not
+hand-constructed), opens a real child engine with the resolver wired in,
+calls `recoverFromInPlaceSplit`, and asserts: the child gets a published
+head at generation 1, the child's manifest references the exact same
+`files()`/`segmentsFileName()` as the parent's (not a copy — the core
+zero-copy property under test), and the range descriptor is durably
+written with the correct parent ID and hash bounds.
+
+Verified meaningfulness by forcing the resolver-null-check to always
+return early (`if (true) { return; }`), confirming the test failed exactly
+where expected (no published head), then restoring and confirming clean.
+
+Full plugin quality gate (`:plugins:serverless-storage:check -x
+internalClusterTest`) — found and fixed 2 real missing-javadoc gate
+failures (the new telescoping constructor's `@param` list, and the new
+record's accessor-method javadoc) before it passed clean. Full
+`internalClusterTest` sweep also clean.
+
+### Scope note
+
+This closes Phase 0's core storage-layer gap (0.3/0.4). Not yet done, and
+explicitly out of scope for this task: 0.5 (n/a per Task 15's resolution),
+0.6 (operator-facing REST/transport trigger for an in-place split), 0.7
+(the full end-to-end IT: real cluster, real writer index, trigger a split
+via the REST action, assert reads/writes survive and route correctly).
+Those remain the next concrete units of Phase 0 work.
+
 ## Tasks 10-11 — `RecoverySource` dispatch seam for `InPlaceSplitShardRecoverySource`
 
 Status: **done**, commit follows this entry.

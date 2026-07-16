@@ -1232,7 +1232,22 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                     shardActivityRegistry,
                     dedicatedWalGcConfig,
                     publicationRateLimitMillis,
-                    writerPublicationNotifierForWriterEngine()
+                    writerPublicationNotifierForWriterEngine(),
+                    // In-place split recovery (dynamic-partitioning-plan.md Phase 0): resolves a
+                    // sibling shard's own container within this same index -- reuses
+                    // resolveBlobContainer, the exact same resolution this shard's own container
+                    // above went through, just parameterized on a different shard id. Wrapped in
+                    // UncheckedIOException since IntFunction has no checked-exception escape hatch;
+                    // ObjectStoreWriterEngine#recoverFromInPlaceSplit only ever invokes this while
+                    // already inside a context that itself declares IOException, so the unchecked
+                    // wrapper is unwrapped there rather than surfacing raw.
+                    siblingShardId -> {
+                        try {
+                            return resolveBlobContainer(indexUuid, siblingShardId);
+                        } catch (IOException e) {
+                            throw new UncheckedIOException(e);
+                        }
+                    }
                 )
             );
         } catch (IOException e) {
