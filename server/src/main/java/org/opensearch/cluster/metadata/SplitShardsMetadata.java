@@ -190,15 +190,6 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
     }
 
     /**
-     * Reverse of {@link #getChildShardsOfParent(int)}: given a shard ID that is currently a
-     * not-yet-committed child of an in-progress split, returns its parent's shard ID and its own
-     * {@link ShardRange}. Returns {@code null} if {@code childShardId} isn't a child of any
-     * currently in-progress split -- in particular, this does <em>not</em> resolve parentage for a
-     * child whose split has already committed (use {@link #getRootShards()}/the {@code
-     * rootShardsToAllChildren} lineage for that case instead; this method only serves the recovery
-     * window between a child's {@link ShardRange} being reserved and the split being committed).
-     */
-    /**
      * The hash range of {@code shardId}, if it is a split child -- in progress or already committed --
      * or {@code null} if it is not a split child at all (an ordinary, never-split shard). Unlike
      * {@link #getParentAndRangeOfChild(int)} (deliberately scoped to only the in-progress window, for
@@ -228,6 +219,15 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         return null;
     }
 
+    /**
+     * Reverse of {@link #getChildShardsOfParent(int)}: given a shard ID that is currently a
+     * not-yet-committed child of an in-progress split, returns its parent's shard ID and its own
+     * {@link ShardRange}. Returns {@code null} if {@code childShardId} isn't a child of any
+     * currently in-progress split -- in particular, this does <em>not</em> resolve parentage for a
+     * child whose split has already committed (use {@link #getRootShards()}/the {@code
+     * rootShardsToAllChildren} lineage for that case instead; this method only serves the recovery
+     * window between a child's {@link ShardRange} being reserved and the split being committed).
+     */
     public Tuple<Integer, ShardRange> getParentAndRangeOfChild(int childShardId) {
         for (Map.Entry<Integer, ShardRange[]> entry : parentToChildShards.entrySet()) {
             if (inProgressSplitShardIds.contains(entry.getKey()) == false) {
@@ -380,6 +380,9 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
          * @param numberOfChildren Number of child shards this shard is going to have.
          */
         public List<ShardRange> splitShard(int splitShardId, int numberOfChildren) {
+            if (numberOfChildren < 2) {
+                throw new IllegalArgumentException("Cannot split shard [" + splitShardId + "] into fewer than 2 children.");
+            }
             if (inProgressSplitShardIds.contains(splitShardId) || parentToChildShards.containsKey(splitShardId)) {
                 throw new IllegalArgumentException("Split of shard [" + splitShardId + "] is already in progress or completed.");
             }
