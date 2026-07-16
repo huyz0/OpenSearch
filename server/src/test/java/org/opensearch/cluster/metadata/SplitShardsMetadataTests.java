@@ -857,7 +857,7 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
                 builder = new SplitShardsMetadata.Builder(metadata);
                 int splittingShard = activeAndNotInProgress.get(randomIntBetween(0, activeAndNotInProgress.size() - 1));
 
-                int numberOfChildren = randomIntBetween(1, 50);
+                int numberOfChildren = randomIntBetween(2, 50);
                 List<ShardRange> childShardRanges;
                 try {
                     childShardRanges = builder.splitShard(splittingShard, numberOfChildren);
@@ -997,6 +997,18 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
         SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(1);
         IllegalArgumentException exception = assertThrows(IllegalArgumentException.class, () -> { builder.splitShard(0, 10000000); });
         assertTrue(exception.getMessage().contains("Cannot split shard [0] further."));
+    }
+
+    public void testSplitShardRejectsFewerThanTwoChildren() {
+        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(1);
+        IllegalArgumentException exception = assertThrows(IllegalArgumentException.class, () -> { builder.splitShard(0, 1); });
+        assertTrue(exception.getMessage().contains("Cannot split shard [0] into fewer than 2 children."));
+    }
+
+    public void testSplitShardRejectsZeroChildren() {
+        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(1);
+        IllegalArgumentException exception = assertThrows(IllegalArgumentException.class, () -> { builder.splitShard(0, 0); });
+        assertTrue(exception.getMessage().contains("Cannot split shard [0] into fewer than 2 children."));
     }
 
     public void testSplitInvalidShardId() {
