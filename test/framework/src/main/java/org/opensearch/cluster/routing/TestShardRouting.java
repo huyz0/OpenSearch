@@ -271,7 +271,6 @@ public class TestShardRouting {
                 }
             case STARTED:
             case RELOCATING:
-            case SPLITTING:
                 return null;
             default:
                 throw new IllegalStateException("illegal state");
@@ -288,9 +287,6 @@ public class TestShardRouting {
             case RELOCATING:
                 AllocationId allocationId = AllocationId.newInitializing();
                 return AllocationId.newRelocation(allocationId);
-            case SPLITTING:
-                AllocationId splitAllocId = AllocationId.newInitializing();
-                return AllocationId.newSplit(splitAllocId, 2);
             default:
                 throw new IllegalStateException("illegal state");
         }
@@ -303,7 +299,6 @@ public class TestShardRouting {
                 return new UnassignedInfo(OpenSearchTestCase.randomFrom(UnassignedInfo.Reason.values()), "auto generated for test");
             case STARTED:
             case RELOCATING:
-            case SPLITTING:
                 return null;
             default:
                 throw new IllegalStateException("illegal state");

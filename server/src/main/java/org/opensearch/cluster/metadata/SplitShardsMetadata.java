@@ -142,24 +142,14 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         }
     }
 
-    public int getShardIdOfHash(int rootShardId, int hash, boolean includeInProgressChildren) {
+    public int getShardIdOfHash(int rootShardId, int hash) {
         // First check if we have child shards against this root shard.
         if (rootShardsToAllChildren[rootShardId] == null) {
-            if (includeInProgressChildren && parentToChildShards.containsKey(rootShardId)) {
-                ShardRange shardRange = binarySearchShards(parentToChildShards.get(rootShardId), hash);
-                assert shardRange != null;
-                return shardRange.shardId();
-            }
             return rootShardId;
         }
 
         ShardRange[] existingChildShards = rootShardsToAllChildren[rootShardId];
         ShardRange shardRange = binarySearchShards(existingChildShards, hash);
-        assert shardRange != null;
-
-        if (includeInProgressChildren && parentToChildShards.containsKey(shardRange.shardId())) {
-            shardRange = binarySearchShards(parentToChildShards.get(shardRange.shardId()), hash);
-        }
         assert shardRange != null;
 
         return shardRange.shardId();

@@ -58,8 +58,10 @@ import org.opensearch.action.admin.indices.stats.CommonStatsFlags;
 import org.opensearch.action.admin.indices.stats.ShardStats;
 import org.opensearch.action.index.IndexRequest;
 import org.opensearch.action.support.PlainActionFuture;
+import org.opensearch.action.support.TransportActions;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.MappingMetadata;
+import org.opensearch.cluster.metadata.SplitShardsMetadata;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.routing.AllocationId;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
@@ -2219,6 +2221,49 @@ public class IndexShardTests extends IndexShardTestCase {
         shard.relocated(routing.getTargetRelocatingShard().allocationId().getId(), primaryContext -> {}, () -> {});
         expectThrows(IllegalIndexShardStateException.class, () -> IndexShardTestCase.updateRoutingEntry(shard, originalRouting));
         closeShards(shard);
+    }
+
+    /**
+     * CC1 regression: while a shard is the parent of an in-progress in-place split, new primary
+     * writes must be rejected. Children clone the parent's published manifest once at their own
+     * recovery time; a document the parent acknowledges after a child cloned but before the split
+     * commits would only ever land in a later parent manifest generation that no child references,
+     * and would be lost when the parent's routing is retired at commit. The rejection is a
+     * shard-not-available (retriable) exception, so the write succeeds after re-routing to a
+     * committed child -- no silent data loss.
+     */
+    public void testRejectsPrimaryWriteWhileInPlaceSplitInProgress() throws IOException {
+        final IndexShard shard = newStartedShard(true);
+        try {
+            // A write succeeds normally before the split starts.
+            indexDoc(shard, "_doc", "0");
+
+            // Mark this shard as the parent of an in-progress (not-yet-committed) in-place split.
+            final IndexMetadata current = shard.indexSettings().getIndexMetadata();
+            final SplitShardsMetadata.Builder splittingBuilder = new SplitShardsMetadata.Builder(current.getNumberOfShards());
+            splittingBuilder.splitShard(shard.shardId().id(), 2);
+            final SplitShardsMetadata splitting = splittingBuilder.build();
+            assertTrue(splitting.isSplitOfShardInProgress(shard.shardId().id()));
+            shard.indexSettings().updateIndexMetadata(IndexMetadata.builder(current).splitShardsMetadata(splitting).build());
+
+            // A new primary index is now cleanly rejected...
+            final IllegalIndexShardStateException indexRejection = expectThrows(
+                IllegalIndexShardStateException.class,
+                () -> indexDoc(shard, "_doc", "1")
+            );
+            assertThat(indexRejection.getMessage(), containsString("in-place split of this shard is in progress"));
+            // ...with a shard-not-available (retriable) exception, exactly like a relocating/closing shard.
+            assertTrue(TransportActions.isShardNotAvailableException(indexRejection));
+
+            // Deletes are rejected the same way.
+            final IllegalIndexShardStateException deleteRejection = expectThrows(
+                IllegalIndexShardStateException.class,
+                () -> deleteDoc(shard, "0")
+            );
+            assertTrue(TransportActions.isShardNotAvailableException(deleteRejection));
+        } finally {
+            closeShards(shard);
+        }
     }
 
     public void testRelocatedSegRepError() throws IOException, InterruptedException {

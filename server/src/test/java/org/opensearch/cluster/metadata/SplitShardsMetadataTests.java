@@ -41,7 +41,7 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
         SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(5);
 
         // Test: When there are no children, should return the root shard id
-        int result = builder.build().getShardIdOfHash(0, 100, false);
+        int result = builder.build().getShardIdOfHash(0, 100);
         assertEquals(0, result);
     }
 
@@ -218,7 +218,10 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
     }
 
     /**
-     * Tests getShardIdOfHash when there are existing child shards and in-progress children.
+     * Tests getShardIdOfHash resolves to a committed child while an in-progress split of that child
+     * is ignored. Routing never targets an in-progress (not-yet-committed) child -- writes stay on
+     * the last committed shard until commit -- so a hash under shard 2's committed range resolves to
+     * shard 2, not to shard 2's still-recovering grandchildren.
      */
     public void testGetShardIdOfHashWithExistingAndInProgressChildren() {
         SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(1); // Start with 1 root shard
@@ -226,31 +229,33 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
         builder.splitShard(0, 3);
         builder.updateSplitMetadataForChildShards(0, Set.of(1, 2, 3));
 
-        // Second split - split the middle shard (ID 2)
+        // Second split - split the middle shard (ID 2), still in progress (not committed)
         builder.splitShard(2, 2);
         SplitShardsMetadata metadata = builder.build();
 
-        // Execute - test hash that falls in the range of first child of shard 2
-        int result = metadata.getShardIdOfHash(0, 500, true);
+        // Execute - test hash that falls in the range of the committed child shard 2
+        int result = metadata.getShardIdOfHash(0, 500);
 
-        // Assert - should route to the first child of the in-progress split
-        assertEquals("Hash should route to first child of in-progress split", 5, result);
+        // Assert - resolves to the committed child, ignoring the in-progress grandchildren
+        assertEquals("Hash should route to committed child, not the in-progress grandchild", 2, result);
     }
 
     /**
-     * Test getShardIdOfHash when root shard has no children but in-progress split exists
+     * Test getShardIdOfHash when root shard has no committed children but an in-progress split exists:
+     * routing resolves to the root (parent) shard, since an in-progress split's children are never
+     * routing targets until the split commits.
      */
     public void testGetShardIdOfHashWithInProgressSplit() {
         SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(1); // Start with 1 root shard
-        // Setup - split root shard
+        // Setup - split root shard (in progress, not committed)
         builder.splitShard(0, 2);
         SplitShardsMetadata metadata = builder.build();
 
-        // Execute - test with hash that should go to second child
-        int result = metadata.getShardIdOfHash(0, 100, true);
+        // Execute
+        int result = metadata.getShardIdOfHash(0, 100);
 
-        // Verify - should route to the second child shard
-        assertEquals("Should route to second child shard", 2, result);
+        // Verify - resolves to the still-active parent shard, not a recovering child
+        assertEquals("Should route to the parent shard while the split is in progress", 0, result);
     }
 
     /**
@@ -261,8 +266,8 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
         builder.splitShard(0, 2);
         SplitShardsMetadata metadata = builder.build();
 
-        // Should return root shard ID when includeInProgressChildren is false
-        assertEquals(0, metadata.getShardIdOfHash(0, 100, false));
+        // Should return root shard ID while the split is in progress
+        assertEquals(0, metadata.getShardIdOfHash(0, 100));
     }
 
     /**
@@ -272,13 +277,12 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
         // Arrange
         int rootShardId = 0;
         int hash = 123;
-        boolean includeInProgressChildren = false;
 
         SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(1); // 1 root shard
         SplitShardsMetadata metadata = builder.build();
 
         // Act
-        int result = metadata.getShardIdOfHash(rootShardId, hash, includeInProgressChildren);
+        int result = metadata.getShardIdOfHash(rootShardId, hash);
 
         // Assert
         assertEquals("Should return the root shard ID when there are no children", rootShardId, result);
@@ -291,7 +295,6 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
         // Setup
         int rootShardId = 0;
         int hash = 500;
-        boolean includeInProgressChildren = true;
 
         // Setup
         SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(1); // Start with 1 root shard
@@ -306,7 +309,7 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
         SplitShardsMetadata metadata = builder.build();
 
         // Execute
-        int result = metadata.getShardIdOfHash(rootShardId, hash, includeInProgressChildren);
+        int result = metadata.getShardIdOfHash(rootShardId, hash);
 
         // Verify
         assertEquals(2, result);
@@ -552,7 +555,7 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
             assertEquals(
                 "every hash formerly owned by a merged-away child must resolve back to the parent",
                 parentShardId,
-                metadata.getShardIdOfHash(parentShardId, formerChild.start(), false)
+                metadata.getShardIdOfHash(parentShardId, formerChild.start())
             );
         }
     }
@@ -1082,7 +1085,7 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
         long childShardRangeDiff = Math.abs((long) parentRange.end() - parentRange.start() + 1) / 3;
         int hashInFirstThird = parentRange.start() + (int) childShardRangeDiff - 1;
 
-        assertEquals("Hash should route to first child of nested split", 3, metadata.getShardIdOfHash(0, hashInFirstThird, true));
+        assertEquals("Hash should route to first child of nested split", 3, metadata.getShardIdOfHash(0, hashInFirstThird));
     }
 
     public void testHashCodeAndEquals() {

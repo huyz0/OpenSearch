@@ -3440,6 +3440,41 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
                     "operation only allowed when shard state is one of " + writeAllowedStates + ", origin [" + origin + "]"
                 );
             }
+            if (origin == Engine.Operation.Origin.PRIMARY) {
+                ensureNotInProgressSplitParent();
+            }
+        }
+    }
+
+    /**
+     * Rejects a new primary write while this shard is the parent of an in-progress in-place split.
+     *
+     * <p>During an in-place split the children each clone the parent's <em>then-latest published
+     * manifest</em> once, at their own recovery time, and ordinary indexing keeps routing to the
+     * still-{@code STARTED} parent (routing resolves in-progress children only when explicitly asked
+     * to). Any document the parent acknowledged after a child had already cloned but before the split
+     * committed would be written only into a later parent manifest generation that no child ever
+     * references; once {@code MetadataInPlaceSplitShardCommitService} retires the parent's routing and
+     * closes it at commit, those documents become permanently unreachable -- silent data loss under
+     * continuous write load during a split.
+     *
+     * <p>Rejecting the write here closes that window entirely: no document is acknowledged on the
+     * parent once the split is in progress, so nothing can be stranded in a post-clone parent
+     * generation. The thrown {@link IllegalIndexShardStateException} is a shard-not-available
+     * exception (see {@code TransportActions#isShardNotAvailableException}), so it is retriable the
+     * same way a relocating/closing shard's rejection is -- the write succeeds once it re-routes to a
+     * committed child.
+     */
+    private void ensureNotInProgressSplitParent() throws IllegalIndexShardStateException {
+        final IndexMetadata indexMetadata = indexSettings.getIndexMetadata();
+        if (indexMetadata != null
+            && indexMetadata.getSplitShardsMetadata() != null
+            && indexMetadata.getSplitShardsMetadata().isSplitOfShardInProgress(shardId.id())) {
+            throw new IllegalIndexShardStateException(
+                shardId,
+                state,
+                "operation rejected while an in-place split of this shard is in progress; retry once the split completes"
+            );
         }
     }
 

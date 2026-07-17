@@ -54,7 +54,7 @@ public class MetadataInPlaceMergeShardServiceTests extends OpenSearchTestCase {
         ClusterState updatedState = applyRequest(state, newRequest("test-index", 0));
 
         SplitShardsMetadata afterMerge = updatedState.metadata().index("test-index").getSplitShardsMetadata();
-        assertEquals(0, afterMerge.getShardIdOfHash(0, randomInt(), false));
+        assertEquals(0, afterMerge.getShardIdOfHash(0, randomInt()));
     }
 
     public void testApplyMergeShardRequestCallsReroute() {
