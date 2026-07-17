@@ -101,14 +101,66 @@ public final class EncryptingBlobContainer extends RegisterDelegatingBlobContain
 
     @Override
     public void writeBlob(String blobName, InputStream inputStream, long blobSize, boolean failIfAlreadyExists) throws IOException {
-        byte[] ciphertext = encryptBlocked(inputStream.readAllBytes());
+        byte[] ciphertext = encryptBlocked(readAllAndClose(inputStream));
         delegate.writeBlob(blobName, new ByteArrayInputStream(ciphertext), ciphertext.length, failIfAlreadyExists);
     }
 
     @Override
     public void writeBlobAtomic(String blobName, InputStream inputStream, long blobSize, boolean failIfAlreadyExists) throws IOException {
-        byte[] ciphertext = encryptBlocked(inputStream.readAllBytes());
+        byte[] ciphertext = encryptBlocked(readAllAndClose(inputStream));
         delegate.writeBlobAtomic(blobName, new ByteArrayInputStream(ciphertext), ciphertext.length, failIfAlreadyExists);
+    }
+
+    // The three writeBlob*WithMetadata overloads are not covered by writeBlob/writeBlobAtomic's own
+    // overrides above -- FilterBlobContainer (this class's superclass's superclass) passes them
+    // straight through to the delegate unchanged, which would write plaintext to the real object
+    // store. Nothing in this plugin currently calls these (verified: zero callers under
+    // plugins/serverless-storage/src/main/java), but leaving them unguarded would silently defeat
+    // this class's entire purpose the moment something does -- so they encrypt exactly like
+    // writeBlob/writeBlobAtomic, just forwarding the metadata/cryptoMetadata arguments unchanged.
+
+    @Override
+    public void writeBlobWithMetadata(
+        String blobName,
+        InputStream inputStream,
+        long blobSize,
+        boolean failIfAlreadyExists,
+        java.util.Map<String, String> metadata
+    ) throws IOException {
+        byte[] ciphertext = encryptBlocked(readAllAndClose(inputStream));
+        delegate.writeBlobWithMetadata(blobName, new ByteArrayInputStream(ciphertext), ciphertext.length, failIfAlreadyExists, metadata);
+    }
+
+    @Override
+    public void writeBlobWithMetadata(
+        String blobName,
+        InputStream inputStream,
+        long blobSize,
+        boolean failIfAlreadyExists,
+        java.util.Map<String, String> metadata,
+        org.opensearch.cluster.metadata.CryptoMetadata cryptoMetadata
+    ) throws IOException {
+        byte[] ciphertext = encryptBlocked(readAllAndClose(inputStream));
+        delegate.writeBlobWithMetadata(
+            blobName,
+            new ByteArrayInputStream(ciphertext),
+            ciphertext.length,
+            failIfAlreadyExists,
+            metadata,
+            cryptoMetadata
+        );
+    }
+
+    @Override
+    public void writeBlobAtomicWithMetadata(
+        String blobName,
+        InputStream inputStream,
+        java.util.Map<String, String> metadata,
+        long blobSize,
+        boolean failIfAlreadyExists
+    ) throws IOException {
+        byte[] ciphertext = encryptBlocked(readAllAndClose(inputStream));
+        delegate.writeBlobAtomicWithMetadata(blobName, new ByteArrayInputStream(ciphertext), metadata, ciphertext.length, failIfAlreadyExists);
     }
 
     private static byte[] readAllAndClose(InputStream in) throws IOException {

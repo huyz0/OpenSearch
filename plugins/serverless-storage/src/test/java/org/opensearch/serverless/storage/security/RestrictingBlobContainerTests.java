@@ -161,4 +161,63 @@ public class RestrictingBlobContainerTests extends OpenSearchTestCase {
             () -> wrappedChild.writeBlob("c", new ByteArrayInputStream(childContent), childContent.length, true)
         );
     }
+
+    /**
+     * Regression test: the three {@code writeBlob*WithMetadata} overloads previously fell through
+     * {@code FilterBlobContainer}'s own passthrough default straight to the delegate, unrestricted by
+     * {@code writeAllowed} -- see this class's own overrides for these methods.
+     */
+    public void testWriteWithMetadataThrowsWhenNotAllowed() throws Exception {
+        BlobContainer delegate = newFsBlobContainer();
+        BlobContainer restricted = new RestrictingBlobContainer(delegate, false, false);
+        byte[] content = "hello".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+
+        expectThrows(
+            SecurityException.class,
+            () -> restricted.writeBlobWithMetadata(
+                "a",
+                new ByteArrayInputStream(content),
+                content.length,
+                true,
+                java.util.Map.of("k", "v")
+            )
+        );
+        expectThrows(
+            SecurityException.class,
+            () -> restricted.writeBlobAtomicWithMetadata(
+                "a",
+                new ByteArrayInputStream(content),
+                java.util.Map.of("k", "v"),
+                content.length,
+                true
+            )
+        );
+
+        assertFalse("a denied metadata write attempt must never reach the real delegate", delegate.blobExists("a"));
+    }
+
+    /**
+     * The write-allowed counterpart of the above: metadata writes must pass through, not be gated,
+     * when writeAllowed is true. {@code FsBlobContainer} (the real delegate) doesn't itself implement
+     * this overload -- {@link BlobContainer}'s own default throws {@link UnsupportedOperationException}
+     * for it -- which is exactly the proof this test needs: the call must reach that far (raising
+     * that exception, not a {@link SecurityException} from this class's own gate) to demonstrate it
+     * was never blocked.
+     */
+    public void testWriteWithMetadataPassesThroughWhenAllowed() throws Exception {
+        BlobContainer delegate = newFsBlobContainer();
+        BlobContainer restricted = new RestrictingBlobContainer(delegate, true, false);
+        byte[] content = "hello".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+
+        expectThrows(
+            UnsupportedOperationException.class,
+            () -> restricted.writeBlobWithMetadata(
+                "a",
+                new ByteArrayInputStream(content),
+                content.length,
+                true,
+                java.util.Map.of("k", "v")
+            )
+        );
+    }
 }

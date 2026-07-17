@@ -106,6 +106,51 @@ public final class RestrictingBlobContainer extends RegisterDelegatingBlobContai
         return super.compareAndSwapRegister(blobName, expectedGeneration, newValue);
     }
 
+    // The three writeBlob*WithMetadata overloads are not covered by writeBlob/writeBlobAtomic's own
+    // overrides above -- FilterBlobContainer (this class's superclass's superclass) passes them
+    // straight through to the delegate unchanged, which would let a metadata-carrying write reach
+    // the real store even when writeAllowed is false. Nothing in this plugin currently calls these
+    // (verified: zero callers under plugins/serverless-storage/src/main/java), but leaving them
+    // unguarded would silently break this class's own "any denied-path bug becomes a loud
+    // SecurityException" contract the moment something does.
+
+    @Override
+    public void writeBlobWithMetadata(
+        String blobName,
+        InputStream inputStream,
+        long blobSize,
+        boolean failIfAlreadyExists,
+        java.util.Map<String, String> metadata
+    ) throws IOException {
+        requireWriteAllowed();
+        super.writeBlobWithMetadata(blobName, inputStream, blobSize, failIfAlreadyExists, metadata);
+    }
+
+    @Override
+    public void writeBlobWithMetadata(
+        String blobName,
+        InputStream inputStream,
+        long blobSize,
+        boolean failIfAlreadyExists,
+        java.util.Map<String, String> metadata,
+        org.opensearch.cluster.metadata.CryptoMetadata cryptoMetadata
+    ) throws IOException {
+        requireWriteAllowed();
+        super.writeBlobWithMetadata(blobName, inputStream, blobSize, failIfAlreadyExists, metadata, cryptoMetadata);
+    }
+
+    @Override
+    public void writeBlobAtomicWithMetadata(
+        String blobName,
+        InputStream inputStream,
+        java.util.Map<String, String> metadata,
+        long blobSize,
+        boolean failIfAlreadyExists
+    ) throws IOException {
+        requireWriteAllowed();
+        super.writeBlobAtomicWithMetadata(blobName, inputStream, metadata, blobSize, failIfAlreadyExists);
+    }
+
     @Override
     public DeleteResult delete() throws IOException {
         requireDeleteAllowed();

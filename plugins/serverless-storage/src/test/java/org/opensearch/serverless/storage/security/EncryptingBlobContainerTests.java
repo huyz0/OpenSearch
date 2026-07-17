@@ -239,4 +239,105 @@ public class EncryptingBlobContainerTests extends OpenSearchTestCase {
         // A read touching the corrupted second block must fail loudly, not return garbage.
         expectThrows(IOException.class, () -> encrypting.readBlob("blob-1", 10, 10).readAllBytes());
     }
+
+    /**
+     * {@code FsBlobContainer} (the real delegate every other test in this class uses) doesn't itself
+     * implement the {@code writeBlob*WithMetadata} overloads -- {@link BlobContainer}'s own defaults
+     * throw {@link UnsupportedOperationException} for them. This tiny wrapper implements them by
+     * dropping straight to the plain (non-metadata) write, purely so the two regression tests below
+     * can exercise {@link EncryptingBlobContainer}'s own metadata-write overrides against something
+     * that accepts the call at all -- the metadata itself is not what's under test.
+     */
+    private static final class MetadataCapableBlobContainer extends FilterBlobContainer {
+        MetadataCapableBlobContainer(BlobContainer delegate) {
+            super(delegate);
+        }
+
+        @Override
+        protected BlobContainer wrapChild(BlobContainer child) {
+            return new MetadataCapableBlobContainer(child);
+        }
+
+        @Override
+        public void writeBlobWithMetadata(
+            String blobName,
+            InputStream inputStream,
+            long blobSize,
+            boolean failIfAlreadyExists,
+            java.util.Map<String, String> metadata
+        ) throws IOException {
+            writeBlob(blobName, inputStream, blobSize, failIfAlreadyExists);
+        }
+
+        @Override
+        public void writeBlobAtomicWithMetadata(
+            String blobName,
+            InputStream inputStream,
+            java.util.Map<String, String> metadata,
+            long blobSize,
+            boolean failIfAlreadyExists
+        ) throws IOException {
+            writeBlobAtomic(blobName, inputStream, blobSize, failIfAlreadyExists);
+        }
+    }
+
+    /**
+     * Regression test: {@code writeBlobWithMetadata} previously fell through {@code
+     * FilterBlobContainer}'s own passthrough default straight to the delegate, writing plaintext to
+     * the real object store instead of going through this class's block-cipher path -- see this
+     * class's own writeBlobWithMetadata overrides. Proves the delegate never sees plaintext and the
+     * write round-trips correctly through the normal (non-metadata) read path.
+     */
+    public void testWriteBlobWithMetadataEncryptsInsteadOfBypassing() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        Path storageDir = blobStore.path();
+        BlobContainer delegate = new MetadataCapableBlobContainer(new FsBlobContainer(blobStore, BlobPath.cleanPath(), storageDir));
+        EncryptingBlobContainer encrypting = new EncryptingBlobContainer(delegate, new StaticEncryptionKeyProvider(newAesKey()));
+
+        byte[] plaintext = "the quick brown fox jumps over the lazy dog".getBytes(StandardCharsets.UTF_8);
+        encrypting.writeBlobWithMetadata(
+            "blob-metadata",
+            new java.io.ByteArrayInputStream(plaintext),
+            plaintext.length,
+            false,
+            java.util.Map.of("k", "v")
+        );
+
+        byte[] onDisk = Files.readAllBytes(storageDir.resolve("blob-metadata"));
+        assertFalse(
+            "writeBlobWithMetadata must not have written plaintext straight to the delegate",
+            new String(onDisk, StandardCharsets.UTF_8).contains("quick brown fox")
+        );
+
+        try (InputStream in = encrypting.readBlob("blob-metadata")) {
+            assertArrayEquals(plaintext, in.readAllBytes());
+        }
+    }
+
+    /** Same regression, for the atomic metadata-write overload. */
+    public void testWriteBlobAtomicWithMetadataEncryptsInsteadOfBypassing() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        Path storageDir = blobStore.path();
+        BlobContainer delegate = new MetadataCapableBlobContainer(new FsBlobContainer(blobStore, BlobPath.cleanPath(), storageDir));
+        EncryptingBlobContainer encrypting = new EncryptingBlobContainer(delegate, new StaticEncryptionKeyProvider(newAesKey()));
+
+        byte[] plaintext = "the quick brown fox jumps over the lazy dog".getBytes(StandardCharsets.UTF_8);
+        encrypting.writeBlobAtomicWithMetadata(
+            "blob-atomic-metadata",
+            new java.io.ByteArrayInputStream(plaintext),
+            java.util.Map.of("k", "v"),
+            plaintext.length,
+            false
+        );
+
+        byte[] onDisk = Files.readAllBytes(storageDir.resolve("blob-atomic-metadata"));
+        assertFalse(
+            "writeBlobAtomicWithMetadata must not have written plaintext straight to the delegate",
+            new String(onDisk, StandardCharsets.UTF_8).contains("quick brown fox")
+        );
+
+        try (InputStream in = encrypting.readBlob("blob-atomic-metadata")) {
+            assertArrayEquals(plaintext, in.readAllBytes());
+        }
+    }
 }
