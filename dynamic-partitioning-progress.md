@@ -2244,3 +2244,43 @@ doc -- build/test commands, the enable recipe (remote cluster state + `serverles
 or `.repository` + `index.serverless_storage.enabled`), the full REST operator surface, and pointers
 to the RFC and this log for anything deeper.
 
+## WAL mirroring — request-level 429 backpressure on upload backlog (`52324677588`)
+
+The other item deferred above ("request-level 429 backpressure") is now done for the batching path,
+resolving rfc-serverless-opensearch.md &sect;6.4's remaining explicit-backpressure goal: *"the WAL
+buffer is bounded; when upload backlog crosses a threshold the node rejects new indexing with 429."*
+Previously the only backstop was the processor's bounded queue, which once full blocks the calling
+(indexing) thread rather than rejecting cleanly -- fine as a memory bound, but not the clean pushback
+the RFC calls for.
+
+`WalBatchingProcessor` now tracks real-time backlog bytes (an `AtomicLong` incremented in an
+overridden `put()`, decremented once a batch's `write()` attempt finishes -- success or failure,
+either way those records are no longer backlog) via a new `backlogBytes()`/`isOverBacklogRejectThreshold()`
+pair, separate from the early-flush trigger's own byte counter (that one resets every drain; this one
+doesn't). `WalMirroringTranslog#add` checks the new accessor before enqueueing a batching-path write
+and, once over the configured `serverless_storage.wal_flush.backlog_reject_threshold` (`ByteSizeValue.ZERO`
+= off, matching every other off-by-default convention in this plugin), throws
+`org.opensearch.core.concurrency.OpenSearchRejectedExecutionException` instead -- the exact exception
+type and message convention `IndexingPressure` already uses for its own backpressure, so this is
+recognized by the same downstream handling (`ReplicationOperation` checks for this type explicitly)
+without any plugin-specific 429 wiring at the REST layer.
+
+The local translog write (`super.add()`) has already happened by the point this check runs, matching
+the legacy path's existing "local append can succeed before a mirror-write failure surfaces" ordering
+-- not a new risk this introduces.
+
+Confirmed with the same break-the-fix discipline: `isOverBacklogRejectThreshold()` hardcoded to
+`false`, watched the new `testAddRejectsWithBackpressureOnceTheBacklogThresholdIsExceeded` fail,
+restored, green.
+
+### Still explicitly out of scope
+
+Node-wide (not just per-shard-processor) admission and the "per-shard budgets first, node-wide
+second" ordering rfc-serverless-opensearch.md &sect;6.4 also mentions are not built -- the shared
+`WalBatchingProcessor` is already node-wide (one instance for the whole node, per &sect;6.4's own
+cross-shard batching design), so there is no separate per-shard budget to order against on the
+batching path today; `SERVERLESS_STORAGE_WAL_PER_SHARD_BUDGET_SETTING`'s fairness siphon remains a
+legacy-path-only mechanism (see `WalChunkService`'s own javadoc). Feeding this backlog signal into
+autoscaling (&sect;10, "the same signal feeds autoscaling") is also not wired up -- `backlogBytes()`
+exists as a public accessor a future autoscaling signal could read, but nothing reads it yet.
+

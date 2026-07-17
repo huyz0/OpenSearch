@@ -75,16 +75,18 @@ this repo:
 
 - **WAL batching Phase 3** — flipping `wal_flush.batching.enabled`'s default to `true`. Deliberately
   deferred pending real load testing against the RFC's cost-sanity target.
-- **Byte-threshold early-flush trigger** for WAL batching (currently interval-only, ~200ms) — noted
-  as a scoped future refinement if load testing shows interval-only batching isn't enough.
-- **Request-level 429 backpressure** for WAL upload backlog — the RFC's own larger stated goal;
-  legitimately separate, larger scope than this session's work.
 - **Resharding-by-copy source write-fencing** — documented as an operator precondition, not built.
   Building real fencing (or a dual-write bridge) would be a genuinely new mechanism, out of scope for
   a documentation pass.
-- **No `plugins/serverless-storage/README.md` exists** — there is currently no quickstart doc for
-  running this plugin at all; the closest thing is reading `ServerlessStorageIntegTestCase.java` and
-  the individual internalClusterTests. Offered to write one earlier in this session; not done yet.
+- **Node-wide/per-shard-budget ordering for the new 429 backpressure**, and **feeding the backlog
+  signal into autoscaling** (rfc-serverless-opensearch.md §10) — see the byte-threshold/backpressure
+  section of `dynamic-partitioning-progress.md` for what's built vs. still open here.
+
+Resolved since the list above was first written: **byte-threshold early-flush trigger** for WAL
+batching (`17bb9ce3dee`) and **request-level 429 backpressure** for WAL upload backlog
+(`52324677588`) are both implemented now — see `dynamic-partitioning-progress.md`'s WAL mirroring
+sections. **`plugins/serverless-storage/README.md`** now exists (`c2c1625dadf`) as the plugin's
+quickstart doc.
 - The plugin has a real, substantial engineering base with correctness-reviewed core mechanisms, but
   has never been run against a real cloud object store at production scale, load-tested, or reviewed
   by anyone outside this session — see the "are we complete?" discussion in this session's transcript
