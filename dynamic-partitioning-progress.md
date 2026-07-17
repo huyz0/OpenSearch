@@ -2071,3 +2071,141 @@ dispatch path. Restored, all green.
 Verification sweeps after each fix: `org.opensearch.cluster.metadata.*` and
 `org.opensearch.cluster.routing.*` (clean) plus `:server:missingJavadoc` (clean).
 
+## WAL mirroring — real group-commit batching (`serverless_storage.wal_flush.batching.enabled`)
+
+WAL mirroring (`serverless_storage.wal_mirroring.enabled`, default off) closes a real durability gap:
+this engine only ships segments/manifests to the object store at flush time, so an acknowledged
+write that hasn't flushed yet lives only in the local translog. WAL mirroring durably writes the
+operation stream itself ahead of the segment flush. The problem was the wiring: `WalMirroringTranslog.add()`
+flushed to the object store after **every single operation** -- one PUT (plus a CAS to claim a chunk
+sequence) per document, blocking the indexing thread until it completed. Turning the feature on as
+wired cost roughly one S3 PUT per document, which is why it defaults off.
+
+### The design pivot that made this worth doing
+
+An earlier draft of this work proposed a bespoke `PendingRecord`/`CompletableFuture`-per-record
+buffering scheme built inside `WalChunkService`. An adversarial design review of that draft found
+several real bugs it would have shipped: an orphaned-future deadlock under the existing per-shard
+fairness budget, a lock-held-during-retry regression, and an unbounded `future.get()` blocking an
+indexing thread with no timeout. A follow-up question during planning reframed the whole thing for
+the better: should a write wait for WAL replication before acking, the same way
+`index.translog.durability=REQUEST` already makes a write wait for remote-store translog upload?
+Investigating that found core OpenSearch has *already solved this exact problem* for `RemoteFsTranslog`
+(remote-store's own translog upload), using two pieces of machinery this plugin reuses directly
+instead of reinventing:
+
+1. **`AsyncIOProcessor`/`BufferedAsyncIOProcessor`** (`server/.../common/util/concurrent/`) -- the
+   exact "batch many concurrent callers' writes onto one shared periodic flush, notify each caller
+   via a listener when its batch completes" primitive `RemoteFsTranslog` itself uses for group
+   commit. `WalBatchingProcessor` is a thin subclass: one node-shared instance drains every writer
+   shard's enqueued records into one chunk per `serverless_storage.wal_flush.interval` tick. The
+   queueing, the one-drain-at-a-time promise semaphore, the per-caller notification, and the
+   `ArrayBlockingQueue` backpressure once full are all inherited and proven correct upstream, so
+   none of the custom concurrency code from the earlier draft had to be written or verified.
+2. **`index.translog.durability`** (`REQUEST`/`ASYNC`, already dynamic, already index-scoped) --
+   reused as-is, no new plugin knob. `WalMirroringTranslog.add()` now appends locally and enqueues
+   without blocking on object-store I/O; the new `ensureSynced(Location)` override is what waits for
+   the group-commit upload. Confirmed by reading the actual code (not assumed) that this override is
+   reached by the standard `IndexShard.sync()` -> `translogSyncProcessor` -> `translogManager().ensureTranslogSynced()`
+   -> `Translog.ensureSynced(Stream)` -> `ensureSynced(Location)` chain. Under `REQUEST` the client's
+   own request thread calls it before acking; under `ASYNC` a background sync task does. Same
+   backend-agnostic contract core already applies to local fsync and remote-store upload, no
+   redundant "wait or not" setting added. No bespoke timeout either, matching `RemoteFsTranslog.ensureSynced()`'s
+   own precedent (the request-level timeout bounds the wait).
+
+### How the processor reaches the translog without new plumbing
+
+The processor is threaded through the *existing* `WalAppendTarget` seam rather than the engine's
+constructor chain. `WalAppendTarget.batchingProcessor()` (default null) is overridden by
+`WalChunkService` to return the processor the plugin attaches to the node-shared service in
+`resolveSharedWalChunkService()`, and by `EncryptingWalChunkService` to forward its delegate's. The
+*presence* of an attached processor is the batching-enabled signal the translog keys off, so no new
+argument had to reach through `WriterEngineFactory`/`ObjectStoreWriterEngine`'s deep telescoping
+constructors. A consequence, chosen deliberately: a dedicated-WAL-stream shard uses its own
+per-shard `WalChunkService` (never the shared one), which is never given a processor, so dedicated
+streams stay on the legacy synchronous path -- consistent with that feature already being an
+explicit higher-request-cost regulatory opt-in.
+
+Encryption moves with the path: the legacy path wraps the service in a per-shard
+`EncryptingWalChunkService` decorator, which the batching path bypasses, so `WalBatchingProcessor.write()`
+re-applies the same per-record `WalRecordCrypto.encrypt` keyed off the node-level provider (a single
+provider covers a mixed batch because each record's key derives from its own `indexUuid`).
+
+### Why the per-shard fairness budget doesn't extend to the batching path
+
+`WalChunkService`'s fairness budget exists because, on the legacy path, `flush()` only fires on a
+caller's own trigger, so one noisy shard could bloat the shared buffer and delay every other shard's
+flush. Once batching is driven by the processor's own interval timer that starvation is closed
+structurally: every drain empties the *entire* queue regardless of which shard populated it, so no
+shard's ops wait longer than one buffer interval behind another's volume. The queue capacity is the
+uniform memory bound instead. The old budget keeps its original job on the legacy path, unchanged.
+
+### Phased rollout (Phases 0-2 done; Phase 3 deliberately separate)
+
+- **Phase 0** (commit: hoist retry / register settings / plugin `close()`): extracted the bounded
+  retry-with-backoff from `WalMirroringTranslog#flushWithRetry` into `WalChunkService#writeChunkWithRetry`,
+  now shared by the legacy `flush()`/overflow paths and the new batching path (and, incidentally,
+  giving `overflowShardToDedicatedChunk` the retry it previously had none of). Registered the three
+  off-by-default settings (`wal_flush.batching.enabled`/`.interval`/`.queue_capacity`). Added a
+  `ServerlessStoragePlugin#close()` override closing `walGcSchedulerTask`, fixing a real pre-existing
+  leak: the plugin had no `close()` at all, so a live scheduled WAL GC sweep was never cancelled on
+  shutdown. Zero behavior change, verified against the full existing WAL suite.
+- **Phase 1** (commit: real group-commit): `WalBatchingProcessor`, the `add()`/`ensureSynced()`
+  split, wired behind the setting. This is the phase that actually delivers the cost reduction.
+- **Phase 2** (this commit): the cost-accounting proof test plus this writeup.
+- **Phase 3** (not part of this work): flipping the default to `true`, only after real load testing
+  against the RFC's cost-sanity target.
+
+### The point-proving test
+
+`WalBatchingCostAccountingTests` uses the same `RequestCountingBlobContainer`/`ObjectStoreRequestCounter`
+harness that guards GC's DELETE cost. Four shards each fire 50 concurrent `add()` calls (200 ops)
+plus one priming op, all folded within one buffer interval by gating the first chunk write open only
+after the whole burst has provably enqueued behind the held promise semaphore (the first drain is
+scheduled with zero delay, so gating is what makes "one interval" deterministic rather than timing-
+dependent). Result: **201 ops cost exactly 4 PUT-shaped requests** (2 sequence-claim CAS + 2 blob
+writes, one priming chunk + one folded burst chunk), against the roughly 402 the one-PUT-per-op
+legacy path would cost. Flat O(1), not O(N). The test also reads both chunks back and asserts all
+201 records survived the fold, so the cost win is not bought by silently dropping ops.
+
+### Verification discipline (break-then-restore)
+
+Two deliberate self-breaks, each confirmed to be caught by exactly the intended test, then restored:
+
+1. **`ExecutionException` -> `IOException` unwrap** in `ensureSynced`: replaced the cause-unwrap with
+   a generic re-wrap. `testBatchingEnsureSyncedPreservesTheIOExceptionTypeOnUploadFailure` failed
+   (`expected ... "injected transient failure", got "WAL mirror group-commit upload failed"`),
+   proving it actually asserts the original chunk-write `IOException` is preserved, not just that
+   *some* exception is thrown. Restored, green.
+2. **The `ensureSynced`/durability wait** itself: short-circuited the WAL wait so `ensureSynced`
+   returned without blocking on the pending upload. `testBatchingAddReturnsWithoutBlockingAndEnsureSyncedPerformsTheDurableUpload`
+   failed (`expected WAITING but was TERMINATED` -- the sync thread no longer parked on the upload),
+   proving the test genuinely exercises the request-thread-waits mechanism that `index.translog.durability=REQUEST`
+   drives. Restored, green.
+
+Full `:plugins:serverless-storage:test` and `:plugins:serverless-storage:missingJavadoc` clean after
+each phase.
+
+### Deliberately deferred (separate future scope, not gaps in this work)
+
+- **Byte-threshold early-flush trigger.** `BufferedAsyncIOProcessor`'s `process()`/`scheduleProcess()`
+  are package-private in core, not designed for cross-package early-triggering, and the queue-capacity
+  bound already gives a coarse safe backstop. If load testing later shows interval-only batching
+  misses the RFC's cost/latency targets, a size trigger is a scoped follow-up, not a v1 blocker.
+- **Request-level 429 backpressure.** The RFC's larger stated goal for the ingest tier; legitimately
+  separate from the batching mechanism itself.
+- **Shutdown drain of the queued tail.** `ServerlessStoragePlugin#close()` intentionally does not
+  force a final processor drain: under `REQUEST` a write's upload already completed before its ack
+  (that is what `ensureSynced` waits for), so no acknowledged op is stranded; under `ASYNC` an
+  unsynced tail may drop on shutdown, exactly the durability-for-latency trade `ASYNC` already makes
+  for core's own translog. `BufferedAsyncIOProcessor` also exposes no cross-package synchronous-drain
+  seam, so a forced drain isn't cleanly implementable and correctness doesn't need one.
+- **Autoscaling backlog signal under batching.** `WalChunkService#bufferedRecordCount()`/`totalBufferedBytes()`
+  read the legacy buffer, which the batching path leaves empty (records sit in the processor queue),
+  so those signals under-report while batching is on. Tied to the same deferred byte-accounting work.
+
+Naming note: this keeps the shipped "WAL mirroring" terminology as-is. "Mirroring" arguably overstates
+what this does (a durability-only upload of the op stream, closer to what core's remote-store calls
+"translog upload" than a live synced replica), but renaming an already-shipped, tested public setting
+is a separate decision with real churn and no bearing on whether the batching mechanism works.
+
