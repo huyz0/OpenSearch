@@ -111,6 +111,10 @@ public class MetadataInPlaceSplitShardCommitServiceTests extends OpenSearchTestC
     public void testApplyCancelFreesChildIdsAndRemovesRouting() {
         ClusterState state = createStateWithInProgressSplit(3, 1, 2);
         Set<Integer> childIds = state.metadata().index("test-index").getSplitShardsMetadata().getChildShardIdsOfParent(0);
+        // applyCancel now defensively re-checks that the state is genuinely cancel-worthy, so drive a
+        // child's allocation retries to exhaustion (SHOULD_CANCEL) before cancelling.
+        int maxRetries = MaxRetryAllocationDecider.SETTING_ALLOCATION_MAX_RETRY.get(state.metadata().index("test-index").getSettings());
+        state = failChildAllocation(state, childIds, maxRetries);
 
         ClusterState afterCancel = MetadataInPlaceSplitShardCommitService.applyCancel(state, "test-index", 0);
 
@@ -136,6 +140,31 @@ public class MetadataInPlaceSplitShardCommitServiceTests extends OpenSearchTestC
 
         ClusterState afterCommit = MetadataInPlaceSplitShardCommitService.applyCommit(started, "test-index", 0);
         assertFalse(afterCommit.metadata().index("test-index").getSplitShardsMetadata().isSplitOfShardInProgress(0));
+    }
+
+    /**
+     * Gap 1 race: a cancel task is queued while a reserved child is retry-exhausted (SHOULD_CANCEL), but
+     * before it runs an operator's {@code retry_failed} reroute allocates all children to STARTED (now
+     * READY_TO_COMMIT). The hardened {@link MetadataInPlaceSplitShardCommitService#applyCancel} must re-check
+     * against the state it's actually applying to and no-op, rather than tearing down children that have
+     * already recovered -- the queued commit task should finalize the split instead.
+     */
+    public void testApplyCancelNoOpsWhenStateBecameCommitWorthy() {
+        ClusterState state = createStateWithInProgressSplit(3, 0, 2);
+        Set<Integer> childIds = state.metadata().index("test-index").getSplitShardsMetadata().getChildShardIdsOfParent(0);
+        // State at the moment the cancel task actually runs: all children STARTED (commit-worthy).
+        ClusterState nowCommitWorthy = startChildShards(state, childIds);
+
+        ClusterState afterCancel = MetadataInPlaceSplitShardCommitService.applyCancel(nowCommitWorthy, "test-index", 0);
+
+        assertSame("cancel must no-op once the state has become commit-worthy", nowCommitWorthy, afterCancel);
+        SplitShardsMetadata splitMetadata = afterCancel.metadata().index("test-index").getSplitShardsMetadata();
+        assertTrue("split marker must remain set so the queued commit can finalize it", splitMetadata.isSplitOfShardInProgress(0));
+        IndexRoutingTable routing = afterCancel.routingTable().index("test-index");
+        for (int childId : childIds) {
+            assertNotNull("recovered child routing must not be torn down", routing.shard(childId));
+            assertTrue("child primary must still be STARTED", routing.shard(childId).primaryShard().started());
+        }
     }
 
     // --- helpers ---

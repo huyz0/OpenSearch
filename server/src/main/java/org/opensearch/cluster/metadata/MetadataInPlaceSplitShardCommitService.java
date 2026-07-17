@@ -235,10 +235,20 @@ public class MetadataInPlaceSplitShardCommitService implements ClusterStateListe
      * frees the reserved child shard IDs in {@link SplitShardsMetadata} and removes their now-abandoned
      * {@link ShardRouting} entries from the routing table, so a later split of the same parent doesn't
      * collide with routing entries this attempt already created.
+     *
+     * <p>Re-validates the cancel condition against the state actually being applied to (not just the state
+     * that triggered the listener), symmetrically with {@link #applyCommit}. Cluster state may have advanced
+     * between {@link #clusterChanged} firing and this task executing: e.g. an operator's {@code retry_failed}
+     * reroute could have allocated the reserved children and driven them all to {@code STARTED} (now {@code
+     * READY_TO_COMMIT}) after this cancel was queued but before it ran. In that case we no-op and let the
+     * queued commit task finalize the split instead of tearing down children that have already recovered.
      */
     static ClusterState applyCancel(ClusterState currentState, String indexName, int parentShardId) {
         IndexMetadata curIndexMetadata = currentState.metadata().index(indexName);
         if (curIndexMetadata == null || curIndexMetadata.getSplitShardsMetadata().isSplitOfShardInProgress(parentShardId) == false) {
+            return currentState;
+        }
+        if (evaluateSplitCompletion(currentState, curIndexMetadata, parentShardId) != SplitCompletionState.SHOULD_CANCEL) {
             return currentState;
         }
 

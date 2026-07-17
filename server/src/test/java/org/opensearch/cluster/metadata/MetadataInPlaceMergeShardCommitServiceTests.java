@@ -159,6 +159,35 @@ public class MetadataInPlaceMergeShardCommitServiceTests extends OpenSearchTestC
         );
     }
 
+    /**
+     * Gap 1 race: a cancel task is queued while the revived parent is retry-exhausted (SHOULD_CANCEL), but
+     * before it executes an operator's {@code retry_failed} reroute allocates the parent and drives it to
+     * STARTED (now READY_TO_COMMIT). The hardened {@link MetadataInPlaceMergeShardCommitService#applyCancel}
+     * must re-check the completion state against the state it's actually applying to and no-op, rather than
+     * rolling back a parent that already holds the merged data (which would wastefully discard a STARTED
+     * primary; the queued commit task should retire the children instead).
+     */
+    public void testApplyCancelNoOpsWhenStateBecameCommitWorthy() {
+        // State at the moment the cancel task actually runs: parent is now STARTED (commit-worthy).
+        ClusterState nowCommitWorthy = startParent(pendingMergeState());
+        assertEquals(
+            MetadataInPlaceMergeShardCommitService.MergeCompletionState.READY_TO_COMMIT,
+            MetadataInPlaceMergeShardCommitService.evaluateMergeCompletion(nowCommitWorthy, nowCommitWorthy.metadata().index(INDEX), 0)
+        );
+
+        ClusterState afterCancel = MetadataInPlaceMergeShardCommitService.applyCancel(nowCommitWorthy, INDEX, 0);
+
+        // No-op: nothing rolled back.
+        assertSame("cancel must no-op once the state has become commit-worthy", nowCommitWorthy, afterCancel);
+        SplitShardsMetadata metadata = afterCancel.metadata().index(INDEX).getSplitShardsMetadata();
+        assertTrue("merge marker must remain set so the queued commit can finalize it", metadata.isMergeOfShardInProgress(0));
+        IndexRoutingTable routing = afterCancel.routingTable().index(INDEX);
+        assertNotNull("STARTED parent routing must not be discarded", routing.shard(0));
+        assertTrue("parent must still be STARTED", routing.shard(0).primaryShard().started());
+        assertNotNull("child 1 routing intact", routing.shard(1));
+        assertNotNull("child 2 routing intact", routing.shard(2));
+    }
+
     // --- helpers ---
 
     /** A committed split of shard 0 into children {1,2}, with both children STARTED (a cluster at rest). */

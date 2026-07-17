@@ -1945,3 +1945,48 @@ proceeded" while the control stays green; restored, both green. The existing IT
 (it needs a search arriving mid-recovery), so the coverage lives at the unit level where the
 window is constructible without real timing; a two-overlapping-searches IT was judged not worth
 the timing flakiness for what the unit test already proves deterministically.
+
+## Skeptical re-review of CC1/CC2/CC3 — two small gaps in the in-place split/merge commit services
+
+A follow-up re-review of the split/merge commit services turned up two real, low-severity gaps.
+Both are fixed.
+
+### Gap 1 — `applyCancel` did not re-check the cancel condition before rolling back
+
+`applyCommit` on both commit services already re-runs its completion classifier
+(`evaluateMergeCompletion` / `evaluateSplitCompletion`) *inside* the cluster-state-update task and
+only commits if the state it is actually applying to still reads `READY_TO_COMMIT` — it does not
+trust the earlier check that queued the task. `applyCancel` had no matching guard: it only
+re-checked `isMergeOfShardInProgress` / `isSplitOfShardInProgress`, not that the state still
+classified as `SHOULD_CANCEL`.
+
+The race that exposes it: a pending merge's revived parent exhausts its allocation retries, so
+`clusterChanged` queues a cancel task. Before it runs, an operator issues
+`_cluster/reroute?retry_failed=true`; the parent allocates and reaches `STARTED`, and a commit task
+is now also queued behind the cancel. The cancel runs first, still sees the marker set, and rolls
+back — discarding a `STARTED` primary that already holds the merged data even though it would have
+committed. Not data loss (the children were never removed, so the rollback is lossless by
+construction), just wasteful. The split side had the identical missing re-check — a symmetric,
+pre-existing pattern.
+
+Fix: `applyCancel` on both services now re-runs its classifier against the state it is applying to
+and no-ops unless it still reads `SHOULD_CANCEL`. If the state has since become `READY_TO_COMMIT`
+(or slipped back to `STILL_IN_PROGRESS`), the cancel does nothing and lets the appropriate task —
+the queued commit, or a later re-evaluation — handle it. This makes cancel symmetric with commit's
+own long-standing defensive re-check.
+
+One existing split test (`testApplyCancelFreesChildIdsAndRemovesRouting`) was calling `applyCancel`
+on a state that was never actually cancel-worthy (children unassigned, zero failed allocations) and
+relying on the old unconditional behavior. With the hardened re-check it correctly no-ops now, so
+the test was updated to drive a genuinely exhausted (`SHOULD_CANCEL`) state first — which is what a
+real cancel task always applies to anyway.
+
+New tests: `testApplyCancelNoOpsWhenStateBecameCommitWorthy` on both service test classes builds the
+race directly (state is commit-worthy by the time `applyCancel` runs) and asserts the hardened path
+no-ops instead of rolling back — marker still set, the `STARTED` shard(s) not discarded. Verified
+real by removing each re-check in turn: the new test goes red with the spurious rollback (`expected
+same … was …` — a different, mutated cluster state), restored, green.
+
+Verification sweeps: `org.opensearch.cluster.metadata.*` and `org.opensearch.cluster.routing.*`
+(clean) plus `:server:missingJavadoc` (clean).
+
