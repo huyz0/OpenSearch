@@ -2315,3 +2315,24 @@ under sustained concurrent-shard load, not the local-filesystem proxy this sessi
 of that infrastructure exists in this session's environment, so Phase 3 remains explicitly deferred
 rather than attempted with a synthetic substitute.
 
+## Resharding-by-copy source write-fencing — re-checked, still a deliberate scope boundary
+
+Revisited whether the last open item -- resharding-by-copy never fencing the source index's writes
+during orchestration (`ae0ee3d25d4`) -- needed real building now, or was still correctly closed as a
+documented precondition. Re-read both write-ups: rfc-serverless-opensearch.md's own resharding
+section (around "the source index is never quiesced, fenced, or made read-only anywhere in this
+orchestration") and `TransportOrchestrateShardSplitAction`'s class javadoc, which carries the same
+warning and the same operator precondition verbatim.
+
+**Conclusion: no code change. This stays a documented precondition, not a gap to close.** The RFC
+already gives the honest reasoning for why: real source fencing (blocking writes against the source
+during the clone window) or a dual-write bridge (mirroring writes to both source and targets until
+cutover) are each "significant, separate mechanisms," "the same 'real design work, not implementation
+time' reasoning this section already gave for the cutover primitive itself before it existed." That
+reasoning still holds -- neither is a small bounded fix, and building either as a rushed addition
+under this session's own "sweep the open-items list" pass would be exactly the kind of half-scoped,
+undertested mechanism the discipline followed throughout this session (implement -> real test ->
+break-the-fix -> restore) argues against for something this durability-sensitive. Confirmed the
+warning is still present, current, and consistent in both places it should be -- that was the actual
+risk worth re-checking (documentation drifting out of sync with code), and it hasn't.
+
