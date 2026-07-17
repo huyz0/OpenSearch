@@ -81,6 +81,7 @@ import org.opensearch.cluster.metadata.IndexTemplateMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.metadata.MetadataCreateDataStreamService;
 import org.opensearch.cluster.metadata.MetadataCreateIndexService;
+import org.opensearch.cluster.metadata.MetadataInPlaceMergeShardCommitService;
 import org.opensearch.cluster.metadata.MetadataInPlaceSplitShardCommitService;
 import org.opensearch.cluster.metadata.MetadataIndexUpgradeService;
 import org.opensearch.cluster.metadata.SystemIndexMetadataUpgradeService;
@@ -1752,6 +1753,10 @@ public class Node implements Closeable {
             // MetadataInPlaceSplitShardCommitService's javadoc for why this can't reuse
             // PersistentTasksClusterService itself despite the similar shape.
             new MetadataInPlaceSplitShardCommitService(settings, clusterService);
+
+            // Surfaces a revived in-place-merge parent that exhausted its allocation retries as a loud,
+            // operator-actionable warning (merge has no automatic rollback yet -- see the service's javadoc).
+            new MetadataInPlaceMergeShardCommitService(settings, clusterService);
 
             // The service TransportInPlaceSplitShardAction actually calls to trigger a split --
             // previously constructed nowhere, making the whole in-place split feature unreachable
