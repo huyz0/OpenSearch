@@ -1748,3 +1748,133 @@ children during a split today? No — entirely absent.** This confirms tasks
 done. Proceeding to task 2/3 next (finish reading the test suites in
 isolation was folded into this pass) and then to the `AllocationService`
 design (tasks 5-6).
+
+## Correctness review — CC1/CC2/CC3
+
+A deep review of the shipped in-place split/merge feature turned up three real
+correctness/robustness gaps. Each is fixed below in its own commit, held to the same
+implement-then-break-the-test-to-prove-it discipline as everything above.
+
+### CC1 (HIGH) — write-during-split data loss window, FIXED
+
+The bug: during an in-progress split, ordinary indexing routes to the still-`STARTED`
+parent (`generateShardId` resolves children only when explicitly asked, which nothing in
+the write path does). Each child clones the parent's then-latest published manifest once,
+at its own recovery time. A document the parent acknowledged *after* a child had cloned
+but *before* the split committed lands only in a later parent manifest generation no child
+references, and becomes permanently unreachable the moment
+`MetadataInPlaceSplitShardCommitService` retires the parent's routing at commit. Silent
+data loss under continuous write load, not a documented tradeoff.
+
+The choice: reject-writes vs. real dual-write across the two engines. The review pointed
+at pre-existing dead scaffolding built for a dual-write path (`ShardRoutingState.SPLITTING`,
+four `ShardRouting` methods, `OperationRouting.shardWithRecoveringChild`, the
+`includeInProgressChildren=true` branch of `getShardIdOfHash`) and asked whether to wire it
+up or delete it. Grep confirmed it had zero non-test callers anywhere in the repo. I went
+with reject-writes: it closes the window with no synchronous cross-engine correctness to
+get subtly wrong mid-recovery, and the split's own design already accepts a recovery-time
+cost, so a short write-rejection window is an easy trade. This matches the session's
+established skepticism of clever engine-level cross-cutting mechanisms.
+
+The fix: `IndexShard.ensureWriteAllowed` now rejects a new primary write whenever this
+shard is the parent of an in-progress split
+(`getSplitShardsMetadata().isSplitOfShardInProgress(shardId)`), throwing
+`IllegalIndexShardStateException`. That is a shard-not-available exception
+(`TransportActions.isShardNotAvailableException`), so it is retriable exactly the way a
+relocating/closing shard's rejection already is: the write fails fast and succeeds once it
+re-routes to a committed child. All three write paths (index/delete/noop) funnel through
+`ensureWriteAllowed`, so the one guard covers them all; replica ops are untouched, since a
+rejected primary op never produces one.
+
+Having chosen reject-writes, I deleted the now-confirmed-dead dual-write scaffolding rather
+than leave it as an active lie about how routing behaves during a split
+(`ShardRoutingState.SPLITTING` + its `fromValue` case, `ShardRouting`'s
+`isSplitTarget`/`getParentShardId`/`getRecoveringChildShards`/`splitting` plus the
+`recoveringChildShards`/`parentShardId` transient fields and the collapsed 12-arg
+constructor, `OperationRouting.shardWithRecoveringChild`, and the `includeInProgressChildren`
+parameter threaded through `generateShardId`/`calculateShardIdOfChild`/`getShardIdOfHash`).
+The transient fields were never serialized and the `SPLITTING` state was never constructed
+in production, so the removal is mechanical dead-code deletion, not a wire-format change.
+`AllocationId.newSplit` was left in place: it is a self-contained, separately-tested factory,
+not part of the misleading write-routing surface, so deleting it would be scope creep.
+`ShardRoutingStateSplitTests` (which only exercised the deleted scaffolding) was removed;
+`SplitShardsMetadataTests`' two tests that asserted the deleted in-progress-child routing
+were rewritten to assert the real production behavior (an in-progress child is never a
+routing target; the hash resolves to the parent, or to the last committed child).
+
+Test: `IndexShardTests.testRejectsPrimaryWriteWhileInPlaceSplitInProgress` indexes a doc,
+marks the shard an in-progress split parent, and asserts both index and delete are rejected
+with a retriable shard-not-available exception. Verified real by commenting out the guard
+call: the test fails with "no exception was thrown." Swept
+`cluster.routing.*`/`cluster.metadata.*`/`action.bulk.*` clean.
+
+### CC2 (MEDIUM-HIGH) — hash filter ignored custom routing, FIXED
+
+The bug: core's real routing hash uses `effectiveRouting = routing != null ? routing : id`
+plus a `partitionOffset` for `routing_partition_size > 1`. The read-path filter
+(`InPlaceSplitPartitionFilter`, via `InPlaceSplitFilteringDirectoryReader`) hashed `_id`
+only. For any document indexed with a custom `_routing`, or on a partitioned index, a child
+bucketed by the wrong hash versus `OperationRouting` -- so a routed document could be
+search-visible on one child while GET-routed to the other.
+
+Two shapes, two fixes. `routing_partition_size` is an index-level setting, so it is blocked
+up front: `MetadataInPlaceSplitShardService` now rejects a split of any index with
+`index.routing_partition_size > 1` with a clear `IllegalArgumentException`, mirroring the
+existing virtual-shards precondition. The filter fundamentally cannot reproduce the
+per-document partition offset, so this is a hard limitation made explicit rather than a bug
+to paper over.
+
+Custom `_routing` is per-document and cannot be statically blocked. It turns out `_routing`
+*is* stored per-doc -- `RoutingFieldMapper` stores it whenever a document carries a routing
+value -- exactly as core's own `ShardSplittingQuery.Visitor` already reads it. So
+`AbstractIdFilteringDirectoryReader` now reads both `_id` (via `binaryField`) and `_routing`
+(via `stringField`) and hands both to the predicate; `InPlaceSplitFilteringDirectoryReader`
+hashes `effectiveRouting = routing != null ? routing : id`, reproducing `OperationRouting`
+exactly so search and GET agree. The predicate contract widened from `Predicate<String>` to
+`BiPredicate<String,String>` (id, routing); `PartitionFilteringDirectoryReader` (the
+pre-existing equal-partition copy mechanism, its own self-consistent scheme) ignores the
+routing argument, behavior unchanged.
+
+Tests: `InPlaceSplitFilteringDirectoryReaderTests.testFiltersByCustomRoutingNotId` indexes
+documents whose `_id`-hash and `_routing`-hash straddle the split point and asserts each is
+visible only in the range that owns its *routing* hash (with a guard that the fixture
+actually contains straddlers, so the test isn't vacuous). Verified real by reverting the
+filter to hash `_id`: it fails.
+`MetadataInPlaceSplitShardServiceTests.testApplySplitShardRequestThrowsIfRoutingPartitionSizeGreaterThanOne`
+asserts the precondition; verified real by disabling the check.
+
+### CC3 (MEDIUM) — merge had no rollback if the revived parent fails to recover, NARROWED
+
+The gap: `MetadataInPlaceMergeShardService.applyMergeShardRequest` de-commits the split and
+revives the parent as a single `UNASSIGNED` primary in one atomic update. If that primary
+then exhausts its allocation-retry budget, the shard is left permanently red with no
+automatic path back. Split has a symmetric rollback for exactly this
+(`MetadataInPlaceSplitShardCommitService`'s `SHOULD_CANCEL` path), but a merge cannot reuse
+its shape: split watches a persistent `inProgressSplitShardIds` marker that survives the
+recovery window, while a merge erases every trace of the children from `SplitShardsMetadata`
+in the very update that revives the parent -- there is no "merge in progress" state left to
+drive an automatic re-split from.
+
+The honest scope call: a full automatic rollback *is* possible in principle -- the
+children's blob containers persist until GC and the revived parent's recovery source still
+carries their `ShardRange`s -- but it needs a genuinely new persistent "merge pending"
+concept in cluster state (a new field, its wire-format and XContent gating, and a
+commit/cancel driver that restores from a pre-merge snapshot). That is a feature-sized,
+serialization-touching change, exactly the kind this session has repeatedly declined to
+force in one pass. So CC3 lands the narrower fix the review explicitly allowed: make the
+failure loud and operator-actionable instead of silently stuck, and record automatic
+rollback as future work.
+
+The fix: `MetadataInPlaceMergeShardCommitService`, a cluster-manager `ClusterStateListener`
+modeled on the split commit service, detects the stuck condition -- an `UNASSIGNED` primary
+still carrying `InPlaceMergeShardRecoverySource` whose failed-allocation count has reached
+`index.allocation.max_retries` (the same threshold split's own commit service uses) -- and
+emits a distinct, de-duplicated WARN naming the parent, the retired children, and the fact
+that their data is still recoverable from their containers, with a concrete next step
+(retry via the reroute API's `retry_failed`). It fires once per stuck parent and re-arms if
+that parent later recovers. Wired in `Node` next to the split commit service.
+
+Test: `MetadataInPlaceMergeShardCommitServiceTests` covers detection (stuck vs.
+within-budget vs. a non-merge unassigned primary) and asserts the actionable WARN actually
+fires through the listener via `MockLogAppender`. Verified real by disabling the
+retry-exhaustion check: the detection tests fail.
