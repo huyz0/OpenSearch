@@ -1843,38 +1843,68 @@ filter to hash `_id`: it fails.
 `MetadataInPlaceSplitShardServiceTests.testApplySplitShardRequestThrowsIfRoutingPartitionSizeGreaterThanOne`
 asserts the precondition; verified real by disabling the check.
 
-### CC3 (MEDIUM) — merge had no rollback if the revived parent fails to recover, NARROWED
+### CC3 (MEDIUM) — merge now has a real automatic rollback if the revived parent fails to recover, FIXED
 
-The gap: `MetadataInPlaceMergeShardService.applyMergeShardRequest` de-commits the split and
-revives the parent as a single `UNASSIGNED` primary in one atomic update. If that primary
-then exhausts its allocation-retry budget, the shard is left permanently red with no
-automatic path back. Split has a symmetric rollback for exactly this
-(`MetadataInPlaceSplitShardCommitService`'s `SHOULD_CANCEL` path), but a merge cannot reuse
-its shape: split watches a persistent `inProgressSplitShardIds` marker that survives the
-recovery window, while a merge erases every trace of the children from `SplitShardsMetadata`
-in the very update that revives the parent -- there is no "merge in progress" state left to
-drive an automatic re-split from.
+The gap CC3 originally landed a narrower fix for: the old one-step
+`MetadataInPlaceMergeShardService.applyMergeShardRequest` de-committed the split and revived
+the parent as a single `UNASSIGNED` primary in the same atomic update. If that primary then
+exhausted its allocation-retry budget the shard was left permanently red, with only a loud
+WARN and no automatic path back. Split has a symmetric rollback for exactly this
+(`MetadataInPlaceSplitShardCommitService`'s `SHOULD_CANCEL` path), but the one-step merge
+couldn't reuse its shape: split watches a persistent `inProgressSplitShardIds` marker that
+survives the recovery window, while the one-step merge erased every trace of the children in
+the very update that revived the parent, leaving no "merge in progress" state to roll back
+from. The original CC3 commit made that failure loud and operator-actionable and deferred the
+real rollback.
 
-The honest scope call: a full automatic rollback *is* possible in principle -- the
-children's blob containers persist until GC and the revived parent's recovery source still
-carries their `ShardRange`s -- but it needs a genuinely new persistent "merge pending"
-concept in cluster state (a new field, its wire-format and XContent gating, and a
-commit/cancel driver that restores from a pre-merge snapshot). That is a feature-sized,
-serialization-touching change, exactly the kind this session has repeatedly declined to
-force in one pass. So CC3 lands the narrower fix the review explicitly allowed: make the
-failure loud and operator-actionable instead of silently stuck, and record automatic
-rollback as future work.
+This lands the deferred rollback by making merge a genuine two-phase operation, symmetric to
+split's split/commit:
 
-The fix: `MetadataInPlaceMergeShardCommitService`, a cluster-manager `ClusterStateListener`
-modeled on the split commit service, detects the stuck condition -- an `UNASSIGNED` primary
-still carrying `InPlaceMergeShardRecoverySource` whose failed-allocation count has reached
-`index.allocation.max_retries` (the same threshold split's own commit service uses) -- and
-emits a distinct, de-duplicated WARN naming the parent, the retired children, and the fact
-that their data is still recoverable from their containers, with a concrete next step
-(retry via the reroute API's `retry_failed`). It fires once per stuck parent and re-arms if
-that parent later recovers. Wired in `Node` next to the split commit service.
+**Phase 1 (initiate).** `applyMergeShardRequest` no longer destroys anything. It calls the new
+`SplitShardsMetadata.Builder.startMergeChildrenToParent`, which validates the same split-level
+preconditions the old `mergeChildrenBackToParent` did but only records the parent in a new
+`inProgressMergeParentShardIds` set (the exact mirror of `inProgressSplitShardIds`). The
+children stay recorded in `parentToChildShards`/`rootShardsToAllChildren`/`activeShardIds`,
+keep their routing entries, and keep owning their hash ranges, so they go on serving reads and
+writes. The parent is still revived as one `UNASSIGNED` primary with
+`InPlaceMergeShardRecoverySource` carrying the children's `ShardRange`s.
 
-Test: `MetadataInPlaceMergeShardCommitServiceTests` covers detection (stuck vs.
-within-budget vs. a non-merge unassigned primary) and asserts the actionable WARN actually
-fires through the listener via `MockLogAppender`. Verified real by disabling the
-retry-exhaustion check: the detection tests fail.
+**Phase 2 (commit or cancel).** `MetadataInPlaceMergeShardCommitService` is rebuilt from the
+CC3 warn-only listener into the real commit/cancel driver, structurally identical to
+`MetadataInPlaceSplitShardCommitService`. On every cluster-state change, for each pending merge
+it reads the revived parent primary's routing state: `STARTED` means commit (now, and only now,
+call `mergeChildrenBackToParent` to actually remove the children and retire their routing, in
+the same update the parent takes over the range, so the range is owned by exactly one
+search-visible shard across the boundary); retry-exhausted (`getNumFailedAllocations() >=
+index.allocation.max_retries`, the same threshold split uses) means cancel, which drops just the
+pending marker via the new `Builder.cancelMerge` and removes the parent's dead routing entry.
+Because phase 1 never removed the children, cancel is a lossless rollback: they are still
+active, routed, and range-owning, so the shard range is fully servable through them again. The
+externally visible contract of `POST /{index}/_merge_in_place/{parent_shard_id}` is unchanged
+(submit acks on initiation, exactly as split does; the commit/cancel is async), so no
+action/transport/REST changes were needed.
+
+**Write-during-merge safety (symmetric to CC1).** Because the children now stay live during the
+parent's recovery, a document a child acknowledges after the parent snapshotted it but before
+commit would be lost when the children are retired. `IndexShard.ensureNotInProgressMergeChild`
+rejects primary writes to a still-live merge child with the same retriable shard-not-available
+exception CC1's split-parent guard uses, closing that window; the write succeeds once it
+re-routes to the merged parent (or, on rollback, to the child again).
+
+**Wire format.** `inProgressMergeParentShardIds` is gated on `Version.V_3_8_0` and appended
+after `splitCommitTimestamps` in the stream, following that field's exact pattern. A pending
+merge only ever exists in a uniform-version cluster (the merge service rejects a merge unless
+every node is on the same version), so a mixed-version rolling upgrade never carries this state;
+an older peer that somehow received the blob drops the marker (empty set), the safe read.
+
+Tests. `SplitShardsMetadataTests` covers the pending-merge state machine (start/commit/cancel
+transitions, and that cancel restores metadata `equals` to the pre-merge snapshot), plus wire
+and XContent round-trips and the pre-`V_3_8_0` drop. `MetadataInPlaceMergeShardCommitServiceTests`
+covers the commit-finalizes and the rollback paths; the rollback test is the real one, not
+tautological: it drives an exhausted revived parent through the same `evaluateMergeCompletion`
+detection the live listener uses, cancels, then asserts real serviceability by sweeping 5000
+ids through `OperationRouting.generateShardId` and requiring every one to resolve to a live
+child (never the dead parent, and both children exercised). `IndexShardTests` covers the write
+guard, and `InPlaceMergeRealRerouteTests` drives phase 1 -> real allocation -> commit end to
+end. Verified real by breaking the cancel-trigger condition (`if (false && ...)`): the rollback
+test goes red with `expected SHOULD_CANCEL but was STILL_IN_PROGRESS`; restored, green again.
