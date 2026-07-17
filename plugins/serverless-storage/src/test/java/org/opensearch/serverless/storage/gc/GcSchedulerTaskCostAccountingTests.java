@@ -96,17 +96,28 @@ public class GcSchedulerTaskCostAccountingTests extends OpenSearchTestCase {
         BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(countingContainer);
         DurablePinRegistry pinRegistry = new BlobContainerDurablePinRegistry(countingContainer);
 
-        GcSchedulerConfig config = new GcSchedulerConfig(
-            TimeValue.timeValueMinutes(5),
-            TimeValue.timeValueMinutes(1).millis(),
-            manifestStore,
-            bundleStore,
-            pinRegistry
-        );
+        long retentionWindowMillis = TimeValue.timeValueMinutes(1).millis();
+        GcSchedulerConfig config = new GcSchedulerConfig(TimeValue.timeValueMinutes(5), retentionWindowMillis, manifestStore, bundleStore, pinRegistry);
         ThreadPool threadPool = new TestThreadPool(getTestName());
         try {
-            GcSchedulerTask task = new GcSchedulerTask(threadPool, config.interval(), INDEX_UUID, SHARD_ID, config);
+            // Bundles now get their own sustained-observation safety window on top of the manifest
+            // retention window (GcSchedulerTask's own javadoc explains why), so this test drives a
+            // controllable clock across two ticks: the first deletes the manifests (one batched
+            // request) and merely observes their now-orphaned bundles; the second, after the window
+            // elapses, deletes the bundles (one more batched request). The combined two-tick cost is
+            // still flat regardless of deletableGenerationCount -- that's what this test proves.
+            long[] clockMillis = { now };
+            GcSchedulerTask task = new GcSchedulerTask(
+                threadPool,
+                config.interval(),
+                INDEX_UUID,
+                SHARD_ID,
+                config,
+                () -> clockMillis[0]
+            );
             try {
+                task.sweepForTesting();
+                clockMillis[0] = now + retentionWindowMillis + 1;
                 task.sweepForTesting();
             } finally {
                 task.close();
@@ -120,8 +131,8 @@ public class GcSchedulerTaskCostAccountingTests extends OpenSearchTestCase {
             assertEquals(
                 "deleting "
                     + deletableGenerationCount
-                    + " manifests and their bundles must cost exactly 2 DELETE-shaped requests (one batched "
-                    + "bundle delete, one batched manifest delete) -- got "
+                    + " manifests and their bundles across the two ticks must cost exactly 2 DELETE-shaped "
+                    + "requests total (one batched bundle delete, one batched manifest delete) -- got "
                     + counter.deleteCount()
                     + ", the sweep likely started issuing one delete per item instead of a batch",
                 2L,

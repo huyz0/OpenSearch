@@ -101,32 +101,27 @@ public class GcSchedulerTaskChaosTests extends OpenSearchTestCase {
         BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(faultyContainer);
         DurablePinRegistry pinRegistry = new BlobContainerDurablePinRegistry(faultyContainer);
 
+        long retentionWindowMillis = TimeValue.timeValueMinutes(1).millis();
         GcSchedulerConfig config = new GcSchedulerConfig(
             TimeValue.timeValueMinutes(5),
-            TimeValue.timeValueMinutes(1).millis(),
+            retentionWindowMillis,
             manifestStore,
             bundleStore,
             pinRegistry
         );
         ThreadPool threadPool = new TestThreadPool(getTestName());
         try {
-            GcSchedulerTask task = new GcSchedulerTask(threadPool, config.interval(), INDEX_UUID, SHARD_ID, config);
+            // Bundles now get their own sustained-observation safety window on top of the manifest
+            // retention window (GcSchedulerTask's own javadoc explains why), so convergence here takes
+            // two converged passes: the first deletes the manifests and merely observes their
+            // now-orphaned bundles; the second, after the window elapses, deletes the bundles. Each
+            // pass is retried past injected faults exactly as before.
+            long[] clockMillis = { now };
+            GcSchedulerTask task = new GcSchedulerTask(threadPool, config.interval(), INDEX_UUID, SHARD_ID, config, () -> clockMillis[0]);
             try {
-                // A single sweepForTesting() call may itself only partially complete under chaos
-                // (e.g. the bundle delete succeeds but the manifest delete faults) -- retrying the
-                // whole sweep is always safe (see this class's own javadoc), so keep sweeping until
-                // one full pass completes with no fault at all, then convergence is guaranteed.
-                IOException lastFailure = null;
-                boolean converged = false;
-                for (int attempt = 0; attempt < MAX_ATTEMPTS && converged == false; attempt++) {
-                    try {
-                        task.sweepForTesting();
-                        converged = true;
-                    } catch (IOException e) {
-                        lastFailure = e;
-                    }
-                }
-                assertTrue("sweep must eventually complete a full pass once retried past any injected faults: " + lastFailure, converged);
+                sweepUntilOneFullPassConverges(task);
+                clockMillis[0] = now + retentionWindowMillis + 1;
+                sweepUntilOneFullPassConverges(task);
             } finally {
                 task.close();
             }
@@ -157,5 +152,24 @@ public class GcSchedulerTaskChaosTests extends OpenSearchTestCase {
         } finally {
             ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
         }
+    }
+
+    /**
+     * A single {@code sweepForTesting()} call may itself only partially complete under chaos (e.g.
+     * the bundle delete succeeds but the manifest delete faults) -- retrying the whole sweep is
+     * always safe (see this class's own javadoc), so keep sweeping until one full pass completes
+     * with no fault at all, then that pass's convergence is guaranteed.
+     */
+    private void sweepUntilOneFullPassConverges(GcSchedulerTask task) throws IOException {
+        IOException lastFailure = null;
+        for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+            try {
+                task.sweepForTesting();
+                return;
+            } catch (IOException e) {
+                lastFailure = e;
+            }
+        }
+        fail("sweep must eventually complete a full pass once retried past any injected faults: " + lastFailure);
     }
 }

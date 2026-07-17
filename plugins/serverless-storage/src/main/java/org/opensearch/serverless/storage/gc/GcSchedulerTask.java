@@ -19,8 +19,12 @@ import org.opensearch.threadpool.ThreadPool;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.function.LongSupplier;
 
 /**
  * Runs the GC sweep (rfc-serverless-opensearch.md &sect;6.5) on a fixed schedule for one shard --
@@ -45,6 +49,18 @@ import java.util.Set;
  * 5&nbsp;s poll interval), so a reader that is merely slow to advance is never at risk of having its
  * currently-open generation deleted out from under it.
  *
+ * <p>Bundles get their own, separate safety window (as required by {@link
+ * BundleReferenceCounter#computeDeletableBundles}'s own javadoc): the manifest list and the bundle
+ * list are two independent snapshots taken at different instants during {@link #sweep()}, so a
+ * bundle written and referenced by a manifest published in between can look orphaned this tick even
+ * though it is not. Rather than deleting a bundle the first tick it looks unreferenced, this task
+ * tracks, per bundle name, when it was <em>first</em> continuously observed as unreferenced
+ * ({@link #firstObservedOrphanedAtMillis}) and only deletes it once that has held for a full {@code
+ * retentionWindowMillis} -- any manifest publish racing a sweep is picked up as soon as the very next
+ * tick, which is always far inside that window given the poll/sweep cadence this class already
+ * assumes elsewhere in this javadoc, removing the bundle from consideration before it can ever reach
+ * the threshold.
+ *
  * <p>Bundles are deleted before the manifests that stopped referencing them, never the reverse --
  * see {@code BlobContainerManifestStore#deleteManifests}'s own javadoc for why that ordering is what
  * makes a mid-sweep crash merely retry-safe rather than bundle-orphaning.
@@ -62,7 +78,15 @@ public final class GcSchedulerTask implements Closeable {
     private final BlobContainerBundleStore bundleStore;
     private final DurablePinRegistry pinRegistry;
     private final long retentionWindowMillis;
+    private final LongSupplier clock;
     private final Scheduler.Cancellable task;
+
+    // Node-local, in-memory, reset on restart -- same "best-effort hint, not a correctness
+    // dependency" status as the lease-pin tier this class's own javadoc already disclaims.
+    // A bundle only becomes deletable once it has been continuously observed as unreferenced
+    // (by every sweep in between) for at least retentionWindowMillis: see the safety-window note
+    // added below.
+    private final Map<String, Long> firstObservedOrphanedAtMillis = new HashMap<>();
 
     /**
      * Schedules a recurring GC sweep for one shard.
@@ -77,12 +101,25 @@ public final class GcSchedulerTask implements Closeable {
      * @param config the shard's manifest/bundle stores, pin registry, and retention window.
      */
     public GcSchedulerTask(ThreadPool threadPool, TimeValue interval, String indexUuid, int shardId, GcSchedulerConfig config) {
+        this(threadPool, interval, indexUuid, shardId, config, System::currentTimeMillis);
+    }
+
+    /** Test-only visibility: lets tests control time instead of waiting out a real retention window. */
+    GcSchedulerTask(
+        ThreadPool threadPool,
+        TimeValue interval,
+        String indexUuid,
+        int shardId,
+        GcSchedulerConfig config,
+        LongSupplier clock
+    ) {
         this.indexUuid = indexUuid;
         this.shardId = shardId;
         this.manifestStore = config.manifestStore();
         this.bundleStore = config.bundleStore();
         this.pinRegistry = config.pinRegistry();
         this.retentionWindowMillis = config.retentionWindowMillis();
+        this.clock = clock;
         this.task = threadPool.scheduleWithFixedDelay(this::sweepSafely, JitteredScheduling.jitter(interval), ThreadPool.Names.GENERIC);
     }
 
@@ -109,10 +146,11 @@ public final class GcSchedulerTask implements Closeable {
             Set.of(),
             durablyPinnedManifests
         );
-        if (deletableManifests.isEmpty()) {
-            return;
-        }
 
+        // Deliberately NOT an early return when deletableManifests is empty: a bundle already
+        // mid-observation from an earlier tick (see below) can become deletable on a tick that has
+        // no new manifest to delete, and must still be revisited -- an early return here would
+        // starve that bundle of ever getting its second look.
         List<CommitManifest> retainedManifests = ManifestRetentionPolicy.computeRetainedManifests(
             manifests,
             retentionCutoffMillis,
@@ -121,12 +159,34 @@ public final class GcSchedulerTask implements Closeable {
         );
         Set<String> liveBundles = BundleReferenceCounter.computeLiveBundles(retainedManifests);
         Set<String> allKnownBundles = bundleStore.listBundleNames();
-        Set<String> deletableBundles = BundleReferenceCounter.computeDeletableBundles(allKnownBundles, liveBundles);
+        Set<String> orphanCandidateBundles = BundleReferenceCounter.computeDeletableBundles(allKnownBundles, liveBundles);
+
+        // BundleReferenceCounter#computeDeletableBundles's own javadoc requires a safety delay before
+        // actually deleting: a bundle can be written and referenced by a manifest published after this
+        // sweep's manifest-list snapshot (taken above) but before this sweep's bundle-list snapshot
+        // (taken above too) -- that bundle looks orphaned this tick even though a commit that references
+        // it is landing concurrently. Requiring a bundle to be observed as an orphan candidate on every
+        // sweep for a full retentionWindowMillis before it is actually deleted closes that window: any
+        // manifest publish racing a sweep is picked up by the very next tick (well inside the window),
+        // which removes the bundle from firstObservedOrphanedAtMillis before it ever reaches the
+        // sustained-orphan threshold.
+        long now = clock.getAsLong();
+        firstObservedOrphanedAtMillis.keySet().retainAll(orphanCandidateBundles);
+        Set<String> deletableBundles = new HashSet<>();
+        for (String bundle : orphanCandidateBundles) {
+            Long firstObserved = firstObservedOrphanedAtMillis.get(bundle);
+            if (firstObserved == null) {
+                firstObservedOrphanedAtMillis.put(bundle, now);
+            } else if (now - firstObserved >= retentionWindowMillis) {
+                deletableBundles.add(bundle);
+            }
+        }
 
         // Bundles before manifests -- see this class's own javadoc for why that ordering, not the
         // reverse, is what keeps a mid-sweep crash merely retry-safe.
         bundleStore.deleteBundles(deletableBundles);
         manifestStore.deleteManifests(deletableManifests);
+        firstObservedOrphanedAtMillis.keySet().removeAll(deletableBundles);
     }
 
     /** Invokes {@link #sweep()} synchronously, rather than waiting out the scheduled interval -- test-only visibility. */

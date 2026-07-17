@@ -96,15 +96,23 @@ public class GcSchedulerTaskTests extends OpenSearchTestCase {
         // gen 3: the current latest -- must always survive regardless of age (nothing newer exists).
         CommitManifest gen3 = writeGeneration(3, farInThePast);
 
+        long retentionWindowMillis = TimeValue.timeValueMinutes(1).millis();
         GcSchedulerConfig config = new GcSchedulerConfig(
             TimeValue.timeValueMinutes(5),
-            TimeValue.timeValueMinutes(1).millis(),
+            retentionWindowMillis,
             manifestStore,
             bundleStore,
             pinRegistry
         );
-        GcSchedulerTask task = new GcSchedulerTask(threadPool, config.interval(), INDEX_UUID, SHARD_ID, config);
+        // A bundle only becomes deletable once it has been continuously observed as unreferenced
+        // for a full retentionWindowMillis (see GcSchedulerTask's own javadoc for why) -- so this
+        // test drives a controllable clock: one sweep to observe gen 1's bundle as newly orphaned,
+        // then advance well past the window and sweep again to actually delete it.
+        long[] clockMillis = { now };
+        GcSchedulerTask task = new GcSchedulerTask(threadPool, config.interval(), INDEX_UUID, SHARD_ID, config, () -> clockMillis[0]);
         try {
+            task.sweepForTesting();
+            clockMillis[0] = now + retentionWindowMillis + 1;
             task.sweepForTesting();
 
             List<CommitManifest> remaining = manifestStore.listManifests();
@@ -279,29 +287,38 @@ public class GcSchedulerTaskTests extends OpenSearchTestCase {
         CommitManifest gen2 = writeGeneration(2, farInThePast);
 
         FaultInjectingBlobContainer faultyContainer = new FaultInjectingBlobContainer(blobContainer, 1);
+        long retentionWindowMillis = TimeValue.timeValueMinutes(1).millis();
         GcSchedulerConfig config = new GcSchedulerConfig(
             TimeValue.timeValueMinutes(5),
-            TimeValue.timeValueMinutes(1).millis(),
+            retentionWindowMillis,
             new BlobContainerManifestStore(faultyContainer),
             new BlobContainerBundleStore(faultyContainer),
             pinRegistry
         );
-        GcSchedulerTask task = new GcSchedulerTask(threadPool, config.interval(), INDEX_UUID, SHARD_ID, config);
+        long[] clockMillis = { System.currentTimeMillis() };
+        GcSchedulerTask task = new GcSchedulerTask(threadPool, config.interval(), INDEX_UUID, SHARD_ID, config, () -> clockMillis[0]);
         try {
-            // First attempt: the injected fault fires on the bundle-delete step (the first
-            // deleteBlobsIgnoringIfNotExists call sweep() makes) and must surface, not be silently
-            // swallowed at this level -- sweepForTesting() (unlike the real scheduled sweepSafely())
-            // deliberately propagates so this test can observe it.
+            // First attempt: gen 1's manifest is already past the (real-clock-based) manifest
+            // retention window, so the manifest delete is attempted -- and is where the injected
+            // fault fires -- but gen 1's bundle is only just now being observed as orphaned (the
+            // bundle-side safety window hasn't elapsed yet), so there is nothing for the fault to
+            // have fired on there. The fault must surface, not be silently swallowed at this level --
+            // sweepForTesting() (unlike the real scheduled sweepSafely()) deliberately propagates so
+            // this test can observe it.
             expectThrows(java.io.IOException.class, task::sweepForTesting);
 
-            // State must be untouched by the failed attempt: the fault fired before either delete
+            // State must be untouched by the failed attempt: the fault fired before the delete
             // actually reached the real underlying container.
             List<CommitManifest> afterFailedAttempt = manifestStore.listManifests();
             assertEquals("a failed sweep attempt must not have deleted anything", 2, afterFailedAttempt.size());
             assertTrue(bundleStore.listBundleNames().contains(gen1.referencedBundles().iterator().next()));
 
-            // Retrying (exactly what the real scheduled task's own periodic tick does naturally)
-            // now succeeds cleanly, since the injected failure budget is exhausted.
+            // Retrying (exactly what the real scheduled task's own periodic tick does naturally) now
+            // succeeds cleanly, since the injected failure budget is exhausted -- but gen 1's bundle
+            // still needs its own safety window to elapse (it was first observed as orphaned during
+            // the failed attempt above) before it is actually deleted, same as the non-fault-injected
+            // sweep test.
+            clockMillis[0] += retentionWindowMillis + 1;
             task.sweepForTesting();
 
             List<CommitManifest> remaining = manifestStore.listManifests();
@@ -344,6 +361,81 @@ public class GcSchedulerTaskTests extends OpenSearchTestCase {
             List<CommitManifest> remaining = manifestStore.listManifests();
             assertEquals("nothing should have been deleted -- everything is within the retention window", 2, remaining.size());
             assertTrue(remaining.stream().anyMatch(m -> m.generation() == gen1.generation()));
+        } finally {
+            task.close();
+        }
+    }
+
+    /**
+     * Regression test for the write-vs-GC race BundleReferenceCounter#computeDeletableBundles's own
+     * javadoc warns about: the manifest list and the bundle list are two independent snapshots taken
+     * at different instants during one sweep. A bundle written and referenced by a manifest published
+     * in between looks orphaned to that sweep even though it is not. Proves the sustained-observation
+     * window (this task's own fix for that gap) actually closes it: a bundle observed as an orphan
+     * candidate on one tick, then referenced again by a fresh manifest before the window elapses, must
+     * never be deleted -- exactly the concurrent-commit-during-sweep scenario, driven directly rather
+     * than via real thread timing.
+     */
+    public void testOrphanCandidateThatBecomesReferencedAgainDuringTheSafetyWindowSurvives() throws Exception {
+        long now = System.currentTimeMillis();
+        long farInThePast = now - TimeValue.timeValueDays(1).millis();
+
+        // gen 1: superseded, unpinned, far past the manifest retention window -- its bundle looks
+        // orphaned as soon as gen 2 supersedes it.
+        CommitManifest gen1 = writeGeneration(1, farInThePast);
+        writeGeneration(2, farInThePast);
+        String gen1Bundle = gen1.referencedBundles().iterator().next();
+
+        long retentionWindowMillis = TimeValue.timeValueMinutes(1).millis();
+        GcSchedulerConfig config = new GcSchedulerConfig(
+            TimeValue.timeValueMinutes(5),
+            retentionWindowMillis,
+            manifestStore,
+            bundleStore,
+            pinRegistry
+        );
+        long[] clockMillis = { now };
+        GcSchedulerTask task = new GcSchedulerTask(threadPool, config.interval(), INDEX_UUID, SHARD_ID, config, () -> clockMillis[0]);
+        try {
+            // Tick 1: gen 1's manifest is already deleted (real manifest-retention path, unaffected by
+            // the bundle-side window), but gen 1's bundle is merely observed as a fresh orphan
+            // candidate, not yet deleted.
+            task.sweepForTesting();
+            assertTrue(
+                "gen 1's bundle must still exist after only being freshly observed as an orphan candidate",
+                bundleStore.listBundleNames().contains(gen1Bundle)
+            );
+
+            // Simulate a concurrent commit landing between ticks: a brand-new generation is published
+            // that reuses gen 1's bundle by reference (e.g. a zero-copy clone or a compaction rebase
+            // that still needs gen 1's segment files) -- exactly the kind of manifest publish that can
+            // race a sweep's two independent snapshots.
+            CommitManifest gen3ReferencingGen1Bundle = new CommitManifest(
+                INDEX_UUID,
+                SHARD_ID,
+                PRIMARY_TERM,
+                3,
+                gen1.segmentsFileName(),
+                gen1.files(),
+                0,
+                0,
+                null,
+                0,
+                PruningStats.empty(),
+                now
+            );
+            manifestStore.writeManifest(gen3ReferencingGen1Bundle);
+
+            // Tick 2: even though the window has now elapsed since gen 1's bundle was first observed
+            // as an orphan candidate, it is live again (referenced by gen 3) -- it must survive, not
+            // be deleted just because enough wall-clock time passed since a now-stale observation.
+            clockMillis[0] = now + retentionWindowMillis + 1;
+            task.sweepForTesting();
+
+            assertTrue(
+                "a bundle referenced again before the safety window elapsed must never be deleted",
+                bundleStore.listBundleNames().contains(gen1Bundle)
+            );
         } finally {
             task.close();
         }

@@ -100,9 +100,10 @@ public class ObjectStoreOutageRecoveryChaosTests extends OpenSearchTestCase {
         BlobContainerBundleStore bundleStore = new BlobContainerBundleStore(outageContainer);
         BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(outageContainer);
         DurablePinRegistry pinRegistry = new BlobContainerDurablePinRegistry(outageContainer);
+        long retentionWindowMillis = TimeValue.timeValueMinutes(1).millis();
         GcSchedulerConfig config = new GcSchedulerConfig(
             TimeValue.timeValueMinutes(5),
-            TimeValue.timeValueMinutes(1).millis(),
+            retentionWindowMillis,
             manifestStore,
             bundleStore,
             pinRegistry
@@ -110,7 +111,13 @@ public class ObjectStoreOutageRecoveryChaosTests extends OpenSearchTestCase {
 
         ThreadPool threadPool = new TestThreadPool(getTestName());
         try {
-            GcSchedulerTask task = new GcSchedulerTask(threadPool, config.interval(), INDEX_UUID, SHARD_ID, config);
+            // Bundles now get their own sustained-observation safety window (GcSchedulerTask's own
+            // javadoc explains why), so this test drives a controllable clock: one recovery sweep to
+            // observe gen 1's bundle as newly orphaned, then advance well past the window and sweep
+            // again to actually delete it -- otherwise "the bundle is gone" would never converge in
+            // this test's single post-outage sweep.
+            long[] clockMillis = { now };
+            GcSchedulerTask task = new GcSchedulerTask(threadPool, config.interval(), INDEX_UUID, SHARD_ID, config, () -> clockMillis[0]);
             try {
                 outage.set(true);
                 expectThrows(IOException.class, task::sweepForTesting);
@@ -130,6 +137,8 @@ public class ObjectStoreOutageRecoveryChaosTests extends OpenSearchTestCase {
                 );
 
                 outage.set(false);
+                task.sweepForTesting();
+                clockMillis[0] = now + retentionWindowMillis + 1;
                 task.sweepForTesting();
             } finally {
                 task.close();
