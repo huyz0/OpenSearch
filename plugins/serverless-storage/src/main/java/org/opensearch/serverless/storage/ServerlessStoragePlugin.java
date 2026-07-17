@@ -794,6 +794,58 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * Turns WAL mirroring's per-operation object-store PUT into a real group-commit batch
+     * (rfc-serverless-opensearch.md &sect;6.4's cost-sanity argument). When {@code false} (the
+     * default), every writer shard's {@code WalMirroringTranslog#add} keeps flushing its record to
+     * the object store synchronously before returning -- roughly one PUT per document, the reason
+     * {@link #SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING} itself defaults off. When {@code
+     * true}, records from every shard on the node are instead enqueued onto one shared {@code
+     * WalBatchingProcessor} (a {@link org.opensearch.common.util.concurrent.BufferedAsyncIOProcessor},
+     * the same group-commit primitive core's own {@code RemoteFsTranslog} uses) that drains them
+     * into one chunk per {@link #SERVERLESS_STORAGE_WAL_FLUSH_INTERVAL_SETTING} tick, and whether a
+     * client's write waits for that upload is governed by the standard, already-dynamic {@code
+     * index.translog.durability} ({@code REQUEST} waits, {@code ASYNC} does not) -- no plugin-specific
+     * "wait or not" knob is added. Default off: this reshapes the durability-critical write path and
+     * has no production load-testing behind it yet, so flipping the default is a deliberately separate
+     * later decision.
+     */
+    public static final Setting<Boolean> SERVERLESS_STORAGE_WAL_FLUSH_BATCHING_ENABLED_SETTING = Setting.boolSetting(
+        "serverless_storage.wal_flush.batching.enabled",
+        false,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * The group-commit buffer interval fed to the shared {@code WalBatchingProcessor} when {@link
+     * #SERVERLESS_STORAGE_WAL_FLUSH_BATCHING_ENABLED_SETTING} is on -- the maximum time a record
+     * waits in the queue before the next drain writes it (and every other record enqueued in the
+     * same window) into one chunk. Ignored entirely when batching is off. Defaults to {@code 200ms},
+     * the middle of rfc-serverless-opensearch.md's 100--250ms target, mirroring how {@code
+     * index.remote_store.translog.buffer_interval} feeds core's own {@link
+     * org.opensearch.common.util.concurrent.BufferedAsyncIOProcessor} usage.
+     */
+    public static final Setting<TimeValue> SERVERLESS_STORAGE_WAL_FLUSH_INTERVAL_SETTING = Setting.timeSetting(
+        "serverless_storage.wal_flush.interval",
+        TimeValue.timeValueMillis(200),
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * The bounded capacity of the shared {@code WalBatchingProcessor}'s queue when {@link
+     * #SERVERLESS_STORAGE_WAL_FLUSH_BATCHING_ENABLED_SETTING} is on -- the batching layer's own
+     * backpressure: once full, an enqueuing shard's thread blocks until the next drain frees space,
+     * the same {@link java.util.concurrent.ArrayBlockingQueue} bound core already relies on for
+     * local/remote translog sync backpressure, reused as-is rather than building a bespoke
+     * byte-threshold trigger. Ignored entirely when batching is off.
+     */
+    public static final Setting<Integer> SERVERLESS_STORAGE_WAL_FLUSH_QUEUE_CAPACITY_SETTING = Setting.intSetting(
+        "serverless_storage.wal_flush.queue_capacity",
+        10000,
+        1,
+        Setting.Property.NodeScope
+    );
+
+    /**
      * Minimum real time between two refresh-triggered publish attempts on any one writer shard
      * (rfc-serverless-opensearch.md &sect;8: "a per-index publication rate limit protect[s] against
      * that footgun" of a caller hammering {@code _refresh}, now that {@code api}/{@code
@@ -908,6 +960,12 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     // itself is no longer built eagerly here.
     private volatile boolean walMirroringEnabled;
     private volatile long walPerShardBudgetBytes;
+    // WAL group-commit batching config, read in createComponents (same "read the NodeScope setting
+    // where Environment is available" reasoning as walPerShardBudgetBytes above) and consumed lazily
+    // by resolveSharedWalChunkService() when it builds the shared WalBatchingProcessor.
+    private volatile boolean walFlushBatchingEnabled;
+    private volatile TimeValue walFlushInterval = TimeValue.timeValueMillis(200);
+    private volatile int walFlushQueueCapacity = 10000;
     // Guards resolveSharedWalChunkService()'s double-checked-locking build -- a plain Object, not
     // `this`, so a caller synchronizing on the plugin instance for an unrelated reason can never
     // accidentally contend with (or deadlock against) this specific lazy-init path.
@@ -995,6 +1053,9 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING,
             SERVERLESS_STORAGE_WAL_GC_INTERVAL_SETTING,
             SERVERLESS_STORAGE_WAL_PER_SHARD_BUDGET_SETTING,
+            SERVERLESS_STORAGE_WAL_FLUSH_BATCHING_ENABLED_SETTING,
+            SERVERLESS_STORAGE_WAL_FLUSH_INTERVAL_SETTING,
+            SERVERLESS_STORAGE_WAL_FLUSH_QUEUE_CAPACITY_SETTING,
             SERVERLESS_STORAGE_PUBLICATION_RATE_LIMIT_SETTING,
             SERVERLESS_STORAGE_LAZY_DIRECTORY_CACHE_SIZE_SETTING,
             SERVERLESS_STORAGE_LOCAL_CACHE_MAX_BYTES_PER_SHARD_SETTING,
@@ -1245,6 +1306,9 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         if (walMirroringEnabled) {
             walPerShardBudgetBytes = SERVERLESS_STORAGE_WAL_PER_SHARD_BUDGET_SETTING.get(environment.settings()).getBytes();
             walGcInterval = SERVERLESS_STORAGE_WAL_GC_INTERVAL_SETTING.get(environment.settings());
+            walFlushBatchingEnabled = SERVERLESS_STORAGE_WAL_FLUSH_BATCHING_ENABLED_SETTING.get(environment.settings());
+            walFlushInterval = SERVERLESS_STORAGE_WAL_FLUSH_INTERVAL_SETTING.get(environment.settings());
+            walFlushQueueCapacity = SERVERLESS_STORAGE_WAL_FLUSH_QUEUE_CAPACITY_SETTING.get(environment.settings());
         }
         // This plugin instance itself, so TransportShardCloneAction (the only consumer) can be
         // constructor-injected with it and reach blobContainerForDirectoryFactory -- the same
@@ -2216,6 +2280,32 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      */
     public long gcRetentionWindowMillis() {
         return gcRetentionWindowMillis;
+    }
+
+    /**
+     * Releases this node's WAL-related node-level components on plugin shutdown. Closes {@link
+     * #walGcSchedulerTask} -- until this override existed the plugin had no {@code close()} at all,
+     * so a live scheduled WAL GC sweep was simply left running with nothing to cancel it (harmless
+     * for correctness, since a skipped sweep only defers space reclamation, but a real resource leak
+     * this fixes in passing).
+     *
+     * <p>Deliberately does <em>not</em> force a final drain of the shared WAL group-commit processor:
+     * under {@code index.translog.durability=REQUEST} a write's WAL upload has already completed
+     * before that write was acknowledged (that is exactly what {@code WalMirroringTranslog#ensureSynced}
+     * waits for), so no acknowledged operation is ever stranded in the queue at shutdown; under
+     * {@code ASYNC}, an unsynced tail may be dropped on shutdown, which is precisely the
+     * durability-for-latency trade {@code ASYNC} already makes for core's own translog and is not
+     * weakened here. {@link org.opensearch.common.util.concurrent.BufferedAsyncIOProcessor} also
+     * exposes no cross-package synchronous-drain seam (its queue-drain internals are package-private),
+     * so a forced drain could not be implemented cleanly regardless, and correctness does not require
+     * one -- see this method's design note in the WAL section of {@code dynamic-partitioning-progress.md}.
+     */
+    @Override
+    public void close() throws IOException {
+        org.opensearch.serverless.storage.wal.WalGcSchedulerTask task = walGcSchedulerTask;
+        if (task != null) {
+            task.close();
+        }
     }
 
     /**

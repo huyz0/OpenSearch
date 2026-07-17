@@ -125,6 +125,21 @@ public final class WalChunkService implements WalAppendTarget {
     private static final int MAX_CAS_ATTEMPTS = 50;
 
     /**
+     * A transient object-store error writing one chunk should not fail the whole engine on the first
+     * blip: {@link #writeChunkWithRetry} retries this many times with a short linear backoff before
+     * giving up and propagating the failure. This is the retry policy that used to live in {@code
+     * WalMirroringTranslog#flushWithRetry} on the caller side, hoisted down to this layer so both the
+     * legacy per-operation {@link #flush}/{@link #overflowShardToDedicatedChunk} paths and the new
+     * group-commit batching path ({@code WalBatchingProcessor}) share exactly one retry
+     * implementation rather than each reimplementing it (or, as {@code overflowShardToDedicatedChunk}
+     * did before this, silently having none at all).
+     */
+    public static final int MAX_WRITE_ATTEMPTS = 3;
+
+    /** The linear backoff base between {@link #writeChunkWithRetry} attempts -- attempt <em>n</em> waits {@code RETRY_BASE_DELAY_MILLIS * n}. */
+    static final long RETRY_BASE_DELAY_MILLIS = 10;
+
+    /**
      * Atomically claims the next chunk sequence number, safe under any number of concurrent {@link
      * WalChunkService} instances (any number of nodes) sharing {@link #blobContainer}: retries the
      * compare-and-swap against whatever the register's current generation actually is until one
@@ -185,7 +200,7 @@ public final class WalChunkService implements WalAppendTarget {
         if (buffered.isEmpty()) {
             return -1;
         }
-        long chunkSequence = writeChunk(buffered);
+        long chunkSequence = writeChunkWithRetry(buffered);
         buffered.clear();
         bufferedBytesByShard.clear();
         return chunkSequence;
@@ -268,8 +283,44 @@ public final class WalChunkService implements WalAppendTarget {
         }
         bufferedBytesByShard.remove(key);
         if (shardRecords.isEmpty() == false) {
-            writeChunk(shardRecords);
+            writeChunkWithRetry(shardRecords);
         }
+    }
+
+    /**
+     * Writes {@code records} into one new chunk blob, retrying a bounded number of times with a
+     * short linear backoff (see {@link #MAX_WRITE_ATTEMPTS}) on a transient {@link IOException}
+     * before giving up and rethrowing -- never silently swallowed. Shared by the legacy
+     * per-operation {@link #flush}/{@link #overflowShardToDedicatedChunk} paths (which pass the
+     * shared buffer, under this service's own monitor) and the group-commit batching path
+     * ({@code WalBatchingProcessor#write}, which passes its own drained batch, off this monitor):
+     * writing a chunk needs no lock of its own since every attempt claims a fresh, globally-unique
+     * chunk sequence (see {@link #claimNextChunkSequence}) and writes a uniquely-named blob, so two
+     * concurrent writers never collide regardless of which path they came in on.
+     *
+     * @param records the records to group-commit into one chunk; a no-op returning {@code -1} if empty.
+     * @return the chunk sequence number written, or {@code -1} if {@code records} was empty.
+     */
+    long writeChunkWithRetry(List<WalRecord> records) throws IOException {
+        if (records.isEmpty()) {
+            return -1;
+        }
+        for (int attempt = 1; attempt <= MAX_WRITE_ATTEMPTS; attempt++) {
+            try {
+                return writeChunk(records);
+            } catch (IOException e) {
+                if (attempt == MAX_WRITE_ATTEMPTS) {
+                    throw e;
+                }
+                try {
+                    Thread.sleep(RETRY_BASE_DELAY_MILLIS * attempt);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw e;
+                }
+            }
+        }
+        throw new AssertionError("writeChunkWithRetry loop exited without returning or throwing");
     }
 
     private long writeChunk(List<WalRecord> records) throws IOException {

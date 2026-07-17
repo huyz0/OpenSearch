@@ -197,19 +197,18 @@ public class WalReplayRecoveryTests extends OpenSearchTestCase {
         Translog.Index op0 = new Translog.Index("doc0", 0, 1, "src0".getBytes("UTF-8"));
         service.append(new WalRecord("idx", 0, 1, 0, serialize(op0)));
 
-        // The killed attempt: claimNextChunkSequence() durably claims sequence 0, then writeBlob()
-        // is hit by the injected fault -- sequence 0 is now permanently orphaned.
-        expectThrows(IOException.class, service::flush);
+        // flush() now carries the bounded retry itself (WalChunkService#writeChunkWithRetry, hoisted
+        // down from WalMirroringTranslog#flushWithRetry): the first attempt's claimNextChunkSequence()
+        // durably claims sequence 0, then writeBlob() is hit by the injected fault, so sequence 0 is
+        // permanently orphaned; the internal retry then claims the *next* sequence rather than
+        // reusing the orphaned one and succeeds. (Before the retry was hoisted, this same orphan was
+        // instead produced by the caller calling flush() a second time after it threw once.)
+        long chunkSequence = service.flush();
+        assertEquals("the retry must claim a fresh sequence, never reuse the orphaned one", 1, chunkSequence);
         assertFalse(
             "a killed write must never leave a partial/torn blob behind",
             blobContainer.blobExists(WalChunkNaming.blobName("epoch-0", 0))
         );
-
-        // A retry (matching WalMirroringTranslog#flushWithRetry's own shape): flush() only clears
-        // the buffer on success, so the same record is still buffered and this must succeed,
-        // claiming the *next* sequence rather than reusing the orphaned one.
-        long chunkSequence = service.flush();
-        assertEquals("the retry must claim a fresh sequence, never reuse the orphaned one", 1, chunkSequence);
 
         List<Translog.Operation> operations = WalReplayRecovery.replayOperations(blobContainer, "idx", 0, 1, null, 2);
         assertEquals(

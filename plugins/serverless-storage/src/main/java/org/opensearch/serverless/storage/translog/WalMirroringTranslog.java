@@ -36,12 +36,13 @@ import java.util.function.LongSupplier;
 public class WalMirroringTranslog extends LocalTranslog {
 
     /**
-     * A transient object-store error mirroring one operation should not fail the whole engine on
-     * the first blip: retry a bounded number of times with a short backoff before giving up and
-     * propagating the failure to the caller.
+     * The bounded retry budget a transient object-store error mirroring one operation gets before
+     * the failure propagates to the caller. The retry policy itself now lives on {@link
+     * WalChunkService#writeChunkWithRetry} (shared with the group-commit batching path) rather than
+     * being reimplemented here; this alias is retained so existing tests asserting on the budget
+     * keep naming it from the caller's vantage point.
      */
-    static final int MAX_MIRROR_FLUSH_ATTEMPTS = 3;
-    static final long RETRY_BASE_DELAY_MILLIS = 10;
+    static final int MAX_MIRROR_FLUSH_ATTEMPTS = WalChunkService.MAX_WRITE_ATTEMPTS;
 
     private final WalAppendTarget walChunkService;
     private final String indexUuid;
@@ -107,7 +108,9 @@ public class WalMirroringTranslog extends LocalTranslog {
         // Flushing per-operation gives the same per-write durability guarantee a local translog
         // fsync gives; a deployment that wants real cross-shard group-commit batching would flush
         // WalChunkService on a timer/size threshold from a shared scheduler instead, independent
-        // of any single shard's Translog.
+        // of any single shard's Translog. WalChunkService#flush now applies the bounded
+        // retry-with-backoff itself (see #flushWithRetry's javadoc for why a transient blip here
+        // should not fail the whole engine), so this call already carries that policy.
         flushWithRetry();
         return location;
     }
@@ -131,29 +134,15 @@ public class WalMirroringTranslog extends LocalTranslog {
     /**
      * The operation is already durable in the local translog by the time this runs (see {@link
      * #add}), so a transient failure writing its WAL mirror chunk should not immediately fail the
-     * whole engine -- retry a few times first. {@link WalChunkService#flush} re-attempts writing
-     * everything currently buffered (not just this operation's record), so a retry here never
+     * whole engine -- {@link WalChunkService#flush} retries a few times first (see {@link
+     * WalChunkService#writeChunkWithRetry}, where that policy now lives). {@code flush} re-attempts
+     * writing everything currently buffered (not just this operation's record), so a retry never
      * loses or duplicates records: on success the buffer is drained exactly once.
      */
     private void flushWithRetry() throws IOException {
-        for (int attempt = 1; attempt <= MAX_MIRROR_FLUSH_ATTEMPTS; attempt++) {
-            try {
-                long chunkSequence = walChunkService.flush();
-                if (chunkSequence >= 0) {
-                    lastFlushedWalChunkSequence = chunkSequence;
-                }
-                return;
-            } catch (IOException e) {
-                if (attempt == MAX_MIRROR_FLUSH_ATTEMPTS) {
-                    throw e;
-                }
-                try {
-                    Thread.sleep(RETRY_BASE_DELAY_MILLIS * attempt);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    throw e;
-                }
-            }
+        long chunkSequence = walChunkService.flush();
+        if (chunkSequence >= 0) {
+            lastFlushedWalChunkSequence = chunkSequence;
         }
     }
 }
