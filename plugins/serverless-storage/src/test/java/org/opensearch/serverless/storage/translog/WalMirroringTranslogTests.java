@@ -96,6 +96,7 @@ public class WalMirroringTranslogTests extends OpenSearchTestCase {
             threadPool.getThreadContext(),
             threadPool,
             () -> org.opensearch.common.unit.TimeValue.timeValueMillis(50),
+            -1,
             service,
             null
         );

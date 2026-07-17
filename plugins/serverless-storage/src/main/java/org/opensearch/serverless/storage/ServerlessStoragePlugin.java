@@ -835,13 +835,28 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      * #SERVERLESS_STORAGE_WAL_FLUSH_BATCHING_ENABLED_SETTING} is on -- the batching layer's own
      * backpressure: once full, an enqueuing shard's thread blocks until the next drain frees space,
      * the same {@link java.util.concurrent.ArrayBlockingQueue} bound core already relies on for
-     * local/remote translog sync backpressure, reused as-is rather than building a bespoke
-     * byte-threshold trigger. Ignored entirely when batching is off.
+     * local/remote translog sync backpressure. Ignored entirely when batching is off.
      */
     public static final Setting<Integer> SERVERLESS_STORAGE_WAL_FLUSH_QUEUE_CAPACITY_SETTING = Setting.intSetting(
         "serverless_storage.wal_flush.queue_capacity",
         10000,
         1,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * The cumulative buffered-payload size at which the shared {@code WalBatchingProcessor} drains
+     * immediately instead of waiting for the next {@link #SERVERLESS_STORAGE_WAL_FLUSH_INTERVAL_SETTING}
+     * tick, when {@link #SERVERLESS_STORAGE_WAL_FLUSH_BATCHING_ENABLED_SETTING} is on. Complements the
+     * interval trigger for a write burst large enough that waiting out the rest of the interval would
+     * buffer an outsized batch in memory for no durability benefit. {@link ByteSizeValue#ZERO} (the
+     * default) disables this trigger, leaving batching purely interval-driven -- the byte threshold is
+     * an additive early-flush trigger, not a replacement for the interval, and the interval still fires
+     * on its own schedule regardless of this setting. Ignored entirely when batching is off.
+     */
+    public static final Setting<ByteSizeValue> SERVERLESS_STORAGE_WAL_FLUSH_BYTE_THRESHOLD_SETTING = Setting.byteSizeSetting(
+        "serverless_storage.wal_flush.byte_threshold",
+        ByteSizeValue.ZERO,
         Setting.Property.NodeScope
     );
 
@@ -966,6 +981,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     private volatile boolean walFlushBatchingEnabled;
     private volatile TimeValue walFlushInterval = TimeValue.timeValueMillis(200);
     private volatile int walFlushQueueCapacity = 10000;
+    private volatile long walFlushByteThreshold = 0;
     // The one node-shared group-commit processor, built and attached to sharedWalChunkService in
     // resolveSharedWalChunkService() only when batching is enabled; null otherwise (and never
     // attached to a dedicated-WAL-stream shard's own service, which keeps the legacy synchronous
@@ -1062,6 +1078,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_WAL_FLUSH_BATCHING_ENABLED_SETTING,
             SERVERLESS_STORAGE_WAL_FLUSH_INTERVAL_SETTING,
             SERVERLESS_STORAGE_WAL_FLUSH_QUEUE_CAPACITY_SETTING,
+            SERVERLESS_STORAGE_WAL_FLUSH_BYTE_THRESHOLD_SETTING,
             SERVERLESS_STORAGE_PUBLICATION_RATE_LIMIT_SETTING,
             SERVERLESS_STORAGE_LAZY_DIRECTORY_CACHE_SIZE_SETTING,
             SERVERLESS_STORAGE_LOCAL_CACHE_MAX_BYTES_PER_SHARD_SETTING,
@@ -1315,6 +1332,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             walFlushBatchingEnabled = SERVERLESS_STORAGE_WAL_FLUSH_BATCHING_ENABLED_SETTING.get(environment.settings());
             walFlushInterval = SERVERLESS_STORAGE_WAL_FLUSH_INTERVAL_SETTING.get(environment.settings());
             walFlushQueueCapacity = SERVERLESS_STORAGE_WAL_FLUSH_QUEUE_CAPACITY_SETTING.get(environment.settings());
+            walFlushByteThreshold = SERVERLESS_STORAGE_WAL_FLUSH_BYTE_THRESHOLD_SETTING.get(environment.settings()).getBytes();
         }
         // This plugin instance itself, so TransportShardCloneAction (the only consumer) can be
         // constructor-injected with it and reach blobContainerForDirectoryFactory -- the same
@@ -1786,6 +1804,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                         threadPool.getThreadContext(),
                         threadPool,
                         () -> walFlushInterval,
+                        walFlushByteThreshold,
                         built,
                         encryptionKeyProvider
                     );

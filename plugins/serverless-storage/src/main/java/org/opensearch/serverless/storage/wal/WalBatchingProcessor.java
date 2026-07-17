@@ -67,6 +67,14 @@ public final class WalBatchingProcessor extends BufferedAsyncIOProcessor<WalReco
     private volatile long lastWrittenChunkSequence = -1;
 
     /**
+     * The cumulative buffered-payload size at which a drain is triggered immediately instead of
+     * waiting for the next interval tick; non-positive disables this early-flush trigger, leaving
+     * batching purely interval-driven. See {@code
+     * ServerlessStoragePlugin#SERVERLESS_STORAGE_WAL_FLUSH_BYTE_THRESHOLD_SETTING}.
+     */
+    private final long bufferByteThreshold;
+
+    /**
      * Creates the shared processor.
      *
      * @param logger the logger the base class logs drain failures through
@@ -74,6 +82,7 @@ public final class WalBatchingProcessor extends BufferedAsyncIOProcessor<WalReco
      * @param threadContext the thread context the base class preserves across each queued listener
      * @param threadPool the thread pool each interval-scheduled drain runs on
      * @param bufferIntervalSupplier supplies the group-commit interval between drains
+     * @param bufferByteThreshold cumulative buffered-payload size that triggers an immediate drain; non-positive disables it
      * @param walChunkService the chunk service each drain group-commits its batch into
      * @param encryptionKeyProvider {@code null} leaves records unencrypted; non-null encrypts each record's payload before it is written
      */
@@ -83,10 +92,12 @@ public final class WalBatchingProcessor extends BufferedAsyncIOProcessor<WalReco
         ThreadContext threadContext,
         ThreadPool threadPool,
         Supplier<TimeValue> bufferIntervalSupplier,
+        long bufferByteThreshold,
         WalChunkService walChunkService,
         EncryptionKeyProvider encryptionKeyProvider
     ) {
         super(logger, queueCapacity, threadContext, threadPool, bufferIntervalSupplier);
+        this.bufferByteThreshold = bufferByteThreshold;
         this.walChunkService = walChunkService;
         this.encryptionKeyProvider = encryptionKeyProvider;
     }
@@ -109,6 +120,16 @@ public final class WalBatchingProcessor extends BufferedAsyncIOProcessor<WalReco
     @Override
     protected String getBufferProcessThreadPoolName() {
         return ThreadPool.Names.GENERIC;
+    }
+
+    @Override
+    protected long getBufferByteThreshold() {
+        return bufferByteThreshold > 0 ? bufferByteThreshold : -1;
+    }
+
+    @Override
+    protected long itemSizeInBytes(WalRecord record) {
+        return record.payload().length;
     }
 
     /** The highest chunk sequence a drain has confirmed durably written, or {@code -1} if none yet -- see {@link #lastWrittenChunkSequence}. */

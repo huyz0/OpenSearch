@@ -115,6 +115,7 @@ public class WalBatchingCostAccountingTests extends OpenSearchTestCase {
             threadPool.getThreadContext(),
             threadPool,
             () -> TimeValue.timeValueMillis(50),
+            -1,
             service,
             null
         );

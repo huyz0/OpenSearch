@@ -65,12 +65,17 @@ public class WalBatchingProcessorTests extends OpenSearchTestCase {
     }
 
     private WalBatchingProcessor newProcessor(WalChunkService service, TimeValue interval, int queueCapacity) {
+        return newProcessor(service, interval, queueCapacity, -1);
+    }
+
+    private WalBatchingProcessor newProcessor(WalChunkService service, TimeValue interval, int queueCapacity, long byteThreshold) {
         return new WalBatchingProcessor(
             LogManager.getLogger(WalBatchingProcessorTests.class),
             queueCapacity,
             threadPool.getThreadContext(),
             threadPool,
             () -> interval,
+            byteThreshold,
             service,
             null
         );
@@ -232,6 +237,78 @@ public class WalBatchingProcessorTests extends OpenSearchTestCase {
             releaseWrite.countDown();
         }
         assertFalse("the interrupted put must unblock and terminate", blocked.isAlive());
+    }
+
+    /**
+     * A byte threshold triggers a drain immediately once crossed, without waiting for the (here,
+     * deliberately very long) interval tick -- proving the early-flush trigger is real and not just a
+     * disguised interval wait. The interval is set far longer than the test's own timeout, so a chunk
+     * only appears at all if the byte threshold fired the drain.
+     */
+    public void testByteThresholdTriggersAnImmediateDrain() throws Exception {
+        WalChunkService service = new WalChunkService(blobContainer, "epoch-0");
+        int recordPayloadBytes = "0123456789".getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+        // Threshold crosses on the third post-priming record; the interval is 10 minutes, far outside
+        // the 10s wait below, so the second assertion can only pass if the byte threshold -- not the
+        // interval -- fired the second drain.
+        WalBatchingProcessor processor = new WalBatchingProcessor(
+            LogManager.getLogger(WalBatchingProcessorTests.class),
+            1000,
+            threadPool.getThreadContext(),
+            threadPool,
+            () -> TimeValue.timeValueMinutes(10),
+            recordPayloadBytes * 3L,
+            service,
+            null
+        );
+
+        // Priming put: the base class always schedules a first-ever drain immediately regardless of
+        // the configured interval (lastRunStartTimeInNs starts at zero), so this establishes a real
+        // "last run" timestamp before the timed part of the test begins, closing off that loophole.
+        put(processor, new WalRecord("idx", 0, 1, -1, "prime".getBytes(java.nio.charset.StandardCharsets.UTF_8))).get(10, TimeUnit.SECONDS);
+        assertEquals(1, logChunkCount());
+
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        for (int i = 0; i < 3; i++) {
+            futures.add(put(processor, new WalRecord("idx", 0, 1, i, "0123456789".getBytes(java.nio.charset.StandardCharsets.UTF_8))));
+        }
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture<?>[0])).get(10, TimeUnit.SECONDS);
+
+        assertEquals("the byte threshold must have folded all three records into one immediate chunk", 2, logChunkCount());
+        byte[] chunkBytes;
+        try (InputStream in = blobContainer.readBlob(WalChunkNaming.blobName("epoch-0", 1))) {
+            chunkBytes = in.readAllBytes();
+        }
+        assertEquals(3, WalChunkReader.readRecords(chunkBytes).size());
+    }
+
+    /**
+     * Below the byte threshold, batching stays purely interval-driven: a single record that never
+     * crosses the threshold must wait out the (short, here) interval rather than draining immediately.
+     */
+    public void testBelowByteThresholdWaitsForTheInterval() throws Exception {
+        WalChunkService service = new WalChunkService(blobContainer, "epoch-0");
+        WalBatchingProcessor processor = new WalBatchingProcessor(
+            LogManager.getLogger(WalBatchingProcessorTests.class),
+            1000,
+            threadPool.getThreadContext(),
+            threadPool,
+            () -> TimeValue.timeValueMillis(300),
+            1_000_000,
+            service,
+            null
+        );
+
+        // Priming put: closes the same first-ever-call loophole documented in
+        // testByteThresholdTriggersAnImmediateDrain -- without it this test would pass even if the
+        // interval trigger were broken, since the very first drain always fires immediately regardless.
+        put(processor, new WalRecord("idx", 0, 1, -1, "prime".getBytes(java.nio.charset.StandardCharsets.UTF_8))).get(10, TimeUnit.SECONDS);
+        assertEquals(1, logChunkCount());
+
+        CompletableFuture<Void> future = put(processor, new WalRecord("idx", 0, 1, 0, "x".getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        assertEquals("must not have drained yet -- interval hasn't elapsed and threshold wasn't crossed", 1, logChunkCount());
+        future.get(10, TimeUnit.SECONDS);
+        assertEquals("the interval drain must still land eventually", 2, logChunkCount());
     }
 
     /** Fails every {@code writeBlob}, but delegates the register operations {@code claimNextChunkSequence} needs so the failure is purely on the chunk write. */
