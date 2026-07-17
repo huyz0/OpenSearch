@@ -1946,6 +1946,67 @@ proceeded" while the control stays green; restored, both green. The existing IT
 window is constructible without real timing; a two-overlapping-searches IT was judged not worth
 the timing flakiness for what the unit test already proves deterministically.
 
+## Scale-to-zero — CONCERN 2: does unconditional suspend eviction risk losing acked writes? (investigated, confirmed safe)
+
+The same review flagged a possible durability gap: `ObjectStoreWriterEngine.close()`'s final
+flush/publish is best-effort and swallows exceptions ("a later reactivation will republish"), but
+`ShardSuspensionCoordinator.evict()` force-unassigns the shard via `CancelAllocationCommand`
+without checking whether that final publish succeeded. With WAL mirroring off (the default), the
+worry was that a publish failing at the wrong moment plus local data not surviving to reactivation
+could silently drop acknowledged writes.
+
+Investigated both open factual questions and concluded this is **not a real gap** — the eviction
+does not introduce any acked-write loss. The reasoning, traced through core and this plugin:
+
+1. **A failed publish does not advance durability.** `ObjectStoreWriterEngine.commitIndexWriter`
+   calls `translogDeletionPolicy.recordDurablePublication(maxSeqNo)` only *after*
+   `publishCommitAsHead` returns true. So a publish that throws or returns false never raises the
+   durability watermark, and `ObjectStoreDurabilityTranslogDeletionPolicy` keeps the un-published
+   op's local translog generation. The acked op stays on local disk.
+
+2. **Cancel-driven unassignment does not delete local shard data.** Core's
+   `IndicesStore.shardCanBeDeleted` returns true only when *every* copy of the shard is `started()`
+   and none is on the local node. A scale-to-zero-evicted shard is force-cancelled to `UNASSIGNED`
+   and pinned there by `SuspendedShardAllocationDecider` (it returns `NO` to every allocation), so
+   no copy is `started()` anywhere. `shardCanBeDeleted` is false, `deleteShardStore` never fires,
+   and the shard's local Lucene directory + translog survive on the node. A same-node reactivation
+   replays them (`LOCAL_TRANSLOG_RECOVERY`).
+
+3. **The Lucene directory backing matters only for readers.** The object-store-backed
+   `LazyBundleDirectory` substitution applies only to reader (search-only) shards; a writer/primary
+   uses a normal local `FSDirectory`, with its committed segments *also* published to the object
+   store by the commit publisher. So a writer's acked-but-unpublished ops live in the local translog
+   (point 1) and its published segments live in the object store — neither is lost by eviction.
+
+4. **An idle candidate's acked writes are already published.** A suspension candidate is selected
+   because it is idle past a threshold; periodic flush/publish on the refresh schedule has already
+   published every acked write well before the quiescent flush runs. So reactivation reads a
+   manifest that already covers them regardless of whether the quiescent publish succeeded — exactly
+   what `flushAndPublishQuiescentBestEffort`'s comment already claims ("missed optimization, never a
+   correctness gap").
+
+The only residual window is an acked-but-unpublished op whose reactivation lands on a *different*
+node with WAL mirroring off. That is the general, pre-existing WAL-off durability limitation
+(unpublished ops are not cross-node durable) — identical for any relocation or node restart, not
+something this eviction introduces or worsens, and precisely the gap WAL mirroring exists to close.
+Gating `evict()` on the quiescent publish's outcome would also mean building the
+coordinator-to-live-engine communication channel `ShardSuspensionCoordinator`'s own javadoc already
+documents as a deliberately-out-of-scope, larger increment. Given points 1-4 already close the
+acked-data-loss path, adding that channel here would be manufacturing a fix for a non-problem,
+against this project's established discipline.
+
+**Outcome: documented as already-safe, no code behavior changed.** The reasoning is recorded in
+`ShardSuspensionCoordinator.evict()`'s javadoc. New test
+`ObjectStoreWriterEngineTests#testFailedQuiescentPublishDoesNotAdvanceDurabilitySoTheUnpublishedOpSurvivesLocally`
+proves the load-bearing property (point 1): with a `FailableBlobContainer` simulating the object
+store going unreachable mid-publish, the quiescent publish throws and the durability watermark stays
+put — the un-published op is never marked durable, so its local translog is retained. Verified real
+by moving `recordDurablePublication` to *before* the publish call: the test goes red (watermark
+advances to the un-published op's seq-no despite the failure); restored, green again. A publish
+failure inside `commitIndexWriter` is a tragic flush event that then fails/closes the engine, which
+is itself why `close()`'s quiescent publish is best-effort and swallows the exception — the acked op
+is already fsynced in the local translog and unaffected by the engine closing.
+
 ## Skeptical re-review of CC1/CC2/CC3 — two small gaps in the in-place split/merge commit services
 
 A follow-up re-review of the split/merge commit services turned up two real, low-severity gaps.

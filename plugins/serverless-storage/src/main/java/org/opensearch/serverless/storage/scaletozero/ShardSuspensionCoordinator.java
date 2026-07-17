@@ -216,6 +216,36 @@ public final class ShardSuspensionCoordinator {
         });
     }
 
+    /**
+     * Force-unassigns the suspended shard's copies. Deliberately unconditional -- it does <em>not</em>
+     * check whether the engine's best-effort final quiescent publish (see {@code
+     * ObjectStoreWriterEngine#flushAndPublishQuiescentBestEffort}) actually succeeded, and that is
+     * safe on the durability axis, not an oversight:
+     *
+     * <ul>
+     *   <li>A publish that fails does <em>not</em> advance the durability watermark ({@code
+     *       ObjectStoreWriterEngine} only calls {@code recordDurablePublication} <em>after</em> {@code
+     *       publishCommitAsHead} returns true), so {@code ObjectStoreDurabilityTranslogDeletionPolicy}
+     *       keeps the un-published op's local translog generation -- the acked op stays on local disk.</li>
+     *   <li>Cancel-driven unassignment never deletes that local data: core's {@code
+     *       IndicesStore.shardCanBeDeleted} only authorizes deletion when every copy of the shard is
+     *       {@code STARTED} and none is local, but a suspended shard is {@code UNASSIGNED} and pinned
+     *       there by {@code SuspendedShardAllocationDecider}, so no copy is {@code STARTED} anywhere.
+     *       The local Lucene directory + translog survive on the node until reactivation, and a
+     *       same-node reactivation replays them ({@code LOCAL_TRANSLOG_RECOVERY}).</li>
+     *   <li>For an idle suspension candidate, prior periodic flush/publish has already published every
+     *       acked write long before the quiescent flush runs, so the reactivation manifest read
+     *       already covers them regardless of the quiescent publish's outcome.</li>
+     * </ul>
+     *
+     * The only residual window -- an acked-but-unpublished op whose reactivation lands on a
+     * <em>different</em> node with WAL mirroring off -- is the general, pre-existing WAL-off durability
+     * limitation (unpublished ops are not cross-node durable), identical for any relocation/restart,
+     * not something this eviction introduces. Gating eviction on the publish outcome would also require
+     * building the coordinator-to-live-engine channel this class's own javadoc documents as out of
+     * scope. See dynamic-partitioning-progress.md's scale-to-zero CONCERN 2 section, and {@code
+     * ObjectStoreWriterEngineTests#testFailedQuiescentPublishDoesNotAdvanceDurabilitySoTheUnpublishedOpSurvivesLocally}.
+     */
     private void evict(ClusterState state, String indexUuid, int shardId, boolean reader) {
         IndexMetadata indexMetadata = findByUuid(state.metadata(), indexUuid);
         if (indexMetadata == null) {

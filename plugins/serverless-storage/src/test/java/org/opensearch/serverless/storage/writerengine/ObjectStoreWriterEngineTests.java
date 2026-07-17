@@ -861,6 +861,82 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
         }
     }
 
+    /**
+     * Scale-to-zero suspend eviction ({@code ShardSuspensionCoordinator#evict}) force-unassigns the
+     * shard unconditionally, without checking whether {@code close()}'s best-effort final quiescent
+     * publish actually succeeded. This test proves that is safe on the durability axis: a quiescent
+     * publish that throws (object store unreachable at exactly the wrong moment) does NOT advance the
+     * durability watermark past the un-published op, so {@link
+     * ObjectStoreDurabilityTranslogDeletionPolicy} keeps that op's local translog generation. Nothing
+     * acked is dropped locally by the failed publish -- and because the shard is force-unassigned (not
+     * started anywhere), core's {@code IndicesStore.shardCanBeDeleted} never authorizes deleting that
+     * local data either, so a subsequent same-node reactivation replays it. The final assertion shows
+     * the durability watermark staying put, which is what keeps the un-published op's translog
+     * generation retained. (A publish failure inside {@code commitIndexWriter} is a tragic flush
+     * event that then fails/closes the engine -- exactly why {@code close()}'s quiescent publish is
+     * best-effort and swallows it; the acked op is already fsynced in the local translog and
+     * unaffected by the engine closing.) See dynamic-partitioning-progress.md's scale-to-zero
+     * CONCERN 2 section for the full argument.
+     */
+    public void testFailedQuiescentPublishDoesNotAdvanceDurabilitySoTheUnpublishedOpSurvivesLocally() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        FailableBlobContainer blobContainer = new FailableBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+
+        ObjectStoreWriterEngine engine = openWriterEngine(shardStateStore, commitPublisher);
+        try {
+            index(engine, "1");
+            engine.flush(true, true);
+            assertEquals(
+                "first op durably published, watermark at its seq-no",
+                0L,
+                engine.translogDeletionPolicyForTesting().durablyPublishedMaxSeqNo()
+            );
+
+            // A second op is acked (fsynced into the local translog) but not yet published.
+            index(engine, "2");
+            long opsBeforePublish = org.opensearch.index.engine.EngineTestCase.getTranslog(engine).totalOperations();
+            assertEquals("both acked ops must be in the local translog before the publish attempt", 2, opsBeforePublish);
+
+            // Object store goes unreachable exactly as the final quiescent publish runs.
+            blobContainer.failWrites = true;
+            expectThrows(Exception.class, engine::flushAndPublishQuiescent);
+
+            assertEquals(
+                "a failed quiescent publish must NOT advance the durability watermark past the un-published "
+                    + "op -- its translog generation stays retained locally, so eviction proceeding loses nothing "
+                    + "(a same-node reactivation replays it; core's IndicesStore never deletes the unassigned "
+                    + "shard's local data either)",
+                0L,
+                engine.translogDeletionPolicyForTesting().durablyPublishedMaxSeqNo()
+            );
+        } finally {
+            IOUtils.close(engine, lastOpenedStore);
+        }
+    }
+
+    /** An {@link FsBlobContainer} whose atomic writes can be made to throw on demand, to simulate the object store going unreachable. */
+    private static final class FailableBlobContainer extends FsBlobContainer {
+        volatile boolean failWrites = false;
+
+        FailableBlobContainer(FsBlobStore blobStore, BlobPath blobPath, java.nio.file.Path path) {
+            super(blobStore, blobPath, path);
+        }
+
+        @Override
+        public void writeBlobAtomic(String blobName, java.io.InputStream inputStream, long blobSize, boolean failIfAlreadyExists)
+            throws java.io.IOException {
+            if (failWrites) {
+                throw new java.io.IOException("simulated object-store outage");
+            }
+            super.writeBlobAtomic(blobName, inputStream, blobSize, failIfAlreadyExists);
+        }
+    }
+
     public void testWalMirroringPublishesARealWalPositionInsteadOfThePlaceholder() throws Exception {
         FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
         BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
