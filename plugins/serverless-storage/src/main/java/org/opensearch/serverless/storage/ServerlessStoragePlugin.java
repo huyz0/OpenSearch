@@ -679,6 +679,28 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * The minimum time that must elapse after a split commits before {@code
+     * InPlaceMergeTriggerCoordinator} will even consider folding that pair back -- the strongest of the
+     * three anti-flap guards (see that class's javadoc), and the one this increment adds now that a real
+     * split-commit timestamp exists in cluster state ({@link
+     * org.opensearch.cluster.metadata.SplitShardsMetadata#getSplitCommitTimestamp(int)}). Unlike the
+     * combined-signal thresholds and the sustained-tick requirement, this is a hard time floor: a pair
+     * inside its cool-down is not a merge candidate at all, no matter how quiet it looks, so a split
+     * cannot be followed immediately by a merge even if the write rate dips right after the split.
+     *
+     * <p>Defaulted to {@code 30m}: long enough for post-split write patterns to stabilize (well beyond a
+     * few evaluation ticks at the plugin's usual sub-minute-to-minutes eval intervals), yet short enough
+     * that a genuinely-and-durably-idle pair is still reclaimed within an operational window rather than
+     * pinned indefinitely. A non-positive value disables the gate, leaving only the signal-margin and
+     * sustained-tick guards; a split whose commit predates the timestamp field fails open (no floor).
+     */
+    public static final Setting<TimeValue> SERVERLESS_STORAGE_RESHARDING_AUTO_MERGE_MIN_COOLDOWN_SETTING = Setting.timeSetting(
+        "serverless_storage.resharding.auto_merge.min_cooldown",
+        TimeValue.timeValueMinutes(30),
+        Setting.Property.NodeScope
+    );
+
+    /**
      * How often {@code ScaleUpCandidatesSchedulerTask} re-evaluates {@code ScaleUpCandidatesAction}
      * in the background -- same "background schedule mirrors an on-demand trigger" shape as {@link
      * #SERVERLESS_STORAGE_SCALE_TO_ZERO_EVAL_INTERVAL_SETTING}, but deliberately its own setting
@@ -1004,6 +1026,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_RESHARDING_AUTO_MERGE_ENABLED_SETTING,
             SERVERLESS_STORAGE_RESHARDING_AUTO_MERGE_REQUIRED_CONSECUTIVE_TICKS_SETTING,
             SERVERLESS_STORAGE_RESHARDING_AUTO_MERGE_MAX_MERGES_PER_TICK_SETTING,
+            SERVERLESS_STORAGE_RESHARDING_AUTO_MERGE_MIN_COOLDOWN_SETTING,
             SERVERLESS_STORAGE_REPOSITORY_SETTING
         );
     }
@@ -1158,7 +1181,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                         SERVERLESS_STORAGE_RESHARDING_AUTO_MERGE_REQUIRED_CONSECUTIVE_TICKS_SETTING.get(environment.settings()),
                         SERVERLESS_STORAGE_RESHARDING_AUTO_MERGE_MAX_MERGES_PER_TICK_SETTING.get(environment.settings()),
                         SERVERLESS_STORAGE_RESHARDING_MERGE_CANDIDATE_COMBINED_WPM_THRESHOLD_SETTING.get(environment.settings()),
-                        SERVERLESS_STORAGE_RESHARDING_MERGE_CANDIDATE_COMBINED_SIZE_THRESHOLD_BYTES_SETTING.get(environment.settings())
+                        SERVERLESS_STORAGE_RESHARDING_MERGE_CANDIDATE_COMBINED_SIZE_THRESHOLD_BYTES_SETTING.get(environment.settings()),
+                        SERVERLESS_STORAGE_RESHARDING_AUTO_MERGE_MIN_COOLDOWN_SETTING.get(environment.settings()).millis()
                     )
                     : null
             );

@@ -27,6 +27,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.LongSupplier;
 
 /**
  * The merge-side "do the work" half of dynamic-partitioning-plan.md Phase 2 item 2.3: the automatic
@@ -68,14 +69,18 @@ import java.util.Set;
  *   <li><b>A higher sustained-tick requirement than split.</b> Merge defaults to more consecutive
  *       quiet ticks than split does, so a momentary lull can't provoke a merge.</li>
  * </ol>
- * <b>Known limitation:</b> there is deliberately no time-based "cool-down since the split committed"
- * eligibility gate, because no split-commit timestamp is recorded anywhere in cluster state today
- * ({@link SplitShardsMetadata} carries no commit time, nor does {@code
- * MetadataInPlaceSplitShardCommitService}). Adding one would mean introducing new persisted
- * cluster-state, out of scope for this increment. The threshold margin plus sustained-tick
- * hysteresis above are the honest stand-in; operators should keep the default-off {@code
- * auto_merge.enabled} gate off until that trade-off is understood. See
- * dynamic-partitioning-progress.md's "Phase 2 item 2.3" entry.
+ * <ol start="3">
+ *   <li><b>A minimum split-commit cool-down.</b> A committed split records its commit instant in
+ *       {@link SplitShardsMetadata#getSplitCommitTimestamp(int)}; a pair is not even a merge
+ *       candidate until at least {@code minCooldownMillis} has elapsed since then. Unlike the two
+ *       signal-based guards above, this is a hard time floor checked <em>before</em> the pair ever
+ *       enters the sustained-tick tracker -- time-since-split is not itself a "sustained" signal, so
+ *       a pair inside its cool-down is omitted entirely (which also keeps its tracked streak reset).
+ *       A split whose commit predates the timestamp field ({@link
+ *       SplitShardsMetadata#NO_SPLIT_COMMIT_TIMESTAMP}) fails open -- no floor -- and a non-positive
+ *       {@code minCooldownMillis} disables the gate. See dynamic-partitioning-progress.md's "Phase 2
+ *       item 2.3" entry.</li>
+ * </ol>
  */
 public final class InPlaceMergeTriggerCoordinator {
 
@@ -88,6 +93,8 @@ public final class InPlaceMergeTriggerCoordinator {
     private final int maxMergesPerTick;
     private final long combinedWritesPerMinuteThreshold;
     private final long combinedSizeThresholdBytes;
+    private final long minCooldownMillis;
+    private final LongSupplier nowMillisSupplier;
     private final SustainedCandidateTracker<MergeCandidate> tracker;
 
     /**
@@ -104,18 +111,51 @@ public final class InPlaceMergeTriggerCoordinator {
      *                                         or below this to count as quiet.
      * @param combinedSizeThresholdBytes a pair's summed children size in bytes must be at or below
      *                                   this to count as quiet.
+     * @param minCooldownMillis the minimum time that must elapse after a split commits before its
+     *                          pair is eligible to be a merge candidate at all -- a hard time floor
+     *                          checked before the sustained-tick tracker. Values {@code <= 0} disable
+     *                          the gate.
      */
     public InPlaceMergeTriggerCoordinator(
         Client client,
         int requiredConsecutiveTicks,
         int maxMergesPerTick,
         long combinedWritesPerMinuteThreshold,
-        long combinedSizeThresholdBytes
+        long combinedSizeThresholdBytes,
+        long minCooldownMillis
+    ) {
+        this(
+            client,
+            requiredConsecutiveTicks,
+            maxMergesPerTick,
+            combinedWritesPerMinuteThreshold,
+            combinedSizeThresholdBytes,
+            minCooldownMillis,
+            System::currentTimeMillis
+        );
+    }
+
+    /**
+     * Test-visible constructor allowing the "now" clock (used with each pair's split-commit timestamp
+     * to evaluate the cool-down floor) to be supplied deterministically. Production uses the other
+     * constructor, which pins {@code nowMillisSupplier} to {@link System#currentTimeMillis()} -- the
+     * same absolute epoch-millis clock the split commit records with.
+     */
+    InPlaceMergeTriggerCoordinator(
+        Client client,
+        int requiredConsecutiveTicks,
+        int maxMergesPerTick,
+        long combinedWritesPerMinuteThreshold,
+        long combinedSizeThresholdBytes,
+        long minCooldownMillis,
+        LongSupplier nowMillisSupplier
     ) {
         this.client = client;
         this.maxMergesPerTick = maxMergesPerTick;
         this.combinedWritesPerMinuteThreshold = combinedWritesPerMinuteThreshold;
         this.combinedSizeThresholdBytes = combinedSizeThresholdBytes;
+        this.minCooldownMillis = minCooldownMillis;
+        this.nowMillisSupplier = nowMillisSupplier;
         this.tracker = new SustainedCandidateTracker<>(requiredConsecutiveTicks);
     }
 
@@ -180,6 +220,13 @@ public final class InPlaceMergeTriggerCoordinator {
                 if (splitShardsMetadata.canMergeChildrenBackToParent(parentShardId) == false) {
                     continue;
                 }
+                // Hard split-commit cool-down floor, checked before the sustained-tick tracker ever sees
+                // this pair: within its cool-down window a just-split pair isn't a candidate at all, no matter
+                // how quiet its combined signal looks -- the strongest anti-flap guard, since it prevents a
+                // split immediately followed by a merge even if write patterns dip right after the split.
+                if (withinSplitCommitCooldown(splitShardsMetadata, parentShardId)) {
+                    continue;
+                }
                 Set<Integer> childShardIds = splitShardsMetadata.getChildShardIdsOfParent(parentShardId);
                 if (childShardIds.size() != SIBLING_PAIR_SIZE) {
                     continue; // only full sibling pairs are in scope -- see class javadoc.
@@ -208,6 +255,23 @@ public final class InPlaceMergeTriggerCoordinator {
             }
         }
         return pairs;
+    }
+
+    /**
+     * Whether {@code parentShardId}'s split committed too recently to be a merge candidate yet. Fails open
+     * on a disabled gate ({@code minCooldownMillis <= 0}) or an unrecorded timestamp ({@link
+     * SplitShardsMetadata#NO_SPLIT_COMMIT_TIMESTAMP}, e.g. a split that committed on a cluster-state old
+     * enough to predate the field): in both cases there is no floor and the pair is allowed through.
+     */
+    private boolean withinSplitCommitCooldown(SplitShardsMetadata splitShardsMetadata, int parentShardId) {
+        if (minCooldownMillis <= 0) {
+            return false;
+        }
+        long committedAt = splitShardsMetadata.getSplitCommitTimestamp(parentShardId);
+        if (committedAt == SplitShardsMetadata.NO_SPLIT_COMMIT_TIMESTAMP) {
+            return false;
+        }
+        return nowMillisSupplier.getAsLong() - committedAt < minCooldownMillis;
     }
 
     private void triggerMerge(MergeCandidate candidate) {

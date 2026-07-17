@@ -216,7 +216,14 @@ public class InPlaceMergeTriggerSchedulerTaskTests extends OpenSearchTestCase {
             }
         };
 
-        InPlaceMergeTriggerCoordinator realCoordinator = new InPlaceMergeTriggerCoordinator(client, 1, 0, 2_000L, 4L * 1024 * 1024 * 1024);
+        InPlaceMergeTriggerCoordinator realCoordinator = new InPlaceMergeTriggerCoordinator(
+            client,
+            1,
+            0,
+            2_000L,
+            4L * 1024 * 1024 * 1024,
+            0L
+        );
         InPlaceMergeTriggerSchedulerTask task = new InPlaceMergeTriggerSchedulerTask(
             threadPool,
             TimeValue.timeValueMinutes(10),

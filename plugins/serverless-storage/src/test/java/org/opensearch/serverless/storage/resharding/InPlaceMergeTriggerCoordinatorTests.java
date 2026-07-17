@@ -55,7 +55,53 @@ public class InPlaceMergeTriggerCoordinatorTests extends OpenSearchTestCase {
     }
 
     private InPlaceMergeTriggerCoordinator coordinator(int requiredConsecutiveTicks, int maxMergesPerTick) {
-        return new InPlaceMergeTriggerCoordinator(client, requiredConsecutiveTicks, maxMergesPerTick, WPM_THRESHOLD, SIZE_THRESHOLD);
+        // Cool-down disabled (0) for the signal/hysteresis tests, which build committed splits with no
+        // recorded timestamp; the dedicated cool-down tests below use the clocked overload.
+        return new InPlaceMergeTriggerCoordinator(client, requiredConsecutiveTicks, maxMergesPerTick, WPM_THRESHOLD, SIZE_THRESHOLD, 0L);
+    }
+
+    private InPlaceMergeTriggerCoordinator coordinator(
+        int requiredConsecutiveTicks,
+        int maxMergesPerTick,
+        long minCooldownMillis,
+        long nowMillis
+    ) {
+        return new InPlaceMergeTriggerCoordinator(
+            client,
+            requiredConsecutiveTicks,
+            maxMergesPerTick,
+            WPM_THRESHOLD,
+            SIZE_THRESHOLD,
+            minCooldownMillis,
+            () -> nowMillis
+        );
+    }
+
+    /** Like {@link #committedSplitIndex} but records {@code commitTimestamp} as the split-commit instant. */
+    private static IndexMetadata committedSplitIndexAt(
+        String indexUuid,
+        String indexName,
+        int rootShards,
+        int parentShardId,
+        int splitInto,
+        long commitTimestamp
+    ) {
+        IndexMetadata base = IndexMetadata.builder(indexName)
+            .settings(
+                Settings.builder()
+                    .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+                    .put(IndexMetadata.SETTING_INDEX_UUID, indexUuid)
+                    .build()
+            )
+            .numberOfShards(rootShards)
+            .numberOfReplicas(0)
+            .build();
+        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(base.getSplitShardsMetadata());
+        List<ShardRange> childRanges = builder.splitShard(parentShardId, splitInto);
+        Set<Integer> childIds = new HashSet<>();
+        childRanges.forEach(r -> childIds.add(r.shardId()));
+        builder.updateSplitMetadataForChildShards(parentShardId, childIds, commitTimestamp);
+        return IndexMetadata.builder(base).splitShardsMetadata(builder.build()).build();
     }
 
     /** An index whose root shard {@code parentShardId} has been split into {@code splitInto} children AND committed. */
@@ -278,6 +324,59 @@ public class InPlaceMergeTriggerCoordinatorTests extends OpenSearchTestCase {
 
         coordinator(1, 0).triggerCandidates(entries, stateOf(a, b));
         verify(client, times(2)).execute(eq(InPlaceMergeShardAction.INSTANCE), any(InPlaceMergeShardAction.Request.class), any());
+    }
+
+    public void testPairExcludedWhenYoungerThanSplitCommitCooldown() {
+        long committedAt = 1_000_000_000_000L;
+        long cooldownMillis = 30 * 60 * 1000L; // 30m
+        IndexMetadata index = committedSplitIndexAt("uuid-1", "my-index", 1, 0, 2, committedAt);
+        // now is only 5 minutes past the commit -- well inside the 30m cool-down.
+        long now = committedAt + 5 * 60 * 1000L;
+        // Signal is well below threshold and single-tick would otherwise merge immediately.
+        coordinator(1, 0, cooldownMillis, now).triggerCandidates(childSignals(index, 0, 10L, 1024L), stateOf(index));
+        verify(client, never()).execute(eq(InPlaceMergeShardAction.INSTANCE), any(InPlaceMergeShardAction.Request.class), any());
+    }
+
+    public void testPairExcludedDuringCooldownEvenAcrossManySustainedTicks() {
+        long committedAt = 1_000_000_000_000L;
+        long cooldownMillis = 30 * 60 * 1000L;
+        IndexMetadata index = committedSplitIndexAt("uuid-1", "my-index", 1, 0, 2, committedAt);
+        long now = committedAt + 60 * 1000L; // 1m past commit -- still inside cool-down
+        InPlaceMergeTriggerCoordinator coordinator = coordinator(3, 0, cooldownMillis, now);
+        List<ShardSplitCandidateEntry> quiet = childSignals(index, 0, 10L, 1024L);
+        ClusterState state = stateOf(index);
+        // Many quiet ticks: the pair is omitted before the tracker each time, so the streak never builds.
+        for (int i = 0; i < 10; i++) {
+            coordinator.triggerCandidates(quiet, state);
+        }
+        verify(client, never()).execute(eq(InPlaceMergeShardAction.INSTANCE), any(InPlaceMergeShardAction.Request.class), any());
+    }
+
+    public void testPairIncludedOncePastSplitCommitCooldown() {
+        long committedAt = 1_000_000_000_000L;
+        long cooldownMillis = 30 * 60 * 1000L;
+        IndexMetadata index = committedSplitIndexAt("uuid-1", "my-index", 1, 0, 2, committedAt);
+        long now = committedAt + 60 * 60 * 1000L; // 1h past commit -- past the 30m cool-down
+        coordinator(1, 0, cooldownMillis, now).triggerCandidates(childSignals(index, 0, 10L, 1024L), stateOf(index));
+        verify(client, times(1)).execute(eq(InPlaceMergeShardAction.INSTANCE), any(InPlaceMergeShardAction.Request.class), any());
+    }
+
+    public void testCooldownDisabledMeansNoTimeGate() {
+        long committedAt = 1_000_000_000_000L;
+        IndexMetadata index = committedSplitIndexAt("uuid-1", "my-index", 1, 0, 2, committedAt);
+        long now = committedAt + 1000L; // just 1s past commit
+        // cooldown 0 disables the gate even though a real timestamp is recorded.
+        coordinator(1, 0, 0L, now).triggerCandidates(childSignals(index, 0, 10L, 1024L), stateOf(index));
+        verify(client, times(1)).execute(eq(InPlaceMergeShardAction.INSTANCE), any(InPlaceMergeShardAction.Request.class), any());
+    }
+
+    public void testCooldownFailsOpenWhenNoCommitTimestampRecorded() {
+        // committedSplitIndex records no timestamp (NO_SPLIT_COMMIT_TIMESTAMP) -- e.g. an old cluster-state.
+        // With the gate enabled, such a pair must fail open (no floor) and still be mergeable.
+        IndexMetadata index = committedSplitIndex("uuid-1", "my-index", 1, 0, 2);
+        long cooldownMillis = 30 * 60 * 1000L;
+        coordinator(1, 0, cooldownMillis, 1_000_000_000_000L).triggerCandidates(childSignals(index, 0, 10L, 1024L), stateOf(index));
+        verify(client, times(1)).execute(eq(InPlaceMergeShardAction.INSTANCE), any(InPlaceMergeShardAction.Request.class), any());
     }
 
     public void testNoCandidatesWhenNoIndexIsSplit() {

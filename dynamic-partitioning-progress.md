@@ -440,25 +440,44 @@ flap split/merge/split. Two mechanisms guard against it:
   sustained-signal requirement. `max_merges_per_tick` defaults to 1 (vs split's 2) since reviving a fresh
   parent primary that must recover is heavier than a split.
 
-### Known limitation: no split-commit cool-down
+### Split-commit cool-down (now built; closes the earlier "no cool-down" gap)
 
-An even stronger anti-flap guard would be a minimum "cool-down since the split committed" during which a pair
-is ineligible to be a merge candidate at all. It was deliberately *not* built, because no split-commit
-timestamp is recorded anywhere in cluster state today: `SplitShardsMetadata` carries no commit time, and
-neither does `MetadataInPlaceSplitShardCommitService`. Adding one would mean introducing new persisted
-cluster-state and threading it through the split commit path -- out of scope for this increment, and the kind
-of new-state addition the task guidance says to flag rather than force. The threshold margin plus the higher
-sustained-tick default are the honest stand-in. **Operators should know**: before enabling
-`serverless_storage.resharding.auto_merge.enabled`, that the only protection against split/merge flapping is
-signal-magnitude margin and sustained-duration hysteresis, not elapsed time since the split. A recorded
-split-commit timestamp + a `min_cool_down` eligibility gate is the clean follow-up.
+A third, stronger anti-flap guard is now in place: a hard minimum "cool-down since the split committed"
+window during which a pair is not a merge candidate at all, no matter how quiet its signal looks. The
+earlier increment could not build this because no split-commit timestamp existed anywhere in cluster state.
+That is now fixed:
 
-### Settings (mirror the split auto-trigger four, plus the two combined thresholds)
+- `SplitShardsMetadata` carries a new `Map<Integer, Long> splitCommitTimestamps` (parent shard id -> epoch
+  millis at commit). It is populated by `SplitShardsMetadata.Builder.updateSplitMetadataForChildShards(...,
+  long commitTimestamp)`, called from `MetadataInPlaceSplitShardCommitService.applyCommit` with
+  `Instant.now().toEpochMilli()` -- the same absolute epoch-millis source `MetadataCreateIndexService` uses
+  for `SETTING_CREATION_DATE`, so the value stays meaningful after cluster-state publication. The timestamp
+  is dropped when the parent is merged back (`mergeChildrenBackToParent`) or a split is cancelled.
+- The field is wire-gated on `Version.V_3_8_0` inside `SplitShardsMetadata`'s own `writeTo`/`StreamInput`
+  ctor (the whole blob is already gated on `V_3_6_0` in `IndexMetadata`, so this inner gate is what keeps a
+  mixed `V_3_6_0`/`V_3_7_x` <-> `V_3_8_0` cluster's cluster-state wire format safe). It also round-trips
+  through XContent for on-disk cluster-state.
+- `InPlaceMergeTriggerCoordinator` gains a `minCooldownMillis` (from the new
+  `serverless_storage.resharding.auto_merge.min_cooldown` setting, default `30m`). The cool-down is checked
+  in `findEligiblePairs` **before** the pair ever enters the `SustainedCandidateTracker` -- time-since-split
+  is a hard floor, not a signal to average. A pair inside its window is omitted entirely (which also keeps
+  its tracked streak reset). Fails open on a disabled gate (`min_cooldown <= 0`) or an unrecorded timestamp
+  (`NO_SPLIT_COMMIT_TIMESTAMP`, e.g. a split committed on cluster-state predating the field).
+
+Default reasoning for `30m`: long enough for post-split write patterns to stabilize (well beyond a few eval
+ticks at the plugin's usual sub-minute-to-minutes intervals), short enough that a genuinely and durably idle
+pair is still reclaimed within an operational window rather than pinned indefinitely.
+
+The two signal-based guards (deliberately-low combined thresholds, higher sustained-tick default) still
+stand alongside this time floor; together the three are the merge side's anti-flap defense.
+
+### Settings (mirror the split auto-trigger four, plus the two combined thresholds and the cool-down)
 
 - `serverless_storage.resharding.auto_merge.eval_interval` (off by default, `-1`)
 - `serverless_storage.resharding.auto_merge.enabled` (independent gate, off by default)
 - `serverless_storage.resharding.auto_merge.required_consecutive_ticks` (default 10)
 - `serverless_storage.resharding.auto_merge.max_merges_per_tick` (default 1)
+- `serverless_storage.resharding.auto_merge.min_cooldown` (default `30m`; `<= 0` disables the time gate)
 - `serverless_storage.resharding.merge_candidate_combined_writes_per_minute_threshold` (default 2,000)
 - `serverless_storage.resharding.merge_candidate_combined_size_threshold_bytes` (default 4 GiB)
 
@@ -476,6 +495,17 @@ split. `InPlaceMergeTriggerSchedulerTaskTests` (4 tests) mirrors the split sched
 child-split-further tests fail with the expected wrong behavior, then restored to green; ran the full
 `:plugins:serverless-storage:test` sweep plus the core `MetadataInPlaceMergeShardServiceTests`/
 `SplitShardsMetadata` tests.
+
+The cool-down follow-up adds five coordinator tests (pair excluded when younger than cool-down even with a
+below-threshold signal and single-tick budget; excluded across many sustained ticks; included once past
+cool-down; disabled cool-down means no time gate; fails open when no commit timestamp is recorded) plus
+core `SplitShardsMetadata`/`MetadataInPlaceSplitShardCommitService` tests (timestamp recorded on real commit,
+absent before commit and for non-split shards, cleared on merge-back, stream and XContent round-trips, and a
+pre-`V_3_8_0` wire read that drops the field). Verification for the cool-down gate specifically: replaced the
+`now - committedAt < minCooldown` comparison with a hard `return false` and confirmed the two
+"excluded during cool-down" tests fail with the pair merged too early (the merge log line fires), then
+restored and confirmed green. Ran the `org.opensearch.cluster.metadata.*`/`org.opensearch.cluster.routing.*`
+core sweep and the full `:plugins:serverless-storage:test` sweep.
 
 ## Task 20 (new, found while attempting item 0.7) — `IndexMetadata.numberOfShards` invariant breaks for split children, FIXED
 
