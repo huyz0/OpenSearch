@@ -2209,3 +2209,38 @@ what this does (a durability-only upload of the op stream, closer to what core's
 "translog upload" than a live synced replica), but renaming an already-shipped, tested public setting
 is a separate decision with real churn and no bearing on whether the batching mechanism works.
 
+## WAL mirroring — byte-threshold early-flush trigger (`c2c1625dadf` / `17bb9ce3dee`), resolving the deferral above
+
+The "byte-threshold early-flush trigger" item above turned out not to need a new cross-package seam
+after all -- `BufferedAsyncIOProcessor`'s `process()`/`scheduleProcess()` stay package-private; the
+trigger is built entirely from two new small `protected` extension points plus one `AtomicReference`
+tracking the currently scheduled-but-not-run drain:
+
+- `getBufferByteThreshold()` / `itemSizeInBytes(Item)` -- both default to disabled/zero, so every
+  existing subclass (`RemoteFsTranslog` included) is behaviorally unchanged.
+- `WalBatchingProcessor` overrides both: `itemSizeInBytes` returns the WAL record's payload length,
+  and the threshold itself comes from the new `serverless_storage.wal_flush.byte_threshold` setting
+  (`ByteSizeValue.ZERO` = off, matching the plugin's other off-by-default conventions).
+
+The one real subtlety: the promise semaphore that gates `BufferedAsyncIOProcessor` only gates *who
+may schedule* a drain, not *when* it runs. A byte-threshold trip after another `put()` has already
+scheduled the next drain for later in the interval can't just call `process()` itself -- the semaphore
+is already held. Fixed by tracking the pending `Scheduler.ScheduledCancellable` and, on a threshold
+trip that finds the semaphore held, racing to `cancel()` it (idempotent, so at most one concurrent
+caller wins) and firing `process()` immediately in that case; if the drain already started, `cancel()`
+returns false and the trip is a no-op since the in-flight write already covers the item.
+
+Caught one test-design bug before it shipped: the base class's very first-ever schedule always fires
+immediately regardless of the configured interval (`lastRunStartTimeInNs` starts at `0`, so "time
+since last run" always looks overdue on the first call). An early version of
+`testByteThresholdTriggersAnImmediateDrain` didn't account for this and passed even with the
+threshold logic deliberately broken -- caught by following the "break the fix, confirm the test
+fails" discipline. Fixed by adding a priming `put()`/drain before the timed part of both new tests
+(`testByteThresholdTriggersAnImmediateDrain`, `testBelowByteThresholdWaitsForTheInterval`), which
+re-broke the threshold path and confirmed both tests now fail as expected before restoring the fix.
+
+Also added `plugins/serverless-storage/README.md` (`c2c1625dadf`) as the plugin's first quickstart
+doc -- build/test commands, the enable recipe (remote cluster state + `serverless_storage.base_path`
+or `.repository` + `index.serverless_storage.enabled`), the full REST operator surface, and pointers
+to the RFC and this log for anything deeper.
+
