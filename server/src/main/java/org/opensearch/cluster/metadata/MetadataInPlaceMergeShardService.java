@@ -37,15 +37,16 @@ import java.util.function.BiFunction;
 
 /**
  * Service responsible for applying in-place shard merge requests to cluster state -- the reverse of
- * {@link MetadataInPlaceSplitShardService}. A merge reverses an earlier split by retiring that
- * split's children and reviving the single parent shard, in one atomic cluster-state update.
+ * {@link MetadataInPlaceSplitShardService}. A merge reverses an earlier split by reviving the single
+ * parent shard and, once it has recovered, retiring that split's children.
  *
- * <p>Unlike split (whose children recover across multiple cluster-state updates, driven to
- * completion asynchronously by {@link MetadataInPlaceSplitShardCommitService}), a full-sibling-pair
- * merge is a single, immediate metadata-and-routing operation: the underlying
- * {@link SplitShardsMetadata.Builder#mergeChildrenBackToParent(int)} primitive de-commits the split
- * synchronously, and no async commit driver is needed -- the revived parent is just one more
- * UNASSIGNED primary to allocate.
+ * <p>Structurally symmetric to split: this service performs only <em>phase 1</em>, marking the merge
+ * pending ({@link SplitShardsMetadata.Builder#startMergeChildrenToParent(int)}) and reviving the
+ * parent as one more UNASSIGNED primary, while KEEPING the children live and serving. The children are
+ * only actually removed -- or the pending merge rolled back if the parent fails to recover -- by the
+ * asynchronous commit/cancel driver {@link MetadataInPlaceMergeShardCommitService}, exactly as split's
+ * children are committed/cancelled by {@link MetadataInPlaceSplitShardCommitService}. Nothing is
+ * destroyed until the revived parent reaches STARTED, so a failed revival is a lossless rollback.
  *
  * @opensearch.experimental
  */
@@ -68,7 +69,13 @@ public class MetadataInPlaceMergeShardService {
      */
     public void merge(final InPlaceMergeShardClusterStateUpdateRequest request, final ActionListener<ClusterStateUpdateResponse> listener) {
         clusterService.submitStateUpdateTask(
-            "in-place-merge-shard [" + request.getParentShardId() + "] of index [" + request.getIndex() + "], cause [" + request.cause() + "]",
+            "in-place-merge-shard ["
+                + request.getParentShardId()
+                + "] of index ["
+                + request.getIndex()
+                + "], cause ["
+                + request.cause()
+                + "]",
             new AckedClusterStateUpdateTask<>(Priority.URGENT, request, listener) {
                 @Override
                 protected ClusterStateUpdateResponse newResponse(boolean acknowledged) {
@@ -102,11 +109,13 @@ public class MetadataInPlaceMergeShardService {
     }
 
     /**
-     * Applies a shard merge request to the given cluster state: de-commits the split in the index's
-     * {@link SplitShardsMetadata} via {@link SplitShardsMetadata.Builder#mergeChildrenBackToParent(int)},
-     * retires the children's {@link IndexRoutingTable} entries, revives a single UNASSIGNED primary
-     * for the parent (recovering via {@link RecoverySource.InPlaceMergeShardRecoverySource}), and
-     * triggers a reroute -- the mirror image of {@link MetadataInPlaceSplitShardService#applySplitShardRequest}.
+     * Applies phase 1 of a shard merge request to the given cluster state: marks the merge pending in the
+     * index's {@link SplitShardsMetadata} via
+     * {@link SplitShardsMetadata.Builder#startMergeChildrenToParent(int)}, KEEPS the children's
+     * {@link IndexRoutingTable} entries live, revives a single UNASSIGNED primary for the parent
+     * (recovering via {@link RecoverySource.InPlaceMergeShardRecoverySource}), and triggers a reroute --
+     * the mirror image of {@link MetadataInPlaceSplitShardService#applySplitShardRequest}, which likewise
+     * only initiates the operation and leaves commit/cancel to its async driver.
      */
     static ClusterState applyMergeShardRequest(
         ClusterState currentState,
@@ -144,12 +153,18 @@ public class MetadataInPlaceMergeShardService {
         ShardRange[] childRanges = splitShardsMetadata.getChildShardsOfParent(parentShardId);
         Set<Integer> childShardIds = splitShardsMetadata.getChildShardIdsOfParent(parentShardId);
 
-        // De-commit the split first. This validates every split-level precondition (parent really is
-        // a split parent, the split is not still in progress, and no child has itself been split
-        // further) and throws a clean IllegalArgumentException -- not a raw assertion -- for any
-        // violation, so those precise errors take priority over the per-child liveness check below.
+        // Mark the merge as *pending* -- phase 1 of the two-phase in-place merge. This validates every
+        // split-level precondition (parent really is a split parent, the split is not still in progress,
+        // and no child has itself been split further) and throws a clean IllegalArgumentException -- not a
+        // raw assertion -- for any violation, so those precise errors take priority over the per-child
+        // liveness check below. Crucially it does NOT yet remove the children: they stay recorded in
+        // SplitShardsMetadata, keep their routing entries, and keep serving their hash ranges. The children
+        // are only actually torn down once the revived parent reaches STARTED, at which point
+        // MetadataInPlaceMergeShardCommitService finalizes the merge (mergeChildrenBackToParent). If the
+        // revived parent instead exhausts its allocation retries, that same commit service cancels the
+        // pending merge and the children -- never destroyed -- remain fully live: a lossless rollback.
         SplitShardsMetadata.Builder mergeMetadataBuilder = new SplitShardsMetadata.Builder(splitShardsMetadata);
-        mergeMetadataBuilder.mergeChildrenBackToParent(parentShardId);
+        mergeMetadataBuilder.startMergeChildrenToParent(parentShardId);
         SplitShardsMetadata updatedSplitShardsMetadata = mergeMetadataBuilder.build();
 
         // Every child being merged must be a live, started, non-relocating primary before its data
@@ -205,19 +220,19 @@ public class MetadataInPlaceMergeShardService {
         indexMetadataBuilder.putInSyncAllocationIds(parentShardId, java.util.Collections.emptySet());
         Metadata.Builder metadataBuilder = Metadata.builder(currentState.metadata()).put(indexMetadataBuilder);
 
-        // Rebuild the IndexRoutingTable retiring every child's routing entry (mirroring how
-        // MetadataInPlaceSplitShardCommitService#applyCommit retires the parent's entry when a split
-        // commits), then revive a single UNASSIGNED primary for the parent recovering via
-        // InPlaceMergeShardRecoverySource. Leaving numberOfShards and the children's inSyncAllocationIds/
-        // primaryTerm map entries untouched, exactly as split's own commit path leaves the retired
-        // parent's -- IndexMetadata.Builder#build preserves those extra entries verbatim.
+        // Rebuild the IndexRoutingTable KEEPING every child's routing entry live (they keep serving their
+        // hash ranges throughout the pending merge, mirroring how split keeps the parent's entry live
+        // until its children start), and add a single UNASSIGNED primary for the parent recovering via
+        // InPlaceMergeShardRecoverySource. The children are retired only later, atomically with the
+        // metadata commit, by MetadataInPlaceMergeShardCommitService#applyCommit -- the mirror of how
+        // split's own commit service retires the parent. Leaving numberOfShards and the children's
+        // inSyncAllocationIds/primaryTerm map entries untouched -- IndexMetadata.Builder#build preserves
+        // those extra entries verbatim.
         Index index = curIndexMetadata.getIndex();
         IndexRoutingTable currentIndexRoutingTable = currentState.routingTable().index(index.getName());
         IndexRoutingTable.Builder indexRoutingTableBuilder = IndexRoutingTable.builder(index);
         for (IndexShardRoutingTable shardTable : currentIndexRoutingTable) {
-            if (childShardIds.contains(shardTable.shardId().id()) == false) {
-                indexRoutingTableBuilder.addIndexShard(shardTable);
-            }
+            indexRoutingTableBuilder.addIndexShard(shardTable);
         }
 
         ShardId parentShard = new ShardId(index, parentShardId);

@@ -57,6 +57,7 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
     private static final String KEY_IN_PROGRESS_SPLIT_SHARD_IDS = "in_progress_split_shard_id";
     private static final String KEY_ACTIVE_SHARD_IDS = "active_shard_ids";
     private static final String KEY_SPLIT_COMMIT_TIMESTAMPS = "split_commit_timestamps";
+    private static final String KEY_IN_PROGRESS_MERGE_PARENT_SHARD_IDS = "in_progress_merge_parent_shard_id";
 
     // Following fields are upadated only after split completion and are used to service active shards request.
     // Root shard id to flat list of all child shards under root.
@@ -77,6 +78,18 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
     // back (Builder#mergeChildrenBackToParent).
     private final Map<Integer, Long> splitCommitTimestamps;
 
+    // Parent shard ids whose in-place merge (children -> parent) is pending, i.e. the parent has been
+    // revived as an UNASSIGNED primary recovering via InPlaceMergeShardRecoverySource but its children
+    // are still live, routed, and serving traffic by hash. Symmetric to inProgressSplitShardIds. While a
+    // parent sits here nothing has been destroyed: its children are still recorded in parentToChildShards/
+    // rootShardsToAllChildren/activeShardIds and still own their hash ranges. The merge is only finalized
+    // (children actually removed via Builder#mergeChildrenBackToParent) once the revived parent reaches
+    // STARTED; if the revival fails instead, Builder#cancelMerge drops just this marker and the caller
+    // removes the parent's revived routing entry, leaving the children fully intact -- so rollback is
+    // trivial because nothing was ever torn down. Driven by MetadataInPlaceMergeShardCommitService, the
+    // exact mirror of split's MetadataInPlaceSplitShardCommitService commit/cancel driver.
+    private final Set<Integer> inProgressMergeParentShardIds;
+
     SplitShardsMetadata(
         ShardRange[][] rootShardsToAllChildren,
         Map<Integer, ShardRange[]> parentToChildShards,
@@ -95,6 +108,26 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         int maxShardId,
         Map<Integer, Long> splitCommitTimestamps
     ) {
+        this(
+            rootShardsToAllChildren,
+            parentToChildShards,
+            inProgressSplitShardIds,
+            activeShardIds,
+            maxShardId,
+            splitCommitTimestamps,
+            Collections.emptySet()
+        );
+    }
+
+    SplitShardsMetadata(
+        ShardRange[][] rootShardsToAllChildren,
+        Map<Integer, ShardRange[]> parentToChildShards,
+        Set<Integer> inProgressSplitShardIds,
+        Set<Integer> activeShardIds,
+        int maxShardId,
+        Map<Integer, Long> splitCommitTimestamps,
+        Set<Integer> inProgressMergeParentShardIds
+    ) {
 
         this.rootShardsToAllChildren = rootShardsToAllChildren;
         this.parentToChildShards = Collections.unmodifiableMap(parentToChildShards);
@@ -102,6 +135,7 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         this.inProgressSplitShardIds = Collections.unmodifiableSet(inProgressSplitShardIds);
         this.activeShardIds = activeShardIds;
         this.splitCommitTimestamps = Collections.unmodifiableMap(splitCommitTimestamps);
+        this.inProgressMergeParentShardIds = Collections.unmodifiableSet(inProgressMergeParentShardIds);
     }
 
     public SplitShardsMetadata(StreamInput in) throws IOException {
@@ -122,8 +156,16 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         // IndexMetadata), so this inner gate is what keeps a mixed V_3_6_0/V_3_7_x <-> V_3_8_0 cluster safe.
         if (in.getVersion().onOrAfter(Version.V_3_8_0)) {
             this.splitCommitTimestamps = Collections.unmodifiableMap(in.readMap(StreamInput::readInt, StreamInput::readLong));
+            // inProgressMergeParentShardIds is the same V_3_8_0+ addition: appended after
+            // splitCommitTimestamps in the stream, read only from a peer new enough to have written it. A
+            // pending merge only ever exists in a uniform-version cluster (MetadataInPlaceMergeShardService
+            // rejects a merge unless every node is on the same version), so a mixed-version cluster never
+            // carries this state during a rolling upgrade -- and were an older peer to somehow receive this
+            // blob, dropping the marker (empty set) is the safe read: the merge simply isn't tracked there.
+            this.inProgressMergeParentShardIds = Collections.unmodifiableSet(in.readSet(StreamInput::readInt));
         } else {
             this.splitCommitTimestamps = Collections.emptyMap();
+            this.inProgressMergeParentShardIds = Collections.emptySet();
         }
     }
 
@@ -139,6 +181,7 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         // See the constructor's note: only write the new field to V_3_8_0+ peers.
         if (out.getVersion().onOrAfter(Version.V_3_8_0)) {
             out.writeMap(this.splitCommitTimestamps, StreamOutput::writeInt, StreamOutput::writeLong);
+            out.writeCollection(this.inProgressMergeParentShardIds, StreamOutput::writeInt);
         }
     }
 
@@ -192,6 +235,8 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
             + inProgressSplitShardIds
             + ", splitCommitTimestamps="
             + splitCommitTimestamps
+            + ", inProgressMergeParentShardIds="
+            + inProgressMergeParentShardIds
             + '}';
     }
 
@@ -369,6 +414,7 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         private final Set<Integer> inProgressSplitShardIds;
         private final Set<Integer> activeShardIds;
         private final Map<Integer, Long> splitCommitTimestamps;
+        private final Set<Integer> inProgressMergeParentShardIds;
 
         public Builder(int numberOfShards) {
             maxShardId = numberOfShards - 1;
@@ -377,6 +423,7 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
             inProgressSplitShardIds = new HashSet<>();
             activeShardIds = new HashSet<>();
             splitCommitTimestamps = new HashMap<>();
+            inProgressMergeParentShardIds = new HashSet<>();
             for (int i = 0; i < numberOfShards; i++) {
                 activeShardIds.add(i);
             }
@@ -410,6 +457,7 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
 
             inProgressSplitShardIds = new HashSet<>(splitShardsMetadata.inProgressSplitShardIds);
             this.activeShardIds = activeShardIds;
+            this.inProgressMergeParentShardIds = new HashSet<>(splitShardsMetadata.inProgressMergeParentShardIds);
         }
 
         /**
@@ -608,6 +656,27 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
          *                                  split further.
          */
         public void mergeChildrenBackToParent(int parentShardId) {
+            ShardRange[] children = validateMergeable(parentShardId);
+            for (ShardRange child : children) {
+                activeShardIds.remove(child.shardId());
+            }
+            activeShardIds.add(parentShardId);
+            rootShardsToAllChildren[parentShardId] = null;
+            parentToChildShards.remove(parentShardId);
+            // The split that produced these children is being undone; its commit timestamp is no longer
+            // meaningful (and the parent id is active-and-unsplit again).
+            splitCommitTimestamps.remove(parentShardId);
+            // A pending merge (if this is the commit half of the two-phase flow) is now finalized.
+            inProgressMergeParentShardIds.remove(parentShardId);
+        }
+
+        /**
+         * Runs exactly the split-level preconditions {@link #mergeChildrenBackToParent(int)} enforces --
+         * {@code parentShardId} is an original root shard, is currently split, is not still mid-split, and
+         * none of its direct children have themselves been split further -- throwing the same descriptive
+         * {@link IllegalArgumentException}s, and returns the parent's direct children on success.
+         */
+        private ShardRange[] validateMergeable(int parentShardId) {
             if (parentShardId < 0 || parentShardId >= rootShardsToAllChildren.length) {
                 throw new IllegalArgumentException(
                     "Shard [" + parentShardId + "] is not an original root shard; nested in-place merge is not supported"
@@ -627,20 +696,47 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
             for (ShardRange child : children) {
                 if (activeShardIds.contains(child.shardId()) == false || inProgressSplitShardIds.contains(child.shardId())) {
                     throw new IllegalArgumentException(
-                        "Child shard [" + child.shardId() + "] of [" + parentShardId + "] has itself been split further (or is "
+                        "Child shard ["
+                            + child.shardId()
+                            + "] of ["
+                            + parentShardId
+                            + "] has itself been split further (or is "
                             + "mid-split); nested in-place merge is not supported"
                     );
                 }
             }
-            for (ShardRange child : children) {
-                activeShardIds.remove(child.shardId());
+            return children;
+        }
+
+        /**
+         * Phase 1 of the two-phase in-place merge: marks {@code parentShardId}'s merge as <em>pending</em>
+         * without destroying anything. Validates the exact same split-level preconditions
+         * {@link #mergeChildrenBackToParent(int)} does (throwing the identical {@link IllegalArgumentException}s
+         * for a bad request), then records the parent in {@code inProgressMergeParentShardIds}. The children
+         * stay recorded in {@code parentToChildShards}/{@code rootShardsToAllChildren}/{@code activeShardIds}
+         * and keep owning their hash ranges, so they continue to serve reads and (barring the write guard)
+         * writes; they are only removed once the revived parent reaches STARTED and
+         * {@link #mergeChildrenBackToParent(int)} finalizes the merge. If the revival fails instead,
+         * {@link #cancelMerge(int)} drops just this marker and the children are already fully intact.
+         */
+        public void startMergeChildrenToParent(int parentShardId) {
+            if (inProgressMergeParentShardIds.contains(parentShardId)) {
+                throw new IllegalArgumentException("In-place merge of shard [" + parentShardId + "] is already in progress");
             }
-            activeShardIds.add(parentShardId);
-            rootShardsToAllChildren[parentShardId] = null;
-            parentToChildShards.remove(parentShardId);
-            // The split that produced these children is being undone; its commit timestamp is no longer
-            // meaningful (and the parent id is active-and-unsplit again).
-            splitCommitTimestamps.remove(parentShardId);
+            validateMergeable(parentShardId);
+            inProgressMergeParentShardIds.add(parentShardId);
+        }
+
+        /**
+         * Phase 2 (rollback) of the two-phase in-place merge: abandons a pending merge whose revived parent
+         * never recovered. Only the {@code inProgressMergeParentShardIds} marker is dropped; because
+         * {@link #startMergeChildrenToParent(int)} never removed the children, they remain active, routed,
+         * and range-owning exactly as before the merge was attempted -- so this is a complete, lossless
+         * rollback. The counterpart of split's {@link #cancelSplit(int)}.
+         */
+        public void cancelMerge(int parentShardId) {
+            assert inProgressMergeParentShardIds.contains(parentShardId);
+            inProgressMergeParentShardIds.remove(parentShardId);
         }
 
         public SplitShardsMetadata build() {
@@ -650,7 +746,8 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
                 this.inProgressSplitShardIds,
                 this.activeShardIds,
                 this.maxShardId,
-                this.splitCommitTimestamps
+                this.splitCommitTimestamps,
+                this.inProgressMergeParentShardIds
             );
         }
     }
@@ -693,6 +790,46 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
 
     public boolean isSplitOfShardInProgress(int shardId) {
         return inProgressSplitShardIds.contains(shardId);
+    }
+
+    /**
+     * Parent shard ids whose two-phase in-place merge is pending (parent revived but children not yet
+     * removed). The mirror of {@link #getInProgressSplitShardIds()}, and what
+     * {@code MetadataInPlaceMergeShardCommitService} iterates to drive each pending merge to commit or
+     * cancel. Returned directly (the field is unmodifiable).
+     */
+    public Set<Integer> getInProgressMergeParentShardIds() {
+        return inProgressMergeParentShardIds;
+    }
+
+    /**
+     * Whether an in-place merge of {@code parentShardId}'s children back into it is currently pending
+     * (its revived parent primary has not yet reached STARTED and the children are still live).
+     */
+    public boolean isMergeOfShardInProgress(int parentShardId) {
+        return inProgressMergeParentShardIds.contains(parentShardId);
+    }
+
+    /**
+     * Whether {@code shardId} is a still-live child of a currently-pending in-place merge -- i.e. it is
+     * about to be folded into its revived parent and retired once that parent starts. Writes to such a
+     * child are rejected ({@code IndexShard#ensureWriteAllowed}) so no document acknowledged after the
+     * parent snapshotted the children can be stranded and lost when the children are retired at commit --
+     * the exact mirror of split's in-progress-split-parent write rejection (CC1).
+     */
+    public boolean isChildOfInProgressMerge(int shardId) {
+        for (Integer parentShardId : inProgressMergeParentShardIds) {
+            ShardRange[] children = parentToChildShards.get(parentShardId);
+            if (children == null) {
+                continue;
+            }
+            for (ShardRange child : children) {
+                if (child.shardId() == shardId) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     public boolean isSplitParent(int shardId) {
@@ -766,6 +903,7 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         if (!Arrays.deepEquals(rootShardsToAllChildren, that.rootShardsToAllChildren)) return false;
         if (!activeShardIds.equals(that.activeShardIds)) return false;
         if (!splitCommitTimestamps.equals(that.splitCommitTimestamps)) return false;
+        if (!inProgressMergeParentShardIds.equals(that.inProgressMergeParentShardIds)) return false;
         if (parentToChildShards.size() != that.parentToChildShards.size()) return false;
         for (Integer key : parentToChildShards.keySet()) {
             if (!Arrays.deepEquals(parentToChildShards.get(key), that.parentToChildShards.get(key))) {
@@ -785,6 +923,7 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         result = 31 * result + inProgressSplitShardIds.hashCode();
         result = 31 * result + activeShardIds.hashCode();
         result = 31 * result + splitCommitTimestamps.hashCode();
+        result = 31 * result + inProgressMergeParentShardIds.hashCode();
         return result;
     }
 
@@ -794,6 +933,9 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         builder.field(KEY_MAX_SHARD_ID, maxShardId);
         if (!inProgressSplitShardIds.isEmpty()) {
             builder.field(KEY_IN_PROGRESS_SPLIT_SHARD_IDS, new ArrayList<>(inProgressSplitShardIds));
+        }
+        if (!inProgressMergeParentShardIds.isEmpty()) {
+            builder.field(KEY_IN_PROGRESS_MERGE_PARENT_SHARD_IDS, new ArrayList<>(inProgressMergeParentShardIds));
         }
         builder.field(KEY_ACTIVE_SHARD_IDS, new ArrayList<>(activeShardIds));
         builder.startObject(KEY_ROOT_SHARDS_TO_ALL_CHILDREN);
@@ -835,6 +977,7 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         String currentFieldName = null;
         int maxShardId = -1;
         Set<Integer> inProgressSplitShardIds = new HashSet<>();
+        Set<Integer> inProgressMergeParentShardIds = new HashSet<>();
         Set<Integer> activeShardIds = new HashSet<>();
         ShardRange[][] rootShardsToAllChildren = null;
         Map<Integer, ShardRange[]> tempShardIdToChildShards = new HashMap<>();
@@ -866,6 +1009,10 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
                     while (parser.nextToken() != XContentParser.Token.END_ARRAY) {
                         inProgressSplitShardIds.add(parser.intValue());
                     }
+                } else if (KEY_IN_PROGRESS_MERGE_PARENT_SHARD_IDS.equals(currentFieldName)) {
+                    while (parser.nextToken() != XContentParser.Token.END_ARRAY) {
+                        inProgressMergeParentShardIds.add(parser.intValue());
+                    }
                 } else if (KEY_ACTIVE_SHARD_IDS.equals(currentFieldName)) {
                     while (parser.nextToken() != XContentParser.Token.END_ARRAY) {
                         activeShardIds.add(parser.intValue());
@@ -880,7 +1027,8 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
             inProgressSplitShardIds,
             activeShardIds,
             maxShardId,
-            splitCommitTimestamps
+            splitCommitTimestamps,
+            inProgressMergeParentShardIds
         );
     }
 

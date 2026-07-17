@@ -1484,6 +1484,121 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
         }
     }
 
+    // --- two-phase in-place merge: pending-merge state (start / commit / cancel) ---
+
+    /** Phase 1 (start): marks the merge pending without destroying anything -- children stay recorded. */
+    public void testStartMergeMarksPendingWithoutRemovingChildren() {
+        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
+        builder.splitShard(0, 2);
+        builder.updateSplitMetadataForChildShards(0, Set.of(3, 4));
+        builder.startMergeChildrenToParent(0);
+        SplitShardsMetadata pending = builder.build();
+
+        assertTrue("merge must be pending", pending.isMergeOfShardInProgress(0));
+        assertEquals(Set.of(0), pending.getInProgressMergeParentShardIds());
+        // Nothing destroyed: parent is still a split parent, children still recorded and range-owning.
+        assertTrue(pending.isSplitParent(0));
+        assertEquals(Set.of(3, 4), pending.getChildShardIdsOfParent(0));
+        assertTrue("root hash still resolves to a child", Set.of(3, 4).contains(pending.getShardIdOfHash(0, randomInt())));
+        // Children are flagged as in-progress-merge children (for the write guard).
+        assertTrue(pending.isChildOfInProgressMerge(3));
+        assertTrue(pending.isChildOfInProgressMerge(4));
+        assertFalse(pending.isChildOfInProgressMerge(0));
+    }
+
+    /** Phase 2 (commit): mergeChildrenBackToParent finalizes and clears the pending marker. */
+    public void testCommitPendingMergeRemovesChildrenAndClearsMarker() {
+        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
+        builder.splitShard(0, 2);
+        builder.updateSplitMetadataForChildShards(0, Set.of(3, 4));
+        builder.startMergeChildrenToParent(0);
+        builder.mergeChildrenBackToParent(0);
+        SplitShardsMetadata committed = builder.build();
+
+        assertFalse("pending marker cleared on commit", committed.isMergeOfShardInProgress(0));
+        assertFalse("parent no longer a split parent", committed.isSplitParent(0));
+        assertEquals(0, committed.getChildShardIdsOfParent(0).size());
+        assertEquals(0, committed.getShardIdOfHash(0, randomInt()));
+        assertFalse(committed.isChildOfInProgressMerge(3));
+    }
+
+    /** Phase 2 (cancel/rollback): cancelMerge clears only the marker, leaving the split fully intact. */
+    public void testCancelPendingMergeRestoresChildrenExactly() {
+        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
+        builder.splitShard(0, 2);
+        builder.updateSplitMetadataForChildShards(0, Set.of(3, 4));
+        SplitShardsMetadata beforeMerge = new SplitShardsMetadata.Builder(builder.build()).build();
+
+        builder.startMergeChildrenToParent(0);
+        builder.cancelMerge(0);
+        SplitShardsMetadata rolledBack = builder.build();
+
+        assertFalse("pending marker cleared on cancel", rolledBack.isMergeOfShardInProgress(0));
+        // The rolled-back metadata is identical to the pre-merge metadata -- a lossless rollback.
+        assertEquals(beforeMerge, rolledBack);
+        assertTrue(rolledBack.isSplitParent(0));
+        assertEquals(Set.of(3, 4), rolledBack.getChildShardIdsOfParent(0));
+        assertTrue("children serve the range again", Set.of(3, 4).contains(rolledBack.getShardIdOfHash(0, randomInt())));
+    }
+
+    public void testStartMergeRejectsAlreadyPendingMerge() {
+        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
+        builder.splitShard(0, 2);
+        builder.updateSplitMetadataForChildShards(0, Set.of(3, 4));
+        builder.startMergeChildrenToParent(0);
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> builder.startMergeChildrenToParent(0));
+        assertTrue(e.getMessage().contains("already in progress"));
+    }
+
+    public void testStartMergeRejectsNeverSplitParent() {
+        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> builder.startMergeChildrenToParent(0));
+        assertTrue(e.getMessage().contains("has not been split"));
+    }
+
+    public void testStreamSerdePendingMergeRoundTrip() throws IOException {
+        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
+        builder.splitShard(0, 2);
+        builder.updateSplitMetadataForChildShards(0, Set.of(3, 4));
+        builder.startMergeChildrenToParent(0);
+        SplitShardsMetadata original = builder.build();
+
+        SplitShardsMetadata deserialized = streamRoundTrip(original);
+        assertEquals(original, deserialized);
+        assertTrue(deserialized.isMergeOfShardInProgress(0));
+        assertEquals(Set.of(0), deserialized.getInProgressMergeParentShardIds());
+    }
+
+    public void testXContentSerdePendingMergeRoundTrip() throws IOException {
+        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
+        builder.splitShard(0, 2);
+        builder.updateSplitMetadataForChildShards(0, Set.of(3, 4));
+        builder.startMergeChildrenToParent(0);
+        SplitShardsMetadata original = builder.build();
+
+        SplitShardsMetadata deserialized = xContentRoundTrip(original);
+        assertEquals(original, deserialized);
+        assertTrue(deserialized.isMergeOfShardInProgress(0));
+    }
+
+    public void testStreamSerdePreV380DropsPendingMergeMarker() throws IOException {
+        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
+        builder.splitShard(0, 2);
+        builder.updateSplitMetadataForChildShards(0, Set.of(3, 4));
+        builder.startMergeChildrenToParent(0);
+        SplitShardsMetadata original = builder.build();
+
+        BytesStreamOutput out = new BytesStreamOutput();
+        out.setVersion(Version.V_3_7_0);
+        original.writeTo(out);
+        try (StreamInput in = out.bytes().streamInput()) {
+            in.setVersion(Version.V_3_7_0);
+            SplitShardsMetadata deserialized = new SplitShardsMetadata(in);
+            assertFalse("pending-merge marker must not survive a pre-V_3_8_0 round trip", deserialized.isMergeOfShardInProgress(0));
+            assertTrue(deserialized.getInProgressMergeParentShardIds().isEmpty());
+        }
+    }
+
     private SplitShardsMetadata streamRoundTrip(SplitShardsMetadata original) throws IOException {
         BytesStreamOutput out = new BytesStreamOutput();
         original.writeTo(out);

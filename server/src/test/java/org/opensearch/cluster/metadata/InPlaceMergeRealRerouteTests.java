@@ -18,8 +18,6 @@ import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.RoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
-import org.opensearch.cluster.routing.ShardRoutingState;
-import org.opensearch.cluster.routing.TestShardRouting;
 import org.opensearch.cluster.routing.allocation.AllocationService;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.Index;
@@ -38,7 +36,7 @@ import java.util.Set;
  */
 public class InPlaceMergeRealRerouteTests extends OpenSearchAllocationTestCase {
 
-    public void testMergeRevivesParentThroughRealRerouteAndStart() {
+    public void testMergeRevivesParentThroughRealRerouteAndCommits() {
         AllocationService allocation = createAllocationService(
             Settings.builder().put("cluster.routing.allocation.node_concurrent_recoveries", 10).build()
         );
@@ -52,21 +50,32 @@ public class InPlaceMergeRealRerouteTests extends OpenSearchAllocationTestCase {
         state = allocation.reroute(state, "reroute");
         state = startInitializingShardsAndReroute(allocation, state);
 
-        // Merge shard 0's two children back into the parent, driving the REAL reroute.
+        // Phase 1: mark shard 0's merge pending, reviving the parent -- children stay live -- driving the
+        // REAL reroute.
         ClusterState merged = MetadataInPlaceMergeShardService.applyMergeShardRequest(
             state,
             new InPlaceMergeShardClusterStateUpdateRequest("test-merge", "idx", 0),
             allocation::reroute
         );
 
+        // While pending, the children are still routed and serving; the parent is only recovering.
+        assertTrue(merged.metadata().index("idx").getSplitShardsMetadata().isMergeOfShardInProgress(0));
+        assertNotNull("child 1 still live while pending", merged.routingTable().index("idx").shard(1));
+        assertNotNull("child 2 still live while pending", merged.routingTable().index("idx").shard(2));
+
         // Drive the revived parent primary from UNASSIGNED to STARTED through real allocation.
         merged = startInitializingShardsAndReroute(allocation, merged);
+        assertTrue("parent primary must be started before commit", merged.routingTable().index("idx").shard(0).primaryShard().started());
+
+        // Phase 2 (commit): the commit driver finalizes the merge now that the parent is STARTED.
+        merged = MetadataInPlaceMergeShardCommitService.applyCommit(merged, "idx", 0);
 
         IndexRoutingTable routing = merged.routingTable().index("idx");
         assertNotNull("parent shard 0 must be revived", routing.shard(0));
         assertTrue("parent primary must be started", routing.shard(0).primaryShard().started());
-        assertNull("child shard 1 must be retired", routing.shard(1));
-        assertNull("child shard 2 must be retired", routing.shard(2));
+        assertNull("child shard 1 must be retired on commit", routing.shard(1));
+        assertNull("child shard 2 must be retired on commit", routing.shard(2));
+        assertFalse(merged.metadata().index("idx").getSplitShardsMetadata().isMergeOfShardInProgress(0));
     }
 
     private ClusterState postSplitStartedState(String indexName, int parentShardId, int splitInto) {

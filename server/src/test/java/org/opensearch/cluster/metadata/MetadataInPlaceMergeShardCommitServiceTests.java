@@ -8,174 +8,256 @@
 
 package org.opensearch.cluster.metadata;
 
-import org.apache.logging.log4j.Level;
-import org.apache.logging.log4j.LogManager;
 import org.opensearch.Version;
-import org.opensearch.cluster.ClusterChangedEvent;
+import org.opensearch.action.admin.indices.split.InPlaceMergeShardClusterStateUpdateRequest;
 import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.ClusterState;
-import org.opensearch.cluster.metadata.MetadataInPlaceMergeShardCommitService.StuckMergeParent;
-import org.opensearch.cluster.node.DiscoveryNode;
-import org.opensearch.cluster.node.DiscoveryNodeRole;
-import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
-import org.opensearch.cluster.routing.RecoverySource;
+import org.opensearch.cluster.routing.OperationRouting;
 import org.opensearch.cluster.routing.RoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
+import org.opensearch.cluster.routing.ShardRoutingState;
+import org.opensearch.cluster.routing.TestShardRouting;
 import org.opensearch.cluster.routing.UnassignedInfo;
-import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.cluster.routing.allocation.decider.MaxRetryAllocationDecider;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
-import org.opensearch.test.MockLogAppender;
 import org.opensearch.test.OpenSearchTestCase;
 
-import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
-import static org.mockito.Mockito.mock;
-
+/**
+ * Tests the two-phase in-place merge commit/cancel driver -- the mirror of
+ * {@link MetadataInPlaceSplitShardCommitServiceTests}. The commit path finalizes a pending merge once the
+ * revived parent starts; the cancel path is the real automatic rollback: it proves that when the revived
+ * parent never recovers, the children were never destroyed and the shard range stays servable through
+ * them.
+ */
 public class MetadataInPlaceMergeShardCommitServiceTests extends OpenSearchTestCase {
 
-    private static final int HIGH_FAILURE_COUNT = 100; // well above index.allocation.max_retries default
+    private static final String INDEX = "test-index";
 
-    /**
-     * CC3: a revived in-place-merge parent primary that has exhausted its allocation-retry budget is
-     * detected as stuck, carrying the retired children it can no longer reach.
-     */
-    public void testDetectsStuckMergeParent() {
-        ClusterState state = mergeParentState(
-            HIGH_FAILURE_COUNT,
-            new RecoverySource.InPlaceMergeShardRecoverySource(Arrays.asList(childRange(1), childRange(2)))
-        );
+    public void testApplyCommitDoesNothingWhileParentStillUnassigned() {
+        ClusterState pending = pendingMergeState();
 
-        List<StuckMergeParent> stuck = MetadataInPlaceMergeShardCommitService.findStuckMergeParents(state);
+        ClusterState afterCommit = MetadataInPlaceMergeShardCommitService.applyCommit(pending, INDEX, 0);
 
-        assertEquals(1, stuck.size());
-        assertEquals(0, stuck.get(0).parentShardId().id());
-        assertEquals("test-index", stuck.get(0).parentShardId().getIndexName());
-        assertEquals(Arrays.asList(1, 2), stuck.get(0).retiredChildShardIds());
+        assertSame(pending, afterCommit);
+        SplitShardsMetadata metadata = afterCommit.metadata().index(INDEX).getSplitShardsMetadata();
+        assertTrue("merge must still be pending", metadata.isMergeOfShardInProgress(0));
+        // Children untouched and still routed.
+        assertNotNull(afterCommit.routingTable().index(INDEX).shard(1));
+        assertNotNull(afterCommit.routingTable().index(INDEX).shard(2));
+    }
+
+    public void testApplyCommitFinalizesMergeWhenParentStarted() {
+        ClusterState started = startParent(pendingMergeState());
+
+        ClusterState afterCommit = MetadataInPlaceMergeShardCommitService.applyCommit(started, INDEX, 0);
+
+        SplitShardsMetadata metadata = afterCommit.metadata().index(INDEX).getSplitShardsMetadata();
+        assertFalse("merge marker cleared on commit", metadata.isMergeOfShardInProgress(0));
+        assertFalse("parent no longer a split parent after commit", metadata.isSplitParent(0));
+        assertEquals("no children recorded after commit", 0, metadata.getChildShardIdsOfParent(0).size());
+
+        IndexRoutingTable routing = afterCommit.routingTable().index(INDEX);
+        assertNotNull("parent routing must remain (now STARTED)", routing.shard(0));
+        assertNull("child 1 routing retired on commit", routing.shard(1));
+        assertNull("child 2 routing retired on commit", routing.shard(2));
+
+        // Post-commit, the hash space is served by the parent again.
+        assertEquals(0, metadata.getShardIdOfHash(0, randomInt()));
+    }
+
+    public void testApplyCommitIsANoOpIfMergeAlreadyCommitted() {
+        ClusterState committed = MetadataInPlaceMergeShardCommitService.applyCommit(startParent(pendingMergeState()), INDEX, 0);
+
+        ClusterState committedAgain = MetadataInPlaceMergeShardCommitService.applyCommit(committed, INDEX, 0);
+
+        assertSame(committed, committedAgain);
     }
 
     /**
-     * A revived merge parent still within its allocation-retry budget is not yet stuck -- it may still
-     * recover, so it must not raise the alarm.
+     * The critical rollback-proving test. Drive a pending merge whose revived parent exhausts its
+     * allocation-retry budget, cancel it, and assert the merge is genuinely rolled back: the children's
+     * routing/metadata is fully intact and the shard range resolves back to the children through the real
+     * {@link OperationRouting#generateShardId} path -- not merely "children still present in some map".
      */
-    public void testMergeParentWithinRetryBudgetIsNotStuck() {
-        // One failure, well below the index.allocation.max_retries default of 5 -- still recoverable.
-        ClusterState state = mergeParentState(
-            1,
-            new RecoverySource.InPlaceMergeShardRecoverySource(Arrays.asList(childRange(1), childRange(2)))
+    public void testApplyCancelRollsBackToFullyServableChildren() {
+        ClusterState pending = pendingMergeState();
+        int maxRetries = MaxRetryAllocationDecider.SETTING_ALLOCATION_MAX_RETRY.get(pending.metadata().index(INDEX).getSettings());
+        ClusterState exhausted = failParentAllocation(pending, maxRetries);
+
+        // Sanity: while pending, the (not-yet-started) parent shard is not what a hash resolves to --
+        // the children still own the range.
+        SplitShardsMetadata beforeCancel = exhausted.metadata().index(INDEX).getSplitShardsMetadata();
+        assertTrue(beforeCancel.isMergeOfShardInProgress(0));
+
+        // Drive the rollback through the SAME detection the live listener uses, so this test also proves
+        // the cancel-trigger condition fires (break that condition and this whole test goes red).
+        assertEquals(
+            "an exhausted revived parent must be detected as needing rollback",
+            MetadataInPlaceMergeShardCommitService.MergeCompletionState.SHOULD_CANCEL,
+            MetadataInPlaceMergeShardCommitService.evaluateMergeCompletion(exhausted, exhausted.metadata().index(INDEX), 0)
         );
 
-        assertTrue(MetadataInPlaceMergeShardCommitService.findStuckMergeParents(state).isEmpty());
-    }
+        ClusterState afterCancel = MetadataInPlaceMergeShardCommitService.applyCancel(exhausted, INDEX, 0);
 
-    /**
-     * An ordinary unassigned primary that exhausted its retries -- but is not a revived merge parent --
-     * is not this service's concern.
-     */
-    public void testNonMergeUnassignedPrimaryIsNotStuck() {
-        ClusterState state = mergeParentState(HIGH_FAILURE_COUNT, RecoverySource.EmptyStoreRecoverySource.INSTANCE);
+        IndexMetadata mergedIndexMetadata = afterCancel.metadata().index(INDEX);
+        SplitShardsMetadata metadata = mergedIndexMetadata.getSplitShardsMetadata();
+        // Marker cleared, but the split is intact: parent still a split parent, children still recorded.
+        assertFalse("pending-merge marker cleared on cancel", metadata.isMergeOfShardInProgress(0));
+        assertTrue("split must survive the rollback -- parent is still a split parent", metadata.isSplitParent(0));
+        assertEquals("both children still recorded after rollback", Set.of(1, 2), metadata.getChildShardIdsOfParent(0));
 
-        assertTrue(MetadataInPlaceMergeShardCommitService.findStuckMergeParents(state).isEmpty());
-    }
+        // The revived parent's routing entry is gone; the children's are untouched.
+        IndexRoutingTable routing = afterCancel.routingTable().index(INDEX);
+        assertNull("revived parent routing removed on rollback", routing.shard(0));
+        assertNotNull("child 1 routing intact", routing.shard(1));
+        assertNotNull("child 2 routing intact", routing.shard(2));
+        assertTrue("child 1 primary still started and serving", routing.shard(1).primaryShard().started());
+        assertTrue("child 2 primary still started and serving", routing.shard(2).primaryShard().started());
 
-    /**
-     * The stuck-parent condition must be loud and operator-actionable: driving it through the listener
-     * emits a distinct WARN naming the shard and stating rollback is manual, rather than leaving a
-     * silently-red shard.
-     */
-    public void testStuckMergeParentEmitsActionableWarning() throws Exception {
-        ClusterState state = mergeParentState(
-            HIGH_FAILURE_COUNT,
-            new RecoverySource.InPlaceMergeShardRecoverySource(Arrays.asList(childRange(1), childRange(2)))
-        );
-        MetadataInPlaceMergeShardCommitService service = new MetadataInPlaceMergeShardCommitService(
-            Settings.EMPTY,
-            mock(ClusterService.class)
-        );
-
-        try (
-            MockLogAppender appender = MockLogAppender.createForLoggers(
-                LogManager.getLogger(MetadataInPlaceMergeShardCommitService.class)
-            )
-        ) {
-            appender.addExpectation(
-                new MockLogAppender.SeenEventExpectation(
-                    "stuck merge warning",
-                    MetadataInPlaceMergeShardCommitService.class.getCanonicalName(),
-                    Level.WARN,
-                    "*In-place merge of shard [0]*cannot complete*remains recoverable*"
-                )
-            );
-            service.clusterChanged(new ClusterChangedEvent("test", state, emptyState()));
-            appender.assertAllExpectationsMatched();
+        // Real serviceability: every possible document routes to a live child (1 or 2), never to the
+        // dead parent (0). Sweep enough ids that both children are exercised.
+        boolean sawChild1 = false, sawChild2 = false;
+        for (int i = 0; i < 5000; i++) {
+            int shardId = OperationRouting.generateShardId(mergedIndexMetadata, Integer.toString(i), null);
+            assertNotEquals("hash must never resolve to the rolled-back parent", 0, shardId);
+            assertTrue("hash must resolve to a child (1 or 2), got " + shardId, shardId == 1 || shardId == 2);
+            sawChild1 |= shardId == 1;
+            sawChild2 |= shardId == 2;
         }
+        assertTrue("both children must actually serve part of the range", sawChild1 && sawChild2);
     }
 
-    private static ShardRange childRange(int shardId) {
-        // Two disjoint halves of the hash space; exact bounds don't matter to this service.
-        return shardId == 1
-            ? new ShardRange(1, Integer.MIN_VALUE, 0)
-            : new ShardRange(2, 1, Integer.MAX_VALUE);
+    public void testEvaluateMergeCompletionClassifiesParentState() {
+        ClusterState pending = pendingMergeState();
+        int maxRetries = MaxRetryAllocationDecider.SETTING_ALLOCATION_MAX_RETRY.get(pending.metadata().index(INDEX).getSettings());
+
+        // Parent still recovering (0 failures) -> still in progress.
+        assertEquals(
+            MetadataInPlaceMergeShardCommitService.MergeCompletionState.STILL_IN_PROGRESS,
+            MetadataInPlaceMergeShardCommitService.evaluateMergeCompletion(pending, pending.metadata().index(INDEX), 0)
+        );
+        // Parent within retry budget -> still in progress, not yet a rollback.
+        ClusterState withinBudget = failParentAllocation(pending, maxRetries - 1);
+        assertEquals(
+            MetadataInPlaceMergeShardCommitService.MergeCompletionState.STILL_IN_PROGRESS,
+            MetadataInPlaceMergeShardCommitService.evaluateMergeCompletion(withinBudget, withinBudget.metadata().index(INDEX), 0)
+        );
+        // Parent STARTED -> ready to commit.
+        ClusterState started = startParent(pending);
+        assertEquals(
+            MetadataInPlaceMergeShardCommitService.MergeCompletionState.READY_TO_COMMIT,
+            MetadataInPlaceMergeShardCommitService.evaluateMergeCompletion(started, started.metadata().index(INDEX), 0)
+        );
     }
 
-    private static ClusterState mergeParentState(int numFailedAllocations, RecoverySource recoverySource) {
-        Settings settings = Settings.builder()
+    // --- helpers ---
+
+    /** A committed split of shard 0 into children {1,2}, with both children STARTED (a cluster at rest). */
+    private static ClusterState postSplitState() {
+        Settings indexSettings = Settings.builder()
             .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
             .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
             .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
             .build();
-        IndexMetadata indexMetadata = IndexMetadata.builder("test-index").settings(settings).build();
+        IndexMetadata base = IndexMetadata.builder(INDEX).settings(indexSettings).build();
+
+        SplitShardsMetadata.Builder splitBuilder = new SplitShardsMetadata.Builder(base.getSplitShardsMetadata());
+        List<ShardRange> childRanges = splitBuilder.splitShard(0, 2);
+        Set<Integer> childIds = new HashSet<>();
+        childRanges.forEach(r -> childIds.add(r.shardId()));
+        splitBuilder.updateSplitMetadataForChildShards(0, childIds);
+
+        IndexMetadata.Builder imBuilder = IndexMetadata.builder(base).splitShardsMetadata(splitBuilder.build());
+        for (int childId : childIds) {
+            imBuilder.putInSyncAllocationIds(childId, Collections.emptySet());
+            imBuilder.primaryTerm(childId, 1);
+        }
+        IndexMetadata indexMetadata = imBuilder.build();
         Index index = indexMetadata.getIndex();
-        ShardId shardId = new ShardId(index, 0);
 
-        UnassignedInfo unassignedInfo = new UnassignedInfo(
-            UnassignedInfo.Reason.ALLOCATION_FAILED,
-            "simulated failure",
-            null,
-            numFailedAllocations,
-            0,
-            0,
-            false,
-            UnassignedInfo.AllocationStatus.DECIDERS_NO,
-            Collections.emptySet()
-        );
-        ShardRouting primary = ShardRouting.newUnassigned(shardId, true, recoverySource, unassignedInfo);
-        IndexShardRoutingTable.Builder shardBuilder = new IndexShardRoutingTable.Builder(shardId);
-        shardBuilder.addShard(primary);
         IndexRoutingTable.Builder indexRoutingBuilder = new IndexRoutingTable.Builder(index);
-        indexRoutingBuilder.addIndexShard(shardBuilder.build());
-
-        DiscoveryNode localNode = new DiscoveryNode(
-            "node1",
-            buildNewFakeTransportAddress(),
-            Collections.emptyMap(),
-            Set.of(DiscoveryNodeRole.CLUSTER_MANAGER_ROLE),
-            Version.CURRENT
-        );
-        DiscoveryNodes nodes = DiscoveryNodes.builder().add(localNode).localNodeId("node1").clusterManagerNodeId("node1").build();
+        for (int childId : childIds) {
+            IndexShardRoutingTable.Builder shardBuilder = new IndexShardRoutingTable.Builder(new ShardId(index, childId));
+            shardBuilder.addShard(TestShardRouting.newShardRouting(new ShardId(index, childId), "node1", true, ShardRoutingState.STARTED));
+            indexRoutingBuilder.addIndexShard(shardBuilder.build());
+        }
 
         return ClusterState.builder(ClusterName.CLUSTER_NAME_SETTING.getDefault(Settings.EMPTY))
-            .nodes(nodes)
             .metadata(Metadata.builder().put(indexMetadata, false))
             .routingTable(RoutingTable.builder().add(indexRoutingBuilder).build())
             .build();
     }
 
-    private static ClusterState emptyState() {
-        DiscoveryNode localNode = new DiscoveryNode(
-            "node1",
-            buildNewFakeTransportAddress(),
-            Collections.emptyMap(),
-            Set.of(DiscoveryNodeRole.CLUSTER_MANAGER_ROLE),
-            Version.CURRENT
+    /** Phase 1: mark the merge of shard 0 pending, reviving the parent as an UNASSIGNED primary. */
+    private static ClusterState pendingMergeState() {
+        return MetadataInPlaceMergeShardService.applyMergeShardRequest(
+            postSplitState(),
+            new InPlaceMergeShardClusterStateUpdateRequest("test", INDEX, 0),
+            (cs, reason) -> cs
         );
-        DiscoveryNodes nodes = DiscoveryNodes.builder().add(localNode).localNodeId("node1").clusterManagerNodeId("node1").build();
-        return ClusterState.builder(ClusterName.CLUSTER_NAME_SETTING.getDefault(Settings.EMPTY)).nodes(nodes).build();
+    }
+
+    /** Drives the revived parent primary (shard 0) to STARTED, as real allocation would. */
+    private static ClusterState startParent(ClusterState state) {
+        Index index = state.metadata().index(INDEX).getIndex();
+        IndexRoutingTable current = state.routingTable().index(INDEX);
+        IndexRoutingTable.Builder indexRoutingBuilder = new IndexRoutingTable.Builder(index);
+        for (IndexShardRoutingTable shardTable : current) {
+            if (shardTable.shardId().id() == 0) {
+                IndexShardRoutingTable.Builder builder = new IndexShardRoutingTable.Builder(shardTable.shardId());
+                builder.addShard(TestShardRouting.newShardRouting(shardTable.shardId(), "node1", true, ShardRoutingState.STARTED));
+                indexRoutingBuilder.addIndexShard(builder.build());
+            } else {
+                indexRoutingBuilder.addIndexShard(shardTable);
+            }
+        }
+        RoutingTable.Builder routingTableBuilder = RoutingTable.builder(state.routingTable());
+        routingTableBuilder.add(indexRoutingBuilder);
+        return ClusterState.builder(state).routingTable(routingTableBuilder.build()).build();
+    }
+
+    /** Fails the revived parent primary's allocation {@code numFailedAllocations} times (still UNASSIGNED). */
+    private static ClusterState failParentAllocation(ClusterState state, int numFailedAllocations) {
+        Index index = state.metadata().index(INDEX).getIndex();
+        IndexRoutingTable current = state.routingTable().index(INDEX);
+        IndexRoutingTable.Builder indexRoutingBuilder = new IndexRoutingTable.Builder(index);
+        for (IndexShardRoutingTable shardTable : current) {
+            if (shardTable.shardId().id() == 0) {
+                UnassignedInfo unassignedInfo = new UnassignedInfo(
+                    UnassignedInfo.Reason.ALLOCATION_FAILED,
+                    "simulated failure",
+                    null,
+                    numFailedAllocations,
+                    0,
+                    0,
+                    false,
+                    UnassignedInfo.AllocationStatus.DECIDERS_NO,
+                    Collections.emptySet()
+                );
+                ShardRouting failedPrimary = ShardRouting.newUnassigned(
+                    shardTable.shardId(),
+                    true,
+                    shardTable.primaryShard().recoverySource(),
+                    unassignedInfo
+                );
+                IndexShardRoutingTable.Builder builder = new IndexShardRoutingTable.Builder(shardTable.shardId());
+                builder.addShard(failedPrimary);
+                indexRoutingBuilder.addIndexShard(builder.build());
+            } else {
+                indexRoutingBuilder.addIndexShard(shardTable);
+            }
+        }
+        RoutingTable.Builder routingTableBuilder = RoutingTable.builder(state.routingTable());
+        routingTableBuilder.add(indexRoutingBuilder);
+        return ClusterState.builder(state).routingTable(routingTableBuilder.build()).build();
     }
 }

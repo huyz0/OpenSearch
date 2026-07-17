@@ -10,55 +10,54 @@ package org.opensearch.cluster.metadata;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.logging.log4j.message.ParameterizedMessage;
 import org.opensearch.cluster.ClusterChangedEvent;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.ClusterStateListener;
+import org.opensearch.cluster.ClusterStateUpdateTask;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
-import org.opensearch.cluster.routing.RecoverySource;
+import org.opensearch.cluster.routing.RoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.allocation.decider.MaxRetryAllocationDecider;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.Priority;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.settings.Settings;
-import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.core.index.Index;
 
-import java.util.ArrayList;
-import java.util.HashSet;
-import java.util.List;
 import java.util.Set;
 
 /**
- * Surfaces the one failure mode {@link MetadataInPlaceMergeShardService} cannot itself recover from:
- * a revived parent primary that never manages to recover.
+ * The commit/cancel driver for the two-phase in-place shard <em>merge</em> -- the exact mirror of
+ * {@link MetadataInPlaceSplitShardCommitService} for split. {@link MetadataInPlaceMergeShardService}
+ * performs only phase 1: it marks a merge <em>pending</em> ({@code inProgressMergeParentShardIds}) and
+ * revives the parent as an UNASSIGNED primary recovering via
+ * {@link org.opensearch.cluster.routing.RecoverySource.InPlaceMergeShardRecoverySource}, while leaving
+ * the children fully live, routed, and serving their hash ranges. This service watches cluster state
+ * and drives each pending merge to one of two terminal outcomes:
  *
- * <p>An in-place merge de-commits the split synchronously and revives the parent as a single
- * {@code UNASSIGNED} primary recovering via {@link RecoverySource.InPlaceMergeShardRecoverySource}.
- * If that primary then exhausts its allocation-retry budget (the same
- * {@code UnassignedInfo#getNumFailedAllocations() >= }{@link MaxRetryAllocationDecider}'s
- * {@code SETTING_ALLOCATION_MAX_RETRY} threshold split's own commit service uses to give up on a
- * child), the shard is left permanently red. Split has a symmetric rollback for this exact case
- * ({@link MetadataInPlaceSplitShardCommitService}'s {@code SHOULD_CANCEL} path), but a merge cannot
- * reuse that shape: split watches a persistent {@code inProgressSplitShardIds} marker that survives
- * across the recovery window, whereas a merge erases all trace of the children from
- * {@link SplitShardsMetadata} in the very same cluster-state update that revives the parent, so there
- * is no "merge in progress" state left to drive an automatic re-split from.
+ * <ul>
+ *   <li><b>commit</b> -- once the revived parent's primary reaches {@code STARTED}, the merge is
+ *       finalized: the children are removed from {@link SplitShardsMetadata} via
+ *       {@link SplitShardsMetadata.Builder#mergeChildrenBackToParent(int)} and their routing entries are
+ *       retired, in the same cluster-state update. This is the only point at which anything is destroyed,
+ *       and it happens only after the parent has confirmed it holds all the data. (Retiring the children
+ *       atomically with the parent becoming the sole owner of the range mirrors split's own commit, which
+ *       retires the parent atomically with its children taking over -- so a range is owned by exactly one
+ *       search-visible shard across the transition.)</li>
+ *   <li><b>cancel (automatic rollback)</b> -- if the revived parent instead exhausts the same
+ *       allocation-retry budget {@link MaxRetryAllocationDecider} uses to permanently give up on a shard
+ *       ({@code UnassignedInfo#getNumFailedAllocations() >= index.allocation.max_retries}), the pending
+ *       merge is cancelled via {@link SplitShardsMetadata.Builder#cancelMerge(int)} and the parent's
+ *       revived (and now permanently unassigned) routing entry is removed. Because phase 1 never removed
+ *       the children, they are still active, routed, and range-owning -- so the shard range is served by
+ *       them exactly as it was before the merge was attempted. This is a genuine, lossless rollback, not
+ *       merely a logged failure.</li>
+ * </ul>
  *
- * <p><b>Scope, stated honestly.</b> A full automatic rollback (re-establish the split's metadata and
- * re-create the children's routing so their still-present data becomes reachable again) is possible
- * in principle -- the children's blob containers persist until GC, and the revived parent's recovery
- * source still carries their {@link ShardRange}s -- but it would require a new persistent
- * "merge pending" concept in cluster state (a new field, wire-format and XContent gating, and a
- * commit/cancel driver to restore from a pre-merge snapshot). That is deferred as future work. This
- * service lands the narrower, honest fix in the meantime: detect the stuck-parent condition and make
- * it <em>loud and operator-actionable</em> -- a distinct WARN naming the parent, the retired
- * children, and the fact that their data is still recoverable from their containers -- rather than
- * leaving a silently-red shard with no explanation of what happened or what can be done about it.
- *
- * <p>Cluster-manager-only, modeled on {@link MetadataInPlaceSplitShardCommitService}. The warning is
- * de-duplicated per stuck parent so it fires once, not on every subsequent cluster-state change,
- * and is re-armed if the same parent later recovers (or the index goes away) and gets stuck again.
+ * <p>Cluster-manager-only, modeled on {@link MetadataInPlaceSplitShardCommitService}.
  *
  * @opensearch.experimental
  */
@@ -67,9 +66,6 @@ public class MetadataInPlaceMergeShardCommitService implements ClusterStateListe
     private static final Logger logger = LogManager.getLogger(MetadataInPlaceMergeShardCommitService.class);
 
     private final ClusterService clusterService;
-
-    /** Parents already warned about, so the actionable WARN fires once per stuck parent, not per cluster-state change. */
-    private final Set<ShardId> warnedStuckParents = new HashSet<>();
 
     public MetadataInPlaceMergeShardCommitService(Settings settings, ClusterService clusterService) {
         this.clusterService = clusterService;
@@ -83,84 +79,196 @@ public class MetadataInPlaceMergeShardCommitService implements ClusterStateListe
         if (event.localNodeClusterManager() == false) {
             return;
         }
-        List<StuckMergeParent> stuck = findStuckMergeParents(event.state());
-
-        // Re-arm any parent that is no longer stuck (recovered, or its index was deleted), so a future
-        // stuck merge of the same shard id warns again rather than being suppressed forever.
-        Set<ShardId> stillStuck = new HashSet<>();
-        for (StuckMergeParent parent : stuck) {
-            stillStuck.add(parent.parentShardId());
-        }
-        warnedStuckParents.retainAll(stillStuck);
-
-        for (StuckMergeParent parent : stuck) {
-            if (warnedStuckParents.add(parent.parentShardId())) {
-                logger.warn(
-                    "In-place merge of shard [{}] of index [{}] cannot complete: the revived parent primary has exhausted its "
-                        + "allocation-retry budget and is permanently unassigned. Automatic rollback is not implemented, so the "
-                        + "shard will stay red until an operator intervenes (e.g. address the allocation failure and retry via the "
-                        + "cluster reroute API's retry_failed flag). The merged-away children {} are no longer in cluster state, but "
-                        + "their underlying data has not been garbage-collected and remains recoverable from their blob containers.",
-                    parent.parentShardId().id(),
-                    parent.parentShardId().getIndexName(),
-                    parent.retiredChildShardIds()
-                );
+        ClusterState state = event.state();
+        for (IndexMetadata indexMetadata : state.metadata()) {
+            SplitShardsMetadata splitShardsMetadata = indexMetadata.getSplitShardsMetadata();
+            for (Integer parentShardId : splitShardsMetadata.getInProgressMergeParentShardIds()) {
+                MergeCompletionState completionState = evaluateMergeCompletion(state, indexMetadata, parentShardId);
+                if (completionState == MergeCompletionState.READY_TO_COMMIT) {
+                    submitCommit(indexMetadata.getIndex().getName(), parentShardId);
+                } else if (completionState == MergeCompletionState.SHOULD_CANCEL) {
+                    submitCancel(indexMetadata.getIndex().getName(), parentShardId);
+                }
             }
         }
+    }
+
+    enum MergeCompletionState {
+        STILL_IN_PROGRESS,
+        READY_TO_COMMIT,
+        SHOULD_CANCEL
     }
 
     /**
-     * A revived in-place-merge parent primary that has permanently failed to recover: it is still
-     * {@code UNASSIGNED}, still carries an {@link RecoverySource.InPlaceMergeShardRecoverySource}, and
-     * has failed allocation at least {@code index.allocation.max_retries} times.
+     * Classifies a pending merge from the revived parent primary's routing state: STARTED means the parent
+     * holds the merged data and the children can be retired (commit); an unassigned parent that has failed
+     * allocation at least {@code index.allocation.max_retries} times will never recover (cancel/rollback);
+     * anything else is still in flight.
      */
-    static List<StuckMergeParent> findStuckMergeParents(ClusterState state) {
-        List<StuckMergeParent> stuck = new ArrayList<>();
-        for (IndexMetadata indexMetadata : state.metadata()) {
-            IndexRoutingTable indexRoutingTable = state.routingTable().index(indexMetadata.getIndex().getName());
-            if (indexRoutingTable == null) {
-                continue;
-            }
-            int maxRetries = MaxRetryAllocationDecider.SETTING_ALLOCATION_MAX_RETRY.get(indexMetadata.getSettings());
-            for (IndexShardRoutingTable shardTable : indexRoutingTable) {
-                ShardRouting primary = shardTable.primaryShard();
-                if (primary == null || primary.unassigned() == false) {
-                    continue;
-                }
-                if ((primary.recoverySource() instanceof RecoverySource.InPlaceMergeShardRecoverySource) == false) {
-                    continue;
-                }
-                if (primary.unassignedInfo() == null || primary.unassignedInfo().getNumFailedAllocations() < maxRetries) {
-                    continue;
-                }
-                RecoverySource.InPlaceMergeShardRecoverySource mergeSource = (RecoverySource.InPlaceMergeShardRecoverySource) primary
-                    .recoverySource();
-                List<Integer> childShardIds = new ArrayList<>();
-                for (ShardRange child : mergeSource.children()) {
-                    childShardIds.add(child.shardId());
-                }
-                stuck.add(new StuckMergeParent(primary.shardId(), childShardIds));
-            }
+    static MergeCompletionState evaluateMergeCompletion(ClusterState state, IndexMetadata indexMetadata, int parentShardId) {
+        IndexRoutingTable indexRoutingTable = state.routingTable().index(indexMetadata.getIndex().getName());
+        if (indexRoutingTable == null) {
+            return MergeCompletionState.STILL_IN_PROGRESS;
         }
-        return stuck;
+        IndexShardRoutingTable parentShardTable = indexRoutingTable.shard(parentShardId);
+        if (parentShardTable == null) {
+            return MergeCompletionState.STILL_IN_PROGRESS;
+        }
+        ShardRouting parentPrimary = parentShardTable.primaryShard();
+        if (parentPrimary == null) {
+            return MergeCompletionState.STILL_IN_PROGRESS;
+        }
+        if (parentPrimary.started()) {
+            return MergeCompletionState.READY_TO_COMMIT;
+        }
+        int maxRetries = MaxRetryAllocationDecider.SETTING_ALLOCATION_MAX_RETRY.get(indexMetadata.getSettings());
+        if (parentPrimary.unassigned()
+            && parentPrimary.unassignedInfo() != null
+            && parentPrimary.unassignedInfo().getNumFailedAllocations() >= maxRetries) {
+            return MergeCompletionState.SHOULD_CANCEL;
+        }
+        return MergeCompletionState.STILL_IN_PROGRESS;
     }
 
-    /** A revived merge parent that exhausted its allocation retries, and the child shard ids it retired. */
-    static final class StuckMergeParent {
-        private final ShardId parentShardId;
-        private final List<Integer> retiredChildShardIds;
+    private void submitCommit(String indexName, int parentShardId) {
+        clusterService.submitStateUpdateTask(
+            "commit in-place merge of shard [" + parentShardId + "] of index [" + indexName + "]",
+            new ClusterStateUpdateTask(Priority.NORMAL) {
+                @Override
+                public ClusterState execute(ClusterState currentState) {
+                    return applyCommit(currentState, indexName, parentShardId);
+                }
 
-        StuckMergeParent(ShardId parentShardId, List<Integer> retiredChildShardIds) {
-            this.parentShardId = parentShardId;
-            this.retiredChildShardIds = retiredChildShardIds;
+                @Override
+                public void onFailure(String source, Exception e) {
+                    logger.warn(
+                        () -> new ParameterizedMessage(
+                            "failed to commit in-place merge of shard [{}] of index [{}]",
+                            parentShardId,
+                            indexName
+                        ),
+                        e
+                    );
+                }
+            }
+        );
+    }
+
+    private void submitCancel(String indexName, int parentShardId) {
+        clusterService.submitStateUpdateTask(
+            "cancel in-place merge of shard ["
+                + parentShardId
+                + "] of index ["
+                + indexName
+                + "] (revived parent allocation retries exhausted)",
+            new ClusterStateUpdateTask(Priority.NORMAL) {
+                @Override
+                public ClusterState execute(ClusterState currentState) {
+                    return applyCancel(currentState, indexName, parentShardId);
+                }
+
+                @Override
+                public void onFailure(String source, Exception e) {
+                    logger.warn(
+                        () -> new ParameterizedMessage(
+                            "failed to cancel in-place merge of shard [{}] of index [{}]",
+                            parentShardId,
+                            indexName
+                        ),
+                        e
+                    );
+                }
+            }
+        );
+    }
+
+    /**
+     * Commits a pending merge whose revived parent primary has reached {@code STARTED}: removes the
+     * children from {@link SplitShardsMetadata} via
+     * {@link SplitShardsMetadata.Builder#mergeChildrenBackToParent(int)} (which also clears the pending
+     * marker) and retires their routing entries, in the very same cluster-state update -- so the range is
+     * owned by exactly one search-visible shard (the parent now, the children before) across the boundary.
+     * Re-validates the completion condition against the state actually being applied to, since cluster
+     * state may have advanced between {@link #clusterChanged} firing and this task executing.
+     */
+    static ClusterState applyCommit(ClusterState currentState, String indexName, int parentShardId) {
+        IndexMetadata curIndexMetadata = currentState.metadata().index(indexName);
+        if (curIndexMetadata == null || curIndexMetadata.getSplitShardsMetadata().isMergeOfShardInProgress(parentShardId) == false) {
+            return currentState;
+        }
+        if (evaluateMergeCompletion(currentState, curIndexMetadata, parentShardId) != MergeCompletionState.READY_TO_COMMIT) {
+            return currentState;
         }
 
-        ShardId parentShardId() {
-            return parentShardId;
+        Set<Integer> childIds = curIndexMetadata.getSplitShardsMetadata().getChildShardIdsOfParent(parentShardId);
+        SplitShardsMetadata.Builder mergeMetadataBuilder = new SplitShardsMetadata.Builder(curIndexMetadata.getSplitShardsMetadata());
+        mergeMetadataBuilder.mergeChildrenBackToParent(parentShardId);
+
+        IndexMetadata.Builder indexMetadataBuilder = IndexMetadata.builder(curIndexMetadata)
+            .splitShardsMetadata(mergeMetadataBuilder.build());
+        Metadata.Builder metadataBuilder = Metadata.builder(currentState.metadata()).put(indexMetadataBuilder);
+
+        Index index = curIndexMetadata.getIndex();
+        IndexRoutingTable currentIndexRoutingTable = currentState.routingTable().index(indexName);
+        IndexRoutingTable.Builder indexRoutingTableBuilder = IndexRoutingTable.builder(index);
+        for (IndexShardRoutingTable shardTable : currentIndexRoutingTable) {
+            if (childIds.contains(shardTable.shardId().id()) == false) {
+                indexRoutingTableBuilder.addIndexShard(shardTable);
+            }
+        }
+        RoutingTable.Builder routingTableBuilder = RoutingTable.builder(currentState.routingTable());
+        routingTableBuilder.add(indexRoutingTableBuilder);
+
+        logger.info(
+            "in-place merge of shard [{}] of index [{}] committed: revived parent is STARTED, children {} retired",
+            parentShardId,
+            indexName,
+            childIds
+        );
+        return ClusterState.builder(currentState).metadata(metadataBuilder).routingTable(routingTableBuilder.build()).build();
+    }
+
+    /**
+     * Rolls back a pending merge whose revived parent primary permanently exhausted its allocation-retry
+     * budget: drops the pending marker via {@link SplitShardsMetadata.Builder#cancelMerge(int)} and removes
+     * the parent's (permanently unassigned) revived routing entry. The children were never removed, so they
+     * remain active, routed, and serving their hash ranges -- the range is fully servable through them
+     * again, exactly as before the merge was attempted.
+     */
+    static ClusterState applyCancel(ClusterState currentState, String indexName, int parentShardId) {
+        IndexMetadata curIndexMetadata = currentState.metadata().index(indexName);
+        if (curIndexMetadata == null || curIndexMetadata.getSplitShardsMetadata().isMergeOfShardInProgress(parentShardId) == false) {
+            return currentState;
         }
 
-        List<Integer> retiredChildShardIds() {
-            return retiredChildShardIds;
+        SplitShardsMetadata.Builder mergeMetadataBuilder = new SplitShardsMetadata.Builder(curIndexMetadata.getSplitShardsMetadata());
+        Set<Integer> childIds = curIndexMetadata.getSplitShardsMetadata().getChildShardIdsOfParent(parentShardId);
+        mergeMetadataBuilder.cancelMerge(parentShardId);
+
+        IndexMetadata.Builder indexMetadataBuilder = IndexMetadata.builder(curIndexMetadata)
+            .splitShardsMetadata(mergeMetadataBuilder.build());
+        Metadata.Builder metadataBuilder = Metadata.builder(currentState.metadata()).put(indexMetadataBuilder);
+
+        Index index = curIndexMetadata.getIndex();
+        IndexRoutingTable currentIndexRoutingTable = currentState.routingTable().index(indexName);
+        IndexRoutingTable.Builder indexRoutingTableBuilder = IndexRoutingTable.builder(index);
+        for (IndexShardRoutingTable shardTable : currentIndexRoutingTable) {
+            // Drop only the revived parent's routing entry; every child's entry stays live and serving.
+            if (shardTable.shardId().id() != parentShardId) {
+                indexRoutingTableBuilder.addIndexShard(shardTable);
+            }
         }
+        RoutingTable.Builder routingTableBuilder = RoutingTable.builder(currentState.routingTable());
+        routingTableBuilder.add(indexRoutingTableBuilder);
+
+        logger.warn(
+            "In-place merge of shard [{}] of index [{}] rolled back automatically: the revived parent primary exhausted its "
+                + "allocation-retry budget and could not recover. The children {} were never removed, so they remain live and "
+                + "continue to serve the shard's hash range -- no data is lost and no operator action is required.",
+            parentShardId,
+            indexName,
+            childIds
+        );
+        return ClusterState.builder(currentState).metadata(metadataBuilder).routingTable(routingTableBuilder.build()).build();
     }
 }

@@ -3442,6 +3442,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
             }
             if (origin == Engine.Operation.Origin.PRIMARY) {
                 ensureNotInProgressSplitParent();
+                ensureNotInProgressMergeChild();
             }
         }
     }
@@ -3474,6 +3475,35 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
                 shardId,
                 state,
                 "operation rejected while an in-place split of this shard is in progress; retry once the split completes"
+            );
+        }
+    }
+
+    /**
+     * Rejects a new primary write while this shard is a still-live child of an in-progress in-place
+     * <em>merge</em> -- the exact mirror of {@link #ensureNotInProgressSplitParent()} (CC1).
+     *
+     * <p>During a two-phase merge the revived parent snapshots each child's then-current published
+     * manifest once, at its own recovery time, while ordinary indexing keeps routing to the still-live
+     * children by hash. Any document a child acknowledged after the parent had already snapshotted it but
+     * before the merge committed would live only in a later child manifest generation the parent never
+     * folded in; once {@code MetadataInPlaceMergeShardCommitService} commits and retires the children,
+     * those documents would become permanently unreachable -- silent data loss under continuous write load
+     * during a merge. Rejecting the write here closes that window: nothing is acknowledged on a child once
+     * its merge is in progress. The thrown {@link IllegalIndexShardStateException} is a
+     * shard-not-available exception (see {@code TransportActions#isShardNotAvailableException}), so it is
+     * retriable -- the write succeeds once it re-routes to the merged parent (or, if the merge rolls back,
+     * to the child again, which is live once more).
+     */
+    private void ensureNotInProgressMergeChild() throws IllegalIndexShardStateException {
+        final IndexMetadata indexMetadata = indexSettings.getIndexMetadata();
+        if (indexMetadata != null
+            && indexMetadata.getSplitShardsMetadata() != null
+            && indexMetadata.getSplitShardsMetadata().isChildOfInProgressMerge(shardId.id())) {
+            throw new IllegalIndexShardStateException(
+                shardId,
+                state,
+                "operation rejected while an in-place merge of this shard's parent is in progress; retry once the merge completes"
             );
         }
     }

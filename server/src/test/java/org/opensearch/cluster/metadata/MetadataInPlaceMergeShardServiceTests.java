@@ -34,19 +34,21 @@ public class MetadataInPlaceMergeShardServiceTests extends OpenSearchTestCase {
 
     // --- applyMergeShardRequest: success cases ---
 
-    public void testApplyMergeShardRequestUpdatesMetadata() {
+    public void testApplyMergeShardRequestMarksMergePending() {
+        // Phase 1 only marks the merge pending; nothing is destroyed. The parent is still a split parent,
+        // the children are still recorded, and the pending marker is set.
         ClusterState state = createPostSplitClusterState("test-index", 3, 0, 0, 2);
         ClusterState updatedState = applyRequest(state, newRequest("test-index", 0));
 
         SplitShardsMetadata mergeMetadata = updatedState.metadata().index("test-index").getSplitShardsMetadata();
-        assertFalse("parent must no longer be a split parent after merge", mergeMetadata.isSplitParent(0));
-        assertTrue("parent shard 0 must be active again after merge", isActive(mergeMetadata, 0));
-        assertEquals("no children should remain recorded for the merged parent", 0, mergeMetadata.getChildShardIdsOfParent(0).size());
+        assertTrue("merge of shard 0 must be marked pending", mergeMetadata.isMergeOfShardInProgress(0));
+        assertTrue("parent stays a split parent until the merge commits", mergeMetadata.isSplitParent(0));
+        assertEquals("children must still be recorded during a pending merge", 2, mergeMetadata.getChildShardIdsOfParent(0).size());
     }
 
-    public void testApplyMergeShardRequestRoundTripsASplit() {
-        // Split shard 0 into 2, commit it, then merge back -- the parent's own hash range resolves
-        // to the parent again, exactly as it did pre-split (getShardIdOfHash needs no code change).
+    public void testApplyMergeShardRequestKeepsChildrenServingWhilePending() {
+        // While a merge is pending the children still own the hash range -- the parent (still recovering)
+        // is not yet resolvable. getShardIdOfHash of the root must still land on a child, not the parent.
         ClusterState state = createPostSplitClusterState("test-index", 3, 0, 0, 2);
         SplitShardsMetadata beforeMerge = state.metadata().index("test-index").getSplitShardsMetadata();
         assertTrue("precondition: shard 0 is a committed split parent", beforeMerge.isSplitParent(0));
@@ -54,7 +56,11 @@ public class MetadataInPlaceMergeShardServiceTests extends OpenSearchTestCase {
         ClusterState updatedState = applyRequest(state, newRequest("test-index", 0));
 
         SplitShardsMetadata afterMerge = updatedState.metadata().index("test-index").getSplitShardsMetadata();
-        assertEquals(0, afterMerge.getShardIdOfHash(0, randomInt()));
+        Set<Integer> childIds = afterMerge.getChildShardIdsOfParent(0);
+        assertTrue(
+            "root hash must still resolve to a live child while the merge is pending",
+            childIds.contains(afterMerge.getShardIdOfHash(0, randomInt()))
+        );
     }
 
     public void testApplyMergeShardRequestCallsReroute() {
@@ -115,7 +121,9 @@ public class MetadataInPlaceMergeShardServiceTests extends OpenSearchTestCase {
         assertTrue(parentReplica.recoverySource() instanceof RecoverySource.PeerRecoverySource);
     }
 
-    public void testApplyMergeShardRequestRetiresChildRoutingEntries() {
+    public void testApplyMergeShardRequestKeepsChildRoutingEntriesWhilePending() {
+        // Phase 1 keeps children live -- they are retired only at commit (parent STARTED), by the commit
+        // service. Retiring them here would be the pre-two-phase, no-rollback behavior.
         ClusterState state = createPostSplitClusterState("test-index", 3, 0, 0, 2);
         Set<Integer> childIds = state.metadata().index("test-index").getSplitShardsMetadata().getChildShardIdsOfParent(0);
         assertEquals(2, childIds.size());
@@ -124,7 +132,8 @@ public class MetadataInPlaceMergeShardServiceTests extends OpenSearchTestCase {
 
         IndexRoutingTable indexRoutingTable = updatedState.routingTable().index("test-index");
         for (int childId : childIds) {
-            assertNull("child shard [" + childId + "] must be retired after merge", indexRoutingTable.shard(childId));
+            assertNotNull("child shard [" + childId + "] must stay live during a pending merge", indexRoutingTable.shard(childId));
+            assertTrue("child primary must stay started", indexRoutingTable.shard(childId).primaryShard().started());
         }
     }
 
@@ -190,7 +199,10 @@ public class MetadataInPlaceMergeShardServiceTests extends OpenSearchTestCase {
         state = ClusterState.builder(state).nodes(nodesBuilder).build();
 
         ClusterState finalState = state;
-        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> applyRequest(finalState, newRequest("test-index", 0)));
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> applyRequest(finalState, newRequest("test-index", 0))
+        );
         assertTrue(e.getMessage().contains("same version"));
     }
 
@@ -202,7 +214,10 @@ public class MetadataInPlaceMergeShardServiceTests extends OpenSearchTestCase {
         state = ClusterState.builder(state).nodes(nodesBuilder).build();
 
         ClusterState finalState = state;
-        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> applyRequest(finalState, newRequest("test-index", 0)));
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> applyRequest(finalState, newRequest("test-index", 0))
+        );
         assertTrue(e.getMessage().contains(Version.V_3_7_0.toString()));
     }
 
@@ -224,10 +239,6 @@ public class MetadataInPlaceMergeShardServiceTests extends OpenSearchTestCase {
     }
 
     // --- helpers ---
-
-    private static boolean isActive(SplitShardsMetadata metadata, int shardId) {
-        return metadata.getChildShardIdsOfParent(shardId).isEmpty() && metadata.isSplitParent(shardId) == false;
-    }
 
     private static ClusterState applyRequest(ClusterState state, InPlaceMergeShardClusterStateUpdateRequest request) {
         return MetadataInPlaceMergeShardService.applyMergeShardRequest(state, request, (cs, reason) -> cs);
