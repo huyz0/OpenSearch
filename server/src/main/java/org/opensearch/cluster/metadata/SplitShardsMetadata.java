@@ -627,6 +627,48 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         return activeShardIds.contains(shardId) == false && parentToChildShards.containsKey(shardId);
     }
 
+    /**
+     * Every shard ID that is currently recorded as a split parent -- i.e. every key in the
+     * parent-to-children map, covering both still-in-progress splits and already-committed ones.
+     * Callers that only want mergeable (committed, unsplit-further) parents should pair this with
+     * {@link #canMergeChildrenBackToParent(int)}. Returned as a fresh copy, so mutating it can't
+     * disturb this immutable instance.
+     */
+    public Set<Integer> getSplitParentShardIds() {
+        return new HashSet<>(parentToChildShards.keySet());
+    }
+
+    /**
+     * Non-mutating counterpart to {@link Builder#mergeChildrenBackToParent(int)}: reports whether an
+     * in-place merge of {@code parentShardId}'s children back into it would satisfy every split-level
+     * precondition that primitive enforces, {@code true} only if it would (so a caller -- e.g. an
+     * automatic merge-trigger policy -- can screen candidate parents without provoking the primitive's
+     * {@link IllegalArgumentException} just to discover ineligibility). Mirrors that primitive's own
+     * checks exactly: {@code parentShardId} must be an original root shard, must currently be split,
+     * must not still be mid-split, and none of its direct children may have been split further (or be
+     * mid-split themselves). Deliberately does <em>not</em> check per-child routing liveness (started,
+     * non-relocating primaries) -- that's a routing-table concern the merge service validates
+     * separately, not a {@link SplitShardsMetadata} one.
+     */
+    public boolean canMergeChildrenBackToParent(int parentShardId) {
+        if (parentShardId < 0 || parentShardId >= rootShardsToAllChildren.length) {
+            return false;
+        }
+        if (inProgressSplitShardIds.contains(parentShardId)) {
+            return false;
+        }
+        ShardRange[] children = parentToChildShards.get(parentShardId);
+        if (children == null || children.length == 0) {
+            return false;
+        }
+        for (ShardRange child : children) {
+            if (activeShardIds.contains(child.shardId()) == false || inProgressSplitShardIds.contains(child.shardId())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     public boolean isRecoveringChild(int shardId, int parentShardId) {
         if (!inProgressSplitShardIds.contains(parentShardId)) {
             return false;

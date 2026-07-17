@@ -578,6 +578,107 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * The combined-writes-per-minute ceiling a committed split's full sibling pair must stay at or
+     * below to count as an in-place *merge* candidate -- dynamic-partitioning-plan.md Phase 2 item
+     * 2.3, the mirror image of {@link #SERVERLESS_STORAGE_RESHARDING_SPLIT_CANDIDATE_WPM_THRESHOLD_SETTING}'s
+     * split-for-heat trigger. {@code InPlaceMergeTriggerCoordinator} sums both siblings' own
+     * writes-per-minute (the same per-shard signal {@code ShardSplitCandidatesAction} already
+     * surfaces) and merges the pair back only when that sum, sustained, is at or below this.
+     *
+     * <p><b>Deliberately far below the split threshold, not equal to it.</b> Defaulted to {@code
+     * 2_000}/min -- one fifth of the {@code 10_000}/min per-shard split trigger -- so a pair that was
+     * just split for heat cannot immediately qualify to be merged straight back: right after a split
+     * each child carries roughly half the parent's former (>10_000/min) rate, a combined sum still an
+     * order of magnitude above this ceiling. Only once the pair's real, sustained combined write rate
+     * has fallen to a small fraction of what triggered the split does merging back make sense. This
+     * margin, together with the sustained-tick hysteresis below, is this feature's anti-flap defense
+     * -- see {@code InPlaceMergeTriggerCoordinator}'s own javadoc, and the known-limitation note there
+     * about the absence of a split-commit-time cool-down.
+     */
+    public static final Setting<Long> SERVERLESS_STORAGE_RESHARDING_MERGE_CANDIDATE_COMBINED_WPM_THRESHOLD_SETTING = Setting.longSetting(
+        "serverless_storage.resharding.merge_candidate_combined_writes_per_minute_threshold",
+        2_000L,
+        0L,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * The merge-for-size counterpart to {@link #SERVERLESS_STORAGE_RESHARDING_MERGE_CANDIDATE_COMBINED_WPM_THRESHOLD_SETTING}:
+     * the combined size, in bytes, a committed split's full sibling pair must stay at or below to
+     * count as a merge candidate. Same "comfortably below the split threshold, with real margin"
+     * reasoning -- defaulted to {@code 4 GiB}, well under the {@code 10 GiB} per-shard split-for-size
+     * trigger, and well under the {@code >10 GiB} a pair carries immediately after being split for
+     * size. A pair only becomes a merge candidate once enough data has been deleted for the two
+     * siblings *together* to fit comfortably back inside one shard.
+     */
+    public static final Setting<Long> SERVERLESS_STORAGE_RESHARDING_MERGE_CANDIDATE_COMBINED_SIZE_THRESHOLD_BYTES_SETTING = Setting.longSetting(
+        "serverless_storage.resharding.merge_candidate_combined_size_threshold_bytes",
+        4L * 1024 * 1024 * 1024,
+        0L,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * How often {@code InPlaceMergeTriggerSchedulerTask} re-evaluates merge candidates in the
+     * background -- the merge-side counterpart to {@link #SERVERLESS_STORAGE_RESHARDING_AUTO_SPLIT_EVAL_INTERVAL_SETTING},
+     * its own independent setting and its own scheduler-task instance. Non-positive (the default)
+     * disables the scheduled evaluation entirely.
+     */
+    public static final Setting<TimeValue> SERVERLESS_STORAGE_RESHARDING_AUTO_MERGE_EVAL_INTERVAL_SETTING = Setting.timeSetting(
+        "serverless_storage.resharding.auto_merge.eval_interval",
+        TimeValue.MINUS_ONE,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * Independent enable gate for automatic in-place merges, defaulting to {@code false} -- same
+     * two-gate reasoning as {@link #SERVERLESS_STORAGE_RESHARDING_AUTO_SPLIT_ENABLED_SETTING}, and
+     * held to it especially firmly here: an automatic merge reverses a committed split and revives a
+     * fresh parent primary that must recover, so turning on the merge eval interval alone must stay
+     * purely observational, never a silent trigger. Operators should read {@code
+     * InPlaceMergeTriggerCoordinator}'s known-limitation note (no split-commit-time cool-down exists
+     * yet) before enabling this.
+     */
+    public static final Setting<Boolean> SERVERLESS_STORAGE_RESHARDING_AUTO_MERGE_ENABLED_SETTING = Setting.boolSetting(
+        "serverless_storage.resharding.auto_merge.enabled",
+        false,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * How many consecutive quiet evaluation ticks a committed sibling pair must be flagged a merge
+     * candidate on, back to back, before {@code InPlaceMergeTriggerCoordinator} actually merges it --
+     * the merge-side counterpart to {@link #SERVERLESS_STORAGE_RESHARDING_AUTO_SPLIT_REQUIRED_CONSECUTIVE_TICKS_SETTING},
+     * defaulted deliberately *higher* than split's own default (10 vs 5). Merge is the "give back"
+     * side of resharding: being too eager to merge a just-split, momentarily-quiet pair risks a
+     * split/merge/split flap, so it warrants a longer sustained-signal requirement than split does
+     * before acting. This sustained-duration requirement, together with the deliberately-low combined
+     * thresholds above, is the anti-flap defense standing in for the split-commit-time cool-down this
+     * increment cannot yet build (see {@code InPlaceMergeTriggerCoordinator}'s javadoc). A value of 1
+     * restores single-tick behavior.
+     */
+    public static final Setting<Integer> SERVERLESS_STORAGE_RESHARDING_AUTO_MERGE_REQUIRED_CONSECUTIVE_TICKS_SETTING = Setting.intSetting(
+        "serverless_storage.resharding.auto_merge.required_consecutive_ticks",
+        10,
+        1,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * The illustrative per-tick cap on how many distinct sibling pairs {@code
+     * InPlaceMergeTriggerCoordinator} will actually merge in one evaluation -- the merge-side
+     * counterpart to {@link #SERVERLESS_STORAGE_RESHARDING_AUTO_SPLIT_MAX_SPLITS_PER_TICK_SETTING},
+     * defaulted to 1 (even smaller than split's 2): a merge revives a fresh parent primary that must
+     * recover, a heavier operation than a split, so the default drip-feeds merges one pair per tick.
+     * A non-positive value restores unbounded behavior.
+     */
+    public static final Setting<Integer> SERVERLESS_STORAGE_RESHARDING_AUTO_MERGE_MAX_MERGES_PER_TICK_SETTING = Setting.intSetting(
+        "serverless_storage.resharding.auto_merge.max_merges_per_tick",
+        1,
+        Setting.Property.NodeScope
+    );
+
+    /**
      * How often {@code ScaleUpCandidatesSchedulerTask} re-evaluates {@code ScaleUpCandidatesAction}
      * in the background -- same "background schedule mirrors an on-demand trigger" shape as {@link
      * #SERVERLESS_STORAGE_SCALE_TO_ZERO_EVAL_INTERVAL_SETTING}, but deliberately its own setting
@@ -830,6 +931,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     private volatile org.opensearch.serverless.storage.scaleup.ScaleUpCandidatesSchedulerTask scaleUpCandidatesSchedulerTask;
     private volatile org.opensearch.serverless.storage.resharding.DataStreamShardCountAdvisorSchedulerTask dataStreamShardCountAdvisorSchedulerTask;
     private volatile org.opensearch.serverless.storage.resharding.InPlaceSplitTriggerSchedulerTask inPlaceSplitTriggerSchedulerTask;
+    private volatile org.opensearch.serverless.storage.resharding.InPlaceMergeTriggerSchedulerTask inPlaceMergeTriggerSchedulerTask;
     // One node-local directory instance shared by every shard on this node -- matches the target
     // design's "one node block cache" shape (&sect;9) rather than a per-shard instance, and needs
     // no I/O to construct, so it's safe to build eagerly rather than threading through createComponents.
@@ -896,6 +998,12 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_RESHARDING_AUTO_SPLIT_ENABLED_SETTING,
             SERVERLESS_STORAGE_RESHARDING_AUTO_SPLIT_REQUIRED_CONSECUTIVE_TICKS_SETTING,
             SERVERLESS_STORAGE_RESHARDING_AUTO_SPLIT_MAX_SPLITS_PER_TICK_SETTING,
+            SERVERLESS_STORAGE_RESHARDING_MERGE_CANDIDATE_COMBINED_WPM_THRESHOLD_SETTING,
+            SERVERLESS_STORAGE_RESHARDING_MERGE_CANDIDATE_COMBINED_SIZE_THRESHOLD_BYTES_SETTING,
+            SERVERLESS_STORAGE_RESHARDING_AUTO_MERGE_EVAL_INTERVAL_SETTING,
+            SERVERLESS_STORAGE_RESHARDING_AUTO_MERGE_ENABLED_SETTING,
+            SERVERLESS_STORAGE_RESHARDING_AUTO_MERGE_REQUIRED_CONSECUTIVE_TICKS_SETTING,
+            SERVERLESS_STORAGE_RESHARDING_AUTO_MERGE_MAX_MERGES_PER_TICK_SETTING,
             SERVERLESS_STORAGE_REPOSITORY_SETTING
         );
     }
@@ -1032,6 +1140,25 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                         client,
                         SERVERLESS_STORAGE_RESHARDING_AUTO_SPLIT_REQUIRED_CONSECUTIVE_TICKS_SETTING.get(environment.settings()),
                         SERVERLESS_STORAGE_RESHARDING_AUTO_SPLIT_MAX_SPLITS_PER_TICK_SETTING.get(environment.settings())
+                    )
+                    : null
+            );
+        }
+        TimeValue autoMergeEvalInterval = SERVERLESS_STORAGE_RESHARDING_AUTO_MERGE_EVAL_INTERVAL_SETTING.get(environment.settings());
+        if (autoMergeEvalInterval.millis() > 0) {
+            boolean autoMergeEnabled = SERVERLESS_STORAGE_RESHARDING_AUTO_MERGE_ENABLED_SETTING.get(environment.settings());
+            this.inPlaceMergeTriggerSchedulerTask = new org.opensearch.serverless.storage.resharding.InPlaceMergeTriggerSchedulerTask(
+                threadPool,
+                autoMergeEvalInterval,
+                client,
+                clusterService,
+                autoMergeEnabled
+                    ? new org.opensearch.serverless.storage.resharding.InPlaceMergeTriggerCoordinator(
+                        client,
+                        SERVERLESS_STORAGE_RESHARDING_AUTO_MERGE_REQUIRED_CONSECUTIVE_TICKS_SETTING.get(environment.settings()),
+                        SERVERLESS_STORAGE_RESHARDING_AUTO_MERGE_MAX_MERGES_PER_TICK_SETTING.get(environment.settings()),
+                        SERVERLESS_STORAGE_RESHARDING_MERGE_CANDIDATE_COMBINED_WPM_THRESHOLD_SETTING.get(environment.settings()),
+                        SERVERLESS_STORAGE_RESHARDING_MERGE_CANDIDATE_COMBINED_SIZE_THRESHOLD_BYTES_SETTING.get(environment.settings())
                     )
                     : null
             );
