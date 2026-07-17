@@ -113,6 +113,21 @@ public class MetadataInPlaceSplitShardService {
             );
         }
 
+        // An index with index.routing_partition_size > 1 spreads each routing value across a
+        // partitionOffset-shifted band of the hash space (see OperationRouting#generateShardId). The
+        // in-place split read-path filter (InPlaceSplitPartitionFilter, used by the plugin's
+        // InPlaceSplitFilteringDirectoryReader) hashes effectiveRouting only and cannot reproduce that
+        // per-document partition offset, so a child would bucket partitioned documents by the wrong
+        // hash. This is a hard, structural limitation of the filter -- reject the split up front rather
+        // than silently corrupt search/GET visibility.
+        if (curIndexMetadata.isRoutingPartitionedIndex()) {
+            throw new IllegalArgumentException(
+                "In-place shard split is not supported on index ["
+                    + request.getIndex()
+                    + "] with index.routing_partition_size > 1"
+            );
+        }
+
         if (currentState.nodes().getMinNodeVersion().equals(currentState.nodes().getMaxNodeVersion()) == false
             || currentState.nodes().getMinNodeVersion().before(Version.V_3_7_0)) {
             throw new IllegalArgumentException(

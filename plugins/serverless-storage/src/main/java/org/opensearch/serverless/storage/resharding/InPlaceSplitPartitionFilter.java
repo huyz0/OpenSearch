@@ -30,13 +30,18 @@ public final class InPlaceSplitPartitionFilter {
     private InPlaceSplitPartitionFilter() {}
 
     /**
-     * Whether a document with the given id falls within {@code range}.
+     * Whether a document with the given effective routing value falls within {@code range}.
      *
-     * @param id the document's {@code _id}.
+     * @param effectiveRouting the document's routing value if it was indexed with a custom {@code
+     *        _routing}, otherwise its {@code _id} -- the exact {@code effectiveRouting} core's {@link
+     *        org.opensearch.cluster.routing.OperationRouting#generateShardId} hashes. (Indices with
+     *        {@code index.routing_partition_size > 1}, whose hash also carries a per-document
+     *        partition offset, are rejected up front by {@code MetadataInPlaceSplitShardService} and
+     *        so never reach this filter.)
      * @param range the split child's own hash range.
      */
-    public static boolean matches(String id, ShardRange range) {
-        int hash = Murmur3HashFunction.hash(id);
+    public static boolean matches(String effectiveRouting, ShardRange range) {
+        int hash = Murmur3HashFunction.hash(effectiveRouting);
         return range.contains(hash);
     }
 }

@@ -17,54 +17,65 @@ import org.apache.lucene.index.StoredFieldVisitor;
 import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.FixedBitSet;
 import org.opensearch.index.mapper.IdFieldMapper;
+import org.opensearch.index.mapper.RoutingFieldMapper;
 import org.opensearch.index.mapper.Uid;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.util.function.Predicate;
+import java.util.function.BiPredicate;
 
 /**
- * Shared machinery for {@link FilterDirectoryReader}s that overlay a document-id predicate onto a
+ * Shared machinery for {@link FilterDirectoryReader}s that overlay a per-document predicate onto a
  * reader's live docs, restricting each leaf's visible documents to just those whose stored {@code
- * _id} field matches the predicate. Both {@link InPlaceSplitFilteringDirectoryReader} and {@link
- * PartitionFilteringDirectoryReader} need exactly this shape -- recompute one leaf's live-doc {@link
- * Bits} by re-reading every live document's stored {@code _id} once, at wrap time, and combine that
- * with the predicate -- differing only in what the predicate itself is. Everything predicate-agnostic
- * (the {@code SubReaderWrapper}, the {@code FilterLeafReader}, and the stored-field visitor used to
- * recover each document's id) lives here once; subclasses supply only the predicate and their own
- * {@code doWrapDirectoryReader}/{@code getReaderCacheHelper} behavior, which differ per subclass (see
- * each subclass's own javadoc for why).
+ * _id} (and, where relevant, {@code _routing}) match the predicate. Both {@link
+ * InPlaceSplitFilteringDirectoryReader} and {@link PartitionFilteringDirectoryReader} need exactly
+ * this shape -- recompute one leaf's live-doc {@link Bits} by re-reading every live document's stored
+ * {@code _id}/{@code _routing} once, at wrap time, and combine that with the predicate -- differing
+ * only in what the predicate itself is. Everything predicate-agnostic (the {@code SubReaderWrapper},
+ * the {@code FilterLeafReader}, and the stored-field visitor used to recover each document's id and
+ * routing) lives here once; subclasses supply only the predicate and their own {@code
+ * doWrapDirectoryReader}/{@code getReaderCacheHelper} behavior, which differ per subclass (see each
+ * subclass's own javadoc for why).
+ *
+ * <p>The predicate receives both {@code _id} and the document's stored {@code _routing} ({@code null}
+ * when the document was indexed without a custom routing value), so an in-place split child can
+ * reproduce core's real routing hash -- {@code effectiveRouting = routing != null ? routing : id} --
+ * exactly as {@link org.opensearch.cluster.routing.OperationRouting#generateShardId} does. A
+ * subclass that keys only off {@code _id} simply ignores the routing argument.
  */
 abstract class AbstractIdFilteringDirectoryReader extends FilterDirectoryReader {
 
     /**
-     * Wraps a reader so every leaf's live docs are additionally restricted to ids matching {@code idPredicate}.
+     * Wraps a reader so every leaf's live docs are additionally restricted to documents matching
+     * {@code idRoutingPredicate}.
      *
      * @param in the reader to wrap.
-     * @param idPredicate returns {@code true} for a document's {@code _id} iff it should remain visible.
+     * @param idRoutingPredicate given a document's {@code _id} and its stored {@code _routing}
+     *        ({@code null} if none), returns {@code true} iff the document should remain visible.
      */
-    protected AbstractIdFilteringDirectoryReader(DirectoryReader in, Predicate<String> idPredicate) throws IOException {
-        super(in, new IdFilteringSubReaderWrapper(idPredicate));
+    protected AbstractIdFilteringDirectoryReader(DirectoryReader in, BiPredicate<String, String> idRoutingPredicate)
+        throws IOException {
+        super(in, new IdFilteringSubReaderWrapper(idRoutingPredicate));
     }
 
     private static final class IdFilteringSubReaderWrapper extends SubReaderWrapper {
-        private final Predicate<String> idPredicate;
+        private final BiPredicate<String, String> idRoutingPredicate;
 
-        IdFilteringSubReaderWrapper(Predicate<String> idPredicate) {
-            this.idPredicate = idPredicate;
+        IdFilteringSubReaderWrapper(BiPredicate<String, String> idRoutingPredicate) {
+            this.idRoutingPredicate = idRoutingPredicate;
         }
 
         @Override
         public LeafReader wrap(LeafReader reader) {
             try {
-                return IdFilteringLeafReader.wrap(reader, idPredicate);
+                return IdFilteringLeafReader.wrap(reader, idRoutingPredicate);
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
             }
         }
     }
 
-    /** The per-leaf half: computes and overlays one segment's id-predicate-membership {@link Bits}. */
+    /** The per-leaf half: computes and overlays one segment's predicate-membership {@link Bits}. */
     static final class IdFilteringLeafReader extends FilterLeafReader {
 
         private final LeafReader wrapped;
@@ -78,11 +89,11 @@ abstract class AbstractIdFilteringDirectoryReader extends FilterDirectoryReader 
             this.numDocs = numDocs;
         }
 
-        static LeafReader wrap(LeafReader reader, Predicate<String> idPredicate) throws IOException {
+        static LeafReader wrap(LeafReader reader, BiPredicate<String, String> idRoutingPredicate) throws IOException {
             Bits existingLiveDocs = reader.getLiveDocs();
             FixedBitSet bits = new FixedBitSet(reader.maxDoc());
             int liveCount = 0;
-            IdFieldVisitor visitor = new IdFieldVisitor();
+            IdRoutingFieldVisitor visitor = new IdRoutingFieldVisitor();
             for (int docId = 0; docId < reader.maxDoc(); docId++) {
                 if (existingLiveDocs != null && existingLiveDocs.get(docId) == false) {
                     continue; // already hard-deleted -- never a candidate for this predicate either
@@ -90,7 +101,7 @@ abstract class AbstractIdFilteringDirectoryReader extends FilterDirectoryReader 
                 visitor.reset();
                 reader.storedFields().document(docId, visitor);
                 String id = visitor.id();
-                if (id != null && idPredicate.test(id)) {
+                if (id != null && idRoutingPredicate.test(id, visitor.routing())) {
                     bits.set(docId);
                     liveCount++;
                 }
@@ -121,29 +132,55 @@ abstract class AbstractIdFilteringDirectoryReader extends FilterDirectoryReader 
         }
     }
 
-    /** Reads only the stored {@code _id} field, decoding it back to its original string form. */
-    private static final class IdFieldVisitor extends StoredFieldVisitor {
+    /**
+     * Reads the stored {@code _id} (decoded back to its original string) and {@code _routing} fields.
+     * {@code _routing} is only stored for documents indexed with a custom routing value (see {@link
+     * RoutingFieldMapper}), so {@link #routing()} stays {@code null} for the common no-routing case --
+     * exactly what {@code effectiveRouting = routing != null ? routing : id} then falls back to. This
+     * mirrors core's own {@code ShardSplittingQuery.Visitor}: {@code _id} arrives via {@code
+     * binaryField}, {@code _routing} via {@code stringField}.
+     */
+    private static final class IdRoutingFieldVisitor extends StoredFieldVisitor {
         private String id;
+        private String routing;
 
         void reset() {
             id = null;
+            routing = null;
         }
 
         String id() {
             return id;
         }
 
+        String routing() {
+            return routing;
+        }
+
         @Override
         public Status needsField(FieldInfo fieldInfo) {
-            if (id != null) {
+            // Stop early once both fields are in hand; a document may legitimately have no _routing.
+            if (id != null && routing != null) {
                 return Status.STOP;
             }
-            return IdFieldMapper.NAME.equals(fieldInfo.name) ? Status.YES : Status.NO;
+            if (IdFieldMapper.NAME.equals(fieldInfo.name) || RoutingFieldMapper.NAME.equals(fieldInfo.name)) {
+                return Status.YES;
+            }
+            return Status.NO;
         }
 
         @Override
         public void binaryField(FieldInfo fieldInfo, byte[] value) {
-            id = Uid.decodeId(value);
+            if (IdFieldMapper.NAME.equals(fieldInfo.name)) {
+                id = Uid.decodeId(value);
+            }
+        }
+
+        @Override
+        public void stringField(FieldInfo fieldInfo, String value) {
+            if (RoutingFieldMapper.NAME.equals(fieldInfo.name)) {
+                routing = value;
+            }
         }
     }
 }

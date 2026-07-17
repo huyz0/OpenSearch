@@ -43,7 +43,9 @@ public final class InPlaceSplitFilteringDirectoryReader extends AbstractIdFilter
      * @param range the split child's own hash range.
      */
     public InPlaceSplitFilteringDirectoryReader(DirectoryReader in, ShardRange range) throws IOException {
-        super(in, id -> InPlaceSplitPartitionFilter.matches(id, range));
+        // Reproduce core's real routing hash: effectiveRouting = routing != null ? routing : id,
+        // exactly as OperationRouting#generateShardId resolves it, so search and GET-by-id agree.
+        super(in, (id, routing) -> InPlaceSplitPartitionFilter.matches(routing != null ? routing : id, range));
         this.range = range;
     }
 

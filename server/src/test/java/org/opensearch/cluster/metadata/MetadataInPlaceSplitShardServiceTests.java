@@ -242,6 +242,29 @@ public class MetadataInPlaceSplitShardServiceTests extends OpenSearchTestCase {
         assertTrue(e.getMessage().contains("virtual shards"));
     }
 
+    public void testApplySplitShardRequestThrowsIfRoutingPartitionSizeGreaterThanOne() {
+        // CC2: index.routing_partition_size > 1 gives each document a per-doc partition offset in the
+        // hash space that the in-place split read-path filter cannot reproduce, so the split must be
+        // rejected up front rather than silently corrupt search/GET visibility.
+        Settings indexSettings = Settings.builder()
+            .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 3)
+            .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+            .put(IndexMetadata.SETTING_ROUTING_PARTITION_SIZE, 2)
+            .build();
+        IndexMetadata indexMetadata = IndexMetadata.builder("test-index").settings(indexSettings).build();
+        ClusterState state = ClusterState.builder(ClusterName.CLUSTER_NAME_SETTING.getDefault(Settings.EMPTY))
+            .metadata(Metadata.builder().put(indexMetadata, false))
+            .routingTable(RoutingTable.builder().addAsNew(indexMetadata).build())
+            .build();
+
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> applyRequest(state, newRequest("test-index", 0, 2))
+        );
+        assertTrue(e.getMessage().contains("routing_partition_size"));
+    }
+
     public void testApplySplitShardRequestThrowsInMixedVersionCluster() {
         ClusterState state = createClusterState("test-index", 3, 0);
         DiscoveryNodes.Builder nodesBuilder = DiscoveryNodes.builder();

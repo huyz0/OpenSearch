@@ -53,7 +53,9 @@ public final class PartitionFilteringDirectoryReader extends AbstractIdFiltering
      * @param descriptor which partition (of how many) this reader should filter down to.
      */
     public PartitionFilteringDirectoryReader(DirectoryReader in, ShardPartitionDescriptor descriptor) throws IOException {
-        super(in, id -> RoutingPartitionFilter.matches(id, descriptor));
+        // This pre-existing equal-partition mechanism keys off _id only (its own self-consistent
+        // scheme); the routing argument is intentionally ignored here.
+        super(in, (id, routing) -> RoutingPartitionFilter.matches(id, descriptor));
         this.descriptor = descriptor;
     }
 
