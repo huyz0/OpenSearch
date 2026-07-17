@@ -10,8 +10,14 @@ package org.opensearch.cluster.metadata;
 
 import org.opensearch.Version;
 import org.opensearch.action.admin.indices.split.InPlaceSplitShardClusterStateUpdateRequest;
+import org.opensearch.cluster.ClusterChangedEvent;
 import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.ClusterStateUpdateTask;
+import org.opensearch.cluster.node.DiscoveryNode;
+import org.opensearch.cluster.node.DiscoveryNodeRole;
+import org.opensearch.cluster.node.DiscoveryNodes;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.RoutingTable;
@@ -24,9 +30,17 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.test.OpenSearchTestCase;
+import org.mockito.ArgumentCaptor;
 
 import java.time.Instant;
+import java.util.Collections;
 import java.util.Set;
+
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.any;
 
 public class MetadataInPlaceSplitShardCommitServiceTests extends OpenSearchTestCase {
 
@@ -167,7 +181,64 @@ public class MetadataInPlaceSplitShardCommitServiceTests extends OpenSearchTestC
         }
     }
 
+    /**
+     * Gap 2: drive the real {@code clusterChanged} listener dispatch (not the static apply* methods
+     * directly) and assert it submits the expected follow-up cluster-state-update task. Here the transition
+     * lands in a cancel-worthy state (a child's allocation retries are exhausted), exercising the listener's
+     * SHOULD_CANCEL branch.
+     */
+    public void testClusterChangedSubmitsCancelTaskWhenChildAllocationExhausted() {
+        ClusterService clusterService = mock(ClusterService.class);
+        MetadataInPlaceSplitShardCommitService service = new MetadataInPlaceSplitShardCommitService(Settings.EMPTY, clusterService);
+
+        ClusterState state = createStateWithInProgressSplit(3, 0, 2);
+        Set<Integer> childIds = state.metadata().index("test-index").getSplitShardsMetadata().getChildShardIdsOfParent(0);
+        int maxRetries = MaxRetryAllocationDecider.SETTING_ALLOCATION_MAX_RETRY.get(state.metadata().index("test-index").getSettings());
+
+        ClusterState before = withClusterManagerNode(state);
+        ClusterState after = withClusterManagerNode(failChildAllocation(state, childIds, maxRetries));
+
+        service.clusterChanged(new ClusterChangedEvent("test", after, before));
+
+        ArgumentCaptor<String> sourceCaptor = ArgumentCaptor.forClass(String.class);
+        verify(clusterService, times(1)).submitStateUpdateTask(sourceCaptor.capture(), any(ClusterStateUpdateTask.class));
+        assertTrue(
+            "listener must dispatch a cancel task, got: " + sourceCaptor.getValue(),
+            sourceCaptor.getValue().startsWith("cancel in-place split of shard [0]")
+        );
+    }
+
+    /** A non-cluster-manager local node must make the listener a complete no-op (no task submitted). */
+    public void testClusterChangedNoOpWhenNotClusterManager() {
+        ClusterService clusterService = mock(ClusterService.class);
+        MetadataInPlaceSplitShardCommitService service = new MetadataInPlaceSplitShardCommitService(Settings.EMPTY, clusterService);
+
+        ClusterState state = createStateWithInProgressSplit(3, 0, 2);
+        Set<Integer> childIds = state.metadata().index("test-index").getSplitShardsMetadata().getChildShardIdsOfParent(0);
+        ClusterState after = startChildShards(state, childIds);
+
+        // States without an elected cluster-manager local node -> localNodeClusterManager() == false.
+        service.clusterChanged(new ClusterChangedEvent("test", after, state));
+
+        verify(clusterService, never()).submitStateUpdateTask(any(String.class), any(ClusterStateUpdateTask.class));
+    }
+
     // --- helpers ---
+
+    /** Attaches an elected cluster-manager local node so {@code event.localNodeClusterManager()} is true. */
+    private static ClusterState withClusterManagerNode(ClusterState state) {
+        DiscoveryNode node = new DiscoveryNode(
+            "node1",
+            "node1",
+            buildNewFakeTransportAddress(),
+            Collections.emptyMap(),
+            Collections.singleton(DiscoveryNodeRole.CLUSTER_MANAGER_ROLE),
+            Version.CURRENT
+        );
+        return ClusterState.builder(state)
+            .nodes(DiscoveryNodes.builder().add(node).localNodeId("node1").clusterManagerNodeId("node1").build())
+            .build();
+    }
 
     private static ClusterState createStateWithInProgressSplit(int numShards, int numReplicas, int splitInto) {
         Settings indexSettings = Settings.builder()

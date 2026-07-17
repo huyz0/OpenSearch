@@ -1987,6 +1987,26 @@ no-ops instead of rolling back — marker still set, the `STARTED` shard(s) not 
 real by removing each re-check in turn: the new test goes red with the spurious rollback (`expected
 same … was …` — a different, mutated cluster state), restored, green.
 
-Verification sweeps: `org.opensearch.cluster.metadata.*` and `org.opensearch.cluster.routing.*`
-(clean) plus `:server:missingJavadoc` (clean).
+### Gap 2 — the `clusterChanged` listener dispatch itself had zero test coverage
+
+Every existing test on both commit services called `applyCommit` / `applyCancel` /
+`evaluate*Completion` directly, bypassing the real `clusterChanged(ClusterChangedEvent)` method that
+is registered as the actual `ClusterStateListener` (wired in `Node.java` under `isClusterManagerNode`).
+A regression in `clusterChanged` itself — wrong iteration over indices/shards, a swallowed exception,
+the listener silently not firing — would pass every existing test and only surface in a live cluster.
+
+New tests drive `clusterChanged` directly with a mock `ClusterService`, a real before/after
+`ClusterChangedEvent` pair, and a `DiscoveryNodes` set whose local node is the elected
+cluster-manager (so `event.localNodeClusterManager()` is true). The merge test transitions into a
+`READY_TO_COMMIT` state and asserts a `submitStateUpdateTask` whose source begins `commit in-place
+merge of shard [0]`; the split test transitions into a `SHOULD_CANCEL` state (a child's allocation
+retries exhausted) and asserts a `cancel in-place split of shard [0]` task. Each also has a
+`testClusterChangedNoOpWhenNotClusterManager` control (no elected cluster-manager local node -> no
+task submitted), confirming the cluster-manager gate. Verified real by breaking the merge listener's
+own dispatch (skipping `submitCommit` in the `READY_TO_COMMIT` branch): only the new listener test
+failed, all seven direct-call tests stayed green — proving the listener test uniquely exercises the
+dispatch path. Restored, all green.
+
+Verification sweeps after each fix: `org.opensearch.cluster.metadata.*` and
+`org.opensearch.cluster.routing.*` (clean) plus `:server:missingJavadoc` (clean).
 

@@ -10,8 +10,14 @@ package org.opensearch.cluster.metadata;
 
 import org.opensearch.Version;
 import org.opensearch.action.admin.indices.split.InPlaceMergeShardClusterStateUpdateRequest;
+import org.opensearch.cluster.ClusterChangedEvent;
 import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.ClusterStateUpdateTask;
+import org.opensearch.cluster.node.DiscoveryNode;
+import org.opensearch.cluster.node.DiscoveryNodeRole;
+import org.opensearch.cluster.node.DiscoveryNodes;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.OperationRouting;
@@ -25,11 +31,18 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.test.OpenSearchTestCase;
+import org.mockito.ArgumentCaptor;
 
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.any;
 
 /**
  * Tests the two-phase in-place merge commit/cancel driver -- the mirror of
@@ -188,7 +201,59 @@ public class MetadataInPlaceMergeShardCommitServiceTests extends OpenSearchTestC
         assertNotNull("child 2 routing intact", routing.shard(2));
     }
 
+    /**
+     * Gap 2: drive the real {@code clusterChanged} listener dispatch (not the static apply*
+     * methods directly) and assert it submits the expected follow-up cluster-state-update task. Every other
+     * test bypasses this listener method; a regression in its iteration/filtering/dispatch would pass them
+     * all yet only surface in a live cluster.
+     */
+    public void testClusterChangedSubmitsCommitTaskWhenParentStarted() {
+        ClusterService clusterService = mock(ClusterService.class);
+        MetadataInPlaceMergeShardCommitService service = new MetadataInPlaceMergeShardCommitService(Settings.EMPTY, clusterService);
+
+        ClusterState before = withClusterManagerNode(pendingMergeState());
+        ClusterState after = withClusterManagerNode(startParent(pendingMergeState()));
+
+        service.clusterChanged(new ClusterChangedEvent("test", after, before));
+
+        ArgumentCaptor<String> sourceCaptor = ArgumentCaptor.forClass(String.class);
+        verify(clusterService, times(1)).submitStateUpdateTask(sourceCaptor.capture(), any(ClusterStateUpdateTask.class));
+        assertTrue(
+            "listener must dispatch a commit task, got: " + sourceCaptor.getValue(),
+            sourceCaptor.getValue().startsWith("commit in-place merge of shard [0]")
+        );
+    }
+
+    /** A non-cluster-manager local node must make the listener a complete no-op (no task submitted). */
+    public void testClusterChangedNoOpWhenNotClusterManager() {
+        ClusterService clusterService = mock(ClusterService.class);
+        MetadataInPlaceMergeShardCommitService service = new MetadataInPlaceMergeShardCommitService(Settings.EMPTY, clusterService);
+
+        // States without an elected cluster-manager local node -> localNodeClusterManager() == false.
+        ClusterState before = pendingMergeState();
+        ClusterState after = startParent(pendingMergeState());
+
+        service.clusterChanged(new ClusterChangedEvent("test", after, before));
+
+        verify(clusterService, never()).submitStateUpdateTask(any(String.class), any(ClusterStateUpdateTask.class));
+    }
+
     // --- helpers ---
+
+    /** Attaches an elected cluster-manager local node so {@code event.localNodeClusterManager()} is true. */
+    private static ClusterState withClusterManagerNode(ClusterState state) {
+        DiscoveryNode node = new DiscoveryNode(
+            "node1",
+            "node1",
+            buildNewFakeTransportAddress(),
+            Collections.emptyMap(),
+            Collections.singleton(DiscoveryNodeRole.CLUSTER_MANAGER_ROLE),
+            Version.CURRENT
+        );
+        return ClusterState.builder(state)
+            .nodes(DiscoveryNodes.builder().add(node).localNodeId("node1").clusterManagerNodeId("node1").build())
+            .build();
+    }
 
     /** A committed split of shard 0 into children {1,2}, with both children STARTED (a cluster at rest). */
     private static ClusterState postSplitState() {
