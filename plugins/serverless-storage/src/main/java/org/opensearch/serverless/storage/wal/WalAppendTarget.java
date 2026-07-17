@@ -39,4 +39,17 @@ public interface WalAppendTarget {
 
     /** How many records are currently buffered, not yet durably written by a {@link #flush} call. */
     int bufferedRecordCount();
+
+    /**
+     * The node-shared group-commit processor driving this target's batching path, or {@code null}
+     * when group-commit batching is disabled (the default) or does not apply (e.g. a dedicated
+     * per-shard WAL stream). Its presence is exactly the batching-enabled signal {@code
+     * WalMirroringTranslog} keys off: non-null means {@code add} enqueues onto it and {@code
+     * ensureSynced} waits for the drain, null means the synchronous {@link #append}/{@link #flush}
+     * legacy path. Threaded through this existing seam so no new plumbing has to reach the translog
+     * -- an {@link EncryptingWalChunkService} simply forwards its delegate's processor.
+     */
+    default WalBatchingProcessor batchingProcessor() {
+        return null;
+    }
 }

@@ -22,15 +22,23 @@ import org.opensearch.index.translog.DefaultTranslogDeletionPolicy;
 import org.opensearch.index.translog.Translog;
 import org.opensearch.index.translog.TranslogConfig;
 import org.opensearch.index.translog.TranslogOperationHelper;
+import org.opensearch.serverless.storage.wal.WalAppendTarget;
+import org.opensearch.serverless.storage.wal.WalBatchingProcessor;
 import org.opensearch.serverless.storage.wal.WalChunkNaming;
 import org.opensearch.serverless.storage.wal.WalChunkReader;
 import org.opensearch.serverless.storage.wal.WalChunkService;
 import org.opensearch.serverless.storage.wal.WalRecord;
 import org.opensearch.test.IndexSettingsModule;
 import org.opensearch.test.OpenSearchTestCase;
+import org.opensearch.threadpool.TestThreadPool;
+import org.opensearch.threadpool.ThreadPool;
 
 import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class WalMirroringTranslogTests extends OpenSearchTestCase {
 
@@ -40,6 +48,7 @@ public class WalMirroringTranslogTests extends OpenSearchTestCase {
     private IndexSettings indexSettings;
     private BlobContainer blobContainer;
     private WalChunkService walChunkService;
+    private ThreadPool threadPool;
 
     @Override
     public void setUp() throws Exception {
@@ -51,9 +60,20 @@ public class WalMirroringTranslogTests extends OpenSearchTestCase {
         FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
         blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
         walChunkService = new WalChunkService(blobContainer, "epoch-0");
+        threadPool = new TestThreadPool(getTestName());
+    }
+
+    @Override
+    public void tearDown() throws Exception {
+        ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
+        super.tearDown();
     }
 
     private WalMirroringTranslog newTranslog(Path translogPath) throws Exception {
+        return newTranslog(translogPath, walChunkService);
+    }
+
+    private WalMirroringTranslog newTranslog(Path translogPath, WalAppendTarget appendTarget) throws Exception {
         TranslogConfig config = new TranslogConfig(shardId, translogPath, indexSettings, BigArrays.NON_RECYCLING_INSTANCE, "node-0", false);
         String translogUUID = Translog.createEmptyTranslog(translogPath, SequenceNumbers.UNASSIGNED_SEQ_NO, shardId, 1L);
         return new WalMirroringTranslog(
@@ -64,8 +84,27 @@ public class WalMirroringTranslogTests extends OpenSearchTestCase {
             () -> 1L,
             seqNo -> {},
             TranslogOperationHelper.DEFAULT,
-            walChunkService
+            appendTarget
         );
+    }
+
+    /** A batching processor with a short interval, attached to {@code service} so a translog built over it takes the batching path. */
+    private WalBatchingProcessor attachProcessor(WalChunkService service) {
+        WalBatchingProcessor processor = new WalBatchingProcessor(
+            org.apache.logging.log4j.LogManager.getLogger(WalMirroringTranslogTests.class),
+            10000,
+            threadPool.getThreadContext(),
+            threadPool,
+            () -> org.opensearch.common.unit.TimeValue.timeValueMillis(50),
+            service,
+            null
+        );
+        service.attachBatchingProcessor(processor);
+        return processor;
+    }
+
+    private int logChunkCount() throws java.io.IOException {
+        return blobContainer.listBlobsByPrefix(WalChunkNaming.LOG_BLOB_PREFIX).size();
     }
 
     public void testAppendedOperationsAreMirroredIntoAWalChunk() throws Exception {
@@ -190,6 +229,144 @@ public class WalMirroringTranslogTests extends OpenSearchTestCase {
                 java.io.IOException.class,
                 () -> translog.add(new Translog.Index("id-1", 0, 1, "{\"field\":1}".getBytes("UTF-8")))
             );
+        }
+    }
+
+    public void testBatchingAddReturnsWithoutBlockingAndEnsureSyncedPerformsTheDurableUpload() throws Exception {
+        CountDownLatch writeStarted = new CountDownLatch(1);
+        CountDownLatch releaseWrite = new CountDownLatch(1);
+        BlobContainer gated = new GateFirstWriteBlobContainer(blobContainer, writeStarted, releaseWrite);
+        WalChunkService service = new WalChunkService(gated, "epoch-0");
+        attachProcessor(service);
+
+        try (WalMirroringTranslog translog = newTranslog(createTempDir(), service)) {
+            Translog.Location location = translog.add(new Translog.Index("id-1", 0, 1, "{\"field\":1}".getBytes("UTF-8")));
+            // add() returned to us even though the group-commit write is gated open -- it did not
+            // block on the object-store upload the way the legacy synchronous path does.
+            assertTrue("the group-commit drain must have reached the gated write", writeStarted.await(10, TimeUnit.SECONDS));
+            assertEquals("add() must not have durably written the chunk itself; that is ensureSynced's job now", 0, logChunkCount());
+
+            AtomicReference<Exception> ensureError = new AtomicReference<>();
+            AtomicBoolean ensureReturned = new AtomicBoolean(false);
+            Thread syncer = new Thread(() -> {
+                try {
+                    translog.ensureSynced(location);
+                    ensureReturned.set(true);
+                } catch (Exception e) {
+                    ensureError.set(e);
+                }
+            }, "ensure-synced");
+            syncer.start();
+            try {
+                // ensureSynced must park on the pending WAL upload while the write is still gated.
+                assertBusy(() -> assertEquals(Thread.State.WAITING, syncer.getState()));
+                assertFalse("ensureSynced must wait for the WAL group-commit upload", ensureReturned.get());
+            } finally {
+                releaseWrite.countDown();
+                syncer.join(TimeUnit.SECONDS.toMillis(10));
+            }
+            assertNull("ensureSynced must not have failed", ensureError.get());
+            assertTrue("ensureSynced must return once the upload completes", ensureReturned.get());
+        }
+
+        assertEquals("the operation must be durable in exactly one chunk after ensureSynced", 1, logChunkCount());
+        byte[] chunkBytes;
+        try (java.io.InputStream in = blobContainer.readBlob(WalChunkNaming.blobName("epoch-0", 0))) {
+            chunkBytes = in.readAllBytes();
+        }
+        List<WalRecord> records = WalChunkReader.readRecords(chunkBytes);
+        assertEquals(1, records.size());
+        assertEquals(0L, records.get(0).seqNo());
+    }
+
+    public void testBatchingEnsureSyncedPreservesTheIOExceptionTypeOnUploadFailure() throws Exception {
+        // Fails every writeBlob, so the group-commit drain's writeChunkWithRetry exhausts its retries
+        // and the batch's listener is handed the original IOException.
+        WalChunkService failing = new WalChunkService(new FailNTimesBlobContainer(blobContainer, Integer.MAX_VALUE), "epoch-0");
+        attachProcessor(failing);
+
+        try (WalMirroringTranslog translog = newTranslog(createTempDir(), failing)) {
+            Translog.Location location = translog.add(new Translog.Index("id-1", 0, 1, "{\"field\":1}".getBytes("UTF-8")));
+            // Type preservation: ensureSynced must surface the *original* IOException from the chunk
+            // write (expectThrows(IOException.class) already rules out an ExecutionException wrapper
+            // leaking, since that is not an IOException), and it must be that same instance rather
+            // than a generic re-wrap. A regression dropping the ExecutionException->IOException unwrap
+            // would fail this: the surfaced message would no longer carry the chunk-write text.
+            java.io.IOException e = expectThrows(java.io.IOException.class, () -> translog.ensureSynced(location));
+            assertTrue(
+                "must preserve the original chunk-write IOException, got: " + e.getMessage(),
+                e.getMessage().contains("injected transient failure")
+            );
+        }
+    }
+
+    public void testBatchingLastFlushedWalChunkSequenceAdvancesAfterEnsureSynced() throws Exception {
+        WalChunkService service = new WalChunkService(blobContainer, "epoch-0");
+        attachProcessor(service);
+
+        try (WalMirroringTranslog translog = newTranslog(createTempDir(), service)) {
+            assertEquals("nothing mirrored yet", -1L, translog.lastFlushedWalChunkSequence());
+
+            Translog.Location loc1 = translog.add(new Translog.Index("id-1", 0, 1, "{\"field\":1}".getBytes("UTF-8")));
+            translog.ensureSynced(loc1);
+            long afterFirst = translog.lastFlushedWalChunkSequence();
+            assertTrue("the first mirrored+synced operation must advance the watermark past -1", afterFirst >= 0);
+
+            Translog.Location loc2 = translog.add(new Translog.Index("id-2", 1, 1, "{\"field\":2}".getBytes("UTF-8")));
+            translog.ensureSynced(loc2);
+            long afterSecond = translog.lastFlushedWalChunkSequence();
+            // Unlike the legacy flush-per-op path this must not *regress*, but may stay level if two
+            // ops ever fold into one chunk -- the node-shared sequence is only a resume lower bound.
+            assertTrue("the watermark must not regress across mirrored+synced operations", afterSecond >= afterFirst);
+        }
+    }
+
+    /** Blocks the first {@code writeBlob} (after signalling it has started) until released, then delegates every write normally. */
+    private static final class GateFirstWriteBlobContainer extends FilterBlobContainer {
+        private final BlobContainer delegate;
+        private final CountDownLatch firstWriteStarted;
+        private final CountDownLatch releaseFirstWrite;
+        private final AtomicBoolean firstWriteGated = new AtomicBoolean(false);
+
+        GateFirstWriteBlobContainer(BlobContainer delegate, CountDownLatch firstWriteStarted, CountDownLatch releaseFirstWrite) {
+            super(delegate);
+            this.delegate = delegate;
+            this.firstWriteStarted = firstWriteStarted;
+            this.releaseFirstWrite = releaseFirstWrite;
+        }
+
+        @Override
+        protected BlobContainer wrapChild(BlobContainer child) {
+            return new GateFirstWriteBlobContainer(child, firstWriteStarted, releaseFirstWrite);
+        }
+
+        @Override
+        public void writeBlob(String blobName, java.io.InputStream inputStream, long blobSize, boolean failIfAlreadyExists)
+            throws java.io.IOException {
+            if (firstWriteGated.compareAndSet(false, true)) {
+                firstWriteStarted.countDown();
+                try {
+                    releaseFirstWrite.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new java.io.IOException("interrupted while gated", e);
+                }
+            }
+            super.writeBlob(blobName, inputStream, blobSize, failIfAlreadyExists);
+        }
+
+        @Override
+        public java.util.Optional<org.opensearch.common.blobstore.BlobRegister> readRegister(String blobName) throws java.io.IOException {
+            return delegate.readRegister(blobName);
+        }
+
+        @Override
+        public org.opensearch.common.blobstore.BlobRegisterCasResult compareAndSwapRegister(
+            String blobName,
+            long expectedGeneration,
+            org.opensearch.core.common.bytes.BytesReference newValue
+        ) throws java.io.IOException {
+            return delegate.compareAndSwapRegister(blobName, expectedGeneration, newValue);
         }
     }
 

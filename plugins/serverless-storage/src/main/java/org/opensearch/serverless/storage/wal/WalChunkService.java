@@ -86,6 +86,14 @@ public final class WalChunkService implements WalAppendTarget {
     private final Map<ShardKey, Long> bufferedBytesByShard = new HashMap<>();
 
     /**
+     * The node-shared group-commit processor attached to this service when batching is enabled, or
+     * {@code null} on the legacy synchronous path -- see {@link #batchingProcessor()}. Volatile
+     * because it is attached ({@link #attachBatchingProcessor}) on one thread during plugin wiring
+     * and read from any writer shard's translog thread thereafter.
+     */
+    private volatile WalBatchingProcessor batchingProcessor;
+
+    /**
      * Creates a WAL chunk service with per-shard fairness budgeting disabled.
      *
      * @param blobContainer the shared blob container chunks are written to
@@ -111,6 +119,26 @@ public final class WalChunkService implements WalAppendTarget {
     /** The configured per-shard fairness budget, exposed for tests confirming node-setting wiring; not part of the read/write API. */
     public long perShardBudgetBytesForTesting() {
         return perShardBudgetBytes;
+    }
+
+    /**
+     * Associates the node-shared group-commit processor that drives this service's batching path,
+     * called once during plugin wiring right after both objects are constructed (they reference each
+     * other -- the processor group-commits into this service, this service hands the processor to
+     * every writer shard's translog via {@link #batchingProcessor()}). Only ever set on the
+     * node-shared service when {@code serverless_storage.wal_flush.batching.enabled} is on; a
+     * dedicated per-shard service is never given one, keeping dedicated WAL streams on the legacy
+     * synchronous path.
+     *
+     * @param processor the group-commit processor to attach.
+     */
+    public void attachBatchingProcessor(WalBatchingProcessor processor) {
+        this.batchingProcessor = processor;
+    }
+
+    @Override
+    public WalBatchingProcessor batchingProcessor() {
+        return batchingProcessor;
     }
 
     /**

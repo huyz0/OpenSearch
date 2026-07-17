@@ -966,6 +966,12 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     private volatile boolean walFlushBatchingEnabled;
     private volatile TimeValue walFlushInterval = TimeValue.timeValueMillis(200);
     private volatile int walFlushQueueCapacity = 10000;
+    // The one node-shared group-commit processor, built and attached to sharedWalChunkService in
+    // resolveSharedWalChunkService() only when batching is enabled; null otherwise (and never
+    // attached to a dedicated-WAL-stream shard's own service, which keeps the legacy synchronous
+    // path). Shutdown-drain concerns are covered by index.translog.durability=REQUEST already having
+    // waited before ack -- see close()'s javadoc.
+    private volatile org.opensearch.serverless.storage.wal.WalBatchingProcessor sharedWalBatchingProcessor;
     // Guards resolveSharedWalChunkService()'s double-checked-locking build -- a plain Object, not
     // `this`, so a caller synchronizing on the plugin instance for an unrelated reason can never
     // accidentally contend with (or deadlock against) this specific lazy-init path.
@@ -1766,6 +1772,26 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             // it only needs to be unique enough that this process's chunk sequence numbering never
             // collides with a prior incarnation's.
             WalChunkService built = new WalChunkService(walBlobContainer, UUIDs.base64UUID(), walPerShardBudgetBytes);
+            if (walFlushBatchingEnabled) {
+                // The node-shared group-commit processor, attached to the shared service so every
+                // writer shard's WalMirroringTranslog reaches it via WalAppendTarget#batchingProcessor()
+                // -- the presence of an attached processor is exactly what flips that shard's add()
+                // from the synchronous legacy PUT-per-op path to real interval-batched group commit.
+                // encryptionKeyProvider (node-level, may be null) is applied inside the processor's own
+                // write(), standing in for the per-shard EncryptingWalChunkService the legacy path uses.
+                org.opensearch.serverless.storage.wal.WalBatchingProcessor processor =
+                    new org.opensearch.serverless.storage.wal.WalBatchingProcessor(
+                        org.apache.logging.log4j.LogManager.getLogger(org.opensearch.serverless.storage.wal.WalBatchingProcessor.class),
+                        walFlushQueueCapacity,
+                        threadPool.getThreadContext(),
+                        threadPool,
+                        () -> walFlushInterval,
+                        built,
+                        encryptionKeyProvider
+                    );
+                built.attachBatchingProcessor(processor);
+                sharedWalBatchingProcessor = processor;
+            }
             if (walGcInterval != null && walGcInterval.millis() > 0) {
                 walGcSchedulerTask = new org.opensearch.serverless.storage.wal.WalGcSchedulerTask(
                     threadPool,

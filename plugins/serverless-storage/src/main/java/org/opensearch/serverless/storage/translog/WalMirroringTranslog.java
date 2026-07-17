@@ -15,10 +15,13 @@ import org.opensearch.index.translog.TranslogConfig;
 import org.opensearch.index.translog.TranslogDeletionPolicy;
 import org.opensearch.index.translog.TranslogOperationHelper;
 import org.opensearch.serverless.storage.wal.WalAppendTarget;
+import org.opensearch.serverless.storage.wal.WalBatchingProcessor;
 import org.opensearch.serverless.storage.wal.WalChunkService;
 import org.opensearch.serverless.storage.wal.WalRecord;
 
 import java.io.IOException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.function.LongConsumer;
 import java.util.function.LongSupplier;
 
@@ -30,8 +33,24 @@ import java.util.function.LongSupplier;
  * commit manifest.
  *
  * <p>This deliberately keeps the entire recovery/replay/generation-rolling machinery of {@link
- * Translog} untouched -- only {@link #add} is overridden -- rather than reimplementing translog
- * file management on top of the WAL chunk format.
+ * Translog} untouched -- only {@link #add} and, on the batching path, {@link #ensureSynced} are
+ * overridden -- rather than reimplementing translog file management on top of the WAL chunk format.
+ *
+ * <p><b>Two paths, chosen by whether a group-commit processor is attached</b> (see {@link
+ * WalAppendTarget#batchingProcessor()}):
+ * <ul>
+ *   <li><b>Legacy (no processor):</b> {@link #add} synchronously appends and flushes the record to
+ *       the object store before returning -- roughly one PUT per operation, unchanged from before
+ *       batching existed.
+ *   <li><b>Batching (processor attached):</b> {@link #add} appends locally then enqueues the record
+ *       onto the shared {@link WalBatchingProcessor} and returns immediately without blocking on any
+ *       object-store I/O; a later {@link #ensureSynced} is what waits for that record's group-commit
+ *       upload to complete. Whether the client's own write waits for it is governed entirely by the
+ *       standard {@code index.translog.durability} setting, exactly as it already governs remote-store
+ *       translog upload: {@code REQUEST} calls {@link #ensureSynced} on the request thread before
+ *       acking, {@code ASYNC} lets a background sync task call it instead. No plugin-specific "wait
+ *       or not" knob is introduced -- this reuses core's own {@code RemoteFsTranslog} precedent.
+ * </ul>
  */
 public class WalMirroringTranslog extends LocalTranslog {
 
@@ -49,7 +68,24 @@ public class WalMirroringTranslog extends LocalTranslog {
     private final int shardId;
     private final LongSupplier primaryTermSupplier;
 
-    /** The chunk sequence, under this WAL service's shared epoch, most recently confirmed durably written -- see {@link #lastFlushedWalChunkSequence()}. */
+    /**
+     * The node-shared group-commit processor, or {@code null} on the legacy synchronous path. Its
+     * presence is the batching-enabled signal (see this class's javadoc); derived once at
+     * construction from {@link WalAppendTarget#batchingProcessor()}.
+     */
+    private final WalBatchingProcessor batchingProcessor;
+
+    /**
+     * The batching path's per-op completion handle: {@link #add} stores the future for the record it
+     * just enqueued here, and {@link #ensureSynced} waits on it. Waiting on the <em>most recent</em>
+     * enqueued future is sufficient -- the shared processor drains the whole queue in FIFO order one
+     * batch at a time, so when this shard's latest record's batch completes, every earlier record it
+     * enqueued has necessarily been written too. {@code null} until the first {@link #add} on the
+     * batching path. Unused on the legacy path.
+     */
+    private volatile CompletableFuture<Void> latestPendingWalFuture;
+
+    /** The chunk sequence, under this WAL service's shared epoch, most recently confirmed durably written on the legacy path -- see {@link #lastFlushedWalChunkSequence()}. */
     private volatile long lastFlushedWalChunkSequence = -1;
 
     /**
@@ -89,30 +125,95 @@ public class WalMirroringTranslog extends LocalTranslog {
         this.indexUuid = config.getShardId().getIndex().getUUID();
         this.shardId = config.getShardId().getId();
         this.primaryTermSupplier = primaryTermSupplier;
+        this.batchingProcessor = walChunkService.batchingProcessor();
     }
 
     @Override
     public Location add(final Operation operation) throws IOException {
         Location location = super.add(operation);
-        BytesStreamOutput out = new BytesStreamOutput();
-        Operation.writeOperation(out, operation);
-        walChunkService.append(
-            new WalRecord(
-                indexUuid,
-                shardId,
-                primaryTermSupplier.getAsLong(),
-                operation.seqNo(),
-                org.opensearch.core.common.bytes.BytesReference.toBytes(out.bytes())
-            )
-        );
-        // Flushing per-operation gives the same per-write durability guarantee a local translog
-        // fsync gives; a deployment that wants real cross-shard group-commit batching would flush
-        // WalChunkService on a timer/size threshold from a shared scheduler instead, independent
-        // of any single shard's Translog. WalChunkService#flush now applies the bounded
-        // retry-with-backoff itself (see #flushWithRetry's javadoc for why a transient blip here
-        // should not fail the whole engine), so this call already carries that policy.
+        WalRecord record = toWalRecord(operation);
+        if (batchingProcessor != null) {
+            // Batching path: enqueue and return immediately. The indexing thread is no longer held
+            // for any object-store I/O -- the shared processor group-commits this record (and every
+            // other shard's records enqueued in the same interval) into one chunk on its own thread.
+            // Durability is deferred to ensureSynced(); under index.translog.durability=REQUEST the
+            // request thread calls that before acking, under ASYNC a background sync task does.
+            CompletableFuture<Void> future = new CompletableFuture<>();
+            batchingProcessor.put(record, exception -> {
+                if (exception != null) {
+                    future.completeExceptionally(exception);
+                } else {
+                    future.complete(null);
+                }
+            });
+            latestPendingWalFuture = future;
+            return location;
+        }
+        // Legacy path: flushing per-operation gives the same per-write durability guarantee a local
+        // translog fsync gives. WalChunkService#flush applies the bounded retry-with-backoff itself
+        // (see #flushWithRetry's javadoc), so this call already carries that policy.
+        walChunkService.append(record);
         flushWithRetry();
         return location;
+    }
+
+    /** Serializes {@code operation} into the plaintext {@link WalRecord} tagged with this shard's identity and current primary term. */
+    private WalRecord toWalRecord(Operation operation) throws IOException {
+        BytesStreamOutput out = new BytesStreamOutput();
+        Operation.writeOperation(out, operation);
+        return new WalRecord(
+            indexUuid,
+            shardId,
+            primaryTermSupplier.getAsLong(),
+            operation.seqNo(),
+            org.opensearch.core.common.bytes.BytesReference.toBytes(out.bytes())
+        );
+    }
+
+    /**
+     * On the batching path, blocks until this shard's most recently enqueued WAL record has been
+     * group-committed to the object store, after first ensuring the local translog is fsynced up to
+     * {@code location} exactly as {@link LocalTranslog} does. This is the method
+     * {@code index.translog.durability=REQUEST} drives on the client's own request thread (via
+     * {@code IndexShard.sync()} -> {@code translogSyncProcessor} -> {@code
+     * TranslogManager#ensureTranslogSynced} -> {@code Translog#ensureSynced(Stream)} -> here),
+     * making a WAL-mirrored write's ack wait for its durable upload; under {@code ASYNC} the same
+     * call happens on a background sync task instead. No bespoke timeout is added, matching {@code
+     * RemoteFsTranslog#ensureSynced}'s own precedent -- the overall request-level timeout bounds the
+     * wait. On the legacy path there is nothing extra to wait for (the mirror write already completed
+     * inside {@link #add}), so this simply defers to {@link LocalTranslog}.
+     *
+     * @param location the translog location to ensure is durable (local fsync, plus the WAL mirror upload on the batching path).
+     * @return {@code true} iff this call caused an actual local sync, exactly as {@link LocalTranslog#ensureSynced} reports it.
+     */
+    @Override
+    public boolean ensureSynced(Location location) throws IOException {
+        boolean localResult = super.ensureSynced(location);
+        if (batchingProcessor == null) {
+            return localResult;
+        }
+        CompletableFuture<Void> pending = latestPendingWalFuture;
+        if (pending != null) {
+            try {
+                pending.get();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("interrupted while waiting for WAL mirror group-commit upload", e);
+            } catch (ExecutionException e) {
+                // Preserve the original failure type: the processor's write() propagates the
+                // IOException WalChunkService#writeChunkWithRetry threw after exhausting its retries,
+                // matching the legacy path's own "add throws IOException on exhaustion" contract.
+                Throwable cause = e.getCause();
+                if (cause instanceof IOException) {
+                    throw (IOException) cause;
+                }
+                if (cause instanceof RuntimeException) {
+                    throw (RuntimeException) cause;
+                }
+                throw new IOException("WAL mirror group-commit upload failed", cause);
+            }
+        }
+        return localResult;
     }
 
     /**
@@ -126,8 +227,16 @@ public class WalMirroringTranslog extends LocalTranslog {
      * to be a lower bound safe to resume scanning from -- replay's own per-record
      * {@code (indexUuid, shardId, primaryTerm)} filter (see {@link WalRecord}'s javadoc) is what
      * actually determines which records apply, not this position alone.
+     *
+     * <p>On the batching path this reads the shared processor's own last-written sequence rather than
+     * this shard's field: the same node-shared, strictly-increasing sequence is the correct resume
+     * lower bound for every shard, and the group-commit that advances it happens off this translog's
+     * threads (see {@link WalBatchingProcessor#lastWrittenChunkSequence()}).
      */
     public long lastFlushedWalChunkSequence() {
+        if (batchingProcessor != null) {
+            return batchingProcessor.lastWrittenChunkSequence();
+        }
         return lastFlushedWalChunkSequence;
     }
 

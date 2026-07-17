@@ -60,4 +60,12 @@ public final class EncryptingWalChunkService implements WalAppendTarget {
     public int bufferedRecordCount() {
         return delegate.bufferedRecordCount();
     }
+
+    @Override
+    public WalBatchingProcessor batchingProcessor() {
+        // The batching path applies encryption in the processor itself (keyed off the same node-level
+        // key provider), so forwarding the delegate's processor unwrapped is correct -- this decorator
+        // only matters on the legacy append/flush path, which the batching path bypasses entirely.
+        return delegate.batchingProcessor();
+    }
 }
