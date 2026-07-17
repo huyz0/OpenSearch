@@ -90,6 +90,11 @@ public class WalMirroringTranslogTests extends OpenSearchTestCase {
 
     /** A batching processor with a short interval, attached to {@code service} so a translog built over it takes the batching path. */
     private WalBatchingProcessor attachProcessor(WalChunkService service) {
+        return attachProcessor(service, -1);
+    }
+
+    /** As {@link #attachProcessor(WalChunkService)}, with an explicit backlog-reject threshold. */
+    private WalBatchingProcessor attachProcessor(WalChunkService service, long backlogRejectThreshold) {
         WalBatchingProcessor processor = new WalBatchingProcessor(
             org.apache.logging.log4j.LogManager.getLogger(WalMirroringTranslogTests.class),
             10000,
@@ -97,6 +102,7 @@ public class WalMirroringTranslogTests extends OpenSearchTestCase {
             threadPool,
             () -> org.opensearch.common.unit.TimeValue.timeValueMillis(50),
             -1,
+            backlogRejectThreshold,
             service,
             null
         );
@@ -319,6 +325,47 @@ public class WalMirroringTranslogTests extends OpenSearchTestCase {
             // Unlike the legacy flush-per-op path this must not *regress*, but may stay level if two
             // ops ever fold into one chunk -- the node-shared sequence is only a resume lower bound.
             assertTrue("the watermark must not regress across mirrored+synced operations", afterSecond >= afterFirst);
+        }
+    }
+
+    /**
+     * Once the WAL upload backlog exceeds the configured threshold, {@code add} must reject the next
+     * write with backpressure rather than enqueueing it -- rfc-serverless-opensearch.md &sect;6.4's
+     * explicit 429-on-backlog design. The first write's group-commit is held open (gated) so its
+     * payload bytes stay counted as backlog for the whole test.
+     */
+    public void testAddRejectsWithBackpressureOnceTheBacklogThresholdIsExceeded() throws Exception {
+        CountDownLatch writeStarted = new CountDownLatch(1);
+        CountDownLatch releaseWrite = new CountDownLatch(1);
+        BlobContainer gated = new GateFirstWriteBlobContainer(blobContainer, writeStarted, releaseWrite);
+        WalChunkService service = new WalChunkService(gated, "epoch-0");
+        byte[] firstPayload = "{\"field\":1}".getBytes("UTF-8");
+        // Threshold set to exactly the first op's own backlog contribution, so the first add() (which
+        // enqueues before the threshold is crossed) succeeds but the second one -- checked before it
+        // enqueues -- is rejected while the first is still held open in the gated write.
+        attachProcessor(service, firstPayload.length);
+
+        try (WalMirroringTranslog translog = newTranslog(createTempDir(), service)) {
+            translog.add(new Translog.Index("id-1", 0, 1, firstPayload));
+            assertTrue("the first op's group-commit drain must have reached the gated write", writeStarted.await(10, TimeUnit.SECONDS));
+
+            org.opensearch.core.concurrency.OpenSearchRejectedExecutionException rejected = expectThrows(
+                org.opensearch.core.concurrency.OpenSearchRejectedExecutionException.class,
+                () -> translog.add(new Translog.Index("id-2", 1, 1, "{\"field\":2}".getBytes("UTF-8")))
+            );
+            assertTrue("rejection message should name the shard", rejected.getMessage().contains(INDEX_UUID));
+            releaseWrite.countDown();
+        }
+    }
+
+    /** Below the backlog threshold, writes are unaffected -- proves the threshold check is a real comparison, not always-reject. */
+    public void testAddDoesNotRejectWhenBacklogStaysUnderTheThreshold() throws Exception {
+        WalChunkService service = new WalChunkService(blobContainer, "epoch-0");
+        attachProcessor(service, 1_000_000L);
+
+        try (WalMirroringTranslog translog = newTranslog(createTempDir(), service)) {
+            Translog.Location location = translog.add(new Translog.Index("id-1", 0, 1, "{\"field\":1}".getBytes("UTF-8")));
+            translog.ensureSynced(location);
         }
     }
 

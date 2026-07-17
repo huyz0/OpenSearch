@@ -9,6 +9,7 @@
 package org.opensearch.serverless.storage.translog;
 
 import org.opensearch.common.io.stream.BytesStreamOutput;
+import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.index.translog.LocalTranslog;
 import org.opensearch.index.translog.Translog;
 import org.opensearch.index.translog.TranslogConfig;
@@ -133,6 +134,24 @@ public class WalMirroringTranslog extends LocalTranslog {
         Location location = super.add(operation);
         WalRecord record = toWalRecord(operation);
         if (batchingProcessor != null) {
+            // Explicit backpressure (rfc-serverless-opensearch.md &sect;6.4): once the upload backlog
+            // crosses serverless_storage.wal_flush.backlog_reject_threshold, reject this write instead
+            // of enqueueing it and letting the backlog (and the memory it holds) keep growing. The
+            // local super.add() above has already happened, so the operation is not silently lost --
+            // the caller (indexing/replication path) sees a clean rejection and the client can retry,
+            // rather than the object store's own slowdown surfacing later as unbounded node memory
+            // growth or an indefinitely blocked indexing thread once the queue eventually fills.
+            if (batchingProcessor.isOverBacklogRejectThreshold()) {
+                throw new OpenSearchRejectedExecutionException(
+                    "rejected WAL mirror write: upload backlog ["
+                        + batchingProcessor.backlogBytes()
+                        + " bytes] exceeds configured threshold for ["
+                        + indexUuid
+                        + "]["
+                        + shardId
+                        + "]"
+                );
+            }
             // Batching path: enqueue and return immediately. The indexing thread is no longer held
             // for any object-store I/O -- the shared processor group-commits this record (and every
             // other shard's records enqueued in the same interval) into one chunk on its own thread.

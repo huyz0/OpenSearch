@@ -76,6 +76,7 @@ public class WalBatchingProcessorTests extends OpenSearchTestCase {
             threadPool,
             () -> interval,
             byteThreshold,
+            -1,
             service,
             null
         );
@@ -258,6 +259,7 @@ public class WalBatchingProcessorTests extends OpenSearchTestCase {
             threadPool,
             () -> TimeValue.timeValueMinutes(10),
             recordPayloadBytes * 3L,
+            -1,
             service,
             null
         );
@@ -295,6 +297,7 @@ public class WalBatchingProcessorTests extends OpenSearchTestCase {
             threadPool,
             () -> TimeValue.timeValueMillis(300),
             1_000_000,
+            -1,
             service,
             null
         );

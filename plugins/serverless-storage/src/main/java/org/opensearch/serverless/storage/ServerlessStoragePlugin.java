@@ -861,6 +861,27 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * The WAL upload backlog size (bytes enqueued or mid-write, not yet confirmed durably written)
+     * above which new writes on the batching path are rejected with backpressure instead of being
+     * enqueued, when {@link #SERVERLESS_STORAGE_WAL_FLUSH_BATCHING_ENABLED_SETTING} is on --
+     * rfc-serverless-opensearch.md &sect;6.4's "the WAL buffer is bounded; when upload backlog crosses
+     * a threshold the node rejects new indexing with 429." {@code WalMirroringTranslog#add} throws an
+     * {@code org.opensearch.core.concurrency.OpenSearchRejectedExecutionException} when the backlog is
+     * over this threshold, the same exception type and rejection path {@code IndexingPressure} already
+     * uses -- so it is recognized by the same downstream backpressure handling (see {@code
+     * ReplicationOperation}) rather than needing plugin-specific 429 wiring. {@link ByteSizeValue#ZERO}
+     * (the default) disables rejection: the queue's own bounded {@link
+     * #SERVERLESS_STORAGE_WAL_FLUSH_QUEUE_CAPACITY_SETTING} capacity remains the only backstop, which
+     * blocks the calling thread rather than rejecting it cleanly. Ignored entirely when batching is
+     * off.
+     */
+    public static final Setting<ByteSizeValue> SERVERLESS_STORAGE_WAL_FLUSH_BACKLOG_REJECT_THRESHOLD_SETTING = Setting.byteSizeSetting(
+        "serverless_storage.wal_flush.backlog_reject_threshold",
+        ByteSizeValue.ZERO,
+        Setting.Property.NodeScope
+    );
+
+    /**
      * Minimum real time between two refresh-triggered publish attempts on any one writer shard
      * (rfc-serverless-opensearch.md &sect;8: "a per-index publication rate limit protect[s] against
      * that footgun" of a caller hammering {@code _refresh}, now that {@code api}/{@code
@@ -982,6 +1003,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     private volatile TimeValue walFlushInterval = TimeValue.timeValueMillis(200);
     private volatile int walFlushQueueCapacity = 10000;
     private volatile long walFlushByteThreshold = 0;
+    private volatile long walFlushBacklogRejectThreshold = 0;
     // The one node-shared group-commit processor, built and attached to sharedWalChunkService in
     // resolveSharedWalChunkService() only when batching is enabled; null otherwise (and never
     // attached to a dedicated-WAL-stream shard's own service, which keeps the legacy synchronous
@@ -1079,6 +1101,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_WAL_FLUSH_INTERVAL_SETTING,
             SERVERLESS_STORAGE_WAL_FLUSH_QUEUE_CAPACITY_SETTING,
             SERVERLESS_STORAGE_WAL_FLUSH_BYTE_THRESHOLD_SETTING,
+            SERVERLESS_STORAGE_WAL_FLUSH_BACKLOG_REJECT_THRESHOLD_SETTING,
             SERVERLESS_STORAGE_PUBLICATION_RATE_LIMIT_SETTING,
             SERVERLESS_STORAGE_LAZY_DIRECTORY_CACHE_SIZE_SETTING,
             SERVERLESS_STORAGE_LOCAL_CACHE_MAX_BYTES_PER_SHARD_SETTING,
@@ -1333,6 +1356,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             walFlushInterval = SERVERLESS_STORAGE_WAL_FLUSH_INTERVAL_SETTING.get(environment.settings());
             walFlushQueueCapacity = SERVERLESS_STORAGE_WAL_FLUSH_QUEUE_CAPACITY_SETTING.get(environment.settings());
             walFlushByteThreshold = SERVERLESS_STORAGE_WAL_FLUSH_BYTE_THRESHOLD_SETTING.get(environment.settings()).getBytes();
+            walFlushBacklogRejectThreshold = SERVERLESS_STORAGE_WAL_FLUSH_BACKLOG_REJECT_THRESHOLD_SETTING.get(environment.settings())
+                .getBytes();
         }
         // This plugin instance itself, so TransportShardCloneAction (the only consumer) can be
         // constructor-injected with it and reach blobContainerForDirectoryFactory -- the same
@@ -1805,6 +1830,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                         threadPool,
                         () -> walFlushInterval,
                         walFlushByteThreshold,
+                        walFlushBacklogRejectThreshold,
                         built,
                         encryptionKeyProvider
                     );

@@ -19,6 +19,7 @@ import org.opensearch.threadpool.ThreadPool;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
@@ -75,6 +76,24 @@ public final class WalBatchingProcessor extends BufferedAsyncIOProcessor<WalReco
     private final long bufferByteThreshold;
 
     /**
+     * The cumulative payload size of every record currently enqueued or mid-write (put but not yet
+     * notified) -- the real-time backlog {@link #isOverBacklogRejectThreshold()} checks, distinct from
+     * {@code bufferedBytes} in the base class which resets every drain and only drives the early-flush
+     * trigger. Incremented in {@link #put}, decremented once a batch's write attempt finishes
+     * (successfully or not -- either way those records are no longer backlog).
+     */
+    private final AtomicLong backlogBytes = new AtomicLong();
+
+    /**
+     * The backlog threshold above which {@link #isOverBacklogRejectThreshold()} reports true, so a
+     * caller can reject new writes with backpressure instead of enqueueing them (rfc-serverless-
+     * opensearch.md &sect;6.4: "the WAL buffer is bounded; when upload backlog crosses a threshold the
+     * node rejects new indexing with 429"). Non-positive disables rejection -- the queue's own bounded
+     * capacity remains the only backstop, which blocks the calling thread rather than rejecting it.
+     */
+    private final long backlogRejectThreshold;
+
+    /**
      * Creates the shared processor.
      *
      * @param logger the logger the base class logs drain failures through
@@ -83,6 +102,7 @@ public final class WalBatchingProcessor extends BufferedAsyncIOProcessor<WalReco
      * @param threadPool the thread pool each interval-scheduled drain runs on
      * @param bufferIntervalSupplier supplies the group-commit interval between drains
      * @param bufferByteThreshold cumulative buffered-payload size that triggers an immediate drain; non-positive disables it
+     * @param backlogRejectThreshold cumulative backlog size above which {@link #isOverBacklogRejectThreshold()} reports true; non-positive disables it
      * @param walChunkService the chunk service each drain group-commits its batch into
      * @param encryptionKeyProvider {@code null} leaves records unencrypted; non-null encrypts each record's payload before it is written
      */
@@ -93,28 +113,46 @@ public final class WalBatchingProcessor extends BufferedAsyncIOProcessor<WalReco
         ThreadPool threadPool,
         Supplier<TimeValue> bufferIntervalSupplier,
         long bufferByteThreshold,
+        long backlogRejectThreshold,
         WalChunkService walChunkService,
         EncryptionKeyProvider encryptionKeyProvider
     ) {
         super(logger, queueCapacity, threadContext, threadPool, bufferIntervalSupplier);
         this.bufferByteThreshold = bufferByteThreshold;
+        this.backlogRejectThreshold = backlogRejectThreshold;
         this.walChunkService = walChunkService;
         this.encryptionKeyProvider = encryptionKeyProvider;
     }
 
     @Override
+    public void put(WalRecord item, Consumer<Exception> listener) {
+        backlogBytes.addAndGet(item.payload().length);
+        super.put(item, listener);
+    }
+
+    @Override
     protected void write(List<Tuple<WalRecord, Consumer<Exception>>> candidates) throws IOException {
+        long batchBytes = 0;
         List<WalRecord> records = new ArrayList<>(candidates.size());
         for (Tuple<WalRecord, Consumer<Exception>> candidate : candidates) {
             WalRecord record = candidate.v1();
+            batchBytes += record.payload().length;
             records.add(encryptionKeyProvider == null ? record : WalRecordCrypto.encrypt(record, encryptionKeyProvider));
         }
-        long chunkSequence = walChunkService.writeChunkWithRetry(records);
-        if (chunkSequence >= 0) {
-            lastWrittenChunkSequence = chunkSequence;
+        try {
+            long chunkSequence = walChunkService.writeChunkWithRetry(records);
+            if (chunkSequence >= 0) {
+                lastWrittenChunkSequence = chunkSequence;
+            }
+            // The base class notifies every candidate's listener with null (success) once this returns
+            // without throwing, or with the thrown exception if it does -- both handled there, not here.
+        } finally {
+            // Decremented on both success and failure: either way these records are no longer sitting
+            // in the backlog once this write attempt is done -- a failed batch's callers get the
+            // exception and, per WalMirroringTranslog#ensureSynced's contract, must retry the whole
+            // operation (which re-enqueues and re-counts it), not silently resurrect the old backlog.
+            backlogBytes.addAndGet(-batchBytes);
         }
-        // The base class notifies every candidate's listener with null (success) once this returns
-        // without throwing, or with the thrown exception if it does -- both handled there, not here.
     }
 
     @Override
@@ -135,5 +173,19 @@ public final class WalBatchingProcessor extends BufferedAsyncIOProcessor<WalReco
     /** The highest chunk sequence a drain has confirmed durably written, or {@code -1} if none yet -- see {@link #lastWrittenChunkSequence}. */
     public long lastWrittenChunkSequence() {
         return lastWrittenChunkSequence;
+    }
+
+    /** The current WAL upload backlog in bytes -- see {@link #backlogBytes}. */
+    public long backlogBytes() {
+        return Math.max(0, backlogBytes.get());
+    }
+
+    /**
+     * Whether the current backlog exceeds {@link #backlogRejectThreshold}, the signal a caller (see
+     * {@code WalMirroringTranslog#add}) uses to reject a new write with backpressure instead of
+     * enqueueing it. Always {@code false} when rejection is disabled ({@code backlogRejectThreshold <= 0}).
+     */
+    public boolean isOverBacklogRejectThreshold() {
+        return backlogRejectThreshold > 0 && backlogBytes() >= backlogRejectThreshold;
     }
 }
