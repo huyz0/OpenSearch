@@ -86,7 +86,42 @@ public final class InPlaceSiblingMerger {
      * @param range the child's own hash range -- the filter that restricts this child's materialized
      *              reader to exactly its authoritative document slice.
      */
-    public record MergeChild(CommitManifest manifest, BundleFileReader readPath, ShardRange range) {}
+    public record MergeChild(CommitManifest manifest, BundleFileReader readPath, ShardRange range) {
+
+        /**
+         * Creates a child descriptor for the merge.
+         *
+         * @param manifest the child's current published commit manifest.
+         * @param readPath fetches {@code manifest}'s bundle files.
+         * @param range the child's own hash range.
+         */
+        public MergeChild {}
+
+        /** The child's current published commit manifest. */
+        @Override
+        public CommitManifest manifest() {
+            return manifest;
+        }
+
+        /**
+         * Fetches {@code manifest}'s bundle files; must resolve both the child's own post-split
+         * bundles and (for a child that never published a post-split commit and so still references
+         * the parent's cloned-by-reference base bundle) the parent's.
+         */
+        @Override
+        public BundleFileReader readPath() {
+            return readPath;
+        }
+
+        /**
+         * The child's own hash range -- the filter that restricts this child's materialized reader to
+         * exactly its authoritative document slice.
+         */
+        @Override
+        public ShardRange range() {
+            return range;
+        }
+    }
 
     /**
      * Folds every child's authoritative document slice into {@code targetDirectory} as a single fresh
@@ -181,6 +216,8 @@ public final class InPlaceSiblingMerger {
         private final List<BundleFileReader> delegates;
 
         /**
+         * Creates a reader that falls through the given delegates in order.
+         *
          * @param delegates the readers to try in order; earlier entries take precedence.
          */
         public FallbackBundleFileReader(List<BundleFileReader> delegates) {

@@ -38,6 +38,8 @@ public final class SustainedCandidateTracker<T> {
     private final ConcurrentMap<String, Integer> consecutiveCandidateTicks = new ConcurrentHashMap<>();
 
     /**
+     * Creates a tracker with the given hysteresis requirement.
+     *
      * @param requiredConsecutiveTicks how many consecutive evaluations in a row a candidate must be
      *                                 flagged on before it counts as sustained. Values {@code <= 1}
      *                                 mean every single flagged tick counts (no hysteresis).
@@ -83,7 +85,11 @@ public final class SustainedCandidateTracker<T> {
         return sustained;
     }
 
-    /** Drops a candidate's tracked streak outright -- e.g. once acted on, or found no longer valid. */
+    /**
+     * Drops a candidate's tracked streak outright -- e.g. once acted on, or found no longer valid.
+     *
+     * @param key the candidate's key to forget.
+     */
     public void clearStreak(String key) {
         consecutiveCandidateTicks.remove(key);
     }
