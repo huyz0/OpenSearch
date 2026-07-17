@@ -384,12 +384,98 @@ recovery time. The hook reads them back via `indexShard.recoveryState()`.
   child's un-published writes aren't dropped) and surfacing precondition violations as a clean 400. Held back
   until the hook was real and the round trip proven, exactly as planned -- the IT now drives it end to end.
 
-Still open (deliberately, not blocked on anything above): **item 2.3 (an automatic merge trigger policy)**,
-the merge counterpart of Phase 1's split-trigger scheduler -- not attempted here; the operator action is the
-honest first cut, same as split was before its own auto-trigger. And the honest scope bound from the spike
-still holds: all of this is the **full-sibling-pair** merge (undo one flat `SPLIT_INTO=2` split). Merging
-shards that are not siblings of the same split remains the harder, unspiked problem `ShardShrinker`'s
+Item 2.3 (an automatic merge trigger policy), the merge counterpart of Phase 1's split-trigger scheduler,
+is now built too -- see the "Phase 2 item 2.3" section immediately below. The honest scope bound from the
+spike still holds: all of this is the **full-sibling-pair** merge (undo one flat `SPLIT_INTO=2` split).
+Merging shards that are not siblings of the same split remains the harder, unspiked problem `ShardShrinker`'s
 cross-identity machinery is the right tool for.
+
+## Phase 2 item 2.3 — Automatic merge trigger policy
+
+Status: **done, off by default**. The merge-side counterpart to Phase 1's split auto-trigger, built to
+mirror `InPlaceSplitTriggerCoordinator`/`InPlaceSplitTriggerSchedulerTask` as closely as the merge problem
+allows. Both `auto_merge` gates default off; an operator opts in explicitly, and should read the anti-flap
+and cool-down notes below first.
+
+### What "merge candidate" means, and how the signal is sourced
+
+Split needs only one shard's own write-rate or size to cross a threshold. Merge is about a *pair*: for each
+parent whose split has committed and that has exactly two direct, unsplit-further children (the
+full-sibling-pair scope this whole feature is bounded to), `InPlaceMergeTriggerCoordinator` sums both
+children's `writesPerMinute` and `shardSizeInBytes` and flags the pair a merge candidate when *both* combined
+sums sit at or below the merge thresholds.
+
+The per-child signal is the very same one split's own trigger already collects: `ShardSplitCandidatesAction`
+fans out `ShardActivityRegistry`'s `snapshotWritesPerMinute`/`snapshotShardSizes` cluster-wide and reports a
+`ShardSplitCandidateEntry` (carrying raw `writesPerMinute`/`shardSizeInBytes`) for every writer shard. The
+merge scheduler reuses that action verbatim rather than adding a parallel merge-candidates action, and the
+coordinator sums the two children's raw values. A pair whose two children aren't *both* currently reporting a
+signal (or where either reports an `UNKNOWN` size) is skipped, not assumed quiet -- without both children's
+size we can't safely conclude the pair fits back inside one shard.
+
+Eligibility (committed, exactly-two-child, none split further) is screened against cluster state via two new
+non-mutating `SplitShardsMetadata` reads: `getSplitParentShardIds()` to enumerate parents and
+`canMergeChildrenBackToParent(int)`, which runs exactly the same split-level precondition
+`Builder.mergeChildrenBackToParent` enforces but returns a boolean instead of throwing -- so the coordinator
+screens candidates without provoking the primitive's `IllegalArgumentException`. Hysteresis and the per-tick
+budget reuse the shared `SustainedCandidateTracker`, keyed by the *parent* shard id (the stable identity
+across a merge decision, since the children are what get retired). On trigger the coordinator submits
+`InPlaceMergeShardAction` via the client, exactly as split submits `InPlaceSplitShardAction` -- the internal
+coordinator uses the transport action directly; the REST action is the separate operator surface.
+
+### Anti-flap design (the reasoning, not skipped)
+
+The danger unique to the merge side: split's own auto-trigger just split a hot/large shard, and if merge saw
+the resulting pair momentarily dip below the merge threshold before write patterns stabilized, the two could
+flap split/merge/split. Two mechanisms guard against it:
+
+- **A deliberately large threshold margin.** Merge combined thresholds default *well below* the split
+  thresholds, with real margin, not equal to them: combined 2,000 writes/min vs the 10,000/min per-shard
+  split trigger (one fifth), and combined 4 GiB vs the 10 GiB per-shard split-for-size trigger. Right after a
+  split each child still carries roughly half the parent's former load, so the pair's combined signal is an
+  order of magnitude above the merge ceiling -- it simply isn't a merge candidate until its real, sustained
+  load has fallen far below what split it.
+- **A higher sustained-tick requirement than split.** `required_consecutive_ticks` defaults to 10 for merge
+  vs 5 for split. Merge is the "give back" side; being too eager risks the flap, so it warrants a longer
+  sustained-signal requirement. `max_merges_per_tick` defaults to 1 (vs split's 2) since reviving a fresh
+  parent primary that must recover is heavier than a split.
+
+### Known limitation: no split-commit cool-down
+
+An even stronger anti-flap guard would be a minimum "cool-down since the split committed" during which a pair
+is ineligible to be a merge candidate at all. It was deliberately *not* built, because no split-commit
+timestamp is recorded anywhere in cluster state today: `SplitShardsMetadata` carries no commit time, and
+neither does `MetadataInPlaceSplitShardCommitService`. Adding one would mean introducing new persisted
+cluster-state and threading it through the split commit path -- out of scope for this increment, and the kind
+of new-state addition the task guidance says to flag rather than force. The threshold margin plus the higher
+sustained-tick default are the honest stand-in. **Operators should know**: before enabling
+`serverless_storage.resharding.auto_merge.enabled`, that the only protection against split/merge flapping is
+signal-magnitude margin and sustained-duration hysteresis, not elapsed time since the split. A recorded
+split-commit timestamp + a `min_cool_down` eligibility gate is the clean follow-up.
+
+### Settings (mirror the split auto-trigger four, plus the two combined thresholds)
+
+- `serverless_storage.resharding.auto_merge.eval_interval` (off by default, `-1`)
+- `serverless_storage.resharding.auto_merge.enabled` (independent gate, off by default)
+- `serverless_storage.resharding.auto_merge.required_consecutive_ticks` (default 10)
+- `serverless_storage.resharding.auto_merge.max_merges_per_tick` (default 1)
+- `serverless_storage.resharding.merge_candidate_combined_writes_per_minute_threshold` (default 2,000)
+- `serverless_storage.resharding.merge_candidate_combined_size_threshold_bytes` (default 4 GiB)
+
+### Tests + verification discipline
+
+`InPlaceMergeTriggerCoordinatorTests` (13 tests) mirrors `InPlaceSplitTriggerCoordinatorTests`'s
+fixture-building: candidate found and merged; correct index/parent-shard targeted; combined write-rate above
+threshold excluded; combined size above threshold excluded; in-progress split excluded; child-split-further
+excluded; child-not-reporting excluded; child-size-`UNKNOWN` excluded; sustained-tick hysteresis (not merged
+until the streak is reached); a gap in quietness resets the streak; per-tick budget limits merges; budget
+prioritizes the quietest pair first; non-positive budget means unlimited; no candidates when nothing is
+split. `InPlaceMergeTriggerSchedulerTaskTests` (4 tests) mirrors the split scheduler-task tests
+(cluster-manager-only, failure tolerance, reaching a real coordinator). Verification: broke the
+`canMergeChildrenBackToParent` eligibility screen and confirmed exactly the in-progress-split and
+child-split-further tests fail with the expected wrong behavior, then restored to green; ran the full
+`:plugins:serverless-storage:test` sweep plus the core `MetadataInPlaceMergeShardServiceTests`/
+`SplitShardsMetadata` tests.
 
 ## Task 20 (new, found while attempting item 0.7) — `IndexMetadata.numberOfShards` invariant breaks for split children, FIXED
 
