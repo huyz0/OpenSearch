@@ -1908,3 +1908,40 @@ child (never the dead parent, and both children exercised). `IndexShardTests` co
 guard, and `InPlaceMergeRealRerouteTests` drives phase 1 -> real allocation -> commit end to
 end. Verified real by breaking the cancel-trigger condition (`if (false && ...)`): the rollback
 test goes red with `expected SHOULD_CANCEL but was STILL_IN_PROGRESS`; restored, green again.
+
+## Scale-to-zero — search-vs-reactivation race in `ShardReactivationActionFilter` (bug fix)
+
+A deep review of the suspend/reactivate path found a real MEDIUM bug in
+`ShardReactivationActionFilter`. The filter holds a search request open until its target reader
+copy is back, but it only decided to hold when it observed the *suspended marker* still set at
+`apply()` time. The marker and the actual shard state diverge during reactivation:
+`TransportReactivateShardsAction` clears the marker in its cluster-state update, but the reader
+copy itself only reaches `STARTED` later (potentially seconds under real object-store latency, as
+it recovers). A search landing in that window — marker already cleared, reader copy still
+`INITIALIZING` — was never added to the pending-wait list, so it proceeded straight through
+`chain.proceed` and failed with `NoShardAvailableActionException` under the default
+`cluster.routing.search_replica.strict=true`. That is exactly the client-visible failure
+scale-to-zero is supposed to never surface.
+
+**Fix.** Gate the search wait on real routing-table state, not just the metadata marker. Every
+search now also checks whether the reader copy that would serve it is actually `STARTED`
+(`readerCopyNotYetStarted`), and waits via the same `ClusterStateObserver` mechanism whenever it
+is not — whether the marker is still set or already cleared. The existing `allFullyReactivated`
+wait predicate already checked `searchOnlyReplicas() ... STARTED` correctly; the bug was only that
+the *decision to wait at all* was made off the marker. The new routing check is kept cheap for the
+common (nothing-reactivating) case: indices with no search-only replicas configured short-circuit
+before touching the routing table, and the per-shard scan stops at the first `STARTED` copy. The
+writer-suspend trigger and the `TransportReplicationAction`/`TransportSingleShardAction`
+never-wait split are unchanged — those paths have core's own retry loop.
+
+**Tests + verification discipline.** New `ShardReactivationActionFilterTests` builds the race
+deterministically: an index with the reader marker cleared but the search-only replica still
+`INITIALIZING`, and asserts the search is held (not proceeded), then that moving the replica to
+`STARTED` releases it. A control test asserts a fully-started reader index proceeds synchronously
+(no wait on the hot path). Verified real by reverting the fix to marker-only checking
+(`readerWait = readerSuspended`): the race test goes red with "the search must be held, not
+proceeded" while the control stays green; restored, both green. The existing IT
+(`ServerlessStorageReaderShardSuspensionIT`) only issues one search and cannot exercise this race
+(it needs a search arriving mid-recovery), so the coverage lives at the unit level where the
+window is constructible without real timing; a two-overlapping-searches IT was judged not worth
+the timing flakiness for what the unit test already proves deterministically.

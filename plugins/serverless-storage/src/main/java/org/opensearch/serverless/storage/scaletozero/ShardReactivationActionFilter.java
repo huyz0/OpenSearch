@@ -73,7 +73,12 @@ import java.util.List;
  * SearchAction#NAME} specifically, this filter therefore holds the request itself via its own {@link
  * ClusterStateObserver}, waiting (bounded by {@link
  * org.opensearch.serverless.storage.ServerlessStoragePlugin#SERVERLESS_STORAGE_SCALE_TO_ZERO_SEARCH_REACTIVATION_WAIT_SETTING})
- * for every suspended shard of every targeted index to clear before calling {@code chain.proceed} --
+ * until the reader copy that would serve the search is actually {@code STARTED} before calling {@code
+ * chain.proceed}. The wait is gated on real routing-table state, not just the suspended metadata
+ * marker: the marker clears the instant the reactivation cluster-state update commits, but the reader
+ * copy reaches {@code STARTED} only later, so a search arriving in that window (marker already clear,
+ * copy still {@code INITIALIZING}) must still wait or it would fail with {@code
+ * NoShardAvailableActionException} --
  * on timeout it proceeds anyway (fail open, matching how a persistent, unrecoverable problem
  * eventually surfaces as an ordinary error rather than hanging a request forever, the same
  * philosophy core's own bounded retries already use).
@@ -156,8 +161,21 @@ public final class ShardReactivationActionFilter implements ActionFilter {
             if (readerSuspended) {
                 triggerReactivation(currentClient, realIndexName, true);
             }
-            if (isSearch && (writerSuspended || readerSuspended)) {
-                pending.add(new PendingReactivation(realIndexName, writerSuspended, readerSuspended));
+            if (isSearch) {
+                // Deciding whether to wait off the suspended marker alone leaves a real race:
+                // TransportReactivateShardsAction clears the marker in the cluster-state update, but
+                // the reader copy itself still takes time (potentially seconds under object-store
+                // latency) to actually reach STARTED. A search landing in that window -- marker
+                // already clear, reader copy still INITIALIZING -- would otherwise skip the wait,
+                // proceed immediately, and fail with NoShardAvailableActionException under the
+                // default cluster.routing.search_replica.strict=true, exactly the client-visible
+                // failure scale-to-zero must never surface. So gate the wait on ACTUAL routing-table
+                // state, not just the metadata marker: wait whenever the reader copy that would serve
+                // this search is not yet STARTED, whether the marker is still set or already cleared.
+                boolean readerWait = readerSuspended || readerCopyNotYetStarted(state, indexMetadata);
+                if (writerSuspended || readerWait) {
+                    pending.add(new PendingReactivation(realIndexName, writerSuspended, readerWait));
+                }
             }
         }
 
@@ -182,6 +200,37 @@ public final class ShardReactivationActionFilter implements ActionFilter {
      * shards failed."
      */
     private record PendingReactivation(String indexName, boolean writer, boolean reader) {
+    }
+
+    /**
+     * True iff this index has search-only replicas configured but, right now, at least one of its
+     * shards has no {@code STARTED} search-only copy -- i.e. a reader copy is mid-reactivation
+     * (INITIALIZING/relocating) and cannot yet serve a strict search. This is the routing-table
+     * counterpart to the suspended marker: the marker clears the instant {@link
+     * org.opensearch.serverless.storage.scaletozero.action.TransportReactivateShardsAction} commits
+     * its cluster-state update, but the copy itself only reaches {@code STARTED} later, so a search
+     * arriving in that gap must still wait.
+     *
+     * <p>Kept cheap for the overwhelmingly common case (nothing reactivating): indices with no
+     * search-only replicas configured short-circuit before touching the routing table, and for
+     * reader-enabled indices the per-shard scan stops at the first {@code STARTED} copy.
+     */
+    private static boolean readerCopyNotYetStarted(ClusterState state, IndexMetadata indexMetadata) {
+        if (indexMetadata.getNumberOfSearchOnlyReplicas() == 0) {
+            return false;
+        }
+        String indexName = indexMetadata.getIndex().getName();
+        if (state.routingTable().hasIndex(indexName) == false) {
+            return false;
+        }
+        for (org.opensearch.cluster.routing.IndexShardRoutingTable shardRoutingTable : state.routingTable().index(indexName)) {
+            List<org.opensearch.cluster.routing.ShardRouting> searchReplicas = shardRoutingTable.searchOnlyReplicas();
+            if (searchReplicas.isEmpty() == false
+                && searchReplicas.stream().noneMatch(r -> r.state() == org.opensearch.cluster.routing.ShardRoutingState.STARTED)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static void triggerReactivation(Client client, String indexName, boolean reader) {
