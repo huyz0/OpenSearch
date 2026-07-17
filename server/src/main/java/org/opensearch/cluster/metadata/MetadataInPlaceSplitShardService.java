@@ -146,6 +146,17 @@ public class MetadataInPlaceSplitShardService {
             throw new IllegalArgumentException("Shard [" + shardId + "] has already been split.");
         }
 
+        // A shard that is currently a live child of an in-progress merge is pending destruction --
+        // the merge's own commit step (SplitShardsMetadata.Builder#mergeChildrenBackToParent) requires
+        // every direct child to still be an active, unsplit leaf, and will fail forever (with no
+        // automatic cancellation, since the merge's revived parent may allocate successfully) if this
+        // shard splits out from under it. Reject up front rather than wedge the merge permanently.
+        if (splitShardsMetadata.isChildOfInProgressMerge(shardId)) {
+            throw new IllegalArgumentException(
+                "Cannot split shard [" + shardId + "] because it is a child of an in-progress merge"
+            );
+        }
+
         ShardRouting primaryShard = currentState.routingTable()
             .shardRoutingTable(curIndexMetadata.getIndex().getName(), shardId)
             .primaryShard();

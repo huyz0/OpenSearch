@@ -200,6 +200,30 @@ public class MetadataInPlaceSplitShardServiceTests extends OpenSearchTestCase {
         assertTrue(e.getMessage().contains("already been split"));
     }
 
+    public void testApplySplitShardRequestThrowsIfChildOfInProgressMerge() {
+        ClusterState state = createClusterState("test-index", 3, 1);
+
+        IndexMetadata indexMetadata = state.metadata().index("test-index");
+        SplitShardsMetadata.Builder splitBuilder = new SplitShardsMetadata.Builder(indexMetadata.getSplitShardsMetadata());
+        var childShards = splitBuilder.splitShard(0, 2);
+        Set<Integer> childIds = new HashSet<>();
+        childShards.forEach(s -> childIds.add(s.shardId()));
+        splitBuilder.updateSplitMetadataForChildShards(0, childIds);
+        splitBuilder.startMergeChildrenToParent(0);
+
+        IndexMetadata.Builder imBuilder = IndexMetadata.builder(indexMetadata);
+        imBuilder.splitShardsMetadata(splitBuilder.build());
+        Metadata.Builder metaBuilder = Metadata.builder(state.metadata()).put(imBuilder);
+        ClusterState stateWithPendingMerge = ClusterState.builder(state).metadata(metaBuilder).build();
+
+        int childShardId = childIds.iterator().next();
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> applyRequest(stateWithPendingMerge, newRequest("test-index", childShardId, 2))
+        );
+        assertTrue(e.getMessage().contains("child of an in-progress merge"));
+    }
+
     public void testApplySplitShardRequestThrowsForNonExistentIndex() {
         ClusterState state = createClusterState("test-index", 3, 1);
 
