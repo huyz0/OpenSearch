@@ -25,6 +25,7 @@ import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.time.Instant;
 import java.util.Set;
 
 public class MetadataInPlaceSplitShardCommitServiceTests extends OpenSearchTestCase {
@@ -52,6 +53,27 @@ public class MetadataInPlaceSplitShardCommitServiceTests extends OpenSearchTestC
         for (int childId : childIds) {
             assertTrue(splitMetadata.getRootShards().contains(childId) || splitMetadata.getChildShardIdsOfParent(0).contains(childId));
         }
+    }
+
+    public void testApplyCommitRecordsSplitCommitTimestamp() {
+        ClusterState state = createStateWithInProgressSplit(3, 1, 2);
+        Set<Integer> childIds = state.metadata().index("test-index").getSplitShardsMetadata().getChildShardIdsOfParent(0);
+
+        // Before commit: no timestamp recorded for the in-progress split.
+        assertEquals(
+            SplitShardsMetadata.NO_SPLIT_COMMIT_TIMESTAMP,
+            state.metadata().index("test-index").getSplitShardsMetadata().getSplitCommitTimestamp(0)
+        );
+
+        ClusterState stateWithStartedChildren = startChildShards(state, childIds);
+
+        long before = Instant.now().toEpochMilli();
+        ClusterState afterCommit = MetadataInPlaceSplitShardCommitService.applyCommit(stateWithStartedChildren, "test-index", 0);
+        long after = Instant.now().toEpochMilli();
+
+        long recorded = afterCommit.metadata().index("test-index").getSplitShardsMetadata().getSplitCommitTimestamp(0);
+        assertNotEquals(SplitShardsMetadata.NO_SPLIT_COMMIT_TIMESTAMP, recorded);
+        assertTrue("commit timestamp " + recorded + " should be within [" + before + ", " + after + "]", recorded >= before && recorded <= after);
     }
 
     public void testApplyCommitRetiresParentShardRoutingAtomically() {

@@ -8,6 +8,7 @@
 
 package org.opensearch.cluster.metadata;
 
+import org.opensearch.Version;
 import org.opensearch.cluster.AbstractDiffable;
 import org.opensearch.cluster.Diff;
 import org.opensearch.common.annotation.ExperimentalApi;
@@ -40,12 +41,22 @@ import java.util.TreeSet;
 public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> implements ToXContentFragment {
     private static final int MINIMUM_RANGE_LENGTH_THRESHOLD = 1000;
 
+    /**
+     * Sentinel returned by {@link #getSplitCommitTimestamp(int)} when no split-commit timestamp is recorded
+     * for a shard id -- because it isn't a committed split parent at all, or because the split committed on a
+     * node/cluster-state old enough to predate the {@code splitCommitTimestamps} field (see wire-format gating
+     * on {@link Version#V_3_8_0}). A caller gating on elapsed-time-since-commit must treat this as "no floor"
+     * (fail open), never as "committed at epoch 0".
+     */
+    public static final long NO_SPLIT_COMMIT_TIMESTAMP = -1L;
+
     private static final String KEY_ROOT_SHARDS_TO_ALL_CHILDREN = "root_shards_to_all_children";
     private static final String KEY_NUMBER_OF_ROOT_SHARDS = "num_of_root_shards";
     private static final String KEY_PARENT_TO_CHILD_SHARDS = "parent_to_child_shards";
     private static final String KEY_MAX_SHARD_ID = "max_shard_id";
     private static final String KEY_IN_PROGRESS_SPLIT_SHARD_IDS = "in_progress_split_shard_id";
     private static final String KEY_ACTIVE_SHARD_IDS = "active_shard_ids";
+    private static final String KEY_SPLIT_COMMIT_TIMESTAMPS = "split_commit_timestamps";
 
     // Following fields are upadated only after split completion and are used to service active shards request.
     // Root shard id to flat list of all child shards under root.
@@ -59,6 +70,13 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
     private final Map<Integer, ShardRange[]> parentToChildShards;
     private final Set<Integer> inProgressSplitShardIds;
 
+    // Parent shard id -> epoch millis at which that shard's split committed (all children reached STARTED and
+    // were promoted to active). Recorded by MetadataInPlaceSplitShardCommitService at commit time so a merge
+    // trigger can enforce a minimum cool-down since the split before considering the pair for re-merge.
+    // Keyed by parent shard id, consistent with parentToChildShards, and dropped when the parent is merged
+    // back (Builder#mergeChildrenBackToParent).
+    private final Map<Integer, Long> splitCommitTimestamps;
+
     SplitShardsMetadata(
         ShardRange[][] rootShardsToAllChildren,
         Map<Integer, ShardRange[]> parentToChildShards,
@@ -66,12 +84,24 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         Set<Integer> activeShardIds,
         int maxShardId
     ) {
+        this(rootShardsToAllChildren, parentToChildShards, inProgressSplitShardIds, activeShardIds, maxShardId, Collections.emptyMap());
+    }
+
+    SplitShardsMetadata(
+        ShardRange[][] rootShardsToAllChildren,
+        Map<Integer, ShardRange[]> parentToChildShards,
+        Set<Integer> inProgressSplitShardIds,
+        Set<Integer> activeShardIds,
+        int maxShardId,
+        Map<Integer, Long> splitCommitTimestamps
+    ) {
 
         this.rootShardsToAllChildren = rootShardsToAllChildren;
         this.parentToChildShards = Collections.unmodifiableMap(parentToChildShards);
         this.maxShardId = maxShardId;
         this.inProgressSplitShardIds = Collections.unmodifiableSet(inProgressSplitShardIds);
         this.activeShardIds = activeShardIds;
+        this.splitCommitTimestamps = Collections.unmodifiableMap(splitCommitTimestamps);
     }
 
     public SplitShardsMetadata(StreamInput in) throws IOException {
@@ -86,6 +116,15 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         this.parentToChildShards = Collections.unmodifiableMap(
             in.readMap(StreamInput::readInt, i -> i.readArray(ShardRange::new, ShardRange[]::new))
         );
+        // splitCommitTimestamps is a V_3_8_0+ addition. Reading from an older node's stream (which never
+        // wrote this map) must leave it empty rather than attempting a read that would corrupt the stream.
+        // The whole SplitShardsMetadata blob is itself only ever serialized between V_3_6_0+ nodes (gated in
+        // IndexMetadata), so this inner gate is what keeps a mixed V_3_6_0/V_3_7_x <-> V_3_8_0 cluster safe.
+        if (in.getVersion().onOrAfter(Version.V_3_8_0)) {
+            this.splitCommitTimestamps = Collections.unmodifiableMap(in.readMap(StreamInput::readInt, StreamInput::readLong));
+        } else {
+            this.splitCommitTimestamps = Collections.emptyMap();
+        }
     }
 
     public void writeTo(StreamOutput out) throws IOException {
@@ -97,6 +136,10 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         out.writeCollection(this.inProgressSplitShardIds, StreamOutput::writeInt);
         out.writeCollection(this.activeShardIds, StreamOutput::writeInt);
         out.writeMap(this.parentToChildShards, StreamOutput::writeInt, StreamOutput::writeArray);
+        // See the constructor's note: only write the new field to V_3_8_0+ peers.
+        if (out.getVersion().onOrAfter(Version.V_3_8_0)) {
+            out.writeMap(this.splitCommitTimestamps, StreamOutput::writeInt, StreamOutput::writeLong);
+        }
     }
 
     public int getShardIdOfHash(int rootShardId, int hash, boolean includeInProgressChildren) {
@@ -157,6 +200,8 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
             + parentToChildMap
             + ", inProgressSplitShardIds="
             + inProgressSplitShardIds
+            + ", splitCommitTimestamps="
+            + splitCommitTimestamps
             + '}';
     }
 
@@ -333,6 +378,7 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         private int maxShardId;
         private final Set<Integer> inProgressSplitShardIds;
         private final Set<Integer> activeShardIds;
+        private final Map<Integer, Long> splitCommitTimestamps;
 
         public Builder(int numberOfShards) {
             maxShardId = numberOfShards - 1;
@@ -340,6 +386,7 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
             parentToChildShards = new HashMap<>();
             inProgressSplitShardIds = new HashSet<>();
             activeShardIds = new HashSet<>();
+            splitCommitTimestamps = new HashMap<>();
             for (int i = 0; i < numberOfShards; i++) {
                 activeShardIds.add(i);
             }
@@ -347,6 +394,7 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
 
         public Builder(SplitShardsMetadata splitShardsMetadata) {
             this.maxShardId = splitShardsMetadata.maxShardId;
+            this.splitCommitTimestamps = new HashMap<>(splitShardsMetadata.splitCommitTimestamps);
 
             this.rootShardsToAllChildren = new ShardRange[splitShardsMetadata.rootShardsToAllChildren.length][];
             Set<Integer> activeShardIds = new HashSet<>();
@@ -482,6 +530,17 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         }
 
         public void updateSplitMetadataForChildShards(int sourceShardId, Set<Integer> newChildShardIds) {
+            updateSplitMetadataForChildShards(sourceShardId, newChildShardIds, NO_SPLIT_COMMIT_TIMESTAMP);
+        }
+
+        /**
+         * Commits a split and records the epoch-millis instant at which it committed, keyed by the parent
+         * shard id. The production commit path ({@code MetadataInPlaceSplitShardCommitService}) passes a real
+         * timestamp here; the no-timestamp overload above (used by tests and any caller that doesn't care)
+         * records {@link #NO_SPLIT_COMMIT_TIMESTAMP}, i.e. no cool-down floor. Passing
+         * {@link #NO_SPLIT_COMMIT_TIMESTAMP} explicitly clears any prior recorded timestamp for the parent.
+         */
+        public void updateSplitMetadataForChildShards(int sourceShardId, Set<Integer> newChildShardIds, long commitTimestamp) {
             Tuple<Integer, ShardRange> shardRangeTuple = findRootAndShard(sourceShardId, rootShardsToAllChildren);
 
             assert inProgressSplitShardIds.contains(sourceShardId);
@@ -510,6 +569,11 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
             maxShardId = currentMaxShardId;
             rootShardsToAllChildren[shardRangeTuple.v1()] = newShardsUnderRoot;
             inProgressSplitShardIds.remove(sourceShardId);
+            if (commitTimestamp == NO_SPLIT_COMMIT_TIMESTAMP) {
+                splitCommitTimestamps.remove(sourceShardId);
+            } else {
+                splitCommitTimestamps.put(sourceShardId, commitTimestamp);
+            }
         }
 
         private Set<Integer> getInProgressChildShardIds() {
@@ -528,6 +592,9 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
             assert inProgressSplitShardIds.contains(sourceShardId);
             inProgressSplitShardIds.remove(sourceShardId);
             parentToChildShards.remove(sourceShardId);
+            // An in-progress split never recorded a commit timestamp, but clear defensively so a re-used
+            // parent id can't inherit a stale one.
+            splitCommitTimestamps.remove(sourceShardId);
         }
 
         /**
@@ -581,6 +648,9 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
             activeShardIds.add(parentShardId);
             rootShardsToAllChildren[parentShardId] = null;
             parentToChildShards.remove(parentShardId);
+            // The split that produced these children is being undone; its commit timestamp is no longer
+            // meaningful (and the parent id is active-and-unsplit again).
+            splitCommitTimestamps.remove(parentShardId);
         }
 
         public SplitShardsMetadata build() {
@@ -589,7 +659,8 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
                 this.parentToChildShards,
                 this.inProgressSplitShardIds,
                 this.activeShardIds,
-                this.maxShardId
+                this.maxShardId,
+                this.splitCommitTimestamps
             );
         }
     }
@@ -617,6 +688,17 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
 
     public Set<Integer> getInProgressSplitShardIds() {
         return inProgressSplitShardIds;
+    }
+
+    /**
+     * Epoch-millis timestamp at which {@code parentShardId}'s split committed (its children were promoted to
+     * active), or {@link #NO_SPLIT_COMMIT_TIMESTAMP} if none is recorded -- either because the shard isn't a
+     * committed split parent, or because the split committed on a cluster old enough to predate this field
+     * (see {@link Version#V_3_8_0} wire gating). A merge-trigger cool-down gate must treat the sentinel as
+     * "no floor" (fail open), not as a commit at epoch 0.
+     */
+    public long getSplitCommitTimestamp(int parentShardId) {
+        return splitCommitTimestamps.getOrDefault(parentShardId, NO_SPLIT_COMMIT_TIMESTAMP);
     }
 
     public boolean isSplitOfShardInProgress(int shardId) {
@@ -693,6 +775,7 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         if (!inProgressSplitShardIds.equals(that.inProgressSplitShardIds)) return false;
         if (!Arrays.deepEquals(rootShardsToAllChildren, that.rootShardsToAllChildren)) return false;
         if (!activeShardIds.equals(that.activeShardIds)) return false;
+        if (!splitCommitTimestamps.equals(that.splitCommitTimestamps)) return false;
         if (parentToChildShards.size() != that.parentToChildShards.size()) return false;
         for (Integer key : parentToChildShards.keySet()) {
             if (!Arrays.deepEquals(parentToChildShards.get(key), that.parentToChildShards.get(key))) {
@@ -711,6 +794,7 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         result = 31 * result + maxShardId;
         result = 31 * result + inProgressSplitShardIds.hashCode();
         result = 31 * result + activeShardIds.hashCode();
+        result = 31 * result + splitCommitTimestamps.hashCode();
         return result;
     }
 
@@ -745,6 +829,14 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         }
         builder.endObject();
 
+        if (!splitCommitTimestamps.isEmpty()) {
+            builder.startObject(KEY_SPLIT_COMMIT_TIMESTAMPS);
+            for (Map.Entry<Integer, Long> entry : splitCommitTimestamps.entrySet()) {
+                builder.field(String.valueOf(entry.getKey()), entry.getValue());
+            }
+            builder.endObject();
+        }
+
         return builder;
     }
 
@@ -756,6 +848,7 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         Set<Integer> activeShardIds = new HashSet<>();
         ShardRange[][] rootShardsToAllChildren = null;
         Map<Integer, ShardRange[]> tempShardIdToChildShards = new HashMap<>();
+        Map<Integer, Long> splitCommitTimestamps = new HashMap<>();
         int numberOfRootShards = -1;
         while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
             if (token == XContentParser.Token.FIELD_NAME) {
@@ -775,6 +868,8 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
                     }
                 } else if (KEY_PARENT_TO_CHILD_SHARDS.equals(currentFieldName)) {
                     tempShardIdToChildShards = parseShardsMap(parser);
+                } else if (KEY_SPLIT_COMMIT_TIMESTAMPS.equals(currentFieldName)) {
+                    splitCommitTimestamps = parseSplitCommitTimestamps(parser);
                 }
             } else if (token == XContentParser.Token.START_ARRAY) {
                 if (KEY_IN_PROGRESS_SPLIT_SHARD_IDS.equals(currentFieldName)) {
@@ -794,8 +889,24 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
             tempShardIdToChildShards,
             inProgressSplitShardIds,
             activeShardIds,
-            maxShardId
+            maxShardId,
+            splitCommitTimestamps
         );
+    }
+
+    private static Map<Integer, Long> parseSplitCommitTimestamps(XContentParser parser) throws IOException {
+        XContentParser.Token token;
+        String currentFieldName = null;
+        Map<Integer, Long> timestamps = new HashMap<>();
+        while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
+            if (token == XContentParser.Token.FIELD_NAME) {
+                currentFieldName = parser.currentName();
+            } else if (token == XContentParser.Token.VALUE_NUMBER) {
+                assert currentFieldName != null;
+                timestamps.put(Integer.parseInt(currentFieldName), parser.longValue());
+            }
+        }
+        return timestamps;
     }
 
     private static Map<Integer, ShardRange[]> parseShardsMap(XContentParser parser) throws IOException {

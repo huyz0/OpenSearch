@@ -27,6 +27,7 @@ import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.Index;
 
+import java.time.Instant;
 import java.util.Set;
 
 /**
@@ -205,7 +206,11 @@ public class MetadataInPlaceSplitShardCommitService implements ClusterStateListe
 
         Set<Integer> childIds = curIndexMetadata.getSplitShardsMetadata().getChildShardIdsOfParent(parentShardId);
         SplitShardsMetadata.Builder splitMetadataBuilder = new SplitShardsMetadata.Builder(curIndexMetadata.getSplitShardsMetadata());
-        splitMetadataBuilder.updateSplitMetadataForChildShards(parentShardId, childIds);
+        // Record the wall-clock instant the split commits, so a merge trigger can enforce a minimum cool-down
+        // before folding the pair back. Instant.now().toEpochMilli() is the same absolute time source
+        // MetadataCreateIndexService uses for SETTING_CREATION_DATE -- an epoch-millis value that stays
+        // meaningful after cluster-state publication to other nodes (unlike a relative/monotonic clock).
+        splitMetadataBuilder.updateSplitMetadataForChildShards(parentShardId, childIds, Instant.now().toEpochMilli());
 
         IndexMetadata.Builder indexMetadataBuilder = IndexMetadata.builder(curIndexMetadata)
             .splitShardsMetadata(splitMetadataBuilder.build());

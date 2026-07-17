@@ -8,6 +8,7 @@
 
 package org.opensearch.cluster.metadata;
 
+import org.opensearch.Version;
 import org.opensearch.cluster.Diff;
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.xcontent.json.JsonXContent;
@@ -1393,6 +1394,90 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
             Diff<SplitShardsMetadata> deserializedDiff = SplitShardsMetadata.readDiffFrom(in);
             SplitShardsMetadata applied = deserializedDiff.apply(before);
             assertEquals(after, applied);
+        }
+    }
+
+    public void testSplitCommitTimestampAbsentBeforeCommit() {
+        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
+        builder.splitShard(0, 2);
+        SplitShardsMetadata inProgress = builder.build();
+        // A split reserved but not yet committed has no recorded commit timestamp.
+        assertEquals(SplitShardsMetadata.NO_SPLIT_COMMIT_TIMESTAMP, inProgress.getSplitCommitTimestamp(0));
+    }
+
+    public void testSplitCommitTimestampAbsentForNonSplitShard() {
+        SplitShardsMetadata metadata = new SplitShardsMetadata.Builder(3).build();
+        assertEquals(SplitShardsMetadata.NO_SPLIT_COMMIT_TIMESTAMP, metadata.getSplitCommitTimestamp(0));
+        assertEquals(SplitShardsMetadata.NO_SPLIT_COMMIT_TIMESTAMP, metadata.getSplitCommitTimestamp(999));
+    }
+
+    public void testSplitCommitTimestampRecordedOnCommit() {
+        long committedAt = 1_700_000_000_000L;
+        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
+        builder.splitShard(0, 2);
+        builder.updateSplitMetadataForChildShards(0, Set.of(3, 4), committedAt);
+        SplitShardsMetadata committed = builder.build();
+        assertEquals(committedAt, committed.getSplitCommitTimestamp(0));
+    }
+
+    public void testSplitCommitTimestampNoTimestampOverloadRecordsNone() {
+        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
+        builder.splitShard(0, 2);
+        builder.updateSplitMetadataForChildShards(0, Set.of(3, 4)); // no-timestamp overload
+        SplitShardsMetadata committed = builder.build();
+        assertEquals(SplitShardsMetadata.NO_SPLIT_COMMIT_TIMESTAMP, committed.getSplitCommitTimestamp(0));
+    }
+
+    public void testSplitCommitTimestampClearedOnMergeBack() {
+        long committedAt = 1_700_000_000_000L;
+        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
+        builder.splitShard(0, 2);
+        builder.updateSplitMetadataForChildShards(0, Set.of(3, 4), committedAt);
+        builder.mergeChildrenBackToParent(0);
+        SplitShardsMetadata merged = builder.build();
+        assertEquals(SplitShardsMetadata.NO_SPLIT_COMMIT_TIMESTAMP, merged.getSplitCommitTimestamp(0));
+    }
+
+    public void testStreamSerdeSplitCommitTimestampRoundTrip() throws IOException {
+        long committedAt = 1_700_000_000_000L;
+        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
+        builder.splitShard(0, 2);
+        builder.updateSplitMetadataForChildShards(0, Set.of(3, 4), committedAt);
+        SplitShardsMetadata original = builder.build();
+
+        SplitShardsMetadata deserialized = streamRoundTrip(original);
+        assertEquals(original, deserialized);
+        assertEquals(committedAt, deserialized.getSplitCommitTimestamp(0));
+    }
+
+    public void testXContentSerdeSplitCommitTimestampRoundTrip() throws IOException {
+        long committedAt = 1_700_000_000_000L;
+        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
+        builder.splitShard(0, 2);
+        builder.updateSplitMetadataForChildShards(0, Set.of(3, 4), committedAt);
+        SplitShardsMetadata original = builder.build();
+
+        SplitShardsMetadata deserialized = xContentRoundTrip(original);
+        assertEquals(original, deserialized);
+        assertEquals(committedAt, deserialized.getSplitCommitTimestamp(0));
+    }
+
+    public void testStreamSerdePreV380DropsSplitCommitTimestamp() throws IOException {
+        long committedAt = 1_700_000_000_000L;
+        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
+        builder.splitShard(0, 2);
+        builder.updateSplitMetadataForChildShards(0, Set.of(3, 4), committedAt);
+        SplitShardsMetadata original = builder.build();
+
+        // Serialize as if writing to a pre-V_3_8_0 peer: the timestamp field must not be written, and a
+        // matching-version read must come back with no recorded timestamp rather than a corrupt stream.
+        BytesStreamOutput out = new BytesStreamOutput();
+        out.setVersion(Version.V_3_7_0);
+        original.writeTo(out);
+        try (StreamInput in = out.bytes().streamInput()) {
+            in.setVersion(Version.V_3_7_0);
+            SplitShardsMetadata deserialized = new SplitShardsMetadata(in);
+            assertEquals(SplitShardsMetadata.NO_SPLIT_COMMIT_TIMESTAMP, deserialized.getSplitCommitTimestamp(0));
         }
     }
 
