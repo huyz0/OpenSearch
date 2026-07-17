@@ -3469,14 +3469,39 @@ silently corrupting object-store state; a pre-existing sibling IT
 (`ServerlessStorageShardPartitionRewriteActionIT`) needed the same fix once this check landed,
 confirming the gap was real and not hypothetical.
 
-**Real routing cutover remains undesigned, not just unimplemented -- deliberately left out of this
-increment.** Unlike the provisioning-precondition gap just closed, cutover has no existing
-mechanism in this plugin to extend: a split target is a wholly separate index identity, not a
-shard within the source's own index, so there is no `ShardRouting`/alias/redirect concept anywhere
-in this plugin's code today that "stop routing writes to the source, resolve client-facing
-requests to the right target partition" could be built on top of. Inventing that concept from
-scratch is real design work, not implementation time, and was deliberately scoped out rather than
-rushed in under this increment.
+**Update: a real routing cutover now exists (`CutoverSplitRoutingAction` and
+`EnableWritePartitionRoutingAction`, chained together with provisioning and per-partition split by
+`OrchestrateShardSplitAction`/`TransportOrchestrateShardSplitAction`), but it is additive-alias, not
+source fencing, and that distinction matters.** Cutover works by pointing a new alias name at the
+split targets (`CutoverSplitRoutingAction`) and, optionally, assigning each target a write partition
+under that alias (`EnableWritePartitionRoutingAction`) -- it never renames, blocks, or otherwise
+touches the source index itself. `TransportOrchestrateShardSplitAction` chains
+`ProvisionSplitTargetsAction` -> per-partition `ShardSplitAction` -> `CutoverSplitRoutingAction` ->
+(optionally) `EnableWritePartitionRoutingAction` into one resumable, still explicitly
+operator-triggered sequence (see `OrchestrateShardSplitAction`'s own javadoc).
+
+**The real, currently unaddressed limitation this leaves: the source index is never quiesced,
+fenced, or made read-only anywhere in this orchestration.** `ShardSplitAction`/`ShardSplitter` clone
+the source's object-store state as of a single point-in-time generation; nothing stops the source
+from continuing to accept writes under its own original name before, during, or after that clone --
+orchestration performs no read-only flip, no write block, and no dual-write bridge to the targets.
+Any document written to the source by its original name after the clone point is captured only by
+the source, not by any split target, so it never becomes visible through the new cutover alias --
+and if the source is later retired via `RetireShrinkSourceAction` (a separate, explicit,
+already-existing "verify then delete" action), that document is gone permanently, with no error or
+warning at any step along the way. This is not enforced or even detected by any of the actions
+involved: `TransportOrchestrateShardSplitAction` does not check whether the source is receiving
+writes, and no other mechanism in this plugin blocks or redirects writes to a source index mid-split.
+
+**Operators MUST treat this as a hard precondition, not a suggestion**: before triggering an
+orchestrated split (or the underlying manual `ShardSplitAction` sequence), ensure the source index
+is not receiving direct writes -- either via an application-level write freeze against the source's
+own name, or by first getting every writer to already be writing through an alias this action can
+safely redirect once cutover happens. Building real source write-fencing during orchestration, or a
+dual-write bridge that mirrors writes to both source and targets until cutover completes, would
+close this gap properly; both are significant, separate mechanisms and remain deliberately
+out of scope here, the same "real design work, not implementation time" reasoning this section
+already gave for the cutover primitive itself before it existed.
 
 **Phase 4.5 — Compaction service, fully done.** Candidate selection, rebase protocol, real Lucene
 merge, size-tiered shaping, background scheduling, a real concurrent-writer data-loss bug, real

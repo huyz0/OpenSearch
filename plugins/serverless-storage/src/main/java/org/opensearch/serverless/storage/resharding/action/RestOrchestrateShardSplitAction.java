@@ -28,6 +28,16 @@ import static org.opensearch.rest.RestRequest.Method.POST;
  * {@code source} itself if not given (the common case: reusing the source's own name as the
  * alias once {@link RetireShrinkSourceAction}'s "verify then delete" pattern later reclaims it,
  * mirroring how {@code RestCutoverSplitRoutingAction}'s own alias parameter is caller-chosen).
+ *
+ * <p><b>Before calling this: make sure the source index named in {@code {source}} is not
+ * receiving direct writes.</b> This action never quiesces or fences the source -- it clones the
+ * source's state as of a point-in-time generation, then adds an alias pointing at the split
+ * targets. Any document written to the source under its own name after that clone point is not
+ * reflected in the targets or visible through the new alias, and is lost for good once the source
+ * is later retired via {@link RetireShrinkSourceAction}. Freeze application-level writes to the
+ * source, or migrate writers onto an alias first, before triggering this action; nothing in this
+ * plugin enforces that for you. See {@link TransportOrchestrateShardSplitAction}'s own javadoc and
+ * rfc-serverless-opensearch.md &sect;16 Phase 4 for the full detail.
  */
 public class RestOrchestrateShardSplitAction extends BaseRestHandler {
 

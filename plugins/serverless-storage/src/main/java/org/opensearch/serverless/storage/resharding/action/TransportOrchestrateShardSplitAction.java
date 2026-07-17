@@ -27,6 +27,21 @@ import java.util.List;
  * avoids duplicating any of {@link ProvisionSplitTargetsAction}'s, {@link ShardSplitAction}'s,
  * {@link CutoverSplitRoutingAction}'s, or {@link EnableWritePartitionRoutingAction}'s own
  * validation and cluster-state-mutation logic.
+ *
+ * <p><b>WARNING -- the source index is never quiesced, fenced, or made read-only by any stage
+ * here.</b> {@link ShardSplitAction} clones the source's object-store state as of a single
+ * point-in-time generation; nothing in this class (or in {@link CutoverSplitRoutingAction} /
+ * {@link EnableWritePartitionRoutingAction} downstream) stops the source index from continuing to
+ * accept writes under its own original name before, during, or after that clone point. A document
+ * written to the source by its original name after the clone point is captured only by the
+ * source, never by any split target -- it will not appear through the new cutover alias, and if
+ * the source is later deleted via {@link RetireShrinkSourceAction}, that document is gone
+ * permanently, with no error raised anywhere in this pipeline. <b>Callers/operators must ensure
+ * the source index is not receiving direct writes</b> -- via an application-level write freeze
+ * against the source's own name, or by first migrating every writer onto an alias this action can
+ * safely redirect at cutover -- before invoking this action. This precondition is not checked or
+ * enforced by any code in this class; it is the caller's responsibility. See
+ * rfc-serverless-opensearch.md &sect;16 Phase 4 for the full design-level discussion of this gap.
  */
 public class TransportOrchestrateShardSplitAction extends HandledTransportAction<
     OrchestrateShardSplitRequest,
