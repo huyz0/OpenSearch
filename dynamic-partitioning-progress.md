@@ -2284,3 +2284,34 @@ legacy-path-only mechanism (see `WalChunkService`'s own javadoc). Feeding this b
 autoscaling (&sect;10, "the same signal feeds autoscaling") is also not wired up -- `backlogBytes()`
 exists as a public accessor a future autoscaling signal could read, but nothing reads it yet.
 
+## WAL batching Phase 3 — evaluated, decision: still keep the default off
+
+Revisited whether `serverless_storage.wal_flush.batching.enabled`'s default should flip to `true`,
+now that the byte-threshold trigger and 429 backpressure above close the two gaps Phase 2's own
+writeup flagged as blockers. **Decision: no, the default stays `false`.** The reasoning:
+
+- The one thing actually available in this environment to re-check is the existing synthetic
+  cost-accounting proof (`WalBatchingCostAccountingTests`) -- re-run clean as part of this session's
+  other changes, still showing the flat O(1) PUT-shaped-request
+  behavior (e.g. 201 ops across 4 shards costing 4 PUTs, not ~402) that motivated building batching in
+  the first place. That is a *correctness* proof (batching does what it says), not a *load* test --
+  it runs against a local `FsBlobStore`, at a handful of ops, with no real network latency, no S3/GCS
+  throttling behavior, and no concurrent-shard production ingest pattern.
+- The RFC's own gating condition for this flip was explicitly "real load testing," not "the known
+  gaps are closed" -- closing the byte-threshold and backpressure gaps removes two *reasons a load
+  test would have failed*, it does not substitute for actually running one. This environment has no
+  real cloud object store, no load generator, and no multi-node cluster to run one against, so that
+  precondition genuinely cannot be satisfied here.
+- Flipping a default that reshapes the durability-critical write path for every existing deployment of
+  this plugin, without the validation the design itself calls for, is exactly the kind of unforced
+  default change worth refusing even though the code changes to reach this point are done and tested.
+
+**What would need to happen before the next revisit:** an actual load test against a real S3/GCS-class
+object store at realistic sustained node ingest rates, measuring (a) p50/p99 indexing-ack latency
+added by the ~200ms interval under `index.translog.durability=REQUEST`, (b) whether the byte threshold
+and backlog-reject threshold's defaults (`ByteSizeValue.ZERO`, i.e. both off) need real non-zero
+defaults once batching itself defaults on, and (c) real object-store PUT cost/throttling behavior
+under sustained concurrent-shard load, not the local-filesystem proxy this session's tests use. None
+of that infrastructure exists in this session's environment, so Phase 3 remains explicitly deferred
+rather than attempted with a synthetic substitute.
+
