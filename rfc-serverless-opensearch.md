@@ -4763,6 +4763,22 @@ head untouched, and that naming a nonexistent index fails with a clear precondit
    when segment data is cold — building global ordinals on a cache-miss storm is a latency
    cliff. Mitigation candidates: ordinal structures included in boot sets, or eager ordinal
    builds pinned behind the admission controller (§7.2). Needs Phase 3 measurement.
+
+   **Status: measured for the first time, confirming the "latency cliff" premise with real
+   evidence -- and finding the existing boot-set prefetch mechanism already closes nearly all of
+   it, unplanned.** `GlobalOrdinalsColdBuildBenchmarkTests` builds a real 8-segment, high-cardinality
+   `SortedSetDocValues` field (the Lucene primitive `OrdinalMap`/`MultiDocValues#getSortedSetValues`
+   construction OpenSearch's own terms/cardinality aggregation framework builds directly on top of),
+   publishes it through the real manifest/bundle path, and measures cold cross-segment ordinal-map
+   construction -- including walking every doc's ordinals, matching a real aggregation's actual
+   access pattern, not just building the map and stopping -- under simulated `HIGH` latency, with
+   and without boot-set prefetch. Result: cold, no-prefetch construction costs ~13.1-13.3s (a real,
+   severe latency cliff, confirming this risk's premise directly); with boot-set prefetch, ~125-170ms
+   -- a ~95-100x reduction, consistent across repeated runs. Neither of the mitigation candidates
+   named above (ordinal structures in boot sets, eager pinned builds) needed to be built: the
+   existing `LazyBundleDirectory#prefetchBootSet` mechanism (built for a different milestone, §18
+   risk #2) already substantially mitigates this for the tested workload shape, since a per-segment
+   doc-values term dictionary at this scale mostly fits within each file's prefetched first block.
 10. **Reader-shard creation itself has never been exercised end to end, and depends on a core
     gate this plugin has not yet verified compatibility with.** Every piece of this plugin's
     reader-engine path (`ObjectStoreReaderEngine`, the lazy directory, admission control) is
