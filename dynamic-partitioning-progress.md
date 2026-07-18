@@ -2417,3 +2417,38 @@ javadoc/code without tracing where its stated limitation was actually closed els
 gap in the feature. Corrected here so this doesn't get re-flagged by a future scan reading the same
 surface-level signal.
 
+## Client write-routing cutover after split — also a stale-docs false alarm, `resharding/package-info.java` fixed
+
+The sweep's other large item was "client write-routing cutover after split needs core routing/wire-
+protocol changes beyond plugin scope," citing `resharding/package-info.java`'s own "explicitly out of
+scope" note. Re-checking against the actual code (not just that one doc comment) found the same kind
+of drift as the WAL fencing item above -- real work landed after the doc note was last touched:
+
+- `resharding/package-info.java`'s "out of scope" note was last edited `f016f7026e2` (2026-07-14
+  06:53). `CutoverSplitRoutingAction` (alias-based cutover) landed as `ec83cf80afe` (2026-07-14
+  19:58) -- **thirteen hours later, same day**. The doc note was simply never revisited after that
+  commit; not a case of anyone missing real work, just doc-lag on a fast-moving day.
+- The actual current state: `CutoverSplitRoutingAction` (points an alias at split targets),
+  `EnableWritePartitionRoutingAction` (assigns each target a write partition under that alias), and
+  `TransportOrchestrateShardSplitAction` (chains provisioning -> per-partition split -> cutover ->
+  optional write-routing into one resumable sequence) are all real, implemented, REST-exposed (I
+  wrote unit test coverage for every one of them as part of the REST-test-coverage item above), and
+  already documented accurately in rfc-serverless-opensearch.md's own resharding section (see this
+  doc's earlier "resharding-by-copy source write-fencing" entry, which was correctly *not* a false
+  alarm -- the RFC text was already current there, just the package-level javadoc lagged behind it).
+- **What genuinely is still out of scope, confirmed real**: auto-triggering a resharding-by-copy
+  split off a write-rate/size threshold alone. `ShardSplitCandidatesAction` surfaces the signal; no
+  scheduler acts on it automatically for this mechanism. This is a *different* thing from the
+  in-place-split mechanism's own auto-trigger (`InPlaceSplitTriggerSchedulerTask`/
+  `InPlaceSplitTriggerCoordinator`, wired in `ServerlessStoragePlugin#createComponents` behind
+  `serverless_storage.resharding.auto_split.*`), which is real and already automated -- this plugin
+  has two genuinely separate split mechanisms (in-place split, real Lucene-level split of one
+  index's own shards; resharding-by-copy, zero-copy split across independent target indices), and
+  only the latter lacks an auto-trigger. Confirmed by reading `ServerlessStoragePlugin#createComponents`
+  directly, not assumed.
+
+Fixed `resharding/package-info.java` to state the real current scope: routing cutover is implemented
+(with its own already-documented source-write-fencing caveat), auto-triggering resharding-by-copy off
+a threshold is what's actually still manual. No new mechanism built -- this was a documentation
+correction, not an implementation gap, exactly like the WAL fencing item above.
+
