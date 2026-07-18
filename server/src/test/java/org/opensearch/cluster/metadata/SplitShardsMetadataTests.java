@@ -536,6 +536,37 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
     }
 
     /**
+     * The nested case is a deliberate, documented scope boundary (dynamic-partitioning-progress.md's
+     * "Phase 2 item 2.1" entry): if one of the parent's direct children has itself been split
+     * further, {@code mergeChildrenBackToParent} must reject the merge with a clear error rather than
+     * silently reversing only the top level and leaving the grandchildren's ranges orphaned from any
+     * still-active parent range.
+     */
+    public void testMergeChildrenBackToParentRejectsWhenAChildHasBeenSplitFurther() {
+        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(1);
+        builder.splitShard(0, 2);
+        builder.updateSplitMetadataForChildShards(0, Set.of(1, 2));
+
+        // Split one of the two children further -- now shard 1 has its own children (3, 4), so
+        // reversing shard 0's split can no longer simply reactivate shards 1 and 2.
+        builder.splitShard(1, 2);
+        builder.updateSplitMetadataForChildShards(1, Set.of(3, 4));
+
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> builder.mergeChildrenBackToParent(0));
+        assertTrue(
+            "must name the child that was split further and explain nested merge isn't supported, got: " + e.getMessage(),
+            e.getMessage().contains("Child shard [1]") && e.getMessage().contains("nested in-place merge is not supported")
+        );
+
+        // Nothing must have been mutated by the rejected attempt: shard 0 is still split, and both
+        // levels of the split remain intact exactly as before the rejected call.
+        SplitShardsMetadata metadata = builder.build();
+        assertTrue("shard 0 must still be reported as split", metadata.isSplitOfShardInProgress(0) || metadata.isSplitParent(0));
+        assertNotNull("shard 0's children must be unaffected by the rejected merge attempt", metadata.getChildShardsOfParent(0));
+        assertNotNull("shard 1's own children must be unaffected by the rejected merge attempt", metadata.getChildShardsOfParent(1));
+    }
+
+    /**
      * Once merged back, the parent's own hash range must resolve to itself again -- the same
      * pre-split behavior getShardIdOfHash was already written to handle, requiring zero routing
      * code changes (see dynamic-partitioning-progress.md's "Phase 2 item 2.1" entry).
