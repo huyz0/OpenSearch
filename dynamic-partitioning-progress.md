@@ -2901,3 +2901,60 @@ Fixed, most severe first:
 
 A convergence-check pass on this round's own fixes found nothing further. Full
 `:plugins:serverless-storage:test` and `:internalClusterTest` green throughout.
+
+## Broadened review round 6: remaining packages, 4 fixes -- whole-project sweep complete (`1efbb2643db`)
+
+Final round covered every package not yet reviewed: `allocation`, `compaction`, `security`,
+`format`, `migration`, `scaletozero`, `scaleup`, `scheduling`, `shardstate`, `manifest`, `util`.
+Most of these came back clean or with only low-confidence/test-coverage notes -- several finder
+agents explicitly remarked the code already showed evidence of prior review rounds baked into its
+own javadoc (`security`/`format` in particular: solid crypto, checksum, and offset-arithmetic
+correctness throughout).
+
+Fixed, most severe first:
+
+1. **`TransportMigrateShardAction` snapshotted a live, currently-open shard's current committed
+   state with no fencing of concurrent indexing** -- documents indexed/committed after the
+   snapshot read were silently never captured in the adopted manifest, yet the response reported
+   unconditional success. This is a real data-loss risk distinct from `ClassicIndexMigrator`'s own
+   documented scope (which assumes an already-quiesced, already-recovered commit) -- this
+   transport action explicitly fills the "resolve a live IndexShard" gap that class's javadoc
+   named as deliberately not built. Fixed by requiring the index already be write-blocked
+   (`index.blocks.write=true`) before migration proceeds, turning a silent gap into a loud,
+   actionable precondition failure.
+2. `ServerlessStorageExistingShardsAllocator`'s `_cluster/allocation/explain` path skipped the
+   cache-affinity preference the real allocation path honors, so it could report a different
+   target node than what a real reroute would actually pick -- misleading for any operator or
+   automation using explain to predict placement. The explain path now honors the same preference
+   while still building the full per-node decision list explain output needs.
+3. `ShardSuspensionCoordinator#evict` silently no-op'd with zero logging when the index vanished
+   between a shard being marked suspended and eviction actually running, unlike every other
+   failure path in the class -- now logs, so an operator investigating a shard that never got
+   force-unassigned can tell "index gone" apart from every other silent no-op path.
+4. `BundleFileEntry`'s javadoc claimed offsets are relative to the end of the bundle header; both
+   `BundleWriter` and `BundleReader` actually use absolute offsets from the start of the blob --
+   confirmed by `SegmentBundle`'s own javadoc. A live landmine for the next contributor who trusted
+   the doc literally rather than the code. Corrected.
+
+Refuted: an index-wide migration retry/orphan-storage concern turned out to be already mostly
+covered by `ObjectStoreCommitPublisher`'s existing idempotent-publish-under-retry behavior for the
+common (same-primary-term) case; a compaction soft-delete-purge concern doesn't apply since PITR
+in this plugin is manifest-level, not doc-level; a `getIndexSafe`/`index()` inconsistency across
+allocation deciders is a low-confidence hardening note, not a reachable bug given core's
+cluster-state invariants.
+
+Also noted but not built (test-coverage recommendations, not correctness bugs): `ShardSuspensionCoordinator`
+and `SustainedCandidateTracker` have no dedicated unit tests, only indirect coverage through their
+callers -- flagged as worth a follow-up given both implement subtle hysteresis/streak logic that
+indirect tests only partially exercise.
+
+A convergence-check pass on this round's own fixes found nothing further. Full
+`:plugins:serverless-storage:test` and `:internalClusterTest` green throughout.
+
+**This closes the full whole-project review cycle**: every package in `plugins/serverless-storage`
+has now been through at least one broadened review round (resharding, gc, clone, retention, wal,
+translog, writerengine, allocation, compaction, security, format, migration, scaletozero,
+scaleup, scheduling, shardstate, manifest, util), across 6 rounds totaling 37 real fixes (8 in the
+original diff-scoped rounds, 6+2 self-caught regressions in resharding, 8 in gc/clone/retention,
+4 in wal/writerengine, 4 in the final sweep), with every fix verified by a subsequent
+convergence-check pass.
