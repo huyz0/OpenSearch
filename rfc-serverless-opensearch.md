@@ -477,6 +477,19 @@ further manifest, a second writer activates under a higher term against the same
 `WalChunkService`/manifest store -- and asserts replay returns exactly the unmanifested operations,
 no more and no less.
 
+**Property-based fuzzing now complements this one hand-written scenario, and the TLA+ proof above,
+with a third layer of coverage**: `WalReplayFencingPropertyFuzzTests` builds real, randomized WAL
+histories -- interleaved, non-monotonic primary terms across chunks (the exact "stale writer keeps
+appending after being superseded" shape `WalReplayFencing.tla`'s own counterexample models) -- and
+checks `WalReplayRecovery.replayOperations` against an independently-computed oracle across many
+random `(minPrimaryTerm, fromChunkSequence, activationWalPosition)` combinations per trial, asserting
+it returns *exactly* the records satisfying both the term floor and the position cutoff, never
+either alone. Confirmed real teeth via break-the-fix: made replay ignore the position cutoff
+entirely (silently reintroducing `NaiveReplay`, the shape TLC already proved violates
+`FixedReplayNeverIncludesAPostFencingWrite`), caught immediately with a reproducible seed, restored.
+This is now a standing regression guard against a future refactor accidentally relaxing either bound
+-- runtime evidence that the *shipped code*, not just the *design*, stays sound as it evolves.
+
 **Applying the replayed operations is now implemented too, via a new, small, generic core seam --
 weighed against an Engine-only approach (accept a documented mapping-update limitation) first, and
 rejected because it couldn't reuse core's own mapping-aware apply logic without either duplicating it

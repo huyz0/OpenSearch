@@ -2642,3 +2642,17 @@ manifest ID still has a real manifest record present, independent of bundle-leve
 break is now caught reliably across repeated runs at a much smaller, CI-reasonable 60x60 budget.
 Restored, full plugin suite and spotless clean.
 
+**Second fuzzer, completing the punch list's "GC bundle-reference-counting and WAL replay fencing"
+scope: `WalReplayFencingPropertyFuzzTests`** (`ba83cf9d441`). Random, non-monotonic-term WAL
+histories (the "stale writer keeps appending after being superseded" shape `WalReplayFencing.tla`'s
+own counterexample already models) checked against an independently-computed oracle across many
+random `(minPrimaryTerm, fromChunkSequence, activationWalPosition)` combinations per trial --
+asserting `WalReplayRecovery.replayOperations` returns exactly the records satisfying both the term
+floor and the position cutoff, the Java counterpart to the already-formally-verified `FixedReplay`
+design. Full detail (including the break-the-fix confirmation) recorded in
+rfc-serverless-opensearch.md's own WAL replay status note. Passed cleanly on its first real run
+against the actual implementation -- unlike the GC fuzzer, this one found no new bug in production
+code, only confirmed the existing implementation already matches the formal model exactly, which is
+itself a real, useful result (three independent techniques -- hand-written test, TLA+ proof, runtime
+fuzzing -- now all agree).
+
