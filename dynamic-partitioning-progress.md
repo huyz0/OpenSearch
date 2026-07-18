@@ -2765,3 +2765,44 @@ for the alias that source-existence already had.
 A third review round, focused specifically on this fix plus a fresh full read of the file,
 found nothing further. Full `:plugins:serverless-storage:test` and `:internalClusterTest` green.
 Converged: three straight rounds of the same process, only the first two found anything real.
+
+## Broadened review round 3: whole resharding package, 6 fixes + 2 self-caught regressions (`291f936e3ab`, `4c4bc57b3ea`)
+
+Widened review scope beyond the recent diff to the entire `resharding` package (80 files) across
+5 thematic finder angles (in-place split/merge mechanics, orchestration/scheduling, write-routing
+metadata/filter, provision/split/shrink transport actions, REST handlers), then verified every
+candidate adversarially before fixing anything.
+
+14 candidates surfaced; verification kept 6 real bugs and refuted the rest (partial-target silent
+degrade -- core rejects the resulting write loudly; orphaned manifest generation -- publish is
+idempotent so it can't happen; two scheduler double-trigger races -- core's cluster-state-update
+queue already serializes and rejects duplicates; provision-targets TOCTOU on create -- core handles
+concurrent same-name creates cleanly). Fixed, most severe first:
+
+1. `ShardShrinkRequest` allowed duplicate `(indexUuid, shardId)` sources -- `addIndexes` merges with
+   no document-level dedup, so a duplicated source's documents ended up duplicated in the target.
+2. `ShardShrinker` never pinned a source's manifest generation while reading it, unlike
+   `ShardCloner` (which fixed the identical pin-before-read TOCTOU race, formally verified in
+   `formal/CloneGc.tla`). `TransportShardShrinkAction` now pins each source before its manifest
+   read and releases every pin once the merge is done.
+3. `EnableWritePartitionRoutingRequest` allowed duplicate target names -- position-based partition
+   assignment meant a duplicate silently orphaned a partition slot.
+4. `TransportDisableWritePartitionRoutingAction` had no existence check and always acked success
+   even when every named target was missing or got deleted mid-request.
+5. `TransportProvisionSplitTargetsAction` never rolled back successfully-created targets on a
+   partial group failure, leaving a stuck state needing manual cleanup.
+6. `ShardSplitCandidatesRequest` treated any negative threshold other than the `-1` sentinel as a
+   real value instead of rejecting it.
+
+**A convergence-check pass immediately after found 2 real regressions in fixes #2 and #5 above**:
+the shrink pin-release used the by-pinId-string `removePin` overload, which deletes every pin
+sharing that id regardless of generation -- a concurrent/retried shrink call pinning a different
+generation of the same source under the identical id would have its still-needed pin wiped out by
+the first call's own cleanup. Fixed to match by full `PinRecord` (id+term+generation) instead. And
+the provision-targets rollback deleted every name in the *request*, not just the names *this call*
+actually created -- since the pre-existence check is TOCTOU, a different, legitimately racing
+provision call's already-successful target could get deleted by this call's own failure cleanup.
+Fixed by tracking per-target success explicitly and rolling back only what this call created.
+
+A second convergence-check pass on that fix-of-a-fix found nothing further. Full
+`:plugins:serverless-storage:test` and `:internalClusterTest` green throughout.
