@@ -2336,3 +2336,28 @@ break-the-fix -> restore) argues against for something this durability-sensitive
 warning is still present, current, and consistent in both places it should be -- that was the actual
 risk worth re-checking (documentation drifting out of sync with code), and it hasn't.
 
+## Scale-to-zero/scale-up lifecycle wiring — re-checked, false alarm
+
+A whole-project sweep for remaining serverless-storage work flagged "scale-to-zero policy not wired
+to actual suspend/reactivate lifecycle" as a possible large gap, worth confirming before trusting it.
+It doesn't hold up: all three legs are real, wired, cluster-state-mutating code, not evaluation-only.
+
+- **Suspend**: `ScaleToZeroCandidatesSchedulerTask` is constructed unconditionally whenever
+  `serverless_storage.scale_to_zero.eval_interval > 0`, and handed a real `ShardSuspensionCoordinator`
+  once `serverless_storage.scale_to_zero.suspend_enabled` (default `false`) is flipped -- at which
+  point `suspendCandidates`/`suspendReaderCandidates` mutate `IndexMetadata` via a real
+  `ClusterStateUpdateTask` and force-evict via `CancelAllocationCommand`.
+- **Reactivate**: `ShardReactivationActionFilter` is unconditionally active (no enable flag at all) as
+  a real `ActionFilter` on every search/write request -- this is the mechanism the earlier
+  "search-vs-reactivation race" bug fix (this doc, "Scale-to-zero — search-vs-reactivation race" entry)
+  already correctness-reviewed and tested.
+- **Scale-up**: `ScaleUpCandidatesSchedulerTask` is likewise constructed unconditionally past its own
+  `eval_interval` gate, handed a real `ReaderReplicaExpansionCoordinator` once `scale_up.enabled`
+  (default `false`) is flipped, at which point it issues real `UpdateSettingsRequest` calls bumping
+  `index.number_of_search_replicas`, under consecutive-tick hysteresis and a per-tick budget.
+
+The only "manual" part is that `suspend_enabled`/`scale_up.enabled` both default `false` -- a
+deliberate operator opt-in (matching every other risk-bearing feature flag in this plugin), not a
+missing implementation. Both settings' own javadoc, and the scheduler tasks' own package-info,
+already say as much explicitly. No code change made; this closes as a confirmed non-issue.
+
