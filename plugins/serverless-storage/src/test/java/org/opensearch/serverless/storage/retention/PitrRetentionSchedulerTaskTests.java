@@ -177,5 +177,10 @@ public class PitrRetentionSchedulerTaskTests extends OpenSearchTestCase {
         public void removePin(String indexUuid, int shardId, PinRecord pin) throws java.io.IOException {
             delegate.removePin(indexUuid, shardId, pin);
         }
+
+        @Override
+        public void replacePin(String indexUuid, int shardId, PinRecord newPin) throws java.io.IOException {
+            delegate.replacePin(indexUuid, shardId, newPin);
+        }
     }
 }

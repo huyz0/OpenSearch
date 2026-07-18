@@ -89,6 +89,20 @@ public final class BlobContainerDurablePinRegistry implements DurablePinRegistry
         });
     }
 
+    @Override
+    public void replacePin(String indexUuid, int shardId, PinRecord newPin) throws IOException {
+        mutate(indexUuid, shardId, current -> {
+            Set<PinRecord> next = new HashSet<>();
+            next.add(newPin);
+            for (PinRecord existing : current) {
+                if (existing.pinId().equals(newPin.pinId()) == false) {
+                    next.add(existing);
+                }
+            }
+            return next;
+        });
+    }
+
     private void mutate(String indexUuid, int shardId, UnaryOperator<Set<PinRecord>> mutation) throws IOException {
         String registerName = registerName(indexUuid, shardId);
         for (int attempt = 0; attempt < MAX_CAS_ATTEMPTS; attempt++) {

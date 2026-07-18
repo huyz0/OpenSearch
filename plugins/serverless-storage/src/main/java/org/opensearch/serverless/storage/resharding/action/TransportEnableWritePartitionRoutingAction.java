@@ -30,6 +30,7 @@ import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -107,6 +108,13 @@ public class TransportEnableWritePartitionRoutingAction extends TransportCluster
         clusterService.submitStateUpdateTask(
             "serverless-storage-enable-write-partition-routing",
             new ClusterStateUpdateTask(Priority.URGENT) {
+                // Tracks any target that vanished between the pre-check above and this task
+                // actually running -- the same race TransportFenceSplitSourceAction/
+                // TransportDisableWritePartitionRoutingAction's own fixes close, applied here so a
+                // concurrent deletion can't make this silently assign fewer than numPartitions
+                // targets while still reporting a full success.
+                private final List<String> missingDuringExecute = new ArrayList<>();
+
                 @Override
                 public ClusterState execute(ClusterState currentState) {
                     Metadata.Builder metadataBuilder = Metadata.builder(currentState.metadata());
@@ -114,6 +122,7 @@ public class TransportEnableWritePartitionRoutingAction extends TransportCluster
                         String targetIndexName = targetIndexNames.get(partitionIndex);
                         IndexMetadata targetMetadata = currentState.metadata().index(targetIndexName);
                         if (targetMetadata == null) {
+                            missingDuringExecute.add(targetIndexName);
                             continue;
                         }
                         metadataBuilder.put(
@@ -126,6 +135,23 @@ public class TransportEnableWritePartitionRoutingAction extends TransportCluster
 
                 @Override
                 public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {
+                    if (missingDuringExecute.isEmpty() == false) {
+                        logger.warn(
+                            "target index(es) were deleted concurrently with enabling write-partition-routing for alias ["
+                                + aliasName
+                                + "], reporting failure rather than a false acknowledgement: "
+                                + missingDuringExecute
+                        );
+                        listener.onFailure(
+                            new IllegalStateException(
+                                "target index(es) were deleted before write-partition-routing could be enabled for alias ["
+                                    + aliasName
+                                    + "]: "
+                                    + missingDuringExecute
+                            )
+                        );
+                        return;
+                    }
                     logger.info(
                         "enabled write-partition-routing for alias ["
                             + aliasName

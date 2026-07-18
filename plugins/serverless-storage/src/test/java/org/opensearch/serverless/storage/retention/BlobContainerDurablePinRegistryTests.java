@@ -186,4 +186,46 @@ public class BlobContainerDurablePinRegistryTests extends OpenSearchTestCase {
 
         assertEquals(Set.of(new PinRecord("to-be-added", 1, 2)), registry.getPins(INDEX_UUID, SHARD_ID));
     }
+
+    // Regression test for a real bug: TransportSnapshotPinAction used to implement
+    // create-or-replace as addPin(newPin) followed by a separate read-then-removePin loop over
+    // every OTHER pin sharing the same pinId. Under two concurrent calls for the same pinId (e.g.
+    // a client retry racing the original request), each call's independent removal pass could
+    // observe and remove the OTHER call's just-added pin -- both calls report success, but zero
+    // pins survive. replacePin does the add-and-strip in one atomic CAS mutation instead.
+    public void testConcurrentReplacePinsForTheSameReasonNeverBothLosesTheirPin() throws Exception {
+        DurablePinRegistry registry = newRegistry();
+        int attempts = 20;
+        ExecutorService executor = Executors.newFixedThreadPool(attempts);
+        CountDownLatch startLine = new CountDownLatch(1);
+
+        try {
+            List<Future<?>> futures = new java.util.ArrayList<>();
+            for (int i = 0; i < attempts; i++) {
+                final int generation = i;
+                futures.add(executor.submit(() -> {
+                    try {
+                        startLine.await();
+                        registry.replacePin(INDEX_UUID, SHARD_ID, new PinRecord("snapshot-1", 1, generation));
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                }));
+            }
+            startLine.countDown();
+            for (Future<?> future : futures) {
+                future.get(30, TimeUnit.SECONDS);
+            }
+        } finally {
+            executor.shutdown();
+        }
+
+        Set<PinRecord> pins = registry.getPins(INDEX_UUID, SHARD_ID);
+        assertEquals(
+            "exactly one pin must survive concurrent replacePin calls for the same pinId -- never zero",
+            1,
+            pins.size()
+        );
+        assertEquals("snapshot-1", pins.iterator().next().pinId());
+    }
 }

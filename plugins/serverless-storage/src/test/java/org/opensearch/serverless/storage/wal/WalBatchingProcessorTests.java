@@ -197,6 +197,13 @@ public class WalBatchingProcessorTests extends OpenSearchTestCase {
      * calling thread (parked inside {@link java.util.concurrent.ArrayBlockingQueue#put}) rather than
      * overrunning the bound. Released by interrupting the blocked thread, which the base class turns
      * into a listener notification rather than a leak.
+     *
+     * <p>Also a regression test for a real bug: when core's {@code BufferedAsyncIOProcessor}
+     * notifies a blocked put's listener directly with an {@code InterruptedException} (the path
+     * exercised below), that record never reaches {@link WalBatchingProcessor#write}, so a
+     * decrement placed only in {@code write}'s own finally block would leak that record's bytes
+     * from {@link WalBatchingProcessor#backlogBytes()} permanently. {@code put} now decrements in a
+     * listener wrapper invoked on every path, including this one.
      */
     public void testQueueCapacityBackpressureBlocksAPutOnceFull() throws Exception {
         CountDownLatch writeStarted = new CountDownLatch(1);
@@ -239,6 +246,13 @@ public class WalBatchingProcessorTests extends OpenSearchTestCase {
             releaseWrite.countDown();
         }
         assertFalse("the interrupted put must unblock and terminate", blocked.isAlive());
+        assertBusy(
+            () -> assertEquals(
+                "an interrupted, never-written put must still release its bytes from the backlog",
+                0L,
+                processor.backlogBytes()
+            )
+        );
     }
 
     /**

@@ -100,18 +100,15 @@ public class TransportSnapshotPinAction extends HandledTransportAction<SnapshotP
                 long generation = head.get().head().latestManifestGeneration();
                 PinRecord newPin = new PinRecord(request.snapshotId(), primaryTerm, generation);
 
-                // Create-or-replace, not additive (see SnapshotPinAction's own javadoc): add the
-                // new pin *before* removing any older one under the same snapshotId, not the other
-                // way around -- a crash between the two calls then only ever leaves both
-                // generations pinned (harmless, self-healing on the next pin call), never a window
-                // where the snapshot name resolves to nothing because the old pin was already gone
-                // and the new one hadn't landed yet.
-                pinRegistry.addPin(request.indexUuid(), request.shardId(), newPin);
-                for (PinRecord existing : pinRegistry.getPins(request.indexUuid(), request.shardId())) {
-                    if (existing.pinId().equals(request.snapshotId()) && existing.equals(newPin) == false) {
-                        pinRegistry.removePin(request.indexUuid(), request.shardId(), existing);
-                    }
-                }
+                // Create-or-replace, not additive (see SnapshotPinAction's own javadoc): replacePin
+                // adds the new pin and strips any older one under the same snapshotId within a
+                // single atomic CAS mutation. Deliberately not a separate addPin call followed by a
+                // read-then-remove loop -- that shape has a real race under two CONCURRENT calls
+                // for the same snapshotId (e.g. a client retry): each call's independent removal
+                // pass could observe and remove the OTHER call's just-added pin, leaving zero pins
+                // for this snapshotId even though both calls reported success. See
+                // DurablePinRegistry#replacePin's own javadoc for why this is safe under that race.
+                pinRegistry.replacePin(request.indexUuid(), request.shardId(), newPin);
 
                 listener.onResponse(new SnapshotPinResponse(primaryTerm, generation));
             } catch (Exception e) {

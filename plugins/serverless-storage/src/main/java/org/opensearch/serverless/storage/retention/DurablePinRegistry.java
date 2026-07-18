@@ -85,4 +85,25 @@ public interface DurablePinRegistry {
      * @param pin       the exact pin to remove.
      */
     void removePin(String indexUuid, int shardId, PinRecord pin) throws IOException;
+
+    /**
+     * Atomically makes {@code newPin} the <em>only</em> pin under {@code newPin.pinId()}: adds it
+     * and removes every other pin sharing that same {@code pinId} (a different generation), all
+     * within one CAS mutation -- the create-or-replace, single-generation-per-reason contract
+     * {@code SnapshotPinAction}'s own javadoc describes ("re-running a snapshot under the same
+     * name updates it to the shard's current state rather than accumulating every generation ever
+     * pinned").
+     *
+     * <p>Unlike calling {@link #addPin} followed by a separate read-then-{@link #removePin(String,
+     * int, PinRecord)} loop, this is safe under two <em>concurrent</em> calls for the same {@code
+     * pinId} (e.g. a client retry racing the original request): each call only ever removes pins
+     * that are not the one it just added, computed from the same atomically-read-and-written state
+     * its own add used -- two racing calls converge on whichever wins the last CAS, never both
+     * ending up with zero pins for that {@code pinId}.
+     *
+     * @param indexUuid the UUID of the index the shard belongs to.
+     * @param shardId   the shard to update the pin on.
+     * @param newPin    the pin that should become the sole pin under its {@code pinId}.
+     */
+    void replacePin(String indexUuid, int shardId, PinRecord newPin) throws IOException;
 }
