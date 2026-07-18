@@ -2855,3 +2855,49 @@ Fixed, most severe first:
 A convergence-check pass on this round's own fixes -- especially the three rewritten read-path
 call sites and the new chain-walking helpers -- found nothing further. Full
 `:plugins:serverless-storage:test` and `:internalClusterTest` green throughout.
+
+## Broadened review round 5: wal/translog/writerengine packages, 4 fixes (`c39ff046df9`)
+
+Widened scope to the `wal`, `translog`, and `writerengine` packages (49 files) -- the actual
+write path backing indexing acks. 4 finder angles (WAL chunk/batching core, WAL replay/GC/
+registry/translog integration, writer-engine core, writer-engine/WAL actions), roughly 10
+candidates, adversarially verified. Refuted: a WAL-overflow "false ack" scenario and a
+WalMirroringTranslog future-assignment race are both prevented by existing synchronization
+(WalChunkService's append/flush are synchronized; core's own Translog.add serializes callers);
+a closed-engine realtime-get race is already caught by its sole caller's try/catch; an unguarded
+substring parse operates on a key format that's structurally guaranteed to contain the expected
+separator. One "fix" (guarding shard_id parseInt in two REST handlers) was itself a false
+positive -- `NumberFormatException` already extends `IllegalArgumentException`, which core's
+`ExceptionsHelper.status()` already maps to 400 regardless of subtype -- and was reverted after
+it broke two existing tests by silently defaulting on a missing param instead of throwing. Left
+as a reminder: verify a "fix" against existing test coverage before assuming a review finding is
+real, even after independent verification -- the verifier confirmed the code shape accurately but
+didn't check whether core already handled the subtype correctly.
+
+Fixed, most severe first:
+
+1. `WalBatchingProcessor#write` leaked `backlogBytes` permanently on any exception thrown before
+   its `try`/`finally` (e.g. an encryption failure) -- `put()` already counted those bytes at
+   enqueue time, and there was no other decrement site, so the leak compounded on every retry and
+   would eventually wedge `WalMirroringTranslog#add` into rejecting all future writes forever,
+   even after the underlying issue resolved. The `try`/`finally` now covers the encryption loop
+   too. Verified with a break-the-fix pass: reverting the fix made the new regression test fail
+   with the exact leaked-byte count predicted.
+2. WAL shard registration in `ObjectStoreWriterEngine` was attempted once at construction and
+   never retried on failure -- an unregistered-but-actively-writing shard's chunks were invisible
+   to `WalGcSchedulerTask`'s registered-shards-only safety bound, a real gap where still-needed
+   WAL chunks could be deleted. Registration now retries on every lease-renewal tick until it
+   succeeds once.
+3. `WalChunkReader#readRecords` used a chunk's claimed `recordCount` to presize an `ArrayList`
+   before the trailing checksum was ever verified, with only a `< 0` check -- a single corrupted
+   bit could trigger an uncaught `OutOfMemoryError` instead of the clean `WalFormatException` the
+   class's own "fail closed" contract promises. Bounded by the chunk's own remaining byte length.
+4. `WalGcSchedulerTask` aborts its entire sweep (not just the affected shard) whenever one
+   registered shard hasn't yet published a manifest -- confirmed this is actually *correct* given
+   the shared-chunk WAL format (there's no way to know which chunk sequences a not-yet-published
+   shard's own writes landed in, so nothing is safe to delete while it's unresolved), not a bug to
+   relax. Added logging instead, so a persistently-stalled sweep is observable rather than
+   silently accumulating unbounded WAL chunk storage.
+
+A convergence-check pass on this round's own fixes found nothing further. Full
+`:plugins:serverless-storage:test` and `:internalClusterTest` green throughout.
