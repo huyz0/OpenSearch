@@ -54,6 +54,18 @@ public class ShardCloneRequestTests extends OpenSearchTestCase {
         assertTrue(validation.validationErrors().stream().anyMatch(e -> e.contains("target shardId")));
     }
 
+    public void testValidateRejectsSourceAndTargetNamingTheSameShard() {
+        ShardCloneRequest request = new ShardCloneRequest("same-idx", 2, "same-idx", 2);
+        ActionRequestValidationException validation = request.validate();
+        assertNotNull(validation);
+        assertTrue(validation.validationErrors().stream().anyMatch(e -> e.contains("must not name the same shard")));
+    }
+
+    public void testValidateAllowsSameIndexDifferentShardId() {
+        ShardCloneRequest request = new ShardCloneRequest("same-idx", 0, "same-idx", 1);
+        assertNull(request.validate());
+    }
+
     public void testValidateReportsEveryViolationTogether() {
         ShardCloneRequest request = new ShardCloneRequest(null, -1, null, -1);
         ActionRequestValidationException validation = request.validate();

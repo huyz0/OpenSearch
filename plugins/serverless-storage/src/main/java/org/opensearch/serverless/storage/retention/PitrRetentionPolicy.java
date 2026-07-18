@@ -62,7 +62,7 @@ public final class PitrRetentionPolicy {
         for (CommitManifest manifest : manifestsForOneShard) {
             if (manifest.createdAtMillis() >= cutoffMillis) {
                 required.add(ManifestId.of(manifest));
-            } else if (latestBeforeCutoff == null || manifest.createdAtMillis() > latestBeforeCutoff.createdAtMillis()) {
+            } else if (isLaterThan(manifest, latestBeforeCutoff)) {
                 latestBeforeCutoff = manifest;
             }
         }
@@ -70,6 +70,29 @@ public final class PitrRetentionPolicy {
             required.add(ManifestId.of(latestBeforeCutoff));
         }
         return required;
+    }
+
+    /**
+     * Whether {@code candidate} should replace {@code current} as the "latest before cutoff" pick.
+     * Breaks a {@code createdAtMillis} tie deterministically by (primaryTerm, generation) --
+     * {@code manifestsForOneShard}'s own iteration order comes from an unordered blob-listing
+     * {@code Map}, so without a secondary key, two manifests sharing a millisecond-precision
+     * timestamp could make consecutive reconciliation calls flip which one is picked, needlessly
+     * churning the pin (add one, remove the other) even though both are equally valid answers for
+     * PITR purposes. A higher (primaryTerm, generation) is later in the shard's real commit order
+     * regardless of what the clock happened to read at either commit.
+     */
+    private static boolean isLaterThan(CommitManifest candidate, CommitManifest current) {
+        if (current == null) {
+            return true;
+        }
+        if (candidate.createdAtMillis() != current.createdAtMillis()) {
+            return candidate.createdAtMillis() > current.createdAtMillis();
+        }
+        if (candidate.primaryTerm() != current.primaryTerm()) {
+            return candidate.primaryTerm() > current.primaryTerm();
+        }
+        return candidate.generation() > current.generation();
     }
 
     /**

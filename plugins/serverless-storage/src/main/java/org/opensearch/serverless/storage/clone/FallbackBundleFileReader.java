@@ -13,6 +13,7 @@ import org.opensearch.serverless.storage.format.BundleFileReader;
 
 import java.io.IOException;
 import java.nio.file.NoSuchFileException;
+import java.util.List;
 
 /**
  * The read-path half of zero-copy clone (rfc-serverless-opensearch.md &sect;4.6/&sect;14): a
@@ -45,6 +46,24 @@ public final class FallbackBundleFileReader implements BundleFileReader {
     public FallbackBundleFileReader(BundleFileReader primary, BundleFileReader fallback) {
         this.primary = primary;
         this.fallback = fallback;
+    }
+
+    /**
+     * Folds an ordered list of readers (own shard first, then each clone-lineage hop back to the
+     * original) into one nested fallback chain -- e.g. {@code chain(List.of(a, b, c))} tries
+     * {@code a}, then {@code b}, then {@code c}, matching {@link ShardCloner#resolveLineageChain}'s
+     * read-priority ordering. Needed for a clone of a clone, where the immediate source's own
+     * manifest can still reference bundles that only physically exist further back in the chain --
+     * a single {@code primary}/{@code fallback} pair only covers one hop.
+     *
+     * @param readers at least one reader; {@code readers.get(0)} is tried first.
+     */
+    public static BundleFileReader chain(List<BundleFileReader> readers) {
+        BundleFileReader result = readers.get(readers.size() - 1);
+        for (int i = readers.size() - 2; i >= 0; i--) {
+            result = new FallbackBundleFileReader(readers.get(i), result);
+        }
+        return result;
     }
 
     /**

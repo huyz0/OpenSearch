@@ -182,10 +182,30 @@ public final class GcSchedulerTask implements Closeable {
             }
         }
 
+        // Re-check pins immediately before the actual delete, not just once near the top of this
+        // method: a snapshot/PITR pin request landing on this shard concurrently, after the
+        // durablyPinnedManifests read above but before this point (the blob-store listing and
+        // bookkeeping loops in between leave a real, if narrow, window), would otherwise never be
+        // seen by this sweep and get deleted anyway. This is a cheap second read on the same
+        // register blob, not a lock, so it doesn't fully close the window against a pin landing in
+        // the few remaining lines between this read and the delete call itself -- but it shrinks
+        // that window from "the whole sweep method" to "a few lines," which is the best available
+        // without introducing real cross-writer coordination this shard's GC has never needed.
+        Set<ManifestId> pinnedImmediatelyBeforeDelete = pinRegistry.getPinnedManifestIds(indexUuid, shardId);
+        List<CommitManifest> finalDeletableManifests = deletableManifests;
+        if (pinnedImmediatelyBeforeDelete.isEmpty() == false) {
+            finalDeletableManifests = new java.util.ArrayList<>(deletableManifests.size());
+            for (CommitManifest manifest : deletableManifests) {
+                if (pinnedImmediatelyBeforeDelete.contains(ManifestId.of(manifest)) == false) {
+                    finalDeletableManifests.add(manifest);
+                }
+            }
+        }
+
         // Bundles before manifests -- see this class's own javadoc for why that ordering, not the
         // reverse, is what keeps a mid-sweep crash merely retry-safe.
         bundleStore.deleteBundles(deletableBundles);
-        manifestStore.deleteManifests(deletableManifests);
+        manifestStore.deleteManifests(finalDeletableManifests);
         firstObservedOrphanedAtMillis.keySet().removeAll(deletableBundles);
     }
 

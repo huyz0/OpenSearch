@@ -278,6 +278,101 @@ public class ShardClonerTests extends OpenSearchTestCase {
         });
     }
 
+    public void testResolveLineageChainWalksMultipleCloneHops() throws Exception {
+        // A three-hop chain: source -> clone1 -> clone2. resolveLineageChain from clone2's own
+        // container must return [clone2, clone1, source], not just [clone2, clone1] -- a clone of
+        // a clone must still be able to fall back all the way to the original.
+        publishSourceCommit();
+        FsBlobStore clone1BlobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer clone1Container = new FsBlobContainer(clone1BlobStore, BlobPath.cleanPath(), clone1BlobStore.path());
+        String clone1IndexUuid = "clone1-idx";
+        ShardCloner.clone(
+            SOURCE_INDEX_UUID,
+            SHARD_ID,
+            sourceManifestStore,
+            sourceShardStateStore,
+            sourcePinRegistry,
+            clone1IndexUuid,
+            SHARD_ID,
+            new BlobContainerManifestStore(clone1Container),
+            new BlobContainerShardStateStore(clone1Container),
+            new BlobContainerCloneLineageStore(clone1Container),
+            System.currentTimeMillis()
+        );
+
+        FsBlobStore clone2BlobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer clone2Container = new FsBlobContainer(clone2BlobStore, BlobPath.cleanPath(), clone2BlobStore.path());
+        String clone2IndexUuid = "clone2-idx";
+        ShardCloner.clone(
+            clone1IndexUuid,
+            SHARD_ID,
+            new BlobContainerManifestStore(clone1Container),
+            new BlobContainerShardStateStore(clone1Container),
+            new BlobContainerDurablePinRegistry(clone1Container),
+            clone2IndexUuid,
+            SHARD_ID,
+            new BlobContainerManifestStore(clone2Container),
+            new BlobContainerShardStateStore(clone2Container),
+            new BlobContainerCloneLineageStore(clone2Container),
+            System.currentTimeMillis()
+        );
+
+        java.util.Map<String, BlobContainer> containersByIndexUuid = java.util.Map.of(
+            SOURCE_INDEX_UUID,
+            sourceContainer,
+            clone1IndexUuid,
+            clone1Container,
+            clone2IndexUuid,
+            clone2Container
+        );
+        java.util.List<BlobContainer> chain = ShardCloner.resolveLineageChain(
+            clone2Container,
+            clone2IndexUuid,
+            SHARD_ID,
+            (indexUuid, shardId) -> containersByIndexUuid.get(indexUuid)
+        );
+        assertEquals(java.util.List.of(clone2Container, clone1Container, sourceContainer), chain);
+    }
+
+    public void testResolveLineageChainOnANeverClonedShardReturnsJustItself() throws Exception {
+        java.util.List<BlobContainer> chain = ShardCloner.resolveLineageChain(
+            sourceContainer,
+            SOURCE_INDEX_UUID,
+            SHARD_ID,
+            (indexUuid, shardId) -> { throw new AssertionError("resolver must not be invoked when there is no lineage"); }
+        );
+        assertEquals(java.util.List.of(sourceContainer), chain);
+    }
+
+    public void testCloneRefusesToSilentlyOverwriteLineageFromADifferentPriorSource() throws Exception {
+        // Simulates a clone attempt that pinned its source and wrote lineage, but then failed
+        // before/at the head CAS (e.g. lost a race) -- the target's lineage blob survives that
+        // failure. A retry with a DIFFERENT source must not silently overwrite it (that would
+        // permanently leak the first attempt's pin on its own source); it must fail loudly instead.
+        publishSourceCommit();
+        targetLineageStore.writeLineage(new CloneLineage("some-other-abandoned-source-idx", SHARD_ID));
+
+        expectThrows(
+            java.io.IOException.class,
+            () -> ShardCloner.clone(
+                SOURCE_INDEX_UUID,
+                SHARD_ID,
+                sourceManifestStore,
+                sourceShardStateStore,
+                sourcePinRegistry,
+                TARGET_INDEX_UUID,
+                SHARD_ID,
+                targetManifestStore,
+                targetShardStateStore,
+                targetLineageStore,
+                System.currentTimeMillis()
+            )
+        );
+        // The abandoned lineage must be left untouched, not overwritten, so the pin it points at
+        // remains discoverable/releasable later.
+        assertEquals("some-other-abandoned-source-idx", targetLineageStore.readLineage().get().sourceIndexUuid());
+    }
+
     public void testDeleteCloneIsIdempotent() throws Exception {
         publishSourceCommit();
         ShardCloner.clone(

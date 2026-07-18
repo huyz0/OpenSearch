@@ -28,6 +28,15 @@ public record GcSchedulerConfig(TimeValue interval, long retentionWindowMillis, 
     BlobContainerBundleStore bundleStore, DurablePinRegistry pinRegistry) {
 
     /**
+     * An upper bound with generous headroom over any legitimate retention window, chosen only to
+     * keep {@code clock.getAsLong() - retentionWindowMillis} (in {@link GcSchedulerTask#sweep})
+     * far away from {@code long} underflow -- a window anywhere near {@code Long.MAX_VALUE} would
+     * wrap that subtraction around to a large *positive* cutoff, making the "generous safety
+     * margin" invert into "no retention window at all" and every manifest immediately deletable.
+     */
+    public static final long MAX_RETENTION_WINDOW_MILLIS = TimeValue.timeValueDays(365).millis();
+
+    /**
      * Validates the configured retention window.
      *
      * @param interval how often {@link GcSchedulerTask} runs its sweep.
@@ -39,6 +48,11 @@ public record GcSchedulerConfig(TimeValue interval, long retentionWindowMillis, 
     public GcSchedulerConfig {
         if (retentionWindowMillis <= 0) {
             throw new IllegalArgumentException("retentionWindowMillis must be > 0, got " + retentionWindowMillis);
+        }
+        if (retentionWindowMillis > MAX_RETENTION_WINDOW_MILLIS) {
+            throw new IllegalArgumentException(
+                "retentionWindowMillis must be <= " + MAX_RETENTION_WINDOW_MILLIS + ", got " + retentionWindowMillis
+            );
         }
     }
 

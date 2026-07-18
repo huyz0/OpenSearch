@@ -112,6 +112,10 @@ import java.util.function.Supplier;
  */
 public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, ClusterPlugin, IndexStorePlugin, ActionPlugin {
 
+    private static final org.apache.logging.log4j.Logger logger = org.apache.logging.log4j.LogManager.getLogger(
+        ServerlessStoragePlugin.class
+    );
+
     /** Creates the plugin; all real wiring happens in {@link #createComponents} once node services are available. */
     public ServerlessStoragePlugin() {}
 
@@ -1972,6 +1976,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 registry.deregister(indexUuid, shardId);
             } catch (Exception e) {
                 // See this method's own javadoc: logged-and-swallowed, not fatal to index deletion.
+                logger.warn("failed to deregister WAL shard registry entry for " + indexUuid + "/" + shardId, e);
             }
         }
     }
@@ -2010,6 +2015,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 );
             } catch (Exception e) {
                 // See this method's own javadoc: logged-and-swallowed, not fatal to index deletion.
+                logger.warn("failed to release clone lineage/pin for deleted index " + indexUuid + "/" + shardId, e);
             }
         }
     }

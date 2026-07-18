@@ -8,6 +8,8 @@
 
 package org.opensearch.serverless.storage.retention;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.threadpool.Scheduler;
@@ -33,6 +35,8 @@ import java.io.IOException;
  * engine over.
  */
 public final class PitrRetentionSchedulerTask implements Closeable {
+
+    private static final Logger logger = LogManager.getLogger(PitrRetentionSchedulerTask.class);
 
     private final String indexUuid;
     private final int shardId;
@@ -76,7 +80,10 @@ public final class PitrRetentionSchedulerTask implements Closeable {
         try {
             reconciler.reconcile(indexUuid, shardId, manifestStore.listManifests(), System.currentTimeMillis(), windowMillis);
         } catch (IOException e) {
-            // See class javadoc: swallow and let the next scheduled tick retry.
+            // See class javadoc: swallow and let the next scheduled tick retry -- but a persistent
+            // (not transient) failure here would otherwise silently stop the PITR window from
+            // advancing with no visible signal anywhere, so it's still worth a log line.
+            logger.warn("PITR reconciliation failed for " + indexUuid + "/" + shardId + ", will retry next tick", e);
         }
     }
 

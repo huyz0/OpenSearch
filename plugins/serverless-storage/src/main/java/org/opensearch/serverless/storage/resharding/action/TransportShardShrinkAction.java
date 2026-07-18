@@ -16,9 +16,9 @@ import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.serverless.storage.ServerlessStoragePlugin;
-import org.opensearch.serverless.storage.clone.BlobContainerCloneLineageStore;
 import org.opensearch.serverless.storage.clone.CloneLineage;
 import org.opensearch.serverless.storage.clone.FallbackBundleFileReader;
+import org.opensearch.serverless.storage.clone.ShardCloner;
 import org.opensearch.serverless.storage.format.BlobContainerBundleStore;
 import org.opensearch.serverless.storage.format.BundleFileReader;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
@@ -203,14 +203,26 @@ public class TransportShardShrinkAction extends HandledTransportAction<ShardShri
             sourceHead.get().head().latestManifestGeneration()
         );
 
-        BundleFileReader readPath = new BlobContainerBundleStore(sourceContainer);
-        Optional<CloneLineage> lineage = new BlobContainerCloneLineageStore(sourceContainer).readLineage();
-        if (lineage.isPresent()) {
-            BlobContainer sourceOfSourceContainer = new RestrictingBlobContainer(
-                plugin.blobContainerForDirectoryFactory(lineage.get().sourceIndexUuid(), lineage.get().sourceShardId()),
+        // Walks the full clone-lineage chain, not just one hop -- a source being shrunk may itself
+        // be an unrewritten split target several clone hops deep, not just one. See
+        // ShardCloner#resolveLineageChain's own javadoc.
+        List<BlobContainer> lineageChain = ShardCloner.resolveLineageChain(
+            sourceContainer,
+            sourceRef.indexUuid(),
+            sourceRef.shardId(),
+            (ancestorIndexUuid, ancestorShardId) -> new RestrictingBlobContainer(
+                plugin.blobContainerForDirectoryFactory(ancestorIndexUuid, ancestorShardId),
                 false
-            );
-            readPath = new FallbackBundleFileReader(readPath, new BlobContainerBundleStore(sourceOfSourceContainer));
+            )
+        );
+        BundleFileReader readPath = new BlobContainerBundleStore(sourceContainer);
+        if (lineageChain.size() > 1) {
+            List<BundleFileReader> readers = new ArrayList<>(lineageChain.size());
+            readers.add(readPath);
+            for (int i = 1; i < lineageChain.size(); i++) {
+                readers.add(new BlobContainerBundleStore(lineageChain.get(i)));
+            }
+            readPath = FallbackBundleFileReader.chain(readers);
         }
 
         return new ShrinkSource(sourceManifest, new ObjectStoreCommitMaterializer(readPath));

@@ -21,9 +21,8 @@ import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.utils.TransferManager;
 import org.opensearch.plugins.IndexStorePlugin;
 import org.opensearch.serverless.storage.ServerlessStoragePlugin;
-import org.opensearch.serverless.storage.clone.BlobContainerCloneLineageStore;
-import org.opensearch.serverless.storage.clone.CloneLineage;
 import org.opensearch.serverless.storage.clone.FallbackStreamReader;
+import org.opensearch.serverless.storage.clone.ShardCloner;
 import org.opensearch.serverless.storage.format.BlobContainerBundleStore;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.manifest.CommitManifest;
@@ -33,6 +32,8 @@ import org.opensearch.serverless.storage.shardstate.ShardStateStore;
 import org.opensearch.serverless.storage.shardstate.VersionedShardHead;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -56,10 +57,11 @@ import java.util.Optional;
  * actually created, {@code createComponents} has long since run.
  *
  * <p>Also transparently supports a cloned shard's reader (rfc-serverless-opensearch.md &sect;14):
- * {@link #resolveStreamReader} checks the shard's {@link BlobContainerCloneLineageStore} and, only
- * when it really is a clone, wraps the normal {@link TransferManager.StreamReader} with a {@link
- * FallbackStreamReader} that falls back to the clone source's own container -- the lazy-directory
- * counterpart of {@code FallbackBundleFileReader}'s support for the eager materializer path.
+ * {@link #resolveStreamReader} walks the shard's full clone-lineage chain (see {@link
+ * ShardCloner#resolveLineageChain}) and, for each hop, wraps the normal {@link
+ * TransferManager.StreamReader} with a {@link FallbackStreamReader} that falls back to that hop's
+ * own container -- the lazy-directory counterpart of {@code FallbackBundleFileReader}'s support
+ * for the eager materializer path.
  */
 public final class ServerlessStorageLazyDirectoryFactory implements IndexStorePlugin.DirectoryFactory {
 
@@ -137,10 +139,10 @@ public final class ServerlessStorageLazyDirectoryFactory implements IndexStorePl
      * A cloned shard's own {@code blobContainer} cannot see bundles that still physically live in
      * its clone source's container (rfc-serverless-opensearch.md &sect;14) -- the same reason
      * {@code ObjectStoreCommitMaterializer}'s eager path needs {@code FallbackBundleFileReader}.
-     * Checks {@link BlobContainerCloneLineageStore} (a cheap single-blob read/miss, harmless for
-     * the overwhelming majority of shards that were never cloned) and, only when this shard really
-     * is a clone, wraps the normal reader with a {@link FallbackStreamReader} that falls back to
-     * the source shard's own container.
+     * Walks the shard's full clone-lineage chain via {@link ShardCloner#resolveLineageChain} (a
+     * cheap single-blob read/miss per hop, harmless for the overwhelming majority of shards that
+     * were never cloned) and, only when this shard really is a clone, wraps the normal reader with
+     * a {@link FallbackStreamReader} chain that falls back through every ancestor's own container.
      */
     private TransferManager.StreamReader resolveStreamReader(
         BlobContainer blobContainer,
@@ -148,16 +150,24 @@ public final class ServerlessStorageLazyDirectoryFactory implements IndexStorePl
         String indexUuid,
         int shardId
     ) throws IOException {
-        Optional<CloneLineage> lineage = new BlobContainerCloneLineageStore(blobContainer).readLineage();
-        if (lineage.isEmpty()) {
+        // Walks the full clone-lineage chain, not just one hop -- a clone of a clone can still
+        // reference bundles that only physically exist further back than its immediate source. See
+        // ShardCloner#resolveLineageChain's own javadoc for why a single-hop fallback isn't enough.
+        List<BlobContainer> chain = ShardCloner.resolveLineageChain(
+            blobContainer,
+            indexUuid,
+            shardId,
+            plugin::blobContainerForDirectoryFactory
+        );
+        if (chain.size() == 1) {
             return bundleStore::openRange;
         }
-        BlobContainer sourceContainer = plugin.blobContainerForDirectoryFactory(
-            lineage.get().sourceIndexUuid(),
-            lineage.get().sourceShardId()
-        );
-        BlobContainerBundleStore sourceBundleStore = new BlobContainerBundleStore(sourceContainer);
-        return new FallbackStreamReader(bundleStore::openRange, sourceBundleStore::openRange);
+        List<TransferManager.StreamReader> readers = new ArrayList<>(chain.size());
+        readers.add(bundleStore::openRange);
+        for (int i = 1; i < chain.size(); i++) {
+            readers.add(new BlobContainerBundleStore(chain.get(i))::openRange);
+        }
+        return FallbackStreamReader.chain(readers);
     }
 
     @Override

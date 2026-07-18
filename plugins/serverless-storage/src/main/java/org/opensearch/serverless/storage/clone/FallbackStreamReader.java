@@ -13,6 +13,7 @@ import org.opensearch.index.store.remote.utils.TransferManager;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.NoSuchFileException;
+import java.util.List;
 
 /**
  * The lazy-directory (reader-shard) counterpart of {@link FallbackBundleFileReader}, for the same
@@ -39,6 +40,23 @@ public final class FallbackStreamReader implements TransferManager.StreamReader 
     public FallbackStreamReader(TransferManager.StreamReader primary, TransferManager.StreamReader fallback) {
         this.primary = primary;
         this.fallback = fallback;
+    }
+
+    /**
+     * Folds an ordered list of readers (own shard first, then each clone-lineage hop back to the
+     * original) into one nested fallback chain -- e.g. {@code chain(List.of(a, b, c))} tries
+     * {@code a}, then {@code b}, then {@code c}, matching {@link ShardCloner#resolveLineageChain}'s
+     * read-priority ordering. See {@link FallbackBundleFileReader#chain} for the eager-materializer
+     * counterpart and the same "clone of a clone" rationale.
+     *
+     * @param readers at least one reader; {@code readers.get(0)} is tried first.
+     */
+    public static TransferManager.StreamReader chain(List<TransferManager.StreamReader> readers) {
+        TransferManager.StreamReader result = readers.get(readers.size() - 1);
+        for (int i = readers.size() - 2; i >= 0; i--) {
+            result = new FallbackStreamReader(readers.get(i), result);
+        }
+        return result;
     }
 
     /**

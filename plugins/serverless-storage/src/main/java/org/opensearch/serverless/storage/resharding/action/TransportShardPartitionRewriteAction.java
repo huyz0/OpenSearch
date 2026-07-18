@@ -14,9 +14,9 @@ import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.serverless.storage.ServerlessStoragePlugin;
-import org.opensearch.serverless.storage.clone.BlobContainerCloneLineageStore;
 import org.opensearch.serverless.storage.clone.CloneLineage;
 import org.opensearch.serverless.storage.clone.FallbackBundleFileReader;
+import org.opensearch.serverless.storage.clone.ShardCloner;
 import org.opensearch.serverless.storage.format.BlobContainerBundleStore;
 import org.opensearch.serverless.storage.format.BundleFileReader;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
@@ -31,7 +31,8 @@ import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
 
-import java.util.Optional;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * The actual work behind {@link ShardPartitionRewriteAction}: builds the same shape of stores
@@ -107,14 +108,26 @@ public class TransportShardPartitionRewriteAction extends HandledTransportAction
                 ShardStateStore shardStateStore = new BlobContainerShardStateStore(container);
                 BlobContainerShardPartitionStore partitionStore = new BlobContainerShardPartitionStore(container);
 
-                BundleFileReader readPath = bundleStore;
-                Optional<CloneLineage> lineage = new BlobContainerCloneLineageStore(container).readLineage();
-                if (lineage.isPresent()) {
-                    BlobContainer sourceContainer = new RestrictingBlobContainer(
-                        plugin.blobContainerForDirectoryFactory(lineage.get().sourceIndexUuid(), lineage.get().sourceShardId()),
+                // Walks the full clone-lineage chain, not just one hop -- see
+                // ShardCloner#resolveLineageChain's own javadoc for why a single-hop fallback isn't
+                // enough for a clone (or split target) of an already-cloned shard.
+                List<BlobContainer> lineageChain = ShardCloner.resolveLineageChain(
+                    container,
+                    request.indexUuid(),
+                    request.shardId(),
+                    (ancestorIndexUuid, ancestorShardId) -> new RestrictingBlobContainer(
+                        plugin.blobContainerForDirectoryFactory(ancestorIndexUuid, ancestorShardId),
                         false
-                    );
-                    readPath = new FallbackBundleFileReader(bundleStore, new BlobContainerBundleStore(sourceContainer));
+                    )
+                );
+                BundleFileReader readPath = bundleStore;
+                if (lineageChain.size() > 1) {
+                    List<BundleFileReader> readers = new ArrayList<>(lineageChain.size());
+                    readers.add(bundleStore);
+                    for (int i = 1; i < lineageChain.size(); i++) {
+                        readers.add(new BlobContainerBundleStore(lineageChain.get(i)));
+                    }
+                    readPath = FallbackBundleFileReader.chain(readers);
                 }
                 ObjectStoreCommitMaterializer materializer = new ObjectStoreCommitMaterializer(readPath);
                 ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(bundleStore, manifestStore);

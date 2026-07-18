@@ -9,6 +9,7 @@
 package org.opensearch.serverless.storage.clone;
 
 import org.opensearch.common.CheckedRunnable;
+import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.manifest.CommitManifest;
 import org.opensearch.serverless.storage.manifest.PruningStats;
@@ -20,6 +21,8 @@ import org.opensearch.serverless.storage.shardstate.ShardStateStore;
 import org.opensearch.serverless.storage.shardstate.VersionedShardHead;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -180,6 +183,31 @@ public final class ShardCloner {
         long nowMillis,
         CheckedRunnable<IOException> beforeActivation
     ) throws IOException {
+        // Refuse to silently overwrite an existing lineage recorded by a PRIOR, different-source
+        // clone attempt against this same target (e.g. one that pinned its source but then lost
+        // the head CAS below and was never cleaned up). writeLineage below is unconditional
+        // overwrite, and deleteClone only ever consults the target's *current* lineage record --
+        // so overwriting it here would make that earlier attempt's pin on its own source
+        // permanently unreachable, leaking it forever. A retry with the SAME source is still a
+        // harmless no-op (addPin below is idempotent for an identical PinRecord), matching this
+        // method's own documented retry-safety; only a genuinely different source is refused.
+        Optional<CloneLineage> existingLineage = targetLineageStore.readLineage();
+        if (existingLineage.isPresent()
+            && (existingLineage.get().sourceIndexUuid().equals(sourceIndexUuid) == false
+                || existingLineage.get().sourceShardId() != sourceShardId)) {
+            throw new IOException(
+                "target shard "
+                    + targetIndexUuid
+                    + "/"
+                    + targetShardId
+                    + " already has clone lineage pointing at "
+                    + existingLineage.get().sourceIndexUuid()
+                    + "/"
+                    + existingLineage.get().sourceShardId()
+                    + " from a prior attempt -- call deleteClone to release that pin before retrying with a different source"
+            );
+        }
+
         Optional<VersionedShardHead> sourceHead = sourceShardStateStore.get(sourceIndexUuid, sourceShardId);
         if (sourceHead.isEmpty() || sourceHead.get().head().latestManifestGeneration() == 0) {
             throw new IOException("source shard " + sourceIndexUuid + "/" + sourceShardId + " has no published manifest to clone from");
@@ -293,5 +321,71 @@ public final class ShardCloner {
             clonePinId(targetIndexUuid, targetShardId)
         );
         targetLineageStore.deleteLineage();
+    }
+
+    /** A defensive bound on how many hops {@link #resolveLineageChain} will follow, guarding against a corrupted/cyclic lineage record. */
+    private static final int MAX_LINEAGE_CHAIN_DEPTH = 32;
+
+    /**
+     * Walks a shard's {@link CloneLineage} chain as far back as it goes, returning every container
+     * in the chain in read-priority order: {@code startContainer} first, then its immediate clone
+     * source, then that source's own clone source, and so on until a shard with no lineage record
+     * (a genuine original, never itself a clone) is reached.
+     *
+     * <p>Needed because a clone's lineage only ever records its immediate parent -- nothing stops
+     * cloning from an already-cloned shard (a "clone of a clone"), and neither {@code
+     * org.opensearch.serverless.storage.resharding.ShardSplitter#split} (which reuses this same
+     * {@link #clone} method) refuses it either. A caller that only checked one hop of lineage,
+     * the way this class's read-path callers used to,
+     * would silently fail to resolve a bundle that only physically exists in the *original*
+     * shard -- two or more clone hops back, not just one -- throwing {@code NoSuchFileException}
+     * on a read that a fully-chained fallback would have served correctly.
+     *
+     * @param startContainer the shard's own container, tried first.
+     * @param startIndexUuid the shard's own index UUID, to read its lineage from.
+     * @param startShardId the shard's own shard number.
+     * @param containerResolver given a (indexUuid, shardId), resolves that shard's own {@link BlobContainer}.
+     * @return every container in the chain, {@code startContainer} first; always at least one element.
+     * @throws IOException if reading any lineage record along the way fails, or the chain exceeds
+     *                      {@link #MAX_LINEAGE_CHAIN_DEPTH} hops (a corrupted or cyclic lineage
+     *                      record -- lineage is otherwise write-once per shard and can never
+     *                      legitimately form a cycle).
+     */
+    public static List<BlobContainer> resolveLineageChain(
+        BlobContainer startContainer,
+        String startIndexUuid,
+        int startShardId,
+        ContainerResolver containerResolver
+    ) throws IOException {
+        List<BlobContainer> chain = new ArrayList<>();
+        chain.add(startContainer);
+        BlobContainer currentContainer = startContainer;
+        for (int hop = 0; hop < MAX_LINEAGE_CHAIN_DEPTH; hop++) {
+            Optional<CloneLineage> lineage = new BlobContainerCloneLineageStore(currentContainer).readLineage();
+            if (lineage.isEmpty()) {
+                return chain;
+            }
+            currentContainer = containerResolver.resolve(lineage.get().sourceIndexUuid(), lineage.get().sourceShardId());
+            chain.add(currentContainer);
+        }
+        throw new IOException(
+            "clone lineage chain starting at "
+                + startIndexUuid
+                + "/"
+                + startShardId
+                + " exceeded "
+                + MAX_LINEAGE_CHAIN_DEPTH
+                + " hops -- refusing to follow a likely-corrupted or cyclic lineage record"
+        );
+    }
+
+    /** Resolves a shard's own {@link BlobContainer} -- {@code java.util.function.BiFunction} can't be used here since resolution does real I/O and throws {@link IOException}. */
+    @FunctionalInterface
+    public interface ContainerResolver {
+        /**
+         * @param indexUuid the index UUID to resolve.
+         * @param shardId the shard number within {@code indexUuid}.
+         */
+        BlobContainer resolve(String indexUuid, int shardId) throws IOException;
     }
 }

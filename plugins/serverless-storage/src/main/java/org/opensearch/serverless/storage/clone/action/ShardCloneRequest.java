@@ -79,6 +79,15 @@ public class ShardCloneRequest extends ActionRequest {
         if (targetShardId < 0) {
             validationException = addValidationError("target shardId must be >= 0", validationException);
         }
+        if (sourceIndexUuid != null
+            && targetIndexUuid != null
+            && sourceIndexUuid.equals(targetIndexUuid)
+            && sourceShardId == targetShardId) {
+            // ShardCloner#clone writes the target's manifest (generation 1) before its head CAS
+            // check runs -- for a self-clone that write would collide with/clobber the shard's own
+            // genuine first commit before the CAS could reject the operation.
+            validationException = addValidationError("source and target must not name the same shard", validationException);
+        }
         return validationException;
     }
 
