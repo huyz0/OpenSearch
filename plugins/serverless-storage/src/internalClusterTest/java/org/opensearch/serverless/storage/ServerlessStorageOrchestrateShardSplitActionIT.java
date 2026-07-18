@@ -16,6 +16,7 @@ import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
+import org.opensearch.action.index.IndexRequest;
 import org.opensearch.action.support.ActiveShardCount;
 import org.opensearch.cluster.metadata.AliasMetadata;
 import org.opensearch.cluster.metadata.IndexMetadata;
@@ -154,6 +155,7 @@ public class ServerlessStorageOrchestrateShardSplitActionIT extends ServerlessSt
         assertTrue("targets must have been provisioned", response.targetsProvisioned());
         assertTrue("every target must have been split", response.allTargetsSplit());
         assertTrue("the alias cutover must have completed", response.cutover());
+        assertTrue("the source must have been fenced once cutover completed", response.sourceFenced());
         assertTrue("write-routing must have been enabled since the request asked for it", response.writeRoutingEnabled());
 
         // Provisioning: both real target indices must now exist.
@@ -203,6 +205,27 @@ public class ServerlessStorageOrchestrateShardSplitActionIT extends ServerlessSt
         assertEquals(routingAlias, WritePartitionRoutingMetadata.writeRoutingAlias(targetAMetadata));
         assertEquals(routingAlias, WritePartitionRoutingMetadata.writeRoutingAlias(targetBMetadata));
 
+        // Source fencing: a direct write against the source's own name, after cutover, must now be
+        // rejected -- the real end-to-end proof of the gap TransportOrchestrateShardSplitAction's
+        // own javadoc used to warn was entirely unenforced. There are no data nodes in this test
+        // (see the class's own "no data node" javadoc), so this rejection must come from
+        // WritePartitionRoutingActionFilter itself, before any attempt to actually route the write.
+        ExecutionException directSourceWriteFailure = expectThrows(
+            ExecutionException.class,
+            () -> client().index(new IndexRequest(sourceIndexName).id("post-cutover-doc").source("field", "value")).get()
+        );
+        assertTrue(
+            "a direct write to a fenced source must be rejected as an IllegalArgumentException, got: "
+                + directSourceWriteFailure.getCause(),
+            directSourceWriteFailure.getCause() instanceof IllegalArgumentException
+        );
+        assertTrue(
+            "the rejection message must name the fenced source and the superseding alias, got: "
+                + directSourceWriteFailure.getCause().getMessage(),
+            directSourceWriteFailure.getCause().getMessage().contains(sourceIndexName)
+                && directSourceWriteFailure.getCause().getMessage().contains(routingAlias)
+        );
+
         // Resumability: re-issuing the exact same request must succeed cleanly, not fail on any
         // already-completed stage (provisioning refuses an existing target; splitting refuses an
         // already-published head; cutover/write-routing were already idempotent).
@@ -213,6 +236,7 @@ public class ServerlessStorageOrchestrateShardSplitActionIT extends ServerlessSt
         assertTrue("a resumed retry must still report every stage complete", retryResponse.targetsProvisioned());
         assertTrue(retryResponse.allTargetsSplit());
         assertTrue(retryResponse.cutover());
+        assertTrue(retryResponse.sourceFenced());
         assertTrue(retryResponse.writeRoutingEnabled());
     }
 

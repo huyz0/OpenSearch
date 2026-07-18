@@ -23,12 +23,19 @@
  * {@link org.opensearch.serverless.storage.resharding.action.EnableWritePartitionRoutingAction}
  * (assigns each target a write partition under that alias), chained together with provisioning and
  * per-partition split by {@link org.opensearch.serverless.storage.resharding.action.OrchestrateShardSplitAction}
- * into one resumable, operator-triggered sequence. This is additive-alias routing, not source
- * fencing -- it never renames, blocks, or otherwise touches the source index itself, so the source
- * must not be receiving direct writes when this is triggered; see
- * {@code TransportOrchestrateShardSplitAction}'s own javadoc for the full precondition and why
- * closing that gap (real source write-fencing, or a dual-write bridge) remains separately out of
- * scope.
+ * into one resumable, operator-triggered sequence.
+ *
+ * <p>Source write-fencing is implemented too, from cutover onward: {@link
+ * org.opensearch.serverless.storage.resharding.action.OrchestrateShardSplitAction} now fences the
+ * source automatically immediately after cutover succeeds (see {@link
+ * org.opensearch.serverless.storage.resharding.SourceSplitFenceMetadata} and {@link
+ * org.opensearch.serverless.storage.resharding.action.FenceSplitSourceAction}), and {@link
+ * org.opensearch.serverless.storage.resharding.WritePartitionRoutingActionFilter} rejects any
+ * further direct write against a fenced source. This narrows, but does not eliminate, the gap: the
+ * earlier window between the split's clone point and cutover actually completing is still
+ * unenforced -- closing that fully needs either true write-blocking synchronized with the clone
+ * itself or a dual-write bridge, both of which remain a genuinely new, separate mechanism, out of
+ * scope here. See {@code TransportOrchestrateShardSplitAction}'s own javadoc for the full detail.
  *
  * <p>Explicitly out of scope: auto-triggering a split off a write-rate/size threshold alone --
  * {@code ShardSplitCandidatesAction} surfaces the signal for an operator (or a future controller) to

@@ -28,20 +28,24 @@ import java.util.List;
  * {@link CutoverSplitRoutingAction}'s, or {@link EnableWritePartitionRoutingAction}'s own
  * validation and cluster-state-mutation logic.
  *
- * <p><b>WARNING -- the source index is never quiesced, fenced, or made read-only by any stage
- * here.</b> {@link ShardSplitAction} clones the source's object-store state as of a single
+ * <p><b>WARNING -- the source index is fenced only from cutover onward, not for the whole
+ * operation.</b> {@link ShardSplitAction} clones the source's object-store state as of a single
  * point-in-time generation; nothing in this class (or in {@link CutoverSplitRoutingAction} /
- * {@link EnableWritePartitionRoutingAction} downstream) stops the source index from continuing to
- * accept writes under its own original name before, during, or after that clone point. A document
- * written to the source by its original name after the clone point is captured only by the
- * source, never by any split target -- it will not appear through the new cutover alias, and if
- * the source is later deleted via {@link RetireShrinkSourceAction}, that document is gone
- * permanently, with no error raised anywhere in this pipeline. <b>Callers/operators must ensure
- * the source index is not receiving direct writes</b> -- via an application-level write freeze
- * against the source's own name, or by first migrating every writer onto an alias this action can
- * safely redirect at cutover -- before invoking this action. This precondition is not checked or
- * enforced by any code in this class; it is the caller's responsibility. See
- * rfc-serverless-opensearch.md &sect;16 Phase 4 for the full design-level discussion of this gap.
+ * {@link EnableWritePartitionRoutingAction} upstream of it) stops the source index from continuing
+ * to accept writes under its own original name before or during that clone point and the stages
+ * that follow it. A document written to the source in that window is captured only by the source,
+ * never by any split target -- it will not appear through the new cutover alias. <b>Once cutover
+ * succeeds, this class now fences the source automatically</b> (see {@link FenceSplitSourceAction},
+ * called immediately after {@link CutoverSplitRoutingAction} below): a further direct write against
+ * the source's own name is rejected by {@link
+ * org.opensearch.serverless.storage.resharding.WritePartitionRoutingActionFilter}, so the
+ * previously permanently-open "keep writing to the source forever, silently diverging, until {@link
+ * RetireShrinkSourceAction} eventually deletes it" gap is now closed from cutover onward. <b>What
+ * remains open, and must still be a caller/operator precondition</b>: the earlier window, between
+ * the split's clone point and cutover actually completing. Closing that fully needs either true
+ * write-blocking synchronized with the clone itself or a dual-write bridge mirroring writes to both
+ * source and targets until cutover -- both remain a genuinely new, separate mechanism, out of scope
+ * here. See rfc-serverless-opensearch.md &sect;16 Phase 4 for the full design-level discussion.
  */
 public class TransportOrchestrateShardSplitAction extends HandledTransportAction<
     OrchestrateShardSplitRequest,
@@ -182,20 +186,34 @@ public class TransportOrchestrateShardSplitAction extends HandledTransportAction
         client.execute(
             CutoverSplitRoutingAction.INSTANCE,
             new CutoverSplitRoutingRequest(request.routingAliasName(), request.targetIndexNames()),
+            ActionListener.wrap(response -> fenceSourceStage(request, listener), listener::onFailure)
+        );
+    }
+
+    /**
+     * Fences the source immediately once cutover has actually landed -- narrowing (not eliminating,
+     * see {@link org.opensearch.serverless.storage.resharding.SourceSplitFenceMetadata}'s own
+     * javadoc for the honest limitation) the "source keeps silently accepting writes forever" gap
+     * this class's own javadoc used to only be able to warn operators about, not close.
+     */
+    private void fenceSourceStage(OrchestrateShardSplitRequest request, ActionListener<OrchestrateShardSplitResponse> listener) {
+        client.execute(
+            FenceSplitSourceAction.INSTANCE,
+            new FenceSplitSourceRequest(request.sourceIndexName(), request.routingAliasName()),
             ActionListener.wrap(response -> writeRoutingStage(request, listener), listener::onFailure)
         );
     }
 
     private void writeRoutingStage(OrchestrateShardSplitRequest request, ActionListener<OrchestrateShardSplitResponse> listener) {
         if (request.enableWriteRouting() == false) {
-            listener.onResponse(new OrchestrateShardSplitResponse(true, true, true, false));
+            listener.onResponse(new OrchestrateShardSplitResponse(true, true, true, true, false));
             return;
         }
         client.execute(
             EnableWritePartitionRoutingAction.INSTANCE,
             new EnableWritePartitionRoutingRequest(request.routingAliasName(), request.targetIndexNames()),
             ActionListener.wrap(
-                response -> listener.onResponse(new OrchestrateShardSplitResponse(true, true, true, true)),
+                response -> listener.onResponse(new OrchestrateShardSplitResponse(true, true, true, true, true)),
                 listener::onFailure
             )
         );

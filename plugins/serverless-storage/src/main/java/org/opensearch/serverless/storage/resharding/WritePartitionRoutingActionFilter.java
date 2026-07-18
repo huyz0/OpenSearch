@@ -75,6 +75,12 @@ import java.util.Set;
  * -- blunter than per-item rejection, but simple and safe: a bulk request half fenced and half not
  * would be a worse failure mode than an oversized, uniform rejection.
  *
+ * <p><b>Also fences a split source's direct writes, once marked (see {@link
+ * org.opensearch.serverless.storage.resharding.SourceSplitFenceMetadata}).</b> Same shape as target
+ * fencing above -- a write naming a fenced source index directly is rejected, closing the
+ * previously-open, permanently-silent "keep writing to the source forever after cutover" gap {@code
+ * TransportOrchestrateShardSplitAction}'s own javadoc used to warn about as entirely unenforced.
+ *
  * <p><b>A real re-entrancy bug this fencing check's own integration test caught</b>: a single-item
  * {@code client().prepareIndex(alias)} call does not run through this filter chain once -- core's
  * {@code TransportSingleItemBulkWriteAction} wraps it into a {@code BulkRequest} and dispatches
@@ -173,9 +179,10 @@ public final class WritePartitionRoutingActionFilter implements ActionFilter {
 
     /**
      * @return a rejection message if {@code request} names a write-routing-assigned target index
-     *         directly (bypassing its alias), or {@code null} if the request is fine to proceed --
-     *         including because it's this filter's own already-rewritten request re-entering on a
-     *         nested dispatch (see this class's own javadoc).
+     *         directly (bypassing its alias) or a fenced split source, or {@code null} if the
+     *         request is fine to proceed -- including because it's this filter's own
+     *         already-rewritten request re-entering on a nested dispatch (see this class's own
+     *         javadoc).
      */
     private static String rejectIfDirectTargetWrite(
         ClusterState state,
@@ -192,6 +199,13 @@ public final class WritePartitionRoutingActionFilter implements ActionFilter {
         IndexMetadata directMetadata = state.metadata().index(indexName);
         if (directMetadata == null) {
             return null;
+        }
+        if (SourceSplitFenceMetadata.isFencedSource(directMetadata)) {
+            return "index ["
+                + indexName
+                + "] was split and is now fenced -- writes must go through alias ["
+                + SourceSplitFenceMetadata.supersedingAlias(directMetadata)
+                + "], not this index directly";
         }
         String assignedAlias = WritePartitionRoutingMetadata.writeRoutingAlias(directMetadata);
         if (assignedAlias == null) {
