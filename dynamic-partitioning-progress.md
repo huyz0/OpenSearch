@@ -2552,3 +2552,41 @@ above explicitly, so this doesn't get re-flagged as a gap by a future sweep read
 auto-triggered here" as a surface-level signal. No scheduler task built; the punch list's original
 framing of this item was itself based on an incomplete read of what already existed.
 
+## WAL batching Phase 3 — real (if simulated) data now exists, decision stands: still keep the default off
+
+Built `WalBatchingLatencyBenchmarkTests` (`b5b9909cb10`) -- the best-effort substitute the Phase 3
+entry above said it would build if it could: reuses `LatencyInjectingBlobContainer`/`LatencyProfile`
+(the same simulated-object-store-latency machinery `LazyDirectoryBootSetPrefetchBenchmarkTests`
+already uses for a different milestone) to drive real concurrent multi-shard indexing-ack latency
+through both the legacy and batching WAL paths, request-thread-waits-for-durable-upload semantics
+matching real `index.translog.durability=REQUEST`.
+
+**Real measured results, consistent across repeated runs:**
+
+| Profile | Legacy p50 | Legacy p99 | Batching p50 | Batching p99 |
+|---|---|---|---|---|
+| TYPICAL | ~250-460ms | ~1.1-1.4s | ~200ms | ~200-220ms |
+| HIGH | ~1.2-2.2s | ~4.7s | ~620-640ms | ~1.3s |
+
+Batching wins clearly on both p50 and p99, in both profiles, every run. A genuine second finding
+surfaced along the way, not planned for: `WalChunkService#append`/`flush` (the legacy path) are
+`synchronized`, and the real plugin shares exactly one node-level `WalChunkService` instance across
+every writer shard on a node -- so concurrent shards don't each independently pay simulated write
+latency, they fully serialize through one lock. An early version of this benchmark with a larger op
+count exceeded a 120s bound under `HIGH` profile for this reason alone (confirmed via thread dump).
+This is a real, additional argument for batching beyond the ack-latency table above: the legacy
+path's throughput ceiling under multi-shard contention is one lock's worth of sequential PUTs, not N
+independently-paced ones.
+
+**Decision, revisited with this new data: still no, the default stays `false`.** The data is a real
+signal in batching's favor, not noise -- but it doesn't change the actual gating question. This
+benchmark still runs against a local `FsBlobStore` with simulated, independent, non-correlated
+per-call latency, not real S3/GCS network behavior, connection pooling, or throttling under genuine
+sustained production concurrency. The RFC's own gating condition was "real load testing" specifically
+because those are exactly the variables a simulated benchmark cannot reproduce -- a strong simulated
+signal narrows the *expected* outcome of the real test, it doesn't substitute for running it. What
+this data *does* change: the earlier framing "no data exists to make an informed decision" is no
+longer accurate -- there is now real, reproducible, favorable-to-batching data; the decision not to
+flip the default is now a considered "wait for real validation despite a favorable signal," not "no
+information available either way."
+
