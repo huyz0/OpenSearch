@@ -2452,3 +2452,50 @@ Fixed `resharding/package-info.java` to state the real current scope: routing cu
 a threshold is what's actually still manual. No new mechanism built -- this was a documentation
 correction, not an implementation gap, exactly like the WAL fencing item above.
 
+## Resharding-by-copy source write-fencing — real fix this time (`84ecb092012`)
+
+A completeness-assessment pass (this session) asked "how far from done is this feature, really,"
+which surfaced the source-write-fencing gap this doc previously closed as "confirmed still a
+deliberate scope boundary, no code change" (see this doc's own earlier "Resharding-by-copy source
+write-fencing — re-checked" entry). Revisiting it with fresh eyes and a concrete design question --
+"is a full dual-write bridge really the only way to close any of this, or is there a smaller real
+increment" -- found there was: `WritePartitionRoutingActionFilter`
+already fences a write-routing *target's* direct writes via an `IndexMetadata` custom-data marker
+(`WritePartitionRoutingMetadata`) plus an `ActionFilter` rejection check. Applying that exact same
+shape to the *source* side of a split, rather than inventing anything new, closes the largest,
+longest-lived, most damaging piece of the gap -- the part where the source silently accepts writes
+forever, not just during the split itself.
+
+**What shipped**: `SourceSplitFenceMetadata` (the same custom-data-marker pattern as
+`WritePartitionRoutingMetadata`), `FenceSplitSourceAction`/`TransportFenceSplitSourceAction`/
+`RestFenceSplitSourceAction` (the same three-file action shape every other resharding action in this
+plugin already has) to set it, and one new `if` branch in `WritePartitionRoutingActionFilter`'s
+existing `rejectIfDirectTargetWrite` reusing the identical rejection mechanism. `TransportOrchestrateShardSplitAction`
+calls `FenceSplitSourceAction` automatically immediately after `CutoverSplitRoutingAction` succeeds,
+so every orchestrated split closes this gap without any extra operator step; `OrchestrateShardSplitResponse`
+gained a `sourceFenced` field so callers can observe it. `TransportOrchestrateShardSplitAction`'s own
+`WARNING` javadoc, `resharding/package-info.java`, and rfc-serverless-opensearch.md's Phase 4 section
+were all updated to describe the real current state rather than the old blanket "never fenced,
+never enforced" framing.
+
+**Honest, explicitly-not-closed remainder**: fencing only takes effect once cutover has already
+succeeded. The earlier window -- between `ShardSplitAction`'s clone point and cutover actually
+completing -- is still real and still unenforced; a document written to the source in that
+specific window is still silently lost. Closing that fully still needs true write-blocking
+synchronized with the clone itself, or an actual dual-write bridge -- both remain genuinely new,
+separate mechanisms, correctly still out of scope, not something this increment tried to also solve.
+This is a real, meaningful narrowing (permanently-open -> bounded-to-one-narrow-window), not a full
+fix, and every piece of new documentation says so explicitly rather than overclaiming.
+
+**Verification, following this session's established discipline**: `SourceSplitFenceMetadataTests`
+(round-trip persistence, unit-level), `RestFenceSplitSourceActionTests` (REST param parsing), and a
+real extension to `ServerlessStorageOrchestrateShardSplitActionIT` -- a genuine orchestrated split
+over the transport layer, then a real `client().index()` call against the now-fenced source name,
+asserting rejection with a message naming both the fenced index and the superseding alias. Confirmed
+meaningful by disabling the new filter check and re-running: the IT still failed, but with a
+different, real error (`UnavailableShardsException`, since the test's own `numDataNodes = 0` means an
+unfenced write would have tried and failed to route to a real shard instead) -- proving the assertion
+is actually pinned on the new rejection path, not just on "any exception." Restored, green. Full
+`:plugins:serverless-storage:test` and `:internalClusterTest` suites and `spotlessJavaCheck` on every
+touched/new file all clean.
+

@@ -3480,28 +3480,33 @@ touches the source index itself. `TransportOrchestrateShardSplitAction` chains
 (optionally) `EnableWritePartitionRoutingAction` into one resumable, still explicitly
 operator-triggered sequence (see `OrchestrateShardSplitAction`'s own javadoc).
 
-**The real, currently unaddressed limitation this leaves: the source index is never quiesced,
-fenced, or made read-only anywhere in this orchestration.** `ShardSplitAction`/`ShardSplitter` clone
-the source's object-store state as of a single point-in-time generation; nothing stops the source
-from continuing to accept writes under its own original name before, during, or after that clone --
-orchestration performs no read-only flip, no write block, and no dual-write bridge to the targets.
-Any document written to the source by its original name after the clone point is captured only by
-the source, not by any split target, so it never becomes visible through the new cutover alias --
-and if the source is later retired via `RetireShrinkSourceAction` (a separate, explicit,
-already-existing "verify then delete" action), that document is gone permanently, with no error or
-warning at any step along the way. This is not enforced or even detected by any of the actions
-involved: `TransportOrchestrateShardSplitAction` does not check whether the source is receiving
-writes, and no other mechanism in this plugin blocks or redirects writes to a source index mid-split.
+**The limitation this left is now closed from cutover onward, though not for the whole operation.**
+`ShardSplitAction`/`ShardSplitter` still clone the source's object-store state as of a single
+point-in-time generation, and nothing stops the source from continuing to accept writes under its
+own original name during provisioning, splitting, or up to the moment cutover itself completes --
+that earlier window is still real and still unenforced (see below). But **once cutover succeeds,
+`TransportOrchestrateShardSplitAction` now fences the source automatically**: `FenceSplitSourceAction`
+marks the source's `IndexMetadata` (`SourceSplitFenceMetadata`, the same custom-data-marker shape
+`WritePartitionRoutingMetadata` already uses for a target's write-routing assignment), and
+`WritePartitionRoutingActionFilter` -- which already rejected a direct write against a write-routing
+target -- now applies the identical rejection to a marked source, closing the previously
+permanently-open "keep writing to the source forever after cutover, silently diverging, until
+`RetireShrinkSourceAction` eventually deletes it, with no error anywhere" gap. Verified end to end:
+`ServerlessStorageOrchestrateShardSplitActionIT` now runs a real orchestrated split and asserts a
+direct write against the source afterward is rejected with a clear `IllegalArgumentException` naming
+both the fenced index and the alias that superseded it -- confirmed meaningful by disabling the new
+check and watching the same assertion fail (with a different, real routing error, since the test has
+no data nodes to actually process the write) before restoring it.
 
-**Operators MUST treat this as a hard precondition, not a suggestion**: before triggering an
-orchestrated split (or the underlying manual `ShardSplitAction` sequence), ensure the source index
-is not receiving direct writes -- either via an application-level write freeze against the source's
-own name, or by first getting every writer to already be writing through an alias this action can
-safely redirect once cutover happens. Building real source write-fencing during orchestration, or a
-dual-write bridge that mirrors writes to both source and targets until cutover completes, would
-close this gap properly; both are significant, separate mechanisms and remain deliberately
-out of scope here, the same "real design work, not implementation time" reasoning this section
-already gave for the cutover primitive itself before it existed.
+**What remains open, and must still be a caller/operator precondition**: the earlier window, between
+the split's clone point and cutover actually completing. Closing that fully needs either true
+write-blocking synchronized with the clone itself, or a dual-write bridge that mirrors writes to
+both source and targets until cutover completes -- both remain genuinely new, separate mechanisms,
+deliberately out of scope here, the same "real design work, not implementation time" reasoning this
+section already gave for the cutover primitive itself before it existed. Operators triggering an
+orchestrated split should still ensure the source is not receiving direct writes during that earlier
+window, even though the tail end of the gap (indefinite post-cutover drift) is now enforced rather
+than merely documented.
 
 **Phase 4.5 — Compaction service, fully done.** Candidate selection, rebase protocol, real Lucene
 merge, size-tiered shaping, background scheduling, a real concurrent-writer data-loss bug, real
