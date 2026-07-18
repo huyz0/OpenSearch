@@ -2806,3 +2806,52 @@ Fixed by tracking per-target success explicitly and rolling back only what this 
 
 A second convergence-check pass on that fix-of-a-fix found nothing further. Full
 `:plugins:serverless-storage:test` and `:internalClusterTest` green throughout.
+
+## Broadened review round 4: gc/clone/retention packages, 8 fixes (`3f3c4f7b37e`)
+
+Widened scope again to the `gc`, `clone`, and `retention` packages (62 files) -- the other
+major data-integrity-critical area besides resharding. 4 finder angles (GC core mechanics,
+clone package, retention core/PITR mechanics, retention/action snapshot pin/restore family),
+14 candidates, adversarially verified. Refuted: index-wide snapshot release/restore
+partial-failure concerns (both already documented, deliberate, retry-safe design, same
+"explicit operator decision" framing this plugin uses elsewhere); single-shard restore's
+once-fetched pin lookup (protected by GC's generous 30-minute retention window -- a restore's
+CAS loop completes in well under a second); clone's lack of in-plugin authorization (systemic,
+deliberate design assumption the whole plugin shares, not clone-specific).
+
+Fixed, most severe first:
+
+1. **Clone-of-a-clone only resolved one fallback hop** -- a bundle physically living two or
+   more clone hops back (not just the immediate source) threw `NoSuchFileException` instead of
+   resolving. Added `ShardCloner#resolveLineageChain` (walks the full chain, 32-hop depth
+   guard against corruption) and a `chain()` helper on both `FallbackBundleFileReader` and
+   `FallbackStreamReader`, wired into all three read paths that previously only checked one
+   hop: the lazy-directory reader, shard-shrink materialization, and partition-rewrite
+   materialization.
+2. **Self-clone (source == target) could corrupt an active shard's manifest history** --
+   `ShardCloner#clone` writes the target's manifest before its head CAS check, so a self-clone
+   would collide with the shard's own genuine first commit before the CAS could reject it.
+   `ShardCloneRequest` now refuses source == target directly.
+3. **Retrying a clone with a different source permanently leaked the earlier attempt's pin** --
+   if a clone attempt pinned its source and wrote lineage but then lost the head CAS, and the
+   caller retried with a *different* source, lineage got silently overwritten and `deleteClone`
+   (which only ever reads the *current* lineage) could never find the first attempt's pin
+   again. `clone()` now refuses to overwrite lineage pointing at a different source.
+4. Two swallowed-exception catch blocks (`ServerlessStoragePlugin`'s clone-lineage/WAL-registry
+   cleanup on index deletion, `PitrRetentionSchedulerTask`'s reconciliation) claimed in their
+   own comments to log but had no logger call -- a persistent failure in either was completely
+   invisible. Both now actually log.
+5. `GcSchedulerConfig` had no upper bound on `retentionWindowMillis`; a value near
+   `Long.MAX_VALUE` would underflow the cutoff subtraction in `GcSchedulerTask#sweep` and
+   invert the safety margin into "no retention window at all." Bounded to 365 days.
+6. `GcSchedulerTask` read pins once near the top of `sweep()` and reused that snapshot all the
+   way to the actual delete call -- a pin added in the (narrow but real) window between was
+   never seen. Now re-checks pins immediately before deleting.
+7. `PitrRetentionPolicy`'s "latest before cutoff" pick broke timestamp ties
+   non-deterministically (iteration order of an unordered blob-listing map), causing needless
+   pin churn across reconciliation ticks. Now breaks ties deterministically by (primaryTerm,
+   generation).
+
+A convergence-check pass on this round's own fixes -- especially the three rewritten read-path
+call sites and the new chain-walking helpers -- found nothing further. Full
+`:plugins:serverless-storage:test` and `:internalClusterTest` green throughout.
