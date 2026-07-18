@@ -2590,3 +2590,55 @@ longer accurate -- there is now real, reproducible, favorable-to-batching data; 
 flip the default is now a considered "wait for real validation despite a favorable signal," not "no
 information available either way."
 
+## RFC risk #8/#9 first measurements (vector/kNN cold query, global-ordinal cold build)
+
+Two more items from the completeness-sweep punch list: RFC risks #8 and #9 (vector/kNN cold-query
+cost, aggregation-heavy global-ordinal cold build) had never actually been measured, only
+speculated. Built `VectorWorkloadColdQueryBenchmarkTests` and `GlobalOrdinalsColdBuildBenchmarkTests`
+(both `plugins/serverless-storage/src/test/.../readerengine/lazydirectory/`), following the same
+real-Lucene-index-through-the-real-manifest-path pattern `LazyDirectoryBootSetPrefetchBenchmarkTests`
+already established. Full findings recorded directly in rfc-serverless-opensearch.md's own risk
+#8/#9 status notes (the natural home for "is this risk still open" tracking) rather than duplicated
+here -- short version: cold k-NN cost turned out comparable to cold term-query cost at the tested
+scale (not dramatically worse, a real counter-signal to risk #8's strongest framing), while cold
+global-ordinal construction confirmed a real, severe latency cliff (~13s cold vs ~140ms with
+prefetch) that the existing boot-set prefetch mechanism (built for an unrelated milestone) already
+substantially mitigates. Neither risk's suggested new machinery (a distinct vector cache class,
+ordinal-aware boot sets) was built -- the evidence didn't justify it.
+
+One real, unrelated flaky-test bug found and fixed during this pass, not deferred: the k-NN
+benchmark's own first assertion (`knn >= term`, strict) turned out fragile against natural
+wall-clock jitter once the two medians landed close together on a real run (3229ms vs 3168ms, ~2%
+apart) -- loosened to a wide floor that still catches a genuine regression without being flaky.
+
+## Property-based GC bundle-safety fuzzer (`f562ded19f8`)
+
+The last completeness-sweep item: existing GC chaos coverage (`GcSchedulerTaskChaosTests`) is a
+single fixed, hand-scripted operation sequence under randomized I/O faults -- real, but only ever
+able to catch the one interleaving its author thought to write down. Added
+`GcBundleSafetyPropertyFuzzTests`: random *sequences* of real logical operations (publish, sweep,
+pin, release, clock-advance), 60 trials of 15-60 steps each, checking after every single step that
+GC never deletes a bundle or manifest record a currently-live (latest or durably pinned) manifest
+still needs. Directly targets the shape of the earlier real HIGH bug this session's own correctness
+review found and fixed (GC deleting a bundle a concurrent commit had just published) -- a race
+between logical operations, not an I/O fault, which is exactly what randomized *interleaving*
+catches and randomized *fault injection* alone does not.
+
+**A real bug found on first real use**, documented in full in rfc-serverless-opensearch.md's own
+risk #5 status note (added alongside the fuzzer's own summary there): `GcSchedulerTask#sweep`'s
+manifest-retention-cutoff computation silently ignored the injectable test `clock`, using
+`System.currentTimeMillis()` directly instead -- a real testability gap (not a production bug, same
+default clock either way) that could have let a real regression in that half of GC's safety logic
+go undetected by any clock-controlled test. Fixed to use `clock.getAsLong()` consistently.
+
+**A second, more interesting finding was in the fuzzer's own test design, not production code**:
+the first version of the fuzzer's invariant check only verified bundle integrity for manifests that
+still *existed* in the manifest store -- missing that a pin-awareness bug lets GC delete the
+*manifest record itself* outright (manifest deletion has no sustained-observation delay, unlike
+bundle deletion), silently removing it from every later check. A deliberately-injected pin-awareness
+break in `ManifestRetentionPolicy#isDeletable` passed 200 trials x up to 80 steps completely
+unnoticed against the original invariant check. Fixed by also asserting every currently-durably-pinned
+manifest ID still has a real manifest record present, independent of bundle-level checks -- the same
+break is now caught reliably across repeated runs at a much smaller, CI-reasonable 60x60 budget.
+Restored, full plugin suite and spotless clean.
+

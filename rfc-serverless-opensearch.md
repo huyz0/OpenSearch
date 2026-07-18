@@ -4698,6 +4698,22 @@ head untouched, and that naming a nonexistent index fails with a clear precondit
    hypothetical one -- caught by modeling the mechanism, not by code review or testing (the
    existing unit/integration test suite passed unchanged both before and after the fix, since
    nothing in it exercised the narrow interleaving window the model surfaces).
+
+   **Runtime property-based fuzzing now complements the TLA+ models above**, a different technique
+   catching a different class of bug: `GcBundleSafetyPropertyFuzzTests` generates random *sequences*
+   of real logical operations (publish, sweep, pin, release, clock-advance) against the actual Java
+   implementation, checking after every step that GC never deletes a bundle or manifest record a
+   currently-live (latest or durably pinned) manifest still needs -- the TLA+ models above verify the
+   *design* is sound in the abstract; this verifies the *shipped code* actually implements that
+   design correctly, which a formal model can't catch on its own (a model can be a faithful proof of
+   an unfaithful abstraction of the real code). Found a real bug on its first real use:
+   `GcSchedulerTask#sweep` computed its manifest-retention-cutoff time from `System.currentTimeMillis()`
+   directly rather than the injectable `clock` its own constructor exists to let tests control --
+   not a production bug (the default clock is `System::currentTimeMillis` either way), but a real
+   testability gap that could have let a genuine regression in that half of GC's safety logic go
+   undetected by any clock-controlled test. Fixed. Confirmed the fuzzer has real teeth via
+   break-the-fix: a deliberately-injected pin-awareness break in `ManifestRetentionPolicy#isDeletable`
+   was caught reliably across repeated runs once tuned to a wide-enough trial/step budget, restored.
 6. **Interplay with existing warm/composite work.** Writable warm solves an overlapping problem
    (disk smaller than data) with a different mechanism (composite local+remote directory under a
    writable engine). Decision needed: converge warm onto the reader-engine + bundle layout in
