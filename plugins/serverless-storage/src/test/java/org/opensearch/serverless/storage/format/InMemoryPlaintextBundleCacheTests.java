@@ -88,6 +88,54 @@ public class InMemoryPlaintextBundleCacheTests extends OpenSearchTestCase {
         assertEquals("b.bin should have been evicted and re-fetched", 4, counting.callCount.get());
     }
 
+    // Regression test for a real bug: readFile releases its lock between the initial get() check
+    // and the later put(), so two concurrent misses for the SAME key both call onMiss independently
+    // and both reach put(). put() on an already-present key silently replaces the old value, but
+    // the old code unconditionally added the new value's length without subtracting the length of
+    // whatever it just overwrote -- currentTotalBytes drifted upward by one entry's worth on every
+    // such race, permanently, even though only one value ever actually survives in the map.
+    public void testConcurrentMissesForTheSameKeyDoNotDoubleCountBytesOnOverwrite() throws Exception {
+        SegmentBundle bundle = writeSampleBundle();
+        BundleFileEntry entry = bundle.entries().get("a.bin");
+        InMemoryPlaintextBundleCache cache = new InMemoryPlaintextBundleCache(1024);
+
+        java.util.concurrent.CountDownLatch bothEntered = new java.util.concurrent.CountDownLatch(2);
+        java.util.concurrent.CountDownLatch proceed = new java.util.concurrent.CountDownLatch(1);
+        BundleFileReader blockingReader = (bundleName, e) -> {
+            bothEntered.countDown();
+            try {
+                proceed.await();
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                throw new java.io.IOException(ex);
+            }
+            return inMemoryReader(bundle).readFile(bundleName, e);
+        };
+
+        java.util.concurrent.ExecutorService executor = java.util.concurrent.Executors.newFixedThreadPool(2);
+        try {
+            java.util.List<java.util.concurrent.Future<byte[]>> futures = new java.util.ArrayList<>();
+            for (int i = 0; i < 2; i++) {
+                futures.add(executor.submit(() -> cache.readFile("bundle-1", entry, blockingReader)));
+            }
+            // Both threads must have missed and entered onMiss (proving the race is real -- neither
+            // saw the other's result cached yet) before either is allowed to proceed to put().
+            assertTrue(bothEntered.await(10, java.util.concurrent.TimeUnit.SECONDS));
+            proceed.countDown();
+            for (java.util.concurrent.Future<byte[]> future : futures) {
+                future.get(10, java.util.concurrent.TimeUnit.SECONDS);
+            }
+        } finally {
+            executor.shutdown();
+        }
+
+        assertEquals(
+            "currentTotalBytes must reflect only the one surviving entry, not both racing writers' lengths",
+            entry.length(),
+            cache.currentTotalBytes()
+        );
+    }
+
     public void testAnEntryLargerThanTheWholeCapIsServedButNeverCached() throws Exception {
         SegmentBundle bundle = writeSampleBundle(); // "hello" == 5 bytes
         BundleFileEntry entry = bundle.entries().get("a.bin");

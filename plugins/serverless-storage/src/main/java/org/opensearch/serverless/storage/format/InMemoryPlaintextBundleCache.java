@@ -86,8 +86,14 @@ public final class InMemoryPlaintextBundleCache {
 
         synchronized (lock) {
             if (fresh.length <= maxTotalBytes) {
-                entriesByKey.put(key, fresh);
-                currentTotalBytes += fresh.length;
+                // Two concurrent misses for the same key both reach here independently (lock is
+                // released between the get() above and this put()) -- byte[] previous holds
+                // whichever one this put() is about to overwrite, so its length is subtracted
+                // rather than double-counted. Without this, currentTotalBytes drifts permanently
+                // upward on every such race, since only one value ever actually survives in the
+                // map but both writers' lengths would otherwise be added.
+                byte[] previous = entriesByKey.put(key, fresh);
+                currentTotalBytes += fresh.length - (previous == null ? 0 : previous.length);
                 evictUntilWithinBudget();
             }
         }
