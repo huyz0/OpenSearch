@@ -109,17 +109,22 @@ public class TransportFenceSplitSourceAction extends TransportClusterManagerNode
             return;
         }
         clusterService.submitStateUpdateTask("serverless-storage-fence-split-source", new ClusterStateUpdateTask(Priority.URGENT) {
-            // Set by execute() so clusterStateProcessed can tell a genuine fence apart from the
-            // no-op branch (source deleted between the pre-checks above and this task actually
-            // running) -- the two must not both report success (see TransportFenceSplitSourceAction
-            // javadoc discussion of this race).
+            // Set by execute() so clusterStateProcessed can tell a genuine fence apart from either
+            // no-op branch (source or superseding alias deleted between the pre-checks above and
+            // this task actually running) -- none of these must report success (see
+            // TransportFenceSplitSourceAction javadoc discussion of this race).
             private boolean sourceStillPresent = true;
+            private boolean aliasStillPresent = true;
 
             @Override
             public ClusterState execute(ClusterState currentState) {
                 IndexMetadata sourceMetadata = currentState.metadata().index(sourceIndexName);
                 if (sourceMetadata == null) {
                     sourceStillPresent = false;
+                    return currentState;
+                }
+                if (currentState.metadata().hasAlias(supersedingAliasName) == false) {
+                    aliasStillPresent = false;
                     return currentState;
                 }
                 Metadata.Builder metadataBuilder = Metadata.builder(currentState.metadata());
@@ -139,6 +144,25 @@ public class TransportFenceSplitSourceAction extends TransportClusterManagerNode
                     listener.onFailure(
                         new IllegalStateException(
                             "source index [" + sourceIndexName + "] was deleted before it could be fenced -- fencing did not apply"
+                        )
+                    );
+                    return;
+                }
+                if (aliasStillPresent == false) {
+                    logger.warn(
+                        "superseding alias ["
+                            + supersedingAliasName
+                            + "] was deleted concurrently with fencing ["
+                            + sourceIndexName
+                            + "] -- fence was not applied, reporting failure rather than a false acknowledgement"
+                    );
+                    listener.onFailure(
+                        new IllegalStateException(
+                            "superseding alias ["
+                                + supersedingAliasName
+                                + "] was deleted before ["
+                                + sourceIndexName
+                                + "] could be fenced -- fencing did not apply"
                         )
                     );
                     return;
