@@ -2679,3 +2679,33 @@ documentation risk -- an operator reading `SnapshotPinAction`'s name alone could
 action classes' own javadoc and a matching RFC status note (Phase 4.6), so this doesn't need
 rediscovering by a future reader or sweep.
 
+## Migration tooling "reverse direction" — the premise itself was wrong (`e03e2aecbce`)
+
+Last punch-list item, and the second genuine self-correction this session (after the earlier
+"WAL fencing"/"write-routing cutover" scan false-alarms). This item's own framing -- "reverse
+direction: serverless-to-classic migration" -- came from *this session's own* earlier completeness
+assessment, not from anything the RFC actually scoped. Re-reading rfc-serverless-opensearch.md's
+Phase 6 text and `ClassicIndexMigrator`'s own javadoc carefully: "both migration directions" this
+section has always named means two different *sources* feeding the *same* classic-to-serverless-
+storage conversion -- ordinary peer/translog recovery vs. a snapshot-mount import -- not a
+serverless-to-classic reverse path. Grepped the whole RFC for "reverse migrat"/"migrate back"/
+similar phrasing: zero hits before this session's own edits. A genuine misreading, caught by going
+back to the primary source instead of trusting an earlier summary (this doc's own, several turns
+back) at face value.
+
+**Also answered the hypothetical anyway, since "how hard would this actually be" is worth knowing
+regardless of whether it was ever promised**: traced what a real reverse-migration mechanism would
+need and found it is not the symmetric packaging step the RFC's original phrasing could be misread
+to imply. `ObjectStoreCommitMaterializer` already does the file-materialization half either
+direction, but a plain classic index has no serverless-storage-specific `DirectoryFactory` seam to
+pre-populate its store through -- core's `StoreRecovery#recoverEmptyStore` unconditionally wipes
+whatever's already on a brand-new shard's local disk, the exact same problem &sect;7.1.2 already had
+to solve with real core changes for this plugin's *own* writer engine's cross-node failover case,
+but with no existing seam to reuse for an ordinary classic index target. Real new core-recovery-path
+design work, correctly not attempted here.
+
+Both `rfc-serverless-opensearch.md`'s Phase 6 section and `ClassicIndexMigrator`'s own javadoc now
+say this precisely, closing out this session's full punch list (items #1-20, all resolved: real
+fixes/additions, confirmed non-issues, corrected stale scan findings, or -- twice now -- corrected
+this session's own earlier mischaracterizations).
+
