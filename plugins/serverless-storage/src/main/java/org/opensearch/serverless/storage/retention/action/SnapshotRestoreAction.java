@@ -32,6 +32,10 @@ import org.opensearch.action.ActionType;
  * <p>Deliberately scoped to one shard per call, same shape as every other action this plugin
  * exposes -- an index-wide "restore every shard from one snapshot, all-or-nothing" orchestration
  * layer is separate future work, not attempted here.
+ *
+ * <p><b>Not core's real snapshot/restore feature</b> -- see {@link SnapshotPinAction}'s own javadoc
+ * for the precise scope boundary (no {@code RepositoryPlugin}/{@code Repository}, no {@code
+ * _snapshot} API compatibility, no cross-cluster restore).
  */
 public class SnapshotRestoreAction extends ActionType<SnapshotRestoreResponse> {
 

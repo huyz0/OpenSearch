@@ -33,6 +33,19 @@ import org.opensearch.action.ActionType;
  * TransportSnapshotPinAction}), matching ordinary snapshot semantics where re-running a snapshot
  * under the same name updates it to the shard's current state rather than accumulating every
  * generation ever pinned under that name.
+ *
+ * <p><b>This is a genuinely different mechanism from core's real snapshot/restore feature, despite
+ * the shared vocabulary -- not a compatible or partial implementation of it.</b> This plugin does
+ * not implement {@code RepositoryPlugin}/{@code Repository}, is not registrable via {@code PUT
+ * _snapshot/&lt;repo&gt;}, and has no repository-level verification, cross-index/all-shards
+ * orchestration, or cross-cluster restore. What "snapshot" means here is exactly what the javadoc
+ * above says: durably retain one shard's current manifest generation, by name, against GC, so a
+ * later {@link SnapshotRestoreAction} can CAS that same shard's own head back to it in place. There
+ * is no data movement, no portable archive, and no way to restore into a different index or a
+ * different cluster. Real {@code Repository} SPI integration -- letting this plugin's storage back
+ * an ordinary {@code _snapshot}/{@code _restore} repository -- would be a genuinely new, separate
+ * mechanism (most likely reusing {@code repository-s3}/{@code repository-fs}-style plumbing rather
+ * than this pin registry), deliberately out of scope here.
  */
 public class SnapshotPinAction extends ActionType<SnapshotPinResponse> {
 

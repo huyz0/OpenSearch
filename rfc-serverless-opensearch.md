@@ -3982,6 +3982,25 @@ internals themselves -- real background ticks, real pin add/remove, cancellation
 exhaustively covered directly in `PitrRetentionSchedulerTaskTests` against a short, configurable
 interval, since the engine's real 5-minute interval is far too long to observe in a test).
 
+**Precise scope of "snapshot" here, assessed and worth stating plainly: this is not, and was never
+meant to be, integration with core's actual snapshot repository system.** A completeness-assessment
+pass this session asked what "a first, scoped slice" of snapshot support actually covers vs. full
+parity with core's `_snapshot`/`_restore` API -- the answer is a real, wide gap, not a narrow one:
+this plugin implements neither `RepositoryPlugin` nor `Repository`, is not registrable via `PUT
+_snapshot/<repo>`, and has no repository verification, index-wide/all-shards snapshot orchestration,
+or cross-cluster restore. `SnapshotPinAction`/`SnapshotRestoreAction` (this section, above) are a
+different, narrower, single-shard mechanism: durably retain one manifest generation by name against
+GC, then CAS that same shard's own head back to it in place -- no data movement, no portable
+archive, no restoring into a different index or cluster. The shared vocabulary ("snapshot,"
+"restore") risks reading as more than it is; both action classes' own javadoc now says this
+explicitly. **Building real `Repository` SPI integration is deliberately not attempted here** -- it
+would be a genuinely new, separate mechanism (most likely composing with `repository-s3`/
+`repository-fs`-style plumbing rather than extending this pin registry), the same cross-team/
+large-new-mechanism scale as &sect;18 risk #6's warm/composite convergence, correctly a future
+decision rather than something this pass should build. What exists today is a real, useful, if
+narrower tool -- protecting a shard against accidental deletion/corruption and rolling it back in
+place -- not a replacement for or implementation of core's backup/restore/DR story.
+
 **Phase 5 — Hardening (ongoing). Resharding-by-copy: split, shrink, and physical bundle
 rewrite all done.** The split half of "split/shrink via manifest rewrite + bundle copy —
 no reindex" is implemented: `ShardSplitter.split` (`resharding` package) creates one target shard
