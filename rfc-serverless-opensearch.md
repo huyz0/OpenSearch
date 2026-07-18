@@ -4742,6 +4742,23 @@ head untouched, and that naming a nonexistent index fails with a clear precondit
    distinct cache class (pin whole graphs while a shard is query-active) and possibly
    graph-aware boot sets; sizing rules differ enough from text search that kNN gets its own
    measurement gate in Phase 3 rather than an assumption of "it's just another file."
+
+   **Status: measured for the first time, with a real (if scale-limited) counter-signal to the
+   "nearly the worst case" framing above.** `VectorWorkloadColdQueryBenchmarkTests` builds a real
+   Lucene-backed k-NN index (128-dim vectors, a real ~3 MB `.vec` file confirmed to span multiple
+   real 1 MiB blocks, not a toy single-block case) and compares cold k-NN query latency against
+   cold term-query latency through the exact same `LazyBundleDirectory`/`FileCache` setup under
+   simulated `HIGH` latency, with and without boot-set prefetch. Result: at this scale, cold k-NN
+   cost is comparable to cold term-query cost (~3.2s vs ~3.1s without prefetch), not dramatically
+   worse as the speculation above predicted, and boot-set prefetch -- despite only ever fetching
+   each file's *first* block -- helps both substantially (k-NN drops to ~355-380ms, term to
+   ~265ms). Neither a distinct cache class nor graph-aware boot sets are justified by this
+   evidence. **Genuine, stated limitation, not glossed over**: this is one dataset at one scale
+   (6000 vectors, dim 128, default HNSW `M`); a larger graph with genuinely deep, scattered
+   multi-hop traversal per query could still show the predicted gap opening up at production
+   scale -- this measurement narrows the risk, it doesn't retire it outright. If real k-NN
+   workloads are adopted at meaningfully larger scale, re-measuring against that real scale is the
+   right next step, not assuming this result generalizes indefinitely.
 9. **Aggregation-heavy heap costs on readers** (global ordinals, fielddata) behave differently
    when segment data is cold — building global ordinals on a cache-miss storm is a latency
    cliff. Mitigation candidates: ordinal structures included in boot sets, or eager ordinal
