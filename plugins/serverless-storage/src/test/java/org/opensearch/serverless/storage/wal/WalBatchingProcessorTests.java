@@ -18,6 +18,7 @@ import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.blobstore.support.FilterBlobContainer;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.common.bytes.BytesReference;
+import org.opensearch.serverless.storage.security.EncryptionKeyProvider;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.threadpool.TestThreadPool;
 import org.opensearch.threadpool.ThreadPool;
@@ -312,6 +313,59 @@ public class WalBatchingProcessorTests extends OpenSearchTestCase {
         assertEquals("must not have drained yet -- interval hasn't elapsed and threshold wasn't crossed", 1, logChunkCount());
         future.get(10, TimeUnit.SECONDS);
         assertEquals("the interval drain must still land eventually", 2, logChunkCount());
+    }
+
+    /**
+     * A failure encrypting a record (thrown before {@code writeChunkWithRetry} is ever reached)
+     * must still release those bytes from {@link WalBatchingProcessor#backlogBytes()} -- the same
+     * "must not hang, must not leak" contract {@link #testAWriteFailureNotifiesEveryCandidateInTheBatch}
+     * already proves for a write-layer failure. Regression test for a real bug: the encryption loop
+     * used to run outside the try/finally that decrements backlogBytes, so an encryption failure
+     * permanently leaked the batch's bytes, eventually wedging every future write with
+     * OpenSearchRejectedExecutionException once the (never-reset) counter crossed the backlog
+     * threshold.
+     */
+    public void testAnEncryptionFailureStillReleasesTheBatchFromTheBacklog() throws Exception {
+        WalChunkService service = new WalChunkService(blobContainer, "epoch-0");
+        EncryptionKeyProvider alwaysThrows = new EncryptionKeyProvider() {
+            @Override
+            public javax.crypto.SecretKey currentKey() {
+                throw new IllegalStateException("injected key-provider failure");
+            }
+
+            @Override
+            public javax.crypto.SecretKey currentKey(String indexUuid) {
+                throw new IllegalStateException("injected key-provider failure");
+            }
+        };
+        WalBatchingProcessor processor = new WalBatchingProcessor(
+            LogManager.getLogger(WalBatchingProcessorTests.class),
+            1000,
+            threadPool.getThreadContext(),
+            threadPool,
+            () -> TimeValue.timeValueMillis(20),
+            -1,
+            -1,
+            service,
+            alwaysThrows
+        );
+
+        int count = 5;
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+        for (int i = 0; i < count; i++) {
+            futures.add(put(processor, new WalRecord("idx", 0, 1, i, ("v" + i).getBytes(java.nio.charset.StandardCharsets.UTF_8))));
+        }
+        for (CompletableFuture<Void> future : futures) {
+            expectThrows(ExecutionException.class, () -> future.get(30, TimeUnit.SECONDS));
+        }
+
+        assertBusy(
+            () -> assertEquals(
+                "an encryption failure must still release the batch's bytes from the backlog",
+                0L,
+                processor.backlogBytes()
+            )
+        );
     }
 
     /** Fails every {@code writeBlob}, but delegates the register operations {@code claimNextChunkSequence} needs so the failure is purely on the chunk write. */

@@ -82,6 +82,25 @@ public class WalChunkWriterReaderTests extends OpenSearchTestCase {
         assertTrue(e.getMessage(), e.getMessage().contains("truncated"));
     }
 
+    // Regression test for a real bug: recordCount was used to presize an ArrayList before the
+    // trailing checksum was ever verified, with only a `< 0` check -- a corrupted recordCount
+    // field (magic/version intact) could pre-size an absurdly large allocation instead of failing
+    // closed with a clean WalFormatException.
+    public void testImpossiblyLargeRecordCountIsRejectedBeforeAllocatingAnything() {
+        WalRecord record = new WalRecord("idx", 0, 1, 0, randomByteArrayOfLength(64));
+        byte[] chunk = WalChunkWriter.write(List.of(record));
+        byte[] corrupted = chunk.clone();
+        // recordCount is the 4-byte int immediately after the 4-byte magic + 4-byte version header,
+        // i.e. bytes [8, 12). Overwrite it with a huge, clearly-impossible value.
+        corrupted[8] = 0x7F;
+        corrupted[9] = (byte) 0xFF;
+        corrupted[10] = (byte) 0xFF;
+        corrupted[11] = (byte) 0xFF;
+
+        WalFormatException e = expectThrows(WalFormatException.class, () -> WalChunkReader.readRecords(corrupted));
+        assertTrue(e.getMessage(), e.getMessage().contains("impossibly large"));
+    }
+
     public void testNotAWalChunkIsRejectedWithSpecificMessage() {
         WalFormatException e = expectThrows(WalFormatException.class, () -> WalChunkReader.readRecords(randomByteArrayOfLength(100)));
         assertTrue(e.getMessage(), e.getMessage().contains("bad magic header"));

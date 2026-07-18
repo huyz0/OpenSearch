@@ -8,6 +8,8 @@
 
 package org.opensearch.serverless.storage.wal;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
@@ -52,6 +54,8 @@ import java.util.function.BiFunction;
  * entirely for that tick rather than guessing a bound that could delete something still needed.
  */
 public final class WalGcSchedulerTask implements Closeable {
+
+    private static final Logger logger = LogManager.getLogger(WalGcSchedulerTask.class);
 
     private final BlobContainer walBlobContainer;
     private final WalShardRegistry registry;
@@ -104,7 +108,17 @@ public final class WalGcSchedulerTask implements Closeable {
             ShardStateStore shardStateStore = new BlobContainerShardStateStore(shardContainer);
             Optional<VersionedShardHead> head = shardStateStore.get(shard.indexUuid(), shard.shardId());
             if (head.isEmpty() || head.get().head().latestManifestGeneration() == 0) {
-                return; // a known shard has never published -- conservative bail-out, see class javadoc
+                // Conservative bail-out, see class javadoc -- this blocks WAL GC for every shard
+                // sharing this container, not just this one, on every tick until this shard
+                // publishes (a brand-new shard that hasn't committed yet is the common, expected
+                // case; a shard that's stuck this way indefinitely is not, and worth an operator
+                // noticing rather than silently accumulating unbounded WAL chunk storage).
+                logger.info(
+                    "WAL GC sweep skipped this tick: shard {}/{} is registered but has never published a manifest",
+                    shard.indexUuid(),
+                    shard.shardId()
+                );
+                return;
             }
             ShardHead shardHead = head.get().head();
             CommitManifest manifest = new BlobContainerManifestStore(shardContainer).readManifest(
@@ -113,7 +127,13 @@ public final class WalGcSchedulerTask implements Closeable {
             );
             WalPosition position = manifest.walPosition();
             if (position == null) {
-                return; // this shard's latest commit carries no real WAL coverage -- conservative bail-out
+                // Same container-wide bail-out as above, see that branch's comment.
+                logger.info(
+                    "WAL GC sweep skipped this tick: shard {}/{}'s latest manifest carries no real WAL position",
+                    shard.indexUuid(),
+                    shard.shardId()
+                );
+                return;
             }
             minCoveredSequence = Math.min(minCoveredSequence, position.offset());
         }

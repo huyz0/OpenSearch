@@ -20,6 +20,15 @@ import java.util.zip.CRC32C;
 /** Parses a {@link WalChunkWriter}-produced chunk back into its ordered list of {@link WalRecord}s. */
 public final class WalChunkReader {
 
+    /**
+     * The smallest a single record's encoding can possibly be: 2-byte indexUuid length + 4-byte
+     * shardId + 8-byte primaryTerm + 8-byte seqNo + 4-byte payload length, with both the indexUuid
+     * and payload themselves at their minimum (zero) length. Used only as an upper bound on a
+     * chunk's claimed {@code recordCount} against its remaining byte length -- see {@link
+     * #readRecords} for why.
+     */
+    private static final int MIN_BYTES_PER_RECORD = 2 + 4 + 8 + 8 + 4;
+
     private WalChunkReader() {}
 
     /**
@@ -51,6 +60,20 @@ public final class WalChunkReader {
             int recordCount = in.readInt();
             if (recordCount < 0) {
                 throw new WalFormatException("negative record count " + recordCount);
+            }
+            // A sanity bound, checked BEFORE presizing the ArrayList below and well before the
+            // trailing checksum is verified: a single corrupted bit landing in this field (while
+            // magic/version stay intact) could otherwise produce a huge positive value, causing an
+            // OutOfMemoryError instead of the clean WalFormatException this method's own contract
+            // promises ("fail closed on a corrupt chunk"). MIN_BYTES_PER_RECORD is the smallest a
+            // real record's encoding can possibly be (every fixed-width field plus a zero-length
+            // indexUuid and payload), so recordCount can never legitimately exceed the remaining
+            // bytes divided by it.
+            int remainingBytes = rawIn.available();
+            if (recordCount > remainingBytes / MIN_BYTES_PER_RECORD) {
+                throw new WalFormatException(
+                    "record count " + recordCount + " impossibly large for a chunk with only " + remainingBytes + " bytes remaining"
+                );
             }
 
             List<WalRecord> records = new ArrayList<>(recordCount);

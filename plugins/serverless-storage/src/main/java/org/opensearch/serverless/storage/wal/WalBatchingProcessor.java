@@ -132,14 +132,24 @@ public final class WalBatchingProcessor extends BufferedAsyncIOProcessor<WalReco
 
     @Override
     protected void write(List<Tuple<WalRecord, Consumer<Exception>>> candidates) throws IOException {
+        // batchBytes is computed from the candidates themselves (their payload lengths are exactly
+        // what put() already added to backlogBytes at enqueue time), so the decrement below is
+        // correct regardless of whether encryption below succeeds -- computing it up front, before
+        // the try, lets the try/finally cover the encryption loop too. Encryption failing partway
+        // through a batch must still release those bytes from the backlog counter: put() already
+        // counted every candidate's bytes, and there is no other decrement site, so a failure here
+        // that skipped the finally would leak backlogBytes permanently (compounding on every retry)
+        // and eventually wedge WalMirroringTranslog#add into rejecting all future writes forever.
         long batchBytes = 0;
-        List<WalRecord> records = new ArrayList<>(candidates.size());
         for (Tuple<WalRecord, Consumer<Exception>> candidate : candidates) {
-            WalRecord record = candidate.v1();
-            batchBytes += record.payload().length;
-            records.add(encryptionKeyProvider == null ? record : WalRecordCrypto.encrypt(record, encryptionKeyProvider));
+            batchBytes += candidate.v1().payload().length;
         }
         try {
+            List<WalRecord> records = new ArrayList<>(candidates.size());
+            for (Tuple<WalRecord, Consumer<Exception>> candidate : candidates) {
+                WalRecord record = candidate.v1();
+                records.add(encryptionKeyProvider == null ? record : WalRecordCrypto.encrypt(record, encryptionKeyProvider));
+            }
             long chunkSequence = walChunkService.writeChunkWithRetry(records);
             if (chunkSequence >= 0) {
                 lastWrittenChunkSequence = chunkSequence;
@@ -147,8 +157,9 @@ public final class WalBatchingProcessor extends BufferedAsyncIOProcessor<WalReco
             // The base class notifies every candidate's listener with null (success) once this returns
             // without throwing, or with the thrown exception if it does -- both handled there, not here.
         } finally {
-            // Decremented on both success and failure: either way these records are no longer sitting
-            // in the backlog once this write attempt is done -- a failed batch's callers get the
+            // Decremented on every path, success or failure (including an encryption failure that
+            // never reaches writeChunkWithRetry): either way these records are no longer sitting in
+            // the backlog once this write attempt is done -- a failed batch's callers get the
             // exception and, per WalMirroringTranslog#ensureSynced's contract, must retry the whole
             // operation (which re-enqueues and re-counts it), not silently resurrect the old backlog.
             backlogBytes.addAndGet(-batchBytes);

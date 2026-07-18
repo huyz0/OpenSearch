@@ -126,6 +126,16 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     private final WalChunkService walChunkService;
     private final org.opensearch.serverless.storage.security.EncryptionKeyProvider encryptionKeyProvider;
     /**
+     * Whether {@link #walChunkService}'s {@code WalShardRegistry} registration has ever succeeded
+     * for this shard -- {@code true} makes {@link #registerWalShardIfNeeded} a no-op. Registration
+     * is retried on every {@link #renewLease} tick until it succeeds once, not just attempted once
+     * at construction: {@code WalGcSchedulerTask}'s safety bound is computed only over registered
+     * shards, so a shard that never registers is invisible to it and its WAL chunks could be GC'd
+     * while still needed for recovery -- a real data-loss gap a single, never-retried attempt left
+     * open.
+     */
+    private final AtomicBoolean walShardRegistered = new AtomicBoolean(false);
+    /**
      * Sweeps {@link #walChunkService}'s own container on a schedule -- non-{@code null} only for a
      * shard opted into a dedicated WAL stream (rfc-serverless-opensearch.md &sect;12's "dedicated
      * WAL streams" regulatory co-residency bullet), where {@link #walChunkService} is scoped to
@@ -551,22 +561,7 @@ public class ObjectStoreWriterEngine extends InternalEngine {
         this.walChunkService = walChunkService;
         this.encryptionKeyProvider = encryptionKeyProvider;
         this.dedicatedWalGcSchedulerTask = dedicatedWalGcSchedulerTask;
-        if (walChunkService != null) {
-            // Once per activation, not per append -- see WalShardRegistry's own javadoc for why a
-            // grow-only registry only needs to know "has this shard ever used this container," not
-            // continuous confirmation. Best-effort like refreshDirectoryEntry/renewLease below: this
-            // is bookkeeping for a future retention sweep, not yet load-bearing for anything this
-            // engine's own correctness depends on, so a transient failure here must never block
-            // activation.
-            try {
-                new org.opensearch.serverless.storage.wal.WalShardRegistry(walChunkService.blobContainer()).register(
-                    engineConfig.getShardId().getIndex().getUUID(),
-                    engineConfig.getShardId().getId()
-                );
-            } catch (Exception e) {
-                logger.warn("failed to register this shard in the WAL shard registry, will not retry until next activation", e);
-            }
-        }
+        registerWalShardIfNeeded();
         // Acquired synchronously, before this engine is usable, so CompactionSchedulerTask's
         // isLeaseHeldAt guard can actually observe this writer as active (see
         // acquireOrRenewLease's javadoc -- fencing correctness itself lives entirely in
@@ -1053,6 +1048,27 @@ public class ObjectStoreWriterEngine extends InternalEngine {
             );
         } catch (Exception e) {
             logger.warn("failed to renew writer lease, will retry next tick", e);
+        }
+        registerWalShardIfNeeded();
+    }
+
+    /**
+     * Registers this shard in {@code WalShardRegistry}, retrying on every {@link #renewLease} tick
+     * until it succeeds once -- see {@link #walShardRegistered}'s own javadoc for why a single,
+     * never-retried attempt at construction left a real gap. Once per activation is still all this
+     * needs on the happy path (the grow-only registry only needs to know "has this shard ever used
+     * this container," not continuous confirmation -- see {@code WalShardRegistry}'s own javadoc),
+     * so {@link #walShardRegistered} makes every call after the first successful one a no-op.
+     */
+    private void registerWalShardIfNeeded() {
+        if (walChunkService == null || walShardRegistered.get()) {
+            return;
+        }
+        try {
+            new org.opensearch.serverless.storage.wal.WalShardRegistry(walChunkService.blobContainer()).register(indexUuid, shardId);
+            walShardRegistered.set(true);
+        } catch (Exception e) {
+            logger.warn("failed to register this shard in the WAL shard registry, will retry next lease-renewal tick", e);
         }
     }
 
