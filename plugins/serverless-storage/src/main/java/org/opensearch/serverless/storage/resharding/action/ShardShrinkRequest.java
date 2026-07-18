@@ -14,6 +14,7 @@ import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 
 import java.io.IOException;
+import java.util.HashSet;
 import java.util.List;
 
 import static org.opensearch.action.ValidateActions.addValidationError;
@@ -77,6 +78,12 @@ public class ShardShrinkRequest extends ActionRequest {
                 if (source.shardId() < 0) {
                     validationException = addValidationError("every source shardId must be >= 0", validationException);
                 }
+            }
+            if (new HashSet<>(sources).size() != sources.size()) {
+                // A duplicated (indexUuid, shardId) would be materialized and merged twice with no
+                // document-level dedup at the Lucene addIndexes layer -- every document in that
+                // source would end up duplicated in the target.
+                validationException = addValidationError("sources must not contain duplicate (indexUuid, shardId) entries", validationException);
             }
         }
         if (targetIndexUuid == null || targetIndexUuid.isEmpty()) {

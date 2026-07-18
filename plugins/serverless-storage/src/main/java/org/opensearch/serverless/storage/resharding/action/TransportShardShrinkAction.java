@@ -8,6 +8,8 @@
 
 package org.opensearch.serverless.storage.resharding.action;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
 import org.opensearch.common.blobstore.BlobContainer;
@@ -24,6 +26,9 @@ import org.opensearch.serverless.storage.manifest.CommitManifest;
 import org.opensearch.serverless.storage.readerengine.ObjectStoreCommitMaterializer;
 import org.opensearch.serverless.storage.resharding.ShardShrinker;
 import org.opensearch.serverless.storage.resharding.ShardShrinker.ShrinkSource;
+import org.opensearch.serverless.storage.retention.BlobContainerDurablePinRegistry;
+import org.opensearch.serverless.storage.retention.DurablePinRegistry;
+import org.opensearch.serverless.storage.retention.PinRecord;
 import org.opensearch.serverless.storage.security.RestrictingBlobContainer;
 import org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore;
 import org.opensearch.serverless.storage.shardstate.ShardStateStore;
@@ -58,6 +63,8 @@ import java.util.Optional;
  */
 public class TransportShardShrinkAction extends HandledTransportAction<ShardShrinkRequest, ShardShrinkResponse> {
 
+    private static final Logger logger = LogManager.getLogger(TransportShardShrinkAction.class);
+
     private final ServerlessStoragePlugin plugin;
     private final ThreadPool threadPool;
 
@@ -89,10 +96,11 @@ public class TransportShardShrinkAction extends HandledTransportAction<ShardShri
     @Override
     protected void doExecute(Task task, ShardShrinkRequest request, ActionListener<ShardShrinkResponse> listener) {
         threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
+            List<PendingPin> pendingPins = new ArrayList<>(request.sources().size());
             try {
                 List<ShrinkSource> sources = new ArrayList<>(request.sources().size());
                 for (ShardRef sourceRef : request.sources()) {
-                    sources.add(resolveShrinkSource(sourceRef));
+                    sources.add(resolveShrinkSource(sourceRef, request.targetIndexUuid(), request.targetShardId(), pendingPins));
                 }
 
                 // Credential scoping per tier (rfc-serverless-opensearch.md &sect;15): a shrink
@@ -120,17 +128,42 @@ public class TransportShardShrinkAction extends HandledTransportAction<ShardShri
                 listener.onResponse(new ShardShrinkResponse(true));
             } catch (Exception e) {
                 listener.onFailure(e);
+            } finally {
+                // Unlike ShardCloner's permanent pin (the clone keeps referencing the source
+                // forever), a shrink's dependency on each source is purely transient -- addIndexes
+                // writes entirely fresh segments into the target (see ShardShrinker's own javadoc),
+                // so once shrink() above has returned (successfully or not) nothing further needs
+                // the pinned generation to still be readable, and holding it longer only delays GC.
+                for (PendingPin pin : pendingPins) {
+                    try {
+                        pin.registry().removePin(pin.indexUuid(), pin.shardId(), pin.pinId());
+                    } catch (IOException e) {
+                        // Harmless extra retention, not a correctness problem (same reasoning
+                        // ShardCloner#clone's own javadoc gives for a pin surviving a failed
+                        // call) -- log and keep releasing the remaining sources' pins rather than
+                        // letting one failed release mask the real result of shrink() above.
+                        logger.warn(
+                            "failed to release transient shrink pin [" + pin.pinId() + "] on " + pin.indexUuid() + "/" + pin.shardId(),
+                            e
+                        );
+                    }
+                }
             }
         });
     }
 
-    private ShrinkSource resolveShrinkSource(ShardRef sourceRef) throws IOException {
+    /** A pin placed on a source generation during a shrink, tracked so it can be released once the merge is done. */
+    private record PendingPin(DurablePinRegistry registry, String indexUuid, int shardId, String pinId) {}
+
+    private ShrinkSource resolveShrinkSource(ShardRef sourceRef, String targetIndexUuid, int targetShardId, List<PendingPin> pendingPins)
+        throws IOException {
         BlobContainer sourceContainer = new RestrictingBlobContainer(
             plugin.blobContainerForDirectoryFactory(sourceRef.indexUuid(), sourceRef.shardId()),
             false
         );
         ShardStateStore sourceShardStateStore = new BlobContainerShardStateStore(sourceContainer);
         BlobContainerManifestStore sourceManifestStore = new BlobContainerManifestStore(sourceContainer);
+        DurablePinRegistry sourcePinRegistry = new BlobContainerDurablePinRegistry(sourceContainer);
 
         Optional<VersionedShardHead> sourceHead = sourceShardStateStore.get(sourceRef.indexUuid(), sourceRef.shardId());
         if (sourceHead.isEmpty() || sourceHead.get().head().latestManifestGeneration() == 0) {
@@ -138,6 +171,22 @@ public class TransportShardShrinkAction extends HandledTransportAction<ShardShri
                 "source shard " + sourceRef.indexUuid() + "/" + sourceRef.shardId() + " has no published manifest to shrink from"
             );
         }
+
+        // Pin BEFORE reading the manifest, using the generation number already known from the
+        // ShardHead read above -- the exact ordering ShardCloner#clone's own javadoc documents as
+        // load-bearing and formally verified (formal/CloneGc.tla): a pin added only after the
+        // manifest read would leave a real TOCTOU window where a concurrent GC sweep could reclaim
+        // this generation between the read and the pin landing, if a newer commit superseded it
+        // in between. This shard was previously unpinned during materialize entirely -- the
+        // asymmetric gap this fix closes.
+        String pinId = "shrink:" + targetIndexUuid + ":" + targetShardId;
+        sourcePinRegistry.addPin(
+            sourceRef.indexUuid(),
+            sourceRef.shardId(),
+            new PinRecord(pinId, sourceHead.get().head().primaryTerm(), sourceHead.get().head().latestManifestGeneration())
+        );
+        pendingPins.add(new PendingPin(sourcePinRegistry, sourceRef.indexUuid(), sourceRef.shardId(), pinId));
+
         CommitManifest sourceManifest = sourceManifestStore.readManifest(
             sourceHead.get().head().primaryTerm(),
             sourceHead.get().head().latestManifestGeneration()

@@ -14,6 +14,7 @@ import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 
 import java.io.IOException;
+import java.util.HashSet;
 import java.util.List;
 
 import static org.opensearch.action.ValidateActions.addValidationError;
@@ -69,6 +70,14 @@ public class EnableWritePartitionRoutingRequest extends ClusterManagerNodeReques
         }
         if (targetIndexNames == null || targetIndexNames.size() < 2) {
             validationException = addValidationError("targetIndexNames must name at least 2 partitions", validationException);
+        } else if (new HashSet<>(targetIndexNames).size() != targetIndexNames.size()) {
+            // Partition index is assigned by list position (see TransportEnableWritePartitionRoutingAction) --
+            // a duplicate name would silently overwrite an earlier partition's assignment with a later one,
+            // leaving one partition slot with no real target.
+            validationException = addValidationError(
+                "targetIndexNames must not contain duplicates -- got " + targetIndexNames,
+                validationException
+            );
         }
         return validationException;
     }

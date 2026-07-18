@@ -8,11 +8,15 @@
 
 package org.opensearch.serverless.storage.resharding.action;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.action.admin.indices.create.CreateIndexResponse;
+import org.opensearch.action.admin.indices.delete.DeleteIndexRequest;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.GroupedActionListener;
 import org.opensearch.action.support.HandledTransportAction;
+import org.opensearch.action.support.IndicesOptions;
 import org.opensearch.action.support.clustermanager.AcknowledgedResponse;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.MappingMetadata;
@@ -33,6 +37,8 @@ import java.util.List;
  * the full design rationale.
  */
 public class TransportProvisionSplitTargetsAction extends HandledTransportAction<ProvisionSplitTargetsRequest, AcknowledgedResponse> {
+
+    private static final Logger logger = LogManager.getLogger(TransportProvisionSplitTargetsAction.class);
 
     private final ClusterService clusterService;
     private final Client client;
@@ -100,10 +106,33 @@ public class TransportProvisionSplitTargetsAction extends HandledTransportAction
         }
         MappingMetadata sourceMapping = sourceMetadata.mapping();
 
-        GroupedActionListener<CreateIndexResponse> groupedListener = new GroupedActionListener<>(
-            ActionListener.wrap(responses -> listener.onResponse(new AcknowledgedResponse(true)), listener::onFailure),
-            targetIndexNames.size()
-        );
+        // GroupedActionListener waits for every CreateIndexRequest, but on a partial failure
+        // (some targets created, one or more failed) surfaces only the first failure and leaves
+        // whichever targets DID get created still sitting there -- a naive retry of the same
+        // request would then hit the "already exists" refusal above for those and get stuck
+        // requiring manual cleanup. Roll back by deleting every named target on any failure
+        // (LENIENT_EXPAND_OPEN so deleting the ones that were never created is a harmless no-op)
+        // before surfacing the original failure, so a retry always starts from a clean slate.
+        GroupedActionListener<CreateIndexResponse> groupedListener = new GroupedActionListener<>(ActionListener.wrap(responses -> {
+            listener.onResponse(new AcknowledgedResponse(true));
+        }, failure -> {
+            client.admin()
+                .indices()
+                .delete(
+                    new DeleteIndexRequest(targetIndexNames.toArray(new String[0])).indicesOptions(IndicesOptions.LENIENT_EXPAND_OPEN),
+                    ActionListener.wrap(
+                        deleteResponse -> listener.onFailure(failure),
+                        rollbackFailure -> {
+                            logger.warn(
+                                "failed to roll back partially-provisioned split targets " + targetIndexNames + " after a "
+                                    + "provisioning failure -- manual cleanup may be required",
+                                rollbackFailure
+                            );
+                            listener.onFailure(failure);
+                        }
+                    )
+                );
+        }), targetIndexNames.size());
         for (String targetIndexName : targetIndexNames) {
             CreateIndexRequest createIndexRequest = new CreateIndexRequest(targetIndexName).settings(targetSettings);
             if (sourceMapping != null) {

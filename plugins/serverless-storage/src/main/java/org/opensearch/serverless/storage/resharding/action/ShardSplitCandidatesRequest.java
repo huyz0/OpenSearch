@@ -8,11 +8,14 @@
 
 package org.opensearch.serverless.storage.resharding.action;
 
+import org.opensearch.action.ActionRequestValidationException;
 import org.opensearch.action.support.nodes.BaseNodesRequest;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 
 import java.io.IOException;
+
+import static org.opensearch.action.ValidateActions.addValidationError;
 
 /**
  * Requests a cluster-wide {@link ShardSplitCandidatesAction} evaluation. Always fans out to every
@@ -80,6 +83,32 @@ public class ShardSplitCandidatesRequest extends BaseNodesRequest<ShardSplitCand
         super.writeTo(out);
         out.writeZLong(writesPerMinuteThreshold);
         out.writeZLong(sizeThresholdBytes);
+    }
+
+    /**
+     * @return validation errors, or {@code null} if the request is well-formed -- {@code -1} is the
+     *         only accepted sentinel for "use the configured default"; any other negative value
+     *         (e.g. a typo like {@code -100}) would otherwise be treated as a real, absurdly-low
+     *         threshold that makes every shard appear as a candidate, silently, instead of being rejected.
+     */
+    @Override
+    public ActionRequestValidationException validate() {
+        ActionRequestValidationException validationException = null;
+        if (writesPerMinuteThreshold < 0 && writesPerMinuteThreshold != USE_DEFAULT_WPM_THRESHOLD) {
+            validationException = addValidationError(
+                "writesPerMinuteThreshold must be >= 0 (or " + USE_DEFAULT_WPM_THRESHOLD + " to use the configured default), got "
+                    + writesPerMinuteThreshold,
+                validationException
+            );
+        }
+        if (sizeThresholdBytes < 0 && sizeThresholdBytes != USE_DEFAULT_SIZE_THRESHOLD_BYTES) {
+            validationException = addValidationError(
+                "sizeThresholdBytes must be >= 0 (or " + USE_DEFAULT_SIZE_THRESHOLD_BYTES + " to use the configured default), got "
+                    + sizeThresholdBytes,
+                validationException
+            );
+        }
+        return validationException;
     }
 
     /** The caller-supplied write-rate threshold override, or {@link #USE_DEFAULT_WPM_THRESHOLD}. */

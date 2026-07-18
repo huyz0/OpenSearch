@@ -30,6 +30,7 @@ import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -92,15 +93,36 @@ public class TransportDisableWritePartitionRoutingAction extends TransportCluste
         ActionListener<AcknowledgedResponse> listener
     ) {
         List<String> targetIndexNames = request.targetIndexNames();
+        List<String> missingUpFront = new ArrayList<>();
+        for (String targetIndexName : targetIndexNames) {
+            if (state.metadata().index(targetIndexName) == null) {
+                missingUpFront.add(targetIndexName);
+            }
+        }
+        if (missingUpFront.isEmpty() == false) {
+            listener.onFailure(
+                new IllegalArgumentException(
+                    "target index(es) do not exist, refusing to report a false acknowledgement: " + missingUpFront
+                )
+            );
+            return;
+        }
         clusterService.submitStateUpdateTask(
             "serverless-storage-disable-write-partition-routing",
             new ClusterStateUpdateTask(Priority.URGENT) {
+                // Tracks any target that vanished between the pre-check above and this task
+                // actually running -- the same race TransportFenceSplitSourceAction's own fix
+                // closes, applied here so a concurrent deletion can't make this report a false
+                // acknowledgement either.
+                private final List<String> missingDuringExecute = new ArrayList<>();
+
                 @Override
                 public ClusterState execute(ClusterState currentState) {
                     Metadata.Builder metadataBuilder = Metadata.builder(currentState.metadata());
                     for (String targetIndexName : targetIndexNames) {
                         IndexMetadata targetMetadata = currentState.metadata().index(targetIndexName);
                         if (targetMetadata == null) {
+                            missingDuringExecute.add(targetIndexName);
                             continue;
                         }
                         metadataBuilder.put(WritePartitionRoutingMetadata.withoutAssignment(targetMetadata), true);
@@ -110,6 +132,19 @@ public class TransportDisableWritePartitionRoutingAction extends TransportCluste
 
                 @Override
                 public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {
+                    if (missingDuringExecute.isEmpty() == false) {
+                        logger.warn(
+                            "target index(es) were deleted concurrently with disabling write-partition-routing, "
+                                + "reporting failure rather than a false acknowledgement: "
+                                + missingDuringExecute
+                        );
+                        listener.onFailure(
+                            new IllegalStateException(
+                                "target index(es) were deleted before write-partition-routing could be disabled: " + missingDuringExecute
+                            )
+                        );
+                        return;
+                    }
                     logger.info("disabled write-partition-routing for target(s): " + targetIndexNames);
                     listener.onResponse(new AcknowledgedResponse(true));
                 }

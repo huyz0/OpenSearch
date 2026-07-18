@@ -39,12 +39,21 @@ import java.util.Optional;
  * org.opensearch.serverless.storage.compaction.LuceneMergeCompactionPublisher} already uses for
  * compaction, just across shards instead of within one.
  *
- * <p><b>No pin needed on any source, unlike {@link ShardSplitter}</b>: {@link ShardSplitter#split}
- * needs a source-generation pin because its target's manifest keeps referencing the source's own
- * bundle files. {@link #shrink} never does that -- {@link IndexWriter#addIndexes(Directory...)}
- * writes entirely fresh segment files into the target's own directory, so the target's published
- * bundle is immediately self-sufficient and never depends on any source shard's bundles staying
- * alive. No source shard is touched, deleted, or otherwise modified by this call.
+ * <p><b>No durable pin needed after this method returns, unlike {@link ShardSplitter}</b>: {@link
+ * ShardSplitter#split} needs a source-generation pin because its target's manifest keeps
+ * referencing the source's own bundle files, for the target's entire lifetime. {@link #shrink}
+ * never does that -- {@link IndexWriter#addIndexes(Directory...)} writes entirely fresh segment
+ * files into the target's own directory, so once this call returns the target's published bundle
+ * is immediately self-sufficient and never depends on any source shard's bundles staying alive. No
+ * source shard is touched, deleted, or otherwise modified by this call.
+ *
+ * <p><b>A transient pin is still required while this call is in flight</b>, though -- the caller
+ * ({@link org.opensearch.serverless.storage.resharding.action.TransportShardShrinkAction}) pins
+ * each source's manifest generation, using the same pin-before-read ordering {@link
+ * org.opensearch.serverless.storage.clone.ShardCloner#clone} documents as load-bearing, before
+ * ever resolving the {@link ShrinkSource}s passed to this method, and releases every pin once this
+ * call returns (success or failure) -- without that, a concurrent GC sweep could reclaim a source
+ * generation between it being read and {@link #shrink} actually materializing it.
  *
  * <p><b>Deliberately conservative merged metadata</b>: the sources being merged are independent
  * shard identities with their own, mutually-meaningless sequence-number spaces -- there is no
