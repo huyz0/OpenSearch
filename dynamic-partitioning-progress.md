@@ -2958,3 +2958,46 @@ scaleup, scheduling, shardstate, manifest, util), across 6 rounds totaling 37 re
 original diff-scoped rounds, 6+2 self-caught regressions in resharding, 8 in gc/clone/retention,
 4 in wal/writerengine, 4 in the final sweep), with every fix verified by a subsequent
 convergence-check pass.
+
+## Round 7: full repeat sweep finds 3 more real bugs (`27a36759b03`)
+
+Per the standing goal ("repeat whole project review, fix all findings one by one until no new
+findings found"), ran a genuine repeat pass -- not just a convergence-check on the latest diff,
+but a fresh independent re-read of every package already covered in rounds 3-6. 3 real issues
+survived, all matching bug classes already fixed elsewhere but missed at these specific call
+sites:
+
+1. `TransportEnableWritePartitionRoutingAction` had the same false-ack race already fixed in its
+   sibling actions (`TransportDisableWritePartitionRoutingAction`, `TransportFenceSplitSourceAction`
+   in round 2/3) -- a target index deleted between the pre-check and the cluster-state-update task
+   running was silently skipped, yet the action still reported full success. Fixed to match the
+   sibling actions' fail-loud pattern.
+2. `TransportSnapshotPinAction`'s create-or-replace implementation (`addPin`, then a separate
+   read-then-remove loop over older pins sharing the same snapshotId) had a real race under two
+   *concurrent* calls for the same snapshotId (e.g. a client retry): each call's independent
+   removal pass could remove the other call's just-added pin, leaving zero pins surviving even
+   though both calls reported success. Added `DurablePinRegistry#replacePin`, doing the add-and-
+   strip in one atomic CAS mutation, and switched this action to use it.
+3. `WalBatchingProcessor#put` incremented `backlogBytes` before enqueuing, but only decremented it
+   inside `write()`'s own finally block -- missing the case where core's `BufferedAsyncIOProcessor`
+   notifies a blocked put's listener directly with an `InterruptedException` (thread interrupted
+   while blocked on the bounded queue, e.g. during shutdown or relocation), bypassing `write()`
+   entirely and leaking that record's bytes permanently. Redesigned so the decrement happens in a
+   per-item listener wrapper invoked on every path, not in `write()`.
+
+Every fix verified with a break-the-fix pass against its regression test before landing.
+
+## Round 8: second repeat sweep converges to zero (no commit -- nothing to fix)
+
+Ran a second full repeat pass, re-checking round 7's own fixes plus a fresh independent re-read
+of every package. All 4 finder angles (resharding; gc/clone/retention; wal/translog/writerengine;
+allocation/compaction/security/format/migration/scaletozero/scaleup/scheduling/shardstate/manifest/util)
+came back "NO FINDINGS" -- including explicit verification that `DurablePinRegistry#replacePin`'s
+CAS retry loop genuinely re-reads the register fresh on every attempt (not against a stale
+snapshot carried across retries), that no other pin call site still uses the old racy
+addPin-then-scan pattern, and that core's `AsyncIOProcessor`/`BufferedAsyncIOProcessor` never
+double-invokes or silently drops a listener (closing out the `WalBatchingProcessor` fix's own
+`AtomicBoolean` guard as defensive-but-not-strictly-load-bearing, not a live bug).
+
+**This is the repeat-until-convergence result the standing review goal asked for**: two
+consecutive full passes, the second finding nothing the first round's fixes didn't already close.
