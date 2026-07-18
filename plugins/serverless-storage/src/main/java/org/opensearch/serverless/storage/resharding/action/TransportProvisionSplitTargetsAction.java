@@ -11,10 +11,8 @@ package org.opensearch.serverless.storage.resharding.action;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
-import org.opensearch.action.admin.indices.create.CreateIndexResponse;
 import org.opensearch.action.admin.indices.delete.DeleteIndexRequest;
 import org.opensearch.action.support.ActionFilters;
-import org.opensearch.action.support.GroupedActionListener;
 import org.opensearch.action.support.HandledTransportAction;
 import org.opensearch.action.support.IndicesOptions;
 import org.opensearch.action.support.clustermanager.AcknowledgedResponse;
@@ -31,6 +29,10 @@ import org.opensearch.transport.TransportService;
 import org.opensearch.transport.client.Client;
 
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * The actual work behind {@link ProvisionSplitTargetsAction} -- see that class's own javadoc for
@@ -106,39 +108,63 @@ public class TransportProvisionSplitTargetsAction extends HandledTransportAction
         }
         MappingMetadata sourceMapping = sourceMetadata.mapping();
 
-        // GroupedActionListener waits for every CreateIndexRequest, but on a partial failure
-        // (some targets created, one or more failed) surfaces only the first failure and leaves
-        // whichever targets DID get created still sitting there -- a naive retry of the same
-        // request would then hit the "already exists" refusal above for those and get stuck
-        // requiring manual cleanup. Roll back by deleting every named target on any failure
-        // (LENIENT_EXPAND_OPEN so deleting the ones that were never created is a harmless no-op)
-        // before surfacing the original failure, so a retry always starts from a clean slate.
-        GroupedActionListener<CreateIndexResponse> groupedListener = new GroupedActionListener<>(ActionListener.wrap(responses -> {
-            listener.onResponse(new AcknowledgedResponse(true));
-        }, failure -> {
-            client.admin()
-                .indices()
-                .delete(
-                    new DeleteIndexRequest(targetIndexNames.toArray(new String[0])).indicesOptions(IndicesOptions.LENIENT_EXPAND_OPEN),
-                    ActionListener.wrap(
-                        deleteResponse -> listener.onFailure(failure),
-                        rollbackFailure -> {
-                            logger.warn(
-                                "failed to roll back partially-provisioned split targets " + targetIndexNames + " after a "
-                                    + "provisioning failure -- manual cleanup may be required",
-                                rollbackFailure
-                            );
-                            listener.onFailure(failure);
-                        }
-                    )
-                );
-        }), targetIndexNames.size());
+        // Track exactly which targets THIS call's own CreateIndexRequest actually succeeded on --
+        // not just every name in the request -- so a partial-failure rollback below only deletes
+        // indices this call created. Rolling back the full requested name list would be wrong
+        // whenever a name in it was concurrently, legitimately created by a *different* racing
+        // provision call (the pre-existence check above is TOCTOU, not atomic with creation): this
+        // call's own failure must never delete another call's already-successful target.
+        Set<String> createdByThisCall = ConcurrentHashMap.newKeySet();
+        AtomicInteger remaining = new AtomicInteger(targetIndexNames.size());
+        AtomicReference<Exception> firstFailure = new AtomicReference<>();
         for (String targetIndexName : targetIndexNames) {
             CreateIndexRequest createIndexRequest = new CreateIndexRequest(targetIndexName).settings(targetSettings);
             if (sourceMapping != null) {
                 createIndexRequest.mapping(sourceMapping.sourceAsMap());
             }
-            client.admin().indices().create(createIndexRequest, groupedListener);
+            client.admin().indices().create(createIndexRequest, ActionListener.wrap(response -> {
+                createdByThisCall.add(targetIndexName);
+                completeOne(remaining, firstFailure, createdByThisCall, listener);
+            }, failure -> {
+                firstFailure.compareAndSet(null, failure);
+                completeOne(remaining, firstFailure, createdByThisCall, listener);
+            }));
         }
+    }
+
+    private void completeOne(
+        AtomicInteger remaining,
+        AtomicReference<Exception> firstFailure,
+        Set<String> createdByThisCall,
+        ActionListener<AcknowledgedResponse> listener
+    ) {
+        if (remaining.decrementAndGet() != 0) {
+            return;
+        }
+        Exception failure = firstFailure.get();
+        if (failure == null) {
+            listener.onResponse(new AcknowledgedResponse(true));
+            return;
+        }
+        if (createdByThisCall.isEmpty()) {
+            listener.onFailure(failure);
+            return;
+        }
+        // Roll back only the targets this call itself created (LENIENT_EXPAND_OPEN so a target
+        // that's already gone by the time this runs is a harmless no-op) before surfacing the
+        // original failure, so a retry of the same request always starts from a clean slate.
+        client.admin()
+            .indices()
+            .delete(
+                new DeleteIndexRequest(createdByThisCall.toArray(new String[0])).indicesOptions(IndicesOptions.LENIENT_EXPAND_OPEN),
+                ActionListener.wrap(deleteResponse -> listener.onFailure(failure), rollbackFailure -> {
+                    logger.warn(
+                        "failed to roll back partially-provisioned split targets " + createdByThisCall + " after a "
+                            + "provisioning failure -- manual cleanup may be required",
+                        rollbackFailure
+                    );
+                    listener.onFailure(failure);
+                })
+            );
     }
 }

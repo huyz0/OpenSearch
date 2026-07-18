@@ -136,14 +136,24 @@ public class TransportShardShrinkAction extends HandledTransportAction<ShardShri
                 // the pinned generation to still be readable, and holding it longer only delays GC.
                 for (PendingPin pin : pendingPins) {
                     try {
-                        pin.registry().removePin(pin.indexUuid(), pin.shardId(), pin.pinId());
+                        // Exact-match removal (by full PinRecord, not by pinId string alone) is
+                        // load-bearing: the by-id overload removes every pin sharing that pinId
+                        // regardless of generation, so a concurrent/retried shrink call pinning a
+                        // different generation of the same source under the identical pinId would
+                        // have its still-needed pin wiped out by this call's own cleanup.
+                        pin.registry().removePin(pin.indexUuid(), pin.shardId(), pin.pinRecord());
                     } catch (IOException e) {
                         // Harmless extra retention, not a correctness problem (same reasoning
                         // ShardCloner#clone's own javadoc gives for a pin surviving a failed
                         // call) -- log and keep releasing the remaining sources' pins rather than
                         // letting one failed release mask the real result of shrink() above.
                         logger.warn(
-                            "failed to release transient shrink pin [" + pin.pinId() + "] on " + pin.indexUuid() + "/" + pin.shardId(),
+                            "failed to release transient shrink pin ["
+                                + pin.pinRecord().pinId()
+                                + "] on "
+                                + pin.indexUuid()
+                                + "/"
+                                + pin.shardId(),
                             e
                         );
                     }
@@ -153,7 +163,7 @@ public class TransportShardShrinkAction extends HandledTransportAction<ShardShri
     }
 
     /** A pin placed on a source generation during a shrink, tracked so it can be released once the merge is done. */
-    private record PendingPin(DurablePinRegistry registry, String indexUuid, int shardId, String pinId) {}
+    private record PendingPin(DurablePinRegistry registry, String indexUuid, int shardId, PinRecord pinRecord) {}
 
     private ShrinkSource resolveShrinkSource(ShardRef sourceRef, String targetIndexUuid, int targetShardId, List<PendingPin> pendingPins)
         throws IOException {
@@ -180,12 +190,13 @@ public class TransportShardShrinkAction extends HandledTransportAction<ShardShri
         // in between. This shard was previously unpinned during materialize entirely -- the
         // asymmetric gap this fix closes.
         String pinId = "shrink:" + targetIndexUuid + ":" + targetShardId;
-        sourcePinRegistry.addPin(
-            sourceRef.indexUuid(),
-            sourceRef.shardId(),
-            new PinRecord(pinId, sourceHead.get().head().primaryTerm(), sourceHead.get().head().latestManifestGeneration())
+        PinRecord pinRecord = new PinRecord(
+            pinId,
+            sourceHead.get().head().primaryTerm(),
+            sourceHead.get().head().latestManifestGeneration()
         );
-        pendingPins.add(new PendingPin(sourcePinRegistry, sourceRef.indexUuid(), sourceRef.shardId(), pinId));
+        sourcePinRegistry.addPin(sourceRef.indexUuid(), sourceRef.shardId(), pinRecord);
+        pendingPins.add(new PendingPin(sourcePinRegistry, sourceRef.indexUuid(), sourceRef.shardId(), pinRecord));
 
         CommitManifest sourceManifest = sourceManifestStore.readManifest(
             sourceHead.get().head().primaryTerm(),
