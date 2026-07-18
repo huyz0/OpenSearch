@@ -1423,6 +1423,16 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             // A pin is only ever added or overwritten by CAS, never deleted through this registry
             // itself, so the delete-denying scoped container is safe here too.
             DurablePinRegistry pinRegistry = new BlobContainerDurablePinRegistry(scopedContainer);
+            // Computed here, ahead of the reader/writer branch below, so both branches can schedule
+            // their own PitrRetentionSchedulerTask -- previously this was only computed in the
+            // writer branch, which meant PITR reconciliation (both adding new pins AND releasing
+            // ones that have aged out of the window) silently stopped the moment a shard's writer
+            // scaled to zero, leaving whatever was pinned at that moment retained forever (GC can
+            // never delete a durably-pinned manifest). Mirrors gcConfig/pinRegistry's own
+            // "always meaningful on either role" reasoning just above.
+            PitrRetentionConfig pitrRetentionConfig = pitrWindowMillis > 0
+                ? new PitrRetentionConfig(manifestStore, pinRegistry, pitrWindowMillis)
+                : null;
 
             boolean isReaderShard = shardRouting != null && shardRouting.isSearchOnly();
             if (isReaderShard) {
@@ -1539,13 +1549,11 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                         gcConfig,
                         readerShardActivityRegistry,
                         partitionDescriptor,
-                        partitionRewriteConfig
+                        partitionRewriteConfig,
+                        pitrRetentionConfig
                     )
                 );
             }
-            PitrRetentionConfig pitrRetentionConfig = pitrWindowMillis > 0
-                ? new PitrRetentionConfig(manifestStore, pinRegistry, pitrWindowMillis)
-                : null;
 
             // §12's "dedicated WAL streams" bullet: an index opted into
             // SERVERLESS_STORAGE_WAL_DEDICATED_STREAM_SETTING gets its own WalChunkService pointed

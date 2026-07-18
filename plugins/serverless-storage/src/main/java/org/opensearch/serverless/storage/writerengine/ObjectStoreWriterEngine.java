@@ -562,10 +562,10 @@ public class ObjectStoreWriterEngine extends InternalEngine {
         this.encryptionKeyProvider = encryptionKeyProvider;
         this.dedicatedWalGcSchedulerTask = dedicatedWalGcSchedulerTask;
         registerWalShardIfNeeded();
-        // Acquired synchronously, before this engine is usable, so CompactionSchedulerTask's
-        // isLeaseHeldAt guard can actually observe this writer as active (see
-        // acquireOrRenewLease's javadoc -- fencing correctness itself lives entirely in
-        // publishCommitAsHead, not here). A failure here means real evidence (a publication) that
+        // Acquired synchronously, before this engine is usable, so the lease is visible to any
+        // observability/diagnostics code that inspects it (see acquireOrRenewLease's javadoc --
+        // fencing correctness itself lives entirely in publishCommitAsHead, not here; compaction no
+        // longer gates on lease presence). A failure here means real evidence (a publication) that
         // this node's term assignment is already stale -- it must not come up as this shard's
         // writer at all. super(engineConfig) above has already opened the local translog/store, so
         // those must be closed before rethrowing -- this constructor cannot rely on close() being

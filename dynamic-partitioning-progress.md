@@ -3096,3 +3096,62 @@ covered or genuinely low-severity/by-design:
 Full `:plugins:serverless-storage:test` green after every fix, including a new regression test
 (`testPublicationIsFencedTheMomentANewerTermAcquiresTheLeaseEvenBeforeItPublishesAnything`) for
 finding 5.
+
+## Round 10: cross-checking round 9's leaseTerm change, plus one more real gap
+
+Per the standing goal, ran a further sweep specifically probing whether round 9's `ShardHead#leaseTerm`
+change introduced any NEW gap in the areas that share `ShardHead` (WAL/translog replay, GC/retention,
+compaction) -- not just a generic re-sweep.
+
+**WAL/translog**: a candidate finding (activation-time `activationWalPosition` snapshot happening
+before lease acquisition in `ObjectStoreWriterEngine`, raised independently by two review passes)
+turned out to be a false alarm on cross-checking against `formal/WalReplayFencing.tla` and this
+log's own "WAL append-time fencing" section: WAL replay fencing is deliberately bound by BOTH a term
+floor AND `activationWalPosition` (never term alone), formally proven sufficient
+(`FixedReplay`, 603,722 states, exhaustive), and the fresh-allocation construction-time ordering was
+already the specific case that proof covers (the live-promotion case needed and got a separate
+`onPrimaryTermBumped` re-snapshot hook, already landed). No code change.
+
+**Compaction**: no new correctness issues -- `CompactionRebaseExecutor`/`LuceneMergeCompactionPublisher`
+fence purely on generation-based CAS (re-reading the live head and re-publishing on every retry),
+never claim a term, and so have nothing to fence against `leaseTerm` for; traced both possible
+interleavings by hand and both converge correctly. Did find and fix two stale comments in
+`ObjectStoreCommitHeadPublisher`/`ObjectStoreWriterEngine` still describing a `CompactionSchedulerTask`
+`isLeaseHeldAt` lease-presence guard that was removed in an earlier commit (`08dd9515cad`) -- compaction
+now gates purely on `CompactionPolicy#shouldCompact` plus CAS fencing, not lease presence. Misleading
+for a future reader reasoning about writer/compactor interaction, so corrected.
+
+**GC/retention -- one real, unrelated-to-leaseTerm gap found**: `PitrRetentionSchedulerTask` was only
+ever instantiated from `ObjectStoreWriterEngine`'s constructor. `GcSchedulerTask` solved the identical
+"writer scales to zero" problem years earlier by attaching itself to the *reader* engine instead (see
+that class's own comment: "a reader shard is a natural home for this... including the 'writer scaled
+to zero' case a writer-only scheduler instance would miss entirely") -- that same reasoning was never
+applied to PITR. Concretely: once a shard's writer scales to zero, `PitrRetentionReconciler#reconcile`
+stops running at all, so the PITR pin set frozen at that moment (both the "add new pins within the
+window" and "release pins that have aged out" halves) never advances again -- `ManifestRetentionPolicy`
+treats a durably-pinned manifest as permanently non-deletable, so GC can never reclaim anything that
+was pinned at scale-to-zero time, silently defeating the PITR window's own stated retention guarantee
+for as long as the shard has no active writer (potentially indefinitely, in a serverless deployment
+where scale-to-zero is the common case).
+
+Fixed by threading a `PitrRetentionConfig` (already existed, same shape as `GcSchedulerConfig`) through
+`ReaderEngineFactory` and `ObjectStoreReaderEngine` the exact same way `GcSchedulerConfig` already is
+(one new widest constructor/factory overload each, existing narrower overloads delegate with `null`
+unchanged), and fixed `ServerlessStoragePlugin#getEngineFactory` to compute `pitrRetentionConfig`
+*before* the reader/writer branch split (it was previously computed only in the code path reachable
+after the reader branch's early return, so the reader branch could never see it) and pass it to both.
+Redundant scheduling alongside a writer-attached instance is safe, same "worst case wasted work"
+argument every other reader-attached scheduler here already relies on.
+
+Verified with `testOpeningAndClosingAReaderEngineWithPitrRetentionConfiguredDoesNotThrow` (mirrors
+`ObjectStoreWriterEngineTests`'s own equivalent test and its stated reasoning: `PitrRetentionSchedulerTask`'s
+actual scheduling/reconciliation behavior is already exhaustively covered by
+`PitrRetentionSchedulerTaskTests` against a configurable short interval, so this level only needs to
+prove the wiring itself doesn't throw -- the hardcoded 5-minute interval makes a real-tick assertBusy
+test impractical, same constraint the writer-side test already worked around). Full
+`:plugins:serverless-storage:test` green.
+
+Two round-10 finder agents (WAL/translog, both retries) returned status updates instead of substantive
+reports on their first attempts and had to be re-launched with stricter "you are the reviewer, produce
+the report yourself" prompts before a real finding (or a real "no findings") came back -- a recurring
+failure mode worth remembering for future rounds.

@@ -210,9 +210,11 @@ public final class ObjectStoreCommitHeadPublisher {
 
     /**
      * Acquires or renews this shard's writer lease (rfc-serverless-opensearch.md &sect;16 Phase
-     * 4.5): without this, {@link ShardHead#leaseHolderNodeId()} is never set, so {@code
-     * CompactionSchedulerTask}'s {@code isLeaseHeldAt} guard can never actually observe an active
-     * writer and always treats the shard as available.
+     * 4.5): without this, {@link ShardHead#leaseHolderNodeId()} is never set, and other code that
+     * inspects lease presence (e.g. observability/diagnostics) would never see an active writer.
+     * {@code CompactionSchedulerTask} itself no longer gates on lease presence -- it compacts purely
+     * off {@code CompactionPolicy#shouldCompact}, relying on generation-based CAS fencing (see
+     * {@code CompactionRebaseExecutor}) rather than the lease for safety.
      *
      * <p>Deliberately does <b>not</b> write the acquiring writer's term into {@code primaryTerm} --
      * only {@link #publishCommitAsHead} legitimately advances that field, since that is the one

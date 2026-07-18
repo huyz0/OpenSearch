@@ -33,6 +33,8 @@ import org.opensearch.serverless.storage.resharding.PartitionRewritePublisher;
 import org.opensearch.serverless.storage.resharding.PartitionRewriteSchedulerConfig;
 import org.opensearch.serverless.storage.resharding.PartitionRewriteSchedulerTask;
 import org.opensearch.serverless.storage.resharding.ShardPartitionDescriptor;
+import org.opensearch.serverless.storage.retention.PitrRetentionConfig;
+import org.opensearch.serverless.storage.retention.PitrRetentionSchedulerTask;
 import org.opensearch.serverless.storage.shardstate.ShardHead;
 import org.opensearch.serverless.storage.shardstate.ShardStateStore;
 import org.opensearch.serverless.storage.shardstate.VersionedShardHead;
@@ -110,6 +112,9 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
      */
     private static final TimeValue MANIFEST_POLL_INTERVAL = TimeValue.timeValueSeconds(5);
 
+    /** Matches {@code ObjectStoreWriterEngine}'s own PITR reconciliation cadence. */
+    private static final TimeValue PITR_RECONCILE_INTERVAL = TimeValue.timeValueMinutes(5);
+
     private final String indexUuid;
     private final int shardId;
     private final AtomicLong currentPrimaryTerm;
@@ -126,6 +131,7 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
     private final CompactionSchedulerTask compactionSchedulerTask;
     private final GcSchedulerTask gcSchedulerTask;
     private final PartitionRewriteSchedulerTask partitionRewriteSchedulerTask;
+    private final PitrRetentionSchedulerTask pitrRetentionTask;
 
     /**
      * The wall-clock time of this engine's own last real query-serving searcher acquisition
@@ -179,7 +185,8 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
         CompactionSchedulerConfig compactionConfig,
         GcSchedulerConfig gcConfig,
         ShardPartitionDescriptor partitionDescriptor,
-        PartitionRewriteSchedulerConfig partitionRewriteConfig
+        PartitionRewriteSchedulerConfig partitionRewriteConfig,
+        PitrRetentionConfig pitrRetentionConfig
     ) {
         super(config, seqNoStats, new TranslogStats(), true, readerWrapperFunction(partitionDescriptor), false);
         this.indexUuid = config.getShardId().getIndex().getUUID();
@@ -247,6 +254,22 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
                     partitionRewriteConfig.commitPublisher(),
                     partitionRewriteConfig.partitionStore()
                 )
+            );
+        // Same reasoning as gcSchedulerTask above, applied to PITR: a reader shard outlives its
+        // writer scaling to zero, so it -- not just ObjectStoreWriterEngine -- must keep reconciling
+        // PITR pins, or a pin set frozen at scale-to-zero time never ages out of the window and GC
+        // can never reclaim it. Redundant with a writer-attached instance is safe, same
+        // "worst case wasted work" argument as every other scheduler here.
+        this.pitrRetentionTask = pitrRetentionConfig == null
+            ? null
+            : new PitrRetentionSchedulerTask(
+                config.getThreadPool(),
+                PITR_RECONCILE_INTERVAL,
+                indexUuid,
+                shardId,
+                pitrRetentionConfig.manifestStore(),
+                pitrRetentionConfig.pinRegistry(),
+                pitrRetentionConfig.windowMillis()
             );
     }
 
@@ -632,6 +655,9 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
         if (partitionRewriteSchedulerTask != null) {
             partitionRewriteSchedulerTask.close();
         }
+        if (pitrRetentionTask != null) {
+            pitrRetentionTask.close();
+        }
         if (admissionController != null) {
             admissionController.release();
         }
@@ -833,6 +859,71 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
         ShardPartitionDescriptor partitionDescriptor,
         PartitionRewriteSchedulerConfig partitionRewriteConfig
     ) throws IOException {
+        return open(
+            config,
+            manifest,
+            materializer,
+            primaryTerm,
+            shardStateStore,
+            manifestStore,
+            shardDirectory,
+            localNodeId,
+            admissionController,
+            compactionConfig,
+            gcConfig,
+            partitionDescriptor,
+            partitionRewriteConfig,
+            null
+        );
+    }
+
+    /**
+     * Same as {@link #open(EngineConfig, CommitManifest, ObjectStoreCommitMaterializer, long,
+     * ShardStateStore, BlobContainerManifestStore, ShardDirectory, String, ReaderShardAdmissionController,
+     * CompactionSchedulerConfig, GcSchedulerConfig, ShardPartitionDescriptor, PartitionRewriteSchedulerConfig)},
+     * with this shard's own optional background PITR retention reconciliation -- see this class's
+     * own javadoc for why a reader shard, not just the writer, must run this.
+     *
+     * @param config the engine configuration, whose {@link EngineConfig#getStore()} directory is materialized into
+     * @param manifest the commit manifest to open the engine against
+     * @param materializer applies the manifest's files to the engine's store directory
+     * @param primaryTerm the primary term the manifest was published under
+     * @param shardStateStore used to poll for a newer published head
+     * @param manifestStore used to read newer manifest generations found via polling
+     * @param shardDirectory the shard-directory-tier client this engine reports its entry to
+     * @param localNodeId this node's id, reported as part of the shard directory entry
+     * @param admissionController {@code null} to disable the admission cap entirely -- see its own javadoc.
+     * @param compactionConfig {@code null} to disable this reader's own background compaction
+     *        scheduler entirely -- see {@link CompactionSchedulerConfig}'s own javadoc.
+     * @param gcConfig {@code null} to disable this reader's own background GC sweep entirely --
+     *        see {@link GcSchedulerConfig}'s own javadoc.
+     * @param partitionDescriptor {@code null} unless this shard is a &sect;16 Phase 5 split
+     *        target -- see {@link PartitionFilteringDirectoryReader}'s own javadoc for what
+     *        supplying one does.
+     * @param partitionRewriteConfig {@code null} to disable this reader's own background
+     *        partition-rewrite scheduler -- see {@link PartitionRewriteSchedulerConfig}'s own
+     *        javadoc. Only meaningful together with a non-null {@code partitionDescriptor}.
+     * @param pitrRetentionConfig {@code null} to disable this reader's own background PITR
+     *        retention reconciliation -- see {@link PitrRetentionConfig}'s own javadoc.
+     * @return an open reader engine, with directory-tier reporting and manifest polling running
+     * @throws IOException if materializing the manifest into the store directory fails
+     */
+    public static ObjectStoreReaderEngine open(
+        EngineConfig config,
+        CommitManifest manifest,
+        ObjectStoreCommitMaterializer materializer,
+        long primaryTerm,
+        ShardStateStore shardStateStore,
+        BlobContainerManifestStore manifestStore,
+        ShardDirectory shardDirectory,
+        String localNodeId,
+        ReaderShardAdmissionController admissionController,
+        CompactionSchedulerConfig compactionConfig,
+        GcSchedulerConfig gcConfig,
+        ShardPartitionDescriptor partitionDescriptor,
+        PartitionRewriteSchedulerConfig partitionRewriteConfig,
+        PitrRetentionConfig pitrRetentionConfig
+    ) throws IOException {
         if (admissionController != null) {
             // Acquire before any I/O: rejecting an over-capacity open should never pay for a
             // materialization that's just going to be thrown away.
@@ -859,7 +950,8 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
                 compactionConfig,
                 gcConfig,
                 partitionDescriptor,
-                partitionRewriteConfig
+                partitionRewriteConfig,
+                pitrRetentionConfig
             );
         } catch (Exception e) {
             // The engine that would have owned releasing this permit in close() never got built --

@@ -1516,4 +1516,90 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
             writerDirectory.close();
         }
     }
+
+    // Regression test for a real bug: PitrRetentionSchedulerTask was only ever wired up from
+    // ObjectStoreWriterEngine, so PITR reconciliation silently stopped running the moment a shard's
+    // writer scaled to zero -- whatever was pinned at that moment stayed pinned (and therefore
+    // un-GC-able) forever, defeating the PITR window's own retention guarantee. PitrRetentionSchedulerTask's
+    // own scheduling/reconciliation behavior is verified directly and exhaustively in
+    // PitrRetentionSchedulerTaskTests against a configurable short interval -- this engine hardcodes
+    // a 5-minute interval, far too long to observe a real tick in a test, matching
+    // ObjectStoreWriterEngineTests#testOpeningAndClosingWithPitrRetentionConfiguredDoesNotThrow's own
+    // reasoning. What this test proves is the wiring itself: opening and closing a reader engine
+    // with a PitrRetentionConfig and NO writer ever active must not throw, i.e. the plumbing from
+    // ReaderEngineFactory/ObjectStoreReaderEngine's constructor through to
+    // PitrRetentionSchedulerTask's own constructor (and back through close()) is correct.
+    public void testOpeningAndClosingAReaderEngineWithPitrRetentionConfiguredDoesNotThrow() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ObjectStoreCommitPublisher publisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+        org.opensearch.serverless.storage.shardstate.ShardStateStore shardStateStore =
+            new org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore(blobContainer);
+        BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(blobContainer);
+        BlobContainerBundleStore bundleStore = new BlobContainerBundleStore(blobContainer);
+        ObjectStoreCommitMaterializer materializer = new ObjectStoreCommitMaterializer(bundleStore);
+        org.opensearch.serverless.storage.retention.DurablePinRegistry pinRegistry =
+            new org.opensearch.serverless.storage.retention.BlobContainerDurablePinRegistry(blobContainer);
+        ShardDirectory shardDirectory = new InMemoryShardDirectory();
+
+        Directory writerDirectory = new ByteBuffersDirectory();
+        IndexWriter writer = new IndexWriter(
+            writerDirectory,
+            new IndexWriterConfig().setMergePolicy(org.apache.lucene.index.NoMergePolicy.INSTANCE)
+        );
+
+        try (Store store = createStore()) {
+            EngineConfig engineConfig = config(defaultSettings, store, createTempDir(), newMergePolicy(), null);
+            String indexUuid = engineConfig.getShardId().getIndex().getUUID();
+            int shardId = engineConfig.getShardId().getId();
+
+            CommitManifest gen1;
+            {
+                Document doc = new Document();
+                doc.add(new StringField("id", "1", Field.Store.YES));
+                writer.addDocument(doc);
+                writer.commit();
+                gen1 = publisher.publishCommit(
+                    writerDirectory,
+                    SegmentInfos.readLatestCommit(writerDirectory),
+                    indexUuid,
+                    shardId,
+                    PRIMARY_TERM,
+                    1,
+                    0,
+                    0,
+                    new WalPosition("epoch-0", 0),
+                    0,
+                    PruningStats.empty()
+                );
+            }
+
+            org.opensearch.serverless.storage.retention.PitrRetentionConfig pitrRetentionConfig =
+                new org.opensearch.serverless.storage.retention.PitrRetentionConfig(manifestStore, pinRegistry, 60_000L);
+
+            ObjectStoreReaderEngine readerEngine = ObjectStoreReaderEngine.open(
+                engineConfig,
+                gen1,
+                materializer,
+                PRIMARY_TERM,
+                shardStateStore,
+                manifestStore,
+                shardDirectory,
+                LOCAL_NODE_ID,
+                null,
+                null,
+                null,
+                null,
+                null,
+                pitrRetentionConfig
+            );
+            readerEngine.close();
+        } finally {
+            writer.close();
+            writerDirectory.close();
+        }
+    }
 }

@@ -19,6 +19,7 @@ import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.manifest.CommitManifest;
 import org.opensearch.serverless.storage.resharding.PartitionRewriteSchedulerConfig;
 import org.opensearch.serverless.storage.resharding.ShardPartitionDescriptor;
+import org.opensearch.serverless.storage.retention.PitrRetentionConfig;
 import org.opensearch.serverless.storage.shardstate.ShardHead;
 import org.opensearch.serverless.storage.shardstate.ShardStateStore;
 import org.opensearch.serverless.storage.shardstate.VersionedShardHead;
@@ -45,6 +46,7 @@ public final class ReaderEngineFactory implements EngineFactory {
     private final ReaderShardActivityRegistry activityRegistry;
     private final ShardPartitionDescriptor partitionDescriptor;
     private final PartitionRewriteSchedulerConfig partitionRewriteConfig;
+    private final PitrRetentionConfig pitrRetentionConfig;
 
     /**
      * Creates a factory with no admission controller, compaction, or GC scheduling.
@@ -256,6 +258,59 @@ public final class ReaderEngineFactory implements EngineFactory {
         ShardPartitionDescriptor partitionDescriptor,
         PartitionRewriteSchedulerConfig partitionRewriteConfig
     ) {
+        this(
+            shardStateStore,
+            manifestStore,
+            materializer,
+            shardDirectory,
+            localNodeId,
+            admissionController,
+            compactionConfig,
+            gcConfig,
+            activityRegistry,
+            partitionDescriptor,
+            partitionRewriteConfig,
+            null
+        );
+    }
+
+    /**
+     * Creates a factory with every optional feature configurable, including this shard's own
+     * background PITR retention reconciliation -- see this class's own javadoc for why a reader
+     * shard, not just the writer, must run this: a reader is what stays alive across a writer
+     * scaling to zero, and PITR pins left unreconciled past that point never age out, so GC can
+     * never reclaim them.
+     *
+     * @param shardStateStore resolves the shard's currently-published head
+     * @param manifestStore reads the commit manifest for a resolved head
+     * @param materializer applies a manifest's files to the engine's store directory
+     * @param shardDirectory the shard-directory-tier client the opened engine reports its entry to
+     * @param localNodeId this node's id, reported as part of the shard directory entry
+     * @param admissionController {@code null} to disable the admission cap entirely -- see its own javadoc.
+     * @param compactionConfig {@code null} disables this reader's own background compaction scheduler -- see its own javadoc.
+     * @param gcConfig {@code null} disables this reader's own background GC sweep -- see its own javadoc.
+     * @param activityRegistry {@code null} to skip registering this factory's engines for manifest-generation-lag lookups.
+     * @param partitionDescriptor {@code null} unless this shard is a split target -- see {@link
+     *        org.opensearch.serverless.storage.resharding.PartitionFilteringDirectoryReader}'s own javadoc.
+     * @param partitionRewriteConfig {@code null} disables this reader's own background
+     *        partition-rewrite scheduler -- see {@link PartitionRewriteSchedulerConfig}'s own javadoc.
+     * @param pitrRetentionConfig {@code null} disables this reader's own background PITR retention
+     *        reconciliation -- see {@link PitrRetentionConfig}'s own javadoc.
+     */
+    public ReaderEngineFactory(
+        ShardStateStore shardStateStore,
+        BlobContainerManifestStore manifestStore,
+        ObjectStoreCommitMaterializer materializer,
+        ShardDirectory shardDirectory,
+        String localNodeId,
+        ReaderShardAdmissionController admissionController,
+        CompactionSchedulerConfig compactionConfig,
+        GcSchedulerConfig gcConfig,
+        ReaderShardActivityRegistry activityRegistry,
+        ShardPartitionDescriptor partitionDescriptor,
+        PartitionRewriteSchedulerConfig partitionRewriteConfig,
+        PitrRetentionConfig pitrRetentionConfig
+    ) {
         this.shardStateStore = shardStateStore;
         this.manifestStore = manifestStore;
         this.materializer = materializer;
@@ -267,6 +322,7 @@ public final class ReaderEngineFactory implements EngineFactory {
         this.activityRegistry = activityRegistry;
         this.partitionDescriptor = partitionDescriptor;
         this.partitionRewriteConfig = partitionRewriteConfig;
+        this.pitrRetentionConfig = pitrRetentionConfig;
     }
 
     @Override
@@ -302,7 +358,8 @@ public final class ReaderEngineFactory implements EngineFactory {
                 compactionConfig,
                 gcConfig,
                 partitionDescriptor,
-                partitionRewriteConfig
+                partitionRewriteConfig,
+                pitrRetentionConfig
             );
             if (activityRegistry != null) {
                 activityRegistry.register(indexUuid, shardId, engine);
