@@ -2709,3 +2709,44 @@ say this precisely, closing out this session's full punch list (items #1-20, all
 fixes/additions, confirmed non-issues, corrected stale scan findings, or -- twice now -- corrected
 this session's own earlier mischaracterizations).
 
+
+## Multi-agent code review of the resharding-fencing work, and 7 fixes (`c518079c341`)
+
+Ran an 8-angle finder + adversarial-verify review pass over this session's own commits
+(2eec8dbdccb..HEAD): line-by-line scan, removed-behavior audit, cross-file tracer, reuse,
+simplification, efficiency, altitude, and CLAUDE.md conventions. 7 candidates survived
+independent verification (2 findings were caught by more than one angle, confirming each
+other); 1 candidate (irreversible fencing breaking a "dual-write bridge" caller strategy) was
+refuted on closer reading -- that mitigation was always scoped to the pre-cutover window, and
+fencing only runs post-cutover, so no documented strategy is actually broken.
+
+Fixed, most severe first:
+
+1. **Retiring a shrink source never checked fencing** (`TransportRetireShrinkSourceAction`) --
+   the action deletes both genuine shrink sources and (per this session's own earlier work)
+   resharding-by-copy split sources, but had no way to tell an un-fenced split source apart
+   from a genuine shrink source. Fixed by requiring an explicit `acknowledgeUnfencedSource`
+   flag before retiring anything that isn't currently fenced.
+2. **Fence-split-source silently acked success on a concurrent-deletion race** -- the
+   cluster-state-update task's no-op branch (source deleted between the pre-check and the
+   task running) reported `acknowledged: true` with no fence actually applied. Fixed to fail
+   loudly instead.
+3. **Fence-split-source never validated the superseding alias exists** -- a typo could
+   permanently fence an index against an alias nothing could ever redirect through. Fixed
+   with an existence check before fencing.
+4. Documented that a transient failure fencing the source after cutover already succeeded
+   does not mean cutover rolled back, and that retrying the whole orchestrate call is safe.
+5. **The GC bundle-safety fuzzer's pin-release action was nearly a no-op** -- it matched
+   pins by exact id but reconstructed a hardcoded `-0` suffix instead of the random suffix
+   used at pin creation, so release only matched about 1 in a million times. Fixed by
+   tracking the real `PinRecord` used at creation. Verified with a break-the-fix pass
+   (disabling the durably-pinned guard): the fuzzer now catches it reliably.
+6. Added headroom to two unguarded wall-clock benchmark assertions (WAL batching p99
+   comparison, global-ordinal cold-build floor) to reduce CI flakiness risk -- one sibling
+   benchmark had already needed the same fix after a real near-miss.
+7. Removed `OrchestrateShardSplitResponse.sourceFenced`, which always equalled `cutover` in
+   every real code path (fencing runs unconditionally right after cutover and any fencing
+   failure short-circuits the whole response).
+
+Full `:plugins:serverless-storage:test` and `:internalClusterTest` green after each fix and
+after the full batch; scope stayed entirely inside the plugin, no core changes needed.
