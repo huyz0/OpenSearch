@@ -73,20 +73,37 @@ this repo:
 
 ## What's explicitly NOT done / open
 
+A second full-project sweep (this session, after the list below was first written) re-checked every
+item still open at that point, plus ran a fresh whole-plugin gap scan. Two of that scan's two largest
+flagged items — WAL append-time fencing, and client write-routing cutover after split — turned out to
+already be fully implemented; the scan was reading stale doc comments, not actual code state. Both
+have since been corrected (`c3e6b34d898`, `f60da2b320d`). What's left, confirmed still genuinely open:
+
 - **WAL batching Phase 3** — flipping `wal_flush.batching.enabled`'s default to `true`. Deliberately
-  deferred pending real load testing against the RFC's cost-sanity target.
+  deferred: no real cloud object store or load generator exists in this environment to satisfy the
+  RFC's own gating condition (`7d013dd7ceb`).
 - **Resharding-by-copy source write-fencing** — documented as an operator precondition, not built.
   Building real fencing (or a dual-write bridge) would be a genuinely new mechanism, out of scope for
-  a documentation pass.
-- **Node-wide/per-shard-budget ordering for the new 429 backpressure**, and **feeding the backlog
-  signal into autoscaling** (rfc-serverless-opensearch.md §10) — see the byte-threshold/backpressure
-  section of `dynamic-partitioning-progress.md` for what's built vs. still open here.
+  a documentation pass. Re-confirmed still accurate (`dbde25b96be`).
+- **Auto-triggering resharding-by-copy off a write-rate/size threshold** — `ShardSplitCandidatesAction`
+  surfaces the signal; no scheduler acts on it. Distinct from the *in-place-split* mechanism's own
+  auto-trigger, which is real and already wired (`f60da2b320d`).
+- **Node-wide/per-shard-budget ordering for the 429 backpressure**, and **feeding the WAL backlog
+  signal into autoscaling** (rfc-serverless-opensearch.md §10) — the shared `WalBatchingProcessor` is
+  already node-wide by design, so there's no separate per-shard budget to order against on the
+  batching path today.
+- **Nested split-of-a-split merge-back** — deliberately guarded, not built (throws a clear error
+  rather than silently misbehaving); confirmed the guard is now actually tested (`27fe367cf72`).
+- Chaos/fuzz test coverage against real cloud-backend failure modes still limited to mock infra;
+  event-driven (non-polling) commit notification remains a documented, non-blocking refinement whose
+  milestone target is already met by the current 5s-poll + push-notification combination.
 
 Resolved since the list above was first written: **byte-threshold early-flush trigger** for WAL
-batching (`17bb9ce3dee`) and **request-level 429 backpressure** for WAL upload backlog
-(`52324677588`) are both implemented now — see `dynamic-partitioning-progress.md`'s WAL mirroring
-sections. **`plugins/serverless-storage/README.md`** now exists (`c2c1625dadf`) as the plugin's
-quickstart doc.
+batching (`17bb9ce3dee`), **request-level 429 backpressure** for WAL upload backlog (`52324677588`),
+**`plugins/serverless-storage/README.md`** (`c2c1625dadf`), and **unit test coverage for every
+Rest*Action class** (`99a9266d04c`) are all done. Settings registered-vs-read, scale-to-zero/scale-up
+lifecycle wiring, and commit-notification polling were all re-checked and confirmed to already be
+correct/wired — no code change needed for those.
 - The plugin has a real, substantial engineering base with correctness-reviewed core mechanisms, but
   has never been run against a real cloud object store at production scale, load-tested, or reviewed
   by anyone outside this session — see the "are we complete?" discussion in this session's transcript
