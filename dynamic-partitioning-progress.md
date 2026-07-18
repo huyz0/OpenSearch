@@ -2656,3 +2656,26 @@ code, only confirmed the existing implementation already matches the formal mode
 itself a real, useful result (three independent techniques -- hand-written test, TLA+ proof, runtime
 fuzzing -- now all agree).
 
+## Snapshot-repository integration gap assessed (`9ad6505055a`)
+
+Next completeness-sweep item: what does Phase 4.6's "first, scoped slice" of snapshot support
+actually cover, vs. full parity with core's real `_snapshot`/`_restore` API. This one turned out to
+be a real, wide gap worth stating plainly, not a narrow implementation detail: `ServerlessStoragePlugin`
+implements neither `RepositoryPlugin` nor `Repository` -- `PUT _snapshot/<repo>` against this
+plugin's storage does not work at all. `SnapshotPinAction`/`SnapshotRestoreAction` are a real,
+useful, but genuinely *different* mechanism: durably retain one shard's current manifest generation
+by name against GC (`TransportSnapshotPinAction`), then CAS that same shard's own head back to it in
+place (`TransportSnapshotRestoreAction`) -- no data movement, no portable archive, no restoring into
+a different index or cluster, no repository verification, no index-wide orchestration.
+
+**Decision: do not build real `Repository` SPI integration.** Same reasoning this doc has now used
+several times this session for genuinely large, cross-team-scale work (resharding source fencing,
+warm/composite convergence): composing this plugin's storage with a real snapshot repository would
+most likely mean building on `repository-s3`/`repository-fs`-style plumbing, a separate, substantial
+mechanism, not an extension of the existing pin registry. **What was worth doing now, and got done**:
+the shared "snapshot"/"restore" vocabulary with core's real, well-known feature is a real
+documentation risk -- an operator reading `SnapshotPinAction`'s name alone could reasonably expect
+`_snapshot` API compatibility that doesn't exist. Added an explicit scope-boundary paragraph to both
+action classes' own javadoc and a matching RFC status note (Phase 4.6), so this doesn't need
+rediscovering by a future reader or sweep.
+
