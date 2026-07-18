@@ -2383,3 +2383,37 @@ No code change made. This is a real, named, deliberately-scoped-out refinement w
 milestone target underneath it -- correctly left as "possible later refinement," not something to
 build under a generic sweep-the-open-items pass.
 
+## WAL append-time fencing — re-checked, already fully implemented (scan finding was stale/wrong)
+
+The project-wide sweep's single largest flagged item was "WAL append-time fencing": the claim that
+`WalChunkService#append` has no fencing check, so a record tagged with a once-valid primary term
+could still be appended after that term was superseded, with only post-hoc `filterByShardAndMinimumTerm`
+filtering to catch it. **This is wrong as a characterization of the current code** -- the scan read
+`WalChunkService#append` in isolation and correctly observed it has no synchronous fencing check
+(true, and by design -- an append-time check would defeat the "cheap, unsynchronized buffering"
+`WalChunkService` exists for, per rfc-serverless-opensearch.md's own reasoning), but missed that the
+actual fencing mechanism was built on the *replay* side instead, and is fully implemented, formally
+verified, and tested:
+
+- `plugins/serverless-storage/formal/WalReplayFencing.tla` formally proves a term-only filter
+  (`NaiveReplay`) is insufficient (a 4-state counterexample) and that a filter bound by *both* the
+  term floor *and* a WAL-position cutoff (`FixedReplay`) holds exhaustively (603,722 states).
+- `WalChunkReader.filterByShardAndMinimumTerm` + `WalReplayRecovery.replayOperations` implement
+  exactly `FixedReplay`: replay is bound by `(indexUuid, shardId, minPrimaryTerm)` *and*
+  `activationWalPosition` (the WAL length snapshotted at activation), never term alone.
+- The snapshot itself was the one real remaining gap (construction-time snapshot missed the
+  live-promotion case, only fresh-allocation) -- closed via a new `Engine#onPrimaryTermBumped(long)`
+  hook called from `IndexShard#bumpPrimaryTerm` inside the same mutex-held, atomic-with-the-term-bump
+  window `WalReplayFencing.tla`'s `AcquireLease` action models, traced and confirmed atomic against
+  the real `IndexShard` code (not assumed). `ObjectStoreWriterEngine#onPrimaryTermBumped` re-snapshots
+  `activationWalPosition` for exactly this case.
+- Tested end-to-end: `ObjectStoreWriterEngineTests#testOnPrimaryTermBumpedReSnapshotsActivationWalPositionToTheLiveBound`
+  (re-ran clean as part of this check), `ServerlessStorageWriterReplicaPromotionIT` (real 2-node
+  live-promotion kill test), `WalReplayRecoveryTests` (re-ran clean), plus a real bug found and fixed
+  along the way (WAL replay never decrypted an encrypted record's payload -- fixed, regression-tested).
+
+No code change made here. The scan's finding was a real methodology gap (reading one class's
+javadoc/code without tracing where its stated limitation was actually closed elsewhere), not a real
+gap in the feature. Corrected here so this doesn't get re-flagged by a future scan reading the same
+surface-level signal.
+
