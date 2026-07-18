@@ -43,6 +43,14 @@ import java.util.Optional;
  * internals). Both are real future work; this class is the packaging mechanism either eventual
  * caller would use once it has a {@link Directory}/{@link SegmentInfos} pair in hand -- see the
  * class-level status note in the RFC's own Phase 6 section for the fuller picture.
+ *
+ * <p><b>This class only ever converts classic &rarr; serverless-storage.</b> The "either eventual
+ * caller" above refers to two different <em>sources</em> of an already-locally-recovered classic
+ * commit (ordinary peer/translog recovery, or a snapshot-mount import) -- not a reverse,
+ * serverless-storage &rarr; classic direction, which was never named as in-scope anywhere in this
+ * plugin and is not implemented. See the RFC's own Phase 6 section for what that reverse direction
+ * would actually require if ever attempted (a real, unaddressed core-recovery-path obstacle, not a
+ * symmetric reuse of this class).
  */
 public final class ClassicIndexMigrator {
 

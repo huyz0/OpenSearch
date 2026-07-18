@@ -4196,8 +4196,8 @@ audit, and autoscaling signal calibration remain separately ongoing Phase 5 work
 background scheduler is no longer on this list -- `PartitionRewriteSchedulerTask` closed it, see
 above.)
 
-**Phase 6 — Migration tooling. The packaging mechanism both migration directions ultimately need
-is implemented and tested; one direction's per-direction orchestration -- resolving a real,
+**Phase 6 — Migration tooling. The packaging mechanism both migration directions this section
+names is implemented and tested; one direction's per-shard orchestration -- resolving a real,
 currently-open shard on this node -- is now also done.** `ClassicIndexMigrator#migrate`
 proves the "conversion is manifest synthesis... not data re-upload" claim directly: by the time any
 shard is open and recoverable at all -- classic peer/translog recovery, a core remote-store
@@ -4205,8 +4205,36 @@ restore, or a snapshot-mount import, it makes no difference -- its store directo
 ordinary valid Lucene commit, and `migrate` packages exactly that (via the same `ObjectStoreCommitPublisher#publishCommit`
 every live writer already uses: one bundle upload, one manifest write, no Lucene re-indexing) and
 CASes it in as the shard's first-ever serverless-storage head, refusing outright rather than
-overwriting if one already exists. This makes both migration directions this bullet names the same
-mechanical operation from here on, once a caller has a `Directory`/`SegmentInfos` pair in hand.
+overwriting if one already exists. To be precise about what "both migration directions" names here
+(worth stating plainly, since it's easy to misread as "classic&harr;serverless" both ways): it means
+two different *sources* feeding the same classic&rarr;serverless-storage conversion -- an
+already-locally-recovered shard via ordinary peer/translog recovery, and one recovered via a
+snapshot-mount import -- not a reverse, serverless-storage&rarr;classic direction. This class is
+genuinely indifferent to which of those two got the commit onto local disk.
+
+**A serverless-storage &rarr; classic reverse direction was never actually named as in-scope
+anywhere in this section, and a completeness-assessment pass this session that went looking for one
+(prompted by an earlier, over-broad reading of "migration tooling" as necessarily bidirectional)
+found none -- worth recording so a future reader doesn't assume otherwise from the name alone.**
+That same pass also asked, as a genuinely hypothetical future feature, how hard reverse migration
+would actually be if someone wanted to build it -- and found a real obstacle, not a symmetric
+packaging step: `ObjectStoreCommitMaterializer`
+already does the *file* half (manifest &rarr; real Lucene files in a target `Directory`) -- that part
+genuinely is reusable either direction -- but a classic index has no serverless-storage-specific
+`DirectoryFactory` to pre-populate a shard's store through the way this plugin's own writer engine
+does for its *own* cross-node failover case (&sect;7.1.2). Core's normal path for a brand-new
+classic shard is `StoreRecovery#recoverEmptyStore`, which unconditionally calls `store.createEmpty()`
+regardless of anything already written to that shard's local directory -- the exact same
+pre-population-gets-wiped problem &sect;7.1.2 already had to solve with real core changes for this
+plugin's own engine, but reverse migration's target is an *ordinary* classic index with no plugin
+engine involved at all, so none of that existing seam applies. Making core take the `EXISTING_STORE`
+path instead for a freshly-created classic index (so a materialized-in-advance local store is
+adopted rather than wiped) needs either a genuinely new core recovery-path seam or piggybacking on
+an existing pre-populated-store mechanism (e.g. disguising the materialized files as a snapshot
+restore to a synthetic repository) -- either way, real new core-interaction design work, not a
+reuse of anything this plugin already has. Correctly out of scope for this pass, the same "real
+design work, not implementation time" reasoning this document already applies to several other
+large, deliberately-deferred items.
 
 **`MigrateShardAction`/`TransportMigrateShardAction` close the "reaching a real, currently-open
 `IndexShard`'s local `Store`" half of what used to be open** -- the `IndicesService` wiring this
@@ -4237,6 +4265,9 @@ accidentally depending on which node the test framework happened to pick.
 **Still open**: reading a classic repository's or remote-store's own on-disk metadata format
 directly (an alternative that could avoid requiring the shard be locally recovered first) depends
 on those formats' internals this plugin hasn't taken on -- real future work, not attempted here.
+This is a different gap than the (never actually in-scope) hypothetical reverse direction discussed
+above: it's about avoiding the *source*-side precondition (a locally-recovered classic shard) for the
+one real, implemented classic&rarr;serverless-storage direction, not about migrating the other way.
 Verified end to end over the real transport layer, not just at the unit level (`ClassicIndexMigratorTests`
 already covered the packaging mechanism against a synthetic `Directory`): `ServerlessStorageMigrateShardActionIT`
 indexes a real document through a real classic (non-serverless-storage) writer engine, migrates its
