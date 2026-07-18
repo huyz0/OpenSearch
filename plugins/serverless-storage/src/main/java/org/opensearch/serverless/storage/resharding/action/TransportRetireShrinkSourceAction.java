@@ -18,6 +18,7 @@ import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.serverless.storage.ServerlessStoragePlugin;
+import org.opensearch.serverless.storage.resharding.SourceSplitFenceMetadata;
 import org.opensearch.serverless.storage.security.RestrictingBlobContainer;
 import org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore;
 import org.opensearch.serverless.storage.shardstate.ShardStateStore;
@@ -90,6 +91,20 @@ public class TransportRetireShrinkSourceAction extends HandledTransportAction<Re
                                 + request.sourceIndexName()
                                 + "] is not a serverless-storage index -- this action only "
                                 + "retires serverless-storage shrink sources, never an ordinary index"
+                        )
+                    );
+                    return;
+                }
+                if (SourceSplitFenceMetadata.isFencedSource(sourceMetadata) == false && request.acknowledgeUnfencedSource() == false) {
+                    listener.onFailure(
+                        new IllegalStateException(
+                            "source ["
+                                + request.sourceIndexName()
+                                + "] is not fenced against direct writes (see FenceSplitSourceAction) -- retiring it now "
+                                + "could permanently delete data still being written directly to it if this is actually an "
+                                + "unfenced resharding-by-copy split source. If this is genuinely a shrink source (never "
+                                + "part of a split) and you have already confirmed writes have stopped, retry with "
+                                + "acknowledgeUnfencedSource=true"
                         )
                     );
                     return;

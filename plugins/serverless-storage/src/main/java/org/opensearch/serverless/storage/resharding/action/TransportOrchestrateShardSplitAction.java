@@ -46,6 +46,17 @@ import java.util.List;
  * write-blocking synchronized with the clone itself or a dual-write bridge mirroring writes to both
  * source and targets until cutover -- both remain a genuinely new, separate mechanism, out of scope
  * here. See rfc-serverless-opensearch.md &sect;16 Phase 4 for the full design-level discussion.
+ *
+ * <p><b>A failure reported after cutover does not mean cutover didn't happen.</b> {@link
+ * CutoverSplitRoutingAction} durably repoints the routing alias before this class ever calls {@link
+ * FenceSplitSourceAction}; a subsequent failure fencing the source (for example a transient {@code
+ * METADATA_WRITE} cluster block) is surfaced to the caller as an overall failure of this action, but
+ * traffic has already moved to the new targets by that point -- this is <i>not</i> rolled back.
+ * Callers must not treat a failure response as proof nothing durable happened. Retrying the whole
+ * call is always safe: every stage (including {@link CutoverSplitRoutingAction} and {@link
+ * FenceSplitSourceAction} itself) is idempotent against its own already-applied state, so a retry
+ * simply re-confirms or completes whatever stage previously failed rather than erroring out or
+ * double-applying anything.
  */
 public class TransportOrchestrateShardSplitAction extends HandledTransportAction<
     OrchestrateShardSplitRequest,
@@ -206,14 +217,14 @@ public class TransportOrchestrateShardSplitAction extends HandledTransportAction
 
     private void writeRoutingStage(OrchestrateShardSplitRequest request, ActionListener<OrchestrateShardSplitResponse> listener) {
         if (request.enableWriteRouting() == false) {
-            listener.onResponse(new OrchestrateShardSplitResponse(true, true, true, true, false));
+            listener.onResponse(new OrchestrateShardSplitResponse(true, true, true, false));
             return;
         }
         client.execute(
             EnableWritePartitionRoutingAction.INSTANCE,
             new EnableWritePartitionRoutingRequest(request.routingAliasName(), request.targetIndexNames()),
             ActionListener.wrap(
-                response -> listener.onResponse(new OrchestrateShardSplitResponse(true, true, true, true, true)),
+                response -> listener.onResponse(new OrchestrateShardSplitResponse(true, true, true, true)),
                 listener::onFailure
             )
         );

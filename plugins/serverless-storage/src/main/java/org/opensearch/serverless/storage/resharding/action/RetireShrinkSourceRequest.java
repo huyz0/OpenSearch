@@ -28,12 +28,25 @@ import static org.opensearch.action.ValidateActions.addValidationError;
  * auto-deletes anything it didn't itself just create" caution {@code ShardCloner#deleteClone}
  * already applies, applied here as "never deletes anything without first confirming its own
  * replacement genuinely exists."
+ *
+ * <p>This same action is also documented (see {@link
+ * org.opensearch.serverless.storage.resharding.SourceSplitFenceMetadata}, {@link
+ * TransportOrchestrateShardSplitAction}) as the eventual deleter of a resharding-by-copy split's
+ * source, once {@link FenceSplitSourceAction} has fenced it. But nothing about this request lets
+ * {@link TransportRetireShrinkSourceAction} tell a genuine, never-split shrink source apart from a
+ * split source that simply hasn't been fenced yet -- both look identical (no distinguishing
+ * {@code IndexMetadata} state exists before fencing). {@link #acknowledgeUnfencedSource} closes
+ * that gap: retiring a source that isn't currently fenced requires this flag to be explicitly
+ * {@code true}, forcing the same "explicit, separate operator decision" this class already demands
+ * for the deletion itself, rather than silently allowing an automated or mistaken call to delete a
+ * split source that's still receiving direct writes.
  */
 public class RetireShrinkSourceRequest extends ActionRequest {
 
     private final String sourceIndexName;
     private final String targetIndexUuid;
     private final int targetShardId;
+    private final boolean acknowledgeUnfencedSource;
 
     /**
      * Creates a request.
@@ -41,11 +54,18 @@ public class RetireShrinkSourceRequest extends ActionRequest {
      * @param sourceIndexName the real index name to delete, once verified safe.
      * @param targetIndexUuid the shrink target's index UUID the caller believes {@code sourceIndexName} was merged into.
      * @param targetShardId the shard number within {@code targetIndexUuid}.
+     * @param acknowledgeUnfencedSource must be {@code true} if {@code sourceIndexName} is not currently fenced (see
+     *                {@link org.opensearch.serverless.storage.resharding.SourceSplitFenceMetadata}) -- required so an
+     *                automated or mistaken retirement of a not-yet-fenced split source fails loudly instead of silently
+     *                deleting data that may still be written directly. Genuine shrink sources (never part of a split)
+     *                are never fenced, so this must always be set for them once the caller has independently confirmed
+     *                writes have stopped.
      */
-    public RetireShrinkSourceRequest(String sourceIndexName, String targetIndexUuid, int targetShardId) {
+    public RetireShrinkSourceRequest(String sourceIndexName, String targetIndexUuid, int targetShardId, boolean acknowledgeUnfencedSource) {
         this.sourceIndexName = sourceIndexName;
         this.targetIndexUuid = targetIndexUuid;
         this.targetShardId = targetShardId;
+        this.acknowledgeUnfencedSource = acknowledgeUnfencedSource;
     }
 
     /**
@@ -58,6 +78,7 @@ public class RetireShrinkSourceRequest extends ActionRequest {
         this.sourceIndexName = in.readString();
         this.targetIndexUuid = in.readString();
         this.targetShardId = in.readVInt();
+        this.acknowledgeUnfencedSource = in.readBoolean();
     }
 
     /** @param out stream to write this request's fields to. */
@@ -67,6 +88,7 @@ public class RetireShrinkSourceRequest extends ActionRequest {
         out.writeString(sourceIndexName);
         out.writeString(targetIndexUuid);
         out.writeVInt(targetShardId);
+        out.writeBoolean(acknowledgeUnfencedSource);
     }
 
     /** @return validation errors, or {@code null} if the request is well-formed. */
@@ -98,5 +120,10 @@ public class RetireShrinkSourceRequest extends ActionRequest {
     /** The shard number within {@link #targetIndexUuid()}. */
     public int targetShardId() {
         return targetShardId;
+    }
+
+    /** Whether the caller has explicitly acknowledged that {@link #sourceIndexName()} is not currently fenced. */
+    public boolean acknowledgeUnfencedSource() {
+        return acknowledgeUnfencedSource;
     }
 }

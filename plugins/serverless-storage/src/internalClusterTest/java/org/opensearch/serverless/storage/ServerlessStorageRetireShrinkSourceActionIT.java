@@ -126,7 +126,7 @@ public class ServerlessStorageRetireShrinkSourceActionIT extends ServerlessStora
             Exception.class,
             () -> client().execute(
                 RetireShrinkSourceAction.INSTANCE,
-                new RetireShrinkSourceRequest("retire-source-idx-1", "never-shrunk-target", SHARD_ID)
+                new RetireShrinkSourceRequest("retire-source-idx-1", "never-shrunk-target", SHARD_ID, true)
             ).get()
         );
 
@@ -160,13 +160,49 @@ public class ServerlessStorageRetireShrinkSourceActionIT extends ServerlessStora
 
         AcknowledgedResponse response = client().execute(
             RetireShrinkSourceAction.INSTANCE,
-            new RetireShrinkSourceRequest("retire-source-idx-2", targetUuid, SHARD_ID)
+            new RetireShrinkSourceRequest("retire-source-idx-2", targetUuid, SHARD_ID, true)
         ).get();
         assertTrue("retirement must be acknowledged once the target is verified", response.isAcknowledged());
 
         assertFalse(
             "the source index must genuinely be deleted, not merely acknowledged as a no-op",
             client().admin().cluster().prepareState().get().getState().metadata().hasIndex("retire-source-idx-2")
+        );
+    }
+
+    public void testRefusesToRetireAnUnfencedSourceWithoutExplicitAcknowledgement() throws Exception {
+        Path basePath = createTempDir("serverless-storage-retire-shrink-source-it-unfenced");
+        Settings nodeSettings = Settings.builder()
+            .putList("path.repo", basePath.toString())
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey(), basePath.toString())
+            .build();
+        internalCluster().startClusterManagerOnlyNode(nodeSettings);
+        internalCluster().startDataOnlyNode(nodeSettings);
+
+        createIndex(
+            "retire-source-idx-3",
+            Settings.builder()
+                .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+                .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+                .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey(), true)
+                .build()
+        );
+        ensureGreen("retire-source-idx-3");
+
+        String targetUuid = "retire-shrink-source-it-unfenced-target-uuid";
+        publishTarget(blobContainerFor(basePath, targetUuid, SHARD_ID), targetUuid);
+
+        expectThrows(
+            Exception.class,
+            () -> client().execute(
+                RetireShrinkSourceAction.INSTANCE,
+                new RetireShrinkSourceRequest("retire-source-idx-3", targetUuid, SHARD_ID, false)
+            ).get()
+        );
+
+        assertTrue(
+            "refusing to retire an unfenced, unacknowledged source must never delete it",
+            client().admin().cluster().prepareState().get().getState().metadata().hasIndex("retire-source-idx-3")
         );
     }
 
@@ -187,7 +223,8 @@ public class ServerlessStorageRetireShrinkSourceActionIT extends ServerlessStora
 
         expectThrows(
             Exception.class,
-            () -> client().execute(RetireShrinkSourceAction.INSTANCE, new RetireShrinkSourceRequest("ordinary-idx", "some-target", 0)).get()
+            () -> client().execute(RetireShrinkSourceAction.INSTANCE, new RetireShrinkSourceRequest("ordinary-idx", "some-target", 0, true))
+                .get()
         );
 
         assertTrue(

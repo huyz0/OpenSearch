@@ -84,39 +84,74 @@ public class TransportFenceSplitSourceAction extends TransportClusterManagerNode
     }
 
     @Override
-    protected void clusterManagerOperation(FenceSplitSourceRequest request, ClusterState state, ActionListener<AcknowledgedResponse> listener) {
+    protected void clusterManagerOperation(
+        FenceSplitSourceRequest request,
+        ClusterState state,
+        ActionListener<AcknowledgedResponse> listener
+    ) {
         String sourceIndexName = request.sourceIndexName();
         String supersedingAliasName = request.supersedingAliasName();
         if (state.metadata().index(sourceIndexName) == null) {
             listener.onFailure(new IllegalArgumentException("source index [" + sourceIndexName + "] does not exist"));
             return;
         }
-        clusterService.submitStateUpdateTask(
-            "serverless-storage-fence-split-source",
-            new ClusterStateUpdateTask(Priority.URGENT) {
-                @Override
-                public ClusterState execute(ClusterState currentState) {
-                    IndexMetadata sourceMetadata = currentState.metadata().index(sourceIndexName);
-                    if (sourceMetadata == null) {
-                        return currentState;
-                    }
-                    Metadata.Builder metadataBuilder = Metadata.builder(currentState.metadata());
-                    metadataBuilder.put(SourceSplitFenceMetadata.withFence(sourceMetadata, supersedingAliasName), true);
-                    return ClusterState.builder(currentState).metadata(metadataBuilder).build();
-                }
+        if (state.metadata().hasAlias(supersedingAliasName) == false) {
+            listener.onFailure(
+                new IllegalArgumentException(
+                    "superseding alias ["
+                        + supersedingAliasName
+                        + "] does not exist -- refusing to fence ["
+                        + sourceIndexName
+                        + "] "
+                        + "against an alias no writer could actually redirect through"
+                )
+            );
+            return;
+        }
+        clusterService.submitStateUpdateTask("serverless-storage-fence-split-source", new ClusterStateUpdateTask(Priority.URGENT) {
+            // Set by execute() so clusterStateProcessed can tell a genuine fence apart from the
+            // no-op branch (source deleted between the pre-checks above and this task actually
+            // running) -- the two must not both report success (see TransportFenceSplitSourceAction
+            // javadoc discussion of this race).
+            private boolean sourceStillPresent = true;
 
-                @Override
-                public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {
-                    logger.info("fenced split source [" + sourceIndexName + "], superseded by alias [" + supersedingAliasName + "]");
-                    listener.onResponse(new AcknowledgedResponse(true));
+            @Override
+            public ClusterState execute(ClusterState currentState) {
+                IndexMetadata sourceMetadata = currentState.metadata().index(sourceIndexName);
+                if (sourceMetadata == null) {
+                    sourceStillPresent = false;
+                    return currentState;
                 }
-
-                @Override
-                public void onFailure(String source, Exception e) {
-                    logger.warn("failed to fence split source [" + sourceIndexName + "]", e);
-                    listener.onFailure(e);
-                }
+                Metadata.Builder metadataBuilder = Metadata.builder(currentState.metadata());
+                metadataBuilder.put(SourceSplitFenceMetadata.withFence(sourceMetadata, supersedingAliasName), true);
+                return ClusterState.builder(currentState).metadata(metadataBuilder).build();
             }
-        );
+
+            @Override
+            public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {
+                if (sourceStillPresent == false) {
+                    logger.warn(
+                        "source ["
+                            + sourceIndexName
+                            + "] was deleted concurrently with fencing -- fence was not applied, reporting failure rather than "
+                            + "a false acknowledgement"
+                    );
+                    listener.onFailure(
+                        new IllegalStateException(
+                            "source index [" + sourceIndexName + "] was deleted before it could be fenced -- fencing did not apply"
+                        )
+                    );
+                    return;
+                }
+                logger.info("fenced split source [" + sourceIndexName + "], superseded by alias [" + supersedingAliasName + "]");
+                listener.onResponse(new AcknowledgedResponse(true));
+            }
+
+            @Override
+            public void onFailure(String source, Exception e) {
+                logger.warn("failed to fence split source [" + sourceIndexName + "]", e);
+                listener.onFailure(e);
+            }
+        });
     }
 }

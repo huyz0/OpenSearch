@@ -68,7 +68,13 @@ public class RestRetireShrinkSourceAction extends BaseRestHandler {
         String sourceIndexName = request.param("source_index");
         String targetIndexUuid = request.param("target_index_uuid");
         int targetShardId = Integer.parseInt(request.param("target_shard_id"));
-        RetireShrinkSourceRequest retireRequest = new RetireShrinkSourceRequest(sourceIndexName, targetIndexUuid, targetShardId);
+        boolean acknowledgeUnfencedSource = request.paramAsBoolean("acknowledge_unfenced_source", false);
+        RetireShrinkSourceRequest retireRequest = new RetireShrinkSourceRequest(
+            sourceIndexName,
+            targetIndexUuid,
+            targetShardId,
+            acknowledgeUnfencedSource
+        );
         return channel -> client.execute(RetireShrinkSourceAction.INSTANCE, retireRequest, new RestToXContentListener<>(channel));
     }
 }

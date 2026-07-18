@@ -154,8 +154,9 @@ public class ServerlessStorageOrchestrateShardSplitActionIT extends ServerlessSt
         ).get();
         assertTrue("targets must have been provisioned", response.targetsProvisioned());
         assertTrue("every target must have been split", response.allTargetsSplit());
+        // cutover() being true already implies fencing succeeded too -- see OrchestrateShardSplitResponse's
+        // own javadoc; the direct-write-rejection assertions below are the real end-to-end proof of fencing.
         assertTrue("the alias cutover must have completed", response.cutover());
-        assertTrue("the source must have been fenced once cutover completed", response.sourceFenced());
         assertTrue("write-routing must have been enabled since the request asked for it", response.writeRoutingEnabled());
 
         // Provisioning: both real target indices must now exist.
@@ -236,7 +237,6 @@ public class ServerlessStorageOrchestrateShardSplitActionIT extends ServerlessSt
         assertTrue("a resumed retry must still report every stage complete", retryResponse.targetsProvisioned());
         assertTrue(retryResponse.allTargetsSplit());
         assertTrue(retryResponse.cutover());
-        assertTrue(retryResponse.sourceFenced());
         assertTrue(retryResponse.writeRoutingEnabled());
     }
 

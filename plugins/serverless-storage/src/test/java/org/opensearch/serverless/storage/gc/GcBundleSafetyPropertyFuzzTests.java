@@ -101,7 +101,7 @@ public class GcBundleSafetyPropertyFuzzTests extends OpenSearchTestCase {
             GcSchedulerTask task = new GcSchedulerTask(threadPool, config.interval(), INDEX_UUID, SHARD_ID, config, () -> clockMillis[0]);
             try {
                 long nextGeneration = 1;
-                List<Long> pinnedGenerations = new ArrayList<>();
+                List<PinRecord> activePins = new ArrayList<>();
                 int steps = MIN_STEPS + random.nextInt(MAX_STEPS - MIN_STEPS + 1);
 
                 // Always start with at least one manifest -- an empty store has nothing for the
@@ -118,23 +118,19 @@ public class GcBundleSafetyPropertyFuzzTests extends OpenSearchTestCase {
                             List<CommitManifest> current = manifestStore.listManifests();
                             if (current.isEmpty() == false) {
                                 CommitManifest toPin = current.get(random.nextInt(current.size()));
-                                pinRegistry.addPin(
-                                    INDEX_UUID,
-                                    SHARD_ID,
-                                    new PinRecord("pin-" + toPin.generation() + "-" + random.nextInt(1_000_000), PRIMARY_TERM, toPin.generation())
+                                PinRecord pin = new PinRecord(
+                                    "pin-" + toPin.generation() + "-" + random.nextInt(1_000_000),
+                                    PRIMARY_TERM,
+                                    toPin.generation()
                                 );
-                                pinnedGenerations.add(toPin.generation());
+                                pinRegistry.addPin(INDEX_UUID, SHARD_ID, pin);
+                                activePins.add(pin);
                             }
                         }
                         case 3 -> {
-                            if (pinnedGenerations.isEmpty() == false) {
-                                long toRelease = pinnedGenerations.remove(random.nextInt(pinnedGenerations.size()));
-                                pinRegistry.removePin(INDEX_UUID, SHARD_ID, "pin-" + toRelease + "-0");
-                                // Best-effort: the exact pin id above may not match if multiple pins
-                                // were placed on the same generation with different random suffixes --
-                                // harmless either way, since the invariant check below only cares
-                                // about the pin registry's real current state, not whether this
-                                // specific removal call found a match.
+                            if (activePins.isEmpty() == false) {
+                                PinRecord toRelease = activePins.remove(random.nextInt(activePins.size()));
+                                pinRegistry.removePin(INDEX_UUID, SHARD_ID, toRelease.pinId());
                             }
                         }
                         default -> clockMillis[0] += random.nextInt((int) retentionWindowMillis * 2);
