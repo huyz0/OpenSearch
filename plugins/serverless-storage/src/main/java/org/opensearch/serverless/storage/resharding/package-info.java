@@ -37,11 +37,26 @@
  * itself or a dual-write bridge, both of which remain a genuinely new, separate mechanism, out of
  * scope here. See {@code TransportOrchestrateShardSplitAction}'s own javadoc for the full detail.
  *
- * <p>Explicitly out of scope: auto-triggering a split off a write-rate/size threshold alone --
- * {@code ShardSplitCandidatesAction} surfaces the signal for an operator (or a future controller) to
- * act on manually via the routing-cutover sequence above, since nothing today automatically decides
- * when a candidate is safe to actually split unattended; and deleting a shrink's now-superseded
- * source shards afterward, a deliberately-not-automatic operator decision (see {@link
+ * <p><b>Auto-triggering this package's own split (as opposed to in-place split) off {@code
+ * ShardSplitCandidatesAction}'s signal is deliberately not built, and should stay that way.</b> The
+ * same signal already has a real automatic consumer -- {@link
+ * org.opensearch.serverless.storage.resharding.InPlaceSplitTriggerCoordinator}, which grows a
+ * shard's count *within* the same index (same {@code indexUuid}), invisible outside this plugin.
+ * This package's own {@link org.opensearch.serverless.storage.resharding.ShardSplitter}-based split
+ * is architecturally sibling, not identical: it produces a brand-new index with its own name and
+ * {@code indexUuid}, reachable through a new alias. Auto-triggering that off the same signal would
+ * be a real design mistake, not a missing wiring step: it would silently create new index identities
+ * with no operator/downstream-system awareness (alias management, ILM, dashboards, access control
+ * all need to know new names exist), and nothing today stops it from firing on the exact same hot
+ * shard {@link org.opensearch.serverless.storage.resharding.InPlaceSplitTriggerCoordinator} is
+ * already acting on in the same tick -- a real, un-designed coordination hazard between two
+ * independent automatic deciders sharing one signal. {@code ShardSplitCandidatesAction}'s REST/
+ * transport surface remains the right shape: an operator (or a future, carefully-designed controller
+ * that explicitly reconciles with in-place split's own decisions) reviews candidates and decides,
+ * deliberately, whether growing the existing index or creating a new one fits that shard.
+ *
+ * <p>Also explicitly out of scope: deleting a shrink's now-superseded source shards automatically,
+ * a deliberately-not-automatic operator decision (see {@link
  * org.opensearch.serverless.storage.resharding.action.RetireShrinkSourceAction}'s own "verify then
  * delete" pattern).
  */

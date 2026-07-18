@@ -2499,3 +2499,56 @@ is actually pinned on the new rejection path, not just on "any exception." Resto
 `:plugins:serverless-storage:test` and `:internalClusterTest` suites and `spotlessJavaCheck` on every
 touched/new file all clean.
 
+## Auto-trigger for resharding-by-copy split candidates — investigated, correct call is: don't build it
+
+Next item on the punch list this session's completeness sweep produced. Before writing a scheduler
+task mirroring `InPlaceSplitTriggerCoordinator`'s shape (the obvious copy-paste move, and what the
+punch list literally asked for), traced what `ShardSplitCandidatesAction`'s `writesPerMinute()`
+signal is already consumed by -- and found a real, already-automatic consumer that changes the
+answer entirely.
+
+**`InPlaceSplitTriggerCoordinator`/`InPlaceSplitTriggerSchedulerTask` (dynamic-partitioning-plan.md
+Phase 1 items 1.2-1.4, landed 2026-07-16) already auto-consumes this exact signal**, growing a hot
+shard's count *within the same index* (same `indexUuid`) via core's own `InPlaceSplitShardAction`,
+on a real scheduler, with sustained-duration hysteresis and a per-tick budget. This plugin's own
+`ShardSplitter`-based split (what this package calls "resharding-by-copy," `OrchestrateShardSplitAction`)
+is architecturally sibling to in-place split, not identical -- confirmed by this doc's own earlier
+"Why this matters for Part 2d's reconciliation question" entry: in-place split grows shard count
+within an index; `ShardSplitter` produces a brand-new index with its own name and `indexUuid`. Two
+different scaling shapes, both legitimate, deliberately coexisting.
+
+**Decision: do not build an auto-trigger for `ShardSplitter`/`OrchestrateShardSplitAction`.** Two
+independent, real reasons, not just "seems risky":
+
+1. **Silently creating new index identities has no safe unattended default.** In-place split's
+   automatic growth is invisible outside this plugin -- same name, same uuid, just more shards.
+   `OrchestrateShardSplitAction` creates a genuinely new index with a new name, reachable through a
+   new alias -- something alias management, ILM policies, dashboards, and access control all need to
+   know about. Automating that with no operator/downstream-system awareness is a real design
+   decision this plugin has no basis to make unilaterally, not a wiring gap.
+2. **A real, currently-undesigned coordination hazard.** `InPlaceSplitTriggerCoordinator`'s own
+   in-flight guard (`alreadySplitOrInFlight`) only checks *its own* mechanism's state
+   (`SplitShardsMetadata`) -- it has no idea whether `ShardSplitter` has also decided to act on the
+   same shard. Adding a second automatic decider consuming the identical candidate signal, with no
+   mutual-exclusion or reconciliation between the two, risks both mechanisms firing on the same hot
+   shard in the same tick. Designing that reconciliation properly is real, separate work -- not
+   something to bolt on as a side effect of copying an existing scheduler-task pattern.
+
+**A real, separate documentation bug found and fixed along the way, same "RFC drift" pattern as the
+two false-alarm findings earlier this session**: rfc-serverless-opensearch.md's own &sect;10 section
+still said "nothing consumes this [writesPerMinute] signal yet, and that is intentional... the only
+real mechanism for adding write capacity, `ShardSplitter`'s auto-split, still has nothing safe to
+trigger against" -- written 2026-07-11, five days *before* `InPlaceSplitTriggerCoordinator` landed
+and started consuming that exact signal automatically. Unlike the two earlier false alarms this
+session found (where the fix was "the code already does the right thing, update the stale doc"),
+this one is subtler: the doc's core factual claim ("nothing consumes this signal") is now false, but
+its underlying conclusion ("don't auto-trigger `ShardSplitter`") turns out to still be correct, for
+the two reasons above -- reasons the original paragraph never actually gave (it blamed the missing
+routing cutover, which is now built, per this doc's own earlier entries). Fixed the RFC to state the
+real current situation and the real reasons, not the stale one.
+
+Both `resharding/package-info.java` and rfc-serverless-opensearch.md's &sect;10 section now say the
+above explicitly, so this doesn't get re-flagged as a gap by a future sweep reading only "nothing is
+auto-triggered here" as a surface-level signal. No scheduler task built; the punch list's original
+framing of this item was itself based on an incomplete read of what already existed.
+

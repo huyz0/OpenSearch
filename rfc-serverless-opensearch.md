@@ -3225,24 +3225,42 @@ it a candidate against a deliberately low threshold, and a real `ReaderReplicaEx
 genuinely raises `index.number_of_search_replicas` on the live index. A full `internalClusterTest`
 regression sweep across the entire plugin stayed green throughout.
 
-**The write-side equivalent of `queriesPerMinute()` now exists too, but deliberately stops at the
-signal.** `ObjectStoreWriterEngine` gained `writesPerMinute()`, the same deliberately crude
-two-window (previous/current) counter as the reader side, updated alongside `lastActivityMillis` in
-`index()`'s existing recovery-origin-excluding branch, and `ShardActivityRegistry` gained
-`writesPerMinute()`/`snapshotWritesPerMinute()` mirroring `millisSinceLastActivity()`/`snapshotAll()`'s
-shape exactly. Unlike the reader side, nothing consumes this signal yet, and that is intentional
-rather than an oversight: reader scale-up above has a real knob to turn (`index.number_of_search_replicas`)
-and a real mechanism already wired to a scheduler; writer capacity has neither. There is no "writer
-replica count" -- exactly one primary per shard -- and the only real mechanism for adding write
-capacity, `ShardSplitter`'s auto-split, still has nothing safe to trigger against for a different
-reason than an earlier draft of this paragraph gave: the physical bundle rewrite itself is done
-(`PartitionRewritePublisher`, with its own background scheduler -- see &sect;16 Phase 5), but the
-routing cutover a real auto-split would need after rewriting (directing traffic to the split targets
-instead of the original shard) is not designed at all, a separate, larger, deliberately out-of-scope
-gap (see &sect;16 Phase 4's own split-target routing note). Wiring a threshold-triggered auto-split off
-`writesPerMinute()` before that exists would have nothing safe to trigger against. This increment exists purely so the
-signal is already being tracked -- the same incremental shape `millisSinceLastActivity()` was built
-in -- ready for whenever a future controller can actually act on it.
+**The write-side equivalent of `queriesPerMinute()` now exists too. Status update: it is no longer
+unconsumed -- a real automatic consumer landed five days after this paragraph was first written, and
+this paragraph was never revisited to say so.** `ObjectStoreWriterEngine` gained `writesPerMinute()`,
+the same deliberately crude two-window (previous/current) counter as the reader side, updated
+alongside `lastActivityMillis` in `index()`'s existing recovery-origin-excluding branch, and
+`ShardActivityRegistry` gained `writesPerMinute()`/`snapshotWritesPerMinute()` mirroring
+`millisSinceLastActivity()`/`snapshotAll()`'s shape exactly. **`InPlaceSplitTriggerCoordinator`/
+`InPlaceSplitTriggerSchedulerTask`** (dynamic-partitioning-plan.md Phase 1 item 1.2) now consumes
+exactly this signal (via `ShardSplitCandidatesAction`, which aggregates it) to automatically trigger
+core's own in-place `InPlaceSplitShardAction` on a sustained-high-write-rate shard -- real automatic
+write-capacity scaling for the common case, wired to a scheduler, with sustained-duration hysteresis
+and a per-tick budget, the same shape reader scale-up already has. There is still no "writer replica
+count" -- exactly one primary per shard -- but "grow the shard count of the same index" is now a real,
+automated answer to that.
+
+**What remains correctly unconsumed, and should stay that way, is specifically `ShardSplitter`'s own
+auto-split** -- the *other*, architecturally sibling split mechanism (`OrchestrateShardSplitAction`,
+&sect;16 Phase 5): where in-place split grows the shard count *within* the same index (same
+`indexUuid`, invisible to anything outside this plugin), `ShardSplitter`/`OrchestrateShardSplitAction`
+produces a *brand-new* index with its own name and `indexUuid`, reachable through a new alias. Those
+are not interchangeable, and auto-triggering the latter off the same `writesPerMinute()` signal that
+already drives in-place split would be a real design mistake, not a missing wiring step: (a) it would
+silently create new index identities with no operator/downstream-system awareness -- new names that
+alias management, ILM policies, dashboards, and access control all need to know about, a fundamentally
+bigger surface than in-place split's invisible shard-count growth; and (b) nothing today stops both
+mechanisms from firing on the exact same hot shard in the same tick, since `InPlaceSplitTriggerCoordinator`'s
+own in-flight guard only checks *its own* mechanism's state (`SplitShardsMetadata`), not `ShardSplitter`'s
+-- a real, un-designed coordination hazard between two independent automatic deciders sharing one
+candidate signal, exactly the "real design work, not implementation time" reasoning this document
+already applies elsewhere. The routing-cutover gap this paragraph originally cited as the blocker is
+now closed (see &sect;16 Phase 4's cutover and source-fencing status notes above) -- but closing that
+blocker did not, on its own, make auto-triggering `ShardSplitter` a good idea; the two reasons above are
+new, independent, and still real. `ShardSplitCandidatesAction`'s REST/transport surface remains the
+correct shape for this: an operator (or a future, carefully-designed higher-level controller that
+explicitly reconciles with in-place split's own decisions) reviews candidates and decides, deliberately,
+whether growing the existing index or creating a new one is the right shape for that specific shard.
 
 **Status: a first, deliberately scoped routing-cutover primitive now exists.**
 `CutoverSplitRoutingAction` (`resharding/action` package, REST-exposed as
