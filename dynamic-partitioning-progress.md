@@ -3001,3 +3001,98 @@ double-invokes or silently drops a listener (closing out the `WalBatchingProcess
 
 **This is the repeat-until-convergence result the standing review goal asked for**: two
 consecutive full passes, the second finding nothing the first round's fixes didn't already close.
+
+## Round 9: broadened-scope sweep finds a real split-brain gap plus 4 smaller issues
+
+Per a new standing goal ("repeat whole project review but in a very broad scope, fix all findings
+one by one until no new findings found"), ran a fresh sweep with finder agents split by
+architectural concern (allocation/routing, snapshot/migration, reader-engine/caching,
+scale-to-zero/lease) rather than by package, deliberately overlapping prior rounds' boundaries to
+catch cross-cutting issues a package-scoped read would miss. Found and fixed 5 real issues:
+
+1. **`TransportMigrateShardAction` read a live shard's commit without pinning it against deletion.**
+   It only called `Store#incRef()` before reading `segmentInfos`/`directory`, which keeps the
+   `Store` object itself from closing but does **not** pin that specific commit generation against
+   Lucene's `IndexDeletionPolicy` -- a concurrent merge/commit could delete the very files being
+   read out from under it, in principle (correctness currently rests entirely on the write-block
+   precondition round 6 added, with no defense-in-depth). Switched to
+   `IndexShard#acquireLastIndexCommitAndRefresh`, which pins the commit for the read's duration via
+   `GatedCloseable<IndexCommit>` and the engine's `CombinedDeletionPolicy` -- the same mechanism
+   core's own `SnapshotShardsService` uses for an equivalent point-in-time read.
+
+2. **`LocalDiskCachingBundleStore`'s per-key lock map leaked forever.** `locksByKey` gained an
+   entry for every distinct cache key ever read but never removed one, even when the corresponding
+   disk-cache file was evicted by the size-bounded sweep -- a slow, permanent heap leak on a
+   long-running reader node cycling through many bundle names, outliving the bounded disk cache it
+   guards. Fixed by removing the lock entry alongside the file inside `evictIfOverBudget`'s existing
+   delete loop.
+
+3. **`EnableWritePartitionRoutingRequest` didn't reject `aliasName` equal to one of its own
+   `targetIndexNames`.** If an operator named the alias the same as one of the targets, that index
+   resolves as a concrete index rather than an alias, so the action filter's alias-rewrite never
+   fires for it -- but the direct-write rejection still does, permanently blocking writes to that
+   partition with no recovery short of a manual disable/re-enable. Added the missing check.
+
+4. **`TransportEnableWritePartitionRoutingAction` never checked whether a target was already
+   assigned to a *different* alias, or already fenced as a split source.** Enabling routing twice
+   with overlapping target sets under different alias names silently reassigned a target between
+   aliases, leaving the old alias with an unrouteable hole at that partition index (writes to it
+   fall through to core's generic "ambiguous alias" rejection instead of a clear error at
+   assignment time); a fenced split source could likewise be re-assigned as a write target,
+   undermining the fencing guarantee. Added a `validateTargetAssignable` check, applied both in the
+   pre-check and re-checked inside `execute()` for the same concurrent-deletion race the existing
+   `missingDuringExecute` pattern already guards against.
+
+5. **Real split-brain gap in writer lease fencing (the most severe finding this round).**
+   `ObjectStoreCommitHeadPublisher#acquireOrRenewLease` deliberately does not advance
+   `ShardHead#primaryTerm` on lease acquisition -- by design, only a real publish does, so that
+   `(primaryTerm, latestManifestGeneration)` always stays a valid pointer to an actually-existing
+   manifest. But `publishCommitAsHead`'s fencing check compared *only* against `primaryTerm`, which
+   meant: if node B is promoted to a newer term and acquires the lease but hasn't published
+   anything yet, the head's recorded term is still the old term. A previous primary A, unaware it
+   has been superseded (e.g. partitioned from the cluster manager, never receiving the promotion),
+   could keep calling `publishCommitAsHead` under its own stale term and succeed -- repeatedly,
+   for as long as it takes B to publish its own first commit. This directly contradicts the
+   `formal/ShardHead.tla` model, whose `AcquireLease` action atomically bumps the term the moment a
+   lease is taken over; the real implementation had silently diverged from what was formally
+   verified. Fixed by giving `ShardHead` a second field, `leaseTerm` (`>= primaryTerm` always,
+   advanced immediately by `acquireOrRenewLease`/`withRenewedLease`, independent of whether
+   anything has published under it yet), and switching both `publishCommitAsHead` and
+   `acquireOrRenewLease`'s fencing checks to compare against `leaseTerm` instead of `primaryTerm`.
+   `primaryTerm` keeps its original meaning (the term the last real manifest was published under)
+   unchanged. Verified with an independent adversarial-verification agent (confirmed real, not a
+   false positive, by tracing that `ObjectStoreWriterEngine` reads `primaryTerm` fresh from core's
+   operation-primary-term supplier on every call, so this is not covered by core's own replication
+   fencing) and a break-the-fix pass: reverting the `leaseTerm` comparison back to `primaryTerm`
+   reproduces the exact predicted failure in the new regression test.
+
+One finder agent (scale-to-zero/lease, first attempt) returned a non-substantive status update
+instead of a report and was re-launched with a stricter prompt; the retry is what surfaced finding
+5. A second independent scale-to-zero pass, run in parallel, read the same code and reported no
+findings -- a reminder that a single "NO FINDINGS" report from one review angle is not sufficient
+confidence on its own for a change this deep in the metadata plane; the adversarial-verification
+step against the disagreeing findings was what actually resolved it.
+
+Other findings surfaced but deliberately not fixed as separate changes, judged either already
+covered or genuinely low-severity/by-design:
+- `ClassicIndexMigrator`'s TOCTOU between existence-check and CAS can leave an orphaned
+  bundle/manifest upload in object storage on a lost race -- a resource leak (eligible for the same
+  GC path as any other unreferenced bundle), not a correctness issue.
+- The narrow window between `TransportMigrateShardAction`'s write-block check and its commit read
+  is real but requires an operator to race a settings change into that specific few-line window;
+  not worth adding transactional cluster-state re-validation for.
+- `TransportCutoverSplitRoutingAction` never removing stale alias membership after a second cutover
+  is explicitly scoped out in that class's own javadoc as deliberate, distinct follow-up work.
+- `BlobContainerShardStateStore`'s register-key string concatenation has no delimiter escaping
+  between `indexUuid` and `shardId`, theoretically collision-prone -- not exploitable given current
+  UUID generation, flagged for awareness only.
+- `InMemoryPlaintextBundleCache` has no per-key lock on a concurrent cache miss (thundering herd,
+  redundant I/O) -- wasted work, not a correctness bug.
+- `ObjectStoreWriterEngine#renewLease` still ignores `acquireOrRenewLease`'s `false` return; left
+  as-is since fencing correctness now genuinely lives entirely in `publishCommitAsHead` (finding 5
+  closes the gap that made this matter), matching the class's own stated reasoning for the first
+  time accurately.
+
+Full `:plugins:serverless-storage:test` green after every fix, including a new regression test
+(`testPublicationIsFencedTheMomentANewerTermAcquiresTheLeaseEvenBeforeItPublishesAnything`) for
+finding 5.

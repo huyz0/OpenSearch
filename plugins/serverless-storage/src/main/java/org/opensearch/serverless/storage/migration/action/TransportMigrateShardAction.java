@@ -8,6 +8,7 @@
 
 package org.opensearch.serverless.storage.migration.action;
 
+import org.apache.lucene.index.IndexCommit;
 import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.store.Directory;
 import org.opensearch.action.support.ActionFilters;
@@ -17,11 +18,11 @@ import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.inject.Inject;
+import org.opensearch.common.concurrent.GatedCloseable;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.index.IndexService;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.shard.IndexShard;
-import org.opensearch.index.store.Store;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.serverless.storage.ServerlessStoragePlugin;
 import org.opensearch.serverless.storage.format.BlobContainerBundleStore;
@@ -39,7 +40,7 @@ import org.opensearch.transport.TransportService;
  * IndexShard} named by the request via {@link IndicesService} -- the exact seam {@link
  * org.opensearch.serverless.storage.migration.ClassicIndexMigrator}'s own javadoc named as
  * deliberately not built yet -- reads its current committed {@link Directory}/{@link
- * SegmentInfos} and sequencing metadata straight off {@link Store} (the same {@code
+ * SegmentInfos} and sequencing metadata straight off a pinned {@code IndexCommit} (the same {@code
  * segmentInfos.userData} fields {@code ObjectStoreWriterEngine#commitIndexWriter} reads, not the
  * shard's live in-memory state, which could have advanced past what this specific commit actually
  * covers), and delegates to {@link ClassicIndexMigrator#migrate} unchanged.
@@ -153,11 +154,15 @@ public class TransportMigrateShardAction extends HandledTransportAction<MigrateS
                     );
                 }
 
-                Store store = shard.store();
-                store.incRef();
-                try {
-                    SegmentInfos segmentInfos = store.readLastCommittedSegmentsInfo();
-                    Directory directory = store.directory();
+                // acquireLastIndexCommit pins THIS specific commit generation against deletion in
+                // the engine's CombinedDeletionPolicy for as long as the returned ref is held --
+                // unlike Store#incRef (which only keeps the Store object itself from closing), this
+                // guarantees the segment files read below cannot be removed by a concurrent
+                // merge/commit even if the write-block precondition above were ever violated.
+                try (GatedCloseable<IndexCommit> commitRef = shard.acquireLastIndexCommitAndRefresh(false)) {
+                    IndexCommit indexCommit = commitRef.get();
+                    Directory directory = indexCommit.getDirectory();
+                    SegmentInfos segmentInfos = SegmentInfos.readCommit(directory, indexCommit.getSegmentsFileName());
                     long primaryTerm = shard.getOperationPrimaryTerm();
                     long maxSeqNo = Long.parseLong(segmentInfos.userData.get(SequenceNumbers.MAX_SEQ_NO));
                     long localCheckpoint = Long.parseLong(segmentInfos.userData.get(SequenceNumbers.LOCAL_CHECKPOINT_KEY));
@@ -181,8 +186,6 @@ public class TransportMigrateShardAction extends HandledTransportAction<MigrateS
                         shardStateStore
                     );
                     listener.onResponse(new MigrateShardResponse(true));
-                } finally {
-                    store.decRef();
                 }
             } catch (Exception e) {
                 listener.onFailure(e);

@@ -157,18 +157,21 @@ public final class ObjectStoreCommitHeadPublisher {
             } else {
                 VersionedShardHead versioned = current.get();
                 currentHead = versioned.head();
-                if (currentHead.primaryTerm() > primaryTerm) {
-                    // A newer term already holds the head -- this writer has been superseded and
-                    // must not publish.
+                if (currentHead.leaseTerm() > primaryTerm) {
+                    // A newer term has already acquired or renewed the lease -- possibly without
+                    // having published anything yet, which is exactly why this compares against
+                    // leaseTerm and not primaryTerm (see ShardHead#leaseTerm's own javadoc): a
+                    // primaryTerm-only comparison would let this writer, if it had been fenced out
+                    // by a takeover it never learned about (e.g. partitioned from the cluster
+                    // manager), keep publishing under its own stale term until the new writer's
+                    // first commit happened to land.
                     return false;
                 }
-                // currentHead.primaryTerm() <= primaryTerm: either this writer is continuing under
+                // currentHead.leaseTerm() <= primaryTerm: either this writer is continuing under
                 // the term already on the head, or it is the first commit of a newly-activated
-                // writer under a term nothing has published under yet (see
-                // acquireOrRenewLease's javadoc for why lease acquisition alone does not already
-                // advance the head's term) -- either way this publish is what legitimately moves the
-                // head's term forward to primaryTerm, via withPublishedGeneration(primaryTerm, ...)
-                // below.
+                // writer under a term nothing has published under yet -- either way this publish is
+                // what legitimately moves the head's term forward to primaryTerm, via
+                // withPublishedGeneration(primaryTerm, ...) below.
                 currentGeneration = currentHead.latestManifestGeneration();
                 currentVersion = Optional.of(versioned.version());
             }
@@ -211,18 +214,22 @@ public final class ObjectStoreCommitHeadPublisher {
      * CompactionSchedulerTask}'s {@code isLeaseHeldAt} guard can never actually observe an active
      * writer and always treats the shard as available.
      *
-     * <p>Deliberately does <b>not</b> write {@code primaryTerm} into the head -- only {@link
-     * #publishCommitAsHead} legitimately advances the head's term, since that is the one place
-     * {@code (primaryTerm, latestManifestGeneration)} is kept in sync as a valid pointer to the last
-     * real manifest (see {@link ShardHead#withRenewedLease}'s javadoc). This means a writer that has
-     * just activated under a newly bumped term but has not yet published anything can still call
-     * this and have it succeed against the head's still-old term -- that is fine, since fencing
-     * correctness itself lives entirely in {@link #publishCommitAsHead}, not here.
+     * <p>Deliberately does <b>not</b> write the acquiring writer's term into {@code primaryTerm} --
+     * only {@link #publishCommitAsHead} legitimately advances that field, since that is the one
+     * place {@code (primaryTerm, latestManifestGeneration)} is kept in sync as a valid pointer to
+     * the last real manifest (see {@link ShardHead#withRenewedLease}'s javadoc). It DOES immediately
+     * advance {@link ShardHead#leaseTerm}, though: a writer that has just activated under a newly
+     * bumped term but has not yet published anything must still fence out any writer still operating
+     * under the old term the instant it acquires the lease, not only once its own first commit
+     * lands -- otherwise a writer partitioned from the cluster manager and unaware it was superseded
+     * could keep publishing under its stale term for as long as the new writer takes to publish its
+     * first commit. See {@link ShardHead#leaseTerm}'s own javadoc.
      *
      * <p>Retries on a lost CAS race by rereading the live head and retrying, same shape as {@link
      * #publishCommitAsHead}. Returns {@code false} (never retries past this) only when the live head
-     * already reflects a term newer than {@code primaryTerm} -- real evidence (a publication) that
-     * this node has been superseded, and it must not go on renewing as this shard's writer.
+     * already reflects a lease term newer than {@code primaryTerm} -- real evidence that a different
+     * node already holds a newer term's lease, and this node must not go on renewing as this shard's
+     * writer.
      *
      * @param indexUuid the index this shard belongs to
      * @param shardId the shard whose lease is being acquired or renewed
@@ -230,19 +237,19 @@ public final class ObjectStoreCommitHeadPublisher {
      * @param nodeId the id of the node acquiring or renewing the lease
      * @param leaseExpiryMillis the epoch millis at which this lease expires unless renewed again
      * @return {@code true} if the lease was successfully acquired or renewed; {@code false} if the
-     *         live head already reflects a newer term, meaning this writer has been superseded
+     *         live head already reflects a newer lease term, meaning this writer has been superseded
      */
     public boolean acquireOrRenewLease(String indexUuid, int shardId, long primaryTerm, String nodeId, long leaseExpiryMillis)
         throws IOException {
         for (;;) {
             Optional<VersionedShardHead> current = shardStateStore.get(indexUuid, shardId);
             ShardHead currentHead = current.map(VersionedShardHead::head).orElse(null);
-            if (currentHead != null && currentHead.primaryTerm() > primaryTerm) {
+            if (currentHead != null && currentHead.leaseTerm() > primaryTerm) {
                 return false;
             }
             ShardHead newHead = currentHead == null
                 ? new ShardHead(primaryTerm, nodeId, leaseExpiryMillis, 0)
-                : currentHead.withRenewedLease(nodeId, leaseExpiryMillis);
+                : currentHead.withRenewedLease(nodeId, leaseExpiryMillis, primaryTerm);
             Optional<Long> expectedVersion = current.map(VersionedShardHead::version);
             if (shardStateStore.compareAndSet(indexUuid, shardId, expectedVersion, newHead) == CasResult.SUCCESS) {
                 return true;

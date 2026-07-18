@@ -168,6 +168,68 @@ public class ObjectStoreCommitHeadPublisherTests extends OpenSearchTestCase {
         }
     }
 
+    // Regression test for a real split-brain bug: acquireOrRenewLease deliberately does not advance
+    // ShardHead#primaryTerm on lease acquisition (only a real publish does) -- so a node that has
+    // acquired the lease under a newer term but has not yet published anything left a stale writer
+    // still able to publish under its own older term, fencing solely on primaryTerm. ShardHead#
+    // leaseTerm closes this: it advances the instant a lease is acquired/renewed, independent of
+    // whether anything has been published under that term yet.
+    public void testPublicationIsFencedTheMomentANewerTermAcquiresTheLeaseEvenBeforeItPublishesAnything() throws Exception {
+        try (Directory directory = new ByteBuffersDirectory()) {
+            SegmentInfos first = commitOneDocument(directory, "1");
+            assertTrue(
+                headPublisher.publishCommitAsHead(
+                    directory,
+                    first,
+                    INDEX_UUID,
+                    SHARD_ID,
+                    1,
+                    0,
+                    0,
+                    new WalPosition("epoch-0", 0),
+                    0,
+                    PruningStats.empty()
+                )
+            );
+            ShardHead afterFirstPublish = shardStateStore.get(INDEX_UUID, SHARD_ID).orElseThrow().head();
+            assertEquals(1, afterFirstPublish.primaryTerm());
+            assertEquals(1, afterFirstPublish.leaseTerm());
+
+            // Node B is promoted to term 2 and acquires the lease, but has not published anything
+            // yet -- primaryTerm on the head is still 1.
+            assertTrue(headPublisher.acquireOrRenewLease(INDEX_UUID, SHARD_ID, 2, "node-b", Long.MAX_VALUE));
+            ShardHead afterAcquire = shardStateStore.get(INDEX_UUID, SHARD_ID).orElseThrow().head();
+            assertEquals("primaryTerm must stay pointing at the last real manifest, not the lease acquirer's term", 1, afterAcquire.primaryTerm());
+            assertEquals("leaseTerm must advance immediately on acquisition, ahead of any publish", 2, afterAcquire.leaseTerm());
+
+            // Node A, still unaware it has been superseded (e.g. partitioned from the cluster
+            // manager), tries to publish under its own stale term 1. This must be rejected
+            // immediately -- not only once node B gets around to publishing its own first commit.
+            SegmentInfos second = commitOneDocument(directory, "2");
+            boolean staleWriterPublished = headPublisher.publishCommitAsHead(
+                directory,
+                second,
+                INDEX_UUID,
+                SHARD_ID,
+                1,
+                1,
+                1,
+                new WalPosition("epoch-0", 1),
+                0,
+                PruningStats.empty()
+            );
+
+            assertFalse(
+                "a writer superseded by a newer term's lease acquisition must be fenced out immediately, "
+                    + "not only after the new writer's first publish",
+                staleWriterPublished
+            );
+            ShardHead headAfterStaleAttempt = shardStateStore.get(INDEX_UUID, SHARD_ID).orElseThrow().head();
+            assertEquals(1, headAfterStaleAttempt.primaryTerm());
+            assertEquals(1, headAfterStaleAttempt.latestManifestGeneration());
+        }
+    }
+
     public void testPublicationAfterAConcurrentCompactionUnderTheSameTermSucceedsAtTheNextLiveGeneration() throws Exception {
         // With the writer's generation numbering decoupled from local Lucene state (formally
         // verified in plugins/serverless-storage/formal/ShardHead.tla's PublishDecoupled/

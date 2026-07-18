@@ -78,6 +78,15 @@ public class EnableWritePartitionRoutingRequest extends ClusterManagerNodeReques
                 "targetIndexNames must not contain duplicates -- got " + targetIndexNames,
                 validationException
             );
+        } else if (aliasName != null && targetIndexNames.contains(aliasName)) {
+            // If the alias name equals one of its own targets, that index resolves as a concrete
+            // index rather than an alias, so WritePartitionRoutingActionFilter's alias-rewrite never
+            // fires for it -- but the direct-write rejection still does, permanently blocking writes
+            // to that partition with no way to recover short of a manual disable/re-enable.
+            validationException = addValidationError(
+                "aliasName [" + aliasName + "] must not equal one of targetIndexNames -- got " + targetIndexNames,
+                validationException
+            );
         }
         return validationException;
     }

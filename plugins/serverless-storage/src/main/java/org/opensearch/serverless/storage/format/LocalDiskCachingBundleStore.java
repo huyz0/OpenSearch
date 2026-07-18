@@ -223,6 +223,13 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
                 Files.deleteIfExists(entry.path);
                 totalBytes -= entry.sizeBytes;
                 evictedCount.incrementAndGet();
+                // Otherwise locksByKey grows forever on a long-running node cycling through many
+                // distinct bundle names (new merges/compactions), even though the bounded disk
+                // cache it guards never does -- safe to drop here since no reader can be
+                // synchronized on this key's lock object at this point: readFile always holds the
+                // lock for the full duration of its write, and this entry only became eviction
+                // eligible because that write already completed and released it.
+                locksByKey.remove(entry.path.toString());
             } catch (IOException e) {
                 // Another thread's concurrent write/rename raced this file, or it's already gone --
                 // move on to the next candidate rather than aborting the whole sweep.
