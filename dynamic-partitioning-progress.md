@@ -2750,3 +2750,18 @@ Fixed, most severe first:
 
 Full `:plugins:serverless-storage:test` and `:internalClusterTest` green after each fix and
 after the full batch; scope stayed entirely inside the plugin, no core changes needed.
+
+## Second review round: one more fix, then convergence (`be57c2e2b3f`)
+
+Re-ran the same 8-angle finder process against the updated diff (round-1 fixes included) to
+check whether those fixes introduced anything new. Found one real issue, independently flagged
+by two finder angles: `TransportFenceSplitSourceAction`'s round-1 fix re-verified source
+existence inside the cluster-state-update task's `execute()`, but not the superseding-alias
+existence check added in the same round -- an asymmetry. An alias deleted between the pre-check
+and the queued task actually running would still get permanently fenced against (no unfence
+primitive), with the response still reporting success. Fixed by adding the same re-verification
+for the alias that source-existence already had.
+
+A third review round, focused specifically on this fix plus a fresh full read of the file,
+found nothing further. Full `:plugins:serverless-storage:test` and `:internalClusterTest` green.
+Converged: three straight rounds of the same process, only the first two found anything real.
