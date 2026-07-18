@@ -137,7 +137,7 @@ public final class GcSchedulerTask implements Closeable {
             return; // never activated, or every manifest already swept -- nothing to do
         }
 
-        long retentionCutoffMillis = System.currentTimeMillis() - retentionWindowMillis;
+        long retentionCutoffMillis = clock.getAsLong() - retentionWindowMillis;
         Set<ManifestId> durablyPinnedManifests = pinRegistry.getPinnedManifestIds(indexUuid, shardId);
 
         List<CommitManifest> deletableManifests = ManifestRetentionPolicy.computeDeletableManifests(
