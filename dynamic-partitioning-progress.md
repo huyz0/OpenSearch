@@ -2361,3 +2361,25 @@ deliberate operator opt-in (matching every other risk-bearing feature flag in th
 missing implementation. Both settings' own javadoc, and the scheduler tasks' own package-info,
 already say as much explicitly. No code change made; this closes as a confirmed non-issue.
 
+## Commit notification: polling vs. event-driven pub/sub — re-checked, already correctly deferred
+
+Same sweep flagged commit notification's 5 s poll interval as still open relative to the RFC's
+originally-envisioned event-driven pub/sub. Re-reading the RFC's own Phase 3 section (the paragraph
+right after `pollForNewerManifest`'s introduction) shows this was already fully reasoned through, not
+overlooked:
+
+- The gap is real and explicitly named -- "notification wiring remains open in its originally-intended
+  event-driven form (true pub/sub via the directory/gossip tier)" -- but the RFC itself calls it "not a
+  correctness gap": the milestone's freshness-lag target (p99 < 15 s) is already comfortably met by
+  the 5 s poll interval alone.
+- It's also been partially narrowed since that paragraph was first written: `WriterPublicationNotifier`/
+  `PollNowAction` (&sect;8) now give writer-triggered push notification after every publish, so in the
+  common case a reader picks up a new generation in one RPC's time, not up to the full 5 s poll
+  window. What's left open is specifically the gossip/directory-tier form for the case routing-table-
+  based push doesn't reach (a reader not yet visible in routing) -- a genuinely different, larger
+  mechanism than a wiring gap, and no longer the only way the freshness goal gets met in practice.
+
+No code change made. This is a real, named, deliberately-scoped-out refinement with an already-met
+milestone target underneath it -- correctly left as "possible later refinement," not something to
+build under a generic sweep-the-open-items pass.
+
