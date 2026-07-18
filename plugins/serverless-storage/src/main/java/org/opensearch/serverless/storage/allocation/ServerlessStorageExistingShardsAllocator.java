@@ -176,27 +176,39 @@ public final class ServerlessStorageExistingShardsAllocator implements ExistingS
                     return preferredRoutingNode.node();
                 }
             }
+            // No preference to honor (feature disabled, writer shard, no/stale record, or the
+            // preferred node itself isn't decider-approved): fall back to the first
+            // decider-approved node, unchanged from this method's pre-cache-affinity behavior.
+            for (RoutingNode routingNode : allocation.routingNodes()) {
+                if (allocation.deciders().canAllocate(shardRouting, routingNode, allocation).type() == Decision.Type.YES) {
+                    return routingNode.node();
+                }
+            }
+            return null;
         }
-        // No preference to honor (feature disabled, writer shard, no/stale record, or the
-        // preferred node itself isn't decider-approved), or the explain path, which always needs
-        // every node's decision anyway and so gets no benefit from the fast path above: fall back
-        // to the first decider-approved node, unchanged from this method's pre-cache-affinity
-        // behavior.
-        DiscoveryNode target = null;
+
+        // The explain path: always needs every node's decision anyway, so it gets no benefit from
+        // the fast path above's early-break -- but it must still honor the SAME cache-affinity
+        // preference the real path does, or _cluster/allocation/explain reports a target that
+        // doesn't match what a real reroute would actually pick. A prior version of this method
+        // skipped the preference entirely on this branch, a real bug caught by code review.
+        String preferredNodeId = preferredCacheAffinityNodeId(shardRouting, allocation);
+        DiscoveryNode preferredTarget = null;
+        DiscoveryNode firstApprovedTarget = null;
         int weightRanking = 0;
         for (RoutingNode routingNode : allocation.routingNodes()) {
             Decision decision = allocation.deciders().canAllocate(shardRouting, routingNode, allocation);
-            if (nodeDecisions != null) {
-                nodeDecisions.add(new NodeAllocationResult(routingNode.node(), decision, ++weightRanking));
-            }
-            if (decision.type() == Decision.Type.YES && target == null) {
-                target = routingNode.node();
-                if (nodeDecisions == null) {
-                    break;
+            nodeDecisions.add(new NodeAllocationResult(routingNode.node(), decision, ++weightRanking));
+            if (decision.type() == Decision.Type.YES) {
+                if (firstApprovedTarget == null) {
+                    firstApprovedTarget = routingNode.node();
+                }
+                if (preferredNodeId != null && preferredNodeId.equals(routingNode.nodeId())) {
+                    preferredTarget = routingNode.node();
                 }
             }
         }
-        return target;
+        return preferredTarget != null ? preferredTarget : firstApprovedTarget;
     }
 
     /**

@@ -99,6 +99,16 @@ public class ServerlessStorageMigrateShardActionIT extends ServerlessStorageInte
         client().admin().indices().prepareFlush(INDEX_NAME).get();
         client().admin().indices().prepareRefresh(INDEX_NAME).get();
 
+        // Migration requires the index already be quiesced (index.blocks.write=true) -- it
+        // snapshots the shard's current commit with no fencing of concurrent indexing, so a real
+        // migration attempt in these tests must set this first, the same precondition a real
+        // operator would have to satisfy.
+        client().admin()
+            .indices()
+            .prepareUpdateSettings(INDEX_NAME)
+            .setSettings(Settings.builder().put(IndexMetadata.SETTING_BLOCKS_WRITE, true))
+            .get();
+
         String indexUuid = client().admin().cluster().prepareState().get().getState().metadata().index(INDEX_NAME).getIndexUUID();
         return new IndexedClassicShard(indexUuid, dataNodeName);
     }
@@ -143,6 +153,42 @@ public class ServerlessStorageMigrateShardActionIT extends ServerlessStorageInte
         // rfc-serverless-opensearch.md's own note on that) is completely untouched by the adoption.
         SearchResponse classicSearch = client().prepareSearch(INDEX_NAME).get();
         assertHitCount(classicSearch, 1);
+    }
+
+    public void testMigrateShardActionRefusesAnIndexThatIsNotWriteBlocked() throws Exception {
+        Path basePath = createTempDir("serverless-storage-migrate-action-it-not-blocked");
+        Settings nodeSettings = Settings.builder()
+            .putList("path.repo", basePath.toString())
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey(), basePath.toString())
+            .build();
+        internalCluster().startClusterManagerOnlyNode(nodeSettings);
+        String dataNodeName = internalCluster().startDataOnlyNode(nodeSettings);
+
+        createIndex(
+            INDEX_NAME,
+            Settings.builder().put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1).put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0).build()
+        );
+        ensureGreen(INDEX_NAME);
+        client().prepareIndex(INDEX_NAME).setId("1").setSource("field", "value1").get();
+        client().admin().indices().prepareFlush(INDEX_NAME).get();
+        // Deliberately never sets index.blocks.write -- this index is still live/writable.
+        String indexUuid = client().admin().cluster().prepareState().get().getState().metadata().index(INDEX_NAME).getIndexUUID();
+
+        ExecutionException failure = expectThrows(
+            ExecutionException.class,
+            () -> internalCluster().client(dataNodeName)
+                .execute(MigrateShardAction.INSTANCE, new MigrateShardRequest(indexUuid, SHARD_ID))
+                .get()
+        );
+        assertTrue(
+            "must fail with a clear precondition error naming the write-block requirement, not something else: " + failure.getCause(),
+            failure.getCause() instanceof IllegalStateException && failure.getCause().getMessage().contains("write-blocked")
+        );
+
+        assertTrue(
+            "refusing to migrate a non-quiesced index must never leave a serverless-storage head behind",
+            new BlobContainerShardStateStore(blobContainerFor(basePath, indexUuid, SHARD_ID)).get(indexUuid, SHARD_ID).isEmpty()
+        );
     }
 
     public void testMigrateShardActionRejectsAnIndexThatDoesNotExist() throws Exception {

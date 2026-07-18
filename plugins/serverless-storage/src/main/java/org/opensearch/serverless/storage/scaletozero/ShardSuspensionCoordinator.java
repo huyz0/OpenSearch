@@ -249,6 +249,13 @@ public final class ShardSuspensionCoordinator {
     private void evict(ClusterState state, String indexUuid, int shardId, boolean reader) {
         IndexMetadata indexMetadata = findByUuid(state.metadata(), indexUuid);
         if (indexMetadata == null) {
+            // Distinguishable from "nothing to evict" below -- the index vanished (deleted)
+            // between this shard being marked suspended and this eviction actually running, not a
+            // real failure, but worth a log line so an operator investigating a shard that never
+            // got force-unassigned can tell "index gone" apart from every other silent no-op path.
+            logger.debug(
+                "skipping eviction of suspended serverless-storage shard [" + indexUuid + "][" + shardId + "] -- index no longer exists"
+            );
             return;
         }
         String indexName = indexMetadata.getIndex().getName();

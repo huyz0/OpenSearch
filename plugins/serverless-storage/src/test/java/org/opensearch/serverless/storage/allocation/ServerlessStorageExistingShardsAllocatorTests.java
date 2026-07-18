@@ -195,6 +195,30 @@ public class ServerlessStorageExistingShardsAllocatorTests extends OpenSearchAll
     }
 
     /**
+     * Regression test for a real bug: {@code explainUnassignedShardAllocation} used to skip the
+     * cache-affinity preference entirely and always report the first decider-approved node in
+     * iteration order, even when a real {@code allocateUnassigned} call for the identical shard
+     * and cluster state would have honored a fresh cache-affinity preference and picked a
+     * different node -- so {@code _cluster/allocation/explain} could report a target that didn't
+     * match what actually happens on a real reroute.
+     */
+    public void testExplainAlsoPrefersTheCacheAffinityRecordedNodeOverTheFirstApprovedNode() {
+        ClusterState noAffinityState = buildServerlessStorageClusterStateWithAffinity(null, 0L);
+        String baselineNodeId = baselineFirstApprovedNodeId(noAffinityState, unassignedReaderShard(noAffinityState));
+        String otherNodeId = "node1".equals(baselineNodeId) ? "node2" : "node1";
+
+        ClusterState state = buildServerlessStorageClusterStateWithAffinity(otherNodeId, System.currentTimeMillis());
+        RoutingAllocation allocation = newRoutingAllocation(yesAllocationDeciders(), state);
+        ServerlessStorageExistingShardsAllocator allocator = new ServerlessStorageExistingShardsAllocator(60_000L);
+        ShardRouting shard = unassignedReaderShard(state);
+
+        AllocateUnassignedDecision decision = allocator.explainUnassignedShardAllocation(shard, allocation);
+
+        assertTrue(decision.isDecisionTaken());
+        assertEquals(otherNodeId, decision.getTargetNode().getId());
+    }
+
+    /**
      * A real regression this session's own code review caught: {@code firstDeciderApprovedNode}
      * used to lose its O(1) early-exit whenever a cache-affinity preference existed, scanning
      * every node's deciders instead of checking only the preferred one. Proven here with a

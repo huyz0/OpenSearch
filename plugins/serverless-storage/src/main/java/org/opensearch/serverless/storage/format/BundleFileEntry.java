@@ -12,7 +12,8 @@ import java.util.Objects;
 
 /**
  * Describes one logical file packed into a {@link SegmentBundle}: its name, the byte range it
- * occupies in the bundle body (relative to the end of the bundle header), and a CRC32C checksum
+ * occupies within the bundle blob (an absolute offset from the start of the bundle, not relative
+ * to the end of the header -- see {@link SegmentBundle}'s own javadoc), and a CRC32C checksum
  * of its raw bytes so corruption is detected on read rather than handed silently to Lucene.
  */
 public final class BundleFileEntry {
@@ -26,7 +27,7 @@ public final class BundleFileEntry {
      * Describes one packed file's location and integrity checksum within a bundle.
      *
      * @param name the file's logical name within the bundle.
-     * @param offset the byte offset of the file's content, relative to the end of the bundle header.
+     * @param offset the absolute byte offset of the file's content within the bundle blob.
      * @param length the length in bytes of the file's content.
      * @param checksum the CRC32C checksum of the file's raw bytes.
      */
@@ -48,7 +49,7 @@ public final class BundleFileEntry {
         return name;
     }
 
-    /** The byte offset of the file's content, relative to the end of the bundle header. */
+    /** The absolute byte offset of the file's content within the bundle blob. */
     public long offset() {
         return offset;
     }

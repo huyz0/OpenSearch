@@ -53,6 +53,14 @@ import org.opensearch.transport.TransportService;
  * real blob-store I/O (a bundle upload, a manifest write, and the head CAS), same reasoning as
  * {@code TransportShardSplitAction}'s own dispatch.
  *
+ * <p><b>Requires the index already be write-blocked</b> ({@code index.blocks.write=true}) --
+ * unlike {@link org.opensearch.serverless.storage.migration.ClassicIndexMigrator}, this action
+ * reads a real, currently-open shard's <em>current</em> committed state, with no fencing of
+ * concurrent indexing on that shard. A document indexed/committed after this action's snapshot
+ * read would otherwise be silently absent from the adopted manifest while the response still
+ * reports success. Refusing outright when the index isn't already quiesced makes that a loud,
+ * caller-visible precondition failure instead of a silent data-loss gap.
+ *
  * <p><b>Deliberately out of scope</b> (rfc-serverless-opensearch.md &sect;16 Phase 6's own status
  * note): reading a classic repository's or remote-store's own on-disk metadata format directly, as
  * an alternative that could avoid requiring the shard be locally recovered first. That is real,
@@ -126,6 +134,22 @@ public class TransportMigrateShardAction extends HandledTransportAction<MigrateS
                             + "] of index ["
                             + request.indexUuid()
                             + "] is not hosted on this node; route this request to a node that hosts it"
+                    );
+                }
+                // This reads a snapshot of the shard's CURRENT committed state (below) with no
+                // fencing of concurrent indexing -- a document indexed/committed after that read
+                // is silently never captured in the adopted manifest. Requiring the index already
+                // be write-blocked (the operator's own explicit "quiesce first" step, the same
+                // "index.blocks.write" any other admin action would set before a similar
+                // point-in-time operation) closes that silent-data-loss window: refuse outright
+                // rather than let a caller who forgot to quiesce first get a false "success".
+                if (IndexMetadata.INDEX_BLOCKS_WRITE_SETTING.get(indexMetadata.getSettings()) == false) {
+                    throw new IllegalStateException(
+                        "index ["
+                            + request.indexUuid()
+                            + "] is not write-blocked -- migration snapshots the shard's current commit with no "
+                            + "fencing of concurrent indexing, so writes after the snapshot would be silently lost; "
+                            + "set index.blocks.write=true first to quiesce the index, then retry"
                     );
                 }
 
