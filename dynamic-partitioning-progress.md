@@ -3155,3 +3155,37 @@ Two round-10 finder agents (WAL/translog, both retries) returned status updates 
 reports on their first attempts and had to be re-launched with stricter "you are the reviewer, produce
 the report yourself" prompts before a real finding (or a real "no findings") came back -- a recurring
 failure mode worth remembering for future rounds.
+
+## Round 11: security sweep clean, one self-caught regression from round 9's own fix
+
+Ran a security/encryption-focused sweep (a lens not yet applied broadly) plus a dedicated adversarial
+self-review of rounds 9 and 10's own diffs.
+
+**Security/encryption**: no findings. Verified every `RestrictingBlobContainer` call site's
+write/delete-allowed flags match its own surrounding comment, `AesGcmCipher` never reuses a nonce,
+`WalRecordCrypto` derives its key per-record from `indexUuid` so `WalBatchingProcessor`'s
+node-shared, multi-index drain cannot leak a key across indices, and `LocalDiskCachingBundleStore`
+never writes plaintext to disk when a key provider is configured.
+
+**Self-review of rounds 9-10 found one real regression**: round 9's own `locksByKey` leak fix
+(`LocalDiskCachingBundleStore.evictIfOverBudget`) deleted a cache file and removed its lock-map
+entry *without holding that entry's own lock* -- broken exactly the mutual exclusion the lock map
+exists to provide. Concretely: thread B is mid-write for key K, holding lock object `L1`; thread A's
+eviction sweep (a different key entirely, running under its own writer's monitor) picks K as stale,
+deletes the file and removes the map entry out from under B; a brand-new thread C then calls
+`readFile` for K, finds no lock entry, mints a fresh `L2`, and starts its own miss/write path
+concurrently with B's still-in-flight write under the old `L1` -- two threads racing
+`writeAtomically` against the same path with no shared lock. Fixed by synchronizing the delete and
+the map removal on the entry's own lock object (the same one `readFile` synchronizes on for that
+path), so eviction now correctly serializes against any writer already in flight for that exact
+entry. All other round 9/10 changes (`ShardHead#leaseTerm` threading, the PITR wiring's constructor
+argument order, `TransportEnableWritePartitionRoutingAction`'s re-check, `TransportMigrateShardAction`'s
+`GatedCloseable` release on every exit path) held up under adversarial self-review.
+
+This is the second time in this project a scheduled sweep of a leak-fix's own concurrency reasoning
+caught a real regression the original fix introduced (round 3's shrink-pin/provision-rollback
+regressions were the first) -- reinforcing that every fix touching a shared mutable structure under
+concurrency needs its own dedicated adversarial pass, not just "does it compile and pass the happy-path
+test."
+
+Full `:plugins:serverless-storage:test` green.

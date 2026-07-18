@@ -220,16 +220,23 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
                 break;
             }
             try {
-                Files.deleteIfExists(entry.path);
+                // Synchronizing on this entry's own lock object (the same one readFile synchronizes
+                // on for this path) before deleting is what makes it safe to also remove it from
+                // locksByKey below: a concurrent readFile call for this exact path either already
+                // holds this same monitor (so this delete waits behind it, same as any other
+                // contended write) or hasn't started yet (so it will mint a fresh lock object via
+                // computeIfAbsent once this synchronized block releases it) -- either way, no writer
+                // can ever be mid-write against a path this block just deleted out from under it.
+                // Without holding this lock here, eviction could delete+unlock a path a different,
+                // concurrently-running readFile call is still writing under the OLD lock object,
+                // letting a brand-new readFile call mint a second, unsynchronized lock for the same
+                // path and race the first writer on writeAtomically.
+                synchronized (lockFor(entry.path)) {
+                    Files.deleteIfExists(entry.path);
+                    locksByKey.remove(entry.path.toString());
+                }
                 totalBytes -= entry.sizeBytes;
                 evictedCount.incrementAndGet();
-                // Otherwise locksByKey grows forever on a long-running node cycling through many
-                // distinct bundle names (new merges/compactions), even though the bounded disk
-                // cache it guards never does -- safe to drop here since no reader can be
-                // synchronized on this key's lock object at this point: readFile always holds the
-                // lock for the full duration of its write, and this entry only became eviction
-                // eligible because that write already completed and released it.
-                locksByKey.remove(entry.path.toString());
             } catch (IOException e) {
                 // Another thread's concurrent write/rename raced this file, or it's already gone --
                 // move on to the next candidate rather than aborting the whole sweep.
