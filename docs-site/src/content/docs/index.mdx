@@ -1,0 +1,39 @@
+---
+title: Serverless Storage
+description: A pluggable, object-store-native storage engine for OpenSearch.
+template: splash
+hero:
+  tagline: Compute and durable storage, decoupled — writer/reader shard split, scale-to-zero, and dynamic resharding on top of an object store.
+  actions:
+    - text: Read the overview
+      link: /overview/
+      icon: right-arrow
+    - text: Architecture
+      link: /design/architecture/
+      icon: document
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+## What's here
+
+<CardGrid stagger>
+	<Card title="Overview" icon="rocket">
+		The problem this plugin solves and why the writer/reader split exists.
+	</Card>
+	<Card title="Architecture" icon="puzzle">
+		Main components — writer/reader engines, WAL, manifests, bundle store, shard-head.
+	</Card>
+	<Card title="Flows" icon="random">
+		Write path, read path, scale-to-zero, resharding, and GC/retention sequences.
+	</Card>
+	<Card title="Core Changes" icon="pencil">
+		The concurrency and correctness fixes made during the broad-scope review, and why each mattered.
+	</Card>
+	<Card title="Configuration" icon="setting">
+		Every node- and index-level setting the plugin registers.
+	</Card>
+</CardGrid>
+
+For build/test instructions and the REST API list, see the [plugin README](https://github.com/huyz0/OpenSearch/blob/feature/pluggable-engine-per-shard-role/plugins/serverless-storage/README.md). For the original design proposal, see `rfc-serverless-opensearch.md` in the repo root.
