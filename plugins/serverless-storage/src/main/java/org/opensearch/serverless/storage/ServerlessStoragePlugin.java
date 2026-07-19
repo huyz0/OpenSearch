@@ -2373,11 +2373,18 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     }
 
     /**
-     * Releases this node's WAL-related node-level components on plugin shutdown. Closes {@link
-     * #walGcSchedulerTask} -- until this override existed the plugin had no {@code close()} at all,
-     * so a live scheduled WAL GC sweep was simply left running with nothing to cancel it (harmless
-     * for correctness, since a skipped sweep only defers space reclamation, but a real resource leak
-     * this fixes in passing).
+     * Releases this node's node-level (cluster-manager-only, one-instance-per-node -- not per-shard,
+     * which is each engine's own responsibility) background schedulers on plugin shutdown: {@link
+     * #walGcSchedulerTask}, {@link #scaleToZeroCandidatesSchedulerTask}, {@link
+     * #scaleUpCandidatesSchedulerTask}, {@link #dataStreamShardCountAdvisorSchedulerTask}, {@link
+     * #inPlaceSplitTriggerSchedulerTask}, and {@link #inPlaceMergeTriggerSchedulerTask} -- until this
+     * override existed the plugin had no {@code close()} at all, so every one of these live scheduled
+     * tasks was simply left running with nothing to cancel it. Harmless for correctness on a real node
+     * shutdown (the thread pool they run on is torn down shortly after regardless), but a real
+     * resource leak in any path that constructs and closes multiple plugin instances in one JVM (e.g.
+     * integration tests, or a hot-reload of node modules) -- each leaked task keeps firing against a
+     * stale {@code ClusterService}/coordinator, and two live instances of the same scheduler can
+     * double-evaluate the same shards.
      *
      * <p>Deliberately does <em>not</em> force a final drain of the shared WAL group-commit processor:
      * under {@code index.translog.durability=REQUEST} a write's WAL upload has already completed
@@ -2392,9 +2399,31 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      */
     @Override
     public void close() throws IOException {
-        org.opensearch.serverless.storage.wal.WalGcSchedulerTask task = walGcSchedulerTask;
-        if (task != null) {
-            task.close();
+        org.opensearch.serverless.storage.wal.WalGcSchedulerTask walGcTask = walGcSchedulerTask;
+        if (walGcTask != null) {
+            walGcTask.close();
+        }
+        org.opensearch.serverless.storage.scaletozero.ScaleToZeroCandidatesSchedulerTask scaleToZeroTask =
+            scaleToZeroCandidatesSchedulerTask;
+        if (scaleToZeroTask != null) {
+            scaleToZeroTask.close();
+        }
+        org.opensearch.serverless.storage.scaleup.ScaleUpCandidatesSchedulerTask scaleUpTask = scaleUpCandidatesSchedulerTask;
+        if (scaleUpTask != null) {
+            scaleUpTask.close();
+        }
+        org.opensearch.serverless.storage.resharding.DataStreamShardCountAdvisorSchedulerTask shardCountAdvisorTask =
+            dataStreamShardCountAdvisorSchedulerTask;
+        if (shardCountAdvisorTask != null) {
+            shardCountAdvisorTask.close();
+        }
+        org.opensearch.serverless.storage.resharding.InPlaceSplitTriggerSchedulerTask splitTriggerTask = inPlaceSplitTriggerSchedulerTask;
+        if (splitTriggerTask != null) {
+            splitTriggerTask.close();
+        }
+        org.opensearch.serverless.storage.resharding.InPlaceMergeTriggerSchedulerTask mergeTriggerTask = inPlaceMergeTriggerSchedulerTask;
+        if (mergeTriggerTask != null) {
+            mergeTriggerTask.close();
         }
     }
 

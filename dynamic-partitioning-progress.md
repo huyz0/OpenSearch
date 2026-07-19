@@ -3228,3 +3228,29 @@ transport), and round 13's one real finding was isolated, fixed, and verified wi
 in the rest of its own (also genuinely new) scope. 13 rounds total this session's continuation, 6 more
 real bugs found and fixed since the prior "converged" checkpoint (rounds 9-11), each via the same
 implement -> compile -> test -> break-the-fix -> full suite green -> commit discipline.
+
+## Round 14: node/cluster lifecycle sweep finds one more real leak
+
+The "very broad scope" goal was re-set, so ran one more round against ground not yet explicitly swept:
+node/cluster lifecycle integration. Found a real bug: `ServerlessStoragePlugin#close()` only ever
+cancelled `walGcSchedulerTask`. Five other node-level (cluster-manager-only, one instance per node --
+not per-shard, which each engine already owns and closes correctly) background schedulers --
+`scaleToZeroCandidatesSchedulerTask`, `scaleUpCandidatesSchedulerTask`,
+`dataStreamShardCountAdvisorSchedulerTask`, `inPlaceSplitTriggerSchedulerTask`,
+`inPlaceMergeTriggerSchedulerTask` -- were simply left running with nothing to cancel them on plugin
+shutdown, even though every one of them already implements `Closeable` with a `close()` that cancels
+its own `Scheduler.Cancellable`. Harmless on a real node shutdown (the thread pool they run on is torn
+down shortly after regardless), but a real leak in any path that constructs and closes multiple plugin
+instances in one JVM (integration tests, hot-reload), where a leaked task keeps firing against a stale
+`ClusterService` and two live instances of the same scheduler could double-evaluate the same shards.
+
+Fixed by cancelling all six in `close()`. Verified concretely, not just "doesn't throw": added a public
+`isCancelledForTesting()` accessor to `ScaleToZeroCandidatesSchedulerTask` (needed across packages,
+matching this plugin's existing `public ... ForTesting()` convention for exactly this reason) and a
+regression test asserting the task is actually cancelled after `close()`, verified via break-the-fix
+(temporarily removing just that one cancel call reproduces the exact predicted assertion failure).
+No `ClusterStateListener`/`ClusterStateApplier`/`IndexEventListener` implementations exist in this
+plugin -- cluster-state reactions go through the `ExistingShardsAllocator`/`AllocationDecider` seams
+round 4 and later already covered, so nothing further to check there.
+
+Full `:plugins:serverless-storage:test` green.

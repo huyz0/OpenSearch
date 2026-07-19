@@ -154,4 +154,13 @@ public final class ScaleToZeroCandidatesSchedulerTask implements Closeable {
     public void close() {
         task.cancel();
     }
+
+    /**
+     * Whether the scheduled evaluation has been cancelled (by {@link #close()}) -- test-only, but
+     * public since {@code ServerlessStoragePluginTests} (a different package) needs to verify the
+     * plugin's own {@code close()} actually reaches this task, not just that it doesn't throw.
+     */
+    public boolean isCancelledForTesting() {
+        return task.isCancelled();
+    }
 }
