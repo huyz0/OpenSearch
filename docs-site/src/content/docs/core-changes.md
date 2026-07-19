@@ -13,7 +13,7 @@ Before this change, a plugin's `EngineFactory` and `Directory` were chosen once 
 
 **`EnginePlugin.java`** — before, a plugin only got the index's settings, never which shard copy was being created:
 
-```diff
+```diff lang="java"
  public interface EnginePlugin {
 +    /**
 +     * Unlike the index-level method, this overload also receives the shard's ShardRouting,
@@ -35,7 +35,7 @@ Before this change, a plugin's `EngineFactory` and `Directory` were chosen once 
 
 **`IndexStorePlugin.java`** — the matching overload on the directory side:
 
-```diff
+```diff lang="java"
      Directory newDirectory(IndexSettings indexSettings, ShardPath shardPath) throws IOException;
 
 +    /**
@@ -51,7 +51,7 @@ Before this change, a plugin's `EngineFactory` and `Directory` were chosen once 
 
 **`Node.java`** — the provider collection threaded through plugin wiring changes shape to carry the routing:
 
-```diff
+```diff lang="java"
 -final Collection<Function<IndexSettings, Optional<EngineFactory>>> engineFactoryProviders = enginePlugins.stream()
 -    .map(plugin -> (Function<IndexSettings, Optional<EngineFactory>>) plugin::getEngineFactory)
 -    .collect(Collectors.toList());
@@ -71,7 +71,7 @@ A classic `Engine` assumes local Lucene commits plus a local translog are the du
 
 **`EngineFactory.java`** — before, the interface had exactly two methods (`newReadWriteEngine`, `newReadOnlyEngine`) and no recovery or durability-ownership hooks at all:
 
-```diff
+```diff lang="java"
  public interface EngineFactory {
      Engine newReadOnlyEngine(EngineConfig config);
      Engine newReadWriteEngine(EngineConfig config);
@@ -116,7 +116,7 @@ A classic `Engine` assumes local Lucene commits plus a local translog are the du
 
 **`IndexShard.java`** — a new pre-write check, called from the same place ordinary shard-state checks already run before a primary operation is accepted:
 
-```diff
+```diff lang="java"
 +                ensureNotInProgressSplitParent();
 +                ensureNotInProgressMergeChild();
              }
@@ -156,7 +156,7 @@ A classic `Engine` assumes local Lucene commits plus a local translog are the du
 
 `MetadataInPlaceSplitShardService` existed in core before this work — but nothing ever constructed one, so `TransportInPlaceSplitShardAction` had no service to call and the feature was unreachable from any API. `Node.java` now constructs and Guice-binds it, plus three new services:
 
-```diff
+```diff lang="java"
 +// Finalizes or aborts in-place shard splits once their child shards converge.
 +new MetadataInPlaceSplitShardCommitService(settings, clusterService);
 +
@@ -175,7 +175,7 @@ A classic `Engine` assumes local Lucene commits plus a local translog are the du
 +    new MetadataInPlaceMergeShardService(clusterService, clusterModule.getAllocationService());
 ```
 
-```diff
+```diff lang="java"
  b.bind(AwarenessReplicaBalance.class).toInstance(awarenessReplicaBalance);
 +b.bind(MetadataInPlaceSplitShardService.class).toInstance(metadataInPlaceSplitShardService);
 +b.bind(MetadataInPlaceMergeShardService.class).toInstance(metadataInPlaceMergeShardService);
@@ -187,7 +187,7 @@ The plugin's `ShardHead` coordination (see [Architecture](/design/architecture/)
 
 **`BlobContainer.java`** — two new default methods, `UnsupportedOperationException` unless a backend implements them:
 
-```diff
+```diff lang="java"
  public interface BlobContainer {
      // ... existing get/write/delete/list methods ...
 
@@ -224,7 +224,7 @@ This generalizes CAS-over-blob as a repository capability, rather than something
 
 **`RestHandler.java`** — a new default method and its enum:
 
-```diff
+```diff lang="java"
  public interface RestHandler {
      // ... existing routes()/handleRequest()/etc ...
 
@@ -256,7 +256,7 @@ Roughly fifteen existing `Rest*Action` classes (e.g. `RestGetAction`, `RestBulkA
 
 **`ShardRoutingState.java`** — the transient in-progress-split marker was removed outright, superseded by the two-phase commit-service model in item 4 (a split child is now a first-class routing table entry from the start, not an ephemeral flag):
 
-```diff
+```diff lang="java"
  public enum ShardRoutingState {
      // ... UNASSIGNED, INITIALIZING, STARTED ...
 -    RELOCATING((byte) 4),
