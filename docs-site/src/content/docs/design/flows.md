@@ -117,4 +117,4 @@ sequenceDiagram
     end
 ```
 
-PITR retention (`retention/`) and GC both run from the writer engine **and** the reader engine — a shard that has scaled to zero on the writer side may still have an active reader, and pins/reconciliation must keep working even when no writer is present. This dual-scheduling was itself a fix made during the broad-scope review; see [Core Changes](/changes/).
+PITR retention (`retention/`) and GC both run from the writer engine **and** the reader engine — a shard that has scaled to zero on the writer side may still have an active reader, and pins/reconciliation must keep working even when no writer is present. This dual-scheduling was itself a fix made during the broad-scope review; see [Plugin Fixes](/plugin-fixes/).

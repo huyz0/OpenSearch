@@ -70,7 +70,7 @@ flowchart TB
 Almost every other component reads or CAS-mutates `ShardHead`. It tracks, per shard:
 
 - **`primaryTerm`** — advances only on a real publish (a commit that actually lands).
-- **`leaseTerm`** — advances immediately when any node acquires or renews the writer lease, even before it publishes anything. This is distinct from `primaryTerm` specifically to close a split-brain window: a partitioned former primary could otherwise keep publishing under a stale term because nothing else had advanced yet. Fencing checks compare against `leaseTerm`, not `primaryTerm`. See [Core Changes](/changes/) for the fix that introduced this.
+- **`leaseTerm`** — advances immediately when any node acquires or renews the writer lease, even before it publishes anything. This is distinct from `primaryTerm` specifically to close a split-brain window: a partitioned former primary could otherwise keep publishing under a stale term because nothing else had advanced yet. Fencing checks compare against `leaseTerm`, not `primaryTerm`. See [Plugin Fixes](/plugin-fixes/) for the fix that introduced this.
 - **`leaseHolderNodeId`**, **`leaseExpiryMillis`** — who currently holds the write lease and until when.
 - **`latestManifestGeneration`** — the generation number of the most recently published manifest.
 

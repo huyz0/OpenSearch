@@ -1,7 +1,9 @@
 ---
-title: Core Changes
-description: What was built, what was fixed during review, and why — with the deliberate scope boundaries.
+title: Plugin Fixes
+description: Correctness fixes made to the plugin during review, and the deliberate scope boundaries.
 ---
+
+For changes to OpenSearch **core** (outside `plugins/serverless-storage`) that were needed to make this plugin possible, see [Core Changes](/core-changes/). This page covers plugin-internal design decisions and the concurrency/correctness fixes made during review.
 
 This plugin was built against a 40-task plan to move it from a fixed shard count decided at index creation toward unbounded, dynamic horizontal partitioning (`dynamic-partitioning-plan.md`). It was followed by many rounds of broadening-scope correctness review across the whole plugin, tracked in `dynamic-partitioning-progress.md`.
 

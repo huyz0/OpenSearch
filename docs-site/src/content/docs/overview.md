@@ -32,4 +32,6 @@ Bundle files (packed segment blobs) are the "storage layer" — uniformly distri
 
 ## What this doesn't try to do
 
-Resharding-by-copy auto-triggering, a general N-way merge (rather than a split's own two children merging back), and full snapshot-repository integration were each investigated and deliberately left out of scope — see [Core Changes](/changes/) for what's actually implemented versus what was considered and rejected.
+Resharding-by-copy auto-triggering, a general N-way merge (rather than a split's own two children merging back), and full snapshot-repository integration were each investigated and deliberately left out of scope — see [Plugin Fixes](/plugin-fixes/) for what's actually implemented versus what was considered and rejected.
+
+The writer/reader-role engine dispatch, the object-store CAS primitive, and in-place split/merge support this all builds on required real changes to OpenSearch core, not just the plugin — see [Core Changes](/core-changes/).
