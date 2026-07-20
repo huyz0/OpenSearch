@@ -139,6 +139,7 @@ import org.opensearch.index.engine.EngineBackedIndexer;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.EngineConfigFactory;
 import org.opensearch.index.engine.EngineException;
+import org.opensearch.index.engine.EngineNativeSnapshotPointer;
 import org.opensearch.index.engine.IngestionEngine;
 import org.opensearch.index.engine.MergedSegmentWarmerFactory;
 import org.opensearch.index.engine.NRTReplicationEngine;
@@ -230,6 +231,7 @@ import org.opensearch.indices.replication.common.ReplicationTimer;
 import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.repositories.Repository;
 import org.opensearch.search.suggest.completion.CompletionStats;
+import org.opensearch.snapshots.SnapshotId;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.Closeable;
@@ -1888,6 +1890,20 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         GatedCloseable<IndexCommit> indexCommit = acquireLastIndexCommit(flushFirst);
         getIndexer().refresh("Snapshot for Remote Store based Shard");
         return indexCommit;
+    }
+
+    /**
+     * Dispatches to the current engine's {@link Engine#attemptEngineNativeSnapshot}, mirroring
+     * {@link #acquireLastIndexCommit}'s own shard-state check and {@code applyOnEngine} dispatch.
+     * See that method's javadoc for the full contract.
+     */
+    public Optional<EngineNativeSnapshotPointer> attemptEngineNativeSnapshot(SnapshotId snapshotId) throws EngineException {
+        final IndexShardState state = this.state; // one time volatile read
+        if (state == IndexShardState.STARTED || state == IndexShardState.CLOSED) {
+            return applyOnEngine(getIndexer(), engine -> engine.attemptEngineNativeSnapshot(snapshotId));
+        } else {
+            throw new IllegalIndexShardStateException(shardId, state, "snapshot is not allowed");
+        }
     }
 
     /**
@@ -3707,6 +3723,24 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
     }
 
     /**
+     * Restores this shard from a snapshot, probing first for an engine-native snapshot pointer
+     * (one written by {@link Engine#attemptEngineNativeSnapshot}) before falling back to the
+     * classic, copy-based {@link #restoreFromRepository}. See {@code StoreRecovery#recoverFromEngineNativeSnapshot}
+     * for why this is a probe rather than a persisted, pre-decided flag.
+     */
+    public void restoreFromEngineNativeSnapshot(Repository repository, ActionListener<Boolean> listener) {
+        try {
+            assert shardRouting.primary() : "recover from store only makes sense if the shard is a primary shard";
+            assert recoveryState.getRecoverySource().getType() == RecoverySource.Type.SNAPSHOT : "invalid recovery type: "
+                + recoveryState.getRecoverySource();
+            StoreRecovery storeRecovery = new StoreRecovery(shardId, logger);
+            storeRecovery.recoverFromEngineNativeSnapshot(this, repository, listener);
+        } catch (Exception e) {
+            listener.onFailure(e);
+        }
+    }
+
+    /**
      * Tests whether or not the engine should be flushed periodically.
      * This test is based on the current size of the translog compared to the configured flush threshold size.
      *
@@ -4646,11 +4680,16 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
                     // indicesService.indexService(shardRouting.shardId().getIndex()).addMetadataListener();
                 } else {
                     final String repo = recoverySource.snapshot().getRepository();
+                    // restoreFromEngineNativeSnapshot probes for an engine-native pointer first,
+                    // falling back unmodified to restoreFromRepository (the classic, copy-based
+                    // path) when none exists -- see that method's own javadoc for why this is a
+                    // runtime probe rather than a persisted flag alongside isSearchableSnapshot/
+                    // remoteStoreIndexShallowCopy above.
                     executeRecovery(
                         "from snapshot",
                         recoveryState,
                         recoveryListener,
-                        l -> restoreFromRepository(repositoriesService.repository(repo), l)
+                        l -> restoreFromEngineNativeSnapshot(repositoriesService.repository(repo), l)
                     );
                 }
                 break;

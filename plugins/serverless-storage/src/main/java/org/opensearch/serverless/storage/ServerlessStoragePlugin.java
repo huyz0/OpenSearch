@@ -128,10 +128,6 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         new org.opensearch.serverless.storage.scaletozero.ShardReactivationActionFilter();
 
     /** Constructed eagerly for the same reason as {@link #shardReactivationActionFilter}. */
-    private final ServerlessStorageLegacySnapshotActionFilter legacySnapshotActionFilter =
-        new ServerlessStorageLegacySnapshotActionFilter();
-
-    /** Constructed eagerly for the same reason as {@link #shardReactivationActionFilter}. */
     private final org.opensearch.serverless.storage.resharding.WritePartitionRoutingActionFilter writePartitionRoutingActionFilter =
         new org.opensearch.serverless.storage.resharding.WritePartitionRoutingActionFilter();
 
@@ -991,6 +987,14 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     private volatile EncryptionKeyProvider encryptionKeyProvider;
     private volatile String localNodeId = "unknown-node";
     private volatile InMemoryPlaintextBundleCache sharedBundleCache;
+    /**
+     * Constructed once in {@code createComponents}, shared by every writer shard's own {@link
+     * WriterEngineFactory} for engine-native snapshot restore, and separately registered under
+     * {@link org.opensearch.serverless.storage.writerengine.EngineNativeSnapshotSupport#ENGINE_ID}
+     * in {@link org.opensearch.index.engine.EngineNativeSnapshotReleasers} for the release path --
+     * see that class's own javadoc for why one shared instance backs both.
+     */
+    private volatile org.opensearch.serverless.storage.writerengine.EngineNativeSnapshotSupport engineNativeSnapshotSupport;
     private volatile long pitrWindowMillis = -1;
     private volatile ReaderShardAdmissionController readerShardAdmissionController;
     private volatile WalChunkService sharedWalChunkService;
@@ -1203,7 +1207,6 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             threadPool,
             SERVERLESS_STORAGE_SCALE_TO_ZERO_SEARCH_REACTIVATION_WAIT_SETTING.get(environment.settings())
         );
-        legacySnapshotActionFilter.setDependencies(clusterService, indexNameExpressionResolver);
         writePartitionRoutingActionFilter.setDependencies(clusterService, threadPool);
         serverlessStorageIndexSettingProvider.setDependencies(dataStreamShardCountAdvisorCache);
         serverlessStorageExistingShardsAllocator.setDependencies(
@@ -1363,6 +1366,24 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             walFlushBacklogRejectThreshold = SERVERLESS_STORAGE_WAL_FLUSH_BACKLOG_REJECT_THRESHOLD_SETTING.get(environment.settings())
                 .getBytes();
         }
+        // Engine-native snapshot restore/release (docs-site design/snapshot-restore-proposal.md):
+        // one shared instance, built once here rather than per-shard in getEngineFactory, since it
+        // is also registered node-wide below for the release path -- see its own class javadoc for
+        // why one instance backs both. blobContainerForDirectoryFactory's signature already matches
+        // ShardCloner.ContainerResolver's exactly (String indexUuid, int shardId -> BlobContainer
+        // throws IOException), so the method reference needs no adapting; wrapped delete-denied,
+        // the same least-privilege scoping TransportShardCloneAction's own cross-index resolution
+        // already uses.
+        engineNativeSnapshotSupport = new org.opensearch.serverless.storage.writerengine.EngineNativeSnapshotSupport(
+            (indexUuid, shardId) -> new org.opensearch.serverless.storage.security.RestrictingBlobContainer(
+                blobContainerForDirectoryFactory(indexUuid, shardId),
+                false
+            )
+        );
+        org.opensearch.index.engine.EngineNativeSnapshotReleasers.register(
+            org.opensearch.serverless.storage.writerengine.EngineNativeSnapshotSupport.ENGINE_ID,
+            engineNativeSnapshotSupport
+        );
         // This plugin instance itself, so TransportShardCloneAction (the only consumer) can be
         // constructor-injected with it and reach blobContainerForDirectoryFactory -- the same
         // resolution ServerlessStorageLazyDirectoryFactory already depends on, just handed to a
@@ -1623,7 +1644,12 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                         } catch (IOException e) {
                             throw new UncheckedIOException(e);
                         }
-                    }
+                    },
+                    // Same pinRegistry every other per-shard store above is scoped to -- engine-native
+                    // snapshot creation pins alongside this shard's own manifests/registers, exactly
+                    // like PITR's own pins do (see pinRegistry's own declaration above).
+                    pinRegistry,
+                    engineNativeSnapshotSupport
                 )
             );
         } catch (IOException e) {
@@ -1904,12 +1930,18 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     /**
      * Registers {@link org.opensearch.serverless.storage.scaletozero.ShardReactivationActionFilter}
      * -- the cold-start-reactivation-on-access half of scale-to-zero (rfc-serverless-opensearch.md
-     * &sect;7.3), see that class's own javadoc -- and {@link ServerlessStorageLegacySnapshotActionFilter},
-     * which vetoes legacy snapshot requests against serverless-storage-enabled indices (&sect;7.1.1).
+     * &sect;7.3), see that class's own javadoc -- and {@link
+     * org.opensearch.serverless.storage.resharding.WritePartitionRoutingActionFilter}.
+     *
+     * <p>No longer registers a blanket legacy-snapshot veto: writer shards now support real,
+     * engine-native {@code _snapshot}/{@code _restore} directly (see {@link
+     * org.opensearch.serverless.storage.writerengine.ObjectStoreWriterEngine#attemptEngineNativeSnapshot}
+     * and the design writeup at {@code docs-site/src/content/docs/design/snapshot-restore-proposal.md}),
+     * so the previous blanket rejection would now incorrectly block a correctly-supported feature.
      */
     @Override
     public List<org.opensearch.action.support.ActionFilter> getActionFilters() {
-        return List.of(shardReactivationActionFilter, legacySnapshotActionFilter, writePartitionRoutingActionFilter);
+        return List.of(shardReactivationActionFilter, writePartitionRoutingActionFilter);
     }
 
     /**

@@ -102,6 +102,7 @@ import org.opensearch.index.translog.TranslogDeletionPolicy;
 import org.opensearch.index.translog.TranslogManager;
 import org.opensearch.indices.pollingingest.PollingIngestStats;
 import org.opensearch.search.suggest.completion.CompletionStats;
+import org.opensearch.snapshots.SnapshotId;
 
 import java.io.Closeable;
 import java.io.FileNotFoundException;
@@ -117,6 +118,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -1345,6 +1347,37 @@ public abstract class Engine implements LifecycleAware, Closeable {
      */
     @Deprecated
     public abstract GatedCloseable<IndexCommit> acquireSafeIndexCommit() throws EngineException;
+
+    /**
+     * Returns an opaque pointer to this engine's own already-durable remote copy of its current
+     * state, if this engine maintains one independent of {@link #acquireLastIndexCommit}-based
+     * snapshotting. Called by {@code SnapshotShardsService} before falling back to the classic,
+     * copy-based snapshot path (which reads real bytes off this engine's local {@code Store}
+     * directory via {@link #acquireLastIndexCommit}) or the remote-store shallow-copy path.
+     *
+     * <p>Default returns {@link Optional#empty()}: current behavior unchanged for every existing
+     * engine, which falls back to {@code acquireLastIndexCommit}-based snapshotting exactly as it
+     * does today.
+     *
+     * <p>An engine that overrides this to return a non-empty {@link Optional} is asserting the
+     * returned {@link EngineNativeSnapshotPointer#payload()} is sufficient, on its own, to
+     * reconstruct this exact point-in-time state later via the matching {@link
+     * EngineFactory#recoverFromEngineNativeSnapshot}, including retaining/pinning whatever it
+     * references for as long as the resulting snapshot exists in the repository -- core has no
+     * visibility into what the payload means and cannot pin or garbage-collect anything on the
+     * engine's behalf. {@link EngineFactory#releaseEngineNativeSnapshot} is core's corresponding
+     * notification when a snapshot referencing it is deleted, resolved by the pointer's own {@link
+     * EngineNativeSnapshotPointer#engineId()} tag via {@link EngineNativeSnapshotReleasers} -- an
+     * engine that overrides this method is responsible for registering a matching releaser there
+     * during its own plugin initialization.
+     *
+     * @throws EngineException if this engine does support engine-native snapshots but this
+     *                          specific attempt failed -- surfaced as this shard's own snapshot
+     *                          failure, not silently downgraded to the copy-based fallback.
+     */
+    public Optional<EngineNativeSnapshotPointer> attemptEngineNativeSnapshot(SnapshotId snapshotId) throws EngineException {
+        return Optional.empty();
+    }
 
     /**
      * Acquires a safe {@link CatalogSnapshot} for the latest commit. Default implementation

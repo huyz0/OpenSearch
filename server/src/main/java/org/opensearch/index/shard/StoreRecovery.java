@@ -66,6 +66,7 @@ import org.opensearch.index.remote.RemoteStorePathStrategy;
 import org.opensearch.index.remote.RemoteStoreUtils;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.snapshots.IndexShardRestoreFailedException;
+import org.opensearch.index.snapshots.blobstore.EngineNativeShardSnapshot;
 import org.opensearch.index.snapshots.blobstore.RemoteStoreShardShallowCopySnapshot;
 import org.opensearch.index.store.RemoteSegmentStoreDirectory;
 import org.opensearch.index.store.RemoteSegmentStoreDirectoryFactory;
@@ -89,6 +90,7 @@ import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
@@ -379,6 +381,90 @@ final class StoreRecovery {
             }
         } catch (Exception e) {
             listener.onFailure(e);
+        }
+    }
+
+    /**
+     * Restores this shard from a snapshot, probing first for an engine-native snapshot pointer
+     * (one written by {@link org.opensearch.index.engine.Engine#attemptEngineNativeSnapshot})
+     * before falling back unmodified to {@link #recoverFromRepository}.
+     *
+     * <p>Deliberately a runtime probe rather than a persisted, pre-decided flag on {@code
+     * SnapshotInfo}/{@code SnapshotRecoverySource} (the shape {@code remoteStoreIndexShallowCopy}
+     * uses): that shape decides ahead of snapshot-finalize time, from a static repository setting,
+     * which would need giving {@code SnapshotsService} a new dependency on {@code EnginePlugin} to
+     * resolve whether an index's engine supports this ahead of any shard actually being
+     * snapshotted -- a materially bigger change than this seam needs. A cheap blob-existence check
+     * at restore time, mirroring the same probe {@link
+     * org.opensearch.repositories.blobstore.BlobStoreRepository#loadShardSnapshot(org.opensearch.common.blobstore.BlobContainer, org.opensearch.snapshots.SnapshotId)}
+     * already does internally for classic vs. shallow-copy, avoids that entirely.
+     *
+     * @param indexShard the index shard instance to recover the snapshot from
+     * @param repository the repository holding either the engine-native pointer or the physical
+     *                    files this shard should be recovered from
+     * @param listener    resolves as {@link #recoverFromRepository} documents
+     */
+    void recoverFromEngineNativeSnapshot(final IndexShard indexShard, Repository repository, ActionListener<Boolean> listener) {
+        try {
+            if (canRecover(indexShard) == false) {
+                listener.onResponse(false);
+                return;
+            }
+            RecoverySource.Type recoveryType = indexShard.recoveryState().getRecoverySource().getType();
+            assert recoveryType == RecoverySource.Type.SNAPSHOT : "expected snapshot recovery type: " + recoveryType;
+            SnapshotRecoverySource recoverySource = (SnapshotRecoverySource) indexShard.recoveryState().getRecoverySource();
+
+            final Optional<EngineNativeShardSnapshot> engineNativeSnapshot = repository.getEngineNativeShardSnapshotMetadata(
+                recoverySource.snapshot().getSnapshotId(),
+                recoverySource.index(),
+                shardId
+            );
+            if (engineNativeSnapshot.isEmpty()) {
+                // No engine-native blob for this shard's snapshot (the common case) -- nothing in
+                // this method has mutated shard state yet, so falling back to the complete,
+                // unmodified classic path is safe.
+                recoverFromRepository(indexShard, repository, listener);
+                return;
+            }
+
+            indexShard.preRecovery();
+            indexShard.prepareForIndexRecovery();
+            final Store store = indexShard.store();
+            if (recoverFromEngineNativeSnapshotFromEngine(indexShard, store, engineNativeSnapshot.get().payload()) == false) {
+                throw new IndexShardRecoveryException(
+                    shardId,
+                    "engine declined to recover the engine-native snapshot it originally produced",
+                    null
+                );
+            }
+            assert indexShard.shardRouting.primary() : "only primary shards can recover from store";
+            writeEmptyRetentionLeasesFile(indexShard);
+            indexShard.recoveryState().getIndex().setFileDetailsComplete();
+            indexShard.openEngineAndRecoverFromTranslog();
+            indexShard.getIndexer().fillSeqNoGaps(indexShard.getPendingPrimaryTerm());
+            indexShard.finalizeRecovery();
+            indexShard.postRecovery("restore done");
+            listener.onResponse(true);
+        } catch (Exception e) {
+            listener.onFailure(e);
+        }
+    }
+
+    /**
+     * See {@link EngineFactory#recoverFromEngineNativeSnapshot} for the full contract. Same
+     * resolution shape as {@link #recoverMissingLocalStoreFromEngine}.
+     */
+    private boolean recoverFromEngineNativeSnapshotFromEngine(IndexShard indexShard, Store store, byte[] snapshotPointer)
+        throws IndexShardRecoveryException {
+        IndexerFactory indexerFactory = indexShard.getIndexerFactory();
+        if (!(indexerFactory instanceof EngineBackedIndexerFactory)) {
+            return false;
+        }
+        EngineFactory engineFactory = ((EngineBackedIndexerFactory) indexerFactory).getEngineFactory();
+        try {
+            return engineFactory.recoverFromEngineNativeSnapshot(indexShard, store, snapshotPointer);
+        } catch (IOException e) {
+            throw new IndexShardRecoveryException(shardId, "engine failed to recover from engine-native snapshot", e);
         }
     }
 

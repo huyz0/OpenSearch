@@ -45,6 +45,8 @@ public final class WriterEngineFactory implements EngineFactory {
     private final long publicationRateLimitMillis;
     private final WriterPublicationNotifier publicationNotifier;
     private final java.util.function.IntFunction<org.opensearch.common.blobstore.BlobContainer> siblingShardBlobContainerResolver;
+    private final org.opensearch.serverless.storage.retention.DurablePinRegistry pinRegistry;
+    private final EngineNativeSnapshotSupport engineNativeSnapshotSupport;
 
     /**
      * Creates a factory with neither PITR retention nor WAL mirroring configured, delegating to the
@@ -433,6 +435,58 @@ public final class WriterEngineFactory implements EngineFactory {
         WriterPublicationNotifier publicationNotifier,
         java.util.function.IntFunction<org.opensearch.common.blobstore.BlobContainer> siblingShardBlobContainerResolver
     ) {
+        this(
+            headPublisher,
+            shardDirectory,
+            localNodeId,
+            pitrRetentionConfig,
+            walChunkService,
+            materializer,
+            encryptionKeyProvider,
+            activityRegistry,
+            dedicatedWalGcConfig,
+            publicationRateLimitMillis,
+            publicationNotifier,
+            siblingShardBlobContainerResolver,
+            null,
+            null
+        );
+    }
+
+    /**
+     * Creates a fully-configured factory, additionally able to produce engines that support
+     * engine-native snapshots -- see {@link ObjectStoreWriterEngine#attemptEngineNativeSnapshot} and
+     * {@link EngineNativeSnapshotSupport}.
+     *
+     * <p>Every other parameter is as documented on the narrower overload above.
+     *
+     * @param pinRegistry {@code null} disables engine-native snapshot <em>creation</em> on produced
+     *                    engines (same shape as every other optional feature in this plugin); a
+     *                    snapshot attempt then fails loudly rather than silently falling back to the
+     *                    classic copy-based path -- see {@code ObjectStoreWriterEngine#pinRegistry}'s
+     *                    own javadoc.
+     * @param engineNativeSnapshotSupport {@code null} disables engine-native snapshot
+     *                                    <em>restore</em> on produced engines; non-null is the
+     *                                    single, node-wide instance also registered under {@link
+     *                                    EngineNativeSnapshotSupport#ENGINE_ID} for the release path
+     *                                    (see {@code ServerlessStoragePlugin}'s own wiring).
+     */
+    public WriterEngineFactory(
+        ObjectStoreCommitHeadPublisher headPublisher,
+        ShardDirectory shardDirectory,
+        String localNodeId,
+        PitrRetentionConfig pitrRetentionConfig,
+        WalChunkService walChunkService,
+        ObjectStoreCommitMaterializer materializer,
+        org.opensearch.serverless.storage.security.EncryptionKeyProvider encryptionKeyProvider,
+        ShardActivityRegistry activityRegistry,
+        DedicatedWalGcConfig dedicatedWalGcConfig,
+        long publicationRateLimitMillis,
+        WriterPublicationNotifier publicationNotifier,
+        java.util.function.IntFunction<org.opensearch.common.blobstore.BlobContainer> siblingShardBlobContainerResolver,
+        org.opensearch.serverless.storage.retention.DurablePinRegistry pinRegistry,
+        EngineNativeSnapshotSupport engineNativeSnapshotSupport
+    ) {
         this.headPublisher = headPublisher;
         this.shardDirectory = shardDirectory;
         this.localNodeId = localNodeId;
@@ -445,6 +499,8 @@ public final class WriterEngineFactory implements EngineFactory {
         this.publicationRateLimitMillis = publicationRateLimitMillis;
         this.publicationNotifier = publicationNotifier;
         this.siblingShardBlobContainerResolver = siblingShardBlobContainerResolver;
+        this.pinRegistry = pinRegistry;
+        this.engineNativeSnapshotSupport = engineNativeSnapshotSupport;
     }
 
     /** Exposed for tests (including from other packages, e.g. {@code ServerlessStoragePluginTests}) -- not part of this class's public contract. */
@@ -490,7 +546,8 @@ public final class WriterEngineFactory implements EngineFactory {
                 encryptionKeyProvider,
                 dedicatedWalGcSchedulerTask,
                 publicationRateLimitMillis,
-                publicationNotifier
+                publicationNotifier,
+                pinRegistry
             );
             if (activityRegistry != null) {
                 activityRegistry.register(config.getShardId().getIndex().getUUID(), config.getShardId().getId(), engine);
@@ -800,5 +857,19 @@ public final class WriterEngineFactory implements EngineFactory {
     @Override
     public boolean ownsRemoteSegmentDurability() {
         return true;
+    }
+
+    /**
+     * Delegates to {@link #engineNativeSnapshotSupport} -- {@code null} disables this (returns
+     * {@code false}, same shape as every other optional feature in this plugin), which core treats
+     * as "engine declined to recover the snapshot it originally produced," an
+     * {@code IndexShardRecoveryException} surfaced as this shard's own recovery failure.
+     */
+    @Override
+    public boolean recoverFromEngineNativeSnapshot(IndexShard indexShard, Store store, byte[] snapshotPointer) throws IOException {
+        if (engineNativeSnapshotSupport == null) {
+            return false;
+        }
+        return engineNativeSnapshotSupport.recoverFromEngineNativeSnapshot(indexShard, store, snapshotPointer);
     }
 }

@@ -137,6 +137,34 @@ public interface EngineFactory {
     }
 
     /**
+     * Called by {@code StoreRecovery#recoverFromEngineNativeSnapshot} exactly once, only when the
+     * shard is recovering from a snapshot this same engine originally produced via {@link
+     * Engine#attemptEngineNativeSnapshot} -- the point where core has an opaque pointer this
+     * engine itself wrote at snapshot-creation time and needs it turned back into this shard's
+     * local Lucene commit. Called before this shard's local translog is created or its engine is
+     * opened, the same ordering {@link #recoverMissingLocalStore} already requires and for the
+     * identical reason. Default {@code false}: this engine never produces engine-native snapshots
+     * (see {@link Engine#attemptEngineNativeSnapshot}'s own default), so it never needs to consume
+     * one either.
+     *
+     * <p>An {@link EngineFactory} that overrides {@link Engine#attemptEngineNativeSnapshot} to
+     * return a non-empty pointer must override this too -- given the exact bytes that call
+     * previously returned, materialize {@code store}'s local Lucene commit and a matching local
+     * translog, then return {@code true}. Returning {@code true} without leaving {@code store} in
+     * a state {@link Store#readLastCommittedSegmentsInfo()} can read is a contract violation core
+     * cannot detect for you, exactly as {@link #recoverMissingLocalStore} warns.
+     *
+     * @param snapshotPointer the exact bytes this engine's own {@link Engine#attemptEngineNativeSnapshot}
+     *                        returned at snapshot-creation time -- opaque to core, round-tripped
+     *                        verbatim through repository storage.
+     * @throws IOException if materialization was attempted but failed -- surfaced as this shard's
+     *                      own recovery failure, not silently downgraded to plain-empty.
+     */
+    default boolean recoverFromEngineNativeSnapshot(IndexShard indexShard, Store store, byte[] snapshotPointer) throws IOException {
+        return false;
+    }
+
+    /**
      * Whether this engine already provides its own durable, remote copy of every segment it
      * writes, independent of core's own remote-store upload path ({@code
      * RemoteStoreRefreshListener}, engaged whenever {@code index.remote_store.enabled} is {@code
@@ -167,4 +195,34 @@ public interface EngineFactory {
     default boolean ownsRemoteSegmentDurability() {
         return false;
     }
+
+    /**
+     * Called when a snapshot whose engine-native pointer bytes ({@link
+     * Engine#attemptEngineNativeSnapshot}) were tagged with this factory's own {@code engineId} is
+     * deleted, so whatever the engine retained/pinned on that snapshot's behalf can be released.
+     * Default is a no-op: an {@link EngineFactory} that never overrides {@link
+     * Engine#attemptEngineNativeSnapshot} never has anything to release either.
+     *
+     * <p><b>Unlike every other hook on this interface, this one may be called with no live {@link
+     * IndexShard} anywhere in the cluster</b> -- a snapshot routinely outlives the index, or even
+     * the node, that originally produced it. This is why the call carries only the opaque pointer
+     * bytes, resolved through a node-level {@code engineId} registry rather than dispatched through
+     * a specific shard's engine the way {@link #recoverFromEngineNativeSnapshot} is: nothing else
+     * on this interface can assume a live shard exists at delete time. An {@link EngineFactory}
+     * implementing this must be able to release purely from the pointer bytes themselves (e.g. an
+     * index UUID/shard id/generation embedded in the pointer, resolved directly against durable
+     * remote state), not from any node-local or in-memory shard reference.
+     *
+     * <p>This is deliberately best-effort from core's side: if no {@link EngineFactory} is
+     * currently registered under the pointer's {@code engineId} (the producing plugin has since
+     * been uninstalled, for example), the snapshot's own blobs are still deleted -- core does not
+     * block a delete on finding a releaser, since that would turn an uninstalled plugin into a
+     * permanent inability to delete a snapshot.
+     *
+     * @param snapshotPointer the exact bytes this engine's own {@link Engine#attemptEngineNativeSnapshot}
+     *                        returned at snapshot-creation time.
+     * @throws IOException if release was attempted but failed -- logged, does not block the
+     *                      snapshot delete itself from proceeding.
+     */
+    default void releaseEngineNativeSnapshot(byte[] snapshotPointer) throws IOException {}
 }

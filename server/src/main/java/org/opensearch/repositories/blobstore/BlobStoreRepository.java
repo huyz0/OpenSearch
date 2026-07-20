@@ -109,6 +109,8 @@ import org.opensearch.core.util.BytesRefUtils;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentParser;
+import org.opensearch.index.engine.EngineFactory;
+import org.opensearch.index.engine.EngineNativeSnapshotReleasers;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.remote.RemoteStoreEnums.PathHashAlgorithm;
 import org.opensearch.index.remote.RemoteStoreEnums.PathType;
@@ -121,6 +123,7 @@ import org.opensearch.index.snapshots.IndexShardRestoreFailedException;
 import org.opensearch.index.snapshots.IndexShardSnapshotStatus;
 import org.opensearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshot;
 import org.opensearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshots;
+import org.opensearch.index.snapshots.blobstore.EngineNativeShardSnapshot;
 import org.opensearch.index.snapshots.blobstore.IndexShardSnapshot;
 import org.opensearch.index.snapshots.blobstore.RateLimitingInputStream;
 import org.opensearch.index.snapshots.blobstore.RemoteStoreShardShallowCopySnapshot;
@@ -237,6 +240,10 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
     public static final String SNAPSHOT_NAME_FORMAT = SNAPSHOT_PREFIX + "%s.dat";
 
     public static final String SHALLOW_SNAPSHOT_NAME_FORMAT = SHALLOW_SNAPSHOT_PREFIX + "%s.dat";
+
+    public static final String ENGINE_NATIVE_SNAPSHOT_PREFIX = "engine-native-snap-";
+
+    public static final String ENGINE_NATIVE_SNAPSHOT_NAME_FORMAT = ENGINE_NATIVE_SNAPSHOT_PREFIX + "%s.dat";
 
     private static final String SNAPSHOT_INDEX_PREFIX = "index-";
 
@@ -542,6 +549,9 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
 
     public static final ChecksumBlobStoreFormat<RemoteStoreShardShallowCopySnapshot> REMOTE_STORE_SHARD_SHALLOW_COPY_SNAPSHOT_FORMAT =
         new ChecksumBlobStoreFormat<>(SNAPSHOT_CODEC, SHALLOW_SNAPSHOT_NAME_FORMAT, RemoteStoreShardShallowCopySnapshot::fromXContent);
+
+    public static final ChecksumBlobStoreFormat<EngineNativeShardSnapshot> ENGINE_NATIVE_SHARD_SNAPSHOT_FORMAT =
+        new ChecksumBlobStoreFormat<>(SNAPSHOT_CODEC, ENGINE_NATIVE_SNAPSHOT_NAME_FORMAT, EngineNativeShardSnapshot::fromXContent);
 
     public static final ChecksumBlobStoreFormat<BlobStoreIndexShardSnapshots> INDEX_SHARD_SNAPSHOTS_FORMAT = new ChecksumBlobStoreFormat<>(
         "snapshots",
@@ -3952,6 +3962,62 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
     }
 
     @Override
+    public void snapshotEngineNative(
+        Store store,
+        SnapshotId snapshotId,
+        IndexId indexId,
+        IndexShardSnapshotStatus snapshotStatus,
+        long startTime,
+        String engineId,
+        byte[] snapshotPointer,
+        ActionListener<String> listener
+    ) {
+        if (isReadOnly()) {
+            listener.onFailure(new RepositoryException(metadata.name(), "cannot snapshot shard on a readonly repository"));
+            return;
+        }
+
+        final ShardId shardId = store.shardId();
+        try {
+            final String generation = snapshotStatus.generation();
+            logger.info("[{}] [{}] engine-native snapshot to [{}] [{}] ...", shardId, snapshotId, metadata.name(), generation);
+            final BlobContainer shardContainer = shardContainer(indexId, shardId);
+
+            // File/byte counts are meaningless for an opaque payload -- see
+            // EngineNativeShardSnapshot#getIndexShardSnapshotStatus for the same acknowledged
+            // limitation the remote-store shallow-copy path already accepts.
+            snapshotStatus.moveToStarted(startTime, 0, 0, 0, snapshotPointer.length);
+            final IndexShardSnapshotStatus.Copy lastSnapshotStatus = snapshotStatus.moveToFinalize(0);
+
+            logger.trace("[{}] [{}] writing engine-native shard snapshot file", shardId, snapshotId);
+            try {
+                ENGINE_NATIVE_SHARD_SNAPSHOT_FORMAT.write(
+                    new EngineNativeShardSnapshot(
+                        snapshotId.getName(),
+                        engineId,
+                        lastSnapshotStatus.getStartTime(),
+                        threadPool.absoluteTimeInMillis() - lastSnapshotStatus.getStartTime(),
+                        snapshotPointer
+                    ),
+                    shardContainer,
+                    snapshotId.getUUID(),
+                    compressor
+                );
+            } catch (IOException e) {
+                throw new IndexShardSnapshotFailedException(
+                    shardId,
+                    "Failed to write engine-native commit point for snapshot " + snapshotId.getName() + "(" + snapshotId.getUUID() + ")",
+                    e
+                );
+            }
+            snapshotStatus.moveToDone(threadPool.absoluteTimeInMillis(), generation);
+            listener.onResponse(generation);
+        } catch (Exception e) {
+            listener.onFailure(e);
+        }
+    }
+
+    @Override
     public void snapshotShard(
         Store store,
         MapperService mapperService,
@@ -4518,6 +4584,41 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
     }
 
     @Override
+    public Optional<EngineNativeShardSnapshot> getEngineNativeShardSnapshotMetadata(
+        SnapshotId snapshotId,
+        IndexId indexId,
+        ShardId snapshotShardId
+    ) {
+        // Deliberately independent of loadShardSnapshot(BlobContainer, SnapshotId): that shared
+        // helper backs restoreShard/cloneShardSnapshot/cloneRemoteStoreIndexShardSnapshot, each of
+        // which unconditionally casts its result to a specific IndexShardSnapshot subtype -- adding
+        // an engine-native branch there would risk a ClassCastException in those unrelated paths
+        // for any shard that happens to have an engine-native blob. This method's own narrow
+        // existence check keeps that risk contained to callers that actually ask for this type.
+        final BlobContainer container = shardContainer(indexId, snapshotShardId);
+        final String blobName = ENGINE_NATIVE_SHARD_SNAPSHOT_FORMAT.blobName(snapshotId.getUUID());
+        try {
+            if (container.blobExists(blobName) == false) {
+                return Optional.empty();
+            }
+            return Optional.of(ENGINE_NATIVE_SHARD_SNAPSHOT_FORMAT.read(container, snapshotId.getUUID(), namedXContentRegistry));
+        } catch (Exception e) {
+            // Broader than IOException deliberately: unlike FsBlobContainer, some BlobContainer
+            // implementations (e.g. S3, GCS) wrap a transient read/existence-check failure in their
+            // own unchecked exception type rather than IOException. Since this probe now runs on
+            // every classic-shaped restore (see this method's own javadoc), every implementation
+            // must fail the same well-typed way here, not leak an implementation-specific unchecked
+            // exception up through StoreRecovery.
+            throw new SnapshotException(
+                metadata.name(),
+                snapshotId,
+                "failed to read engine-native shard snapshot file for [" + container.path() + ']',
+                e
+            );
+        }
+    }
+
+    @Override
     public IndexShardSnapshotStatus getShardSnapshotStatus(SnapshotId snapshotId, IndexId indexId, ShardId shardId) {
         IndexShardSnapshot snapshot = loadShardSnapshot(shardContainer(indexId, shardId), snapshotId);
         return snapshot.getIndexShardSnapshotStatus();
@@ -4610,6 +4711,17 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
         long indexGeneration,
         RemoteStoreLockManagerFactory remoteStoreLockManagerFactory
     ) {
+        // Release any engine-native snapshot pointer this shard is about to lose, before computing
+        // which blobs to delete below -- best-effort (see EngineFactory#releaseEngineNativeSnapshot's
+        // own javadoc): a missing/failed release never blocks the delete itself from proceeding,
+        // it only risks the producing engine retaining something it no longer needs to.
+        for (SnapshotId removedSnapshotId : snapshotIds) {
+            if (survivingSnapshots.contains(removedSnapshotId)) {
+                continue;
+            }
+            releaseEngineNativeSnapshotIfPresent(shardContainer, removedSnapshotId);
+        }
+
         // Build a list of snapshots that should be preserved
         List<SnapshotFiles> newSnapshotsList = new ArrayList<>();
         final Set<String> survivingSnapshotNames = survivingSnapshots.stream().map(SnapshotId::getName).collect(Collectors.toSet());
@@ -4661,6 +4773,48 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
                     + " with shard index ["
                     + INDEX_SHARD_SNAPSHOTS_FORMAT.blobName(writtenGeneration)
                     + "]",
+                e
+            );
+        }
+    }
+
+    /**
+     * Best-effort release of an engine-native snapshot pointer, called just before this shard's
+     * blobs for {@code removedSnapshotId} are computed for deletion. A missing engine-native blob
+     * (the common case -- most snapshots are classic or shallow-copy) or a missing/failed release
+     * is logged and otherwise ignored: see {@link EngineFactory#releaseEngineNativeSnapshot}'s own
+     * javadoc for why release must never block a delete from proceeding.
+     */
+    private void releaseEngineNativeSnapshotIfPresent(BlobContainer shardContainer, SnapshotId removedSnapshotId) {
+        final String blobName = ENGINE_NATIVE_SHARD_SNAPSHOT_FORMAT.blobName(removedSnapshotId.getUUID());
+        try {
+            if (shardContainer.blobExists(blobName) == false) {
+                return;
+            }
+            final EngineNativeShardSnapshot snapshot = ENGINE_NATIVE_SHARD_SNAPSHOT_FORMAT.read(
+                shardContainer,
+                removedSnapshotId.getUUID(),
+                namedXContentRegistry
+            );
+            final Optional<EngineFactory> releaser = EngineNativeSnapshotReleasers.find(snapshot.engineId());
+            if (releaser.isEmpty()) {
+                logger.warn(
+                    "[{}] no releaser registered for engineId [{}] while deleting snapshot [{}] -- "
+                        + "the producing plugin may be uninstalled; proceeding with delete without releasing",
+                    metadata.name(),
+                    snapshot.engineId(),
+                    removedSnapshotId
+                );
+                return;
+            }
+            releaser.get().releaseEngineNativeSnapshot(snapshot.payload());
+        } catch (Exception e) {
+            logger.warn(
+                () -> new ParameterizedMessage(
+                    "[{}] failed to release engine-native snapshot pointer for [{}], proceeding with delete anyway",
+                    metadata.name(),
+                    removedSnapshotId
+                ),
                 e
             );
         }

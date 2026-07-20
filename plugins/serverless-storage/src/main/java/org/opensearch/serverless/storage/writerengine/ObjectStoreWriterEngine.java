@@ -21,6 +21,7 @@ import org.opensearch.index.engine.Engine.Index;
 import org.opensearch.index.engine.Engine.IndexResult;
 import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.EngineException;
+import org.opensearch.index.engine.EngineNativeSnapshotPointer;
 import org.opensearch.index.engine.InternalEngine;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.translog.InternalTranslogManager;
@@ -35,6 +36,7 @@ import org.opensearch.serverless.storage.directory.ShardRole;
 import org.opensearch.serverless.storage.manifest.CommitManifest;
 import org.opensearch.serverless.storage.manifest.PruningStats;
 import org.opensearch.serverless.storage.manifest.WalPosition;
+import org.opensearch.serverless.storage.retention.DurablePinRegistry;
 import org.opensearch.serverless.storage.retention.PitrRetentionConfig;
 import org.opensearch.serverless.storage.retention.PitrRetentionSchedulerTask;
 import org.opensearch.serverless.storage.translog.WalMirroringTranslog;
@@ -42,6 +44,7 @@ import org.opensearch.serverless.storage.translog.WalMirroringTranslogFactory;
 import org.opensearch.serverless.storage.wal.WalChunkService;
 import org.opensearch.serverless.storage.wal.WalGcSchedulerTask;
 import org.opensearch.serverless.storage.wal.WalReplayRecovery;
+import org.opensearch.snapshots.SnapshotId;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 
@@ -159,6 +162,16 @@ public class ObjectStoreWriterEngine extends InternalEngine {
 
     /** {@code null} disables writer-side publication notification entirely -- see that class's own javadoc. */
     private final WriterPublicationNotifier publicationNotifier;
+
+    /**
+     * {@code null} disables engine-native snapshot support entirely -- see {@link
+     * #attemptEngineNativeSnapshot}, which always throws rather than returning empty when this is
+     * {@code null}, so a snapshot attempt fails loudly instead of silently falling back to the
+     * classic copy-based path this shard's own model doesn't actually support (this shard's local
+     * commit and local {@code Directory} are not guaranteed to reflect its real durable state --
+     * see the design writeup at {@code docs-site/src/content/docs/design/snapshot-restore-proposal.md}).
+     */
+    private final DurablePinRegistry pinRegistry;
 
     /**
      * Set (via {@link java.util.concurrent.atomic.AtomicLong#compareAndSet}, so two concurrent
@@ -528,6 +541,45 @@ public class ObjectStoreWriterEngine extends InternalEngine {
             dedicatedWalGcSchedulerTask,
             publicationRateLimitMillis,
             publicationNotifier,
+            null
+        );
+    }
+
+    /**
+     * Creates a fully-configured writer engine, additionally able to pin its own manifest
+     * generations against GC when this shard is snapshotted -- see {@link #attemptEngineNativeSnapshot}.
+     * Every other parameter is as documented on the narrower overload above.
+     *
+     * @param pinRegistry {@code null} disables engine-native snapshot support entirely (same shape
+     *                    as every other optional feature in this plugin) -- {@link
+     *                    #attemptEngineNativeSnapshot} always throws in that case, rather than
+     *                    silently falling back to the classic copy-based snapshot path.
+     */
+    public ObjectStoreWriterEngine(
+        EngineConfig engineConfig,
+        ObjectStoreCommitHeadPublisher headPublisher,
+        ShardDirectory shardDirectory,
+        String localNodeId,
+        PitrRetentionConfig pitrRetentionConfig,
+        WalChunkService walChunkService,
+        org.opensearch.serverless.storage.security.EncryptionKeyProvider encryptionKeyProvider,
+        WalGcSchedulerTask dedicatedWalGcSchedulerTask,
+        long publicationRateLimitMillis,
+        WriterPublicationNotifier publicationNotifier,
+        DurablePinRegistry pinRegistry
+    ) {
+        this(
+            engineConfig,
+            headPublisher,
+            shardDirectory,
+            localNodeId,
+            pitrRetentionConfig,
+            walChunkService,
+            encryptionKeyProvider,
+            dedicatedWalGcSchedulerTask,
+            publicationRateLimitMillis,
+            publicationNotifier,
+            pinRegistry,
             beginConstruction(walChunkService, encryptionKeyProvider)
         );
     }
@@ -544,11 +596,13 @@ public class ObjectStoreWriterEngine extends InternalEngine {
         WalGcSchedulerTask dedicatedWalGcSchedulerTask,
         long publicationRateLimitMillis,
         WriterPublicationNotifier publicationNotifier,
+        DurablePinRegistry pinRegistry,
         Void ignored
     ) {
         super(engineConfig);
         this.publicationRateLimitMillis = publicationRateLimitMillis;
         this.publicationNotifier = publicationNotifier;
+        this.pinRegistry = pinRegistry;
         CONSTRUCTION_WAL_CHUNK_SERVICE.remove();
         CONSTRUCTION_ENCRYPTION_KEY_PROVIDER.remove();
         this.activationWalPosition = CONSTRUCTION_ACTIVATION_WAL_POSITION.get();
@@ -1010,6 +1064,57 @@ public class ObjectStoreWriterEngine extends InternalEngine {
             return replayWalOperations();
         } catch (IOException e) {
             throw new EngineException(engineConfig.getShardId(), "failed to replay WAL operations for activation", e);
+        }
+    }
+
+    /**
+     * This engine's own already-durable manifest publication already <em>is</em> a complete,
+     * addressable point-in-time copy of this shard (the same insight {@link
+     * WriterEngineFactory#ownsRemoteSegmentDurability} documents) -- so a real {@code _snapshot} request never needs
+     * to copy segment bytes for this engine the way {@code Engine#acquireLastIndexCommit}-based
+     * snapshotting does. This pins the latest manifest generation under {@code snapshotId} (via
+     * {@link ObjectStoreCommitHeadPublisher#readLatestManifestWithPin}, the same pin-before-read
+     * ordering {@code ShardCloner#clone} uses) and returns it, serialized, as the pointer -- see
+     * {@link EngineNativeSnapshotSupport} for how the matching restore/release hooks consume it.
+     *
+     * <p>Never returns {@link Optional#empty()}: an activated writer engine always supports
+     * engine-native snapshots when {@link #pinRegistry} is configured (the normal case -- see that
+     * field's own javadoc for the {@code null} opt-out). If nothing has been published yet, that is
+     * a real failure to surface (there is nothing yet to snapshot), not a silent signal to fall
+     * back to the classic path this shard's model doesn't actually support.
+     *
+     * @throws EngineException if {@link #pinRegistry} is {@code null} (feature disabled), if no
+     *                          manifest has ever been published yet, or if pinning/serialization
+     *                          itself failed.
+     */
+    @Override
+    public Optional<EngineNativeSnapshotPointer> attemptEngineNativeSnapshot(SnapshotId snapshotId) throws EngineException {
+        if (pinRegistry == null) {
+            throw new EngineException(engineConfig.getShardId(), "engine-native snapshot support is not configured for this shard");
+        }
+        Optional<CommitManifest> manifest;
+        try {
+            manifest = headPublisher.readLatestManifestWithPin(indexUuid, shardId, pinRegistry, snapshotId.getUUID());
+        } catch (IOException e) {
+            throw new EngineException(engineConfig.getShardId(), "failed to produce engine-native snapshot pointer", e);
+        }
+        if (manifest.isEmpty()) {
+            throw new EngineException(engineConfig.getShardId(), "no manifest has been published yet for this shard");
+        }
+        try {
+            byte[] payload = new EngineNativeSnapshotPayload(snapshotId.getUUID(), manifest.get()).toBytes();
+            return Optional.of(new EngineNativeSnapshotPointer(EngineNativeSnapshotSupport.ENGINE_ID, payload));
+        } catch (IOException e) {
+            // readLatestManifestWithPin above already registered a durable pin for this generation.
+            // If serialization fails here, no pointer is ever returned for anything downstream (a
+            // later snapshot delete) to key a release off of -- release it ourselves before failing,
+            // or it is orphaned forever.
+            try {
+                pinRegistry.removePin(indexUuid, shardId, snapshotId.getUUID());
+            } catch (IOException releaseFailure) {
+                e.addSuppressed(releaseFailure);
+            }
+            throw new EngineException(engineConfig.getShardId(), "failed to produce engine-native snapshot pointer", e);
         }
     }
 

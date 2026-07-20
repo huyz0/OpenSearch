@@ -68,6 +68,15 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
         ObjectStoreCommitPublisher commitPublisher,
         long publicationRateLimitMillis
     ) throws Exception {
+        return openWriterEngine(shardStateStore, commitPublisher, publicationRateLimitMillis, null);
+    }
+
+    private ObjectStoreWriterEngine openWriterEngine(
+        ShardStateStore shardStateStore,
+        ObjectStoreCommitPublisher commitPublisher,
+        long publicationRateLimitMillis,
+        DurablePinRegistry pinRegistry
+    ) throws Exception {
         Store store = createStore();
         lastOpenedStore = store;
         store.createEmpty(defaultSettings.getIndexVersionCreated().luceneVersion);
@@ -85,7 +94,9 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
             null,
             null,
             null,
-            publicationRateLimitMillis
+            publicationRateLimitMillis,
+            null,
+            pinRegistry
         );
         engine.translogManager().recoverFromTranslog(translogHandler, engine.getProcessedLocalCheckpoint(), Long.MAX_VALUE);
         return engine;
@@ -405,6 +416,71 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
                 afterQuiesce.head().latestManifestGeneration()
             );
             assertTrue("flushAndPublishQuiescent's own manifest must be marked quiescent", quiescentManifest.quiescent());
+        } finally {
+            IOUtils.close(engine, lastOpenedStore);
+        }
+    }
+
+    public void testAttemptEngineNativeSnapshotPinsTheLatestPublishedManifest() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+        DurablePinRegistry pinRegistry = new BlobContainerDurablePinRegistry(blobContainer);
+
+        ObjectStoreWriterEngine engine = openWriterEngine(shardStateStore, commitPublisher, 0L, pinRegistry);
+        try {
+            index(engine, "1");
+            engine.flush(true, true);
+
+            VersionedShardHead head = shardStateStore.get(shardId.getIndex().getUUID(), shardId.getId()).orElseThrow();
+
+            org.opensearch.snapshots.SnapshotId snapshotId = new org.opensearch.snapshots.SnapshotId("test-snap", "test-snap-uuid");
+            Optional<org.opensearch.index.engine.EngineNativeSnapshotPointer> pointer = engine.attemptEngineNativeSnapshot(snapshotId);
+
+            assertTrue("a writer engine with a pin registry configured must always produce a pointer", pointer.isPresent());
+            assertEquals(EngineNativeSnapshotSupport.ENGINE_ID, pointer.get().engineId());
+
+            Set<org.opensearch.serverless.storage.retention.PinRecord> pins = pinRegistry.getPins(
+                shardId.getIndex().getUUID(),
+                shardId.getId()
+            );
+            assertEquals(1, pins.size());
+            org.opensearch.serverless.storage.retention.PinRecord pin = pins.iterator().next();
+            assertEquals(
+                "the pin must protect exactly the generation that was current when the snapshot was taken",
+                head.head().latestManifestGeneration(),
+                pin.generation()
+            );
+            assertEquals(snapshotId.getUUID(), pin.pinId());
+        } finally {
+            IOUtils.close(engine, lastOpenedStore);
+        }
+    }
+
+    public void testAttemptEngineNativeSnapshotThrowsWhenNoPinRegistryIsConfigured() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+
+        // Deliberately the 3-arg overload -- pinRegistry defaults to null, same as production when
+        // this plugin's engine-native snapshot support isn't wired up.
+        ObjectStoreWriterEngine engine = openWriterEngine(shardStateStore, commitPublisher, 0L);
+        try {
+            index(engine, "1");
+            engine.flush(true, true);
+
+            expectThrows(
+                org.opensearch.index.engine.EngineException.class,
+                () -> engine.attemptEngineNativeSnapshot(new org.opensearch.snapshots.SnapshotId("test-snap", "test-snap-uuid"))
+            );
         } finally {
             IOUtils.close(engine, lastOpenedStore);
         }

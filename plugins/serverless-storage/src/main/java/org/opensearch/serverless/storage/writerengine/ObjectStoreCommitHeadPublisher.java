@@ -285,4 +285,54 @@ public final class ObjectStoreCommitHeadPublisher {
         }
         return Optional.of(commitPublisher.readManifest(head.primaryTerm(), head.latestManifestGeneration()));
     }
+
+    /**
+     * Same as {@link #readLatestManifest}, except the current head's {@code (primaryTerm,
+     * generation)} is pinned via {@code pinRegistry} under {@code pinId} <b>before</b> the manifest
+     * itself is read -- the same pin-before-read ordering {@link
+     * org.opensearch.serverless.storage.clone.ShardCloner#clone} uses and for the identical reason
+     * (formally verified in {@code formal/CloneGc.tla}): pinning only after reading the manifest
+     * would leave a window where a concurrent GC sweep could observe this generation as superseded
+     * and unpinned, and delete it, between this method's own read of the head and its write of the
+     * pin.
+     *
+     * @param pinRegistry this shard's own durable pin registry
+     * @param pinId the pin identifier to register the generation under (e.g. a snapshot UUID)
+     * @return the pinned, just-read manifest, or empty if nothing has been published yet (nothing
+     *         to pin)
+     */
+    public Optional<CommitManifest> readLatestManifestWithPin(
+        String indexUuid,
+        int shardId,
+        org.opensearch.serverless.storage.retention.DurablePinRegistry pinRegistry,
+        String pinId
+    ) throws IOException {
+        Optional<VersionedShardHead> current = shardStateStore.get(indexUuid, shardId);
+        if (current.isEmpty()) {
+            return Optional.empty();
+        }
+        ShardHead head = current.get().head();
+        if (head.latestManifestGeneration() == 0) {
+            return Optional.empty();
+        }
+        pinRegistry.addPin(
+            indexUuid,
+            shardId,
+            new org.opensearch.serverless.storage.retention.PinRecord(pinId, head.primaryTerm(), head.latestManifestGeneration())
+        );
+        try {
+            return Optional.of(commitPublisher.readManifest(head.primaryTerm(), head.latestManifestGeneration()));
+        } catch (IOException e) {
+            // The pin above is now durable, but this method is about to fail without ever handing
+            // back a manifest/pointer for anything downstream to key a later release off of --
+            // release it ourselves here, or it is orphaned forever (still protected from GC, but
+            // with nothing left anywhere that will ever call removePin for it).
+            try {
+                pinRegistry.removePin(indexUuid, shardId, pinId);
+            } catch (IOException releaseFailure) {
+                e.addSuppressed(releaseFailure);
+            }
+            throw e;
+        }
+    }
 }

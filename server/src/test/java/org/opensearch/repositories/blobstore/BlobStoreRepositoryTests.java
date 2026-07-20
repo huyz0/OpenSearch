@@ -58,7 +58,10 @@ import org.opensearch.env.Environment;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.remote.RemoteStoreEnums;
 import org.opensearch.index.remote.RemoteStorePathStrategy;
+import org.opensearch.index.snapshots.IndexShardSnapshotStatus;
+import org.opensearch.index.snapshots.blobstore.EngineNativeShardSnapshot;
 import org.opensearch.index.store.RemoteSegmentStoreDirectoryFactory;
+import org.opensearch.index.store.Store;
 import org.opensearch.index.store.lockmanager.RemoteStoreLockManager;
 import org.opensearch.index.store.lockmanager.RemoteStoreLockManagerFactory;
 import org.opensearch.indices.recovery.RecoverySettings;
@@ -90,6 +93,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -271,6 +275,49 @@ public class BlobStoreRepositoryTests extends BlobStoreRepositoryHelperTests {
             RepositoryException.class,
             () -> writeIndexGen(repository, repositoryData.withGenId(startingGeneration + 1), repositoryData.getGenId())
         );
+    }
+
+    public void testSnapshotEngineNativeWritesRecoverableMetadata() throws Exception {
+        final BlobStoreRepository repository = setupRepo();
+        final ShardId shardId = new ShardId("test-index", "_na_", 0);
+        final IndexId indexId = new IndexId("test-index", "test-index-uuid");
+        final SnapshotId snapshotId = new SnapshotId("test-snap", UUIDs.randomBase64UUID());
+        final Store store = mock(Store.class);
+        when(store.shardId()).thenReturn(shardId);
+        final byte[] payload = randomByteArrayOfLength(32);
+        final String engineId = "test-engine/v1";
+
+        final PlainActionFuture<String> future = PlainActionFuture.newFuture();
+        repository.snapshotEngineNative(
+            store,
+            snapshotId,
+            indexId,
+            IndexShardSnapshotStatus.newInitializing(ShardGenerations.NEW_SHARD_GEN),
+            0L,
+            engineId,
+            payload,
+            future
+        );
+        future.actionGet();
+
+        final Optional<EngineNativeShardSnapshot> read = repository.getEngineNativeShardSnapshotMetadata(snapshotId, indexId, shardId);
+        assertTrue("engine-native metadata must be readable back after a successful write", read.isPresent());
+        assertEquals(engineId, read.get().engineId());
+        assertArrayEquals(payload, read.get().payload());
+        assertEquals(snapshotId.getName(), read.get().snapshot());
+    }
+
+    public void testGetEngineNativeShardSnapshotMetadataReturnsEmptyWhenAbsent() {
+        final BlobStoreRepository repository = setupRepo();
+        final ShardId shardId = new ShardId("test-index", "_na_", 0);
+        final IndexId indexId = new IndexId("test-index", "test-index-uuid");
+        final SnapshotId snapshotId = new SnapshotId("test-snap", UUIDs.randomBase64UUID());
+
+        // No engine-native snapshot was ever written for this (snapshotId, indexId, shardId) -- the
+        // shape every classic (non-engine-native) snapshot in existence today has -- so the probe
+        // must return empty rather than throw, letting StoreRecovery fall back to the classic
+        // restore path instead of failing outright.
+        assertEquals(Optional.empty(), repository.getEngineNativeShardSnapshotMetadata(snapshotId, indexId, shardId));
     }
 
     public void testBadChunksize() throws Exception {

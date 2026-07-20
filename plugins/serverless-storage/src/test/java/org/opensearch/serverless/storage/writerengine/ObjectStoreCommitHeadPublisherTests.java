@@ -24,6 +24,8 @@ import org.opensearch.serverless.storage.format.BlobContainerBundleStore;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.manifest.PruningStats;
 import org.opensearch.serverless.storage.manifest.WalPosition;
+import org.opensearch.serverless.storage.retention.BlobContainerDurablePinRegistry;
+import org.opensearch.serverless.storage.retention.DurablePinRegistry;
 import org.opensearch.serverless.storage.security.RegisterDelegatingBlobContainer;
 import org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore;
 import org.opensearch.serverless.storage.shardstate.CasResult;
@@ -282,6 +284,56 @@ public class ObjectStoreCommitHeadPublisherTests extends OpenSearchTestCase {
             assertTrue("a writer resuming after a concurrent compaction must succeed at the next live generation", published);
             ShardHead head = shardStateStore.get(INDEX_UUID, SHARD_ID).orElseThrow().head();
             assertEquals(compactedGeneration + 1, head.latestManifestGeneration());
+        }
+    }
+
+    public void testReadLatestManifestWithPinReleasesItsOwnPinIfTheReadAfterwardFails() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer rawContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore localShardStateStore = new BlobContainerShardStateStore(rawContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(rawContainer),
+            new BlobContainerManifestStore(rawContainer)
+        );
+        ObjectStoreCommitHeadPublisher localHeadPublisher = new ObjectStoreCommitHeadPublisher(commitPublisher, localShardStateStore);
+        DurablePinRegistry pinRegistry = new BlobContainerDurablePinRegistry(rawContainer);
+
+        try (Directory directory = new ByteBuffersDirectory()) {
+            SegmentInfos first = commitOneDocument(directory, "1");
+            assertTrue(
+                localHeadPublisher.publishCommitAsHead(
+                    directory,
+                    first,
+                    INDEX_UUID,
+                    SHARD_ID,
+                    1,
+                    0,
+                    0,
+                    new WalPosition("epoch-0", 0),
+                    0,
+                    PruningStats.empty()
+                )
+            );
+            VersionedShardHead afterPublish = localShardStateStore.get(INDEX_UUID, SHARD_ID).orElseThrow();
+
+            // Plant a head pointing one generation past what was actually published -- no manifest
+            // blob exists there -- so the read that follows the pin below is guaranteed to fail with
+            // IOException, letting this test prove the pin gets released rather than orphaned.
+            ShardHead bogusHead = afterPublish.head().withPublishedGeneration(afterPublish.head().latestManifestGeneration() + 1);
+            assertEquals(
+                CasResult.SUCCESS,
+                localShardStateStore.compareAndSet(INDEX_UUID, SHARD_ID, Optional.of(afterPublish.version()), bogusHead)
+            );
+
+            expectThrows(
+                IOException.class,
+                () -> localHeadPublisher.readLatestManifestWithPin(INDEX_UUID, SHARD_ID, pinRegistry, "test-snap-uuid")
+            );
+
+            assertTrue(
+                "a pin registered right before a failed read must be released, not orphaned",
+                pinRegistry.getPins(INDEX_UUID, SHARD_ID).isEmpty()
+            );
         }
     }
 
