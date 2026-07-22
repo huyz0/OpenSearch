@@ -515,6 +515,21 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * Comma-joined node names currently marked warming (node autoscaling design doc part 2,
+     * "pre-warm before rotation" -- Phase 3) -- see {@link
+     * org.opensearch.serverless.storage.nodecapacity.NodeWarmupCoordinator}. A transient cluster
+     * setting, mirroring how core's own {@code cluster.routing.allocation.exclude._name} is
+     * registered ({@code Property.Dynamic, Property.NodeScope}), so a {@code
+     * ClusterUpdateSettingsRequest} against it validates and survives cluster-manager failover for
+     * free.
+     */
+    public static final Setting<String> SERVERLESS_STORAGE_NODE_WARMUP_NAMES_SETTING = Setting.simpleString(
+        org.opensearch.serverless.storage.nodecapacity.NodeWarmupCoordinator.WARMING_NAMES_SETTING_KEY,
+        Setting.Property.Dynamic,
+        Setting.Property.NodeScope
+    );
+
+    /**
      * The default writes-per-minute threshold {@code ShardSplitCandidatesAction} uses to decide a
      * writer shard's sustained write rate is high enough to be worth an operator's attention as a
      * possible split target -- a caller can override this per-request, this is only the default
@@ -1147,6 +1162,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_SCALE_TO_ZERO_LAG_THRESHOLD_SETTING,
             SERVERLESS_STORAGE_NODE_CAPACITY_EVAL_INTERVAL_SETTING,
             SERVERLESS_STORAGE_NODE_CAPACITY_DRAIN_REQUIRED_CONSECUTIVE_TICKS_SETTING,
+            SERVERLESS_STORAGE_NODE_WARMUP_NAMES_SETTING,
             SERVERLESS_STORAGE_SCALE_TO_ZERO_EVAL_INTERVAL_SETTING,
             SERVERLESS_STORAGE_SCALE_TO_ZERO_SUSPEND_ENABLED_SETTING,
             SERVERLESS_STORAGE_SCALE_TO_ZERO_SEARCH_REACTIVATION_WAIT_SETTING,
@@ -1945,7 +1961,11 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
 
     @Override
     public Collection<AllocationDecider> createAllocationDeciders(Settings settings, ClusterSettings clusterSettings) {
-        return java.util.List.of(new ReaderShardPlacementAllocationDecider(), new SuspendedShardAllocationDecider());
+        return java.util.List.of(
+            new ReaderShardPlacementAllocationDecider(),
+            new SuspendedShardAllocationDecider(),
+            new org.opensearch.serverless.storage.allocation.NodeWarmupAllocationDecider()
+        );
     }
 
     /**
@@ -2140,6 +2160,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 org.opensearch.serverless.storage.nodecapacity.action.TransportNodeDrainAction.class
             ),
             new ActionHandler<>(
+                org.opensearch.serverless.storage.nodecapacity.action.NodeWarmupAction.INSTANCE,
+                org.opensearch.serverless.storage.nodecapacity.action.TransportNodeWarmupAction.class
+            ),
+            new ActionHandler<>(
                 org.opensearch.serverless.storage.compaction.action.CompactionTriggerAction.INSTANCE,
                 org.opensearch.serverless.storage.compaction.action.TransportCompactionTriggerAction.class
             ),
@@ -2294,6 +2318,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new org.opensearch.serverless.storage.readerengine.action.RestPollNowAction(),
             new org.opensearch.serverless.storage.nodecapacity.action.RestNodeCapacityAction(),
             new org.opensearch.serverless.storage.nodecapacity.action.RestNodeDrainAction(),
+            new org.opensearch.serverless.storage.nodecapacity.action.RestNodeWarmupAction(),
             new org.opensearch.serverless.storage.scaletozero.action.RestScaleToZeroCandidatesAction(),
             new org.opensearch.serverless.storage.scaletozero.action.RestReactivateShardsAction(),
             new org.opensearch.serverless.storage.scaleup.action.RestScaleUpCandidatesAction(),
