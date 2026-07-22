@@ -515,8 +515,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
-     * Comma-joined node names currently marked warming (node autoscaling design doc part 2,
-     * "pre-warm before rotation" -- Phase 3) -- see {@link
+     * Comma-joined node names currently marked warming (node autoscaling design doc, "Warming up a
+     * node before it serves") -- see {@link
      * org.opensearch.serverless.storage.nodecapacity.NodeWarmupCoordinator}. A transient cluster
      * setting, mirroring how core's own {@code cluster.routing.allocation.exclude._name} is
      * registered ({@code Property.Dynamic, Property.NodeScope}), so a {@code
@@ -526,6 +526,33 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     public static final Setting<String> SERVERLESS_STORAGE_NODE_WARMUP_NAMES_SETTING = Setting.simpleString(
         org.opensearch.serverless.storage.nodecapacity.NodeWarmupCoordinator.WARMING_NAMES_SETTING_KEY,
         Setting.Property.Dynamic,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * How often {@code NodeSelfWarmupSchedulerTask} checks whether this node still needs to
+     * self-mark as warming (docs-site/src/content/docs/design/node-autoscaling.md, "Warming up a
+     * node before it serves") -- same "background schedule, non-positive disables it" shape as
+     * every other eval-interval setting in this plugin. Runs on every reader-role node, not just
+     * the cluster-manager, since self-marking is inherently local-node work.
+     */
+    public static final Setting<TimeValue> SERVERLESS_STORAGE_NODE_SELF_WARMUP_EVAL_INTERVAL_SETTING = Setting.timeSetting(
+        "serverless_storage.node_warmup.self_mark_eval_interval",
+        TimeValue.MINUS_ONE,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * How long after a successful self-mark {@code NodeSelfWarmupSchedulerTask} automatically clears
+     * it again. {@link TimeValue#ZERO} (the default) means never auto-clear -- the node stays
+     * warming until an external caller (the control plane, or an operator) clears it, matching the
+     * fully-external flow this task's self-marking only narrows the race window on, not replaces.
+     * Only worth setting for a deployment with no readiness check of its own; a control plane with a
+     * real one should leave this disabled and clear explicitly once its own check passes.
+     */
+    public static final Setting<TimeValue> SERVERLESS_STORAGE_NODE_SELF_WARMUP_AUTO_CLEAR_DELAY_SETTING = Setting.timeSetting(
+        "serverless_storage.node_warmup.self_mark_auto_clear_delay",
+        TimeValue.ZERO,
         Setting.Property.NodeScope
     );
 
@@ -1110,6 +1137,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     private volatile long scaleToZeroLagThreshold = SERVERLESS_STORAGE_SCALE_TO_ZERO_LAG_THRESHOLD_SETTING.getDefault(Settings.EMPTY);
     private volatile org.opensearch.serverless.storage.scaletozero.ScaleToZeroCandidatesSchedulerTask scaleToZeroCandidatesSchedulerTask;
     private volatile org.opensearch.serverless.storage.nodecapacity.NodeCapacitySignalService nodeCapacitySignalService;
+    private volatile org.opensearch.serverless.storage.nodecapacity.NodeSelfWarmupSchedulerTask nodeSelfWarmupSchedulerTask;
     // Same "resolved once in createComponents" reasoning as the scale-to-zero thresholds above --
     // TransportScaleUpCandidatesAction reads these as its per-request defaults, overridable per
     // ScaleUpCandidatesRequest.
@@ -1179,6 +1207,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_NODE_CAPACITY_EVAL_INTERVAL_SETTING,
             SERVERLESS_STORAGE_NODE_CAPACITY_DRAIN_REQUIRED_CONSECUTIVE_TICKS_SETTING,
             SERVERLESS_STORAGE_NODE_WARMUP_NAMES_SETTING,
+            SERVERLESS_STORAGE_NODE_SELF_WARMUP_EVAL_INTERVAL_SETTING,
+            SERVERLESS_STORAGE_NODE_SELF_WARMUP_AUTO_CLEAR_DELAY_SETTING,
             SERVERLESS_STORAGE_SCALE_TO_ZERO_EVAL_INTERVAL_SETTING,
             SERVERLESS_STORAGE_SCALE_TO_ZERO_SUSPEND_ENABLED_SETTING,
             SERVERLESS_STORAGE_SCALE_TO_ZERO_SEARCH_REACTIVATION_WAIT_SETTING,
@@ -1301,6 +1331,16 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                     client
                 );
             }
+        }
+        TimeValue selfWarmupEvalInterval = SERVERLESS_STORAGE_NODE_SELF_WARMUP_EVAL_INTERVAL_SETTING.get(environment.settings());
+        if (selfWarmupEvalInterval.millis() > 0) {
+            this.nodeSelfWarmupSchedulerTask = new org.opensearch.serverless.storage.nodecapacity.NodeSelfWarmupSchedulerTask(
+                threadPool,
+                selfWarmupEvalInterval,
+                clusterService,
+                new org.opensearch.serverless.storage.nodecapacity.NodeWarmupCoordinator(client),
+                SERVERLESS_STORAGE_NODE_SELF_WARMUP_AUTO_CLEAR_DELAY_SETTING.get(environment.settings())
+            );
         }
         this.scaleUpQpmThreshold = SERVERLESS_STORAGE_SCALE_UP_QPM_THRESHOLD_SETTING.get(environment.settings());
         this.scaleUpMaxSearchReplicas = SERVERLESS_STORAGE_SCALE_UP_MAX_SEARCH_REPLICAS_SETTING.get(environment.settings());
@@ -2576,6 +2616,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         if (nodeCapacityTask != null) {
             nodeCapacityTask.close();
         }
+        org.opensearch.serverless.storage.nodecapacity.NodeSelfWarmupSchedulerTask selfWarmupTask = nodeSelfWarmupSchedulerTask;
+        if (selfWarmupTask != null) {
+            selfWarmupTask.close();
+        }
     }
 
     /**
@@ -2585,6 +2629,15 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      */
     public org.opensearch.serverless.storage.nodecapacity.NodeCapacitySignalService nodeCapacitySignalService() {
         return nodeCapacitySignalService;
+    }
+
+    /**
+     * This node's {@code NodeSelfWarmupSchedulerTask}, or {@code null} if {@link
+     * #SERVERLESS_STORAGE_NODE_SELF_WARMUP_EVAL_INTERVAL_SETTING} is non-positive (the default) --
+     * test-only visibility.
+     */
+    public org.opensearch.serverless.storage.nodecapacity.NodeSelfWarmupSchedulerTask nodeSelfWarmupSchedulerTaskForTesting() {
+        return nodeSelfWarmupSchedulerTask;
     }
 
     /**

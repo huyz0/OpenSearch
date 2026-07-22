@@ -354,6 +354,54 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
         }
     }
 
+    public void testNodeSelfWarmupSchedulerTaskIsNotConstructedByDefault() {
+        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin();
+        Path basePath = createTempDir();
+        Settings nodeSettings = Settings.builder()
+            .put("path.home", createTempDir().toString())
+            .putList("path.repo", basePath.toString())
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey(), basePath.toString())
+            .build();
+        Environment environment = TestEnvironment.newEnvironment(nodeSettings);
+        plugin.createComponents(null, null, null, null, null, null, environment, null, null, null, null);
+
+        assertNull(
+            "the node self-warmup scheduler must stay off by default (non-positive interval), "
+                + "matching every other optional-feature-off default in this plugin",
+            plugin.nodeSelfWarmupSchedulerTaskForTesting()
+        );
+    }
+
+    public void testCloseCancelsTheNodeSelfWarmupSchedulerTask() throws Exception {
+        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin();
+        Path basePath = createTempDir();
+        Settings nodeSettings = Settings.builder()
+            .put("path.home", createTempDir().toString())
+            .putList("path.repo", basePath.toString())
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey(), basePath.toString())
+            .put(
+                ServerlessStoragePlugin.SERVERLESS_STORAGE_NODE_SELF_WARMUP_EVAL_INTERVAL_SETTING.getKey(),
+                org.opensearch.common.unit.TimeValue.timeValueMinutes(5)
+            )
+            .build();
+        Environment environment = TestEnvironment.newEnvironment(nodeSettings);
+        org.opensearch.threadpool.ThreadPool threadPool = new org.opensearch.threadpool.TestThreadPool(getTestName());
+        try {
+            plugin.createComponents(null, null, threadPool, null, null, null, environment, null, null, null, null);
+
+            org.opensearch.serverless.storage.nodecapacity.NodeSelfWarmupSchedulerTask task = plugin
+                .nodeSelfWarmupSchedulerTaskForTesting();
+            assertNotNull("a positive eval interval must construct a real scheduled task", task);
+            assertFalse("must be actively scheduled before close()", task.isCancelledForTesting());
+
+            plugin.close();
+
+            assertTrue("Plugin#close() must cancel this task too", task.isCancelledForTesting());
+        } finally {
+            org.opensearch.threadpool.ThreadPool.terminate(threadPool, 10, java.util.concurrent.TimeUnit.SECONDS);
+        }
+    }
+
     public void testWalMirroringDisabledByDefaultStillConstructsAWriterEngineFactory() {
         // The default-off setting must never be a hard requirement: every existing deployment of
         // this plugin (and every other test in this class) constructs a WriterEngineFactory with
