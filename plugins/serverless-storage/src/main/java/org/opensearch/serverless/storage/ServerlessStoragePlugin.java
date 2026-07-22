@@ -1290,7 +1290,13 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                         client,
                         scaleUpMaxSearchReplicas,
                         SERVERLESS_STORAGE_SCALE_UP_REQUIRED_CONSECUTIVE_TICKS_SETTING.get(environment.settings()),
-                        SERVERLESS_STORAGE_SCALE_UP_MAX_EXPANSIONS_PER_TICK_SETTING.get(environment.settings())
+                        SERVERLESS_STORAGE_SCALE_UP_MAX_EXPANSIONS_PER_TICK_SETTING.get(environment.settings()),
+                        // Degrades safely to "never saturated" when node capacity signaling is off
+                        // (nodeCapacitySignalService null) or hasn't evaluated yet (empty signal,
+                        // unassignedShardCount() == 0) -- see ReaderReplicaExpansionCoordinator's own
+                        // "Ceiling-aware" javadoc for why a fresh service must never block expansion.
+                        () -> this.nodeCapacitySignalService != null
+                            && this.nodeCapacitySignalService.latestSignal().reader().unassignedShardCount() > 0
                     )
                     : null
             );

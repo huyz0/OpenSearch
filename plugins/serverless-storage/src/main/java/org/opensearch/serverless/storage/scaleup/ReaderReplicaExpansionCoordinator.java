@@ -22,6 +22,7 @@ import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.function.BooleanSupplier;
 
 /**
  * The "do the work" half of scale-up (see the RFC's scale-up autoscaling subsection), consuming
@@ -64,6 +65,16 @@ import java.util.Set;
  * Candidates that lose out to the budget keep their sustained-duration streak intact (not reset),
  * so they carry the highest priority into the very next tick rather than having to re-qualify from
  * scratch.
+ *
+ * <p><b>Ceiling-aware, node autoscaling design doc part 4</b> ("Ceiling-aware replica expansion"):
+ * before acting on any candidate, {@link #expandCandidates} consults {@link #readerCapacitySaturated}.
+ * If the reader node fleet is already saturated (no node has room for another shard copy), expansion
+ * is skipped entirely for this tick -- bumping a replica count that can never actually be assigned
+ * would just leave a permanently-unassigned shard and stick {@code unassigned_shard_count} nonzero
+ * for no benefit. Every candidate's sustained-duration streak is left intact either way, so expansion
+ * resumes immediately once capacity frees up rather than needing candidates to re-qualify. This is
+ * a one-way dependency: this coordinator only ever <em>reads</em> the node-autoscaling signal, it
+ * never commands the fleet -- see the design doc's "one-way dependency" framing.
  */
 public final class ReaderReplicaExpansionCoordinator {
 
@@ -73,9 +84,13 @@ public final class ReaderReplicaExpansionCoordinator {
     private final int maxSearchReplicas;
     private final int maxExpansionsPerTick;
     private final SustainedCandidateTracker<ScaleUpCandidateEntry> tracker;
+    private final BooleanSupplier readerCapacitySaturated;
 
     /**
-     * Creates a coordinator.
+     * Creates a coordinator with no capacity-ceiling awareness -- {@link #expandCandidates} always
+     * proceeds regardless of node-level fleet capacity, the original behavior before node
+     * autoscaling existed. Equivalent to the other constructor with a supplier that always returns
+     * {@code false}.
      *
      * @param client dispatches the {@link UpdateSettingsRequest} that actually expands the index.
      * @param maxSearchReplicas the cap {@link #expandCandidates} never bumps a candidate index past,
@@ -92,10 +107,38 @@ public final class ReaderReplicaExpansionCoordinator {
      *                             {@code <= 0} mean unlimited (the original, unbounded behavior).
      */
     public ReaderReplicaExpansionCoordinator(Client client, int maxSearchReplicas, int requiredConsecutiveTicks, int maxExpansionsPerTick) {
+        this(client, maxSearchReplicas, requiredConsecutiveTicks, maxExpansionsPerTick, () -> false);
+    }
+
+    /**
+     * Creates a coordinator.
+     *
+     * @param client dispatches the {@link UpdateSettingsRequest} that actually expands the index.
+     * @param maxSearchReplicas the cap {@link #expandCandidates} never bumps a candidate index past.
+     * @param requiredConsecutiveTicks how many consecutive evaluations in a row a shard must be
+     *                                 flagged a candidate on before its index is actually expanded.
+     * @param maxExpansionsPerTick the maximum number of distinct indices {@link #expandCandidates}
+     *                             will actually expand in one call.
+     * @param readerCapacitySaturated returns {@code true} when the reader node fleet has no room for
+     *                                another shard copy right now -- see this class's own
+     *                                "Ceiling-aware" javadoc. Typically backed by {@code
+     *                                NodeCapacitySignalService#latestSignal().reader().unassignedShardCount() > 0},
+     *                                and must degrade safely (return {@code false}) before that
+     *                                signal has ever been computed, so a fresh node capacity service
+     *                                never blocks expansion by default.
+     */
+    public ReaderReplicaExpansionCoordinator(
+        Client client,
+        int maxSearchReplicas,
+        int requiredConsecutiveTicks,
+        int maxExpansionsPerTick,
+        BooleanSupplier readerCapacitySaturated
+    ) {
         this.client = client;
         this.maxSearchReplicas = maxSearchReplicas;
         this.maxExpansionsPerTick = maxExpansionsPerTick;
         this.tracker = new SustainedCandidateTracker<>(requiredConsecutiveTicks);
+        this.readerCapacitySaturated = readerCapacitySaturated;
     }
 
     private static String key(ScaleUpCandidateEntry entry) {
@@ -117,6 +160,15 @@ public final class ReaderReplicaExpansionCoordinator {
      *                   the streak of a shard no longer reported at all.
      */
     public void expandCandidates(List<ScaleUpCandidateEntry> candidates) {
+        if (readerCapacitySaturated.getAsBoolean()) {
+            // Fleet is already at capacity for the reader role -- skip acting this tick, but still
+            // run filterSustained below so every candidate's streak stays current (neither reset nor
+            // left stale), and skip straight past selectWithBudget so nothing is expanded.
+            tracker.filterSustained(candidates, ReaderReplicaExpansionCoordinator::key, ScaleUpCandidateEntry::candidate);
+            logger.debug("skipping reader replica expansion this tick -- node capacity signal reports the reader fleet is saturated");
+            return;
+        }
+
         List<ScaleUpCandidateEntry> sustainedCandidates = tracker.filterSustained(
             candidates,
             ReaderReplicaExpansionCoordinator::key,

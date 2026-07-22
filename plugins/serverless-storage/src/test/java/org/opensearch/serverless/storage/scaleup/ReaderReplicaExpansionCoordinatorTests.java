@@ -195,4 +195,26 @@ public class ReaderReplicaExpansionCoordinatorTests extends OpenSearchTestCase {
 
         verify(indicesAdminClient, times(3)).updateSettings(any(UpdateSettingsRequest.class), any());
     }
+
+    public void testSkipsExpansionWhenReaderCapacitySaturated() {
+        ReaderReplicaExpansionCoordinator coordinator = new ReaderReplicaExpansionCoordinator(client, 5, 1, 0, () -> true);
+        ScaleUpCandidateEntry candidate = new ScaleUpCandidateEntry("uuid-1", 0, "my-index", 900L, 1, true);
+
+        coordinator.expandCandidates(List.of(candidate));
+
+        verify(indicesAdminClient, never()).updateSettings(any(UpdateSettingsRequest.class), any());
+    }
+
+    public void testResumesExpansionOnceCapacityFreesUp() {
+        java.util.concurrent.atomic.AtomicBoolean saturated = new java.util.concurrent.atomic.AtomicBoolean(true);
+        ReaderReplicaExpansionCoordinator coordinator = new ReaderReplicaExpansionCoordinator(client, 5, 1, 0, saturated::get);
+        ScaleUpCandidateEntry candidate = new ScaleUpCandidateEntry("uuid-1", 0, "my-index", 900L, 1, true);
+
+        coordinator.expandCandidates(List.of(candidate));
+        verify(indicesAdminClient, never()).updateSettings(any(UpdateSettingsRequest.class), any());
+
+        saturated.set(false);
+        coordinator.expandCandidates(List.of(candidate));
+        verify(indicesAdminClient, times(1)).updateSettings(any(UpdateSettingsRequest.class), any());
+    }
 }
