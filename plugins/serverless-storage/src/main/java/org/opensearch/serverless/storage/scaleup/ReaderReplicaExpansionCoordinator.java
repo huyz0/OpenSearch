@@ -23,6 +23,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.function.BooleanSupplier;
+import java.util.function.IntSupplier;
 
 /**
  * The "do the work" half of scale-up (see the RFC's scale-up autoscaling subsection), consuming
@@ -75,6 +76,17 @@ import java.util.function.BooleanSupplier;
  * resumes immediately once capacity frees up rather than needing candidates to re-qualify. This is
  * a one-way dependency: this coordinator only ever <em>reads</em> the node-autoscaling signal, it
  * never commands the fleet -- see the design doc's "one-way dependency" framing.
+ *
+ * <p><b>Headroom-aware expansion budget, node autoscaling design doc part 4</b> ("per-index
+ * scale-up fairness"): {@link #headroomBudget} refines the binary ceiling check above into a
+ * rationed one. Where {@link #readerCapacitySaturated} only distinguishes "some room" from "none,"
+ * {@link #headroomBudget} estimates <em>how much</em> room is left -- {@code (reader node count
+ * &times; a configured max shards per node) - currently assigned reader shards} -- and shrinks the
+ * per-tick budget to that estimate as the fleet approaches its ceiling, so the last slice of
+ * capacity is spent on the busiest sustained candidates rather than whichever tick happened to ask
+ * first. Returns {@link Integer#MAX_VALUE} (no additional constraint) when the per-node capacity
+ * setting is disabled or the signal isn't available yet, matching {@link #readerCapacitySaturated}'s
+ * own safe-degrade convention.
  */
 public final class ReaderReplicaExpansionCoordinator {
 
@@ -85,6 +97,7 @@ public final class ReaderReplicaExpansionCoordinator {
     private final int maxExpansionsPerTick;
     private final SustainedCandidateTracker<ScaleUpCandidateEntry> tracker;
     private final BooleanSupplier readerCapacitySaturated;
+    private final IntSupplier headroomBudget;
 
     /**
      * Creates a coordinator with no capacity-ceiling awareness -- {@link #expandCandidates} always
@@ -111,7 +124,10 @@ public final class ReaderReplicaExpansionCoordinator {
     }
 
     /**
-     * Creates a coordinator.
+     * Creates a coordinator with no headroom-aware budget refinement -- {@link #expandCandidates}
+     * is bounded only by {@code maxExpansionsPerTick}, never by an estimate of remaining fleet
+     * capacity. Equivalent to the other constructor with a supplier that always returns {@link
+     * Integer#MAX_VALUE}.
      *
      * @param client dispatches the {@link UpdateSettingsRequest} that actually expands the index.
      * @param maxSearchReplicas the cap {@link #expandCandidates} never bumps a candidate index past.
@@ -134,11 +150,42 @@ public final class ReaderReplicaExpansionCoordinator {
         int maxExpansionsPerTick,
         BooleanSupplier readerCapacitySaturated
     ) {
+        this(client, maxSearchReplicas, requiredConsecutiveTicks, maxExpansionsPerTick, readerCapacitySaturated, () -> Integer.MAX_VALUE);
+    }
+
+    /**
+     * Creates a coordinator.
+     *
+     * @param client dispatches the {@link UpdateSettingsRequest} that actually expands the index.
+     * @param maxSearchReplicas the cap {@link #expandCandidates} never bumps a candidate index past.
+     * @param requiredConsecutiveTicks how many consecutive evaluations in a row a shard must be
+     *                                 flagged a candidate on before its index is actually expanded.
+     * @param maxExpansionsPerTick the maximum number of distinct indices {@link #expandCandidates}
+     *                             will actually expand in one call.
+     * @param readerCapacitySaturated returns {@code true} when the reader node fleet has no room for
+     *                                another shard copy right now -- see this class's own
+     *                                "Ceiling-aware" javadoc.
+     * @param headroomBudget returns an estimate of how many more shard copies the current reader
+     *                       fleet can actually absorb -- see this class's own "Headroom-aware
+     *                       expansion budget" javadoc. Must return {@link Integer#MAX_VALUE} (not
+     *                       zero, and not a negative number) when the estimate is unavailable or
+     *                       the underlying setting is disabled, so a fresh or disabled headroom
+     *                       model never blocks expansion by default.
+     */
+    public ReaderReplicaExpansionCoordinator(
+        Client client,
+        int maxSearchReplicas,
+        int requiredConsecutiveTicks,
+        int maxExpansionsPerTick,
+        BooleanSupplier readerCapacitySaturated,
+        IntSupplier headroomBudget
+    ) {
         this.client = client;
         this.maxSearchReplicas = maxSearchReplicas;
         this.maxExpansionsPerTick = maxExpansionsPerTick;
         this.tracker = new SustainedCandidateTracker<>(requiredConsecutiveTicks);
         this.readerCapacitySaturated = readerCapacitySaturated;
+        this.headroomBudget = headroomBudget;
     }
 
     private static String key(ScaleUpCandidateEntry entry) {
@@ -178,6 +225,20 @@ public final class ReaderReplicaExpansionCoordinator {
         // Busiest shard first, so a tight budget is spent on whichever candidates need it most.
         sustainedCandidates.sort(Comparator.comparingLong(ScaleUpCandidateEntry::queriesPerMinute).reversed());
 
+        // maxExpansionsPerTick <= 0 means "unlimited" by SustainedCandidateTracker's own convention,
+        // so only intersect it with the headroom estimate when it's a real, positive cap. Headroom
+        // itself is never treated as "unlimited" at 0 -- a headroom of exactly 0 is a real signal
+        // (the fleet has no room left), not a disabled setting, so it must actually block expansion
+        // rather than being passed through to selectWithBudget's own <= 0-means-unlimited handling.
+        int headroom = headroomBudget.getAsInt();
+        int effectiveBudget = maxExpansionsPerTick <= 0 ? headroom : Math.min(maxExpansionsPerTick, headroom);
+        if (effectiveBudget <= 0) {
+            // Headroom is exhausted -- same shape as the saturated-fleet fast path above: keep every
+            // candidate's streak current, act on nothing.
+            logger.debug("skipping reader replica expansion this tick -- node capacity headroom estimate is exhausted");
+            return;
+        }
+
         // Budget exhausted for any *new* index this tick -- deliberately leave this (and every
         // remaining) candidate's streak intact rather than clearing it, so it keeps its "already
         // sustained" status and highest priority into the next tick instead of having to re-qualify
@@ -186,7 +247,7 @@ public final class ReaderReplicaExpansionCoordinator {
         Set<String> alreadyExpanded = new HashSet<>();
         tracker.selectWithBudget(
             sustainedCandidates,
-            maxExpansionsPerTick,
+            effectiveBudget,
             entry -> alreadyExpanded.contains(entry.indexName()) == false,
             entry -> {
                 tracker.clearStreak(key(entry)); // acted on -- start counting fresh.

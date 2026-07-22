@@ -97,6 +97,20 @@ public final class RoleCapacitySignal implements Writeable, ToXContentObject {
         return nodes.size();
     }
 
+    /**
+     * The sum of {@link NodeCapacityEntry#assignedShardCount()} across every node -- the numerator
+     * a headroom estimate (node autoscaling design doc part 4, "per-index scale-up fairness")
+     * divides against a configured per-node shard capacity to decide how much expansion budget the
+     * current fleet can actually absorb.
+     */
+    public int totalAssignedShardCount() {
+        int total = 0;
+        for (NodeCapacityEntry entry : nodes) {
+            total += entry.assignedShardCount();
+        }
+        return total;
+    }
+
     /** Shard copies of this role allocation wants to place but cannot -- the primary scale-up trigger. */
     public int unassignedShardCount() {
         return unassignedShardCount;

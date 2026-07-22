@@ -821,6 +821,22 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * A configured per-node reader shard capacity, used only to derive a headroom estimate for
+     * {@link org.opensearch.serverless.storage.scaleup.ReaderReplicaExpansionCoordinator}'s
+     * per-tick expansion budget (node autoscaling design doc part 4, "per-index scale-up fairness")
+     * -- {@code (reader node count &times; this value) - currently assigned reader shards}. Not a
+     * hard placement limit anywhere else in this plugin; purely a scale-up-budget input. Disabled
+     * (the default) means no headroom estimate is computed and expansion is bounded only by {@link
+     * #SERVERLESS_STORAGE_SCALE_UP_MAX_EXPANSIONS_PER_TICK_SETTING}, matching every other
+     * optional-feature-off default in this plugin.
+     */
+    public static final Setting<Integer> SERVERLESS_STORAGE_SCALE_UP_MAX_SHARDS_PER_READER_NODE_SETTING = Setting.intSetting(
+        "serverless_storage.scale_up.max_shards_per_reader_node",
+        0,
+        Setting.Property.NodeScope
+    );
+
+    /**
      * Per-shard fairness budget for the one node-shared {@code WalChunkService}
      * (rfc-serverless-opensearch.md &sect;18 risk #4, "WAL multiplexing fairness") -- a shard whose
      * own buffered payload bytes since its last flush cross this budget is immediately siphoned
@@ -1175,6 +1191,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_SCALE_UP_ENABLED_SETTING,
             SERVERLESS_STORAGE_SCALE_UP_REQUIRED_CONSECUTIVE_TICKS_SETTING,
             SERVERLESS_STORAGE_SCALE_UP_MAX_EXPANSIONS_PER_TICK_SETTING,
+            SERVERLESS_STORAGE_SCALE_UP_MAX_SHARDS_PER_READER_NODE_SETTING,
             SERVERLESS_STORAGE_RESHARDING_SPLIT_CANDIDATE_WPM_THRESHOLD_SETTING,
             SERVERLESS_STORAGE_RESHARDING_SPLIT_CANDIDATE_SIZE_THRESHOLD_BYTES_SETTING,
             SERVERLESS_STORAGE_RESHARDING_AUTO_SPLIT_EVAL_INTERVAL_SETTING,
@@ -1296,6 +1313,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         TimeValue scaleUpEvalInterval = SERVERLESS_STORAGE_SCALE_UP_EVAL_INTERVAL_SETTING.get(environment.settings());
         if (scaleUpEvalInterval.millis() > 0) {
             boolean scaleUpEnabled = SERVERLESS_STORAGE_SCALE_UP_ENABLED_SETTING.get(environment.settings());
+            int maxShardsPerReaderNode = SERVERLESS_STORAGE_SCALE_UP_MAX_SHARDS_PER_READER_NODE_SETTING.get(environment.settings());
             this.scaleUpCandidatesSchedulerTask = new org.opensearch.serverless.storage.scaleup.ScaleUpCandidatesSchedulerTask(
                 threadPool,
                 scaleUpEvalInterval,
@@ -1312,7 +1330,21 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                         // unassignedShardCount() == 0) -- see ReaderReplicaExpansionCoordinator's own
                         // "Ceiling-aware" javadoc for why a fresh service must never block expansion.
                         () -> this.nodeCapacitySignalService != null
-                            && this.nodeCapacitySignalService.latestSignal().reader().unassignedShardCount() > 0
+                            && this.nodeCapacitySignalService.latestSignal().reader().unassignedShardCount() > 0,
+                        // Headroom-aware budget refinement -- disabled (Integer.MAX_VALUE, no
+                        // additional constraint) unless both the per-node capacity setting is
+                        // configured and the signal service has evaluated at least once, matching
+                        // the same safe-degrade convention as readerCapacitySaturated above.
+                        () -> {
+                            if (maxShardsPerReaderNode <= 0 || this.nodeCapacitySignalService == null) {
+                                return Integer.MAX_VALUE;
+                            }
+                            org.opensearch.serverless.storage.nodecapacity.RoleCapacitySignal reader = this.nodeCapacitySignalService
+                                .latestSignal()
+                                .reader();
+                            int headroom = reader.nodeCount() * maxShardsPerReaderNode - reader.totalAssignedShardCount();
+                            return Math.max(0, headroom);
+                        }
                     )
                     : null
             );

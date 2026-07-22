@@ -217,4 +217,73 @@ public class ReaderReplicaExpansionCoordinatorTests extends OpenSearchTestCase {
         coordinator.expandCandidates(List.of(candidate));
         verify(indicesAdminClient, times(1)).updateSettings(any(UpdateSettingsRequest.class), any());
     }
+
+    public void testZeroHeadroomBlocksExpansionEvenWithinTheConfiguredCap() {
+        // maxExpansionsPerTick=0 (unlimited by its own convention), but headroom=0 must still block --
+        // headroom is a real signal at zero, not a disabled setting, unlike maxExpansionsPerTick.
+        ReaderReplicaExpansionCoordinator coordinator = new ReaderReplicaExpansionCoordinator(client, 5, 1, 0, () -> false, () -> 0);
+        ScaleUpCandidateEntry candidate = new ScaleUpCandidateEntry("uuid-1", 0, "my-index", 900L, 1, true);
+
+        coordinator.expandCandidates(List.of(candidate));
+
+        verify(indicesAdminClient, never()).updateSettings(any(UpdateSettingsRequest.class), any());
+    }
+
+    public void testHeadroomBudgetLimitsExpansionsIndependentlyOfTheConfiguredCap() {
+        // maxExpansionsPerTick=5 (would allow all 3), but headroom=1 must still ration to 1.
+        ReaderReplicaExpansionCoordinator coordinator = new ReaderReplicaExpansionCoordinator(client, 5, 1, 5, () -> false, () -> 1);
+        List<ScaleUpCandidateEntry> candidates = List.of(
+            new ScaleUpCandidateEntry("uuid-a", 0, "index-a", 100L, 1, true),
+            new ScaleUpCandidateEntry("uuid-b", 0, "index-b", 200L, 1, true),
+            new ScaleUpCandidateEntry("uuid-c", 0, "index-c", 300L, 1, true)
+        );
+
+        coordinator.expandCandidates(candidates);
+
+        verify(indicesAdminClient, times(1)).updateSettings(any(UpdateSettingsRequest.class), any());
+    }
+
+    public void testMaxValueHeadroomImposesNoAdditionalConstraint() {
+        // The default (disabled) headroom supplier -- verifies it doesn't accidentally clamp the
+        // configured per-tick cap down to something smaller than intended.
+        ReaderReplicaExpansionCoordinator coordinator = new ReaderReplicaExpansionCoordinator(
+            client,
+            5,
+            1,
+            0,
+            () -> false,
+            () -> Integer.MAX_VALUE
+        );
+        List<ScaleUpCandidateEntry> candidates = List.of(
+            new ScaleUpCandidateEntry("uuid-a", 0, "index-a", 100L, 1, true),
+            new ScaleUpCandidateEntry("uuid-b", 0, "index-b", 200L, 1, true)
+        );
+
+        coordinator.expandCandidates(candidates);
+
+        verify(indicesAdminClient, times(2)).updateSettings(any(UpdateSettingsRequest.class), any());
+    }
+
+    public void testHeadroomExhaustionLeavesTheStreakIntactForTheNextTick() {
+        java.util.concurrent.atomic.AtomicInteger headroom = new java.util.concurrent.atomic.AtomicInteger(0);
+        ReaderReplicaExpansionCoordinator coordinator = new ReaderReplicaExpansionCoordinator(
+            client,
+            5,
+            1,
+            0,
+            () -> false,
+            headroom::get
+        );
+        ScaleUpCandidateEntry candidate = new ScaleUpCandidateEntry("uuid-1", 0, "my-index", 900L, 1, true);
+
+        // requiredConsecutiveTicks=1 -- the candidate would qualify immediately if headroom allowed
+        // it. Under zero headroom it must not expand, and once headroom returns it must expand
+        // right away with no re-qualification needed, proving exhaustion never reset the streak.
+        coordinator.expandCandidates(List.of(candidate));
+        verify(indicesAdminClient, never()).updateSettings(any(UpdateSettingsRequest.class), any());
+
+        headroom.set(1);
+        coordinator.expandCandidates(List.of(candidate));
+        verify(indicesAdminClient, times(1)).updateSettings(any(UpdateSettingsRequest.class), any());
+    }
 }
