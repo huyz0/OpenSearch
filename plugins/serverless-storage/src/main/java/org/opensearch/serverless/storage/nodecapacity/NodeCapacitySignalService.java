@@ -25,13 +25,16 @@ import org.opensearch.serverless.storage.scaletozero.action.ScaleToZeroCandidate
 import org.opensearch.serverless.storage.util.SustainedCandidateTracker;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.transport.client.Client;
 
 import java.io.Closeable;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -59,6 +62,7 @@ public final class NodeCapacitySignalService implements Closeable {
     private final ClusterService clusterService;
     private final ScaleToZeroCandidatesSchedulerTask scaleToZeroTask;
     private final long readerCacheAffinityTtlMillis;
+    private final DrainCoordinator drainCoordinator;
     private final Scheduler.Cancellable task;
     private final SustainedCandidateTracker<String> writerDrainTracker;
     private final SustainedCandidateTracker<String> readerDrainTracker;
@@ -80,6 +84,9 @@ public final class NodeCapacitySignalService implements Closeable {
      *                                     ReaderCacheAffinityMetadata#isAffinityFresh}.
      * @param requiredConsecutiveDrainTicks how many consecutive fully-idle ticks a node must have
      *                                      before it appears in {@link RoleCapacitySignal#drainCandidates()}.
+     * @param client used to build this service's own {@link DrainCoordinator} -- reads {@code
+     *               cluster.routing.allocation.exclude._name} to populate {@link
+     *               NodeCapacityEntry#draining()}, and sweeps stale (departed-node) exclude entries.
      */
     public NodeCapacitySignalService(
         ThreadPool threadPool,
@@ -87,11 +94,13 @@ public final class NodeCapacitySignalService implements Closeable {
         ClusterService clusterService,
         ScaleToZeroCandidatesSchedulerTask scaleToZeroTask,
         long readerCacheAffinityTtlMillis,
-        int requiredConsecutiveDrainTicks
+        int requiredConsecutiveDrainTicks,
+        Client client
     ) {
         this.clusterService = clusterService;
         this.scaleToZeroTask = scaleToZeroTask;
         this.readerCacheAffinityTtlMillis = readerCacheAffinityTtlMillis;
+        this.drainCoordinator = new DrainCoordinator(client);
         this.writerDrainTracker = new SustainedCandidateTracker<>(requiredConsecutiveDrainTicks);
         this.readerDrainTracker = new SustainedCandidateTracker<>(requiredConsecutiveDrainTicks);
         this.task = threadPool.scheduleWithFixedDelay(this::evaluateSafely, interval, ThreadPool.Names.GENERIC);
@@ -119,8 +128,9 @@ public final class NodeCapacitySignalService implements Closeable {
             idleByShard.put(entry.indexUuid() + "/" + entry.shardId(), entry);
         }
 
-        RoleAccumulator writer = new RoleAccumulator();
-        RoleAccumulator reader = new RoleAccumulator();
+        Set<String> excludedNames = DrainCoordinator.currentlyExcludedNames(state);
+        RoleAccumulator writer = new RoleAccumulator(excludedNames);
+        RoleAccumulator reader = new RoleAccumulator(excludedNames);
         long now = System.currentTimeMillis();
 
         for (IndexRoutingTable indexRoutingTable : state.routingTable()) {
@@ -179,6 +189,36 @@ public final class NodeCapacitySignalService implements Closeable {
             readerSignal.nodeCount(),
             readerSignal.unassignedShardCount()
         );
+
+        sweepStaleExcludeNames(state, excludedNames);
+    }
+
+    /**
+     * Removes any excluded name with no matching live node from {@code cluster.routing.allocation.exclude._name}
+     * -- node autoscaling design doc part 1's "exclude-list hygiene" rule: a leaked exclude entry
+     * must not be able to silently poison a future node that reuses the departed node's name.
+     */
+    private void sweepStaleExcludeNames(ClusterState state, Set<String> excludedNames) {
+        if (excludedNames.isEmpty()) {
+            return;
+        }
+        Set<String> liveNames = new HashSet<>();
+        for (DiscoveryNode node : state.nodes()) {
+            liveNames.add(node.getName());
+        }
+        Set<String> stale = new HashSet<>(excludedNames);
+        stale.removeAll(liveNames);
+        if (stale.isEmpty()) {
+            return;
+        }
+        drainCoordinator.removeStaleNames(
+            state,
+            stale,
+            org.opensearch.core.action.ActionListener.wrap(
+                response -> logger.debug("removed stale drain exclude entries: {}", stale),
+                e -> logger.warn("failed to remove stale drain exclude entries {}, will retry next tick", stale, e)
+            )
+        );
     }
 
     /** The most recently computed signal, or an empty-but-valid signal if no evaluation has completed yet. */
@@ -205,7 +245,12 @@ public final class NodeCapacitySignalService implements Closeable {
     private static final class RoleAccumulator {
         final Map<String, NodeAccumulator> nodes = new LinkedHashMap<>();
         final Map<String, Integer> unassignedByIndex = new LinkedHashMap<>();
+        final Set<String> excludedNames;
         int unassignedShardCount;
+
+        RoleAccumulator(Set<String> excludedNames) {
+            this.excludedNames = excludedNames;
+        }
 
         RoleCapacitySignal toSignal(SustainedCandidateTracker<String> drainTracker, int sustainedPressureTicks) {
             List<NodeCapacityEntry> entries = new ArrayList<>(nodes.size());
@@ -213,8 +258,17 @@ public final class NodeCapacitySignalService implements Closeable {
             for (String nodeId : nodeIds) {
                 NodeAccumulator acc = nodes.get(nodeId);
                 boolean allIdle = acc.assignedShardCount > 0 && acc.hasNonIdleShard == false;
+                boolean draining = excludedNames.contains(acc.nodeName);
                 entries.add(
-                    new NodeCapacityEntry(nodeId, acc.nodeName, acc.assignedShardCount, allIdle, acc.idleShardCount, acc.hotAffinityShardCount, false)
+                    new NodeCapacityEntry(
+                        nodeId,
+                        acc.nodeName,
+                        acc.assignedShardCount,
+                        allIdle,
+                        acc.idleShardCount,
+                        acc.hotAffinityShardCount,
+                        draining
+                    )
                 );
             }
             List<String> drainCandidates = drainTracker.filterSustained(

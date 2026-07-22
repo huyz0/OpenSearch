@@ -1264,7 +1264,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                     clusterService,
                     this.scaleToZeroCandidatesSchedulerTask,
                     SERVERLESS_STORAGE_READER_CACHE_AFFINITY_TTL_SETTING.get(environment.settings()).millis(),
-                    SERVERLESS_STORAGE_NODE_CAPACITY_DRAIN_REQUIRED_CONSECUTIVE_TICKS_SETTING.get(environment.settings())
+                    SERVERLESS_STORAGE_NODE_CAPACITY_DRAIN_REQUIRED_CONSECUTIVE_TICKS_SETTING.get(environment.settings()),
+                    client
                 );
             }
         }
@@ -2129,6 +2130,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 org.opensearch.serverless.storage.nodecapacity.action.TransportNodeCapacityAction.class
             ),
             new ActionHandler<>(
+                org.opensearch.serverless.storage.nodecapacity.action.NodeDrainAction.INSTANCE,
+                org.opensearch.serverless.storage.nodecapacity.action.TransportNodeDrainAction.class
+            ),
+            new ActionHandler<>(
                 org.opensearch.serverless.storage.compaction.action.CompactionTriggerAction.INSTANCE,
                 org.opensearch.serverless.storage.compaction.action.TransportCompactionTriggerAction.class
             ),
@@ -2282,6 +2287,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new org.opensearch.serverless.storage.readerengine.action.RestWaitForGenerationAction(),
             new org.opensearch.serverless.storage.readerengine.action.RestPollNowAction(),
             new org.opensearch.serverless.storage.nodecapacity.action.RestNodeCapacityAction(),
+            new org.opensearch.serverless.storage.nodecapacity.action.RestNodeDrainAction(),
             new org.opensearch.serverless.storage.scaletozero.action.RestScaleToZeroCandidatesAction(),
             new org.opensearch.serverless.storage.scaletozero.action.RestReactivateShardsAction(),
             new org.opensearch.serverless.storage.scaleup.action.RestScaleUpCandidatesAction(),
