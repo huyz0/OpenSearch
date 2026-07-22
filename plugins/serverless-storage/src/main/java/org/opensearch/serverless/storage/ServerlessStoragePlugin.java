@@ -488,6 +488,33 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * How often {@code NodeCapacitySignalService} re-evaluates the cluster-wide node-autoscaling
+     * signal (docs-site/src/content/docs/design/node-autoscaling.md, "The aggregation task") --
+     * same "background schedule, non-positive disables it" shape every other eval-interval setting
+     * in this plugin uses. Requires {@link #SERVERLESS_STORAGE_SCALE_TO_ZERO_EVAL_INTERVAL_SETTING}
+     * to also be positive, since the signal reuses that task's idle-candidate cache rather than
+     * re-deriving it.
+     */
+    public static final Setting<TimeValue> SERVERLESS_STORAGE_NODE_CAPACITY_EVAL_INTERVAL_SETTING = Setting.timeSetting(
+        "serverless_storage.node_capacity.eval_interval",
+        TimeValue.MINUS_ONE,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * How many consecutive fully-idle evaluation ticks a node must have before it appears in {@code
+     * RoleCapacitySignal#drainCandidates()} -- the in-cluster half of the asymmetric-window rule
+     * (docs-site/src/content/docs/design/node-autoscaling.md, "Asymmetric reaction windows"); an
+     * external control plane may apply its own additional window on top.
+     */
+    public static final Setting<Integer> SERVERLESS_STORAGE_NODE_CAPACITY_DRAIN_REQUIRED_CONSECUTIVE_TICKS_SETTING = Setting.intSetting(
+        "serverless_storage.node_capacity.drain_required_consecutive_ticks",
+        10,
+        1,
+        Setting.Property.NodeScope
+    );
+
+    /**
      * The default writes-per-minute threshold {@code ShardSplitCandidatesAction} uses to decide a
      * writer shard's sustained write rate is high enough to be worth an operator's attention as a
      * possible split target -- a caller can override this per-request, this is only the default
@@ -1051,6 +1078,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     ).millis();
     private volatile long scaleToZeroLagThreshold = SERVERLESS_STORAGE_SCALE_TO_ZERO_LAG_THRESHOLD_SETTING.getDefault(Settings.EMPTY);
     private volatile org.opensearch.serverless.storage.scaletozero.ScaleToZeroCandidatesSchedulerTask scaleToZeroCandidatesSchedulerTask;
+    private volatile org.opensearch.serverless.storage.nodecapacity.NodeCapacitySignalService nodeCapacitySignalService;
     // Same "resolved once in createComponents" reasoning as the scale-to-zero thresholds above --
     // TransportScaleUpCandidatesAction reads these as its per-request defaults, overridable per
     // ScaleUpCandidatesRequest.
@@ -1117,6 +1145,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_WAL_DEDICATED_STREAM_SETTING,
             SERVERLESS_STORAGE_SCALE_TO_ZERO_IDLE_THRESHOLD_SETTING,
             SERVERLESS_STORAGE_SCALE_TO_ZERO_LAG_THRESHOLD_SETTING,
+            SERVERLESS_STORAGE_NODE_CAPACITY_EVAL_INTERVAL_SETTING,
+            SERVERLESS_STORAGE_NODE_CAPACITY_DRAIN_REQUIRED_CONSECUTIVE_TICKS_SETTING,
             SERVERLESS_STORAGE_SCALE_TO_ZERO_EVAL_INTERVAL_SETTING,
             SERVERLESS_STORAGE_SCALE_TO_ZERO_SUSPEND_ENABLED_SETTING,
             SERVERLESS_STORAGE_SCALE_TO_ZERO_SEARCH_REACTIVATION_WAIT_SETTING,
@@ -1226,6 +1256,17 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                     ? new org.opensearch.serverless.storage.scaletozero.ShardSuspensionCoordinator(clusterService, client, cooldownMillis)
                     : null
             );
+            TimeValue nodeCapacityEvalInterval = SERVERLESS_STORAGE_NODE_CAPACITY_EVAL_INTERVAL_SETTING.get(environment.settings());
+            if (nodeCapacityEvalInterval.millis() > 0) {
+                this.nodeCapacitySignalService = new org.opensearch.serverless.storage.nodecapacity.NodeCapacitySignalService(
+                    threadPool,
+                    nodeCapacityEvalInterval,
+                    clusterService,
+                    this.scaleToZeroCandidatesSchedulerTask,
+                    SERVERLESS_STORAGE_READER_CACHE_AFFINITY_TTL_SETTING.get(environment.settings()).millis(),
+                    SERVERLESS_STORAGE_NODE_CAPACITY_DRAIN_REQUIRED_CONSECUTIVE_TICKS_SETTING.get(environment.settings())
+                );
+            }
         }
         this.scaleUpQpmThreshold = SERVERLESS_STORAGE_SCALE_UP_QPM_THRESHOLD_SETTING.get(environment.settings());
         this.scaleUpMaxSearchReplicas = SERVERLESS_STORAGE_SCALE_UP_MAX_SEARCH_REPLICAS_SETTING.get(environment.settings());
@@ -2084,6 +2125,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 org.opensearch.serverless.storage.clone.action.TransportShardCloneAction.class
             ),
             new ActionHandler<>(
+                org.opensearch.serverless.storage.nodecapacity.action.NodeCapacityAction.INSTANCE,
+                org.opensearch.serverless.storage.nodecapacity.action.TransportNodeCapacityAction.class
+            ),
+            new ActionHandler<>(
                 org.opensearch.serverless.storage.compaction.action.CompactionTriggerAction.INSTANCE,
                 org.opensearch.serverless.storage.compaction.action.TransportCompactionTriggerAction.class
             ),
@@ -2236,6 +2281,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new org.opensearch.serverless.storage.wal.action.RestNodeWalBacklogAction(),
             new org.opensearch.serverless.storage.readerengine.action.RestWaitForGenerationAction(),
             new org.opensearch.serverless.storage.readerengine.action.RestPollNowAction(),
+            new org.opensearch.serverless.storage.nodecapacity.action.RestNodeCapacityAction(),
             new org.opensearch.serverless.storage.scaletozero.action.RestScaleToZeroCandidatesAction(),
             new org.opensearch.serverless.storage.scaletozero.action.RestReactivateShardsAction(),
             new org.opensearch.serverless.storage.scaleup.action.RestScaleUpCandidatesAction(),
@@ -2457,6 +2503,19 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         if (mergeTriggerTask != null) {
             mergeTriggerTask.close();
         }
+        org.opensearch.serverless.storage.nodecapacity.NodeCapacitySignalService nodeCapacityTask = nodeCapacitySignalService;
+        if (nodeCapacityTask != null) {
+            nodeCapacityTask.close();
+        }
+    }
+
+    /**
+     * This node's {@code NodeCapacitySignalService}, or {@code null} if {@link
+     * #SERVERLESS_STORAGE_NODE_CAPACITY_EVAL_INTERVAL_SETTING} is non-positive (the default) --
+     * {@code TransportNodeCapacityAction} reads this and reports an empty signal when {@code null}.
+     */
+    public org.opensearch.serverless.storage.nodecapacity.NodeCapacitySignalService nodeCapacitySignalService() {
+        return nodeCapacitySignalService;
     }
 
     /**
