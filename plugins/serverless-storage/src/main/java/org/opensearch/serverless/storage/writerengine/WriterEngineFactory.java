@@ -717,9 +717,32 @@ public final class WriterEngineFactory implements EngineFactory {
         // copies bytes, only references -- so materialization must read from there, not from this
         // factory's own `materializer` field (which is fixed to THIS shard's own, still-empty
         // container, appropriate for #recoverMissingLocalStore's very different "re-read my own past
-        // publish" case, not this one).
+        // publish" case, not this one). The parent itself may be a clone/split child too (a
+        // split-of-a-split), in which case ITS manifest can still reference bundles that only
+        // physically exist further back in the lineage -- walking the full chain (mirroring {@code
+        // ServerlessStoragePlugin#chainedBundleReadPath}) rather than reading only `parentContainer`
+        // avoids a NoSuchFileException on a bundle that legitimately exists, just further upstream.
+        List<org.opensearch.common.blobstore.BlobContainer> parentLineageChain = org.opensearch.serverless.storage.clone.ShardCloner
+            .resolveLineageChain(parentContainer, indexUuid, parentShardId, (lineageIndexUuid, lineageShardId) -> {
+                if (lineageIndexUuid.equals(indexUuid) == false) {
+                    throw new IOException(
+                        "in-place split recovery: lineage of parent shard "
+                            + indexUuid
+                            + "/"
+                            + parentShardId
+                            + " unexpectedly crosses into a different index ["
+                            + lineageIndexUuid
+                            + "] -- in-place split/merge lineage must stay within one index"
+                    );
+                }
+                return resolveSiblingShardBlobContainer(lineageShardId);
+            });
+        List<org.opensearch.serverless.storage.format.BundleFileReader> parentReaders = new ArrayList<>(parentLineageChain.size());
+        for (org.opensearch.common.blobstore.BlobContainer container : parentLineageChain) {
+            parentReaders.add(new org.opensearch.serverless.storage.format.BlobContainerBundleStore(container));
+        }
         ObjectStoreCommitMaterializer parentBundleMaterializer = new ObjectStoreCommitMaterializer(
-            new org.opensearch.serverless.storage.format.BlobContainerBundleStore(parentContainer)
+            org.opensearch.serverless.storage.clone.FallbackBundleFileReader.chain(parentReaders)
         );
         parentBundleMaterializer.materialize(manifest, directory);
 
@@ -787,8 +810,31 @@ public final class WriterEngineFactory implements EngineFactory {
         String indexUuid = indexShard.shardId().getIndex().getUUID();
         int parentShardId = indexShard.shardId().getId();
         org.opensearch.common.blobstore.BlobContainer parentContainer = resolveSiblingShardBlobContainer(parentShardId);
-        org.opensearch.serverless.storage.format.BlobContainerBundleStore parentBundleStore =
-            new org.opensearch.serverless.storage.format.BlobContainerBundleStore(parentContainer);
+        // Each child's own clone lineage points directly at the parent (one hop -- see
+        // #recoverInPlaceSplitLocalStore, which writes exactly that), so the child's own container is
+        // always tried first. But the PARENT itself may be a clone/split child too (a split-of-a-split
+        // later merged back), in which case its manifest can still reference bundles that only
+        // physically exist further back in the lineage than `parentContainer` alone -- walk the full
+        // chain once, shared by every child below, mirroring #recoverInPlaceSplitLocalStore's fix.
+        List<org.opensearch.common.blobstore.BlobContainer> parentLineageChain = org.opensearch.serverless.storage.clone.ShardCloner
+            .resolveLineageChain(parentContainer, indexUuid, parentShardId, (lineageIndexUuid, lineageShardId) -> {
+                if (lineageIndexUuid.equals(indexUuid) == false) {
+                    throw new IOException(
+                        "in-place merge recovery: lineage of parent shard "
+                            + indexUuid
+                            + "/"
+                            + parentShardId
+                            + " unexpectedly crosses into a different index ["
+                            + lineageIndexUuid
+                            + "] -- in-place split/merge lineage must stay within one index"
+                    );
+                }
+                return resolveSiblingShardBlobContainer(lineageShardId);
+            });
+        List<org.opensearch.serverless.storage.format.BundleFileReader> parentReaders = new ArrayList<>(parentLineageChain.size());
+        for (org.opensearch.common.blobstore.BlobContainer container : parentLineageChain) {
+            parentReaders.add(new org.opensearch.serverless.storage.format.BlobContainerBundleStore(container));
+        }
 
         List<org.opensearch.serverless.storage.resharding.InPlaceSiblingMerger.MergeChild> mergeChildren = new ArrayList<>(children.size());
         for (org.opensearch.cluster.metadata.ShardRange childRange : children) {
@@ -807,10 +853,11 @@ public final class WriterEngineFactory implements EngineFactory {
                 childHead.head().latestManifestGeneration()
             );
 
+            List<org.opensearch.serverless.storage.format.BundleFileReader> childDelegates = new ArrayList<>(parentReaders.size() + 1);
+            childDelegates.add(new org.opensearch.serverless.storage.format.BlobContainerBundleStore(childContainer));
+            childDelegates.addAll(parentReaders);
             org.opensearch.serverless.storage.format.BundleFileReader childReadPath =
-                new org.opensearch.serverless.storage.resharding.InPlaceSiblingMerger.FallbackBundleFileReader(
-                    List.of(new org.opensearch.serverless.storage.format.BlobContainerBundleStore(childContainer), parentBundleStore)
-                );
+                new org.opensearch.serverless.storage.resharding.InPlaceSiblingMerger.FallbackBundleFileReader(childDelegates);
             mergeChildren.add(
                 new org.opensearch.serverless.storage.resharding.InPlaceSiblingMerger.MergeChild(childManifest, childReadPath, childRange)
             );

@@ -38,7 +38,7 @@ import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertHitCount;
  * <em>replica</em> (an already-constructed, already-open {@link ObjectStoreWriterEngine}) that
  * gets promoted to primary by core's own real replica-promotion machinery when its node's primary
  * copy is killed -- exactly the live-promotion case {@code IndexShard#bumpPrimaryTerm}'s
- * {@code onResponse} callback now calls {@link Indexer#onPrimaryTermBumped} for.
+ * {@code onResponse} callback now calls {@code Engine#onPrimaryTermBumped} for.
  *
  * <p>Two things are checked, not just one: end-to-end correctness (nothing broke, no data lost --
  * the same black-box proof {@code ServerlessStorageWriterFailoverIT} already establishes for the
