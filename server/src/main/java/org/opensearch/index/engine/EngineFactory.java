@@ -165,6 +165,30 @@ public interface EngineFactory {
     }
 
     /**
+     * A cheap, purely local capability check: whether this factory's engines ever produce
+     * engine-native snapshots at all (i.e. whether {@link Engine#attemptEngineNativeSnapshot} can
+     * ever return non-empty for a shard this factory builds). Default {@code false}, matching every
+     * other engine-native default on this interface.
+     *
+     * <p>{@code StoreRecovery#recoverFromEngineNativeSnapshot} checks this <em>before</em> calling
+     * {@link org.opensearch.repositories.Repository#getEngineNativeShardSnapshotMetadata}, which is
+     * a real remote blob-existence check -- without this gate, every classic-shaped restore across
+     * every {@code BlobStoreRepository}-backed deployment would pay that round trip on every shard,
+     * even though the overwhelming majority of engines never produce an engine-native snapshot at
+     * all. This method lets that cost be skipped entirely from a value already resolved locally
+     * (the target shard's own {@link EngineFactory}), rather than always reaching out to the
+     * repository to find out there was never anything to look for.
+     *
+     * <p>An {@link EngineFactory} that overrides {@link Engine#attemptEngineNativeSnapshot} to ever
+     * return non-empty must override this to return {@code true} too, or its own snapshots will
+     * fail to restore: {@code StoreRecovery} would skip the probe that finds them and fall straight
+     * to the classic, copy-based restore path instead.
+     */
+    default boolean supportsEngineNativeSnapshots() {
+        return false;
+    }
+
+    /**
      * Whether this engine already provides its own durable, remote copy of every segment it
      * writes, independent of core's own remote-store upload path ({@code
      * RemoteStoreRefreshListener}, engaged whenever {@code index.remote_store.enabled} is {@code

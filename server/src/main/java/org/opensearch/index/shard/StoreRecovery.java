@@ -414,15 +414,24 @@ final class StoreRecovery {
             assert recoveryType == RecoverySource.Type.SNAPSHOT : "expected snapshot recovery type: " + recoveryType;
             SnapshotRecoverySource recoverySource = (SnapshotRecoverySource) indexShard.recoveryState().getRecoverySource();
 
+            if (shardEngineFactory(indexShard).map(EngineFactory::supportsEngineNativeSnapshots).orElse(false) == false) {
+                // This shard's own engine never produces engine-native snapshots (the overwhelming
+                // common case -- see EngineFactory#supportsEngineNativeSnapshots's own javadoc) --
+                // skip the remote getEngineNativeShardSnapshotMetadata probe entirely rather than
+                // paying a blob-existence round trip to confirm what's already known locally.
+                recoverFromRepository(indexShard, repository, listener);
+                return;
+            }
+
             final Optional<EngineNativeShardSnapshot> engineNativeSnapshot = repository.getEngineNativeShardSnapshotMetadata(
                 recoverySource.snapshot().getSnapshotId(),
                 recoverySource.index(),
                 shardId
             );
             if (engineNativeSnapshot.isEmpty()) {
-                // No engine-native blob for this shard's snapshot (the common case) -- nothing in
-                // this method has mutated shard state yet, so falling back to the complete,
-                // unmodified classic path is safe.
+                // No engine-native blob for this shard's snapshot -- nothing in this method has
+                // mutated shard state yet, so falling back to the complete, unmodified classic path
+                // is safe.
                 recoverFromRepository(indexShard, repository, listener);
                 return;
             }
@@ -456,16 +465,31 @@ final class StoreRecovery {
      */
     private boolean recoverFromEngineNativeSnapshotFromEngine(IndexShard indexShard, Store store, byte[] snapshotPointer)
         throws IndexShardRecoveryException {
-        IndexerFactory indexerFactory = indexShard.getIndexerFactory();
-        if (!(indexerFactory instanceof EngineBackedIndexerFactory)) {
+        Optional<EngineFactory> engineFactory = shardEngineFactory(indexShard);
+        if (engineFactory.isEmpty()) {
             return false;
         }
-        EngineFactory engineFactory = ((EngineBackedIndexerFactory) indexerFactory).getEngineFactory();
         try {
-            return engineFactory.recoverFromEngineNativeSnapshot(indexShard, store, snapshotPointer);
+            return engineFactory.get().recoverFromEngineNativeSnapshot(indexShard, store, snapshotPointer);
         } catch (IOException e) {
             throw new IndexShardRecoveryException(shardId, "engine failed to recover from engine-native snapshot", e);
         }
+    }
+
+    /**
+     * Resolves {@code indexShard}'s own {@link EngineFactory}, purely from its already-constructed
+     * {@link IndexerFactory} -- no engine needs to be open for this, the same resolution {@link
+     * #recoverMissingLocalStoreFromEngine} already does. Shared by {@link
+     * #recoverFromEngineNativeSnapshot}'s cheap local capability check and {@link
+     * #recoverFromEngineNativeSnapshotFromEngine}'s actual dispatch, so both use the identical
+     * resolution rather than risking the two silently diverging.
+     */
+    private static Optional<EngineFactory> shardEngineFactory(IndexShard indexShard) {
+        IndexerFactory indexerFactory = indexShard.getIndexerFactory();
+        if (!(indexerFactory instanceof EngineBackedIndexerFactory)) {
+            return Optional.empty();
+        }
+        return Optional.of(((EngineBackedIndexerFactory) indexerFactory).getEngineFactory());
     }
 
     void recoverFromSnapshotAndRemoteStore(

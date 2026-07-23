@@ -45,4 +45,12 @@ public class EngineFactoryEngineNativeSnapshotDefaultsTests extends OpenSearchTe
         // has anything of its own to release.
         DEFAULT_ENGINE_FACTORY.releaseEngineNativeSnapshot(new byte[] { 1, 2, 3 });
     }
+
+    public void testDefaultSupportsEngineNativeSnapshotsReturnsFalse() {
+        assertFalse(
+            "an EngineFactory that hasn't opted in must tell StoreRecovery to skip the remote "
+                + "engine-native probe entirely, not claim support it doesn't have",
+            DEFAULT_ENGINE_FACTORY.supportsEngineNativeSnapshots()
+        );
+    }
 }

@@ -872,4 +872,16 @@ public final class WriterEngineFactory implements EngineFactory {
         }
         return engineNativeSnapshotSupport.recoverFromEngineNativeSnapshot(indexShard, store, snapshotPointer);
     }
+
+    /**
+     * {@code engineNativeSnapshotSupport != null} -- must stay in lockstep with {@link
+     * #recoverFromEngineNativeSnapshot}'s own null check: core's {@code StoreRecovery} uses this
+     * method to decide whether it's even worth probing the repository for an engine-native snapshot
+     * blob at all before calling {@link #recoverFromEngineNativeSnapshot}, so this must return
+     * {@code true} in exactly the cases that method can return something other than {@code false}.
+     */
+    @Override
+    public boolean supportsEngineNativeSnapshots() {
+        return engineNativeSnapshotSupport != null;
+    }
 }

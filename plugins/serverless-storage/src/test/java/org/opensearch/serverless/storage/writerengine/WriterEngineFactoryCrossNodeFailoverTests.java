@@ -149,4 +149,62 @@ public class WriterEngineFactoryCrossNodeFailoverTests extends IndexShardTestCas
             factory.ownsRemoteSegmentDurability()
         );
     }
+
+    /**
+     * {@link WriterEngineFactory#supportsEngineNativeSnapshots} must stay in lockstep with {@link
+     * WriterEngineFactory#recoverFromEngineNativeSnapshot}'s own null check on {@code
+     * engineNativeSnapshotSupport} -- core's {@code StoreRecovery} uses the former as a cheap local
+     * gate to decide whether it's even worth calling the latter (via a real repository probe) at
+     * all. A mismatch here would mean core silently skips restoring exactly the snapshots this
+     * factory can actually recover.
+     */
+    public void testSupportsEngineNativeSnapshotsIsFalseWhenSupportIsDisabled() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+        WriterEngineFactory factory = new WriterEngineFactory(
+            new ObjectStoreCommitHeadPublisher(commitPublisher, shardStateStore),
+            shardDirectory,
+            "test-node"
+        );
+        assertFalse(
+            "the 3-arg constructor leaves engineNativeSnapshotSupport null, disabling engine-native restore",
+            factory.supportsEngineNativeSnapshots()
+        );
+    }
+
+    public void testSupportsEngineNativeSnapshotsIsTrueWhenSupportIsConfigured() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+        EngineNativeSnapshotSupport engineNativeSnapshotSupport = new EngineNativeSnapshotSupport((indexUuid, shardId) -> blobContainer);
+        WriterEngineFactory factory = new WriterEngineFactory(
+            new ObjectStoreCommitHeadPublisher(commitPublisher, shardStateStore),
+            shardDirectory,
+            "test-node",
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            0L,
+            null,
+            null,
+            null,
+            engineNativeSnapshotSupport
+        );
+        assertTrue(
+            "a non-null engineNativeSnapshotSupport must make this factory report engine-native restore support",
+            factory.supportsEngineNativeSnapshots()
+        );
+    }
 }
