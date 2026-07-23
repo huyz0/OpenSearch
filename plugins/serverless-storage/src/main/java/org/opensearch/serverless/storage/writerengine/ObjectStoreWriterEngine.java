@@ -1353,6 +1353,22 @@ public class ObjectStoreWriterEngine extends InternalEngine {
 
     @Override
     protected void commitIndexWriter(final DocumentIndexWriter writer, final String translogUUID) throws IOException {
+        // Snapshotted before the commit, not after: currentWalPosition() reads a chunk-sequence
+        // watermark this WAL service shares across every shard on the node (see its own javadoc).
+        // Concurrent indexing on this shard is not excluded during commitIndexWriter (only a shared
+        // read lock is held here, same as ordinary index() calls), so an op whose Lucene write lands
+        // just after this commit's segment snapshot but whose WAL mirror write completes before a
+        // *post*-commit read of this watermark would otherwise be recorded as "already covered" by
+        // this manifest's WalPosition even though it is not reflected in these segments -- silent
+        // data loss on replay, and permanent once WAL GC trusts the same inflated position to delete
+        // the chunk. A pre-commit snapshot cannot have this problem: this WAL service's own contract
+        // (translog.add() only enqueues a record after the same operation's Lucene write has already
+        // returned) guarantees every op reflected in this watermark already has its Lucene write
+        // applied before the watermark was read, and Lucene's own commit() durability contract
+        // guarantees any such already-applied write is included in the very next commit -- so this
+        // snapshot is always a safe (if occasionally conservative) lower bound for what this specific
+        // commit contains, never an inflated one.
+        WalPosition walPositionBeforeCommit = currentWalPosition();
         super.commitIndexWriter(writer, translogUUID);
 
         boolean quiescent = nextCommitIsQuiescent.getAndSet(false);
@@ -1370,7 +1386,7 @@ public class ObjectStoreWriterEngine extends InternalEngine {
                 primaryTerm,
                 maxSeqNo,
                 localCheckpoint,
-                currentWalPosition(),
+                walPositionBeforeCommit,
                 0,
                 PruningStats.empty(),
                 quiescent
