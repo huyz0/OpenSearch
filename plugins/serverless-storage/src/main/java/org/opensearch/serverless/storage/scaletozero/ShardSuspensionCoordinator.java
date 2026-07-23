@@ -58,10 +58,14 @@ import java.util.List;
  * mid-cancel) explicitly force-unassigns the shard from its current node, after which it correctly
  * stays {@code UNASSIGNED} (the decider still says {@code NO} to every candidate node).
  *
- * <p><b>Reader eviction cancels every currently-assigned search-only copy, not just one.</b> Unlike
- * a writer shard (exactly one primary), a shard's reader role can have several concurrently-assigned
- * search-only replica copies ({@code index.number_of_search_only_replicas > 1}); suspending the
- * reader role means evicting all of them, via {@link IndexShardRoutingTable#searchOnlyReplicas()}.
+ * <p><b>Eviction cancels every currently-assigned copy of the suspended role, not just one.</b> A
+ * shard's reader role can have several concurrently-assigned search-only replica copies ({@code
+ * index.number_of_search_only_replicas > 1}); suspending the reader role means evicting all of
+ * them, via {@link IndexShardRoutingTable#searchOnlyReplicas()}. The writer role is not always a
+ * lone primary either -- {@code index.number_of_replicas > 0} is permitted on a serverless-storage
+ * index (only an explicitly requested {@code SEGMENT} replication type is rejected), so writer
+ * suspension evicts the primary plus every ordinary replica via {@link
+ * IndexShardRoutingTable#writerReplicas()} too.
  *
  * <p><b>Hysteresis via {@link #cooldownMillis}, rfc-serverless-opensearch.md &sect;16 Phase 4's
  * "balancer hysteresis" milestone.</b> Without it, a shard idling just past the threshold, getting a
@@ -260,7 +264,21 @@ public final class ShardSuspensionCoordinator {
         }
         String indexName = indexMetadata.getIndex().getName();
         IndexShardRoutingTable shardRoutingTable = state.routingTable().index(indexName).shard(shardId);
-        List<ShardRouting> toEvict = reader ? shardRoutingTable.searchOnlyReplicas() : List.of(shardRoutingTable.primaryShard());
+        // Writer suspension must evict every writer-role copy, not just the primary: a
+        // serverless-storage index can have index.number_of_replicas > 0 (ServerlessStorageIndexSettingProvider
+        // only rejects an explicitly requested SEGMENT replication.type, not ordinary writer
+        // replicas under the default DOCUMENT type), and SuspendedShardAllocationDecider suspends
+        // both the primary and any ordinary replica alike for the writer role. Evicting only the
+        // primary would leave a replica permanently STARTED -- canRemain=NO on its own never forces
+        // an unassignment (see this class's own javadoc above), so nothing else would ever evict it.
+        List<ShardRouting> toEvict;
+        if (reader) {
+            toEvict = shardRoutingTable.searchOnlyReplicas();
+        } else {
+            toEvict = new java.util.ArrayList<>();
+            toEvict.add(shardRoutingTable.primaryShard());
+            toEvict.addAll(shardRoutingTable.writerReplicas());
+        }
 
         ClusterRerouteRequest reroute = new ClusterRerouteRequest();
         int assignedCount = 0;
@@ -278,6 +296,11 @@ public final class ShardSuspensionCoordinator {
         client.admin().cluster().reroute(reroute, ActionListener.wrap(response -> {
             logger.info("evicted suspended serverless-storage " + role + " shard [" + indexUuid + "][" + shardId + "]");
         }, e -> logger.warn("failed to evict suspended serverless-storage " + role + " shard [" + indexUuid + "][" + shardId + "]", e)));
+    }
+
+    /** Invokes {@link #evict} directly against a caller-built state -- test-only visibility. */
+    void evictForTesting(ClusterState state, String indexUuid, int shardId, boolean reader) {
+        evict(state, indexUuid, shardId, reader);
     }
 
     private static IndexMetadata findByUuid(Metadata metadata, String indexUuid) {
