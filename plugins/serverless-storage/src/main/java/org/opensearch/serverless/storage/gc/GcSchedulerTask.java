@@ -202,6 +202,26 @@ public final class GcSchedulerTask implements Closeable {
             }
         }
 
+        // The same late-pin race applies to bundles, not just manifests: deletableBundles above was
+        // derived from liveBundles, which was computed from the *early* durablyPinnedManifests read.
+        // A pin landing in the window between that early read and pinnedImmediatelyBeforeDelete above
+        // is correctly kept out of finalDeletableManifests -- but without this second filter, its
+        // now-surviving manifest's exclusive bundle would still be deleted here anyway, leaving a
+        // pinned manifest pointing at a bundle that no longer exists. Recompute live bundles from the
+        // late pin snapshot and drop anything newly-live from this tick's delete set; a bundle
+        // excluded this way simply falls out of orphanCandidateBundles on the next tick once the late
+        // pin is reflected in the early read too, same as any other manifest publish racing a sweep.
+        if (pinnedImmediatelyBeforeDelete.isEmpty() == false) {
+            List<CommitManifest> retainedManifestsAtDelete = ManifestRetentionPolicy.computeRetainedManifests(
+                manifests,
+                retentionCutoffMillis,
+                Set.of(),
+                pinnedImmediatelyBeforeDelete
+            );
+            Set<String> liveBundlesAtDelete = BundleReferenceCounter.computeLiveBundles(retainedManifestsAtDelete);
+            deletableBundles.removeAll(liveBundlesAtDelete);
+        }
+
         // Bundles before manifests -- see this class's own javadoc for why that ordering, not the
         // reverse, is what keeps a mid-sweep crash merely retry-safe.
         bundleStore.deleteBundles(deletableBundles);

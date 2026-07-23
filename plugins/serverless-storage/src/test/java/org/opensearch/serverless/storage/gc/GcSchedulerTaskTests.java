@@ -440,4 +440,121 @@ public class GcSchedulerTaskTests extends OpenSearchTestCase {
             task.close();
         }
     }
+
+    /**
+     * Regression test: the late pin re-check immediately before delete (added to close the window
+     * where a snapshot/PITR pin lands mid-sweep) filtered {@code finalDeletableManifests} but, before
+     * this fix, never recomputed {@code deletableBundles} -- both were derived from the *early* pin
+     * snapshot taken at the top of {@code sweep()}. A pin landing in between correctly kept the
+     * now-pinned manifest alive, but a bundle it references -- already past the sustained-orphan
+     * threshold from an earlier tick's observation of a *different*, already-deleted manifest that
+     * used to be the sole referencer -- was still deleted anyway, leaving a surviving, supposedly-
+     * pinned manifest pointing at bytes that no longer exist.
+     *
+     * <p>Constructing this needs the same "bundle re-referenced by a later manifest" shape {@link
+     * #testOrphanCandidateThatBecomesReferencedAgainDuringTheSafetyWindowSurvives} uses (a bundle can
+     * never be mid-observation while its *only* referencing manifest still exists unpinned: that
+     * manifest's own deletion is single-tick, not gated by the bundle's sustained-observation window,
+     * so it would already be gone by the time the window elapses) -- except here the *later* manifest
+     * is itself already old and unpinned too, surviving this final tick only because of the racing
+     * pin, not because it's fresh.
+     */
+    public void testLatePinArrivalProtectsTheBundleTooNotJustTheManifest() throws Exception {
+        long now = System.currentTimeMillis();
+        long farInThePast = now - TimeValue.timeValueDays(1).millis();
+
+        // gen 1: superseded, unpinned, far past retention -- deleted on the very first sweep below,
+        // starting its exclusively-referenced bundle's sustained-orphan clock.
+        CommitManifest gen1 = writeGeneration(1, farInThePast);
+        writeGeneration(2, farInThePast);
+        String sharedBundle = gen1.referencedBundles().iterator().next();
+
+        long retentionWindowMillis = TimeValue.timeValueMinutes(1).millis();
+        // getPins is called twice per sweep (the early read, then the late pre-delete re-check) --
+        // inject a pin for gen 3 into the real registry right as the *second* call within the final
+        // sweep returns, simulating a pin request landing in the narrow window sweep()'s own comment
+        // describes, without needing real concurrent threads to hit it deterministically.
+        java.util.concurrent.atomic.AtomicInteger callCount = new java.util.concurrent.atomic.AtomicInteger(0);
+        long gen3Generation = 3;
+        DurablePinRegistry racingPinRegistry = new DurablePinRegistry() {
+            @Override
+            public Set<PinRecord> getPins(String indexUuid, int shardId) throws java.io.IOException {
+                if (callCount.incrementAndGet() == 4) { // 2 calls/sweep * 2 sweeps = the final sweep's late re-check
+                    pinRegistry.addPin(indexUuid, shardId, new PinRecord("racing-snapshot", PRIMARY_TERM, gen3Generation));
+                }
+                return pinRegistry.getPins(indexUuid, shardId);
+            }
+
+            @Override
+            public void addPin(String indexUuid, int shardId, PinRecord pin) throws java.io.IOException {
+                pinRegistry.addPin(indexUuid, shardId, pin);
+            }
+
+            @Override
+            public void removePin(String indexUuid, int shardId, String pinId) throws java.io.IOException {
+                pinRegistry.removePin(indexUuid, shardId, pinId);
+            }
+
+            @Override
+            public void removePin(String indexUuid, int shardId, PinRecord pin) throws java.io.IOException {
+                pinRegistry.removePin(indexUuid, shardId, pin);
+            }
+
+            @Override
+            public void replacePin(String indexUuid, int shardId, PinRecord newPin) throws java.io.IOException {
+                pinRegistry.replacePin(indexUuid, shardId, newPin);
+            }
+        };
+
+        GcSchedulerConfig config = new GcSchedulerConfig(
+            TimeValue.timeValueMinutes(5),
+            retentionWindowMillis,
+            manifestStore,
+            bundleStore,
+            racingPinRegistry
+        );
+        long[] clockMillis = { now };
+        GcSchedulerTask task = new GcSchedulerTask(threadPool, config.interval(), INDEX_UUID, SHARD_ID, config, () -> clockMillis[0]);
+        try {
+            task.sweepForTesting(); // tick 1: gen 1 deleted (unpinned, superseded, past retention); its bundle observed as a fresh orphan candidate.
+
+            // A new manifest re-references the same bundle by name (e.g. a compaction rebase or clone
+            // reusing gen 1's segment files) -- like the sibling test above, but this one is itself
+            // already old, superseded, and unpinned, so it too would be immediately deletable on the
+            // next sweep were it not for the racing pin. gen 4 supersedes it so it isn't exempted by
+            // being the current latest.
+            CommitManifest gen3ReferencingTheSameBundle = new CommitManifest(
+                INDEX_UUID,
+                SHARD_ID,
+                PRIMARY_TERM,
+                gen3Generation,
+                gen1.segmentsFileName(),
+                gen1.files(),
+                0,
+                0,
+                null,
+                0,
+                PruningStats.empty(),
+                farInThePast
+            );
+            manifestStore.writeManifest(gen3ReferencingTheSameBundle);
+            writeGeneration(4, farInThePast); // new latest, unrelated -- makes gen 3 superseded.
+
+            clockMillis[0] = now + retentionWindowMillis + 1;
+            task.sweepForTesting(); // tick 2 (final): the racing pin for gen 3 lands during this sweep's late re-check.
+
+            List<CommitManifest> remaining = manifestStore.listManifests();
+            assertTrue(
+                "the late-pinned manifest must survive -- this part already worked before the fix",
+                remaining.stream().anyMatch(m -> m.generation() == gen3Generation)
+            );
+            assertTrue(
+                "the late-pinned manifest's bundle must survive too -- a pinned manifest must never "
+                    + "end up pointing at a deleted bundle",
+                bundleStore.listBundleNames().contains(sharedBundle)
+            );
+        } finally {
+            task.close();
+        }
+    }
 }
