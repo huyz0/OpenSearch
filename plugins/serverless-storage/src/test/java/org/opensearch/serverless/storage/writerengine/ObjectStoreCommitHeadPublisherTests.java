@@ -22,6 +22,7 @@ import org.opensearch.common.blobstore.fs.FsBlobContainer;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.serverless.storage.format.BlobContainerBundleStore;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
+import org.opensearch.serverless.storage.manifest.CommitManifest;
 import org.opensearch.serverless.storage.manifest.PruningStats;
 import org.opensearch.serverless.storage.manifest.WalPosition;
 import org.opensearch.serverless.storage.retention.BlobContainerDurablePinRegistry;
@@ -334,6 +335,83 @@ public class ObjectStoreCommitHeadPublisherTests extends OpenSearchTestCase {
                 "a pin registered right before a failed read must be released, not orphaned",
                 pinRegistry.getPins(INDEX_UUID, SHARD_ID).isEmpty()
             );
+        }
+    }
+
+    // Regression test: readLatestManifestWithPin previously used DurablePinRegistry#addPin, which
+    // treats pins with the same pinId but a different generation as distinct entries -- so a
+    // retried snapshot request (same pinId) landing after a newer generation had published in
+    // between left TWO pins under one pinId, leaking the stale generation's pin (protected from GC
+    // forever) until this pinId is eventually released outright. replacePin fixes this by making the
+    // new generation the sole pin under that pinId.
+    public void testReadLatestManifestWithPinReplacesAStalePinFromAnEarlierGenerationUnderTheSamePinId() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer rawContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore localShardStateStore = new BlobContainerShardStateStore(rawContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(rawContainer),
+            new BlobContainerManifestStore(rawContainer)
+        );
+        ObjectStoreCommitHeadPublisher localHeadPublisher = new ObjectStoreCommitHeadPublisher(commitPublisher, localShardStateStore);
+        DurablePinRegistry pinRegistry = new BlobContainerDurablePinRegistry(rawContainer);
+        String pinId = "test-snap-uuid";
+
+        try (Directory directory = new ByteBuffersDirectory()) {
+            SegmentInfos first = commitOneDocument(directory, "1");
+            assertTrue(
+                localHeadPublisher.publishCommitAsHead(
+                    directory,
+                    first,
+                    INDEX_UUID,
+                    SHARD_ID,
+                    1,
+                    0,
+                    0,
+                    new WalPosition("epoch-0", 0),
+                    0,
+                    PruningStats.empty()
+                )
+            );
+            // Simulates the FIRST attempt of a snapshot request that pinned generation 1, whose
+            // response the client never received (so it will retry under the same pinId).
+            Optional<CommitManifest> firstAttempt = localHeadPublisher.readLatestManifestWithPin(
+                INDEX_UUID,
+                SHARD_ID,
+                pinRegistry,
+                pinId
+            );
+            assertTrue(firstAttempt.isPresent());
+            assertEquals(1, pinRegistry.getPins(INDEX_UUID, SHARD_ID).size());
+
+            // A newer commit publishes in between, advancing the head to generation 2.
+            SegmentInfos second = commitOneDocument(directory, "2");
+            assertTrue(
+                localHeadPublisher.publishCommitAsHead(
+                    directory,
+                    second,
+                    INDEX_UUID,
+                    SHARD_ID,
+                    1,
+                    1,
+                    0,
+                    new WalPosition("epoch-0", 0),
+                    0,
+                    PruningStats.empty()
+                )
+            );
+
+            // The client retries under the SAME pinId, now reading the newer generation.
+            Optional<CommitManifest> retry = localHeadPublisher.readLatestManifestWithPin(INDEX_UUID, SHARD_ID, pinRegistry, pinId);
+            assertTrue(retry.isPresent());
+
+            assertEquals(
+                "the retry must replace the stale generation-1 pin, not accumulate a second pin under the same pinId",
+                1,
+                pinRegistry.getPins(INDEX_UUID, SHARD_ID).size()
+            );
+            org.opensearch.serverless.storage.retention.PinRecord onlyPin = pinRegistry.getPins(INDEX_UUID, SHARD_ID).iterator().next();
+            assertEquals(pinId, onlyPin.pinId());
+            assertEquals(2, onlyPin.generation());
         }
     }
 

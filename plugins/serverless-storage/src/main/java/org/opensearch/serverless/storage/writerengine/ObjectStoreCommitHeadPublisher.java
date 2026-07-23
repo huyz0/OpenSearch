@@ -296,6 +296,14 @@ public final class ObjectStoreCommitHeadPublisher {
      * and unpinned, and delete it, between this method's own read of the head and its write of the
      * pin.
      *
+     * <p>Uses {@link org.opensearch.serverless.storage.retention.DurablePinRegistry#replacePin},
+     * not {@code addPin}: a retried request under the same {@code pinId} (e.g. a client retry after
+     * a newer generation has since published) must make the new generation the <em>only</em> pin
+     * under that {@code pinId}, not accumulate a second pin alongside the stale one -- {@code
+     * addPin} treats pins with the same {@code pinId} but a different generation as distinct
+     * entries, which would leak the stale generation's pin (protected from GC forever) until this
+     * {@code pinId} is eventually released outright.
+     *
      * @param pinRegistry this shard's own durable pin registry
      * @param pinId the pin identifier to register the generation under (e.g. a snapshot UUID)
      * @return the pinned, just-read manifest, or empty if nothing has been published yet (nothing
@@ -315,7 +323,7 @@ public final class ObjectStoreCommitHeadPublisher {
         if (head.latestManifestGeneration() == 0) {
             return Optional.empty();
         }
-        pinRegistry.addPin(
+        pinRegistry.replacePin(
             indexUuid,
             shardId,
             new org.opensearch.serverless.storage.retention.PinRecord(pinId, head.primaryTerm(), head.latestManifestGeneration())
