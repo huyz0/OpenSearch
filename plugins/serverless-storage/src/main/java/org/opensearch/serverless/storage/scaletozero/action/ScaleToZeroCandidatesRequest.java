@@ -8,11 +8,14 @@
 
 package org.opensearch.serverless.storage.scaletozero.action;
 
+import org.opensearch.action.ActionRequestValidationException;
 import org.opensearch.action.support.nodes.BaseNodesRequest;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 
 import java.io.IOException;
+
+import static org.opensearch.action.ValidateActions.addValidationError;
 
 /**
  * Requests a cluster-wide {@link ScaleToZeroCandidatesAction} evaluation. Always fans out to every
@@ -68,6 +71,26 @@ public class ScaleToZeroCandidatesRequest extends BaseNodesRequest<ScaleToZeroCa
         super.writeTo(out);
         out.writeZLong(idleThresholdMillis);
         out.writeZLong(lagThreshold);
+    }
+
+    /**
+     * Rejects any override strictly less than the "use default" sentinel: {@code
+     * idleThresholdMillis}/{@code lagThreshold} feed directly into {@code
+     * ScaleToZeroCandidatesResponse}'s {@code millisSinceLastActivity() >= idleThresholdMillis}
+     * candidate check -- an unvalidated negative value other than the sentinel would make every
+     * shard on every node satisfy that comparison, flagging actively-written/actively-queried
+     * shards as scale-to-zero candidates.
+     */
+    @Override
+    public ActionRequestValidationException validate() {
+        ActionRequestValidationException validationException = null;
+        if (idleThresholdMillis < USE_DEFAULT_IDLE_THRESHOLD) {
+            validationException = addValidationError("idleThresholdMillis must be >= -1", validationException);
+        }
+        if (lagThreshold < USE_DEFAULT_LAG_THRESHOLD) {
+            validationException = addValidationError("lagThreshold must be >= -1", validationException);
+        }
+        return validationException;
     }
 
     /** The caller-supplied idle threshold override, or {@link #USE_DEFAULT_IDLE_THRESHOLD}. */

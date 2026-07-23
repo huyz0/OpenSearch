@@ -8,11 +8,14 @@
 
 package org.opensearch.serverless.storage.scaleup.action;
 
+import org.opensearch.action.ActionRequestValidationException;
 import org.opensearch.action.support.nodes.BaseNodesRequest;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 
 import java.io.IOException;
+
+import static org.opensearch.action.ValidateActions.addValidationError;
 
 /**
  * Requests a cluster-wide {@link ScaleUpCandidatesAction} evaluation. Always fans out to every
@@ -65,6 +68,26 @@ public class ScaleUpCandidatesRequest extends BaseNodesRequest<ScaleUpCandidates
         super.writeTo(out);
         out.writeZLong(qpmThreshold);
         out.writeVInt(maxSearchReplicas);
+    }
+
+    /**
+     * Rejects any override strictly less than the "use default" sentinel: {@code qpmThreshold}/
+     * {@code maxSearchReplicas} feed directly into {@code ScaleUpCandidatesResponse}'s {@code
+     * queriesPerMinute() > qpmThreshold} candidate check -- an unvalidated negative value other than
+     * the sentinel (e.g. a typo'd {@code ?qpm_threshold=-100}) would make every shard on every node
+     * satisfy that comparison, since query rates are never negative, flagging the entire cluster as
+     * a scale-up candidate.
+     */
+    @Override
+    public ActionRequestValidationException validate() {
+        ActionRequestValidationException validationException = null;
+        if (qpmThreshold < USE_DEFAULT_QPM_THRESHOLD) {
+            validationException = addValidationError("qpmThreshold must be >= -1", validationException);
+        }
+        if (maxSearchReplicas < USE_DEFAULT_MAX_SEARCH_REPLICAS) {
+            validationException = addValidationError("maxSearchReplicas must be >= -1", validationException);
+        }
+        return validationException;
     }
 
     /** The caller-supplied query-rate threshold override, or {@link #USE_DEFAULT_QPM_THRESHOLD}. */

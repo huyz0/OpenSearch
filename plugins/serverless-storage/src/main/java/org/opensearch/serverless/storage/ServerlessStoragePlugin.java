@@ -1382,8 +1382,13 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                             org.opensearch.serverless.storage.nodecapacity.RoleCapacitySignal reader = this.nodeCapacitySignalService
                                 .latestSignal()
                                 .reader();
-                            int headroom = reader.nodeCount() * maxShardsPerReaderNode - reader.totalAssignedShardCount();
-                            return Math.max(0, headroom);
+                            // long arithmetic, not int: nodeCount() * maxShardsPerReaderNode can
+                            // overflow Integer for a pathologically large configured capacity,
+                            // which Math.max(0, ...) on an already-wrapped-negative int would then
+                            // misreport as zero headroom -- falsely blocking all scale-up instead
+                            // of reporting the (very large but real) capacity.
+                            long headroom = (long) reader.nodeCount() * maxShardsPerReaderNode - reader.totalAssignedShardCount();
+                            return (int) Math.max(0, Math.min(Integer.MAX_VALUE, headroom));
                         }
                     )
                     : null
