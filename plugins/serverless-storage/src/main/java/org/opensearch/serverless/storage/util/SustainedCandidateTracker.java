@@ -101,10 +101,14 @@ public final class SustainedCandidateTracker<T> {
      * <p>A candidate for which {@code needsBudget} is {@code false} is always acted on regardless of
      * remaining budget and never consumes a slot -- e.g. a coordinator that dedupes several
      * candidates down to one action per group can let every candidate but the group's first pass
-     * through free. Once a candidate that does need budget is reached with none left, iteration
-     * stops entirely: every remaining candidate (all lower priority) keeps whatever streak it had --
-     * callers are expected to have already cleared the streak of any candidate not passed in here at
-     * all (e.g. one already handled outside this tick's budget concern).
+     * through free. Once a candidate that does need budget is reached with none left, that candidate
+     * (and every other budget-needing candidate after it) is skipped, keeping whatever streak it
+     * had -- but iteration does not stop there: a later candidate that does <em>not</em> need budget
+     * (e.g. a sibling of an already-acted-on candidate, from the same dedup group) is still visited
+     * and acted on, exactly as it would be with budget to spare. Skipping the rest of the list
+     * entirely once budget runs out would leave such a candidate's streak un-cleared even though its
+     * group was already handled this tick, letting it re-qualify as "sustained" on the very next
+     * tick without ever needing to build up a fresh streak.
      *
      * @param sustainedCandidates the sustained candidates, highest priority first.
      * @param budget the maximum number of budget-consuming actions this call may take. Values {@code
@@ -119,7 +123,11 @@ public final class SustainedCandidateTracker<T> {
         int used = 0;
         for (T entry : sustainedCandidates) {
             if (needsBudget.test(entry) && budget > 0 && used >= budget) {
-                break;
+                // Budget exhausted for this (lower-priority) candidate -- skip acting, but keep
+                // scanning rather than stopping here: a later candidate might not need budget at all
+                // (see this method's own javadoc for why stopping the whole loop here was a bug, not
+                // an optimization).
+                continue;
             }
             if (Boolean.TRUE.equals(act.apply(entry))) {
                 used++;
