@@ -64,4 +64,17 @@ public final class EngineNativeSnapshotReleasers {
     public static Optional<EngineFactory> find(String engineId) {
         return Optional.ofNullable(REGISTRY.get(engineId));
     }
+
+    /**
+     * Whether this node has any releaser registered at all. {@code BlobStoreRepository}'s
+     * delete-time release scan checks this before touching the shard container: an empty registry
+     * means {@link #find} would return empty for every {@code engineId} regardless, exactly the
+     * same outcome the existing best-effort contract already accepts -- so a repository that's
+     * never loaded a plugin producing engine-native snapshots (almost every real deployment) can
+     * skip the per-removed-snapshot blob read entirely rather than confirming an empty result the
+     * expensive way, once per snapshot, on every delete.
+     */
+    public static boolean isEmpty() {
+        return REGISTRY.isEmpty();
+    }
 }

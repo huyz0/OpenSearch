@@ -4715,11 +4715,18 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
         // which blobs to delete below -- best-effort (see EngineFactory#releaseEngineNativeSnapshot's
         // own javadoc): a missing/failed release never blocks the delete itself from proceeding,
         // it only risks the producing engine retaining something it no longer needs to.
-        for (SnapshotId removedSnapshotId : snapshotIds) {
-            if (survivingSnapshots.contains(removedSnapshotId)) {
-                continue;
+        //
+        // Skipped entirely when no releaser is registered on this node at all -- see
+        // EngineNativeSnapshotReleasers#isEmpty's own javadoc for why this is behaviorally
+        // identical to running the loop, just without paying a blob read per removed snapshot to
+        // confirm what an empty registry already guarantees.
+        if (EngineNativeSnapshotReleasers.isEmpty() == false) {
+            for (SnapshotId removedSnapshotId : snapshotIds) {
+                if (survivingSnapshots.contains(removedSnapshotId)) {
+                    continue;
+                }
+                releaseEngineNativeSnapshotIfPresent(shardContainer, removedSnapshotId);
             }
-            releaseEngineNativeSnapshotIfPresent(shardContainer, removedSnapshotId);
         }
 
         // Build a list of snapshots that should be preserved
