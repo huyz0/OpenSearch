@@ -117,6 +117,42 @@ public class EngineNativeSnapshotSupportTests extends IndexShardTestCase {
         }
     }
 
+    // Regression test: containerResolver resolves (indexUuid, shardId) against THIS cluster's own
+    // repository configuration, never the snapshot's actual origin -- restoring a pointer whose
+    // original shard data genuinely isn't reachable there (the realistic shape of a cross-cluster
+    // restore or a repository whose underlying location changed) previously surfaced as a raw,
+    // unexplained NoSuchFileException from deep inside bundle materialization. It must instead fail
+    // with a clear, actionable explanation of what's actually wrong.
+    public void testRecoverFromEngineNativeSnapshotFailsWithAClearExplanationWhenTheOriginalShardDataIsUnreachable() throws Exception {
+        CommitManifest manifest = publishSourceCommit();
+        EngineNativeSnapshotPayload payload = new EngineNativeSnapshotPayload("test-snap-uuid", manifest);
+
+        // Resolves to a genuinely empty container -- simulates this pointer being restored against
+        // a repository/cluster that never had the original shard's data, e.g. a different cluster
+        // entirely.
+        FsBlobStore emptyBlobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer emptyContainer = new FsBlobContainer(emptyBlobStore, BlobPath.cleanPath(), emptyBlobStore.path());
+        EngineNativeSnapshotSupport support = new EngineNativeSnapshotSupport((indexUuid, shardId) -> emptyContainer);
+
+        IndexShard targetShard = newShard(true);
+        try {
+            java.io.IOException e = expectThrows(
+                java.io.IOException.class,
+                () -> support.recoverFromEngineNativeSnapshot(targetShard, targetShard.store(), payload.toBytes())
+            );
+            assertTrue(
+                "the failure must explain the cross-cluster/repository-mismatch cause, not surface a raw low-level read error",
+                e.getMessage().contains("different cluster")
+            );
+            assertTrue(
+                "the underlying NoSuchFileException must still be reachable for diagnostics",
+                e.getCause() instanceof java.nio.file.NoSuchFileException
+            );
+        } finally {
+            closeShard(targetShard, false);
+        }
+    }
+
     public void testReleaseEngineNativeSnapshotRemovesExactlyItsOwnPin() throws Exception {
         CommitManifest manifest = publishSourceCommit();
         String pinId = "test-snap-uuid";
