@@ -25,7 +25,6 @@ import org.opensearch.serverless.storage.scaletozero.action.ScaleToZeroCandidate
 import org.opensearch.serverless.storage.util.SustainedCandidateTracker;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
-import org.opensearch.transport.client.Client;
 
 import java.io.Closeable;
 import java.util.ArrayList;
@@ -63,6 +62,7 @@ public final class NodeCapacitySignalService implements Closeable {
     private final ScaleToZeroCandidatesSchedulerTask scaleToZeroTask;
     private final long readerCacheAffinityTtlMillis;
     private final DrainCoordinator drainCoordinator;
+    private final NodeWarmupCoordinator warmupCoordinator;
     private final Scheduler.Cancellable task;
     private final SustainedCandidateTracker<String> writerDrainTracker;
     private final SustainedCandidateTracker<String> readerDrainTracker;
@@ -84,9 +84,6 @@ public final class NodeCapacitySignalService implements Closeable {
      *                                     ReaderCacheAffinityMetadata#isAffinityFresh}.
      * @param requiredConsecutiveDrainTicks how many consecutive fully-idle ticks a node must have
      *                                      before it appears in {@link RoleCapacitySignal#drainCandidates()}.
-     * @param client used to build this service's own {@link DrainCoordinator} -- reads {@code
-     *               cluster.routing.allocation.exclude._name} to populate {@link
-     *               NodeCapacityEntry#draining()}, and sweeps stale (departed-node) exclude entries.
      */
     public NodeCapacitySignalService(
         ThreadPool threadPool,
@@ -94,13 +91,13 @@ public final class NodeCapacitySignalService implements Closeable {
         ClusterService clusterService,
         ScaleToZeroCandidatesSchedulerTask scaleToZeroTask,
         long readerCacheAffinityTtlMillis,
-        int requiredConsecutiveDrainTicks,
-        Client client
+        int requiredConsecutiveDrainTicks
     ) {
         this.clusterService = clusterService;
         this.scaleToZeroTask = scaleToZeroTask;
         this.readerCacheAffinityTtlMillis = readerCacheAffinityTtlMillis;
-        this.drainCoordinator = new DrainCoordinator(client);
+        this.drainCoordinator = new DrainCoordinator(clusterService);
+        this.warmupCoordinator = new NodeWarmupCoordinator(clusterService);
         this.writerDrainTracker = new SustainedCandidateTracker<>(requiredConsecutiveDrainTicks);
         this.readerDrainTracker = new SustainedCandidateTracker<>(requiredConsecutiveDrainTicks);
         this.task = threadPool.scheduleWithFixedDelay(this::evaluateSafely, interval, ThreadPool.Names.GENERIC);
@@ -191,6 +188,7 @@ public final class NodeCapacitySignalService implements Closeable {
         );
 
         sweepStaleExcludeNames(state, excludedNames);
+        sweepStaleWarmingNames(state);
     }
 
     /**
@@ -212,11 +210,39 @@ public final class NodeCapacitySignalService implements Closeable {
             return;
         }
         drainCoordinator.removeStaleNames(
-            state,
             stale,
             org.opensearch.core.action.ActionListener.wrap(
                 response -> logger.debug("removed stale drain exclude entries: {}", stale),
                 e -> logger.warn("failed to remove stale drain exclude entries {}, will retry next tick", stale, e)
+            )
+        );
+    }
+
+    /**
+     * Removes any warming name with no matching live node from {@link
+     * NodeWarmupCoordinator#WARMING_NAMES_SETTING_KEY} -- same hygiene rule as {@link
+     * #sweepStaleExcludeNames}, since a leaked warming mark blocks reader allocation to a future node
+     * that reuses the departed node's name just as permanently as a leaked exclude entry would.
+     */
+    private void sweepStaleWarmingNames(ClusterState state) {
+        Set<String> warmingNames = NodeWarmupCoordinator.currentlyWarmingNames(state);
+        if (warmingNames.isEmpty()) {
+            return;
+        }
+        Set<String> liveNames = new HashSet<>();
+        for (DiscoveryNode node : state.nodes()) {
+            liveNames.add(node.getName());
+        }
+        Set<String> stale = new HashSet<>(warmingNames);
+        stale.removeAll(liveNames);
+        if (stale.isEmpty()) {
+            return;
+        }
+        warmupCoordinator.removeStaleNames(
+            stale,
+            org.opensearch.core.action.ActionListener.wrap(
+                response -> logger.debug("removed stale warming entries: {}", stale),
+                e -> logger.warn("failed to remove stale warming entries {}, will retry next tick", stale, e)
             )
         );
     }

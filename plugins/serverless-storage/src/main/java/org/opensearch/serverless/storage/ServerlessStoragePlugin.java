@@ -1327,8 +1327,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                     clusterService,
                     this.scaleToZeroCandidatesSchedulerTask,
                     SERVERLESS_STORAGE_READER_CACHE_AFFINITY_TTL_SETTING.get(environment.settings()).millis(),
-                    SERVERLESS_STORAGE_NODE_CAPACITY_DRAIN_REQUIRED_CONSECUTIVE_TICKS_SETTING.get(environment.settings()),
-                    client
+                    SERVERLESS_STORAGE_NODE_CAPACITY_DRAIN_REQUIRED_CONSECUTIVE_TICKS_SETTING.get(environment.settings())
                 );
             }
         }
@@ -1338,7 +1337,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 threadPool,
                 selfWarmupEvalInterval,
                 clusterService,
-                new org.opensearch.serverless.storage.nodecapacity.NodeWarmupCoordinator(client),
+                new org.opensearch.serverless.storage.nodecapacity.NodeWarmupCoordinator(clusterService),
                 SERVERLESS_STORAGE_NODE_SELF_WARMUP_AUTO_CLEAR_DELAY_SETTING.get(environment.settings())
             );
         }

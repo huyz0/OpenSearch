@@ -19,14 +19,13 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.serverless.storage.nodecapacity.DrainCoordinator;
 import org.opensearch.tasks.Task;
 import org.opensearch.transport.TransportService;
-import org.opensearch.transport.client.Client;
 
 /**
  * The actual work behind {@link NodeDrainAction}: resolves the requested node id to its current
  * name (core's exclude filter matches on name, not id -- see {@link DrainCoordinator}), then starts
  * or cancels a drain. Not routed through a cluster-manager-only base class -- {@link
- * DrainCoordinator} dispatches a {@code ClusterUpdateSettingsRequest}, which core already forwards
- * to the cluster-manager itself, so a second layer of forwarding here would be redundant.
+ * DrainCoordinator} submits its own cluster-state task, which core already routes to the
+ * cluster-manager itself, so a second layer of forwarding here would be redundant.
  */
 public class TransportNodeDrainAction extends HandledTransportAction<NodeDrainRequest, AcknowledgedResponse> {
 
@@ -38,19 +37,14 @@ public class TransportNodeDrainAction extends HandledTransportAction<NodeDrainRe
      *
      * @param transportService used by {@link HandledTransportAction} to register this action.
      * @param actionFilters applied by {@link HandledTransportAction} around every request.
-     * @param clusterService resolves the requested node id to its current name.
-     * @param client used to construct this node's {@link DrainCoordinator}.
+     * @param clusterService resolves the requested node id to its current name, and constructs this
+     *                       node's {@link DrainCoordinator}.
      */
     @Inject
-    public TransportNodeDrainAction(
-        TransportService transportService,
-        ActionFilters actionFilters,
-        ClusterService clusterService,
-        Client client
-    ) {
+    public TransportNodeDrainAction(TransportService transportService, ActionFilters actionFilters, ClusterService clusterService) {
         super(NodeDrainAction.NAME, transportService, actionFilters, NodeDrainRequest::new);
         this.clusterService = clusterService;
-        this.drainCoordinator = new DrainCoordinator(client);
+        this.drainCoordinator = new DrainCoordinator(clusterService);
     }
 
     @Override
@@ -61,14 +55,11 @@ public class TransportNodeDrainAction extends HandledTransportAction<NodeDrainRe
             listener.onFailure(new IllegalArgumentException("no such node: " + request.nodeId()));
             return;
         }
-        ActionListener<org.opensearch.action.admin.cluster.settings.ClusterUpdateSettingsResponse> ackListener = ActionListener.wrap(
-            response -> listener.onResponse(new AcknowledgedResponse(true)),
-            listener::onFailure
-        );
+        ActionListener<Void> ackListener = ActionListener.wrap(response -> listener.onResponse(new AcknowledgedResponse(true)), listener::onFailure);
         if (request.drain()) {
-            drainCoordinator.drain(state, node.getName(), ackListener);
+            drainCoordinator.drain(node.getName(), ackListener);
         } else {
-            drainCoordinator.cancelDrain(state, node.getName(), ackListener);
+            drainCoordinator.cancelDrain(node.getName(), ackListener);
         }
     }
 }

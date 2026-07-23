@@ -29,12 +29,13 @@ import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.storage.ServerlessStoragePlugin;
 import org.opensearch.serverless.storage.scaletozero.ScaleToZeroCandidatesSchedulerTask;
+import org.opensearch.test.ClusterServiceUtils;
 import org.opensearch.test.OpenSearchTestCase;
-import org.opensearch.test.client.NoOpClient;
 import org.opensearch.threadpool.TestThreadPool;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
 
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 import static org.mockito.Mockito.mock;
@@ -86,14 +87,17 @@ public class NodeCapacitySignalServiceTests extends OpenSearchTestCase {
     private NodeCapacitySignalService newService(ClusterState state) {
         ClusterService clusterService = mock(ClusterService.class);
         when(clusterService.state()).thenReturn(state);
+        return newService(clusterService);
+    }
+
+    private NodeCapacitySignalService newService(ClusterService clusterService) {
         return new NodeCapacitySignalService(
             threadPool,
             TimeValue.timeValueDays(1),
             clusterService,
             scaleToZeroCandidatesSchedulerTask,
             -1L, // reader cache affinity disabled -- not under test here
-            10,
-            new NoOpClient(threadPool)
+            10
         );
     }
 
@@ -252,5 +256,41 @@ public class NodeCapacitySignalServiceTests extends OpenSearchTestCase {
 
         // Never elected -- evaluate() returns early, latestSignal() stays at its initial empty value.
         assertEquals(NodeCapacitySignal.empty(), service.latestSignal());
+    }
+
+    /**
+     * Regression test: a warming mark left behind by a node that departed the cluster (crashed
+     * before {@code NodeWarmupCoordinator.clearWarming}, or was replaced by a differently-named
+     * node) must be swept every tick, exactly like a stale drain-exclude entry -- otherwise it
+     * permanently blocks reader allocation to any future node that reuses the departed name.
+     */
+    public void testStaleWarmingNameForADepartedNodeIsSweptOnEvaluate() throws Exception {
+        Settings.Builder transientSettings = Settings.builder()
+            .put(NodeWarmupCoordinator.WARMING_NAMES_SETTING_KEY, "live-node,departed-node");
+        Metadata metadata = Metadata.builder().transientSettings(transientSettings.build()).build();
+        DiscoveryNode local = node("live-node");
+        DiscoveryNodes discoveryNodes = DiscoveryNodes.builder().add(local).localNodeId("live-node").clusterManagerNodeId("live-node").build();
+
+        ClusterState state = ClusterState.builder(new ClusterName("test"))
+            .metadata(metadata)
+            .routingTable(RoutingTable.builder().build())
+            .nodes(discoveryNodes)
+            .build();
+
+        // A real (test) ClusterService is required here, not a mock -- the sweep now runs through
+        // DrainCoordinator/NodeWarmupCoordinator's own ClusterStateUpdateTask (see their javadoc for
+        // why), which a plain mock can't execute.
+        ClusterService clusterService = ClusterServiceUtils.createClusterService(threadPool);
+        clusterService.setRerouteService((reason, priority, listener) -> listener.onResponse(clusterService.state()));
+        ClusterServiceUtils.setState(clusterService, state);
+
+        NodeCapacitySignalService service = newService(clusterService);
+        service.evaluateForTesting();
+
+        // The sweep's cluster-state task runs asynchronously on the (real) cluster-manager task
+        // queue -- assertBusy waits for it rather than racing it.
+        assertBusy(() -> assertEquals(Set.of("live-node"), NodeWarmupCoordinator.currentlyWarmingNames(clusterService.state())));
+
+        clusterService.close();
     }
 }

@@ -10,7 +10,6 @@ package org.opensearch.serverless.storage.nodecapacity;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.opensearch.action.admin.cluster.settings.ClusterUpdateSettingsResponse;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.service.ClusterService;
@@ -121,9 +120,9 @@ public final class NodeSelfWarmupSchedulerTask implements Closeable {
             return; // a previous tick's mark call hasn't completed yet.
         }
         String nodeName = localNode.getName();
-        coordinator.markWarming(state, nodeName, new ActionListener<>() {
+        coordinator.markWarming(nodeName, new ActionListener<>() {
             @Override
-            public void onResponse(ClusterUpdateSettingsResponse response) {
+            public void onResponse(Void response) {
                 markAttemptInFlight.set(false);
                 selfMarked = true;
                 logger.info("self-marked this node [{}] as warming before it enters reader shard rotation", nodeName);
@@ -141,7 +140,7 @@ public final class NodeSelfWarmupSchedulerTask implements Closeable {
     }
 
     private void autoClear(String nodeName) {
-        coordinator.clearWarming(clusterService.state(), nodeName, ActionListener.wrap(response -> {
+        coordinator.clearWarming(nodeName, ActionListener.wrap(response -> {
             logger.info("auto-cleared this node [{}]'s warming status after the configured delay", nodeName);
         }, e -> logger.warn("failed to auto-clear this node [" + nodeName + "]'s warming status", e)));
     }

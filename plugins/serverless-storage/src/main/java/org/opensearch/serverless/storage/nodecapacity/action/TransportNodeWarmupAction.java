@@ -19,13 +19,12 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.serverless.storage.nodecapacity.NodeWarmupCoordinator;
 import org.opensearch.tasks.Task;
 import org.opensearch.transport.TransportService;
-import org.opensearch.transport.client.Client;
 
 /**
  * The actual work behind {@link NodeWarmupAction}: resolves the requested node id to its current
  * name, then marks or clears warming. Mirrors {@link TransportNodeDrainAction}'s shape -- not
- * routed through a cluster-manager-only base class, since {@link NodeWarmupCoordinator} dispatches
- * a {@code ClusterUpdateSettingsRequest}, which core already forwards to the cluster-manager itself.
+ * routed through a cluster-manager-only base class, since {@link NodeWarmupCoordinator} submits its
+ * own cluster-state task, which core already routes to the cluster-manager itself.
  */
 public class TransportNodeWarmupAction extends HandledTransportAction<NodeWarmupRequest, AcknowledgedResponse> {
 
@@ -37,19 +36,14 @@ public class TransportNodeWarmupAction extends HandledTransportAction<NodeWarmup
      *
      * @param transportService used by {@link HandledTransportAction} to register this action.
      * @param actionFilters applied by {@link HandledTransportAction} around every request.
-     * @param clusterService resolves the requested node id to its current name.
-     * @param client used to construct this node's {@link NodeWarmupCoordinator}.
+     * @param clusterService resolves the requested node id to its current name, and constructs this
+     *                       node's {@link NodeWarmupCoordinator}.
      */
     @Inject
-    public TransportNodeWarmupAction(
-        TransportService transportService,
-        ActionFilters actionFilters,
-        ClusterService clusterService,
-        Client client
-    ) {
+    public TransportNodeWarmupAction(TransportService transportService, ActionFilters actionFilters, ClusterService clusterService) {
         super(NodeWarmupAction.NAME, transportService, actionFilters, NodeWarmupRequest::new);
         this.clusterService = clusterService;
-        this.warmupCoordinator = new NodeWarmupCoordinator(client);
+        this.warmupCoordinator = new NodeWarmupCoordinator(clusterService);
     }
 
     @Override
@@ -60,14 +54,11 @@ public class TransportNodeWarmupAction extends HandledTransportAction<NodeWarmup
             listener.onFailure(new IllegalArgumentException("no such node: " + request.nodeId()));
             return;
         }
-        ActionListener<org.opensearch.action.admin.cluster.settings.ClusterUpdateSettingsResponse> ackListener = ActionListener.wrap(
-            response -> listener.onResponse(new AcknowledgedResponse(true)),
-            listener::onFailure
-        );
+        ActionListener<Void> ackListener = ActionListener.wrap(response -> listener.onResponse(new AcknowledgedResponse(true)), listener::onFailure);
         if (request.warming()) {
-            warmupCoordinator.markWarming(state, node.getName(), ackListener);
+            warmupCoordinator.markWarming(node.getName(), ackListener);
         } else {
-            warmupCoordinator.clearWarming(state, node.getName(), ackListener);
+            warmupCoordinator.clearWarming(node.getName(), ackListener);
         }
     }
 }
