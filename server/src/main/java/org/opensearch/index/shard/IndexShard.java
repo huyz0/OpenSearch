@@ -5192,10 +5192,13 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
                         // Engine#onPrimaryTermBumped's own javadoc for exactly what atomicity this
                         // guarantees a listener. getIndexerOrNull(), not getIndexer(): an engine
                         // that hasn't been constructed yet (still mid-recovery) has nothing to
-                        // notify, and that is not an error here.
+                        // notify, and that is not an error here. Unwrapped to the concrete Engine
+                        // via EngineBackedIndexer#getEngine(), the same resolution
+                        // #replayEngineRecoveryOperations already uses, rather than adding a
+                        // second, Indexer-level copy of this hook.
                         Indexer currentIndexer = getIndexerOrNull();
-                        if (currentIndexer != null) {
-                            currentIndexer.onPrimaryTermBumped(newPrimaryTerm);
+                        if (currentIndexer instanceof EngineBackedIndexer) {
+                            ((EngineBackedIndexer) currentIndexer).getEngine().onPrimaryTermBumped(newPrimaryTerm);
                         }
                         onBlocked.run();
                     }
