@@ -1533,6 +1533,36 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     }
 
     /**
+     * Builds a {@link BundleFileReader} that reads this shard's own bundles from {@code ownContainer}
+     * first, falling back to each ancestor container in {@code lineageChain} (see {@link
+     * #getEngineFactory}'s own resolution of that chain) in order -- the same {@code
+     * FallbackBundleFileReader.chain(...)} shape {@code TransportShardShrinkAction.resolveShrinkSource}
+     * already uses, generalized so every read path built in {@link #getEngineFactory} can share it
+     * rather than only the shrink path having it. {@code ownContainer} need not be {@code
+     * lineageChain.get(0)} itself -- callers pass whichever permission-scoped wrapper of this shard's
+     * own container that specific read path already uses (e.g. the reader query-serving path's
+     * further-restricted {@code readOnlyContainer}), while ancestor containers are always resolved
+     * unrestricted, since a {@link BundleFileReader} only ever reads.
+     *
+     * @param ownContainer this shard's own (possibly permission-wrapped) container, tried first.
+     * @param lineageChain this shard's full clone-lineage chain; only entries from index 1 onward
+     *                     (the ancestors) are used as fallbacks -- entry 0 is never consulted since
+     *                     {@code ownContainer} already covers this shard's own data.
+     */
+    private static BundleFileReader chainedBundleReadPath(BlobContainer ownContainer, List<BlobContainer> lineageChain) {
+        BundleFileReader ownReadPath = new BlobContainerBundleStore(ownContainer);
+        if (lineageChain.size() <= 1) {
+            return ownReadPath;
+        }
+        List<BundleFileReader> readers = new java.util.ArrayList<>(lineageChain.size());
+        readers.add(ownReadPath);
+        for (int i = 1; i < lineageChain.size(); i++) {
+            readers.add(new BlobContainerBundleStore(lineageChain.get(i)));
+        }
+        return org.opensearch.serverless.storage.clone.FallbackBundleFileReader.chain(readers);
+    }
+
+    /**
      * Resolves this shard's own {@link BlobContainer} (index-UUID/shard-scoped, encryption-wrapped
      * if configured) -- shared by {@link #getEngineFactory} and {@link
      * #blobContainerForDirectoryFactory}, which both need exactly this same resolution.
@@ -1585,6 +1615,21 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             // A pin is only ever added or overwritten by CAS, never deleted through this registry
             // itself, so the delete-denying scoped container is safe here too.
             DurablePinRegistry pinRegistry = new BlobContainerDurablePinRegistry(scopedContainer);
+            // Resolved once, shared by every read path built below (reader query-serving, background
+            // compaction, background partition-rewrite, and writer cross-node-failover recovery
+            // alike): a shard freshly split off a parent (or several clone hops deep -- see
+            // ShardCloner#resolveLineageChain's own javadoc) has a manifest referencing bundle files
+            // that physically exist only in an ancestor's container until this shard republishes its
+            // own commit. Without this, every one of those read paths throws NoSuchFileException the
+            // moment anything tries to read such a manifest -- unlike TransportShardShrinkAction's
+            // own resolveShrinkSource, which already does this, these engine-construction read paths
+            // never did.
+            List<BlobContainer> lineageChain = org.opensearch.serverless.storage.clone.ShardCloner.resolveLineageChain(
+                blobContainer,
+                indexUuid,
+                shardIdValue,
+                this::resolveBlobContainer
+            );
             // Computed here, ahead of the reader/writer branch below, so both branches can schedule
             // their own PitrRetentionSchedulerTask -- previously this was only computed in the
             // writer branch, which meant PITR reconciliation (both adding new pins AND releasing
@@ -1612,7 +1657,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 );
                 ShardStateStore readerShardStateStore = new BlobContainerShardStateStore(readOnlyContainer);
                 BlobContainerManifestStore readerManifestStore = new BlobContainerManifestStore(readOnlyContainer);
-                BundleFileReader readPath = new BlobContainerBundleStore(readOnlyContainer);
+                BundleFileReader readPath = chainedBundleReadPath(readOnlyContainer, lineageChain);
                 if (localCacheRoot != null) {
                     // The cache layer (rfc-serverless-opensearch.md &sect;9): a reader shard
                     // re-fetches the same bundle files across queries far more often than a writer
@@ -1642,11 +1687,12 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                     : new CompactionSchedulerConfig(
                         compactionInterval,
                         manifestStore,
-                        // Straight to the raw bundle store, not the (possibly cache-wrapped) readPath
-                        // above -- a merge reads every input segment file exactly once, so there's no
-                        // hot-rereading benefit a cache would give, matching WriterEngineFactory's own
-                        // "no caching layer needed" choice for its own materializer.
-                        new ObjectStoreCommitMaterializer(bundleStore),
+                        // Straight to the raw bundle store (via the lineage-fallback-aware read path,
+                        // not the possibly-cache-wrapped readPath above) -- a merge reads every input
+                        // segment file exactly once, so there's no hot-rereading benefit a cache would
+                        // give, matching WriterEngineFactory's own "no caching layer needed" choice for
+                        // its own materializer.
+                        new ObjectStoreCommitMaterializer(chainedBundleReadPath(scopedContainer, lineageChain)),
                         commitPublisher,
                         CompactionPolicy.withDefaults(),
                         new CompactionRebaseExecutor(shardStateStore, 5)
@@ -1692,7 +1738,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                             partitionRewriteInterval,
                             new BlobContainerShardStateStore(blobContainer),
                             new BlobContainerManifestStore(blobContainer),
-                            new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer)),
+                            new ObjectStoreCommitMaterializer(chainedBundleReadPath(blobContainer, lineageChain)),
                             new ObjectStoreCommitPublisher(
                                 new BlobContainerBundleStore(blobContainer),
                                 new BlobContainerManifestStore(blobContainer)
@@ -1759,9 +1805,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                     writerWalChunkService,
                     // Cross-node failover materializes at most once per activation (rfc-serverless-opensearch.md
                     // &sect;7.1.2), not per-query like a reader shard -- no caching layer needed,
-                    // straight to the bundle store, matching the "caching is wired in for reader
-                    // shards only" note on the reader path just above.
-                    new ObjectStoreCommitMaterializer(bundleStore),
+                    // straight to the bundle store (via the lineage-fallback-aware read path), matching
+                    // the "caching is wired in for reader shards only" note on the reader path just
+                    // above.
+                    new ObjectStoreCommitMaterializer(chainedBundleReadPath(scopedContainer, lineageChain)),
                     // WAL-mirrored records get the same at-rest protection bundles/manifests already
                     // have when this is configured (&sect;12 bullet 1) -- null (the default) leaves
                     // WAL mirroring's own on/off switch (sharedWalChunkService being non-null) as the
