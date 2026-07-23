@@ -8,6 +8,8 @@
 
 package org.opensearch.serverless.storage.wal;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.index.translog.Translog;
@@ -40,6 +42,8 @@ import java.util.List;
  * real-kill proof).
  */
 public final class WalReplayRecovery {
+
+    private static final Logger logger = LogManager.getLogger(WalReplayRecovery.class);
 
     private WalReplayRecovery() {}
 
@@ -127,15 +131,34 @@ public final class WalReplayRecovery {
             return List.of();
         }
 
+        List<Long> chunkSequences = listChunkSequencesInRange(walBlobContainer, fromChunkSequenceInclusive, activationWalPosition);
         List<Translog.Operation> operations = new ArrayList<>();
-        for (long chunkSequence : listChunkSequencesInRange(walBlobContainer, fromChunkSequenceInclusive, activationWalPosition)) {
+        for (int i = 0; i < chunkSequences.size(); i++) {
+            long chunkSequence = chunkSequences.get(i);
             byte[] chunkBytes = readChunkBytes(walBlobContainer, chunkSequence);
-            List<WalRecord> records = WalChunkReader.filterByShardAndMinimumTerm(
-                WalChunkReader.readRecords(chunkBytes),
-                indexUuid,
-                shardId,
-                minPrimaryTerm
-            );
+            List<WalRecord> rawRecords;
+            try {
+                rawRecords = WalChunkReader.readRecords(chunkBytes);
+            } catch (WalFormatException e) {
+                // A torn/corrupt chunk at the very end of the range this writer would replay is
+                // indistinguishable from an in-flight write that crashed mid-append (the last chunk
+                // sequence a predecessor was writing when it died, never fully flushed) -- treat it
+                // as "nothing more was durably written," not a fatal error, and stop replay here
+                // rather than failing the whole recovery over a write this shard's own activation
+                // never depended on completing. A torn chunk anywhere else in the range is real
+                // corruption of a chunk some LATER chunk was written after, so it must fail loudly.
+                if (i == chunkSequences.size() - 1) {
+                    logger.warn(
+                        "WAL chunk {} (the last chunk in this replay range) is corrupt or truncated -- "
+                            + "treating it as an incomplete tail write and stopping replay there",
+                        chunkSequence,
+                        e
+                    );
+                    break;
+                }
+                throw e;
+            }
+            List<WalRecord> records = WalChunkReader.filterByShardAndMinimumTerm(rawRecords, indexUuid, shardId, minPrimaryTerm);
             if (encryptionKeyProvider != null) {
                 records = WalRecordCrypto.decryptAll(records, encryptionKeyProvider);
             }

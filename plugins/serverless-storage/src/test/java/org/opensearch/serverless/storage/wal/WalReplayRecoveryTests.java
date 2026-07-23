@@ -219,6 +219,67 @@ public class WalReplayRecoveryTests extends OpenSearchTestCase {
         assertEquals(0L, operations.get(0).seqNo());
     }
 
+    // A torn/corrupt LAST chunk in the replay range is indistinguishable from a predecessor that
+    // crashed mid-append (the chunk it was writing when killed, never fully flushed) -- must be
+    // treated as "nothing more was durably written" and stop replay there, not fail the whole
+    // recovery over a write this shard's own activation never depended on completing.
+    public void testReplayStopsCleanlyAtATruncatedLastChunkInsteadOfFailingTheWholeRecovery() throws Exception {
+        BlobContainer blobContainer = newBlobContainer();
+        WalChunkService service = new WalChunkService(blobContainer, "epoch-0");
+
+        Translog.Index op0 = new Translog.Index("doc0", 0, 1, "src0".getBytes("UTF-8"));
+        Translog.Index op1 = new Translog.Index("doc1", 1, 1, "src1".getBytes("UTF-8"));
+
+        service.append(new WalRecord("idx", 0, 1, 0, serialize(op0)));
+        assertEquals(0, service.flush()); // a good, fully-written chunk.
+
+        service.append(new WalRecord("idx", 0, 1, 1, serialize(op1)));
+        assertEquals(1, service.flush()); // this one gets torn below, simulating a killed mid-write.
+
+        String blobName = WalChunkNaming.blobName("epoch-0", 1);
+        byte[] fullBytes;
+        try (InputStream in = blobContainer.readBlob(blobName)) {
+            fullBytes = in.readAllBytes();
+        }
+        byte[] truncated = java.util.Arrays.copyOf(fullBytes, fullBytes.length / 2);
+        blobContainer.writeBlob(blobName, new java.io.ByteArrayInputStream(truncated), truncated.length, false);
+
+        List<Translog.Operation> operations = WalReplayRecovery.replayOperations(blobContainer, "idx", 0, 1, null, 2);
+
+        assertEquals("only the good chunk's operation must be returned, not a thrown exception", 1, operations.size());
+        assertEquals(0L, operations.get(0).seqNo());
+    }
+
+    // The same torn-chunk condition, but NOT at the end of the replay range -- a later, intact
+    // chunk exists past it, so this is real corruption (data written after a corrupted chunk can't
+    // exist unless the corrupted chunk itself was once valid and later damaged) and must fail loudly
+    // rather than silently dropping a gap in the middle of the replayed sequence.
+    public void testReplayFailsLoudlyOnATruncatedChunkThatIsNotTheLastOne() throws Exception {
+        BlobContainer blobContainer = newBlobContainer();
+        WalChunkService service = new WalChunkService(blobContainer, "epoch-0");
+
+        Translog.Index op0 = new Translog.Index("doc0", 0, 1, "src0".getBytes("UTF-8"));
+        Translog.Index op1 = new Translog.Index("doc1", 1, 1, "src1".getBytes("UTF-8"));
+        Translog.Index op2 = new Translog.Index("doc2", 2, 1, "src2".getBytes("UTF-8"));
+
+        service.append(new WalRecord("idx", 0, 1, 0, serialize(op0)));
+        assertEquals(0, service.flush());
+        service.append(new WalRecord("idx", 0, 1, 1, serialize(op1))); // this one gets torn below.
+        assertEquals(1, service.flush());
+        service.append(new WalRecord("idx", 0, 1, 2, serialize(op2)));
+        assertEquals(2, service.flush()); // a good chunk AFTER the torn one.
+
+        String blobName = WalChunkNaming.blobName("epoch-0", 1);
+        byte[] fullBytes;
+        try (InputStream in = blobContainer.readBlob(blobName)) {
+            fullBytes = in.readAllBytes();
+        }
+        byte[] truncated = java.util.Arrays.copyOf(fullBytes, fullBytes.length / 2);
+        blobContainer.writeBlob(blobName, new java.io.ByteArrayInputStream(truncated), truncated.length, false);
+
+        expectThrows(WalFormatException.class, () -> WalReplayRecovery.replayOperations(blobContainer, "idx", 0, 1, null, 3));
+    }
+
     /** Fails the first {@code writeBlob} call, then delegates normally -- simulates a kill exactly between the CAS claim and the blob write. */
     private static final class OneShotFailingOnWriteBlobContainer extends RegisterDelegatingBlobContainer {
 
