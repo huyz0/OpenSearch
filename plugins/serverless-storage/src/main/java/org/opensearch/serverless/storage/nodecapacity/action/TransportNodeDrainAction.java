@@ -9,47 +9,82 @@
 package org.opensearch.serverless.storage.nodecapacity.action;
 
 import org.opensearch.action.support.ActionFilters;
-import org.opensearch.action.support.HandledTransportAction;
 import org.opensearch.action.support.clustermanager.AcknowledgedResponse;
+import org.opensearch.action.support.clustermanager.TransportClusterManagerNodeAction;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.block.ClusterBlockException;
+import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.serverless.storage.nodecapacity.DrainCoordinator;
-import org.opensearch.tasks.Task;
+import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
+
+import java.io.IOException;
 
 /**
  * The actual work behind {@link NodeDrainAction}: resolves the requested node id to its current
  * name (core's exclude filter matches on name, not id -- see {@link DrainCoordinator}), then starts
- * or cancels a drain. Not routed through a cluster-manager-only base class -- {@link
- * DrainCoordinator} submits its own cluster-state task, which core already routes to the
- * cluster-manager itself, so a second layer of forwarding here would be redundant.
+ * or cancels a drain. Always executed on the elected cluster-manager node -- see {@link
+ * NodeDrainRequest}'s own javadoc for why that indirection is required ({@link DrainCoordinator}
+ * mutates cluster state via a plain {@code ClusterService#submitStateUpdateTask} call, which throws
+ * {@code NotClusterManagerException} when invoked from a node that isn't currently the
+ * cluster-manager).
  */
-public class TransportNodeDrainAction extends HandledTransportAction<NodeDrainRequest, AcknowledgedResponse> {
+public class TransportNodeDrainAction extends TransportClusterManagerNodeAction<NodeDrainRequest, AcknowledgedResponse> {
 
-    private final ClusterService clusterService;
     private final DrainCoordinator drainCoordinator;
 
     /**
      * Creates the transport action.
      *
-     * @param transportService used by {@link HandledTransportAction} to register this action.
-     * @param actionFilters applied by {@link HandledTransportAction} around every request.
+     * @param transportService used by {@link TransportClusterManagerNodeAction} to register this action.
      * @param clusterService resolves the requested node id to its current name, and constructs this
      *                       node's {@link DrainCoordinator}.
+     * @param threadPool used by {@link TransportClusterManagerNodeAction}'s own base machinery.
+     * @param actionFilters applied by {@link TransportClusterManagerNodeAction} around every request.
+     * @param indexNameExpressionResolver required by {@link TransportClusterManagerNodeAction}'s constructor, unused here.
      */
     @Inject
-    public TransportNodeDrainAction(TransportService transportService, ActionFilters actionFilters, ClusterService clusterService) {
-        super(NodeDrainAction.NAME, transportService, actionFilters, NodeDrainRequest::new);
-        this.clusterService = clusterService;
+    public TransportNodeDrainAction(
+        TransportService transportService,
+        ClusterService clusterService,
+        ThreadPool threadPool,
+        ActionFilters actionFilters,
+        IndexNameExpressionResolver indexNameExpressionResolver
+    ) {
+        super(
+            NodeDrainAction.NAME,
+            transportService,
+            clusterService,
+            threadPool,
+            actionFilters,
+            NodeDrainRequest::new,
+            indexNameExpressionResolver
+        );
         this.drainCoordinator = new DrainCoordinator(clusterService);
     }
 
     @Override
-    protected void doExecute(Task task, NodeDrainRequest request, ActionListener<AcknowledgedResponse> listener) {
-        ClusterState state = clusterService.state();
+    protected String executor() {
+        return ThreadPool.Names.SAME;
+    }
+
+    @Override
+    protected ClusterBlockException checkBlock(NodeDrainRequest request, ClusterState state) {
+        return null;
+    }
+
+    @Override
+    protected AcknowledgedResponse read(StreamInput in) throws IOException {
+        return new AcknowledgedResponse(in);
+    }
+
+    @Override
+    protected void clusterManagerOperation(NodeDrainRequest request, ClusterState state, ActionListener<AcknowledgedResponse> listener) {
         DiscoveryNode node = state.nodes().get(request.nodeId());
         if (node == null) {
             listener.onFailure(new IllegalArgumentException("no such node: " + request.nodeId()));

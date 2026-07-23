@@ -1337,7 +1337,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 threadPool,
                 selfWarmupEvalInterval,
                 clusterService,
-                new org.opensearch.serverless.storage.nodecapacity.NodeWarmupCoordinator(clusterService),
+                client,
                 SERVERLESS_STORAGE_NODE_SELF_WARMUP_AUTO_CLEAR_DELAY_SETTING.get(environment.settings())
             );
         }

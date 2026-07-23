@@ -8,8 +8,8 @@
 
 package org.opensearch.serverless.storage.nodecapacity.action;
 
-import org.opensearch.action.ActionRequest;
 import org.opensearch.action.ActionRequestValidationException;
+import org.opensearch.action.support.clustermanager.ClusterManagerNodeRequest;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 
@@ -17,8 +17,16 @@ import java.io.IOException;
 
 import static org.opensearch.action.ValidateActions.addValidationError;
 
-/** Requests a warmup mark start ({@link #warming()} {@code true}) or clear ({@code false}) for one node. */
-public class NodeWarmupRequest extends ActionRequest {
+/**
+ * Requests a warmup mark start ({@link #warming()} {@code true}) or clear ({@code false}) for one
+ * node. A {@link ClusterManagerNodeRequest} because {@code NodeWarmupCoordinator} mutates cluster
+ * state via a plain {@code ClusterService#submitStateUpdateTask} call, which throws {@code
+ * NotClusterManagerException} when invoked from a node that isn't currently the cluster-manager --
+ * {@link org.opensearch.action.support.clustermanager.TransportClusterManagerNodeAction} is what
+ * transparently forwards this request to whichever node actually is, rather than every caller
+ * needing to know or care (mirrors {@code ReactivateShardsRequest}'s identical reasoning).
+ */
+public class NodeWarmupRequest extends ClusterManagerNodeRequest<NodeWarmupRequest> {
 
     private final String nodeId;
     private final boolean warming;

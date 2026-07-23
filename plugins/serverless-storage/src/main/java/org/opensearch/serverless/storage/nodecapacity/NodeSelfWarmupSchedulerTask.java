@@ -10,14 +10,18 @@ package org.opensearch.serverless.storage.nodecapacity;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.action.support.clustermanager.AcknowledgedResponse;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.serverless.storage.allocation.ReaderShardPlacementAllocationDecider;
+import org.opensearch.serverless.storage.nodecapacity.action.NodeWarmupAction;
+import org.opensearch.serverless.storage.nodecapacity.action.NodeWarmupRequest;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.transport.client.Client;
 
 import java.io.Closeable;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -41,14 +45,21 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *
  * <p>Runs on every reader-role node (not cluster-manager-only, unlike this package's other
  * scheduled tasks) -- self-marking is inherently local-node work, there is nothing to fan out or
- * deduplicate across the cluster.
+ * deduplicate across the cluster. Dispatches through {@link NodeWarmupAction} via {@code client}
+ * rather than calling {@link NodeWarmupCoordinator} directly, deliberately: {@link
+ * NodeWarmupCoordinator} mutates cluster state via a plain {@code
+ * ClusterService#submitStateUpdateTask} call, which throws {@code NotClusterManagerException} when
+ * invoked from a node that isn't currently the cluster-manager -- exactly the node this task most
+ * often runs on, since it runs on every reader-role node, not just the cluster-manager. Routing
+ * through {@link NodeWarmupAction} (a {@code TransportClusterManagerNodeAction}) lets core
+ * transparently forward the request to whichever node actually is cluster-manager.
  */
 public final class NodeSelfWarmupSchedulerTask implements Closeable {
 
     private static final Logger logger = LogManager.getLogger(NodeSelfWarmupSchedulerTask.class);
 
     private final ClusterService clusterService;
-    private final NodeWarmupCoordinator coordinator;
+    private final Client client;
     private final TimeValue autoClearDelay;
     private final ThreadPool threadPool;
     private final Scheduler.Cancellable task;
@@ -63,7 +74,9 @@ public final class NodeSelfWarmupSchedulerTask implements Closeable {
      * @param interval how often to check whether this node still needs to self-mark.
      * @param clusterService supplies the cluster state this task reads the local node's attributes
      *                       and current warming set from.
-     * @param coordinator marks/clears this node's own warming status.
+     * @param client dispatches {@link NodeWarmupAction} requests to mark/clear this node's own
+     *               warming status -- see this class's own javadoc for why a direct {@link
+     *               NodeWarmupCoordinator} call isn't used here.
      * @param autoClearDelay how long after a successful self-mark to automatically clear it again --
      *                       {@link TimeValue#ZERO} (the default) means never auto-clear, leaving the
      *                       node warming until something external clears it, exactly like today's
@@ -75,12 +88,12 @@ public final class NodeSelfWarmupSchedulerTask implements Closeable {
         ThreadPool threadPool,
         TimeValue interval,
         ClusterService clusterService,
-        NodeWarmupCoordinator coordinator,
+        Client client,
         TimeValue autoClearDelay
     ) {
         this.threadPool = threadPool;
         this.clusterService = clusterService;
-        this.coordinator = coordinator;
+        this.client = client;
         this.autoClearDelay = autoClearDelay;
         this.task = threadPool.scheduleWithFixedDelay(this::evaluateSafely, interval, ThreadPool.Names.GENERIC);
     }
@@ -120,14 +133,14 @@ public final class NodeSelfWarmupSchedulerTask implements Closeable {
             return; // a previous tick's mark call hasn't completed yet.
         }
         String nodeName = localNode.getName();
-        coordinator.markWarming(nodeName, new ActionListener<>() {
+        client.execute(NodeWarmupAction.INSTANCE, new NodeWarmupRequest(localNode.getId(), true), new ActionListener<>() {
             @Override
-            public void onResponse(Void response) {
+            public void onResponse(AcknowledgedResponse response) {
                 markAttemptInFlight.set(false);
                 selfMarked = true;
                 logger.info("self-marked this node [{}] as warming before it enters reader shard rotation", nodeName);
                 if (autoClearDelay.millis() > 0) {
-                    threadPool.schedule(() -> autoClear(nodeName), autoClearDelay, ThreadPool.Names.GENERIC);
+                    threadPool.schedule(() -> autoClear(localNode.getId(), nodeName), autoClearDelay, ThreadPool.Names.GENERIC);
                 }
             }
 
@@ -139,10 +152,15 @@ public final class NodeSelfWarmupSchedulerTask implements Closeable {
         });
     }
 
-    private void autoClear(String nodeName) {
-        coordinator.clearWarming(nodeName, ActionListener.wrap(response -> {
-            logger.info("auto-cleared this node [{}]'s warming status after the configured delay", nodeName);
-        }, e -> logger.warn("failed to auto-clear this node [" + nodeName + "]'s warming status", e)));
+    private void autoClear(String nodeId, String nodeName) {
+        client.execute(
+            NodeWarmupAction.INSTANCE,
+            new NodeWarmupRequest(nodeId, false),
+            ActionListener.wrap(
+                response -> logger.info("auto-cleared this node [{}]'s warming status after the configured delay", nodeName),
+                e -> logger.warn("failed to auto-clear this node [" + nodeName + "]'s warming status", e)
+            )
+        );
     }
 
     /** Invokes {@link #evaluate()} synchronously -- test-only visibility. */
