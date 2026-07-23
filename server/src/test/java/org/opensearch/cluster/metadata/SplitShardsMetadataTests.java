@@ -1587,6 +1587,31 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
         assertTrue(e.getMessage().contains("has not been split"));
     }
 
+    /**
+     * Regression test: canMergeChildrenBackToParent exists specifically so a caller (e.g. an
+     * automatic merge-trigger policy) can screen a candidate parent without provoking
+     * startMergeChildrenToParent's own IllegalArgumentException. Once a merge is already pending
+     * for a parent, that primitive throws ("already in progress") -- the screening predicate must
+     * therefore also report false for that same parent, or a caller relying on it as a pre-check
+     * would call straight into the exception it exists to let them avoid.
+     */
+    public void testCanMergeChildrenBackToParentIsFalseOnceAMergeIsPending() {
+        SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
+        builder.splitShard(0, 2);
+        builder.updateSplitMetadataForChildShards(0, Set.of(3, 4));
+        assertTrue("mergeable before any merge is started", builder.build().canMergeChildrenBackToParent(0));
+
+        builder.startMergeChildrenToParent(0);
+        SplitShardsMetadata pending = builder.build();
+
+        assertFalse("must not report mergeable while a merge is already pending", pending.canMergeChildrenBackToParent(0));
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> new SplitShardsMetadata.Builder(pending).startMergeChildrenToParent(0)
+        );
+        assertTrue(e.getMessage().contains("already in progress"));
+    }
+
     public void testStreamSerdePendingMergeRoundTrip() throws IOException {
         SplitShardsMetadata.Builder builder = new SplitShardsMetadata.Builder(3);
         builder.splitShard(0, 2);

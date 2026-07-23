@@ -848,22 +848,26 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
     }
 
     /**
-     * Non-mutating counterpart to {@link Builder#mergeChildrenBackToParent(int)}: reports whether an
-     * in-place merge of {@code parentShardId}'s children back into it would satisfy every split-level
-     * precondition that primitive enforces, {@code true} only if it would (so a caller -- e.g. an
-     * automatic merge-trigger policy -- can screen candidate parents without provoking the primitive's
-     * {@link IllegalArgumentException} just to discover ineligibility). Mirrors that primitive's own
-     * checks exactly: {@code parentShardId} must be an original root shard, must currently be split,
-     * must not still be mid-split, and none of its direct children may have been split further (or be
-     * mid-split themselves). Deliberately does <em>not</em> check per-child routing liveness (started,
-     * non-relocating primaries) -- that's a routing-table concern the merge service validates
-     * separately, not a {@link SplitShardsMetadata} one.
+     * Non-mutating counterpart to {@link Builder#startMergeChildrenToParent(int)} (and, by extension,
+     * {@link Builder#mergeChildrenBackToParent(int)}): reports whether starting an in-place merge of
+     * {@code parentShardId}'s children back into it would satisfy every precondition those primitives
+     * enforce, {@code true} only if it would (so a caller -- e.g. an automatic merge-trigger policy --
+     * can screen candidate parents without provoking either primitive's {@link IllegalArgumentException}
+     * just to discover ineligibility). Mirrors those primitives' own checks exactly: {@code parentShardId}
+     * must be an original root shard, must currently be split, must not still be mid-split, must not
+     * already have an in-place merge pending, and none of its direct children may have been split
+     * further (or be mid-split themselves). Deliberately does <em>not</em> check per-child routing
+     * liveness (started, non-relocating primaries) -- that's a routing-table concern the merge service
+     * validates separately, not a {@link SplitShardsMetadata} one.
      */
     public boolean canMergeChildrenBackToParent(int parentShardId) {
         if (parentShardId < 0 || parentShardId >= rootShardsToAllChildren.length) {
             return false;
         }
         if (inProgressSplitShardIds.contains(parentShardId)) {
+            return false;
+        }
+        if (inProgressMergeParentShardIds.contains(parentShardId)) {
             return false;
         }
         ShardRange[] children = parentToChildShards.get(parentShardId);
