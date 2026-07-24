@@ -15,6 +15,7 @@ import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.zip.CRC32C;
+import java.util.zip.CheckedOutputStream;
 
 /**
  * Serializes a group-committed batch of {@link WalRecord}s from potentially many shards on one
@@ -49,13 +50,20 @@ public final class WalChunkWriter {
     /**
      * Serializes {@code records} into a single chunk blob's bytes, per this class's wire format.
      *
+     * <p>Computes the trailing checksum incrementally as the body is written (via {@link
+     * CheckedOutputStream}) rather than in a separate pass over a fully-materialized copy of the
+     * body -- for a large group-commit batch, re-copying the whole body just to checksum it would
+     * double the allocation/copy cost of every flush for no reason; {@link ByteArrayOutputStream
+     * #toByteArray()} is called exactly once, at the very end, to hand back the final result.
+     *
      * @param records the records to serialize, in append order
      * @return the serialized chunk bytes, including header, records, and trailing checksum
      */
     public static byte[] write(List<WalRecord> records) {
         try {
             ByteArrayOutputStream buf = new ByteArrayOutputStream();
-            DataOutputStream out = new DataOutputStream(buf);
+            CRC32C crc = new CRC32C();
+            DataOutputStream out = new DataOutputStream(new CheckedOutputStream(buf, crc));
 
             out.write(MAGIC);
             out.writeInt(FORMAT_VERSION);
@@ -76,11 +84,11 @@ public final class WalChunkWriter {
             }
             out.flush();
 
-            CRC32C crc = new CRC32C();
-            byte[] bodyBytes = buf.toByteArray();
-            crc.update(bodyBytes);
-            out.writeLong(crc.getValue());
-            out.flush();
+            // The checksum itself must not be covered by its own value -- written directly to
+            // `buf`, bypassing the checked stream above.
+            DataOutputStream trailer = new DataOutputStream(buf);
+            trailer.writeLong(crc.getValue());
+            trailer.flush();
 
             return buf.toByteArray();
         } catch (IOException e) {
