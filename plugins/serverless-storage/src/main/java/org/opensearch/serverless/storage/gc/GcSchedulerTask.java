@@ -167,6 +167,16 @@ public final class GcSchedulerTask implements Closeable {
             durablyPinnedManifests
         );
         Set<String> liveBundles = BundleReferenceCounter.computeLiveBundles(retainedManifests);
+        // Unlike manifestStore.listManifests(manifestReadCache) above, this can't be given the same
+        // read-caching treatment: a manifest's BODY is immutable once written, so caching it across
+        // ticks is safe, but a bundle's EXISTENCE is exactly what this call needs fresh every tick --
+        // this same sweep is what deletes bundles, so a stale cached name set could either miss a
+        // bundle this sweep itself already removed (harmless, just wasted work re-checking a name
+        // that's already gone) or, worse, miss one written since the last tick (a real correctness
+        // gap in orphan detection). There's also no cheaper way to ask for "just the bundles new
+        // since last time": BlobContainer#listBlobsByPrefix has no marker/cursor parameter to list
+        // incrementally, only a full prefix listing every call -- investigated and confirmed there is
+        // no plugin-scoped way to reduce this call's cost without extending that core interface.
         Set<String> allKnownBundles = bundleStore.listBundleNames();
         Set<String> orphanCandidateBundles = BundleReferenceCounter.computeDeletableBundles(allKnownBundles, liveBundles);
 
