@@ -242,6 +242,23 @@ public final class WalChunkService implements WalAppendTarget {
      * now regardless of whatever else was appended to the buffer while this attempt's I/O was in
      * flight.
      *
+     * <p><b>Releasing the lock lets two different shards' {@link #flush()} calls race on {@link
+     * #claimNextChunkSequence}, so their claimed chunk sequences can land out of "which call
+     * started first" order -- this is safe.</b> Nothing about correctness ever depended on chunk
+     * sequence order reflecting real time across <em>different</em> shards: replay is filtered
+     * per-shard ({@link WalChunkReader#filterByShardAndMinimumTerm}), and {@link
+     * #currentChunkSequenceUpperBound} fences on the register's live generation, not on any
+     * assumption about which in-flight claim finishes writing first -- a claim not yet made simply
+     * cannot be assigned a sequence below the current generation, by construction of the CAS
+     * counter itself. What genuinely must stay ordered -- one shard's own records never replaying
+     * out of the order they were originally appended in -- still does: {@link #flush} is
+     * synchronous (it blocks the caller until the write completes or exhausts retries), and {@code
+     * WalMirroringTranslog#add} calls {@link #append} then this method sequentially for every
+     * operation on that shard's own indexing thread, so operation N+1's append can never happen
+     * until operation N's flush -- claim included -- has fully completed. This is also not a new
+     * risk class: the group-commit batching path ({@code WalBatchingProcessor}) has always claimed
+     * its shared sequence outside of any single shard's own lock, for the identical reason.
+     *
      * @return the chunk sequence number written, or -1 if there was nothing to flush
      */
     @Override
