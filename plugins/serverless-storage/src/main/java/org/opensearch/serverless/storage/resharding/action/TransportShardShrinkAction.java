@@ -103,18 +103,21 @@ public class TransportShardShrinkAction extends HandledTransportAction<ShardShri
                     sources.add(resolveShrinkSource(sourceRef, request.targetIndexUuid(), request.targetShardId(), pendingPins));
                 }
 
-                // Credential scoping per tier (rfc-serverless-opensearch.md &sect;15): a shrink
-                // never deletes anything -- ShardShrinker#shrink only reads sources and publishes
-                // a new target commit -- so every container resolved here and in
-                // resolveShrinkSource is wrapped delete-denied.
+                // Credential scoping per tier (rfc-serverless-opensearch.md &sect;15): a shrink is
+                // not granted delete -- every container resolved here and in resolveShrinkSource is
+                // wrapped delete-denied. ShardShrinker#shrink does attempt a best-effort delete of
+                // its own target manifest on a lost head CAS, but that call is expected to (and, on
+                // this delete-denied container, always does) fail and get swallowed -- see that
+                // method's own javadoc for why this is fine, not a correctness gap.
                 BlobContainer targetContainer = new RestrictingBlobContainer(
                     plugin.blobContainerForDirectoryFactory(request.targetIndexUuid(), request.targetShardId()),
                     false
                 );
                 ShardStateStore targetShardStateStore = new BlobContainerShardStateStore(targetContainer);
+                BlobContainerManifestStore targetManifestStore = new BlobContainerManifestStore(targetContainer);
                 ObjectStoreCommitPublisher targetCommitPublisher = new ObjectStoreCommitPublisher(
                     new BlobContainerBundleStore(targetContainer),
-                    new BlobContainerManifestStore(targetContainer)
+                    targetManifestStore
                 );
 
                 ShardShrinker.shrink(
@@ -123,6 +126,7 @@ public class TransportShardShrinkAction extends HandledTransportAction<ShardShri
                     request.targetShardId(),
                     targetShardStateStore,
                     targetCommitPublisher,
+                    targetManifestStore,
                     threadPool.absoluteTimeInMillis()
                 );
                 listener.onResponse(new ShardShrinkResponse(true));

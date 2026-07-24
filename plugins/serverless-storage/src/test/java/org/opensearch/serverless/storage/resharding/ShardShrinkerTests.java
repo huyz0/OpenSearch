@@ -50,6 +50,7 @@ public class ShardShrinkerTests extends OpenSearchTestCase {
 
     private BlobContainer targetContainer;
     private ShardStateStore targetShardStateStore;
+    private BlobContainerManifestStore targetManifestStore;
     private ObjectStoreCommitPublisher targetCommitPublisher;
 
     @Override
@@ -58,10 +59,8 @@ public class ShardShrinkerTests extends OpenSearchTestCase {
         FsBlobStore targetBlobStore = new FsBlobStore(1024, createTempDir(), false);
         targetContainer = new FsBlobContainer(targetBlobStore, BlobPath.cleanPath(), targetBlobStore.path());
         targetShardStateStore = new BlobContainerShardStateStore(targetContainer);
-        targetCommitPublisher = new ObjectStoreCommitPublisher(
-            new BlobContainerBundleStore(targetContainer),
-            new BlobContainerManifestStore(targetContainer)
-        );
+        targetManifestStore = new BlobContainerManifestStore(targetContainer);
+        targetCommitPublisher = new ObjectStoreCommitPublisher(new BlobContainerBundleStore(targetContainer), targetManifestStore);
     }
 
     private ShrinkSource publishSource(String indexUuid, int startId, int count, long maxSeqNo, long mappingVersion) throws Exception {
@@ -104,7 +103,15 @@ public class ShardShrinkerTests extends OpenSearchTestCase {
     public void testShrinkRejectsAnEmptySourceList() {
         expectThrows(
             java.io.IOException.class,
-            () -> ShardShrinker.shrink(List.of(), TARGET_INDEX_UUID, SHARD_ID, targetShardStateStore, targetCommitPublisher, 1L)
+            () -> ShardShrinker.shrink(
+                List.of(),
+                TARGET_INDEX_UUID,
+                SHARD_ID,
+                targetShardStateStore,
+                targetCommitPublisher,
+                targetManifestStore,
+                1L
+            )
         );
     }
 
@@ -119,11 +126,11 @@ public class ShardShrinkerTests extends OpenSearchTestCase {
             SHARD_ID,
             targetShardStateStore,
             targetCommitPublisher,
+            targetManifestStore,
             System.currentTimeMillis()
         );
 
         VersionedShardHead targetHead = targetShardStateStore.get(TARGET_INDEX_UUID, SHARD_ID).orElseThrow();
-        BlobContainerManifestStore targetManifestStore = new BlobContainerManifestStore(targetContainer);
         CommitManifest targetManifest = targetManifestStore.readManifest(
             targetHead.head().primaryTerm(),
             targetHead.head().latestManifestGeneration()
@@ -158,7 +165,53 @@ public class ShardShrinkerTests extends OpenSearchTestCase {
         sources.add(sourceB);
         expectThrows(
             java.io.IOException.class,
-            () -> ShardShrinker.shrink(sources, TARGET_INDEX_UUID, SHARD_ID, targetShardStateStore, targetCommitPublisher, 1L)
+            () -> ShardShrinker.shrink(
+                sources,
+                TARGET_INDEX_UUID,
+                SHARD_ID,
+                targetShardStateStore,
+                targetCommitPublisher,
+                targetManifestStore,
+                1L
+            )
+        );
+    }
+
+    public void testShrinkRollsBackItsOwnManifestWhenTheHeadCasLosesToAnUnrelatedWrite() throws Exception {
+        ShrinkSource sourceA = publishSource("shrink-source-a3", 0, 2, 1, 0);
+        ShrinkSource sourceB = publishSource("shrink-source-b3", 10, 2, 1, 0);
+
+        // Simulates "an ordinary index creation racing this call" (this method's own javadoc): some
+        // unrelated writer already established the target's real head before shrink's own CAS runs,
+        // at a DIFFERENT generation so shrink's own writeManifest at (1, 1) still lands successfully
+        // -- only the head CAS itself loses.
+        assertEquals(
+            CasResult.SUCCESS,
+            targetShardStateStore.compareAndSet(TARGET_INDEX_UUID, SHARD_ID, Optional.empty(), new ShardHead(1, null, 0L, 7))
+        );
+
+        List<ShrinkSource> sources = new ArrayList<>();
+        sources.add(sourceA);
+        sources.add(sourceB);
+        expectThrows(
+            java.io.IOException.class,
+            () -> ShardShrinker.shrink(
+                sources,
+                TARGET_INDEX_UUID,
+                SHARD_ID,
+                targetShardStateStore,
+                targetCommitPublisher,
+                targetManifestStore,
+                1L
+            )
+        );
+
+        // The test container here is a plain, unrestricted FsBlobContainer (unlike the real,
+        // delete-denied production wiring this method's own javadoc describes), so the best-effort
+        // rollback delete genuinely succeeds and should leave no stray manifest behind.
+        assertFalse(
+            "a lost head CAS must roll back this attempt's own orphaned manifest when delete is actually permitted",
+            targetManifestStore.manifestExists(1, 1)
         );
     }
 }

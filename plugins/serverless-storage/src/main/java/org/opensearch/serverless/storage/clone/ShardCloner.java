@@ -362,20 +362,33 @@ public final class ShardCloner {
             // this clone (e.g. an ordinary index creation racing this call, or a stale request
             // against an already-cloned target). Left in place, a failed attempt's lineage record
             // would misdescribe that unrelated, legitimate shard's origin forever, its pin would
-            // block the source shard's GC forever for a clone that will never exist, and -- the most
-            // dangerous of the three -- its stray manifest at (1, 1) would sit there ready for
-            // ObjectStoreCommitPublisher#publishCommit's own "manifest already exists at this (term,
-            // generation), return it unchanged" guard to silently hand this attempt's SOURCE shard's
-            // file references back to whatever later, genuinely first commit that unrelated target
-            // shard eventually makes at (1, 1) -- silent misdirection to the wrong segment files, not
-            // just a failed retry.
+            // block the source shard's GC forever for a clone that will never exist, and its stray
+            // manifest at (1, 1) would sit there for whatever later, genuinely first commit that
+            // unrelated target shard eventually makes at (1, 1).
             //
-            // Every rollback step below is best-effort and independently guarded: a failure in ANY
-            // one of them must never mask e, the real reason this attempt failed and the only thing
-            // the caller actually needs to see -- a rollback failure is attached to it as a
-            // suppressed exception (surfaced to anything that inspects the thrown exception in
-            // detail) rather than replacing it, and every other rollback step still runs regardless
-            // of whether an earlier one failed.
+            // That last one is now a loud failure, not silent corruption:
+            // ObjectStoreCommitPublisher#publishCommit's own idempotency guard used to trust ANY
+            // existing manifest at a given (term, generation) as "my own prior attempt" and hand it
+            // back unchanged -- which would have silently handed this attempt's SOURCE shard's file
+            // references to that unrelated commit. It now verifies the existing manifest's content
+            // actually matches before trusting it (see that method's own requireSameContent javadoc),
+            // so a foreign manifest like this one now makes the real commit fail loudly instead of
+            // silently adopting the wrong segment files.
+            //
+            // This rollback below is still worth attempting -- it is the only thing that can turn
+            // that loud failure back into a working shard -- but cannot be relied on for correctness
+            // by itself: the caller's target container is deliberately delete-denied
+            // (rfc-serverless-opensearch.md &sect;15), so in the real, deployed wiring the manifest
+            // delete below throws SecurityException and is swallowed same as every other step here,
+            // leaving the target genuinely stuck (loudly failing every commit attempt) until the
+            // orphaned manifest is reclaimed by some other means -- see ShardShrinker#shrink's own
+            // javadoc for why GcSchedulerTask cannot do that today either. Every rollback step below
+            // is nonetheless best-effort and independently guarded: a failure in ANY one of them must
+            // never mask e, the real reason this attempt failed and the only thing the caller
+            // actually needs to see -- a rollback failure is attached to it as a suppressed exception
+            // (surfaced to anything that inspects the thrown exception in detail) rather than
+            // replacing it, and every other rollback step still runs regardless of whether an earlier
+            // one failed.
             //
             // The pin is always attempted, regardless of which later step (if any) actually ran:
             // removePin(String, int, PinRecord) is an exact-match compare-and-remove (see that

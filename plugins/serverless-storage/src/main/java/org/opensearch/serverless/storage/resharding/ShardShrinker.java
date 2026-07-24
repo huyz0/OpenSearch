@@ -13,6 +13,7 @@ import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.store.ByteBuffersDirectory;
 import org.apache.lucene.store.Directory;
+import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.manifest.CommitManifest;
 import org.opensearch.serverless.storage.manifest.PruningStats;
 import org.opensearch.serverless.storage.readerengine.ObjectStoreCommitMaterializer;
@@ -62,6 +63,26 @@ import java.util.Optional;
  * how {@code ManifestRetentionPolicy} and friends already treat these fields as monotonic
  * watermarks, never as an exact merged-history reconstruction) and does not attempt to carry
  * forward any source's WAL position at all (there is no coherent one).
+ *
+ * <p><b>A lost target head CAS leaves the merged manifest this call already published in place,
+ * genuinely orphaned</b> -- the same {@code (1, 1)} target-generation collision {@link
+ * org.opensearch.serverless.storage.clone.ShardCloner#clone}'s own javadoc documents (e.g. an
+ * ordinary index creation racing this call). This method attempts a best-effort delete of that
+ * manifest on CAS failure, same shape as {@code ShardCloner}'s own rollback, but it is exactly as
+ * unreliable in the real, deployed system: the caller's target container is wrapped delete-denied
+ * (rfc-serverless-opensearch.md &sect;15), so the delete throws {@code SecurityException} and is
+ * swallowed as a suppressed exception every time in production -- this is dead-code-in-practice
+ * cleanup, kept only because it is free and genuinely works wherever delete happens to be allowed
+ * (e.g. an unrestricted test container). What actually prevents this orphan from silently
+ * corrupting whatever legitimately becomes this shard's real first commit is {@link
+ * ObjectStoreCommitPublisher#publishCommit}'s own content-verification guard, not this rollback --
+ * see that method's {@code requireSameContent} javadoc. The residual risk once that guard is in
+ * place is availability, not correctness: the real writer's own first-commit publish now fails
+ * loudly (content mismatch) instead of silently adopting the wrong segment files, but the shard
+ * stays stuck until the orphaned manifest is reclaimed -- which {@code GcSchedulerTask} cannot do
+ * on its own today, since a manifest that was never superseded by anything newer is unconditionally
+ * retained by {@code ManifestRetentionPolicy}'s "the current-latest manifest can never be deleted"
+ * rule, regardless of whether any shard head ever actually referenced it.
  */
 public final class ShardShrinker {
 
@@ -103,6 +124,10 @@ public final class ShardShrinker {
      * @param targetShardId the shard number within {@code targetIndexUuid}.
      * @param targetShardStateStore where the target shard's new head is published.
      * @param targetCommitPublisher publishes the merged result as the target's first commit manifest.
+     * @param targetManifestStore the same store {@code targetCommitPublisher} itself writes through,
+     *                            passed separately only for this method's own best-effort rollback of
+     *                            that write on a lost head CAS -- see this method's own javadoc for
+     *                            why that rollback cannot be relied on for correctness by itself.
      * @param nowMillis the target manifest's {@code createdAtMillis} -- passed in rather than read
      *                  internally so this class stays trivially deterministic to test.
      * @throws IOException if {@code sources} is empty, materializing any source fails, or the
@@ -114,6 +139,7 @@ public final class ShardShrinker {
         int targetShardId,
         ShardStateStore targetShardStateStore,
         ObjectStoreCommitPublisher targetCommitPublisher,
+        BlobContainerManifestStore targetManifestStore,
         long nowMillis
     ) throws IOException {
         if (sources.isEmpty()) {
@@ -160,6 +186,19 @@ public final class ShardShrinker {
                     new ShardHead(1, null, 0L, targetManifest.generation())
                 );
                 if (result != CasResult.SUCCESS) {
+                    // Best-effort only -- see this method's own javadoc for why this delete is
+                    // expected to (and, in the real delete-denied production wiring, always does)
+                    // throw and get swallowed here rather than actually removing the manifest.
+                    try {
+                        targetManifestStore.deleteManifests(List.of(targetManifest));
+                    } catch (IOException | RuntimeException rollbackFailure) {
+                        // Intentionally not attached to the exception thrown below: unlike
+                        // ShardCloner's multi-step rollback (where a suppressed rollback failure is
+                        // genuinely useful diagnostic signal about which step failed), this is the
+                        // only rollback step here and its failure is the expected, common case under
+                        // normal credential scoping -- surfacing it on every ordinary CAS-loss would
+                        // just be noise on the actual failure this method needs to report.
+                    }
                     throw new IOException(
                         "target shard "
                             + targetIndexUuid
