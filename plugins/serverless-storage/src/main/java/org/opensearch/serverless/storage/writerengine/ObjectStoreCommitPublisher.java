@@ -68,10 +68,13 @@ public final class ObjectStoreCommitPublisher {
      * through a written manifest, so an unreferenced bundle is simply eligible for GC) rather than
      * a corruption -- never the reverse (a manifest referencing a bundle that failed to write).
      *
-     * <p>Idempotent under retry: a (primaryTerm, generation) pair uniquely identifies one Lucene
-     * commit, so if a manifest for it was already published (e.g. the caller timed out waiting for
-     * a first call that actually succeeded), this returns that existing manifest unchanged rather
-     * than re-uploading and overwriting the bundle.
+     * <p>Idempotent under retry, but only for a genuine retry of the exact same content: a
+     * (primaryTerm, generation) pair is meant to uniquely identify one Lucene commit, so if a
+     * manifest for it was already published (e.g. the caller timed out waiting for a first call
+     * that actually succeeded), this returns that existing manifest unchanged rather than
+     * re-uploading and overwriting the bundle -- but only after {@link #requireSameContent}
+     * confirms the existing manifest actually describes {@code segmentInfos}' own files, not some
+     * unrelated write that happens to occupy the same generation (see that method's own javadoc).
      *
      * @param directory the local Lucene {@link Directory} holding the files referenced by {@code segmentInfos}
      * @param segmentInfos the local Lucene commit to package
@@ -212,14 +215,16 @@ public final class ObjectStoreCommitPublisher {
         boolean quiescent,
         String bundleNameSuffix
     ) throws IOException {
-        if (manifestStore.manifestExists(primaryTerm, generation)) {
-            return manifestStore.readManifest(primaryTerm, generation);
-        }
-
         Collection<String> fileNames = segmentInfos.files(true);
         List<BundleFileContent> contents = new java.util.ArrayList<>(fileNames.size());
         for (String fileName : fileNames) {
             contents.add(new BundleFileContent(fileName, readFile(directory, fileName)));
+        }
+
+        if (manifestStore.manifestExists(primaryTerm, generation)) {
+            CommitManifest existing = manifestStore.readManifest(primaryTerm, generation);
+            requireSameContent(primaryTerm, generation, contents, existing);
+            return existing;
         }
 
         String bundleName = BlobContainerBundleStore.NAME_PREFIX
@@ -281,5 +286,65 @@ public final class ObjectStoreCommitPublisher {
             input.readBytes(bytes, 0, bytes.length);
             return bytes;
         }
+    }
+
+    /**
+     * Guards {@link #publishCommit}'s idempotency short-circuit: an existing manifest at {@code
+     * (primaryTerm, generation)} is only safe to trust as "this caller's own prior attempt" if it
+     * actually describes the same file content {@code candidate} is about to publish. Without this
+     * check, any caller that computes the same {@code (primaryTerm, generation)} as a completely
+     * unrelated, still-in-flight write elsewhere -- e.g. {@code ShardCloner} or {@code
+     * ShardShrinker} writing a brand-new target's very first commit at {@code (1, 1)}, which loses
+     * its own shard-head CAS afterward -- would silently receive that foreign manifest back and
+     * treat it as "my commit was already published," discarding its real content. {@code
+     * ShardCloner}/{@code ShardShrinker}'s own best-effort rollback of that stray manifest cannot be
+     * relied on to prevent this by itself: their target containers are deliberately delete-denied
+     * (rfc-serverless-opensearch.md &sect;15), so the rollback's delete call fails and is swallowed
+     * in the normal, production wiring -- this check is what actually keeps the wrong content from
+     * ever becoming durably referenced as this shard's head, independent of whether that best-effort
+     * cleanup happens to run.
+     *
+     * <p>Comparing local, already-in-memory checksums against the existing manifest's {@link
+     * FileReference#checksum()} values costs no additional object-store round trip beyond the
+     * {@code readManifest} the caller already just did -- {@code candidate} was built from the local
+     * {@link Directory} before this method is ever reached.
+     *
+     * @param primaryTerm the primary term being published under, used only for the error message.
+     * @param generation the manifest generation being published at, used only for the error message.
+     * @param candidate this call's own file content, as about to be bundled.
+     * @param existing the manifest already found at {@code (primaryTerm, generation)}.
+     * @throws IOException if {@code existing} does not describe the exact same set of files (by name,
+     *                      length, and checksum) as {@code candidate}.
+     */
+    private static void requireSameContent(long primaryTerm, long generation, List<BundleFileContent> candidate, CommitManifest existing)
+        throws IOException {
+        Map<String, FileReference> existingFiles = existing.files();
+        boolean matches = candidate.size() == existingFiles.size();
+        if (matches) {
+            for (BundleFileContent file : candidate) {
+                FileReference reference = existingFiles.get(file.name());
+                if (reference == null || reference.length() != file.content().length || reference.checksum() != checksum(file.content())) {
+                    matches = false;
+                    break;
+                }
+            }
+        }
+        if (matches == false) {
+            throw new IOException(
+                "manifest already exists at (primaryTerm="
+                    + primaryTerm
+                    + ", generation="
+                    + generation
+                    + ") with different content -- refusing to treat it as this caller's own idempotent retry "
+                    + "(likely a foreign write, e.g. a lost clone/shrink/split attempt, occupying this generation)"
+            );
+        }
+    }
+
+    /** Computes the CRC32C checksum of {@code data}, matching {@code BundleWriter}'s own per-file checksum. */
+    private static long checksum(byte[] data) {
+        java.util.zip.CRC32C crc = new java.util.zip.CRC32C();
+        crc.update(data);
+        return crc.getValue();
     }
 }

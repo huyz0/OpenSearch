@@ -246,6 +246,56 @@ public class ObjectStoreCommitPublisherTests extends OpenSearchTestCase {
         }
     }
 
+    public void testPublishAtAnAlreadyOccupiedGenerationWithDifferentContentThrowsInsteadOfReturningTheForeignManifest() throws Exception {
+        try (Directory foreignDirectory = new ByteBuffersDirectory(); Directory ownDirectory = new ByteBuffersDirectory()) {
+            // Simulates a foreign write already occupying (primaryTerm=1, generation=0) -- e.g. a
+            // lost ShardCloner/ShardShrinker attempt whose own head CAS never landed -- followed by
+            // this shard's own, unrelated genuine commit computing the exact same (primaryTerm,
+            // generation), the collision ShardCloner/ShardShrinker's own javadoc warns about.
+            SegmentInfos foreignSegmentInfos = commitTwoDocuments(foreignDirectory);
+            publisher.publishCommit(
+                foreignDirectory,
+                foreignSegmentInfos,
+                INDEX_UUID,
+                SHARD_ID,
+                1,
+                0,
+                1,
+                1,
+                new WalPosition("epoch-0", 0),
+                0,
+                PruningStats.empty()
+            );
+
+            IndexWriterConfig config = new IndexWriterConfig();
+            try (IndexWriter writer = new IndexWriter(ownDirectory, config)) {
+                Document doc = new Document();
+                doc.add(new StringField("id", "own-unique-doc", Field.Store.YES));
+                writer.addDocument(doc);
+                writer.commit();
+            }
+            SegmentInfos ownSegmentInfos = SegmentInfos.readLatestCommit(ownDirectory);
+
+            IOException thrown = expectThrows(
+                IOException.class,
+                () -> publisher.publishCommit(
+                    ownDirectory,
+                    ownSegmentInfos,
+                    INDEX_UUID,
+                    SHARD_ID,
+                    1,
+                    0,
+                    2,
+                    2,
+                    new WalPosition("epoch-0", 1),
+                    0,
+                    PruningStats.empty()
+                )
+            );
+            assertTrue(thrown.getMessage().contains("different content"));
+        }
+    }
+
     private static byte[] readFile(Directory directory, String fileName) throws IOException {
         try (IndexInput input = directory.openInput(fileName, IOContext.READONCE)) {
             byte[] bytes = new byte[(int) input.length()];
