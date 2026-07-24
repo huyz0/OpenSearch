@@ -85,8 +85,19 @@ public final class EncryptingBlobContainer extends RegisterDelegatingBlobContain
 
     @Override
     public InputStream readBlob(String blobName) throws IOException {
-        BlockLayout.Header header = readHeader(blobName);
-        return new ByteArrayInputStream(decryptRange(blobName, header, 0, header.totalPlaintextLength()));
+        // A single unranged fetch of the whole ciphertext object, not readHeader() followed by
+        // decryptRange()'s own separate ranged fetch -- those two calls together already cover
+        // the entire object (the header's own bytes, immediately followed by every block's own
+        // ciphertext, with no gap -- see BlockLayout#blockDiskOffset(0, ...) == HEADER_SIZE_BYTES),
+        // so doing them as two requests instead of one doubled the GET cost of every full-object
+        // read for no benefit. This is the manifest-read hot path whenever encryption is enabled
+        // (BlobContainerManifestStore#readBlob always uses this no-range overload), so the doubled
+        // cost was real, not theoretical.
+        byte[] wholeObject = readAllAndClose(delegate.readBlob(blobName));
+        BlockLayout.Header header = BlockLayout.decodeHeader(Arrays.copyOfRange(wholeObject, 0, BlockLayout.HEADER_SIZE_BYTES));
+        byte[] blockCiphertext = Arrays.copyOfRange(wholeObject, BlockLayout.HEADER_SIZE_BYTES, wholeObject.length);
+        int blockCount = BlockLayout.blockCount(header.blockSizeBytes(), header.totalPlaintextLength());
+        return new ByteArrayInputStream(decryptBlockRange(blockCiphertext, header, 0, blockCount - 1));
     }
 
     @Override
@@ -210,6 +221,21 @@ public final class EncryptingBlobContainer extends RegisterDelegatingBlobContain
         );
         byte[] rawBlocks = readAllAndClose(delegate.readBlob(blobName, diskStart, diskEnd - diskStart));
 
+        byte[] concatenated = decryptBlockRange(rawBlocks, header, firstBlock, lastBlock);
+        int sliceStart = (int) (position - (long) firstBlock * blockSize);
+        return Arrays.copyOfRange(concatenated, sliceStart, sliceStart + (int) length);
+    }
+
+    /**
+     * Decrypts blocks {@code [firstBlock, lastBlock]} (inclusive) given their raw, contiguous
+     * ciphertext bytes already in hand ({@code rawBlocks[0]} is the first byte of {@code
+     * firstBlock}'s own ciphertext) -- shared by both {@link #readBlob(String)} (the whole object,
+     * already fully fetched in one unranged call) and {@link #decryptRange} (just the blocks one
+     * ranged sub-fetch needs). Neither caller does any additional I/O here.
+     */
+    private byte[] decryptBlockRange(byte[] rawBlocks, BlockLayout.Header header, int firstBlock, int lastBlock) throws IOException {
+        int blockSize = header.blockSizeBytes();
+        long totalLength = header.totalPlaintextLength();
         ByteArrayOutputStream decryptedBlocks = new ByteArrayOutputStream();
         int cursor = 0;
         for (int blockIndex = firstBlock; blockIndex <= lastBlock; blockIndex++) {
@@ -218,9 +244,6 @@ public final class EncryptingBlobContainer extends RegisterDelegatingBlobContain
             decryptedBlocks.write(AesGcmCipher.decrypt(blockCiphertext, keyProvider.currentKey()));
             cursor += cipherLen;
         }
-
-        byte[] concatenated = decryptedBlocks.toByteArray();
-        int sliceStart = (int) (position - (long) firstBlock * blockSize);
-        return Arrays.copyOfRange(concatenated, sliceStart, sliceStart + (int) length);
+        return decryptedBlocks.toByteArray();
     }
 }

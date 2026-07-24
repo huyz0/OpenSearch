@@ -171,6 +171,7 @@ public class EncryptingBlobContainerTests extends OpenSearchTestCase {
     private static final class RecordingBlobContainer extends FilterBlobContainer {
         private final BlobContainer delegate;
         final List<long[]> rangedReadCalls = new ArrayList<>();
+        int unrangedReadCalls = 0;
 
         RecordingBlobContainer(BlobContainer delegate) {
             super(delegate);
@@ -186,6 +187,12 @@ public class EncryptingBlobContainerTests extends OpenSearchTestCase {
         public InputStream readBlob(String blobName, long position, long length) throws IOException {
             rangedReadCalls.add(new long[] { position, length });
             return delegate.readBlob(blobName, position, length);
+        }
+
+        @Override
+        public InputStream readBlob(String blobName) throws IOException {
+            unrangedReadCalls++;
+            return delegate.readBlob(blobName);
         }
     }
 
@@ -215,6 +222,37 @@ public class EncryptingBlobContainerTests extends OpenSearchTestCase {
         assertEquals(0, recording.rangedReadCalls.get(0)[0]);
         long[] blockFetch = recording.rangedReadCalls.get(1);
         assertTrue("must fetch far less than the whole blob", blockFetch[1] < 100);
+    }
+
+    /**
+     * S3-efficiency regression test: readBlob(String) (no range) previously did readHeader()'s own
+     * ranged fetch followed by decryptRange()'s own separate ranged fetch -- two delegate round
+     * trips for what should be a single full-object read, doubling the GET cost of every full read
+     * (the manifest-read hot path whenever encryption is enabled).
+     */
+    public void testWholeBlobReadIssuesExactlyOneDelegateReadNotTwo() throws Exception {
+        RecordingBlobContainer recording = new RecordingBlobContainer(newFsBlobContainer());
+        int blockSize = 10;
+        EncryptingBlobContainer encrypting = new EncryptingBlobContainer(
+            recording,
+            new StaticEncryptionKeyProvider(newAesKey()),
+            blockSize
+        );
+
+        byte[] plaintext = new byte[1000]; // 100 blocks
+        for (int i = 0; i < plaintext.length; i++) {
+            plaintext[i] = (byte) i;
+        }
+        encrypting.writeBlob("blob-1", new java.io.ByteArrayInputStream(plaintext), plaintext.length, false);
+        recording.rangedReadCalls.clear();
+        recording.unrangedReadCalls = 0;
+
+        try (InputStream in = encrypting.readBlob("blob-1")) {
+            assertArrayEquals(plaintext, in.readAllBytes());
+        }
+
+        assertEquals("a full-object read must issue exactly one delegate call, not a header fetch plus a separate body fetch", 1, recording.unrangedReadCalls);
+        assertEquals("must not fall back to any ranged delegate read either", 0, recording.rangedReadCalls.size());
     }
 
     public void testRangedReadOfOneBlockSucceedsEvenIfADifferentBlockIsCorrupted() throws Exception {
