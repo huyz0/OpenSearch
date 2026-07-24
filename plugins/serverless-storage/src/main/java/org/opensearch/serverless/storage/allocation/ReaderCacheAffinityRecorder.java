@@ -40,9 +40,13 @@ import java.util.Map;
  * in that cycle (core's own batching), commonly many reader shards at once after a node restart,
  * rolling upgrade, or scale-up -- {@link Metadata.Builder#build()} is a full copy of every index in
  * the cluster's metadata, so submitting one task per shard would pay that cost once per shard
- * instead of once per batch. This groups updates by index first (each {@link IndexMetadata} is
- * rebuilt at most once per batch, however many of its shards started) and only builds a new {@link
- * Metadata} at all if at least one index actually changed.
+ * instead of once per batch. This groups updates by index first and only builds one new {@link
+ * Metadata} (and one new {@link ClusterState}) for the whole batch, at all, if at least one index
+ * actually changed -- the win this class exists for. Each touched {@link IndexMetadata} can still
+ * be rebuilt more than once within that single task, once per one of its own shards in the batch
+ * (see {@link ReaderCacheAffinityMetadata#withShardCacheAffinity}, called once per shard record);
+ * only the cluster-wide {@link Metadata} copy, the genuinely expensive part, is collapsed to once
+ * per batch rather than once per shard.
  */
 public final class ReaderCacheAffinityRecorder {
 
@@ -84,9 +88,9 @@ public final class ReaderCacheAffinityRecorder {
 
     /**
      * Records that every shard in {@code records} just started on its recorded node, as one batch:
-     * exactly one {@link ClusterStateUpdateTask}, and at most one rebuild per distinct {@link
-     * IndexMetadata} touched, regardless of how many shards in {@code records} belong to it -- see
-     * this class's own javadoc for why that matters. A no-op if {@code records} is empty.
+     * exactly one {@link ClusterStateUpdateTask}, and at most one rebuild of the whole cluster's
+     * {@link Metadata} -- see this class's own javadoc for why that, not the per-index {@link
+     * IndexMetadata} rebuild, is what actually matters here. A no-op if {@code records} is empty.
      *
      * @param records every reader shard that just started, and the node it started on.
      */
