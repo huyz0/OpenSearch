@@ -181,6 +181,29 @@ public class WalReplayRecoveryTests extends OpenSearchTestCase {
         assertEquals(List.of(1L, 2L, 3L), sequences);
     }
 
+    /**
+     * S3-efficiency regression test: this range lookup must never list the whole shared container --
+     * chunk sequences are a single counter shared across every shard using this container, so a full
+     * listing costs O(every live chunk from every shard, ever written), unrelated to how large this
+     * one replay's own range actually is. Probing each candidate sequence directly keeps the cost
+     * bounded to the range size instead.
+     */
+    public void testListChunkSequencesInRangeNeverListsTheWholeContainer() throws Exception {
+        BlobContainer blobContainer = newBlobContainer();
+        WalChunkService service = new WalChunkService(blobContainer, "epoch-0");
+        for (int i = 0; i < 5; i++) {
+            service.append(new WalRecord("idx", 0, 1, i, ("v" + i).getBytes("UTF-8")));
+            assertEquals(i, service.flush());
+        }
+
+        List<Long> sequences = WalReplayRecovery.listChunkSequencesInRange(
+            new ListBlobsByPrefixForbiddenBlobContainer(blobContainer),
+            1,
+            4
+        );
+        assertEquals(List.of(1L, 2L, 3L), sequences);
+    }
+
     // Kill-mid-WAL-chunk (rfc-serverless-opensearch.md &sect;17): WalChunkService#writeChunk is a
     // two-step write -- claimNextChunkSequence() durably advances the shared CAS register first,
     // then writeBlob() writes the chunk's actual content -- so a kill (or any hard fault) between
@@ -301,6 +324,25 @@ public class WalReplayRecoveryTests extends OpenSearchTestCase {
                 throw new IOException("injected kill-mid-WAL-chunk failure writing " + blobName);
             }
             super.writeBlob(blobName, inputStream, blobSize, failIfAlreadyExists);
+        }
+    }
+
+    /** Fails any call to {@code listBlobsByPrefix} -- proves a range lookup never falls back to listing the whole container. */
+    private static final class ListBlobsByPrefixForbiddenBlobContainer extends RegisterDelegatingBlobContainer {
+
+        ListBlobsByPrefixForbiddenBlobContainer(BlobContainer delegate) {
+            super(delegate);
+        }
+
+        @Override
+        protected BlobContainer wrapChild(BlobContainer child) {
+            return new ListBlobsByPrefixForbiddenBlobContainer(child);
+        }
+
+        @Override
+        public java.util.Map<String, org.opensearch.common.blobstore.BlobMetadata> listBlobsByPrefix(String blobNamePrefix)
+            throws IOException {
+            throw new AssertionError("listBlobsByPrefix must never be called by a range-bounded chunk lookup");
         }
     }
 }

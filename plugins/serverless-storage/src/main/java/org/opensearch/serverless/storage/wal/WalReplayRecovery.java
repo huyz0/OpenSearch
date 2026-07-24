@@ -19,7 +19,6 @@ import org.opensearch.serverless.storage.security.EncryptionKeyProvider;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 
 /**
@@ -169,16 +168,30 @@ public final class WalReplayRecovery {
         return operations;
     }
 
-    /** Package-visible for direct testing of the listing/range logic without needing real chunk bytes. */
+    /**
+     * Package-visible for direct testing of the listing/range logic without needing real chunk bytes.
+     *
+     * <p>Probes each candidate sequence in {@code [fromInclusive, uptoExclusive)} directly via
+     * {@link BlobContainer#blobExists}, rather than listing the entire shared container and
+     * filtering client-side. Chunk sequences are a single counter shared across every shard using
+     * this container (see {@code WalChunkService#claimNextChunkSequence}), so a full listing costs
+     * O(every live chunk from every shard sharing this container, ever written and not yet WAL-GC'd)
+     * -- unrelated entirely to how large the range one writer's own activation actually needs to
+     * replay is, and, unlike a manifest-body read, cannot be cached across calls (a chunk's mere
+     * existence, not its content, is what's being asked here, and this is the one-time question a
+     * replay asks at activation, not a repeated poll). One {@code blobExists} HEAD-shaped call per
+     * candidate sequence instead costs O(this replay's own range size) -- for the common case (a
+     * healthy failover replaying a short recent gap against a large, busy shared container), this is
+     * the far cheaper direction; a genuinely huge range is still bounded to that range's own size,
+     * never the whole container's history the way the listing this replaces was.
+     */
     static List<Long> listChunkSequencesInRange(BlobContainer walBlobContainer, long fromInclusive, long uptoExclusive) throws IOException {
         List<Long> sequences = new ArrayList<>();
-        for (String blobName : walBlobContainer.listBlobsByPrefix(WalChunkNaming.LOG_BLOB_PREFIX).keySet()) {
-            long chunkSequence = WalChunkNaming.parseChunkSequence(blobName);
-            if (chunkSequence >= fromInclusive && chunkSequence < uptoExclusive) {
-                sequences.add(chunkSequence);
+        for (long candidate = fromInclusive; candidate < uptoExclusive; candidate++) {
+            if (walBlobContainer.blobExists(WalChunkNaming.LOG_BLOB_PREFIX + candidate)) {
+                sequences.add(candidate);
             }
         }
-        Collections.sort(sequences);
         return sequences;
     }
 
