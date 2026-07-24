@@ -15,8 +15,12 @@ import org.opensearch.cluster.routing.RoutingTable;
 import org.opensearch.common.settings.Settings;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Random;
+import java.util.Set;
 
 /**
  * Standalone diagnostic, not a JMH benchmark: {@link TenantIndexRetentionBenchmark}'s
@@ -35,6 +39,8 @@ import java.util.Random;
  *   org.opensearch.benchmark.clusterstate.TenantIndexRetainedHeapEstimate full 200000
  * java -Xms4g -Xmx4g -cp <runtime classpath> \
  *   org.opensearch.benchmark.clusterstate.TenantIndexRetainedHeapEstimate compact 200000
+ * java -Xms4g -Xmx4g -cp <runtime classpath> \
+ *   org.opensearch.benchmark.clusterstate.TenantIndexRetainedHeapEstimate realistic 200000
  * }</pre>
  */
 public final class TenantIndexRetainedHeapEstimate {
@@ -43,7 +49,7 @@ public final class TenantIndexRetainedHeapEstimate {
 
     public static void main(String[] args) throws Exception {
         if (args.length < 2) {
-            System.err.println("usage: TenantIndexRetainedHeapEstimate <full|compact> <count>");
+            System.err.println("usage: TenantIndexRetainedHeapEstimate <full|compact|realistic> <count>");
             System.exit(1);
         }
         String mode = args[0];
@@ -102,8 +108,36 @@ public final class TenantIndexRetainedHeapEstimate {
                 list.add(new Object[] { indexMetadata, routingTable });
             } else if (mode.equals("compact")) {
                 list.add(new TenantIndexRetentionBenchmark.CompactTenantStub(name, uuid, 1, aliasName));
+            } else if (mode.equals("realistic")) {
+                Settings settings = Settings.builder()
+                    .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+                    .put(IndexMetadata.SETTING_INDEX_UUID, uuid)
+                    .build();
+                Map<String, AliasMetadata> aliases = new HashMap<>();
+                AliasMetadata alias = AliasMetadata.builder(aliasName).build();
+                aliases.put(alias.getAlias(), alias);
+                Map<Integer, Long> primaryTermsMap = new HashMap<>();
+                primaryTermsMap.put(0, 1L);
+                Map<Integer, Set<String>> inSyncAllocationIds = new HashMap<>();
+                inSyncAllocationIds.put(0, Collections.emptySet());
+                RealisticCompactTenantIndex compactIndex = new RealisticCompactTenantIndex(
+                    name,
+                    uuid,
+                    settings,
+                    aliases,
+                    1,
+                    0,
+                    primaryTermsMap,
+                    inSyncAllocationIds
+                );
+                RealisticCompactTenantIndex.CompactShardRouting shardRouting = new RealisticCompactTenantIndex.CompactShardRouting(
+                    0,
+                    null,
+                    true
+                );
+                list.add(new Object[] { compactIndex, shardRouting });
             } else {
-                throw new IllegalArgumentException("mode must be 'full' or 'compact', got: " + mode);
+                throw new IllegalArgumentException("mode must be 'full', 'compact', or 'realistic', got: " + mode);
             }
         }
         return list;
