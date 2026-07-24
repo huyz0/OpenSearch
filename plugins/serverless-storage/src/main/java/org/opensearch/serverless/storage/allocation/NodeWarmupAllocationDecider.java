@@ -9,6 +9,7 @@
 package org.opensearch.serverless.storage.allocation;
 
 import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.routing.RoutingNode;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.allocation.RoutingAllocation;
@@ -16,6 +17,8 @@ import org.opensearch.cluster.routing.allocation.decider.AllocationDecider;
 import org.opensearch.cluster.routing.allocation.decider.Decision;
 import org.opensearch.serverless.storage.ServerlessStoragePlugin;
 import org.opensearch.serverless.storage.nodecapacity.NodeWarmupCoordinator;
+
+import java.util.Set;
 
 /**
  * Withholds reader shard allocation from a node marked warming -- node autoscaling design doc part
@@ -36,8 +39,38 @@ public class NodeWarmupAllocationDecider extends AllocationDecider {
     /** The decider name this class is registered under. */
     public static final String NAME = "serverless_storage_node_warmup";
 
-    /** Creates a decider with no state; every decision is derived from cluster state passed to it per call. */
+    /**
+     * Memoizes the parsed warming-node-name set against the {@link Metadata} instance it was
+     * computed from -- {@code canAllocate} is invoked once per candidate node for every shard
+     * core considers placing in one reroute pass, and {@link NodeWarmupCoordinator
+     * #currentlyWarmingNames} otherwise re-splits the same comma-joined transient-setting string
+     * and rebuilds a {@link Set} from scratch on every single one of those calls, even though the
+     * warming set itself is unchanged for the whole pass.
+     */
+    private volatile MetadataWarmingNamesCache warmingNamesCache = new MetadataWarmingNamesCache(null, Set.of());
+
+    /** Creates a decider with no state beyond {@link #warmingNamesCache}; every decision is derived from cluster state passed to it per call. */
     public NodeWarmupAllocationDecider() {}
+
+    private Set<String> currentlyWarmingNames(Metadata metadata) {
+        MetadataWarmingNamesCache cache = warmingNamesCache;
+        if (cache.metadata != metadata) {
+            cache = new MetadataWarmingNamesCache(metadata, NodeWarmupCoordinator.currentlyWarmingNames(metadata));
+            warmingNamesCache = cache;
+        }
+        return cache.warmingNames;
+    }
+
+    /** Pairs a {@link Metadata} snapshot with the warming-node-name set parsed from it -- see {@link #warmingNamesCache}. */
+    private static final class MetadataWarmingNamesCache {
+        private final Metadata metadata;
+        private final Set<String> warmingNames;
+
+        MetadataWarmingNamesCache(Metadata metadata, Set<String> warmingNames) {
+            this.metadata = metadata;
+            this.warmingNames = warmingNames;
+        }
+    }
 
     @Override
     public Decision canAllocate(ShardRouting shardRouting, RoutingNode node, RoutingAllocation allocation) {
@@ -61,7 +94,7 @@ public class NodeWarmupAllocationDecider extends AllocationDecider {
         if (isServerlessStorageIndex == false) {
             return allocation.decision(Decision.YES, NAME, "index has not opted into serverless storage, no opinion");
         }
-        boolean nodeIsWarming = NodeWarmupCoordinator.currentlyWarmingNames(allocation.metadata()).contains(node.node().getName());
+        boolean nodeIsWarming = currentlyWarmingNames(allocation.metadata()).contains(node.node().getName());
         if (nodeIsWarming) {
             return allocation.decision(Decision.NO, NAME, "node is warming, not yet eligible for reader shard allocation");
         }

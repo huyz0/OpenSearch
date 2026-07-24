@@ -128,6 +128,45 @@ public class NodeWarmupAllocationDeciderTests extends OpenSearchAllocationTestCa
         assertEquals(Decision.Type.YES, decider.canAllocate(writerShard, warmingRoutingNode, allocation).type());
     }
 
+    /**
+     * Regression test for the decider's per-{@link Metadata}-snapshot warming-name cache: reusing
+     * the SAME decider instance (the real lifecycle -- one instance registered once, reused across
+     * every reroute for the node's lifetime) across two different {@link Metadata} snapshots must
+     * never serve a stale cached warming set from the first snapshot once the second is current.
+     */
+    public void testDeciderInstanceReusedAcrossMetadataChangesNeverServesAStaleWarmingSet() {
+        NodeWarmupAllocationDecider decider = new NodeWarmupAllocationDecider();
+
+        ClusterState notWarmingYet = buildClusterState(null);
+        RoutingAllocation firstAllocation = newAllocation(notWarmingYet);
+        RoutingNode warmingRoutingNode = notWarmingYet.getRoutingNodes().node("warming-node");
+        assertEquals(
+            "before the metadata change, the node is not yet marked warming",
+            Decision.Type.YES,
+            decider.canAllocate(readerShard(notWarmingYet), warmingRoutingNode, firstAllocation).type()
+        );
+
+        ClusterState nowWarming = buildClusterState("warming-node");
+        RoutingAllocation secondAllocation = newAllocation(nowWarming);
+        RoutingNode warmingRoutingNodeAfter = nowWarming.getRoutingNodes().node("warming-node");
+        assertEquals(
+            "after the metadata change, the SAME decider instance must see the new warming mark, not a cached empty set",
+            Decision.Type.NO,
+            decider.canAllocate(readerShard(nowWarming), warmingRoutingNodeAfter, secondAllocation).type()
+        );
+
+        // And back again -- a third, distinct Metadata instance (cleared warming set) must also be
+        // picked up correctly, not stuck on the second snapshot's cached result.
+        ClusterState warmingCleared = buildClusterState(null);
+        RoutingAllocation thirdAllocation = newAllocation(warmingCleared);
+        RoutingNode warmingRoutingNodeCleared = warmingCleared.getRoutingNodes().node("warming-node");
+        assertEquals(
+            "once cleared again, the same decider instance must reflect that too",
+            Decision.Type.YES,
+            decider.canAllocate(readerShard(warmingCleared), warmingRoutingNodeCleared, thirdAllocation).type()
+        );
+    }
+
     public void testCanRemainAlwaysAllowedRegardlessOfWarming() {
         // Phase 3 gates only new placement; a node that starts warming after a shard already landed
         // is not evicted (see the decider's own javadoc on canRemain).
