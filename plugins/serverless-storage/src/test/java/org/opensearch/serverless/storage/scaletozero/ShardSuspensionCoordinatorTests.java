@@ -12,6 +12,7 @@ import org.opensearch.Version;
 import org.opensearch.action.admin.cluster.reroute.ClusterRerouteRequest;
 import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.ClusterStateUpdateTask;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.routing.IndexRoutingTable;
@@ -21,10 +22,12 @@ import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.ShardRoutingState;
 import org.opensearch.cluster.routing.TestShardRouting;
 import org.opensearch.cluster.routing.allocation.command.CancelAllocationCommand;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.storage.ServerlessStoragePlugin;
+import org.opensearch.serverless.storage.allocation.SuspendedShardsMetadata;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.transport.client.AdminClient;
 import org.opensearch.transport.client.Client;
@@ -34,7 +37,9 @@ import java.util.List;
 import java.util.Map;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -91,6 +96,42 @@ public class ShardSuspensionCoordinatorTests extends OpenSearchTestCase {
         org.mockito.ArgumentCaptor<ClusterRerouteRequest> captor = org.mockito.ArgumentCaptor.forClass(ClusterRerouteRequest.class);
         verify(clusterAdminClient, times(1)).reroute(captor.capture(), any());
         assertEquals(1, captor.getValue().getCommands().commands().size());
+    }
+
+    /**
+     * Regression test: suspendCandidates/suspendReaderCandidates call suspend() once per candidate
+     * on every scheduler tick regardless of whether it's already suspended -- suspend() used to
+     * unconditionally submit a ClusterStateUpdateTask every time, even though most ticks in steady
+     * state find nothing new to do (the task's own execute() would just no-op). The cheap pre-check
+     * against already-known state must skip the submission entirely in that case.
+     */
+    public void testSuspendSkipsSubmittingAClusterStateTaskWhenAlreadySuspended() {
+        ClusterState state = buildClusterState(0);
+        IndexMetadata alreadySuspended = SuspendedShardsMetadata.withShardSuspended(state.metadata().index(INDEX_NAME), 0);
+        ClusterState suspendedState = ClusterState.builder(state)
+            .metadata(Metadata.builder(state.metadata()).put(alreadySuspended, true))
+            .build();
+
+        ClusterService clusterService = mock(ClusterService.class);
+        when(clusterService.state()).thenReturn(suspendedState);
+        ShardSuspensionCoordinator coordinator = new ShardSuspensionCoordinator(clusterService, client);
+
+        coordinator.suspendWriterShard(indexUuid(suspendedState), 0);
+
+        verify(clusterService, never()).submitStateUpdateTask(anyString(), any(ClusterStateUpdateTask.class));
+    }
+
+    /** Control: when the shard is genuinely not yet suspended, the pre-check must not skip the real submission. */
+    public void testSuspendStillSubmitsAClusterStateTaskWhenNotYetSuspended() {
+        ClusterState state = buildClusterState(0);
+
+        ClusterService clusterService = mock(ClusterService.class);
+        when(clusterService.state()).thenReturn(state);
+        ShardSuspensionCoordinator coordinator = new ShardSuspensionCoordinator(clusterService, client);
+
+        coordinator.suspendWriterShard(indexUuid(state), 0);
+
+        verify(clusterService, times(1)).submitStateUpdateTask(anyString(), any(ClusterStateUpdateTask.class));
     }
 
     private static String indexUuid(ClusterState state) {

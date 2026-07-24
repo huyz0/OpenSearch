@@ -167,6 +167,24 @@ public final class ShardSuspensionCoordinator {
     }
 
     private void suspend(String indexUuid, int shardId, boolean reader) {
+        // Cheap pre-check against whatever state is already locally known (no submission, no
+        // cluster-manager task-queue round trip): in steady state, most evaluated candidates on
+        // most ticks are already suspended, and suspendCandidates/suspendReaderCandidates call this
+        // once per candidate every single tick regardless. Skipping the submission entirely when
+        // it's already a no-op avoids that queueing overhead scaling with candidate count on every
+        // tick. Purely an optimization -- the authoritative check inside execute() below still runs
+        // for whatever this pre-check doesn't skip, so a stale read here (this coordinator's cached
+        // state momentarily behind reality) can only ever cause a harmless one-tick delay, never an
+        // incorrect suspend.
+        IndexMetadata preCheckMetadata = findByUuid(clusterService.state().metadata(), indexUuid);
+        if (preCheckMetadata != null) {
+            boolean alreadySuspendedPreCheck = reader
+                ? SuspendedShardsMetadata.isReaderSuspended(preCheckMetadata, shardId)
+                : SuspendedShardsMetadata.isSuspended(preCheckMetadata, shardId);
+            if (alreadySuspendedPreCheck) {
+                return;
+            }
+        }
         String role = reader ? "reader" : "writer";
         clusterService.submitStateUpdateTask("serverless-storage-suspend-shard", new ClusterStateUpdateTask(Priority.NORMAL) {
             @Override
