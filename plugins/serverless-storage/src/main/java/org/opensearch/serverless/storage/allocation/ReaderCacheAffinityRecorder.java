@@ -17,19 +17,32 @@ import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.Priority;
 
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
 /**
  * The "do the work" half of cache-locality hysteresis (rfc-serverless-opensearch.md &sect;10):
  * persists, via an ordinary {@link ClusterStateUpdateTask}, the node id a reader (search-only)
  * shard just successfully started on -- the same {@link IndexMetadata} custom-data mutation shape
  * {@code ShardSuspensionCoordinator} already uses for suspend/reactivate bookkeeping. {@link
- * ServerlessStorageExistingShardsAllocator#applyStartedShards} is this class's only caller, firing
- * once per reader shard that finishes starting.
+ * ServerlessStorageExistingShardsAllocator#applyStartedShards} is this class's only caller.
  *
  * <p>Deliberately fire-and-forget and best-effort: a failed or superseded update just means the
  * next real shard start (or the existing record's staleness) corrects it later. Losing one record
  * never breaks correctness -- {@link ReaderCacheAffinityMetadata} is consulted only as a placement
  * <em>preference</em>, never a requirement, so there's nothing here worth blocking, retrying with
  * backoff, or surfacing to a caller.
+ *
+ * <p><b>{@link #recordStarted(List)} batches one whole {@code applyStartedShards} call into a
+ * single {@link ClusterStateUpdateTask}</b>, not one task per shard: {@code
+ * applyStartedShards} itself is already called once per reroute with every shard that just started
+ * in that cycle (core's own batching), commonly many reader shards at once after a node restart,
+ * rolling upgrade, or scale-up -- {@link Metadata.Builder#build()} is a full copy of every index in
+ * the cluster's metadata, so submitting one task per shard would pay that cost once per shard
+ * instead of once per batch. This groups updates by index first (each {@link IndexMetadata} is
+ * rebuilt at most once per batch, however many of its shards started) and only builds a new {@link
+ * Metadata} at all if at least one index actually changed.
  */
 public final class ReaderCacheAffinityRecorder {
 
@@ -47,36 +60,78 @@ public final class ReaderCacheAffinityRecorder {
     }
 
     /**
+     * One reader shard's just-recorded start, as an element of a {@link #recordStarted(List)} batch.
+     *
+     * @param indexUuid the index the shard belongs to.
+     * @param shardId the shard number that started.
+     * @param nodeId the node id it started on.
+     */
+    public record ShardStartRecord(String indexUuid, int shardId, String nodeId) {}
+
+    /**
      * Records that {@code indexUuid}'s reader shard {@code shardId} just started on {@code
      * nodeId}, so a future reallocation of this shard prefers that node while its cache is
-     * presumed still warm. Idempotent in effect: {@link
-     * ReaderCacheAffinityMetadata#withShardCacheAffinity} is itself a no-op when the record is
-     * already current, so calling this on every shard start -- most of which will find nothing to
-     * change after the very first recording -- is cheap.
+     * presumed still warm. Equivalent to calling {@link #recordStarted(List)} with a single-element
+     * list -- prefer that overload when recording more than one shard at once.
      *
      * @param indexUuid the index the shard belongs to.
      * @param shardId the shard number that started.
      * @param nodeId the node id it started on.
      */
     public void recordStarted(String indexUuid, int shardId, String nodeId) {
+        recordStarted(List.of(new ShardStartRecord(indexUuid, shardId, nodeId)));
+    }
+
+    /**
+     * Records that every shard in {@code records} just started on its recorded node, as one batch:
+     * exactly one {@link ClusterStateUpdateTask}, and at most one rebuild per distinct {@link
+     * IndexMetadata} touched, regardless of how many shards in {@code records} belong to it -- see
+     * this class's own javadoc for why that matters. A no-op if {@code records} is empty.
+     *
+     * @param records every reader shard that just started, and the node it started on.
+     */
+    public void recordStarted(List<ShardStartRecord> records) {
+        if (records.isEmpty()) {
+            return;
+        }
         long nowMillis = System.currentTimeMillis();
         clusterService.submitStateUpdateTask("serverless-storage-record-reader-cache-affinity", new ClusterStateUpdateTask(Priority.LOW) {
             @Override
             public ClusterState execute(ClusterState currentState) {
-                IndexMetadata indexMetadata = findByUuid(currentState.metadata(), indexUuid);
-                if (indexMetadata == null) {
+                // LinkedHashMap purely for deterministic iteration order in tests -- correctness
+                // never depends on the order these are grouped or applied in.
+                Map<String, List<ShardStartRecord>> byIndexUuid = new LinkedHashMap<>();
+                for (ShardStartRecord record : records) {
+                    byIndexUuid.computeIfAbsent(record.indexUuid(), key -> new java.util.ArrayList<>()).add(record);
+                }
+
+                Metadata.Builder metadataBuilder = null;
+                for (Map.Entry<String, List<ShardStartRecord>> entry : byIndexUuid.entrySet()) {
+                    IndexMetadata indexMetadata = findByUuid(currentState.metadata(), entry.getKey());
+                    if (indexMetadata == null) {
+                        continue;
+                    }
+                    IndexMetadata updated = indexMetadata;
+                    for (ShardStartRecord record : entry.getValue()) {
+                        updated = ReaderCacheAffinityMetadata.withShardCacheAffinity(updated, record.shardId(), record.nodeId(), nowMillis);
+                    }
+                    if (updated != indexMetadata) {
+                        if (metadataBuilder == null) {
+                            metadataBuilder = Metadata.builder(currentState.metadata());
+                        }
+                        metadataBuilder.put(updated, true);
+                    }
+                }
+
+                if (metadataBuilder == null) {
                     return currentState;
                 }
-                IndexMetadata updated = ReaderCacheAffinityMetadata.withShardCacheAffinity(indexMetadata, shardId, nodeId, nowMillis);
-                if (updated == indexMetadata) {
-                    return currentState;
-                }
-                return ClusterState.builder(currentState).metadata(Metadata.builder(currentState.metadata()).put(updated, true)).build();
+                return ClusterState.builder(currentState).metadata(metadataBuilder).build();
             }
 
             @Override
             public void onFailure(String source, Exception e) {
-                logger.debug("failed to record serverless-storage reader cache affinity for shard [" + indexUuid + "][" + shardId + "]", e);
+                logger.debug("failed to record serverless-storage reader cache affinity for " + records.size() + " shard(s)", e);
             }
         });
     }

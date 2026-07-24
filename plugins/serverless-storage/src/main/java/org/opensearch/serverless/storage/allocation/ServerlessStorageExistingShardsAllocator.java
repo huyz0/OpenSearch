@@ -243,6 +243,10 @@ public final class ServerlessStorageExistingShardsAllocator implements ExistingS
         if (recorder == null) {
             return;
         }
+        // Collected into one batch and recorded with a single call, not one recordStarted() call
+        // per shard -- see ReaderCacheAffinityRecorder's own javadoc for why that matters once a
+        // reroute starts many reader shards at once (e.g. a node restart or scale-up).
+        List<ReaderCacheAffinityRecorder.ShardStartRecord> records = new java.util.ArrayList<>();
         for (ShardRouting shardRouting : startedShards) {
             if (shardRouting.isSearchOnly() == false) {
                 continue;
@@ -252,8 +256,11 @@ public final class ServerlessStorageExistingShardsAllocator implements ExistingS
                 || ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.get(indexMetadata.getSettings()) == false) {
                 continue;
             }
-            recorder.recordStarted(indexMetadata.getIndexUUID(), shardRouting.id(), shardRouting.currentNodeId());
+            records.add(
+                new ReaderCacheAffinityRecorder.ShardStartRecord(indexMetadata.getIndexUUID(), shardRouting.id(), shardRouting.currentNodeId())
+            );
         }
+        recorder.recordStarted(records);
     }
 
     @Override
