@@ -302,12 +302,26 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
                 // concurrently-running readFile call is still writing under the OLD lock object,
                 // letting a brand-new readFile call mint a second, unsynchronized lock for the same
                 // path and race the first writer on writeAtomically.
+                long actualSizeBeingDeleted;
                 synchronized (lockFor(entry.path)) {
+                    // Re-measured HERE, under the lock, rather than trusting entry.sizeBytes from
+                    // the listCacheEntries() snapshot taken before this loop even started: a
+                    // concurrent readFile call for this exact path could have replaced it (its own
+                    // corrupted-entry overwrite, see readFile's own comment) in the window between
+                    // that snapshot and this lock being acquired -- currentTotalBytes already
+                    // correctly absorbed that replacement's own net size change when it happened, so
+                    // subtracting the STALE snapshot size here instead of what's actually about to
+                    // be deleted would silently double-adjust the counter by the difference. Growing
+                    // that difference just wastes a future sweep (see maybeEvict's own javadoc on
+                    // why an inflated counter is harmless); shrinking it is the dangerous direction --
+                    // an under-counted currentTotalBytes could wrongly bail out of a sweep the
+                    // directory genuinely still needs.
+                    actualSizeBeingDeleted = Files.exists(entry.path) ? Files.size(entry.path) : 0L;
                     Files.deleteIfExists(entry.path);
                     locksByKey.remove(entry.path.toString());
                 }
                 totalBytes -= entry.sizeBytes;
-                currentTotalBytes.addAndGet(-entry.sizeBytes);
+                currentTotalBytes.addAndGet(-actualSizeBeingDeleted);
                 evictedCount.incrementAndGet();
             } catch (IOException e) {
                 // Another thread's concurrent write/rename raced this file, or it's already gone --
