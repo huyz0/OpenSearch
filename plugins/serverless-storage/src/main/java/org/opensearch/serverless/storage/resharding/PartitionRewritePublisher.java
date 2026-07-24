@@ -197,7 +197,13 @@ public final class PartitionRewritePublisher {
                 );
             } catch (IOException casFailure) {
                 Optional<VersionedShardHead> headAfterFailure = shardStateStore.get(indexUuid, shardId);
+                // Both primaryTerm and generation must match, not generation alone: this attempt's
+                // own CAS (currentHead.withPublishedGeneration) never changes primaryTerm, so a
+                // mismatched term here means the head moved for some other reason entirely (this
+                // target's "never expected to have a concurrent writer" case actually happening),
+                // not this attempt's own write landing late.
                 boolean actuallyLanded = headAfterFailure.isPresent()
+                    && headAfterFailure.get().head().primaryTerm() == newManifest.primaryTerm()
                     && headAfterFailure.get().head().latestManifestGeneration() == newManifest.generation();
                 if (actuallyLanded) {
                     partitionStore.clearDescriptor();
@@ -226,25 +232,30 @@ public final class PartitionRewritePublisher {
     /**
      * Best-effort cleanup of {@code orphanedManifest} (and the bundle it references) after this
      * attempt's own head CAS is known to have failed to land -- see {@link #rewrite}'s own body for
-     * why leaving it in place would collide with a genuine later retry. Both the manifest delete
-     * and the bundle delete are attempted independently: a failure in either is attached to {@code
-     * originalFailure} as a suppressed exception rather than replacing it, matching {@code
-     * ShardCloner#clone}'s own rollback-must-never-mask-the-real-failure reasoning. Real delete
-     * permission is available here (unlike {@code ShardCloner}/{@code ShardShrinker}'s target
-     * containers -- see {@code RestrictingBlobContainer}'s own javadoc for why this action is the
-     * one exception), so this is expected to actually succeed in the normal, deployed wiring, not
-     * merely in tests.
+     * why leaving it in place would collide with a genuine later retry. The bundle is deleted
+     * before the manifest, not after: {@code BlobContainerManifestStore#deleteManifests}'s own
+     * javadoc documents bundles-before-manifests as the crash-safe ordering everywhere else in this
+     * codebase (e.g. {@code GcSchedulerTask}'s sweep) -- a crash between the two steps then leaves,
+     * at worst, a still-listed manifest pointing at an already-gone bundle (already an unusable,
+     * clearly-broken state nothing would ever mistake for live), never an orphaned bundle with
+     * nothing left to reference it and revisit it later. Both deletes are attempted independently:
+     * a failure in either is attached to {@code originalFailure} as a suppressed exception rather
+     * than replacing it, matching {@code ShardCloner#clone}'s own rollback-must-never-mask-the-real-
+     * failure reasoning. Real delete permission is available here (unlike {@code ShardCloner}/{@code
+     * ShardShrinker}'s target containers -- see {@code RestrictingBlobContainer}'s own javadoc for
+     * why this action is the one exception), so this is expected to actually succeed in the normal,
+     * deployed wiring, not merely in tests.
      */
     private void rollbackOrphanedManifest(CommitManifest orphanedManifest, IOException originalFailure) {
-        try {
-            manifestStore.deleteManifests(List.of(orphanedManifest));
-        } catch (IOException | RuntimeException rollbackFailure) {
-            originalFailure.addSuppressed(rollbackFailure);
-        }
         java.util.Set<String> bundleNames = new java.util.HashSet<>();
         orphanedManifest.files().values().forEach(ref -> bundleNames.add(ref.bundleName()));
         try {
             bundleStore.deleteBundles(bundleNames);
+        } catch (IOException | RuntimeException rollbackFailure) {
+            originalFailure.addSuppressed(rollbackFailure);
+        }
+        try {
+            manifestStore.deleteManifests(List.of(orphanedManifest));
         } catch (IOException | RuntimeException rollbackFailure) {
             originalFailure.addSuppressed(rollbackFailure);
         }
