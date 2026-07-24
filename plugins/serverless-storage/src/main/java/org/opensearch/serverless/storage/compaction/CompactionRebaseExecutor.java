@@ -81,7 +81,12 @@ public final class CompactionRebaseExecutor {
                 return RebaseResult.published(attempts);
             }
             // VERSION_CONFLICT: someone else published meanwhile. Loop -- re-read the new
-            // current head and let the publisher recompute against it.
+            // current head and let the publisher recompute against it. Whatever this losing
+            // attempt's own publisher call already durably uploaded (a bundle, for
+            // LuceneMergeCompactionPublisher's real implementation) is now unreferenced by any
+            // manifest -- this executor has no delete permission of its own and makes no attempt
+            // to clean it up; see LuceneMergeCompactionPublisher's own javadoc for why that's
+            // deliberate and how it's eventually reclaimed.
         }
         return RebaseResult.exhausted(attempts);
     }

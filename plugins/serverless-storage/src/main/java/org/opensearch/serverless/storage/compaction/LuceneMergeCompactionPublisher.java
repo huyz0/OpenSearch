@@ -55,6 +55,21 @@ import java.util.Optional;
  * time is what keeps every attempt an independent, correct merge-and-publish against the actual
  * current state.
  *
+ * <p><b>A losing rebase attempt's already-uploaded bundle is genuinely orphaned, and this class
+ * cannot clean it up itself.</b> {@code publishWithBundleNameCollisionRetry} below uploads the
+ * merged bundle <em>before</em> {@link CompactionRebaseExecutor} attempts the head CAS that would
+ * make it live -- the same bundle-before-manifest-before-head ordering used everywhere else in
+ * this codebase, so a crash never leaves a published manifest pointing at bytes that aren't
+ * durably there. If that CAS then loses the race, the bundle this attempt just uploaded is
+ * unreferenced by any manifest, but this class's container is deliberately delete-denied
+ * (rfc-serverless-opensearch.md &sect;15, see {@code RestrictingBlobContainer}'s own javadoc:
+ * "the compaction service needs GET+PUT but no DELETE (deletion stays with GC)") -- reclaiming it
+ * is {@code GcSchedulerTask}'s own per-shard bundle sweep's job, not this class's, exactly the same
+ * way the bundle-name-collision "stuck leftover" case just above relies on that same sweep rather
+ * than deleting the leftover directly. Both are bounded (at most {@code maxAttempts} orphaned
+ * bundles per rebase-and-retry cycle, not unbounded), but only actually reclaimed if GC is enabled
+ * on this shard -- see {@code GcSchedulerTask}'s own class javadoc for that setting.
+ *
  * <p><b>Unsticks a permanently-colliding target generation on its own, without needing delete
  * permission or a manual operator action.</b> {@code ObjectStoreCommitPublisher#publishCommit}'s
  * bundle name is deterministic per {@code (indexUuid, shardId, primaryTerm, generation)}; on a
