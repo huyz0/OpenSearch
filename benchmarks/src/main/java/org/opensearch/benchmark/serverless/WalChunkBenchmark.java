@@ -62,7 +62,7 @@ public class WalChunkBenchmark {
             byte[] payload = new byte[payloadSizeBytes];
             random.nextBytes(payload);
             // Simulate ~20 distinct shards on one node sharing the chunk, as the RFC describes.
-            records.add(new WalRecord("index-" + (i % 4), i % 20, i, payload));
+            records.add(new WalRecord("index-" + (i % 4), i % 20, 1L, i, payload));
         }
         prebuiltChunk = WalChunkWriter.write(records);
     }
