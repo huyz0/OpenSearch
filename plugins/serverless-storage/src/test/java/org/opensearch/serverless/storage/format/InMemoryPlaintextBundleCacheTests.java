@@ -12,6 +12,7 @@ import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -199,5 +200,71 @@ public class InMemoryPlaintextBundleCacheTests extends OpenSearchTestCase {
 
         assertEquals("shard A's entry must be a genuine hit on the second read", 1, countingA.callCount.get());
         assertEquals("shard B's entry must be a genuine hit on the second read", 1, countingB.callCount.get());
+    }
+
+    public void testSmallBudgetsCollapseToOneStripe() {
+        // Every test above relies on this: a budget below MIN_BYTES_PER_STRIPE (1024) must behave
+        // exactly like the pre-striping single map, which is what makes the exact-LRU and exact-
+        // byte-count assertions above valid regardless of the striped implementation underneath.
+        assertEquals(1, new InMemoryPlaintextBundleCache(0).stripeCountForTesting());
+        assertEquals(1, new InMemoryPlaintextBundleCache(2).stripeCountForTesting());
+        assertEquals(1, new InMemoryPlaintextBundleCache(1024).stripeCountForTesting());
+    }
+
+    public void testLargeBudgetsSpreadAcrossMultipleStripes() {
+        InMemoryPlaintextBundleCache cache = new InMemoryPlaintextBundleCache(64 * 1024);
+        assertTrue("a 64KiB budget should be worth striping", cache.stripeCountForTesting() > 1);
+    }
+
+    public void testEachStripeEvictsIndependentlyByItsOwnByteBudget() throws Exception {
+        // A budget large enough to guarantee multiple stripes (see MIN_BYTES_PER_STRIPE/MAX_STRIPES).
+        InMemoryPlaintextBundleCache cache = new InMemoryPlaintextBundleCache(64 * 1024);
+        SegmentBundle bundle = BundleWriter.write(
+            List.of(new BundleFileContent("f.bin", "x".repeat(200).getBytes(StandardCharsets.UTF_8)))
+        );
+        BundleFileEntry entry = bundle.entries().get("f.bin"); // 200 bytes, reused under many different bundle names
+        BundleFileReader reader = inMemoryReader(bundle);
+
+        String anchorBundle = "anchor-bundle";
+        cache.readFile(anchorBundle, entry, reader);
+        int anchorStripe = cache.stripeIndexFor(anchorBundle, entry);
+
+        // Find enough distinct bundle names landing in one OTHER stripe to overflow that stripe's
+        // own share of the budget (perStripeBudget = 64KiB / stripeCount, each entry is 200 bytes).
+        List<String> floodBundles = new ArrayList<>();
+        int floodStripe = -1;
+        for (int i = 0; floodBundles.size() < 40; i++) {
+            String candidate = "flood-bundle-" + i;
+            int stripe = cache.stripeIndexFor(candidate, entry);
+            if (stripe == anchorStripe) {
+                continue;
+            }
+            if (floodStripe == -1) {
+                floodStripe = stripe;
+            }
+            if (stripe == floodStripe) {
+                floodBundles.add(candidate);
+            }
+        }
+
+        for (String name : floodBundles) {
+            cache.readFile(name, entry, reader);
+        }
+
+        CountingBundleFileReader countingAnchor = new CountingBundleFileReader(reader);
+        cache.readFile(anchorBundle, entry, countingAnchor);
+        assertEquals(
+            "an entry in an untouched stripe must survive eviction pressure in a different stripe",
+            0,
+            countingAnchor.callCount.get()
+        );
+
+        CountingBundleFileReader countingFirstFlooded = new CountingBundleFileReader(reader);
+        cache.readFile(floodBundles.get(0), entry, countingFirstFlooded);
+        assertEquals(
+            "the earliest entry in the flooded stripe should have been evicted by its own stripe's budget",
+            1,
+            countingFirstFlooded.callCount.get()
+        );
     }
 }

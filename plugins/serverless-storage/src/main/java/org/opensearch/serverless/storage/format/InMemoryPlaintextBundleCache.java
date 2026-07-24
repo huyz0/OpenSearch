@@ -37,13 +37,32 @@ import java.util.concurrent.atomic.AtomicLong;
  * factory actually wires up. Cache keys are the bundle name plus the entry's offset/length/checksum;
  * bundle names already embed index UUID and shard id (see {@code ObjectStoreCommitPublisher}), so
  * two different shards can never collide on the same key.
+ *
+ * <p><b>Striped, not one global lock.</b> Every {@link #readFile} hit re-links the touched entry
+ * to the most-recently-used end of a {@link LinkedHashMap}, which is a write, not just a read --
+ * a single shared lock around one such map serializes every concurrent cache hit across every
+ * reader shard on the node, even though each individual critical section is pure in-memory work.
+ * Measured under concurrent hits (16+ threads, all-cache-resident keys), a single global lock's
+ * throughput actually falls below its own 2-thread throughput as thread count grows, rather than
+ * merely plateauing -- real contention, not a theoretical one. The keyspace is instead partitioned
+ * across {@link #stripes}, each an independently-locked {@link Stripe} holding its own slice of
+ * {@code maxTotalBytes}: LRU eviction becomes per-stripe rather than a single global ordering, and
+ * an entry evicts only other entries that hash to the same stripe. This is the same tradeoff
+ * {@code ConcurrentHashMap}-backed caches (Guava, Caffeine) make -- approximate LRU under real
+ * concurrency beats exact LRU serialized behind one lock. For small budgets (below {@link
+ * #MIN_BYTES_PER_STRIPE} per stripe -- covers every test in this class and any tiny cache) the
+ * stripe count collapses to 1, which is exactly the pre-striping single-map behavior: this only
+ * changes behavior once the budget is large enough for multiple stripes to hold a meaningful share
+ * each, which is also precisely the regime where contention was ever going to matter.
  */
 public final class InMemoryPlaintextBundleCache {
 
-    private final long maxTotalBytes;
-    private final Object lock = new Object();
-    private final LinkedHashMap<String, byte[]> entriesByKey;
-    private long currentTotalBytes;
+    /** Below this many bytes per stripe, striping buys nothing and only fragments a tiny budget. */
+    private static final long MIN_BYTES_PER_STRIPE = 1024L;
+    /** Caps lock fragmentation (and per-stripe fixed overhead) once the budget is large. */
+    private static final int MAX_STRIPES = 32;
+
+    private final Stripe[] stripes;
     private final AtomicLong hitCount = new AtomicLong();
     private final AtomicLong missCount = new AtomicLong();
 
@@ -56,10 +75,12 @@ public final class InMemoryPlaintextBundleCache {
         if (maxTotalBytes < 0) {
             throw new IllegalArgumentException("maxTotalBytes must be >= 0, got " + maxTotalBytes);
         }
-        this.maxTotalBytes = maxTotalBytes;
-        // accessOrder=true turns iteration order into LRU order; removeEldestEntry below is never
-        // used since eviction has to happen by total bytes, not entry count, so it's done manually.
-        this.entriesByKey = new LinkedHashMap<>(16, 0.75f, true);
+        int stripeCount = (int) Math.max(1, Math.min(MAX_STRIPES, maxTotalBytes / MIN_BYTES_PER_STRIPE));
+        long perStripeBudget = maxTotalBytes / stripeCount;
+        this.stripes = new Stripe[stripeCount];
+        for (int i = 0; i < stripeCount; i++) {
+            stripes[i] = new Stripe(perStripeBudget);
+        }
     }
 
     /**
@@ -73,40 +94,27 @@ public final class InMemoryPlaintextBundleCache {
      */
     public byte[] readFile(String bundleName, BundleFileEntry entry, BundleFileReader onMiss) throws IOException {
         String key = cacheKey(bundleName, entry);
-        synchronized (lock) {
-            byte[] cached = entriesByKey.get(key); // get(), not containsKey+get, so this also marks it most-recently-used
-            if (cached != null) {
-                hitCount.incrementAndGet();
-                return cached;
-            }
+        Stripe stripe = stripes[stripeIndexFor(key)];
+
+        byte[] cached = stripe.get(key); // marks it most-recently-used within its own stripe
+        if (cached != null) {
+            hitCount.incrementAndGet();
+            return cached;
         }
 
         missCount.incrementAndGet();
         byte[] fresh = onMiss.readFile(bundleName, entry);
-
-        synchronized (lock) {
-            if (fresh.length <= maxTotalBytes) {
-                // Two concurrent misses for the same key both reach here independently (lock is
-                // released between the get() above and this put()) -- byte[] previous holds
-                // whichever one this put() is about to overwrite, so its length is subtracted
-                // rather than double-counted. Without this, currentTotalBytes drifts permanently
-                // upward on every such race, since only one value ever actually survives in the
-                // map but both writers' lengths would otherwise be added.
-                byte[] previous = entriesByKey.put(key, fresh);
-                currentTotalBytes += fresh.length - (previous == null ? 0 : previous.length);
-                evictUntilWithinBudget();
-            }
-        }
+        stripe.put(key, fresh);
         return fresh;
     }
 
-    private void evictUntilWithinBudget() {
-        var iterator = entriesByKey.entrySet().iterator();
-        while (currentTotalBytes > maxTotalBytes && iterator.hasNext()) {
-            Map.Entry<String, byte[]> eldest = iterator.next();
-            currentTotalBytes -= eldest.getValue().length;
-            iterator.remove();
-        }
+    private int stripeIndexFor(String key) {
+        // Same spreading trick HashMap/ConcurrentHashMap use on hashCode() -- without it, keys
+        // that only differ in low bits (identical bundle name, adjacent offsets) could alias onto
+        // the same stripe far more often than chance would predict.
+        int h = key.hashCode();
+        h ^= (h >>> 16);
+        return (h & 0x7fffffff) % stripes.length;
     }
 
     /** Number of reads served from the in-memory cache. */
@@ -119,14 +127,85 @@ public final class InMemoryPlaintextBundleCache {
         return missCount.get();
     }
 
-    /** Current total bytes held -- exposed for tests/metrics, not part of the read path's contract. */
+    /** Current total bytes held across every stripe -- exposed for tests/metrics, not part of the read path's contract. */
     long currentTotalBytes() {
-        synchronized (lock) {
-            return currentTotalBytes;
+        long total = 0;
+        for (Stripe stripe : stripes) {
+            total += stripe.currentTotalBytes();
         }
+        return total;
+    }
+
+    /** Exposed for tests only, to find bundle-file keys that land in a chosen stripe deterministically. */
+    int stripeIndexFor(String bundleName, BundleFileEntry entry) {
+        return stripeIndexFor(cacheKey(bundleName, entry));
+    }
+
+    /** Exposed for tests only, to assert the sizing formula collapses to 1 stripe for small budgets. */
+    int stripeCountForTesting() {
+        return stripes.length;
     }
 
     private static String cacheKey(String bundleName, BundleFileEntry entry) {
         return bundleName + "-" + entry.offset() + "-" + entry.length() + "-" + entry.checksum();
+    }
+
+    /**
+     * One independently-locked shard of the cache: its own LRU map, its own lock, and its own
+     * fixed slice of the total byte budget. Eviction here never looks at, or affects, any other
+     * stripe -- the tradeoff striping makes, see this class's own javadoc for why it's safe.
+     */
+    private static final class Stripe {
+
+        private final long maxBytes;
+        private final Object lock = new Object();
+        private final LinkedHashMap<String, byte[]> entriesByKey;
+        private long currentTotalBytes;
+
+        Stripe(long maxBytes) {
+            this.maxBytes = maxBytes;
+            // accessOrder=true turns iteration order into LRU order; removeEldestEntry below is
+            // never used since eviction has to happen by total bytes, not entry count, so it's
+            // done manually.
+            this.entriesByKey = new LinkedHashMap<>(16, 0.75f, true);
+        }
+
+        byte[] get(String key) {
+            synchronized (lock) {
+                return entriesByKey.get(key); // get(), not containsKey+get, so this also marks it most-recently-used
+            }
+        }
+
+        void put(String key, byte[] fresh) {
+            if (fresh.length > maxBytes) {
+                return;
+            }
+            synchronized (lock) {
+                // Two concurrent misses for the same key both reach here independently (the lock
+                // is released between get() and this put()) -- byte[] previous holds whichever one
+                // this put() is about to overwrite, so its length is subtracted rather than double-
+                // counted. Without this, currentTotalBytes drifts permanently upward on every such
+                // race, since only one value ever actually survives in the map but both writers'
+                // lengths would otherwise be added.
+                byte[] previous = entriesByKey.put(key, fresh);
+                currentTotalBytes += fresh.length - (previous == null ? 0 : previous.length);
+                evictUntilWithinBudget();
+            }
+        }
+
+        private void evictUntilWithinBudget() {
+            var iterator = entriesByKey.entrySet().iterator();
+            while (currentTotalBytes > maxBytes && iterator.hasNext()) {
+                Map.Entry<String, byte[]> eldest = iterator.next();
+                currentTotalBytes -= eldest.getValue().length;
+                iterator.remove();
+            }
+        }
+
+        long currentTotalBytes() {
+            synchronized (lock) {
+                return currentTotalBytes;
+            }
+        }
     }
 }
