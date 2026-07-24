@@ -137,6 +137,27 @@ public class TransportMigrateShardAction extends HandledTransportAction<MigrateS
                             + "] is not hosted on this node; route this request to a node that hosts it"
                     );
                 }
+                // index.blocks.write only fences NEW writes -- it says nothing about whether
+                // whatever local shard copy this node happens to host has actually caught UP to the
+                // primary's last acknowledged write before the block took effect. Ordinary
+                // segment/document replication is asynchronous, so a replica can legitimately still
+                // be behind the primary even after writes stop. Reading a lagging replica's own
+                // commit here would silently adopt an incomplete document set as the shard's
+                // permanent serverless-storage content -- the exact same class of silent data loss
+                // the write-block check above exists to prevent, just via a different door. Refusing
+                // outright on anything but the primary makes that a loud, actionable precondition
+                // failure instead.
+                if (shard.routingEntry().primary() == false) {
+                    throw new IllegalArgumentException(
+                        "shard ["
+                            + request.shardId()
+                            + "] of index ["
+                            + request.indexUuid()
+                            + "] hosted on this node is a replica, not the primary -- migration must read the "
+                            + "primary's own commit (a replica may not have fully caught up even with writes "
+                            + "blocked); route this request to the node hosting the primary"
+                    );
+                }
                 // This reads a snapshot of the shard's CURRENT committed state (below) with no
                 // fencing of concurrent indexing -- a document indexed/committed after that read
                 // is silently never captured in the adopted manifest. Requiring the index already

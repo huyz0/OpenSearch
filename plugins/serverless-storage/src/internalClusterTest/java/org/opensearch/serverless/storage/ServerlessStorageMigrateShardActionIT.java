@@ -211,6 +211,71 @@ public class ServerlessStorageMigrateShardActionIT extends ServerlessStorageInte
         assertTrue(failure.getCause().getMessage().contains("does not exist"));
     }
 
+    /**
+     * index.blocks.write only fences NEW writes -- it says nothing about whether a replica's own
+     * local copy has actually caught up to the primary's last acknowledged write before the block
+     * took effect. A request routed to a node hosting the replica (not the primary) must be
+     * refused outright, not silently adopt whatever that replica's own local commit happens to be.
+     */
+    public void testMigrateShardActionRefusesARequestRoutedToAReplica() throws Exception {
+        Path basePath = createTempDir("serverless-storage-migrate-action-it-replica");
+        Settings nodeSettings = Settings.builder()
+            .putList("path.repo", basePath.toString())
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey(), basePath.toString())
+            .build();
+        internalCluster().startClusterManagerOnlyNode(nodeSettings);
+        internalCluster().startDataOnlyNode(nodeSettings);
+        internalCluster().startDataOnlyNode(nodeSettings);
+
+        createIndex(
+            INDEX_NAME,
+            Settings.builder().put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1).put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 1).build()
+        );
+        ensureGreen(INDEX_NAME);
+        client().prepareIndex(INDEX_NAME).setId("1").setSource("field", "value1").get();
+        client().admin().indices().prepareFlush(INDEX_NAME).get();
+        client().admin()
+            .indices()
+            .prepareUpdateSettings(INDEX_NAME)
+            .setSettings(Settings.builder().put(IndexMetadata.SETTING_BLOCKS_WRITE, true))
+            .get();
+
+        String indexUuid = client().admin().cluster().prepareState().get().getState().metadata().index(INDEX_NAME).getIndexUUID();
+        org.opensearch.cluster.routing.IndexShardRoutingTable shardRoutingTable = client().admin()
+            .cluster()
+            .prepareState()
+            .get()
+            .getState()
+            .routingTable()
+            .index(INDEX_NAME)
+            .shard(SHARD_ID);
+        String replicaNodeId = shardRoutingTable.replicaShards().get(0).currentNodeId();
+        String replicaNodeName = client().admin()
+            .cluster()
+            .prepareState()
+            .get()
+            .getState()
+            .nodes()
+            .get(replicaNodeId)
+            .getName();
+
+        ExecutionException failure = expectThrows(
+            ExecutionException.class,
+            () -> internalCluster().client(replicaNodeName)
+                .execute(MigrateShardAction.INSTANCE, new MigrateShardRequest(indexUuid, SHARD_ID))
+                .get()
+        );
+        assertTrue(
+            "must fail with a clear precondition error naming the replica, not something else: " + failure.getCause(),
+            failure.getCause() instanceof IllegalArgumentException && failure.getCause().getMessage().contains("replica")
+        );
+
+        assertTrue(
+            "refusing to migrate a replica must never leave a serverless-storage head behind",
+            new BlobContainerShardStateStore(blobContainerFor(basePath, indexUuid, SHARD_ID)).get(indexUuid, SHARD_ID).isEmpty()
+        );
+    }
+
     public void testMigrateShardActionRefusesAShardThatAlreadyHasAServerlessStorageHead() throws Exception {
         Path basePath = createTempDir("serverless-storage-migrate-action-it-twice");
         IndexedClassicShard shard = startClusterAndIndexOneRealDocument(basePath);
