@@ -176,12 +176,23 @@ public final class ShardSuspensionCoordinator {
         // for whatever this pre-check doesn't skip, so a stale read here (this coordinator's cached
         // state momentarily behind reality) can only ever cause a harmless one-tick delay, never an
         // incorrect suspend.
-        IndexMetadata preCheckMetadata = findByUuid(clusterService.state().metadata(), indexUuid);
+        ClusterState currentState = clusterService.state();
+        IndexMetadata preCheckMetadata = findByUuid(currentState.metadata(), indexUuid);
         if (preCheckMetadata != null) {
             boolean alreadySuspendedPreCheck = reader
                 ? SuspendedShardsMetadata.isReaderSuspended(preCheckMetadata, shardId)
                 : SuspendedShardsMetadata.isSuspended(preCheckMetadata, shardId);
             if (alreadySuspendedPreCheck) {
+                // Reconciliation, not just a no-op: clusterStateProcessed below only ever calls
+                // evict() once, on the single tick that actually flips the suspended flag -- if that
+                // one attempt is lost (a cluster-manager failover between the cluster-state commit
+                // and the reroute call, or the reroute call itself failing), nothing would otherwise
+                // ever retry it, since execute() below always short-circuits once already suspended.
+                // evict() is already cheap and idempotent when there is nothing left to evict (its
+                // own assignedCount==0 no-op below), so calling it unconditionally here on every
+                // already-suspended candidate, every tick, safely self-heals a lost eviction without
+                // needing any new scheduling or state to track which attempts succeeded.
+                evict(currentState, indexUuid, shardId, reader);
                 return;
             }
         }

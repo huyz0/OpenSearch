@@ -121,6 +121,36 @@ public class ShardSuspensionCoordinatorTests extends OpenSearchTestCase {
         verify(clusterService, never()).submitStateUpdateTask(anyString(), any(ClusterStateUpdateTask.class));
     }
 
+    /**
+     * Regression test: clusterStateProcessed's own eviction call only ever fires once, on the tick
+     * that actually flips the suspended flag -- if that one attempt is lost (a cluster-manager
+     * failover between the cluster-state commit and the reroute call, or the reroute call itself
+     * failing), the shard stays marked suspended forever with an assigned copy still STARTED, and
+     * nothing used to ever retry it (suspend()'s own pre-check just returned). The already-suspended
+     * pre-check path must reconcile by re-attempting eviction, not merely skip the redundant
+     * cluster-state submission.
+     */
+    public void testSuspendRetriesEvictionWhenAlreadySuspendedButAnAssignedCopySurvived() {
+        ClusterState state = buildClusterState(0);
+        IndexMetadata alreadySuspended = SuspendedShardsMetadata.withShardSuspended(state.metadata().index(INDEX_NAME), 0);
+        ClusterState suspendedButStillAssignedState = ClusterState.builder(state)
+            .metadata(Metadata.builder(state.metadata()).put(alreadySuspended, true))
+            .build();
+
+        ClusterService clusterService = mock(ClusterService.class);
+        when(clusterService.state()).thenReturn(suspendedButStillAssignedState);
+        ShardSuspensionCoordinator coordinator = new ShardSuspensionCoordinator(clusterService, client);
+
+        coordinator.suspendWriterShard(indexUuid(suspendedButStillAssignedState), 0);
+
+        verify(clusterService, never()).submitStateUpdateTask(anyString(), any(ClusterStateUpdateTask.class));
+        // A suspended shard with a surviving assigned copy must have its lost eviction retried.
+        org.mockito.ArgumentCaptor<ClusterRerouteRequest> captor = org.mockito.ArgumentCaptor.forClass(ClusterRerouteRequest.class);
+        verify(clusterAdminClient, times(1)).reroute(captor.capture(), any());
+        assertEquals(1, captor.getValue().getCommands().commands().size());
+        assertTrue(captor.getValue().getCommands().commands().get(0) instanceof CancelAllocationCommand);
+    }
+
     /** Control: when the shard is genuinely not yet suspended, the pre-check must not skip the real submission. */
     public void testSuspendStillSubmitsAClusterStateTaskWhenNotYetSuspended() {
         ClusterState state = buildClusterState(0);
