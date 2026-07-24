@@ -254,6 +254,7 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
                     shardId,
                     partitionRewriteConfig.shardStateStore(),
                     partitionRewriteConfig.manifestStore(),
+                    partitionRewriteConfig.bundleStore(),
                     partitionRewriteConfig.materializer(),
                     partitionRewriteConfig.commitPublisher(),
                     partitionRewriteConfig.partitionStore()

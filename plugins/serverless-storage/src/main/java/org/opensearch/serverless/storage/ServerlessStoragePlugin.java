@@ -1761,6 +1761,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                             partitionRewriteInterval,
                             new BlobContainerShardStateStore(blobContainer),
                             new BlobContainerManifestStore(blobContainer),
+                            new BlobContainerBundleStore(blobContainer),
                             new ObjectStoreCommitMaterializer(chainedBundleReadPath(blobContainer, lineageChain)),
                             new ObjectStoreCommitPublisher(
                                 new BlobContainerBundleStore(blobContainer),

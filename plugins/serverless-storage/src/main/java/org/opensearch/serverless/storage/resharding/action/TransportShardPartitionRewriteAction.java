@@ -137,6 +137,7 @@ public class TransportShardPartitionRewriteAction extends HandledTransportAction
                     request.shardId(),
                     shardStateStore,
                     manifestStore,
+                    bundleStore,
                     materializer,
                     commitPublisher,
                     partitionStore

@@ -123,6 +123,7 @@ public class PartitionRewriteSchedulerTaskTests extends OpenSearchTestCase {
             SHARD_ID,
             shardStateStore,
             manifestStore,
+            bundleStore,
             new ObjectStoreCommitMaterializer(bundleStore),
             new ObjectStoreCommitPublisher(bundleStore, manifestStore),
             partitionStore
@@ -175,6 +176,7 @@ public class PartitionRewriteSchedulerTaskTests extends OpenSearchTestCase {
             SHARD_ID,
             faultInjectingShardStateStore,
             manifestStore,
+            bundleStore,
             new ObjectStoreCommitMaterializer(bundleStore),
             new ObjectStoreCommitPublisher(bundleStore, manifestStore),
             partitionStore
@@ -201,6 +203,7 @@ public class PartitionRewriteSchedulerTaskTests extends OpenSearchTestCase {
             SHARD_ID,
             shardStateStore,
             manifestStore,
+            bundleStore,
             new ObjectStoreCommitMaterializer(bundleStore),
             new ObjectStoreCommitPublisher(bundleStore, manifestStore),
             partitionStore
@@ -237,6 +240,7 @@ public class PartitionRewriteSchedulerTaskTests extends OpenSearchTestCase {
             SHARD_ID,
             shardStateStore,
             manifestStore,
+            bundleStore,
             new ObjectStoreCommitMaterializer(bundleStore),
             new ObjectStoreCommitPublisher(bundleStore, manifestStore),
             partitionStore

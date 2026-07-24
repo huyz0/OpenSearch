@@ -9,6 +9,7 @@
 package org.opensearch.serverless.storage.resharding;
 
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.serverless.storage.format.BlobContainerBundleStore;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.readerengine.ObjectStoreCommitMaterializer;
 import org.opensearch.serverless.storage.scheduling.RewriteAdmissionController;
@@ -25,7 +26,7 @@ import org.opensearch.serverless.storage.writerengine.ObjectStoreCommitPublisher
  * target at all).
  */
 public record PartitionRewriteSchedulerConfig(TimeValue interval, ShardStateStore shardStateStore, BlobContainerManifestStore manifestStore,
-    ObjectStoreCommitMaterializer materializer, ObjectStoreCommitPublisher commitPublisher,
+    BlobContainerBundleStore bundleStore, ObjectStoreCommitMaterializer materializer, ObjectStoreCommitPublisher commitPublisher,
     BlobContainerShardPartitionStore partitionStore, RewriteAdmissionController admissionController) {
 
     /**
@@ -34,6 +35,8 @@ public record PartitionRewriteSchedulerConfig(TimeValue interval, ShardStateStor
      * @param interval        delay between successive rewrite ticks
      * @param shardStateStore store used to read the shard's live head
      * @param manifestStore   store used to read the manifest at the shard's currently published generation
+     * @param bundleStore     the same store {@code commitPublisher} itself writes through, passed
+     *                        separately only for {@link PartitionRewritePublisher}'s own CAS-failure rollback
      * @param materializer    materializes the pre-rewrite manifest's segments into a real Lucene directory
      * @param commitPublisher publishes the filtered result as a new commit manifest
      * @param partitionStore  reads (and, on success, clears) this shard's {@link ShardPartitionDescriptor}
@@ -59,6 +62,12 @@ public record PartitionRewriteSchedulerConfig(TimeValue interval, ShardStateStor
     @Override
     public BlobContainerManifestStore manifestStore() {
         return manifestStore;
+    }
+
+    /** The same store {@code commitPublisher} itself writes through, for CAS-failure rollback. */
+    @Override
+    public BlobContainerBundleStore bundleStore() {
+        return bundleStore;
     }
 
     /** Materializes the pre-rewrite manifest's segments into a real Lucene directory. */

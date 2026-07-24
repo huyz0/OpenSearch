@@ -68,6 +68,7 @@ public final class PartitionRewritePublisher {
     private final int shardId;
     private final ShardStateStore shardStateStore;
     private final BlobContainerManifestStore manifestStore;
+    private final org.opensearch.serverless.storage.format.BlobContainerBundleStore bundleStore;
     private final ObjectStoreCommitMaterializer materializer;
     private final ObjectStoreCommitPublisher commitPublisher;
     private final BlobContainerShardPartitionStore partitionStore;
@@ -79,6 +80,9 @@ public final class PartitionRewritePublisher {
      * @param shardId the target shard's numeric id within {@code indexUuid}.
      * @param shardStateStore reads and CASes the target's own published head.
      * @param manifestStore reads the target's currently published manifest.
+     * @param bundleStore the same store {@code commitPublisher} itself writes through, passed
+     *                     separately only so a CAS-failure rollback (see this class's own {@link
+     *                     #rewrite} body) can clean up the bundle it published alongside its manifest.
      * @param materializer materializes the target's current manifest into a real Lucene directory.
      * @param commitPublisher publishes the filtered result as a new commit manifest.
      * @param partitionStore reads (and, on success, clears) the target's {@link ShardPartitionDescriptor}.
@@ -88,6 +92,7 @@ public final class PartitionRewritePublisher {
         int shardId,
         ShardStateStore shardStateStore,
         BlobContainerManifestStore manifestStore,
+        org.opensearch.serverless.storage.format.BlobContainerBundleStore bundleStore,
         ObjectStoreCommitMaterializer materializer,
         ObjectStoreCommitPublisher commitPublisher,
         BlobContainerShardPartitionStore partitionStore
@@ -96,6 +101,7 @@ public final class PartitionRewritePublisher {
         this.shardId = shardId;
         this.shardStateStore = shardStateStore;
         this.manifestStore = manifestStore;
+        this.bundleStore = bundleStore;
         this.materializer = materializer;
         this.commitPublisher = commitPublisher;
         this.partitionStore = partitionStore;
@@ -112,7 +118,10 @@ public final class PartitionRewritePublisher {
      * @return {@code true} if a rewrite was actually performed and published; {@code false} if there was nothing to rewrite.
      * @throws IOException if the rewrite's own head CAS loses a race against another actor -- this
      *                      target is never expected to have a concurrent writer, so this is treated
-     *                      as a genuine failure to surface, not something to silently retry.
+     *                      as a genuine failure to surface, not something to silently retry -- or if
+     *                      the CAS call itself faults ambiguously and a fresh re-read shows it
+     *                      genuinely didn't land (see this method's own body for how that case's own
+     *                      orphaned manifest gets cleaned up before the exception propagates).
      */
     public boolean rewrite() throws IOException {
         ShardPartitionDescriptor descriptor = partitionStore.readDescriptor().orElse(null);
@@ -160,16 +169,49 @@ public final class PartitionRewritePublisher {
                 currentManifest.pruningStats()
             );
 
-            CasResult result = shardStateStore.compareAndSet(
-                indexUuid,
-                shardId,
-                Optional.of(currentVersionedHead.get().version()),
-                currentHead.withPublishedGeneration(newManifest.generation())
-            );
+            // The scheduler that drives this method (PartitionRewriteSchedulerTask) catches every
+            // exception and retries on the next tick, re-reading the head fresh each time -- so a
+            // genuine VERSION_CONFLICT (a real concurrent actor, this method's own javadoc's "never
+            // expected" case) safely lands on a different, fresh target generation next time and is
+            // simply reported here, same as before. An IOException from the CAS call itself is
+            // ambiguous, though -- unlike VERSION_CONFLICT, it does not say whether the write landed
+            // or not, and the manifest at newGeneration this attempt already durably published stays
+            // written either way. Left alone, an ambiguous non-landing failure would leave that
+            // exact generation permanently occupied for the NEXT tick's retry to collide with: its
+            // own fresh rewrite (a new IndexWriter/addIndexes run) is not byte-deterministic, so
+            // ObjectStoreCommitPublisher#publishCommit's content-verification guard would then
+            // reject that genuine self-retry as if it were a foreign write. Re-reading the head
+            // resolves the ambiguity directly instead of leaving it to fester: if this attempt's own
+            // write actually landed, adopt it as success; otherwise best-effort delete the orphaned
+            // manifest (this class's own container has real delete permission, unlike
+            // ShardCloner/ShardShrinker's target containers -- see RestrictingBlobContainer's own
+            // javadoc) so the next tick's retry finds nothing occupying newGeneration and republishes
+            // cleanly, rather than colliding with its own abandoned attempt.
+            CasResult result;
+            try {
+                result = shardStateStore.compareAndSet(
+                    indexUuid,
+                    shardId,
+                    Optional.of(currentVersionedHead.get().version()),
+                    currentHead.withPublishedGeneration(newManifest.generation())
+                );
+            } catch (IOException casFailure) {
+                Optional<VersionedShardHead> headAfterFailure = shardStateStore.get(indexUuid, shardId);
+                boolean actuallyLanded = headAfterFailure.isPresent()
+                    && headAfterFailure.get().head().latestManifestGeneration() == newManifest.generation();
+                if (actuallyLanded) {
+                    partitionStore.clearDescriptor();
+                    return true;
+                }
+                rollbackOrphanedManifest(newManifest, casFailure);
+                throw casFailure;
+            }
             if (result != CasResult.SUCCESS) {
-                throw new IOException(
+                IOException lostRace = new IOException(
                     "partition rewrite for " + indexUuid + "/" + shardId + " lost a head CAS race -- unexpected for a split target"
                 );
+                rollbackOrphanedManifest(newManifest, lostRace);
+                throw lostRace;
             }
         }
 
@@ -179,5 +221,32 @@ public final class PartitionRewritePublisher {
         // from scratch, still correctly, since the descriptor is still there to read).
         partitionStore.clearDescriptor();
         return true;
+    }
+
+    /**
+     * Best-effort cleanup of {@code orphanedManifest} (and the bundle it references) after this
+     * attempt's own head CAS is known to have failed to land -- see {@link #rewrite}'s own body for
+     * why leaving it in place would collide with a genuine later retry. Both the manifest delete
+     * and the bundle delete are attempted independently: a failure in either is attached to {@code
+     * originalFailure} as a suppressed exception rather than replacing it, matching {@code
+     * ShardCloner#clone}'s own rollback-must-never-mask-the-real-failure reasoning. Real delete
+     * permission is available here (unlike {@code ShardCloner}/{@code ShardShrinker}'s target
+     * containers -- see {@code RestrictingBlobContainer}'s own javadoc for why this action is the
+     * one exception), so this is expected to actually succeed in the normal, deployed wiring, not
+     * merely in tests.
+     */
+    private void rollbackOrphanedManifest(CommitManifest orphanedManifest, IOException originalFailure) {
+        try {
+            manifestStore.deleteManifests(List.of(orphanedManifest));
+        } catch (IOException | RuntimeException rollbackFailure) {
+            originalFailure.addSuppressed(rollbackFailure);
+        }
+        java.util.Set<String> bundleNames = new java.util.HashSet<>();
+        orphanedManifest.files().values().forEach(ref -> bundleNames.add(ref.bundleName()));
+        try {
+            bundleStore.deleteBundles(bundleNames);
+        } catch (IOException | RuntimeException rollbackFailure) {
+            originalFailure.addSuppressed(rollbackFailure);
+        }
     }
 }

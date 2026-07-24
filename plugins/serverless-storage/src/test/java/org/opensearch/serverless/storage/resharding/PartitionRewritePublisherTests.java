@@ -106,6 +106,7 @@ public class PartitionRewritePublisherTests extends OpenSearchTestCase {
             SHARD_ID,
             shardStateStore,
             manifestStore,
+            bundleStore,
             new ObjectStoreCommitMaterializer(bundleStore),
             new ObjectStoreCommitPublisher(bundleStore, manifestStore),
             partitionStore
@@ -176,5 +177,95 @@ public class PartitionRewritePublisherTests extends OpenSearchTestCase {
 
         assertTrue(publisher().rewrite());
         assertFalse("calling rewrite again after the descriptor is already cleared must be a safe no-op", publisher().rewrite());
+    }
+
+    public void testRewriteTreatsAnAmbiguousCasFaultAsSuccessWhenTheWriteActuallyLanded() throws Exception {
+        publishTargetCommit();
+        partitionStore.writeDescriptor(new ShardPartitionDescriptor(0, 2));
+
+        ShardStateStore faultingAfterRealCas = new CasFaultInjectingShardStateStore(shardStateStore, true);
+        PartitionRewritePublisher publisher = new PartitionRewritePublisher(
+            TARGET_INDEX_UUID,
+            SHARD_ID,
+            faultingAfterRealCas,
+            manifestStore,
+            bundleStore,
+            new ObjectStoreCommitMaterializer(bundleStore),
+            new ObjectStoreCommitPublisher(bundleStore, manifestStore),
+            partitionStore
+        );
+
+        assertTrue(
+            "an ambiguous CAS fault whose write actually landed must be treated as success, not a failure to surface",
+            publisher.rewrite()
+        );
+        assertTrue(
+            "the descriptor must still be cleared when the ambiguous fault's write actually landed",
+            partitionStore.readDescriptor().isEmpty()
+        );
+    }
+
+    public void testRewriteCleansUpItsOwnOrphanedManifestWhenAnAmbiguousCasFaultDidNotActuallyLand() throws Exception {
+        publishTargetCommit();
+        partitionStore.writeDescriptor(new ShardPartitionDescriptor(0, 2));
+
+        ShardStateStore faultingWithoutRealCas = new CasFaultInjectingShardStateStore(shardStateStore, false);
+        PartitionRewritePublisher publisher = new PartitionRewritePublisher(
+            TARGET_INDEX_UUID,
+            SHARD_ID,
+            faultingWithoutRealCas,
+            manifestStore,
+            bundleStore,
+            new ObjectStoreCommitMaterializer(bundleStore),
+            new ObjectStoreCommitPublisher(bundleStore, manifestStore),
+            partitionStore
+        );
+
+        java.io.IOException thrown = expectThrows(java.io.IOException.class, publisher::rewrite);
+        assertEquals("injected ambiguous CAS fault", thrown.getMessage());
+        assertTrue(
+            "the descriptor must survive an ambiguous CAS fault whose write never landed -- nothing succeeded",
+            partitionStore.readDescriptor().isPresent()
+        );
+
+        // The manifest this failed attempt published at (primaryTerm, currentGeneration + 1) must
+        // not be left occupying that generation -- otherwise the next retry's own fresh rewrite
+        // (non-deterministic content, a new IndexWriter/addIndexes run) would collide with it as if
+        // it were a foreign write, per ObjectStoreCommitPublisher#publishCommit's content-verification
+        // guard.
+        ShardHead currentHead = shardStateStore.get(TARGET_INDEX_UUID, SHARD_ID).orElseThrow().head();
+        assertFalse(
+            "this attempt's own orphaned manifest must be cleaned up so a genuine retry doesn't collide with it",
+            manifestStore.manifestExists(currentHead.primaryTerm(), currentHead.latestManifestGeneration() + 1)
+        );
+
+        // And a genuine retry, now that the collision is cleared, must converge normally.
+        assertTrue("a real retry after the ambiguous fault is cleaned up must succeed normally", publisher().rewrite());
+    }
+
+    /** Delegates every call to a real {@link ShardStateStore}, but always throws after compareAndSet -- optionally after actually performing it. */
+    private static final class CasFaultInjectingShardStateStore implements ShardStateStore {
+
+        private final ShardStateStore delegate;
+        private final boolean performRealCasBeforeFaulting;
+
+        CasFaultInjectingShardStateStore(ShardStateStore delegate, boolean performRealCasBeforeFaulting) {
+            this.delegate = delegate;
+            this.performRealCasBeforeFaulting = performRealCasBeforeFaulting;
+        }
+
+        @Override
+        public Optional<VersionedShardHead> get(String indexUuid, int shardId) throws java.io.IOException {
+            return delegate.get(indexUuid, shardId);
+        }
+
+        @Override
+        public CasResult compareAndSet(String indexUuid, int shardId, Optional<Long> expectedVersion, ShardHead newHead)
+            throws java.io.IOException {
+            if (performRealCasBeforeFaulting) {
+                delegate.compareAndSet(indexUuid, shardId, expectedVersion, newHead);
+            }
+            throw new java.io.IOException("injected ambiguous CAS fault");
+        }
     }
 }
