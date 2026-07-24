@@ -10,6 +10,7 @@ package org.opensearch.serverless.storage.retention.action;
 
 import org.opensearch.action.ActionRequestValidationException;
 import org.opensearch.common.io.stream.BytesStreamOutput;
+import org.opensearch.serverless.storage.retention.PitrRetentionPolicy;
 import org.opensearch.test.OpenSearchTestCase;
 
 public class SnapshotReleaseRequestTests extends OpenSearchTestCase {
@@ -34,5 +35,16 @@ public class SnapshotReleaseRequestTests extends OpenSearchTestCase {
 
     public void testValidateAcceptsAWellFormedRequest() {
         assertNull(new SnapshotReleaseRequest("idx-uuid", 0, "snap-1").validate());
+    }
+
+    /**
+     * "pitr" is PitrRetentionPolicy's own reserved pinId. removePin(String, int, String) removes
+     * EVERY pin under a given pinId, so accepting this name here would let a caller wipe out
+     * every internal PITR-window pin on this shard, exposing in-window manifests to GC deletion.
+     */
+    public void testValidateRejectsTheReservedPitrSnapshotId() {
+        ActionRequestValidationException e = new SnapshotReleaseRequest("idx-uuid", 0, PitrRetentionPolicy.PITR_PIN_ID).validate();
+        assertNotNull(e);
+        assertTrue(e.getMessage().contains("reserved"));
     }
 }

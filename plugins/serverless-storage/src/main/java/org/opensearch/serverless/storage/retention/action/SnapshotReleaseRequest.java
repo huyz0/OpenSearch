@@ -12,6 +12,7 @@ import org.opensearch.action.ActionRequest;
 import org.opensearch.action.ActionRequestValidationException;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
+import org.opensearch.serverless.storage.retention.PitrRetentionPolicy;
 
 import java.io.IOException;
 
@@ -70,6 +71,15 @@ public class SnapshotReleaseRequest extends ActionRequest {
         }
         if (snapshotId == null || snapshotId.isEmpty()) {
             validationException = addValidationError("snapshotId is required", validationException);
+        } else if (snapshotId.equals(PitrRetentionPolicy.PITR_PIN_ID)) {
+            // removePin(String, int, String) removes EVERY pin under this pinId -- accepting
+            // "pitr" here would wipe out every internal PITR-window pin on this shard, exposing
+            // in-window manifests to GC deletion. See SnapshotPinRequest's own validate() for
+            // the pin-side half of this same reserved-name guard.
+            validationException = addValidationError(
+                "snapshotId [" + PitrRetentionPolicy.PITR_PIN_ID + "] is reserved for internal PITR retention and cannot be used",
+                validationException
+            );
         }
         return validationException;
     }

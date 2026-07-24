@@ -12,6 +12,7 @@ import org.opensearch.action.ActionRequest;
 import org.opensearch.action.ActionRequestValidationException;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
+import org.opensearch.serverless.storage.retention.PitrRetentionPolicy;
 
 import java.io.IOException;
 
@@ -70,6 +71,17 @@ public class SnapshotPinRequest extends ActionRequest {
         }
         if (snapshotId == null || snapshotId.isEmpty()) {
             validationException = addValidationError("snapshotId is required", validationException);
+        } else if (snapshotId.equals(PitrRetentionPolicy.PITR_PIN_ID)) {
+            // "pitr" is the reserved pinId PitrRetentionReconciler uses for its own internal
+            // pins (see that class's own javadoc, and DurablePinRegistry#replacePin's "strips
+            // every other pin sharing this pinId" semantics). A snapshot pin under this exact
+            // name would either wipe out every legitimate PITR-window pin on this shard right
+            // now, or get silently deleted itself the next time the reconciler ticks and treats
+            // it as its own stale entry -- neither of which the caller would ever be told about.
+            validationException = addValidationError(
+                "snapshotId [" + PitrRetentionPolicy.PITR_PIN_ID + "] is reserved for internal PITR retention and cannot be used",
+                validationException
+            );
         }
         return validationException;
     }

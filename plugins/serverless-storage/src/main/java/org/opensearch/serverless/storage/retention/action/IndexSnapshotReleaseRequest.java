@@ -12,6 +12,7 @@ import org.opensearch.action.ActionRequest;
 import org.opensearch.action.ActionRequestValidationException;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
+import org.opensearch.serverless.storage.retention.PitrRetentionPolicy;
 
 import java.io.IOException;
 
@@ -62,6 +63,12 @@ public class IndexSnapshotReleaseRequest extends ActionRequest {
         }
         if (snapshotId == null || snapshotId.isEmpty()) {
             validationException = addValidationError("snapshotId is required", validationException);
+        } else if (snapshotId.equals(PitrRetentionPolicy.PITR_PIN_ID)) {
+            // See SnapshotReleaseRequest's own validate() for why this exact name is reserved.
+            validationException = addValidationError(
+                "snapshotId [" + PitrRetentionPolicy.PITR_PIN_ID + "] is reserved for internal PITR retention and cannot be used",
+                validationException
+            );
         }
         return validationException;
     }
