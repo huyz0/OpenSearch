@@ -153,6 +153,50 @@ contention (fine — mapping churn at high rate is pathological today too, and p
 contention does not affect neighbors); and mapping *deletion*/breaking changes remain
 disallowed, exactly as today, which is what makes the merge commutative.
 
+### 4.2 What Class C "cached on demand" actually costs today, quantified
+
+§4's table states Class C (per-index metadata) lives "in the object store, cached on demand by
+nodes that host that index." That's the design intent; this subsection quantifies what stands
+between today's implementation and that intent, with measured numbers rather than estimate —
+a spike run against this exact question, code and results at
+`benchmarks/src/main/java/org/opensearch/benchmark/clusterstate/` and
+`benchmarks/CLUSTERSTATE_METADATA_SPIKE_FINDINGS.md`.
+
+**The barrier is precise, not general.** `IndexMetadata`'s only full-data constructor is
+`private` (`IndexMetadata.java:1168`), reachable exclusively through `Builder#build()`, which
+does substantial unconditional per-index work eagerly (settings validation, filling
+`inSyncAllocationIds` for every shard, building `DiscoveryNodeFilters`). There is no lazy or
+partial construction path, and the private constructor means no subclass can exist outside
+`org.opensearch.cluster.metadata` — i.e. outside OpenSearch core entirely.
+`Metadata.Builder#buildIndicesLookup()` (`Metadata.java:1802-1858`) then unconditionally wraps
+every entry of the hard-typed `Map<String, IndexMetadata>` in a real `IndexAbstraction.Index`,
+with no branch for a partial/stub entry. So "cached on demand" for Class C, in this codebase
+today, requires literal changes to `IndexMetadata.java`/`Metadata.java` in `server/` — not a
+plugin-side or even a directory-tier-side change, and not achievable by extending anything
+Phase 2.5/4 already built.
+
+**Measured cost, and the realistic achievable reduction.** A real `IndexMetadata` +
+`RoutingTable` pair for a minimal single-shard tenant index retains ~3,668 B (measured,
+200,000-object samples, OpenJDK 21). Reading `IndexMetadata.IndexMetadataDiff` — the object
+actually sent over the wire on every cluster-state publish (`IndexMetadata.java:1660-1705`) —
+shows the diff protocol keeps the full `Settings` object and full alias map whole, not
+shrinkable further without changing the wire format; a candidate representation that respects
+that constraint while dropping only what's genuinely unused (`DiscoveryNodeFilters`, empty
+mappings/rollover/custom-data, a compact routing substitute in place of the full
+`RoutingTable`/`ShardRouting` object chain) measures ~1,097 B — a real but modest ~3.3x
+reduction, not an order of magnitude. At 100M tenants that's ~341.6 GiB → ~102.2 GiB: still
+too large for one node's resident heap, meaning **compacting `IndexMetadata` alone, without
+also making it genuinely non-resident for inactive tenants, does not reach this RFC's target.**
+
+This is consistent with, not a contradiction of, §3's core insight. §3's "quiescent shard costs
+zero control-plane state" is exactly the property Class C needs and doesn't yet have in this
+codebase's `IndexMetadata`/`Metadata` implementation — every index's metadata is resident on
+every node all the time today, active or not, regardless of size. A compact representation
+helps the active set and softens the ceiling, but the actual fix for Class C is the same shape
+already applied to Class D: stop holding it everywhere, hold it only where and while it's
+needed, discoverable rather than broadcast. That is squarely §12 Phase 5.5 territory (see the
+update there), not a narrower "shrink the object" fix.
+
 ## 5. The Directory Tier
 
 A horizontally scalable, soft-state lookup service — our MemDS analog — mapping
@@ -419,6 +463,16 @@ control cell's small replicated log, which can itself checkpoint to the object s
   parallel control-cell process from scratch, which is not a "slice," it's the plugin's second
   major subsystem. Recommendation: treat this as its own follow-on RFC amendment with its own
   design review, not something to bolt onto this one in passing.
+  **Evidence update (§4.2):** a spike measuring the actual Java-level cost of Class C
+  (`IndexMetadata`/`Metadata` residency) confirms option (a)'s "real surgery" characterization
+  with numbers rather than intuition — `IndexMetadata`'s only full-data constructor is private
+  and `Metadata#buildIndicesLookup()` unconditionally wraps every index in a full
+  `IndexAbstraction.Index`, so no non-core implementation is possible — and shows that a compact
+  representation alone, without also making Class C genuinely non-resident for inactive tenants
+  (option (a)'s actual ask), only buys ~3.3x, not enough on its own to reach this RFC's target.
+  That sharpens rather than changes the recommendation: this remains a decision for a
+  maintainer to scope and sign off on as its own RFC amendment before any `server/` code is
+  written, not something to start off the back of a benchmarks-module spike.
 - **Gossip/SWIM node membership.** **Deliberately not attempted.** Per the discussion that led to
   building the directory tier (§5/§8's design already anticipated this): gossip's target is
   node-fleet size scaling into the thousands, a *different* axis from the shard-count scaling this

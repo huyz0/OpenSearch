@@ -160,3 +160,32 @@ that implies it solves the whole problem. Given that scope and the real risk of 
 cluster depends on, not contained plugin or benchmark code -- that prototype is a decision
 point for a human maintainer to sign off on before it starts, not something to begin
 autonomously off the back of a benchmarks-module spike.
+
+## 4. What this means for cell sizing
+
+Translating the measured per-index cost into a concrete federation topology, for a few
+plausible cluster-manager heap budgets dedicated specifically to index metadata (leaving the
+rest of a node's heap for everything else `ClusterState` holds, JVM overhead, and normal
+operation):
+
+| metadata budget | tenants/cell, today's design (3,668 B) | tenants/cell, realistic-compact (~1,097 B) | cells needed for 100M, today | cells needed for 100M, realistic-compact |
+|---|---|---|---|---|
+| 8 GiB | ~2.3M | ~7.8M | 43 | 13 |
+| 12 GiB | ~3.5M | ~11.7M | 29 | 9 |
+| 20 GiB | ~5.9M | ~19.6M | 18 | 6 |
+
+One practical constraint worth naming: HotSpot's compressed-oops optimization (4-byte object
+references instead of 8) stops applying somewhere around a 32 GiB heap, and every number in
+this spike was measured with compressed oops enabled. A cluster-manager heap pushed
+meaningfully past that line doesn't just get more room, it also makes every object reference
+in this measurement more expensive, so "one bigger machine" doesn't scale linearly the way
+the table above might suggest -- there's a practical ceiling somewhere in the 20-30 GiB
+metadata-budget range on typical hardware, not an arbitrarily large one.
+
+The concrete takeaway: even with the realistic-compact SPI fully built, 100M tenants needs
+somewhere around 6-13 federated cells depending on how much of each cluster-manager's heap is
+budgeted to metadata, not 1. Without it, the same target needs roughly 3x as many cells
+(18-43). The SPI is worth building because it cuts the number of cells (and therefore the
+operational surface: cluster-manager elections, cross-cell nothing-shared boundaries, etc.)
+by roughly the same ~3.3x factor measured in section 2b -- not because it eliminates the need
+for cells at all.
