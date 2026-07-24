@@ -8,6 +8,7 @@
 
 package org.opensearch.serverless.storage.format;
 
+import org.opensearch.serverless.storage.security.AesGcmCipher;
 import org.opensearch.serverless.storage.security.StaticEncryptionKeyProvider;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -218,6 +219,78 @@ public class LocalDiskCachingBundleStoreTests extends OpenSearchTestCase {
         assertEquals("undecryptable cache entry must fall back to a real fetch", 2, counting.callCount.get());
     }
 
+    // Regression test for the byte counter this fix's own cheap eviction bail-out depends on
+    // (currentTotalBytes): a write that REPLACES an existing, differently-sized on-disk entry
+    // (rather than creating a brand-new one) must net out the old size against the new one, not add
+    // the new size on top of a counter that still includes the old. Realistic trigger: a cache
+    // directory populated without encryption, then reopened by a new instance with encryption now
+    // enabled (a legitimate config change across a restart) -- the old plaintext file can't decrypt,
+    // so it's replaced by a longer ciphertext file at the very same path.
+    //
+    // Not a correctness bug if missed: evictIfOverBudget always re-verifies against a real, fresh
+    // directory listing before deleting anything, so a wrongly-inflated counter can never cause an
+    // INCORRECT eviction -- only a wasted one that finds nothing to actually reclaim. What it DOES
+    // break, permanently, for the rest of this instance's lifetime, is the whole point of this
+    // session's OWN earlier hit-path eviction fix: with no write ever correcting a wrongly-inflated
+    // counter back down, every single future hit would forever re-trigger a full sweep it doesn't
+    // need. sweepCountForTesting() (distinct from evictedCount(), which only counts actual deletes)
+    // is what makes that permanent-drift regression directly observable rather than merely inferred.
+    public void testReplacingACorruptedEntryDoesNotDoubleCountItsOldSizeInTheEvictionBudget() throws Exception {
+        SegmentBundle bundle = BundleWriter.write(
+            List.of(
+                new BundleFileContent("a.bin", "hello".getBytes(java.nio.charset.StandardCharsets.UTF_8)),
+                new BundleFileContent("b.bin", "world".getBytes(java.nio.charset.StandardCharsets.UTF_8))
+            )
+        );
+        BundleFileEntry entryA = bundle.entries().get("a.bin");
+        BundleFileEntry entryB = bundle.entries().get("b.bin");
+        Path cacheDir = createTempDir();
+
+        // First instance: no encryption -- writes only A, as 5 plaintext bytes. B is deliberately
+        // left uncached here (see below for why).
+        LocalDiskCachingBundleStore plainWriter = new LocalDiskCachingBundleStore(inMemoryReader(bundle), cacheDir);
+        plainWriter.readFile("bundle-1", entryA);
+
+        SecretKey key = newAesKey();
+        long ciphertextLength = AesGcmCipher.encrypt("hello".getBytes(java.nio.charset.StandardCharsets.UTF_8), key).length;
+
+        // Second instance: encryption now enabled. Budget has headroom over A's ciphertext + B's
+        // (about-to-be-written) ciphertext -- both 33 bytes here, "hello"/"world" being the same
+        // length -- but stays comfortably under what double-counting A's replaced plaintext would
+        // add on top, so the two cases stay clearly distinguishable.
+        LocalDiskCachingBundleStore secondInstance = new LocalDiskCachingBundleStore(
+            inMemoryReader(bundle),
+            cacheDir,
+            new StaticEncryptionKeyProvider(key),
+            2 * ciphertextLength + 2
+        );
+
+        secondInstance.readFile("bundle-1", entryA); // undecryptable plaintext -- falls through, re-fetches, re-writes as ciphertext
+        // B was never cached under ANY key before this -- a genuine first-ever miss, not a replace,
+        // so it can never exercise the double-counting this test targets. Writing it now (rather
+        // than via plainWriter above) is what keeps every later read of B a plain, uncomplicated
+        // hit -- if B had also started out as plaintext, its OWN first read here would need the same
+        // corrupted-entry replace A's did, compounding the arithmetic this test is trying to isolate
+        // to A alone.
+        secondInstance.readFile("bundle-1", entryB);
+        long sweepsAfterBothWrites = secondInstance.sweepCountForTesting();
+
+        // Many subsequent hits against an unchanged, correctly-within-budget directory -- with the
+        // counter accurate, none of these should need to re-verify anything.
+        for (int i = 0; i < 50; i++) {
+            secondInstance.readFile("bundle-1", entryA);
+            secondInstance.readFile("bundle-1", entryB);
+        }
+
+        assertEquals(
+            "a correctly-accounted-for replacement must not leave the counter permanently over budget, "
+                + "which would otherwise re-trigger a full sweep on every single future hit forever",
+            sweepsAfterBothWrites,
+            secondInstance.sweepCountForTesting()
+        );
+        assertEquals("no entry should ever have actually needed eviction in this scenario", 0, secondInstance.evictedCount());
+    }
+
     private interface ThrowingRunnable {
         void run() throws IOException;
     }
@@ -317,39 +390,42 @@ public class LocalDiskCachingBundleStoreTests extends OpenSearchTestCase {
     // after writeAtomically), never from a hit. A shard whose working set is already fully warm --
     // every subsequent read a hit, no new file ever written -- would never get another chance to
     // evict if its directory ended up over budget for a reason that didn't originate from that same
-    // call (e.g. content that predates the cache, or a directory that grew over budget purely from
-    // touches without any fresh write crossing the line). Simulated here by dropping an oversized
-    // file into the cache directory directly (bypassing the cache's own write path entirely, so
-    // maybeEvict() is never triggered by it), then proving a plain HIT on an unrelated, already-
-    // cached entry is what finally triggers the sweep that reclaims it.
+    // call. The realistic way that happens: a node restart or shard relocation constructs a NEW
+    // instance over a directory a PRIOR instance already populated under a larger (or unbounded)
+    // budget, and the new instance's own budget is smaller -- the new instance's constructor
+    // correctly measures the real, already-over-budget total, but (before this fix) nothing but a
+    // fresh write would ever act on that. Proven here with two separate instances over the same
+    // directory, and a plain HIT (no write) on the second one triggering the sweep.
     public void testAHitAloneCanTriggerEvictionWhenTheDirectoryIsAlreadyOverBudgetWithNoNewWrite() throws Exception {
-        SegmentBundle bundle = writeSampleBundle(); // "hello" == 5 bytes
-        BundleFileEntry entry = bundle.entries().get("a.bin");
-        CountingBundleFileReader counting = new CountingBundleFileReader(inMemoryReader(bundle));
-        Path cacheDir = createTempDir();
-        LocalDiskCachingBundleStore cache = new LocalDiskCachingBundleStore(counting, cacheDir, null, 25L);
-
-        Path cachedEntryPath = fileWrittenBy(cacheDir, () -> cache.readFile("bundle-1", entry));
-        Files.setLastModifiedTime(cachedEntryPath, FileTime.from(Instant.now()));
-
-        // Dropped in directly, not through the cache's own write path -- represents content that
-        // predates this instance (or a budget lowered after the fact), backdated older than the
-        // real entry above so it's the sweep's obvious eviction candidate.
-        Path oversizedLeftover = cacheDir.resolve("leftover-from-a-previous-session");
-        Files.write(oversizedLeftover, new byte[30]); // alone already exceeds the 25-byte budget
-        Files.setLastModifiedTime(oversizedLeftover, FileTime.from(Instant.now().minusSeconds(60)));
-
-        assertEquals("no eviction must have run yet -- the oversized file bypassed the cache's own write path", 0, cache.evictedCount());
-
-        cache.readFile("bundle-1", entry); // a plain hit -- the real entry is already on disk and valid
-
-        assertTrue(
-            "a hit against an already over-budget directory must still trigger a sweep",
-            cache.evictedCount() >= 1
+        SegmentBundle bundle = BundleWriter.write(
+            List.of(
+                new BundleFileContent("a.bin", "aaaaaaaaaa".getBytes(java.nio.charset.StandardCharsets.UTF_8)),
+                new BundleFileContent("b.bin", "bbbbbbbbbb".getBytes(java.nio.charset.StandardCharsets.UTF_8))
+            )
         );
-        assertFalse("the oldest, oversized entry must be the one reclaimed", Files.exists(oversizedLeftover));
-        assertTrue("the entry the hit itself just served must survive its own triggering read", Files.exists(cachedEntryPath));
-        assertEquals("the hit must still have been served from disk, not the delegate", 1, counting.callCount.get());
+        BundleFileEntry entryA = bundle.entries().get("a.bin");
+        BundleFileEntry entryB = bundle.entries().get("b.bin");
+        Path cacheDir = createTempDir();
+
+        // First instance: unbounded, so both 10-byte entries land with no eviction at all.
+        LocalDiskCachingBundleStore firstInstance = new LocalDiskCachingBundleStore(inMemoryReader(bundle), cacheDir);
+        Path fileA = fileWrittenBy(cacheDir, () -> firstInstance.readFile("bundle-1", entryA));
+        Files.setLastModifiedTime(fileA, FileTime.from(Instant.now().minusSeconds(60)));
+        Path fileB = fileWrittenBy(cacheDir, () -> firstInstance.readFile("bundle-1", entryB));
+        assertEquals(20, Files.size(fileA) + Files.size(fileB));
+
+        // Second instance: simulates a restart/relocation reopening the same directory under a
+        // smaller, newly configured 15-byte budget -- its own constructor must measure the real
+        // 20-byte total already on disk, not start from a blank slate.
+        CountingBundleFileReader counting = new CountingBundleFileReader(inMemoryReader(bundle));
+        LocalDiskCachingBundleStore secondInstance = new LocalDiskCachingBundleStore(counting, cacheDir, null, 15L);
+        assertEquals("no eviction must have run yet -- construction only measures, it doesn't sweep", 0, secondInstance.evictedCount());
+
+        secondInstance.readFile("bundle-1", entryB); // a plain hit -- B is already on disk and valid
+
+        assertTrue("a hit against an already over-budget directory must still trigger a sweep", secondInstance.evictedCount() >= 1);
+        assertFalse("the older, unrelated entry must be the one reclaimed", Files.exists(fileA));
+        assertEquals("the hit must still have been served from disk, not the delegate", 0, counting.callCount.get());
     }
 
     public void testUnboundedByDefaultNeverEvictsRegardlessOfSize() throws Exception {

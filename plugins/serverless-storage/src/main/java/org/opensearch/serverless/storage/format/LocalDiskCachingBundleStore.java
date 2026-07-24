@@ -87,11 +87,31 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
     /** {@code <= 0} means unbounded -- see this class's own javadoc. */
     private final long maxBytesOnDisk;
     private final AtomicLong evictedCount = new AtomicLong();
+    // Running total of on-disk bytes (post-encryption size, matching what listCacheEntries/
+    // Files.size actually measures), maintained incrementally rather than re-derived from a fresh
+    // directory listing on every call -- see maybeEvict's own cheap bail-out. Only ever read/written
+    // when maxBytesOnDisk > 0; left at 0 and never consulted otherwise. Seeded once at construction
+    // by actually listing the directory (a real, if unbounded-mode-only, startup cost -- see the
+    // constructor), then kept accurate purely incrementally: +onDisk.length on a write that lands a
+    // new or replaced entry (net of whatever it replaced, so a corruption-triggered overwrite of an
+    // existing entry at the same path doesn't double-count), -entry.sizeBytes per entry an eviction
+    // sweep actually removes. Never reset from a fresh listing after that, since a sweep's own
+    // listing runs concurrently with other threads' writes to OTHER keys -- overwriting this field
+    // with that snapshot's total would silently discard whichever of those concurrent increments
+    // landed in between, undercounting real usage exactly the way this counter exists to avoid.
+    private final AtomicLong currentTotalBytes;
     // CAS-guarded so only one thread runs a sweep at a time; a write that loses the race just
     // leaves its own overage for the next write to catch, same "best-effort, never blocks
     // correctness" shape as this plugin's other in-flight guards (e.g. ObjectStoreWriterEngine's
     // refreshPublicationInFlight).
     private final AtomicBoolean evictionInProgress = new AtomicBoolean(false);
+    // Counts every full evictIfOverBudget() invocation, whether or not it actually evicts
+    // anything -- distinct from evictedCount, which only counts entries actually deleted.
+    // Test-only visibility (see sweepCountForTesting): currentTotalBytes staying accurate is a
+    // pure efficiency property (evictIfOverBudget always re-verifies against a real listing before
+    // deleting anything, so a wrongly-inflated counter can never cause an incorrect eviction -- only
+    // wasted, repeated full-directory listings), which this is what makes it possible to assert on.
+    private final AtomicLong sweepCount = new AtomicLong();
 
     /**
      * Wraps a delegate reader with a plaintext-on-disk cache, unbounded (no eviction).
@@ -137,13 +157,27 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
         this.encryptionKeyProvider = encryptionKeyProvider;
         this.maxBytesOnDisk = maxBytesOnDisk;
         Files.createDirectories(cacheDirectory);
+        // A real, one-time listing cost, same as evictIfOverBudget's own -- but paid once at
+        // construction (e.g. engine open) rather than on every read, and only when eviction is
+        // actually enabled; accounts for a directory a PRIOR instance already populated (see
+        // testCachedBytesSurviveAFreshCacheInstanceOverTheSameDirectory).
+        this.currentTotalBytes = new AtomicLong(maxBytesOnDisk > 0 ? sumBytesOnDisk() : 0L);
+    }
+
+    private long sumBytesOnDisk() throws IOException {
+        long total = 0;
+        for (CacheEntry entry : listCacheEntries()) {
+            total += entry.sizeBytes;
+        }
+        return total;
     }
 
     @Override
     public byte[] readFile(String bundleName, BundleFileEntry entry) throws IOException {
         Path cachedPath = cachePathFor(bundleName, entry);
         synchronized (lockFor(cachedPath)) {
-            if (Files.exists(cachedPath)) {
+            boolean existedBefore = Files.exists(cachedPath);
+            if (existedBefore) {
                 byte[] cached = null;
                 try {
                     cached = decryptIfNeeded(Files.readAllBytes(cachedPath));
@@ -178,9 +212,26 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
             long start = System.nanoTime();
             byte[] fresh = delegate.readFile(bundleName, entry);
             coldReadNanos.addAndGet(System.nanoTime() - start);
-            writeAtomically(cachedPath, encryptIfNeeded(fresh));
+            byte[] onDisk = encryptIfNeeded(fresh);
+            if (maxBytesOnDisk > 0) {
+                // existedBefore here means this write is REPLACING a corrupted/checksum-mismatched
+                // entry (see the fall-through just above), not creating a brand-new one -- net out
+                // the old on-disk size so this doesn't double-count the same path's bytes.
+                long oldSizeOnDisk = existedBefore ? sizeOnDiskOrZero(cachedPath) : 0L;
+                currentTotalBytes.addAndGet(onDisk.length - oldSizeOnDisk);
+            }
+            writeAtomically(cachedPath, onDisk);
             maybeEvict();
             return fresh;
+        }
+    }
+
+    /** {@code 0} if {@code path} vanished between the caller observing it and this call -- nothing to net out either way. */
+    private static long sizeOnDiskOrZero(Path path) {
+        try {
+            return Files.size(path);
+        } catch (IOException e) {
+            return 0L;
         }
     }
 
@@ -202,6 +253,13 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
         if (maxBytesOnDisk <= 0) {
             return;
         }
+        // Cheap, O(1) bail-out before anything that touches the filesystem: called from every hit
+        // now, not just every miss (see readFile's own comment on why), so this check is what keeps
+        // eviction being enabled from turning into a full directory listing on every single read --
+        // only a read that lands while currentTotalBytes is genuinely over budget pays that cost.
+        if (currentTotalBytes.get() <= maxBytesOnDisk) {
+            return;
+        }
         if (evictionInProgress.compareAndSet(false, true) == false) {
             return;
         }
@@ -217,6 +275,7 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
     }
 
     private void evictIfOverBudget() throws IOException {
+        sweepCount.incrementAndGet();
         List<CacheEntry> entries = listCacheEntries();
         long totalBytes = 0;
         for (CacheEntry entry : entries) {
@@ -248,6 +307,7 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
                     locksByKey.remove(entry.path.toString());
                 }
                 totalBytes -= entry.sizeBytes;
+                currentTotalBytes.addAndGet(-entry.sizeBytes);
                 evictedCount.incrementAndGet();
             } catch (IOException e) {
                 // Another thread's concurrent write/rename raced this file, or it's already gone --
@@ -282,6 +342,17 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
     /** Number of cache entries evicted so far by the size-bounded sweep -- always 0 when eviction is disabled. */
     public long evictedCount() {
         return evictedCount.get();
+    }
+
+    /**
+     * Number of full {@code evictIfOverBudget} sweeps run so far, whether or not any actually
+     * evicted anything -- see {@link #sweepCount}'s own field comment for why this, not
+     * {@link #evictedCount()}, is the signal for proving {@link #currentTotalBytes} stays accurate
+     * (a drifted-too-high counter can never cause an incorrect eviction, only wasted repeat sweeps).
+     * Test-only visibility, same shape as {@code ObjectStoreWriterEngine#activationWalPositionForTesting}.
+     */
+    public long sweepCountForTesting() {
+        return sweepCount.get();
     }
 
     private record CacheEntry(Path path, long sizeBytes, FileTime lastModifiedTime) {
