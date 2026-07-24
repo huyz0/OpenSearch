@@ -48,7 +48,11 @@ import org.opensearch.threadpool.ThreadPool;
 
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 @ThreadLeakFilters(filters = CleanerDaemonThreadLeakFilter.class)
 public class LazyBundleDirectoryTests extends OpenSearchTestCase {
@@ -282,5 +286,110 @@ public class LazyBundleDirectoryTests extends OpenSearchTestCase {
         } finally {
             fileCache.clear();
         }
+    }
+
+    private static final int MANY_FILES_COUNT = 20;
+
+    /** Builds a manifest referencing {@link #MANY_FILES_COUNT} distinct small files in one bundle. */
+    private CommitManifest manifestWithManyFiles(BlobContainerBundleStore bundleStore) throws Exception {
+        List<BundleFileContent> files = new java.util.ArrayList<>(MANY_FILES_COUNT);
+        for (int i = 0; i < MANY_FILES_COUNT; i++) {
+            files.add(new BundleFileContent("file-" + i, ("content-" + i).getBytes("UTF-8")));
+        }
+        var bundle = bundleStore.writeBundle("bundle-many-files-test", files);
+        Map<String, FileReference> fileMap = new java.util.HashMap<>();
+        for (var e : bundle.entries().entrySet()) {
+            var entry = e.getValue();
+            fileMap.put(e.getKey(), new FileReference("bundle-many-files-test", entry.offset(), entry.length(), entry.checksum()));
+        }
+        return new CommitManifest(INDEX_UUID, SHARD_ID, 1, 1, "file-0", fileMap, 0, 0, null, 0, PruningStats.empty(), System.currentTimeMillis());
+    }
+
+    public void testPrefetchBootSetEventuallyPrefetchesEveryFile() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        BlobContainerBundleStore bundleStore = new BlobContainerBundleStore(blobContainer);
+        CommitManifest manifest = manifestWithManyFiles(bundleStore);
+
+        CountDownLatch completed = new CountDownLatch(MANY_FILES_COUNT);
+        TransferManager.StreamReader countingReader = (name, position, length) -> {
+            java.io.InputStream in = bundleStore.openRange(name, position, length);
+            completed.countDown();
+            return in;
+        };
+
+        FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(64L * 1024 * 1024, 1);
+        ExecutorService executor = Executors.newFixedThreadPool(4);
+        try (MMapDirectory cacheDirectory = new MMapDirectory(createTempDir(), SimpleFSLockFactory.INSTANCE)) {
+            TransferManager transferManager = new TransferManager(countingReader, fileCache, threadPool);
+            try (LazyBundleDirectory lazyDirectory = new LazyBundleDirectory(manifest, cacheDirectory, transferManager)) {
+                lazyDirectory.prefetchBootSet(executor);
+                assertTrue(
+                    "every file in the boot set must eventually be prefetched despite the bounded worker pool",
+                    completed.await(30, TimeUnit.SECONDS)
+                );
+            }
+        } finally {
+            executor.shutdown();
+            fileCache.clear();
+        }
+    }
+
+    /**
+     * Regression test: prefetchBootSet used to submit one task per file with no bound at all --
+     * for a shard with many segment files, this bursts every file's fetch onto the shared executor
+     * simultaneously. Verifies the bounded worker-pool implementation genuinely never lets more than
+     * the documented cap run concurrently, even when both the file count and the executor's own
+     * capacity are well above that cap (so neither is what's limiting concurrency here).
+     */
+    public void testPrefetchBootSetNeverExceedsTheConcurrencyCap() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        BlobContainerBundleStore bundleStore = new BlobContainerBundleStore(blobContainer);
+        CommitManifest manifest = manifestWithManyFiles(bundleStore);
+
+        int concurrencyCap = 8; // must match LazyBundleDirectory.MAX_CONCURRENT_BOOT_SET_PREFETCHES
+        AtomicInteger inFlight = new AtomicInteger();
+        AtomicInteger maxInFlight = new AtomicInteger();
+        CountDownLatch completed = new CountDownLatch(MANY_FILES_COUNT);
+        TransferManager.StreamReader slowReader = (name, position, length) -> {
+            int current = inFlight.incrementAndGet();
+            maxInFlight.updateAndGet(prev -> Math.max(prev, current));
+            try {
+                Thread.sleep(200); // long enough that unbounded fan-out would clearly overshoot the cap
+                return bundleStore.openRange(name, position, length);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new java.io.IOException(e);
+            } finally {
+                inFlight.decrementAndGet();
+                completed.countDown();
+            }
+        };
+
+        FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(64L * 1024 * 1024, 1);
+        // Deliberately sized well above the concurrency cap -- proves the executor's own capacity is
+        // not what's bounding concurrency here, LazyBundleDirectory's own worker-pool logic is.
+        ExecutorService executor = Executors.newFixedThreadPool(MANY_FILES_COUNT);
+        try (MMapDirectory cacheDirectory = new MMapDirectory(createTempDir(), SimpleFSLockFactory.INSTANCE)) {
+            TransferManager transferManager = new TransferManager(slowReader, fileCache, threadPool);
+            try (LazyBundleDirectory lazyDirectory = new LazyBundleDirectory(manifest, cacheDirectory, transferManager)) {
+                lazyDirectory.prefetchBootSet(executor);
+                assertTrue("all prefetches must complete", completed.await(30, TimeUnit.SECONDS));
+            }
+        } finally {
+            executor.shutdown();
+            fileCache.clear();
+        }
+
+        assertTrue(
+            "at most " + concurrencyCap + " prefetches may ever be in flight at once, observed " + maxInFlight.get(),
+            maxInFlight.get() <= concurrencyCap
+        );
+        assertEquals(
+            "the cap must actually be reached (not an accidentally-serialized 1-at-a-time run) to prove real concurrency is happening",
+            concurrencyCap,
+            maxInFlight.get()
+        );
     }
 }

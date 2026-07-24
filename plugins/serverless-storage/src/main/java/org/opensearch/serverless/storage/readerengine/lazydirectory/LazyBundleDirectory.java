@@ -20,7 +20,9 @@ import org.opensearch.serverless.storage.manifest.CommitManifest;
 import org.opensearch.serverless.storage.manifest.FileReference;
 
 import java.io.IOException;
+import java.util.ArrayDeque;
 import java.util.Collection;
+import java.util.Deque;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -83,37 +85,68 @@ public final class LazyBundleDirectory extends Directory {
     }
 
     /**
+     * The most files' prefetches this directory will ever have simultaneously in flight, across
+     * one {@link #prefetchBootSet} call -- see that method's own javadoc for why an unbounded
+     * fan-out (one task per file, all submitted at once) is unsafe: {@code executor} is a shared,
+     * node-wide pool, and many reader shards opening around the same time (a node restart, a scale-
+     * up event) would otherwise each contribute their own unbounded burst on top of each other,
+     * competing for the same pool and the same object-store connections as every other shard's
+     * legitimate, non-prefetch work (manifest polls, directory refreshes, actual query reads).
+     */
+    private static final int MAX_CONCURRENT_BOOT_SET_PREFETCHES = 8;
+
+    /**
      * Illustrative "boot-set" prefetch (rfc-serverless-opensearch.md &sect;18 risk #2, "cold-query
      * latency... mitigation: boot-set prefetch"): warms this directory's local block cache by
-     * fetching just the first block of every currently-known file, concurrently, on {@code
-     * executor} -- <em>not</em> on the calling thread, so this method itself returns immediately
-     * and never reintroduces the upfront-I/O cost this whole directory exists to avoid (see this
-     * class's own javadoc). The actual win is reordering, not reducing, request count: Lucene's own
-     * {@code DirectoryReader}/{@code SegmentInfos} open sequence would fetch these same first
-     * blocks anyway, one at a time, serially, as it opens each file in turn -- this fires them all
-     * at once instead, so by the time Lucene actually asks, the fetch is already in flight or done
-     * rather than starting cold.
+     * fetching just the first block of every currently-known file, concurrently but bounded to at
+     * most {@link #MAX_CONCURRENT_BOOT_SET_PREFETCHES} in flight at once, on {@code executor} --
+     * <em>not</em> on the calling thread, so this method itself returns immediately and never
+     * reintroduces the upfront-I/O cost this whole directory exists to avoid (see this class's own
+     * javadoc). The actual win is reordering, not reducing, request count: Lucene's own {@code
+     * DirectoryReader}/{@code SegmentInfos} open sequence would fetch these same first blocks
+     * anyway, one at a time, serially, as it opens each file in turn -- this fires a bounded number
+     * of them concurrently instead, so by the time Lucene actually asks, the fetch is already in
+     * flight or done rather than starting cold, without unboundedly bursting every file's fetch at
+     * once (a real shard can easily have far more than a handful of segment files).
+     *
+     * <p>Implemented as a small fixed-size worker pool pulling from one shared queue, rather than
+     * submitting every file's task upfront and having most of them immediately block on a permit:
+     * that would still tie up {@code executor}'s own threads/queue slots one-for-one with file
+     * count, defeating the point of bounding concurrency at all.
      *
      * <p>Deliberately best-effort: a failed or slow prefetch of one file must never block or fail
      * this method, nor the real read that follows -- that real read (via the ordinary {@link
      * #openInput} path) still correctly (re)fetches on its own if the prefetch never completed or
      * hit a transient fault, exactly the same fault-tolerance the on-demand path always had.
      *
-     * @param executor runs each file's own prefetch task; must not run tasks synchronously on the
+     * @param executor runs each worker's prefetch loop; must not run tasks synchronously on the
      *                  calling thread (see above).
      */
     public void prefetchBootSet(Executor executor) {
-        for (String name : filesByName.keySet()) {
-            executor.execute(() -> {
-                try (IndexInput input = openInput(name, IOContext.READONCE)) {
-                    if (input.length() > 0) {
-                        input.readByte();
-                    }
-                } catch (IOException | RuntimeException prefetchFailure) {
-                    // Best-effort only -- the real read still happens (and still correctly
-                    // fetches) through the ordinary openInput path regardless of this outcome.
+        Deque<String> queue = new ArrayDeque<>(filesByName.keySet());
+        int workerCount = Math.min(MAX_CONCURRENT_BOOT_SET_PREFETCHES, queue.size());
+        for (int i = 0; i < workerCount; i++) {
+            executor.execute(() -> drainBootSetPrefetchQueue(queue));
+        }
+    }
+
+    private void drainBootSetPrefetchQueue(Deque<String> queue) {
+        for (;;) {
+            String name;
+            synchronized (queue) {
+                name = queue.poll();
+            }
+            if (name == null) {
+                return;
+            }
+            try (IndexInput input = openInput(name, IOContext.READONCE)) {
+                if (input.length() > 0) {
+                    input.readByte();
                 }
-            });
+            } catch (IOException | RuntimeException prefetchFailure) {
+                // Best-effort only -- the real read still happens (and still correctly fetches)
+                // through the ordinary openInput path regardless of this outcome.
+            }
         }
     }
 
