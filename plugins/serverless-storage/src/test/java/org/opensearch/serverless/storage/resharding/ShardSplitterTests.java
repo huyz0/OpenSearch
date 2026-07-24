@@ -222,11 +222,61 @@ public class ShardSplitterTests extends OpenSearchTestCase {
     // ShardCloner.clone returned successfully, i.e. after the head CAS that makes the target
     // shard visible/openable. An engine-open retry landing in the window between that CAS and the
     // descriptor write would cache "no partition filter" for the engine's entire lifetime,
-    // silently serving the full pre-split document set. Proven here by making the head CAS fail:
-    // if the descriptor is written before activation (the fix), it survives a failed activation;
-    // if it were still written after (the bug), a failed activation would leave no descriptor at
-    // all -- a directly observable difference between the two orderings.
-    public void testPartitionDescriptorIsDurableBeforeActivationEvenIfActivationFails() throws Exception {
+    // silently serving the full pre-split document set. Proven here by observing, from INSIDE a
+    // fake compareAndSet, that the descriptor already exists at the moment the CAS is attempted --
+    // the ordering fix's own actual guarantee -- rather than by checking what remains once the
+    // whole call has failed (see the next test for why that final-state check alone is no longer
+    // the right assertion, now that a failed activation rolls the descriptor back too).
+    public void testPartitionDescriptorIsDurableBeforeTheHeadCasIsEvenAttempted() throws Exception {
+        publishSourceCommit();
+
+        java.util.concurrent.atomic.AtomicBoolean descriptorPresentDuringCas = new java.util.concurrent.atomic.AtomicBoolean();
+        ShardStateStore observingStore = new ShardStateStore() {
+            @Override
+            public Optional<VersionedShardHead> get(String indexUuid, int shardId) throws IOException {
+                return targetShardStateStore.get(indexUuid, shardId);
+            }
+
+            @Override
+            public CasResult compareAndSet(String indexUuid, int shardId, Optional<Long> expectedVersion, ShardHead newHead)
+                throws IOException {
+                descriptorPresentDuringCas.set(targetPartitionStore.readDescriptor().isPresent());
+                return targetShardStateStore.compareAndSet(indexUuid, shardId, expectedVersion, newHead);
+            }
+        };
+
+        ShardSplitter.split(
+            SOURCE_INDEX_UUID,
+            SHARD_ID,
+            sourceManifestStore,
+            sourceShardStateStore,
+            sourcePinRegistry,
+            TARGET_INDEX_UUID,
+            SHARD_ID,
+            targetManifestStore,
+            observingStore,
+            targetLineageStore,
+            targetPartitionStore,
+            1,
+            3,
+            System.currentTimeMillis()
+        );
+
+        assertTrue(
+            "the partition descriptor must already be durable at the moment the head CAS is "
+                + "attempted -- it must never depend on activation having already succeeded",
+            descriptorPresentDuringCas.get()
+        );
+    }
+
+    // Regression test for a different bug: once ShardCloner.clone() started rolling back its own
+    // durable writes on a definitively failed activation (a target already active for an unrelated
+    // reason), a split target's own extra write -- the partition descriptor -- was left behind,
+    // uncleaned, unlike the manifest/lineage/pin ShardCloner itself already knew how to roll back.
+    // Left in place, a retry against the same target would fail forever at writeDescriptor itself
+    // (write-once, fails if the blob already exists), the same "retry can never succeed" bug this
+    // session already found and fixed for lineage and the target manifest.
+    public void testPartitionDescriptorIsRolledBackIfActivationFails() throws Exception {
         publishSourceCommit();
 
         ShardStateStore activationFailingStore = new ShardStateStore() {
@@ -263,9 +313,13 @@ public class ShardSplitterTests extends OpenSearchTestCase {
         );
 
         assertTrue(
-            "the partition descriptor must be durable even when activation (the head CAS) itself "
-                + "fails -- it must never depend on activation having already succeeded",
-            targetPartitionStore.readDescriptor().isPresent()
+            "a definitively failed split attempt must roll back its own partition descriptor, "
+                + "the same way ShardCloner already rolls back the manifest/lineage/pin it wrote",
+            targetPartitionStore.readDescriptor().isEmpty()
+        );
+        assertTrue(
+            "a definitively failed split attempt must roll back the manifest ShardCloner wrote too",
+            targetManifestStore.listManifests().isEmpty()
         );
         assertTrue(
             "a failed activation must leave no published target head",

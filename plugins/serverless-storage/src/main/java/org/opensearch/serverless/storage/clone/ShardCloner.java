@@ -96,12 +96,13 @@ public final class ShardCloner {
      * @param nowMillis the target manifest's {@link CommitManifest#createdAtMillis()} -- passed in
      *                  rather than read internally so this class stays trivially deterministic to
      *                  test.
-     * @throws IOException if the source has no published manifest, or the target already does
-     *                      (both refusals are safe to retry after the caller resolves them, and
-     *                      neither leaves the target in a half-written state -- the pin added on
-     *                      the source before either check's target-side failure is harmless
-     *                      extra retention, not a correctness problem, exactly as {@code
-     *                      DurablePinRegistry#addPin}'s own idempotency is designed for).
+     * @throws IOException if the source has no published manifest, or the target already does --
+     *                      the first refusal happens before any durable write at all, and the
+     *                      second (and any other failure between the source pin and the head CAS)
+     *                      rolls back every durable write this call itself made before rethrowing,
+     *                      so neither ever leaves the target, or the source's pin, in a half-written
+     *                      state (see this method's own body for exactly what that rollback does and
+     *                      why it's safe).
      */
     public static void clone(
         String sourceIndexUuid,
@@ -137,7 +138,8 @@ public final class ShardCloner {
      * every durable write up to and including the target's manifest, but strictly before the head
      * {@link ShardStateStore#compareAndSet} below that is what actually makes the target shard
      * visible/openable. {@code null} is a no-op, matching the eleven-argument overload's behavior
-     * exactly.
+     * exactly. Delegates to the thirteen-argument overload with no compensating rollback for {@code
+     * beforeActivation} -- equivalent to passing {@code null} there too.
      *
      * <p>This exists for {@link org.opensearch.serverless.storage.resharding.ShardSplitter#split},
      * which needs to durably write a {@code ShardPartitionDescriptor} before the target becomes
@@ -182,6 +184,72 @@ public final class ShardCloner {
         BlobContainerCloneLineageStore targetLineageStore,
         long nowMillis,
         CheckedRunnable<IOException> beforeActivation
+    ) throws IOException {
+        clone(
+            sourceIndexUuid,
+            sourceShardId,
+            sourceManifestStore,
+            sourceShardStateStore,
+            sourcePinRegistry,
+            targetIndexUuid,
+            targetShardId,
+            targetManifestStore,
+            targetShardStateStore,
+            targetLineageStore,
+            nowMillis,
+            beforeActivation,
+            null
+        );
+    }
+
+    /**
+     * Same as the twelve-argument overload, with one addition: {@code rollbackBeforeActivation},
+     * this method's own compensating action for {@code beforeActivation} -- run, best-effort, from
+     * this method's own failure-rollback handling (see this method's own body) if and only if {@code
+     * beforeActivation} itself is known to have completed successfully. {@code null} is a no-op,
+     * matching the twelve-argument overload's behavior exactly: {@link
+     * org.opensearch.serverless.storage.resharding.ShardSplitter#split} is the only caller that
+     * supplies one, to clear the {@code ShardPartitionDescriptor} {@code beforeActivation} wrote
+     * (see {@code BlobContainerShardPartitionStore#clearDescriptor}) if this attempt fails at the
+     * head CAS afterward -- this method has no way to know what an opaque {@code beforeActivation}
+     * callback did, so it relies entirely on the caller's own matching compensating action here,
+     * the same shape {@code beforeActivation} itself already uses.
+     *
+     * @param sourceIndexUuid the index being cloned from; must already have a published manifest.
+     * @param sourceShardId the shard number within {@code sourceIndexUuid}.
+     * @param sourceManifestStore where the source shard's manifests live.
+     * @param sourceShardStateStore where the source shard's head lives.
+     * @param sourcePinRegistry the source shard's durable pin registry, protected via this call.
+     * @param targetIndexUuid the brand-new index the clone creates; must not already have a
+     *                        published head -- cloning onto an already-active shard is refused,
+     *                        the same put-if-absent contract {@link ShardStateStore#compareAndSet}
+     *                        already gives every first activation.
+     * @param targetShardId the shard number within {@code targetIndexUuid}.
+     * @param targetManifestStore where the target shard's new manifest is written.
+     * @param targetShardStateStore where the target shard's new head is published.
+     * @param targetLineageStore where the target shard's {@link CloneLineage} is recorded.
+     * @param nowMillis the target manifest's {@link CommitManifest#createdAtMillis()} -- passed in
+     *                  rather than read internally so this class stays trivially deterministic to
+     *                  test.
+     * @param beforeActivation run after the manifest write, before the head CAS; {@code null} for none.
+     * @param rollbackBeforeActivation this attempt's own undo of {@code beforeActivation}, run only
+     *                                 if {@code beforeActivation} itself completed; {@code null} for none.
+     * @throws IOException if the source has no published manifest, or the target already does.
+     */
+    public static void clone(
+        String sourceIndexUuid,
+        int sourceShardId,
+        BlobContainerManifestStore sourceManifestStore,
+        ShardStateStore sourceShardStateStore,
+        DurablePinRegistry sourcePinRegistry,
+        String targetIndexUuid,
+        int targetShardId,
+        BlobContainerManifestStore targetManifestStore,
+        ShardStateStore targetShardStateStore,
+        BlobContainerCloneLineageStore targetLineageStore,
+        long nowMillis,
+        CheckedRunnable<IOException> beforeActivation,
+        CheckedRunnable<IOException> rollbackBeforeActivation
     ) throws IOException {
         // Fails with a specific, actionable message for a PRIOR, different-source clone attempt's
         // still-present lineage (e.g. one that pinned its source but then lost the head CAS below
@@ -231,13 +299,27 @@ public final class ShardCloner {
         // ordering is shown to hold across the complete reachable state space for that model.
         PinRecord pin = new PinRecord(clonePinId(targetIndexUuid, targetShardId), head.primaryTerm(), head.latestManifestGeneration());
         sourcePinRegistry.addPin(sourceIndexUuid, sourceShardId, pin);
-        CommitManifest sourceManifest = sourceManifestStore.readManifest(head.primaryTerm(), head.latestManifestGeneration());
-        // Lineage before the head CAS below makes the clone visible/active -- so whenever a clone
-        // is visible, deleteClone can already find its way back to the pin it must remove.
-        targetLineageStore.writeLineage(new CloneLineage(sourceIndexUuid, sourceShardId));
 
+        // Every step from here through the head CAS is wrapped in one try/catch: a failure anywhere
+        // in this range rolls back everything THIS call itself durably wrote, tracked explicitly per
+        // step below rather than inferred from reaching a later line -- each of writeLineage,
+        // writeManifest, and beforeActivation can throw either because nothing was written yet (a
+        // transient I/O error) or because it's write-once and something else already durably
+        // occupies that exact name (e.g. the target is already active from something other than
+        // this clone). In neither case did THIS call's own write succeed, so the catch block below
+        // must never attempt to undo a step whose own flag says it didn't actually land.
+        boolean lineageWritten = false;
+        boolean manifestWritten = false;
+        boolean beforeActivationRan = false;
+        CommitManifest targetManifest = null;
         try {
-            CommitManifest targetManifest = new CommitManifest(
+            CommitManifest sourceManifest = sourceManifestStore.readManifest(head.primaryTerm(), head.latestManifestGeneration());
+            // Lineage before the head CAS below makes the clone visible/active -- so whenever a
+            // clone is visible, deleteClone can already find its way back to the pin it must remove.
+            targetLineageStore.writeLineage(new CloneLineage(sourceIndexUuid, sourceShardId));
+            lineageWritten = true;
+
+            targetManifest = new CommitManifest(
                 targetIndexUuid,
                 targetShardId,
                 1,
@@ -252,9 +334,11 @@ public final class ShardCloner {
                 nowMillis
             );
             targetManifestStore.writeManifest(targetManifest);
+            manifestWritten = true;
 
             if (beforeActivation != null) {
                 beforeActivation.run();
+                beforeActivationRan = true;
             }
 
             CasResult result = targetShardStateStore.compareAndSet(
@@ -269,37 +353,86 @@ public final class ShardCloner {
                 );
             }
         } catch (IOException | RuntimeException e) {
-            // Everything past this point in the method is now definitively, permanently unusable --
-            // unlike the pin-added-but-lineage-not-yet-written window above (a harmless, idempotent
-            // no-op to retry, see this method's own javadoc), the lineage write just above IS visible
-            // to other readers, and this specific attempt will never get a later chance to complete:
-            // a retry with the same target either hits this same failure again (the target was
-            // already active for an unrelated reason) or is a genuinely idempotent no-op (the target
-            // is this exact attempt succeeding on a later try, which never reaches this catch).
-            // Rolling back here, rather than leaving the pin permanently unreclaimed and the lineage
-            // permanently wrong, matters most for the case a plain retry can never fix: the target
-            // was already active from something other than this clone (e.g. an ordinary index
-            // creation racing this call, or a stale request against an already-cloned target) --
-            // left in place, this failed attempt's lineage record would misdescribe that unrelated,
-            // legitimate shard's origin forever, and its pin would block the source shard's GC
-            // forever for a clone that will never exist.
+            // This specific attempt will never get a later chance to complete: a retry with the same
+            // target either hits this same failure again (the target was already active for an
+            // unrelated reason) or is a genuinely idempotent no-op (the target is this exact attempt
+            // succeeding on a later try, which never reaches this catch). Rolling back here, rather
+            // than leaving durable state permanently unreclaimed or wrong, matters most for the case
+            // a plain retry can never fix: the target was already active from something other than
+            // this clone (e.g. an ordinary index creation racing this call, or a stale request
+            // against an already-cloned target). Left in place, a failed attempt's lineage record
+            // would misdescribe that unrelated, legitimate shard's origin forever, its pin would
+            // block the source shard's GC forever for a clone that will never exist, and -- the most
+            // dangerous of the three -- its stray manifest at (1, 1) would sit there ready for
+            // ObjectStoreCommitPublisher#publishCommit's own "manifest already exists at this (term,
+            // generation), return it unchanged" guard to silently hand this attempt's SOURCE shard's
+            // file references back to whatever later, genuinely first commit that unrelated target
+            // shard eventually makes at (1, 1) -- silent misdirection to the wrong segment files, not
+            // just a failed retry.
             //
+            // Every rollback step below is best-effort and independently guarded: a failure in ANY
+            // one of them must never mask e, the real reason this attempt failed and the only thing
+            // the caller actually needs to see -- a rollback failure is attached to it as a
+            // suppressed exception (surfaced to anything that inspects the thrown exception in
+            // detail) rather than replacing it, and every other rollback step still runs regardless
+            // of whether an earlier one failed.
+            //
+            // The pin is always attempted, regardless of which later step (if any) actually ran:
+            // removePin(String, int, PinRecord) is an exact-match compare-and-remove (see that
+            // method's own javadoc), so it can never remove a different attempt's pin even under a
+            // genuinely concurrent, different-source clone() call racing for the same target --
+            // unlike lineage/manifest below, there is no ambiguity to guard against here at all.
+            try {
+                sourcePinRegistry.removePin(sourceIndexUuid, sourceShardId, pin);
+            } catch (IOException | RuntimeException rollbackFailure) {
+                e.addSuppressed(rollbackFailure);
+            }
+            // Rolls back the manifest unconditionally once manifestWritten is true: since
+            // writeManifest is write-once (same as writeLineage), this call succeeding at all means
+            // no one else's content could be at that exact name, so nothing else could need
+            // protecting from this delete. Unlike lineage below, there is no exposed "clear this
+            // manifest and let something else immediately reuse the same (term, generation)"
+            // primitive in normal operation, so the narrow re-read-and-compare guard lineage needs
+            // doesn't apply here.
+            if (manifestWritten) {
+                try {
+                    targetManifestStore.deleteManifests(java.util.List.of(targetManifest));
+                } catch (IOException | RuntimeException rollbackFailure) {
+                    e.addSuppressed(rollbackFailure);
+                }
+            }
+            // Same "run only if it definitely happened" reasoning as the manifest above, but the
+            // undo itself is the caller's own responsibility (see this method's own javadoc for
+            // rollbackBeforeActivation): this method has no way to inspect what an opaque
+            // beforeActivation callback actually wrote.
+            if (beforeActivationRan && rollbackBeforeActivation != null) {
+                try {
+                    rollbackBeforeActivation.run();
+                } catch (IOException | RuntimeException rollbackFailure) {
+                    e.addSuppressed(rollbackFailure);
+                }
+            }
             // Re-reads the lineage rather than blindly deleting the one just written, and only rolls
             // back if it still names exactly this attempt's source. writeLineage itself is write-once
-            // (its own writeBlobAtomic call fails outright if the blob already exists -- see this
-            // method's own earlier comment -- it can never silently overwrite), so an ordinary
-            // concurrent clone() call racing for the same target cannot have replaced this attempt's
-            // lineage out from under it. The only way the record here could be someone else's is an
-            // explicit deleteLineage (e.g. an operator-triggered deleteClone) followed by a different
-            // attempt's write, both landing in the narrow window between this write and this catch --
-            // astronomically unlikely, but the guard costs one extra read and removes any doubt: this
-            // attempt's failure must never touch state it can positively tell is no longer its own.
-            Optional<CloneLineage> currentLineage = targetLineageStore.readLineage();
-            if (currentLineage.isPresent()
-                && currentLineage.get().sourceIndexUuid().equals(sourceIndexUuid)
-                && currentLineage.get().sourceShardId() == sourceShardId) {
-                targetLineageStore.deleteLineage();
-                sourcePinRegistry.removePin(sourceIndexUuid, sourceShardId, pin);
+            // (its own writeBlobAtomic call fails outright if the blob already exists -- it never
+            // silently overwrites), so an ordinary concurrent clone() call racing for the same target
+            // cannot have replaced this attempt's lineage out from under it. The only way the record
+            // here could be someone else's is an explicit deleteLineage (e.g. an operator-triggered
+            // deleteClone) followed by a different attempt's write, both landing in the narrow window
+            // between this write and this catch -- astronomically unlikely, but the guard costs one
+            // extra read and removes any doubt: this attempt's failure must never touch state it can
+            // positively tell is no longer its own.
+            if (lineageWritten) {
+                try {
+                    Optional<CloneLineage> currentLineage = targetLineageStore.readLineage();
+                    if (currentLineage.isPresent()
+                        && currentLineage.get().sourceIndexUuid().equals(sourceIndexUuid)
+                        && currentLineage.get().sourceShardId() == sourceShardId) {
+                        targetLineageStore.deleteLineage();
+                    }
+                } catch (IOException | RuntimeException rollbackFailure) {
+                    e.addSuppressed(rollbackFailure);
+                }
             }
             throw e;
         }

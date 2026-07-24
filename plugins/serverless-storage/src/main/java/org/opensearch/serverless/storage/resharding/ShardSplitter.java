@@ -111,7 +111,13 @@ public final class ShardSplitter {
             targetShardStateStore,
             targetLineageStore,
             nowMillis,
-            () -> targetPartitionStore.writeDescriptor(descriptor)
+            () -> targetPartitionStore.writeDescriptor(descriptor),
+            // If the descriptor write above succeeds but a later step (the head CAS) fails, this
+            // attempt is definitively over -- clear it, the same idempotent primitive
+            // PartitionRewritePublisher itself already uses once a rewrite legitimately completes,
+            // so a failed split attempt doesn't leave a live descriptor pointing at a target that
+            // was never actually activated.
+            targetPartitionStore::clearDescriptor
         );
     }
 }

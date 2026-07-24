@@ -25,6 +25,7 @@ import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.fs.FsBlobContainer;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
+import org.opensearch.common.blobstore.support.FilterBlobContainer;
 import org.opensearch.serverless.storage.format.BlobContainerBundleStore;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.manifest.CommitManifest;
@@ -176,6 +177,59 @@ public class ShardClonerTests extends OpenSearchTestCase {
             "a definitively failed clone attempt must not leave its pin on the source",
             sourcePinRegistry.getPins(SOURCE_INDEX_UUID, SHARD_ID).isEmpty()
         );
+        assertTrue(
+            "a definitively failed clone attempt must not leave its stray manifest on the target -- "
+                + "ObjectStoreCommitPublisher would otherwise silently hand that manifest's content "
+                + "(the SOURCE shard's file references) back to this target's own real first commit later",
+            targetManifestStore.listManifests().isEmpty()
+        );
+    }
+
+    // Regression test for a narrower leak: a failure BEFORE the manifest/lineage are ever written
+    // (e.g. the source manifest read itself fails) must still release the pin that was already
+    // added -- previously left in place as "harmless extra retention" (still true in the sense
+    // that nothing was corrupted), but with no discovery path at all once a later, genuinely
+    // different-source attempt takes over the target: deleteClone can only ever see ONE lineage
+    // record, so an earlier, never-completed attempt's own pin on its own chosen source becomes
+    // permanently unreachable through any mechanism, not just inconvenient to clean up.
+    public void testCloneReleasesThePinEvenWhenFailingBeforeTheManifestOrLineageAreWritten() throws Exception {
+        publishSourceCommit();
+        BlobContainer readFailingSourceContainer = new FilterBlobContainer(sourceContainer) {
+            @Override
+            public java.io.InputStream readBlob(String blobName) throws java.io.IOException {
+                throw new java.io.IOException("simulated transient read failure for " + blobName);
+            }
+
+            @Override
+            protected BlobContainer wrapChild(BlobContainer child) {
+                throw new AssertionError("this test never descends into a child container");
+            }
+        };
+        BlobContainerManifestStore failingSourceManifestStore = new BlobContainerManifestStore(readFailingSourceContainer);
+
+        expectThrows(
+            java.io.IOException.class,
+            () -> ShardCloner.clone(
+                SOURCE_INDEX_UUID,
+                SHARD_ID,
+                failingSourceManifestStore,
+                sourceShardStateStore,
+                sourcePinRegistry,
+                TARGET_INDEX_UUID,
+                SHARD_ID,
+                targetManifestStore,
+                targetShardStateStore,
+                targetLineageStore,
+                1L
+            )
+        );
+
+        assertTrue(
+            "the pin added just before the failing read must still be released, not left as "
+                + "unreachable garbage",
+            sourcePinRegistry.getPins(SOURCE_INDEX_UUID, SHARD_ID).isEmpty()
+        );
+        assertTrue(targetLineageStore.readLineage().isEmpty());
     }
 
     public void testClonePinsTheExactSourceGenerationItClonedFrom() throws Exception {
