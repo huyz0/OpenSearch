@@ -88,6 +88,15 @@ public final class GcSchedulerTask implements Closeable {
     // added below.
     private final Map<String, Long> firstObservedOrphanedAtMillis = new HashMap<>();
 
+    // Node-local, in-memory, reset on restart. Manifests are immutable and write-once (see
+    // BlobContainerManifestStore#writeManifest's own javadoc), so once this task has read a given
+    // manifest's body, it never needs to re-fetch it on a later tick -- only whether it still
+    // exists needs to be current, which listManifests(Map) still checks fresh via a real listing
+    // every tick regardless of this cache. Without this, every tick pays one readBlob call per
+    // manifest the shard has EVER retained, not per manifest newly written since the last tick --
+    // a real, unbounded-with-history S3 GET cost this cache turns into a bounded one.
+    private final Map<String, CommitManifest> manifestReadCache = new HashMap<>();
+
     /**
      * Schedules a recurring GC sweep for one shard.
      *
@@ -132,7 +141,7 @@ public final class GcSchedulerTask implements Closeable {
     }
 
     private void sweep() throws IOException {
-        List<CommitManifest> manifests = manifestStore.listManifests();
+        List<CommitManifest> manifests = manifestStore.listManifests(manifestReadCache);
         if (manifests.isEmpty()) {
             return; // never activated, or every manifest already swept -- nothing to do
         }

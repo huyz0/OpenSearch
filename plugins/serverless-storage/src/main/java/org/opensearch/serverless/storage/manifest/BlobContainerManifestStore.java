@@ -20,6 +20,7 @@ import java.nio.file.NoSuchFileException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Persists and retrieves {@link CommitManifest}s against a real {@link BlobContainer}, using each
@@ -99,14 +100,57 @@ public final class BlobContainerManifestStore {
      * here too.
      */
     public List<CommitManifest> listManifests() throws IOException {
+        return listManifests(null);
+    }
+
+    /**
+     * Same as {@link #listManifests()}, except a manifest whose blob name is already a key in
+     * {@code readCache} is served from there instead of a fresh {@code readBlob} call, and any
+     * manifest newly read here is added to it. {@code null} disables caching entirely -- exactly
+     * {@link #listManifests()}'s own behavior.
+     *
+     * <p>Safe because manifests are immutable and write-once (see {@link #writeManifest}'s own
+     * javadoc): once a given blob name has been read successfully, its content can never change
+     * later, only the blob's continued existence can (a GC sweep deleting it). This method still
+     * lists the container fresh every call -- so a manifest's existence is always current, and a
+     * newly-written manifest never seen before is always read fresh -- only the body of an
+     * already-seen, still-existing manifest is served from {@code readCache} rather than re-fetched.
+     * A caller that owns and reuses the same {@code readCache} instance across many calls (e.g. a
+     * recurring per-shard scheduler task, one cache per task instance) turns what would otherwise be
+     * a full re-read of every retained manifest on every call into a read of only the manifests
+     * newly written since the last call -- the same size as the container's actual per-tick growth,
+     * not its whole retained history.
+     *
+     * @param readCache a mutable map this call may read from and add to, or {@code null} to disable
+     *                  caching; the caller owns its lifetime (typically one instance per recurring
+     *                  task, node-local and reset on restart). Entries for a blob name no longer
+     *                  present in this call's own fresh listing are evicted before returning, so the
+     *                  cache stays bounded to the container's currently retained manifests -- never
+     *                  every manifest the shard has ever written -- rather than growing unboundedly
+     *                  as GC deletes old ones out from under it.
+     */
+    public List<CommitManifest> listManifests(Map<String, CommitManifest> readCache) throws IOException {
         List<CommitManifest> manifests = new ArrayList<>();
-        for (String blobName : blobContainer.listBlobsByPrefix(CommitManifest.NAME_PREFIX).keySet()) {
+        java.util.Set<String> currentBlobNames = blobContainer.listBlobsByPrefix(CommitManifest.NAME_PREFIX).keySet();
+        for (String blobName : currentBlobNames) {
+            CommitManifest cached = readCache == null ? null : readCache.get(blobName);
+            if (cached != null) {
+                manifests.add(cached);
+                continue;
+            }
             try (InputStream in = blobContainer.readBlob(blobName)) {
-                manifests.add(new CommitManifest(StreamInput.wrap(in.readAllBytes())));
+                CommitManifest manifest = new CommitManifest(StreamInput.wrap(in.readAllBytes()));
+                manifests.add(manifest);
+                if (readCache != null) {
+                    readCache.put(blobName, manifest);
+                }
             } catch (NoSuchFileException e) {
                 // Concurrently deleted by a GC sweep between the listing above and this read --
                 // see this method's own javadoc.
             }
+        }
+        if (readCache != null) {
+            readCache.keySet().retainAll(currentBlobNames);
         }
         return manifests;
     }

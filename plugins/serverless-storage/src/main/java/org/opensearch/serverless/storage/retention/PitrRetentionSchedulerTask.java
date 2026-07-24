@@ -12,11 +12,14 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
+import org.opensearch.serverless.storage.manifest.CommitManifest;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
 
 /**
  * Runs {@link PitrRetentionReconciler} for one shard on a fixed schedule -- the piece
@@ -24,8 +27,10 @@ import java.io.IOException;
  * PitrRetentionReconciler} existed and was correct, but nothing invoked it periodically.
  *
  * <p>Reconciliation is heavier than the directory-tier refresh {@code ObjectStoreWriterEngine}
- * already schedules (it enumerates and reads every manifest the shard has ever written, via
- * {@link BlobContainerManifestStore#listManifests}), and the PITR window moves far more slowly
+ * already schedules: it enumerates every manifest the shard currently retains on every tick, via
+ * {@link BlobContainerManifestStore#listManifests(Map)} (only genuinely new manifests since the
+ * last tick are actually read -- see that method's own javadoc for why re-reading a manifest this
+ * task has already seen is unnecessary and skipped). The PITR window also moves far more slowly
  * than a directory entry's TTL, so this is a separate task with its own (much longer) interval
  * rather than folded into that existing refresh.
  *
@@ -44,6 +49,15 @@ public final class PitrRetentionSchedulerTask implements Closeable {
     private final PitrRetentionReconciler reconciler;
     private final long windowMillis;
     private final Scheduler.Cancellable task;
+
+    // Node-local, in-memory, reset on restart. Manifests are immutable and write-once (see
+    // BlobContainerManifestStore#writeManifest's own javadoc), so once this task has read a given
+    // manifest's body, it never needs to re-fetch it on a later tick -- see
+    // BlobContainerManifestStore#listManifests(Map)'s own javadoc for why this is safe and what it
+    // saves. Reconciliation already runs on both the writer and (per this class's own earlier
+    // history) the reader engine for the same shard, so this cache also halves what would otherwise
+    // be double the unnecessary re-reads across those two independent task instances.
+    private final Map<String, CommitManifest> manifestReadCache = new HashMap<>();
 
     /**
      * Creates and immediately schedules a recurring PITR reconciliation task for one shard.
@@ -78,7 +92,13 @@ public final class PitrRetentionSchedulerTask implements Closeable {
 
     private void reconcileSafely() {
         try {
-            reconciler.reconcile(indexUuid, shardId, manifestStore.listManifests(), System.currentTimeMillis(), windowMillis);
+            reconciler.reconcile(
+                indexUuid,
+                shardId,
+                manifestStore.listManifests(manifestReadCache),
+                System.currentTimeMillis(),
+                windowMillis
+            );
         } catch (IOException e) {
             // See class javadoc: swallow and let the next scheduled tick retry -- but a persistent
             // (not transient) failure here would otherwise silently stop the PITR window from
