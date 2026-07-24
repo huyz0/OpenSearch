@@ -75,6 +75,8 @@ public final class ObjectStoreCommitPublisher {
      * re-uploading and overwriting the bundle -- but only after {@link #requireSameContent}
      * confirms the existing manifest actually describes {@code segmentInfos}' own files, not some
      * unrelated write that happens to occupy the same generation (see that method's own javadoc).
+     * One caller, {@code LuceneMergeCompactionPublisher}, needs this content check disabled -- see
+     * the {@code verifyIdempotentContent} overload further down for why.
      *
      * @param directory the local Lucene {@link Directory} holding the files referenced by {@code segmentInfos}
      * @param segmentInfos the local Lucene commit to package
@@ -184,6 +186,10 @@ public final class ObjectStoreCommitPublisher {
      * is keyed on {@code (primaryTerm, generation)} alone, never on {@code bundleNameSuffix}, so this
      * parameter cannot affect whether an already-fully-published generation short-circuits.
      *
+     * <p>Delegates with content verification enabled -- see the {@code verifyIdempotentContent}
+     * overload's own javadoc for why {@code LuceneMergeCompactionPublisher} specifically needs to
+     * call that overload directly with it disabled, instead of this one.
+     *
      * @param directory the local Lucene {@link Directory} holding the files referenced by {@code segmentInfos}
      * @param segmentInfos the local Lucene commit to package
      * @param indexUuid the index this shard belongs to
@@ -215,6 +221,67 @@ public final class ObjectStoreCommitPublisher {
         boolean quiescent,
         String bundleNameSuffix
     ) throws IOException {
+        return publishCommit(
+            directory,
+            segmentInfos,
+            indexUuid,
+            shardId,
+            primaryTerm,
+            generation,
+            maxSeqNo,
+            localCheckpoint,
+            walPosition,
+            mappingVersion,
+            pruningStats,
+            quiescent,
+            bundleNameSuffix,
+            true
+        );
+    }
+
+    /**
+     * Same as {@link #publishCommit(Directory, SegmentInfos, String, int, long, long, long, long,
+     * WalPosition, long, PruningStats, boolean, String)}, with {@code verifyIdempotentContent}
+     * controlling whether the idempotency short-circuit below trusts an existing manifest by
+     * identity ({@code (primaryTerm, generation)} alone) or requires it to also describe the exact
+     * same file content this call is about to publish (see {@link #requireSameContent}'s own
+     * javadoc for why the latter matters).
+     *
+     * <p>{@code false} is for {@code LuceneMergeCompactionPublisher} alone, called directly rather
+     * than through any other overload here: that class's own javadoc documents, as a deliberate
+     * design property rather than an oversight, that redoing its merge on every retry is
+     * <em>not</em> byte-deterministic, so two of its own attempts at the exact same {@code
+     * (primaryTerm, generation)} can legitimately differ -- content verification would reject
+     * compaction's own legitimate self-retry (an already-published, equally valid prior merge
+     * attempt of its own) exactly as if it were a genuinely foreign write, defeating the
+     * idempotency this short-circuit exists to provide for that caller. Every other caller keeps
+     * content verification enabled, since for them a differing existing manifest really does mean
+     * a foreign write, not their own retry -- see {@code requireSameContent}'s own javadoc for the
+     * danger that protects against.
+     *
+     * @param verifyIdempotentContent {@code true} (every caller except {@code
+     *                                 LuceneMergeCompactionPublisher}) to require an existing
+     *                                 manifest to match this call's own content before trusting it
+     *                                 as an idempotent retry; {@code false} to trust it by identity
+     *                                 alone, matching this method's behavior before that check existed.
+     * @return the manifest describing the packaged commit
+     */
+    public CommitManifest publishCommit(
+        Directory directory,
+        SegmentInfos segmentInfos,
+        String indexUuid,
+        int shardId,
+        long primaryTerm,
+        long generation,
+        long maxSeqNo,
+        long localCheckpoint,
+        WalPosition walPosition,
+        long mappingVersion,
+        PruningStats pruningStats,
+        boolean quiescent,
+        String bundleNameSuffix,
+        boolean verifyIdempotentContent
+    ) throws IOException {
         Collection<String> fileNames = segmentInfos.files(true);
         List<BundleFileContent> contents = new java.util.ArrayList<>(fileNames.size());
         for (String fileName : fileNames) {
@@ -223,7 +290,9 @@ public final class ObjectStoreCommitPublisher {
 
         if (manifestStore.manifestExists(primaryTerm, generation)) {
             CommitManifest existing = manifestStore.readManifest(primaryTerm, generation);
-            requireSameContent(primaryTerm, generation, contents, existing);
+            if (verifyIdempotentContent) {
+                requireSameContent(primaryTerm, generation, contents, existing);
+            }
             return existing;
         }
 

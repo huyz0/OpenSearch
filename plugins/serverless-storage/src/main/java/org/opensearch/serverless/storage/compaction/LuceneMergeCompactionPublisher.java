@@ -191,6 +191,12 @@ public final class LuceneMergeCompactionPublisher implements CompactionPublisher
         String bundleNameSuffix = "";
         for (int attempt = 0; attempt <= MAX_BUNDLE_NAME_COLLISION_RETRIES; attempt++) {
             try {
+                // verifyIdempotentContent=false: this class's own javadoc documents that redoing
+                // the merge on every retry is not byte-deterministic, so a genuine prior attempt of
+                // this class's own can legitimately land at the same generation with different
+                // content -- content verification would wrongly reject that as a foreign write. See
+                // ObjectStoreCommitPublisher#publishCommit's own verifyIdempotentContent-overload
+                // javadoc for the full reasoning.
                 return commitPublisher.publishCommit(
                     mergedDirectory,
                     mergedInfos,
@@ -204,7 +210,8 @@ public final class LuceneMergeCompactionPublisher implements CompactionPublisher
                     sourceManifest.mappingVersion(),
                     sourceManifest.pruningStats(),
                     false,
-                    bundleNameSuffix
+                    bundleNameSuffix,
+                    false
                 );
             } catch (IOException e) {
                 if (attempt == MAX_BUNDLE_NAME_COLLISION_RETRIES || isBundleNameCollision(e) == false) {
