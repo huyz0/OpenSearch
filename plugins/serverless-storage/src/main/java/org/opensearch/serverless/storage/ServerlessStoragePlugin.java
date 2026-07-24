@@ -2063,6 +2063,11 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 sharedWalBatchingProcessor = processor;
             }
             if (walGcInterval != null && walGcInterval.millis() > 0) {
+                // clusterService: this container is shared cluster-wide (not a shard's own
+                // dedicated WAL stream), and WalShardRegistry is a single durable register every
+                // node reads identically -- running the sweep on every node would just multiply
+                // the same object-store read traffic by the node count, see WalGcSchedulerTask's
+                // own javadoc.
                 walGcSchedulerTask = new org.opensearch.serverless.storage.wal.WalGcSchedulerTask(
                     threadPool,
                     walGcInterval,
@@ -2074,7 +2079,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                         } catch (IOException e) {
                             throw new UncheckedIOException(e);
                         }
-                    }
+                    },
+                    clusterService
                 );
             }
             sharedWalChunkService = built;

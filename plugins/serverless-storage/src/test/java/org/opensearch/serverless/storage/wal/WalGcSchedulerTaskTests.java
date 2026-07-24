@@ -8,10 +8,18 @@
 
 package org.opensearch.serverless.storage.wal;
 
+import org.opensearch.Version;
+import org.opensearch.cluster.ClusterName;
+import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.node.DiscoveryNode;
+import org.opensearch.cluster.node.DiscoveryNodes;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.fs.FsBlobContainer;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
+import org.opensearch.common.settings.ClusterSettings;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.serverless.storage.format.BlobContainerBundleStore;
 import org.opensearch.serverless.storage.format.BundleFileContent;
@@ -23,6 +31,7 @@ import org.opensearch.serverless.storage.manifest.WalPosition;
 import org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore;
 import org.opensearch.serverless.storage.shardstate.ShardHead;
 import org.opensearch.serverless.storage.shardstate.ShardStateStore;
+import org.opensearch.test.ClusterServiceUtils;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.threadpool.TestThreadPool;
 import org.opensearch.threadpool.ThreadPool;
@@ -100,6 +109,43 @@ public class WalGcSchedulerTaskTests extends OpenSearchTestCase {
 
     private WalGcSchedulerTask newTask(java.util.function.BiFunction<String, Integer, BlobContainer> shardContainerResolver) {
         return new WalGcSchedulerTask(threadPool, TimeValue.timeValueDays(1), walBlobContainer, registry, shardContainerResolver);
+    }
+
+    private WalGcSchedulerTask newTask(
+        java.util.function.BiFunction<String, Integer, BlobContainer> shardContainerResolver,
+        ClusterService clusterService
+    ) {
+        return new WalGcSchedulerTask(
+            threadPool,
+            TimeValue.timeValueDays(1),
+            walBlobContainer,
+            registry,
+            shardContainerResolver,
+            clusterService
+        );
+    }
+
+    private static DiscoveryNode node(String id) {
+        return new DiscoveryNode(id, buildNewFakeTransportAddress(), Version.CURRENT);
+    }
+
+    private ClusterService electedClusterManagerClusterService() {
+        return ClusterServiceUtils.createClusterService(threadPool);
+    }
+
+    private ClusterService notClusterManagerClusterService() {
+        DiscoveryNode local = node("not-the-cluster-manager");
+        DiscoveryNode other = node("the-real-cluster-manager");
+        ClusterService clusterService = ClusterServiceUtils.createClusterService(
+            threadPool,
+            local,
+            new ClusterSettings(Settings.EMPTY, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS)
+        );
+        ClusterState notElected = ClusterState.builder(new ClusterName("test"))
+            .nodes(DiscoveryNodes.builder().add(local).add(other).localNodeId(local.getId()).clusterManagerNodeId(other.getId()))
+            .build();
+        ClusterServiceUtils.setState(clusterService, notElected);
+        return clusterService;
     }
 
     public void testSweepDoesNothingWhenNoShardIsRegistered() throws Exception {
@@ -188,6 +234,59 @@ public class WalGcSchedulerTaskTests extends OpenSearchTestCase {
             );
         } finally {
             task.close();
+        }
+    }
+
+    public void testSweepSkipsEntirelyWhenThisNodeIsNotTheElectedClusterManager() throws Exception {
+        walChunkService.append(new WalRecord("idx", 0, PRIMARY_TERM, 0, "a".getBytes("UTF-8")));
+        long seq0 = walChunkService.flush();
+
+        BlobContainer shardContainer = shardScopedBlobContainer("idx-0");
+        publishHead(shardContainer, "idx", 0, 1, seq0);
+        registry.register("idx", 0);
+
+        ClusterService clusterService = notClusterManagerClusterService();
+        try {
+            WalGcSchedulerTask task = newTask((indexUuid, shardId) -> {
+                throw new AssertionError("resolver must not be invoked when this node is not the elected cluster-manager");
+            }, clusterService);
+            try {
+                task.sweepForTesting();
+                assertEquals(
+                    "a non-cluster-manager node must not delete anything from the shared container",
+                    1,
+                    walBlobContainer.listBlobsByPrefix(WalChunkNaming.LOG_BLOB_PREFIX).size()
+                );
+            } finally {
+                task.close();
+            }
+        } finally {
+            clusterService.close();
+        }
+    }
+
+    public void testSweepRunsNormallyWhenThisNodeIsTheElectedClusterManager() throws Exception {
+        walChunkService.append(new WalRecord("idx", 0, PRIMARY_TERM, 0, "a".getBytes("UTF-8")));
+        long seq0 = walChunkService.flush();
+
+        BlobContainer shardContainer = shardScopedBlobContainer("idx-0");
+        publishHead(shardContainer, "idx", 0, 1, seq0);
+        registry.register("idx", 0);
+
+        ClusterService clusterService = electedClusterManagerClusterService();
+        try {
+            WalGcSchedulerTask task = newTask((indexUuid, shardId) -> shardContainer, clusterService);
+            try {
+                task.sweepForTesting();
+                assertFalse(
+                    "the elected cluster-manager must still perform the sweep as normal",
+                    walBlobContainer.listBlobsByPrefix(WalChunkNaming.LOG_BLOB_PREFIX).keySet().contains(WalChunkNaming.blobName("epoch-0", seq0))
+                );
+            } finally {
+                task.close();
+            }
+        } finally {
+            clusterService.close();
         }
     }
 }

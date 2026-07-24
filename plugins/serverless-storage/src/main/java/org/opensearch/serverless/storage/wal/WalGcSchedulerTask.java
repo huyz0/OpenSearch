@@ -10,6 +10,7 @@ package org.opensearch.serverless.storage.wal;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
@@ -52,6 +53,22 @@ import java.util.function.BiFunction;
  * real {@link WalPosition} (WAL mirroring wasn't active for that particular commit -- see {@code
  * ObjectStoreWriterEngine#currentWalPosition}'s own placeholder-shape note), this sweep skips
  * entirely for that tick rather than guessing a bound that could delete something still needed.
+ *
+ * <p><b>{@code clusterService} ({@code null} to always sweep, non-{@code null} to run only on
+ * the elected cluster-manager)</b>: {@link WalShardRegistry} is a single durable, CAS-backed
+ * register shared by the whole cluster, so every node's sweep of a shared, cluster-wide {@code
+ * walBlobContainer} would compute the exact same {@code minCoveredSequence} bound from the exact
+ * same registered-shard list -- running it on every node multiplies the same object-store read
+ * traffic (one {@link ShardStateStore} read and one manifest read per registered shard, every
+ * tick) by the node count for no benefit, the same "don't multiply identical cluster-wide work by
+ * node count" reasoning {@code ScaleToZeroCandidatesSchedulerTask} already applies. Pass a
+ * non-{@code null} {@link ClusterService}, checked fresh on every tick (never cached, since the
+ * elected node can change), for that case. This does <b>not</b> apply to a shard's own <em>
+ * dedicated</em>, single-shard-scoped WAL container ({@code DedicatedWalGcConfig}): exactly one
+ * node ever hosts a given shard's writer engine at a time, so there is no redundant peer to
+ * eliminate there, and gating that sweep on cluster-manager election would instead wrongly stop
+ * it entirely on every node that isn't currently the elected cluster-manager -- pass {@code null}
+ * for that case, which is exactly what the narrower constructor below does.
  */
 public final class WalGcSchedulerTask implements Closeable {
 
@@ -60,14 +77,17 @@ public final class WalGcSchedulerTask implements Closeable {
     private final BlobContainer walBlobContainer;
     private final WalShardRegistry registry;
     private final BiFunction<String, Integer, BlobContainer> shardContainerResolver;
+    private final ClusterService clusterService;
     private final Scheduler.Cancellable task;
 
     /**
-     * Starts the scheduled sweep.
+     * Starts the scheduled sweep, running on every node -- for a shard's own dedicated,
+     * single-shard-scoped WAL container, where there is no cross-node redundancy to eliminate
+     * (see this class's own javadoc).
      *
      * @param threadPool schedules {@link #sweep()} on a fixed delay.
      * @param interval how often to sweep.
-     * @param walBlobContainer the shared WAL container chunks are deleted from.
+     * @param walBlobContainer the WAL container chunks are deleted from.
      * @param registry every shard known to use {@code walBlobContainer}.
      * @param shardContainerResolver given a shard's {@code (indexUuid, shardId)}, returns that shard's own {@link BlobContainer}.
      */
@@ -78,9 +98,35 @@ public final class WalGcSchedulerTask implements Closeable {
         WalShardRegistry registry,
         BiFunction<String, Integer, BlobContainer> shardContainerResolver
     ) {
+        this(threadPool, interval, walBlobContainer, registry, shardContainerResolver, null);
+    }
+
+    /**
+     * Starts the scheduled sweep.
+     *
+     * @param threadPool schedules {@link #sweep()} on a fixed delay.
+     * @param interval how often to sweep.
+     * @param walBlobContainer the WAL container chunks are deleted from.
+     * @param registry every shard known to use {@code walBlobContainer}.
+     * @param shardContainerResolver given a shard's {@code (indexUuid, shardId)}, returns that shard's own {@link BlobContainer}.
+     * @param clusterService {@code null} to sweep on every node unconditionally (a shard's own
+     *                       dedicated WAL container); non-{@code null} to sweep only when this
+     *                       node is currently the elected cluster-manager (the shared, cluster-wide
+     *                       WAL container, where every node would otherwise compute and delete the
+     *                       identical bound) -- see this class's own javadoc.
+     */
+    public WalGcSchedulerTask(
+        ThreadPool threadPool,
+        TimeValue interval,
+        BlobContainer walBlobContainer,
+        WalShardRegistry registry,
+        BiFunction<String, Integer, BlobContainer> shardContainerResolver,
+        ClusterService clusterService
+    ) {
         this.walBlobContainer = walBlobContainer;
         this.registry = registry;
         this.shardContainerResolver = shardContainerResolver;
+        this.clusterService = clusterService;
         // Jittered once per instance (rfc-serverless-opensearch.md §13's own "recovery stampede"
         // requirement) -- see JitteredScheduling's own javadoc for why a one-time offset is what
         // actually prevents lockstep ticking after a coordinated outage recovery.
@@ -93,10 +139,21 @@ public final class WalGcSchedulerTask implements Closeable {
         } catch (IOException e) {
             // Swallowed and retried next tick, same tolerance GcSchedulerTask already has for its
             // own sweep: nothing is corrupted by a skipped tick, only deferred.
+        } catch (Throwable t) {
+            // Deliberately Throwable, not just IOException: ClusterService#state() throws an
+            // AssertionError (not an Exception) if called before the node's initial cluster state
+            // is applied -- a real window this task's very first tick or two can land in, since
+            // threadPool.scheduleWithFixedDelay starts ticking as soon as this task is constructed,
+            // which can be well before the node finishes starting up. Same tolerance as the
+            // IOException case above: nothing is corrupted by a skipped tick, only deferred.
+            logger.warn("WAL GC sweep failed, will retry next tick", t);
         }
     }
 
     void sweep() throws IOException {
+        if (clusterService != null && clusterService.state().nodes().isLocalNodeElectedClusterManager() == false) {
+            return; // not our turn -- see class javadoc for why only the cluster-manager sweeps the shared container
+        }
         Set<RegisteredShard> shards = registry.registeredShards();
         if (shards.isEmpty()) {
             return; // nothing known to use this container yet -- nothing provably safe to delete
