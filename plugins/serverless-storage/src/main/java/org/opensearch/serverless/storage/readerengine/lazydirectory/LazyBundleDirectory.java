@@ -56,6 +56,7 @@ public final class LazyBundleDirectory extends Directory {
     private final FSDirectory cacheDirectory;
     private final TransferManager transferManager;
     private final Lock noOpLock = NoLockFactory.INSTANCE.obtainLock(null, null);
+    private volatile CommitManifest currentManifest;
 
     /**
      * Builds a directory whose file map starts from {@code manifest}'s files.
@@ -68,6 +69,23 @@ public final class LazyBundleDirectory extends Directory {
         this.filesByName = new ConcurrentHashMap<>(manifest.files());
         this.cacheDirectory = cacheDirectory;
         this.transferManager = transferManager;
+        this.currentManifest = manifest;
+    }
+
+    /**
+     * The most recent manifest this directory was built or advanced with -- lets a caller that
+     * already holds a reference to this directory (e.g. {@code ReaderEngineFactory#newReadWriteEngine},
+     * moments after {@code ServerlessStorageLazyDirectoryFactory#newDirectory} constructed it for the
+     * exact same shard open) reuse it instead of independently re-reading the shard's head and
+     * manifest from the object store -- one redundant head read plus one redundant manifest GET
+     * avoided per lazy-directory reader-shard open. No staler than the two independent reads it
+     * replaces would have been relative to each other anyway: both this field and an independent
+     * fresh read are subject to the exact same "a newer commit could land in between" race, which
+     * {@code ObjectStoreReaderEngine}'s own poll-and-catch-up design already tolerates by
+     * construction, so reusing this field introduces no new consistency risk.
+     */
+    public CommitManifest currentManifest() {
+        return currentManifest;
     }
 
     /**
@@ -82,6 +100,7 @@ public final class LazyBundleDirectory extends Directory {
      */
     public void advanceToManifest(CommitManifest manifest) {
         filesByName.putAll(manifest.files());
+        currentManifest = manifest;
     }
 
     /**

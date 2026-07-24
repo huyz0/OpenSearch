@@ -330,16 +330,36 @@ public final class ReaderEngineFactory implements EngineFactory {
         try {
             String indexUuid = config.getShardId().getIndex().getUUID();
             int shardId = config.getShardId().getId();
-            Optional<VersionedShardHead> head = shardStateStore.get(indexUuid, shardId);
-            // generation 0 means a head exists (e.g. a writer's lease acquisition put one there
-            // ahead of any commit, see ObjectStoreCommitHeadPublisher#acquireOrRenewLease) but
-            // nothing has actually been published yet -- same "nothing for a reader to open" case
-            // as no head at all.
-            if (head.isEmpty() || head.get().head().latestManifestGeneration() == 0) {
-                throw new IllegalStateException("no published head for shard " + config.getShardId() + "; nothing for a reader to open");
+
+            // Reuse ServerlessStorageLazyDirectoryFactory#newDirectory's own already-fetched head
+            // and manifest when this shard's directory is a LazyBundleDirectory: core builds the
+            // directory before the engine for the same shard open, and that factory already paid
+            // for exactly the head read + manifest GET this method would otherwise redundantly
+            // repeat moments later. No staler than the two independent reads it replaces would have
+            // been relative to each other anyway -- see LazyBundleDirectory#currentManifest's own
+            // javadoc for why this introduces no new consistency risk.
+            org.apache.lucene.store.Directory unwrapped = org.apache.lucene.store.FilterDirectory.unwrap(config.getStore().directory());
+            CommitManifest manifest;
+            long primaryTerm;
+            if (unwrapped instanceof org.opensearch.serverless.storage.readerengine.lazydirectory.LazyBundleDirectory) {
+                manifest = ((org.opensearch.serverless.storage.readerengine.lazydirectory.LazyBundleDirectory) unwrapped)
+                    .currentManifest();
+                primaryTerm = manifest.primaryTerm();
+            } else {
+                Optional<VersionedShardHead> head = shardStateStore.get(indexUuid, shardId);
+                // generation 0 means a head exists (e.g. a writer's lease acquisition put one there
+                // ahead of any commit, see ObjectStoreCommitHeadPublisher#acquireOrRenewLease) but
+                // nothing has actually been published yet -- same "nothing for a reader to open"
+                // case as no head at all.
+                if (head.isEmpty() || head.get().head().latestManifestGeneration() == 0) {
+                    throw new IllegalStateException(
+                        "no published head for shard " + config.getShardId() + "; nothing for a reader to open"
+                    );
+                }
+                ShardHead shardHead = head.get().head();
+                manifest = manifestStore.readManifest(shardHead.primaryTerm(), shardHead.latestManifestGeneration());
+                primaryTerm = shardHead.primaryTerm();
             }
-            ShardHead shardHead = head.get().head();
-            CommitManifest manifest = manifestStore.readManifest(shardHead.primaryTerm(), shardHead.latestManifestGeneration());
             // ObjectStoreReaderEngine reports to the directory tier itself, both on activation and
             // on a fixed refresh schedule for as long as it stays open (rfc-serverless-metadata-plane.md
             // &sect;9 activation path step 3, &sect;13 risk #1 metastability mitigation) -- see its
@@ -349,7 +369,7 @@ public final class ReaderEngineFactory implements EngineFactory {
                 config,
                 manifest,
                 materializer,
-                shardHead.primaryTerm(),
+                primaryTerm,
                 shardStateStore,
                 manifestStore,
                 shardDirectory,

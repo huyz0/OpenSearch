@@ -183,6 +183,68 @@ public class LazyBundleDirectoryTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * S3-efficiency regression test: ReaderEngineFactory#newReadWriteEngine reuses this directory's
+     * own already-fetched manifest instead of independently re-reading the shard's head and
+     * manifest from the object store when this shard's directory is a LazyBundleDirectory -- that
+     * reuse depends on currentManifest() actually reflecting what this directory was built (and,
+     * later, advanced) with.
+     */
+    public void testCurrentManifestReflectsConstructionAndLaterAdvances() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        BlobContainerBundleStore bundleStore = new BlobContainerBundleStore(blobContainer);
+        ObjectStoreCommitPublisher publisher = new ObjectStoreCommitPublisher(bundleStore, new BlobContainerManifestStore(blobContainer));
+
+        CommitManifest firstManifest = publishOneDocCommit(publisher, 1);
+        CommitManifest secondManifest = publishOneDocCommit(publisher, 2);
+
+        FileCache fileCache = FileCacheFactory.createConcurrentLRUFileCache(64L * 1024 * 1024, 1);
+        try (MMapDirectory cacheDirectory = new MMapDirectory(createTempDir(), SimpleFSLockFactory.INSTANCE)) {
+            TransferManager transferManager = new TransferManager(bundleStore::openRange, fileCache, threadPool);
+            try (LazyBundleDirectory lazyDirectory = new LazyBundleDirectory(firstManifest, cacheDirectory, transferManager)) {
+                assertEquals(
+                    "currentManifest() must reflect the manifest this directory was constructed with",
+                    firstManifest.generation(),
+                    lazyDirectory.currentManifest().generation()
+                );
+                lazyDirectory.advanceToManifest(secondManifest);
+                assertEquals(
+                    "currentManifest() must reflect the latest manifest advanceToManifest was called with",
+                    secondManifest.generation(),
+                    lazyDirectory.currentManifest().generation()
+                );
+            }
+        } finally {
+            fileCache.clear();
+        }
+    }
+
+    private CommitManifest publishOneDocCommit(ObjectStoreCommitPublisher publisher, long generation) throws Exception {
+        try (Directory writerDirectory = new ByteBuffersDirectory()) {
+            try (IndexWriter writer = new IndexWriter(writerDirectory, new IndexWriterConfig())) {
+                Document doc = new Document();
+                doc.add(new StringField("id", String.valueOf(generation), Field.Store.YES));
+                writer.addDocument(doc);
+                writer.commit();
+            }
+            SegmentInfos segmentInfos = SegmentInfos.readLatestCommit(writerDirectory);
+            return publisher.publishCommit(
+                writerDirectory,
+                segmentInfos,
+                INDEX_UUID,
+                SHARD_ID,
+                1,
+                generation,
+                0,
+                0,
+                new WalPosition("epoch-0", 0),
+                0,
+                PruningStats.empty()
+            );
+        }
+    }
+
     public void testWriteOperationsAreRejected() throws Exception {
         FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
         BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
