@@ -32,8 +32,10 @@ import org.opensearch.threadpool.ThreadPool;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * The write-side counterpart to {@link RoutingPartitionFilter}: rewrites an {@link
@@ -101,6 +103,18 @@ public final class WritePartitionRoutingActionFilter implements ActionFilter {
 
     private volatile ClusterService clusterService;
     private volatile ThreadPool threadPool;
+
+    /**
+     * Memoizes each write-routing alias's {@code partitionIndex -> target index name} table --
+     * pure functions of {@code (Metadata, aliasName)} -- so a bulk request's per-item rewrite (or a
+     * cluster sustaining steady write traffic across the many cluster-state updates it will never
+     * see, since {@code Metadata} is unchanged by a routing-only update such as a shard relocation)
+     * doesn't re-walk every target index's custom data and re-derive the same table on every single
+     * document. Replaced wholesale whenever {@code metadata} itself changes identity (a real
+     * metadata update, e.g. a new partition target attached) -- never merged/patched -- so a stale
+     * entry can never survive past the state it was computed from.
+     */
+    private volatile MetadataPartitionTableCache tableCache = new MetadataPartitionTableCache(null);
 
     /** Creates the filter with no dependencies yet -- see {@link #setDependencies}. */
     public WritePartitionRoutingActionFilter() {}
@@ -218,7 +232,7 @@ public final class WritePartitionRoutingActionFilter implements ActionFilter {
             + "] -- writes must go through the alias, not the target index directly";
     }
 
-    private static void rewriteIfAssigned(ClusterState state, DocWriteRequest<?> request, Set<DocWriteRequest<?>> alreadyRewritten) {
+    private void rewriteIfAssigned(ClusterState state, DocWriteRequest<?> request, Set<DocWriteRequest<?>> alreadyRewritten) {
         String aliasName = request.index();
         String id = request.id();
         if (aliasName == null || id == null) {
@@ -240,7 +254,43 @@ public final class WritePartitionRoutingActionFilter implements ActionFilter {
         }
     }
 
-    private static String resolvePartitionTarget(Metadata metadata, String aliasName, List<String> targetIndexNames, String id) {
+    private String resolvePartitionTarget(Metadata metadata, String aliasName, List<String> targetIndexNames, String id) {
+        MetadataPartitionTableCache cache = tableCache;
+        if (cache.metadata != metadata) {
+            cache = new MetadataPartitionTableCache(metadata);
+            tableCache = cache;
+        }
+        Optional<PartitionTable> tableOpt = cache.tablesByAlias.computeIfAbsent(
+            aliasName,
+            a -> buildPartitionTable(metadata, a, targetIndexNames)
+        );
+        if (tableOpt.isEmpty()) {
+            return null;
+        }
+        PartitionTable table = tableOpt.get();
+        int hash = Murmur3HashFunction.hash(id);
+        int partition = Math.floorMod(hash, table.numPartitions());
+        String resolved = table.byPartitionIndex()[partition];
+        if (resolved == null) {
+            logger.warn("write-routing alias [" + aliasName + "] has no target assigned for partition [" + partition + "]");
+        }
+        return resolved;
+    }
+
+    /** The precomputed {@code partitionIndex -> target index name} table for one write-routing alias. */
+    private record PartitionTable(int numPartitions, String[] byPartitionIndex) {}
+
+    /** Pairs a {@link Metadata} snapshot with the partition tables computed against it -- see {@link #tableCache}. */
+    private static final class MetadataPartitionTableCache {
+        private final Metadata metadata;
+        private final ConcurrentHashMap<String, Optional<PartitionTable>> tablesByAlias = new ConcurrentHashMap<>();
+
+        MetadataPartitionTableCache(Metadata metadata) {
+            this.metadata = metadata;
+        }
+    }
+
+    private static Optional<PartitionTable> buildPartitionTable(Metadata metadata, String aliasName, List<String> targetIndexNames) {
         Integer numPartitions = null;
         String[] byPartitionIndex = null;
         for (String targetIndexName : targetIndexNames) {
@@ -262,14 +312,8 @@ public final class WritePartitionRoutingActionFilter implements ActionFilter {
             }
         }
         if (numPartitions == null) {
-            return null;
+            return Optional.empty();
         }
-        int hash = Murmur3HashFunction.hash(id);
-        int partition = Math.floorMod(hash, numPartitions);
-        String resolved = byPartitionIndex[partition];
-        if (resolved == null) {
-            logger.warn("write-routing alias [" + aliasName + "] has no target assigned for partition [" + partition + "]");
-        }
-        return resolved;
+        return Optional.of(new PartitionTable(numPartitions, byPartitionIndex));
     }
 }
