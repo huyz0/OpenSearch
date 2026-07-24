@@ -994,16 +994,22 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     }
 
     /**
-     * The manifest's real {@code WalPosition} once WAL mirroring is wired in (&sect;6.4), instead
-     * of the {@code (String.valueOf(primaryTerm), 0)} placeholder used before this was tracked at
-     * all. When WAL mirroring is disabled ({@link #walMirroringTranslog} is {@code null}), the
-     * placeholder shape is kept so every existing caller/test that never configured a {@link
-     * WalChunkService} keeps working unchanged -- this manifest simply carries no real WAL
-     * coverage information, matching today's behavior exactly.
+     * The manifest's real {@code WalPosition} once WAL mirroring is wired in (&sect;6.4), or {@code
+     * null} when WAL mirroring is disabled ({@link #walMirroringTranslog} is {@code null}) -- this
+     * manifest simply carries no real WAL coverage information. {@code null} here, not a
+     * placeholder {@link WalPosition}, is load-bearing: {@code WalGcSchedulerTask#sweep} treats a
+     * {@code null} manifest {@code walPosition()} as "this shard's coverage is unknown, skip this
+     * tick" (see that class's own class javadoc), and previously could not tell that case apart
+     * from a genuine, real position at chunk sequence {@code 0} -- an earlier {@code (String.valueOf(primaryTerm),
+     * 0)} placeholder was non-{@code null} and silently defeated that bail-out, pinning WAL GC's
+     * deletable bound at {@code 0} for the whole shared container, cluster-wide, for as long as any
+     * registered shard's latest manifest carried it. {@link CommitManifest} already fully supports
+     * a {@code null} {@code walPosition} (see e.g. {@code ShardShrinker#shrink}, which always
+     * publishes one), so no other caller needed to change for this.
      */
     private WalPosition currentWalPosition() {
         if (walMirroringTranslog == null) {
-            return new WalPosition(String.valueOf(engineConfig.getPrimaryTermSupplier().getAsLong()), 0);
+            return null;
         }
         return new WalPosition(walChunkService.writerEpoch(), walMirroringTranslog.lastFlushedWalChunkSequence());
     }

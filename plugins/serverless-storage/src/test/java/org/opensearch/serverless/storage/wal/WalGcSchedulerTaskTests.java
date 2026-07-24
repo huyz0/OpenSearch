@@ -107,6 +107,45 @@ public class WalGcSchedulerTaskTests extends OpenSearchTestCase {
         );
     }
 
+    /**
+     * Same as {@link #publishHead}, but publishes a manifest with {@code walPosition() == null} --
+     * the shape {@code ObjectStoreWriterEngine#currentWalPosition} produces when WAL mirroring isn't
+     * configured for that commit, not a shard that never published at all.
+     */
+    private void publishHeadWithNoWalPosition(BlobContainer shardContainer, String indexUuid, int shardId, long generation)
+        throws Exception {
+        BlobContainerBundleStore bundleStore = new BlobContainerBundleStore(shardContainer);
+        BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(shardContainer);
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(shardContainer);
+
+        String bundleName = "bundle-" + indexUuid + "-" + shardId + "-" + PRIMARY_TERM + "-" + generation;
+        byte[] content = ("content-" + generation).getBytes("UTF-8");
+        var bundle = bundleStore.writeBundle(bundleName, List.of(new BundleFileContent("segments_" + generation, content)));
+        var entry = bundle.entries().get("segments_" + generation);
+        CommitManifest manifest = new CommitManifest(
+            indexUuid,
+            shardId,
+            PRIMARY_TERM,
+            generation,
+            "segments_" + generation,
+            Map.of("segments_" + generation, new FileReference(bundleName, entry.offset(), entry.length(), entry.checksum())),
+            0,
+            0,
+            null,
+            0,
+            PruningStats.empty(),
+            System.currentTimeMillis()
+        );
+        manifestStore.writeManifest(manifest);
+        Optional<org.opensearch.serverless.storage.shardstate.VersionedShardHead> existing = shardStateStore.get(indexUuid, shardId);
+        shardStateStore.compareAndSet(
+            indexUuid,
+            shardId,
+            existing.map(org.opensearch.serverless.storage.shardstate.VersionedShardHead::version),
+            new ShardHead(PRIMARY_TERM, null, 0L, generation)
+        );
+    }
+
     private WalGcSchedulerTask newTask(java.util.function.BiFunction<String, Integer, BlobContainer> shardContainerResolver) {
         return new WalGcSchedulerTask(threadPool, TimeValue.timeValueDays(1), walBlobContainer, registry, shardContainerResolver);
     }
@@ -229,6 +268,31 @@ public class WalGcSchedulerTaskTests extends OpenSearchTestCase {
             task.sweepForTesting();
             assertEquals(
                 "a registered-but-never-published shard must block the whole sweep, not just be skipped",
+                1,
+                walBlobContainer.listBlobsByPrefix(WalChunkNaming.LOG_BLOB_PREFIX).size()
+            );
+        } finally {
+            task.close();
+        }
+    }
+
+    public void testSweepIsConservativeWhenARegisteredShardsLatestManifestHasNoWalPosition() throws Exception {
+        walChunkService.append(new WalRecord("idx", 0, PRIMARY_TERM, 0, "a".getBytes("UTF-8")));
+        walChunkService.flush();
+
+        // The shape ObjectStoreWriterEngine#currentWalPosition produces when WAL mirroring isn't
+        // configured for that particular commit -- a real, published head, but with no WAL coverage
+        // information at all. Must block the sweep exactly like the never-published case above, not
+        // be silently treated as "covers chunk sequence 0."
+        BlobContainer shardContainer = shardScopedBlobContainer("idx-0");
+        publishHeadWithNoWalPosition(shardContainer, "idx", 0, 1);
+        registry.register("idx", 0);
+
+        WalGcSchedulerTask task = newTask((indexUuid, shardId) -> shardContainer);
+        try {
+            task.sweepForTesting();
+            assertEquals(
+                "a registered shard whose latest manifest carries no real WAL position must block the whole sweep",
                 1,
                 walBlobContainer.listBlobsByPrefix(WalChunkNaming.LOG_BLOB_PREFIX).size()
             );

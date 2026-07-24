@@ -153,6 +153,42 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
         }
     }
 
+    public void testPublishedManifestHasANullWalPositionWhenWalMirroringIsDisabled() throws Exception {
+        // openWriterEngine's default helper configures no WalChunkService, the same "WAL mirroring
+        // disabled" shape most tests in this class use. The published manifest's walPosition() must
+        // be null, not a non-null placeholder -- WalGcSchedulerTask#sweep's own bail-out for "this
+        // shard's latest manifest carries no real WAL position" checks for null specifically, and a
+        // non-null placeholder here would silently defeat it (see that class's own javadoc).
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
+        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+
+        ObjectStoreWriterEngine engine = openWriterEngine(shardStateStore, commitPublisher);
+        try {
+            index(engine, "1");
+            engine.flush(true, true);
+
+            org.opensearch.serverless.storage.shardstate.ShardHead head = shardStateStore.get(
+                shardId.getIndex().getUUID(),
+                shardId.getId()
+            ).orElseThrow().head();
+            CommitManifest manifest = new BlobContainerManifestStore(blobContainer).readManifest(
+                head.primaryTerm(),
+                head.latestManifestGeneration()
+            );
+            assertNull(
+                "a manifest published with WAL mirroring disabled must carry no WalPosition at all, not a placeholder",
+                manifest.walPosition()
+            );
+        } finally {
+            IOUtils.close(engine, lastOpenedStore);
+        }
+    }
+
     public void testApiSourcedRefreshPublishesAManifest() throws Exception {
         FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
         BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
