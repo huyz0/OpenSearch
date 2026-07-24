@@ -43,7 +43,8 @@ import java.util.Set;
  * ever writes a new segment for new data; it does not rewrite an untouched one just because a later
  * commit still references it) -- found by a real refresh test throwing {@code
  * FileAlreadyExistsException} on exactly this overlap, not assumed. Every file already present in
- * {@code targetDirectory} is skipped (not re-fetched, not re-verified) rather than re-written.
+ * {@code targetDirectory} with the length its manifest entry expects is skipped (not re-fetched);
+ * see {@link #materialize} for why length, not a full re-checksum, is what's actually verified.
  */
 public final class ObjectStoreCommitMaterializer {
 
@@ -59,12 +60,28 @@ public final class ObjectStoreCommitMaterializer {
     }
 
     /**
-     * Fetches and writes every file in {@code manifest.files()} not already present in {@code
-     * targetDirectory} into it, so that {@code Lucene.readSegmentInfos(targetDirectory)} (and hence
-     * any plain Lucene {@code DirectoryReader}) can open the commit afterward. Every newly-fetched
-     * file's bytes are verified against the checksum recorded in the manifest as they're fetched, so
-     * a corrupt or truncated transfer fails loudly here rather than surfacing as a confusing
-     * Lucene-level error later.
+     * Fetches and writes every file in {@code manifest.files()} not already present (and correctly
+     * sized) in {@code targetDirectory} into it, so that {@code Lucene.readSegmentInfos(targetDirectory)}
+     * (and hence any plain Lucene {@code DirectoryReader}) can open the commit afterward. Every
+     * newly-fetched file's bytes are verified against the checksum recorded in the manifest as
+     * they're fetched, so a corrupt or truncated transfer fails loudly here rather than surfacing as
+     * a confusing Lucene-level error later.
+     *
+     * <p><b>An "already present" file is only trusted if its on-disk length matches the manifest's
+     * own record of it.</b> This matters because a prior call into this same {@code targetDirectory}
+     * can be interrupted partway through the file loop below (a transient object-store error, or the
+     * process dying) -- any file from before the interruption point is fully written and {@code
+     * close()}d, but the batch {@link Directory#sync} that would make it durable against a crash
+     * only ever runs once, after every file in that call's own loop finished. A subsequent call
+     * (this method's own retry-safety contract above) must not treat such a file as done purely
+     * because {@link Directory#listAll} lists it -- a length mismatch (the truncated-write
+     * signature an interrupted transfer actually leaves) means it's deleted and re-fetched instead
+     * of silently trusted. This is a length check, not a full re-checksum: re-reading and
+     * re-hashing every already-present file on every call (including the common, unchanged-segment
+     * case this method's own "safe to call more than once" contract exists for) would reintroduce
+     * real local-disk I/O this skip-if-present path is specifically meant to avoid, for a class of
+     * corruption (same length, wrong bytes) that {@code IndexOutput}/Lucene's own per-file checksum
+     * footer already catches whenever the segment is actually opened for reading.
      *
      * @param manifest the commit manifest whose files should be present in {@code targetDirectory}
      * @param targetDirectory the Lucene directory to write missing files into
@@ -75,10 +92,17 @@ public final class ObjectStoreCommitMaterializer {
         Set<String> newlyWritten = new HashSet<>();
         for (Map.Entry<String, FileReference> entry : manifest.files().entrySet()) {
             String fileName = entry.getKey();
-            if (alreadyPresent.contains(fileName)) {
-                continue;
-            }
             FileReference ref = entry.getValue();
+            if (alreadyPresent.contains(fileName)) {
+                if (targetDirectory.fileLength(fileName) == ref.length()) {
+                    continue;
+                }
+                // A prior call's own write into this exact file was interrupted before it could be
+                // synced -- the on-disk copy is a truncated (or otherwise incomplete) leftover, not
+                // a legitimately reusable one. deleteFile before createOutput below: Lucene's
+                // createOutput throws FileAlreadyExistsException rather than overwriting.
+                targetDirectory.deleteFile(fileName);
+            }
             byte[] bytes = bundleStore.readFile(
                 ref.bundleName(),
                 new BundleFileEntry(fileName, ref.offset(), ref.length(), ref.checksum())

@@ -37,10 +37,13 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class ObjectStoreCommitMaterializerTests extends OpenSearchTestCase {
 
     private CommitManifest manifestWithThreeFiles() {
+        // Lengths must actually match contentFor()'s real output now that materialize() verifies
+        // an already-present file's on-disk length against this field -- these were previously
+        // fabricated placeholders since nothing checked them before that fix existed.
         Map<String, FileReference> files = new LinkedHashMap<>();
-        files.put("segments_3", new FileReference("bundle-0", 0, 10, 1L));
-        files.put("_0.si", new FileReference("bundle-0", 10, 10, 2L));
-        files.put("_0.cfs", new FileReference("bundle-0", 20, 10, 3L));
+        files.put("segments_3", new FileReference("bundle-0", 0, contentFor("segments_3").length, 1L));
+        files.put("_0.si", new FileReference("bundle-0", 10, contentFor("_0.si").length, 2L));
+        files.put("_0.cfs", new FileReference("bundle-0", 20, contentFor("_0.cfs").length, 3L));
         return new CommitManifest(
             "index-uuid-abc",
             0,
@@ -127,6 +130,48 @@ public class ObjectStoreCommitMaterializerTests extends OpenSearchTestCase {
         // succeeded, one failed) + 2 more on retry (the two files that were never written) = 4, not
         // 5 (which is what a naive re-fetch-everything retry would produce).
         assertEquals("the already-written file from the killed attempt must be skipped, not re-fetched, on retry", 4, faulty.callCount());
+    }
+
+    /**
+     * Simulates the specific leftover an interrupted materialize call can produce: a file that was
+     * fully {@code close()}d by a prior call but never reached that call's own batch {@link
+     * Directory#sync}, because that call was killed on a LATER file before it got there. On a real
+     * filesystem across a crash, such a file can end up truncated/incomplete despite {@code
+     * listAll()} reporting it present. This directly writes a truncated stand-in for one file (never
+     * going through the materializer at all) to model exactly that leftover, then verifies a normal
+     * {@code materialize} call detects the length mismatch and re-fetches it rather than trusting it.
+     */
+    public void testATruncatedLeftoverFileFromAnInterruptedPriorWriteIsRefetchedNotTrusted() throws Exception {
+        CommitManifest manifest = manifestWithThreeFiles();
+        Directory directory = new ByteBuffersDirectory();
+
+        String truncatedFile = manifest.files().keySet().iterator().next();
+        byte[] fullContent = contentFor(truncatedFile);
+        byte[] truncatedContent = Arrays.copyOf(fullContent, fullContent.length - 3);
+        try (org.apache.lucene.store.IndexOutput out = directory.createOutput(truncatedFile, org.apache.lucene.store.IOContext.DEFAULT)) {
+            out.writeBytes(truncatedContent, truncatedContent.length);
+        }
+        assertEquals(
+            "test setup sanity check: the stand-in file must actually be shorter than the manifest expects",
+            truncatedContent.length,
+            directory.fileLength(truncatedFile)
+        );
+
+        FakeBundleFileReader reader = new FakeBundleFileReader(-1);
+        new ObjectStoreCommitMaterializer(reader).materialize(manifest, directory);
+
+        for (String fileName : manifest.files().keySet()) {
+            assertArrayEquals(
+                "every file, including the truncated leftover, must end up with its full correct content",
+                contentFor(fileName),
+                readAll(directory, fileName)
+            );
+        }
+        assertEquals(
+            "the truncated leftover must have been re-fetched (all 3 files fetched), not silently trusted as already present",
+            3,
+            reader.callCount()
+        );
     }
 
     /** Returns fixed per-file content, failing the {@code failOnCallIndex}-th (0-indexed) {@code readFile} call exactly once. */
