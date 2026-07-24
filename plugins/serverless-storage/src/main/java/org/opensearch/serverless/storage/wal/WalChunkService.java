@@ -221,17 +221,54 @@ public final class WalChunkService implements WalAppendTarget {
      * Writes every currently-buffered record into one new chunk blob and clears the buffer.
      * A no-op (no blob written) if nothing is buffered.
      *
+     * <p>Deliberately does not hold this service's monitor across the actual write: only the
+     * cheap in-memory swap (snapshot the buffer, clear it) is synchronized, and {@link
+     * #writeChunkWithRetry} -- the network I/O, including its own bounded retry-with-backoff --
+     * runs with no lock held, exactly as its own javadoc says is safe ("writing a chunk needs no
+     * lock of its own since every attempt claims a fresh, globally-unique chunk sequence"). This
+     * service is shared by every writer shard on the node (see the class javadoc's "Per-shard
+     * fairness" section), and on the legacy synchronous path {@link
+     * org.opensearch.serverless.storage.translog.WalMirroringTranslog#add} calls {@link #append}
+     * then this method on every single operation -- holding the lock across the write would
+     * serialize every shard's indexing threads behind one shard's object-store PUT (plus retries),
+     * turning this node-shared buffer into a single bottleneck for the whole node's legacy-path
+     * write throughput. Releasing it lets concurrent flushes from different shards actually
+     * overlap their I/O, each against its own independently-claimed chunk sequence.
+     *
+     * <p>On failure (every {@link #writeChunkWithRetry} attempt exhausted), the snapshotted
+     * records are put back at the front of the buffer rather than left in {@code toWrite} and
+     * discarded -- preserving the existing "a flush failure never loses or duplicates records, a
+     * later flush retries them" contract {@code WalMirroringTranslog#flushWithRetry} depends on,
+     * now regardless of whatever else was appended to the buffer while this attempt's I/O was in
+     * flight.
+     *
      * @return the chunk sequence number written, or -1 if there was nothing to flush
      */
     @Override
-    public synchronized long flush() throws IOException {
-        if (buffered.isEmpty()) {
-            return -1;
+    public long flush() throws IOException {
+        List<WalRecord> toWrite;
+        synchronized (this) {
+            if (buffered.isEmpty()) {
+                return -1;
+            }
+            toWrite = new ArrayList<>(buffered);
+            buffered.clear();
+            bufferedBytesByShard.clear();
         }
-        long chunkSequence = writeChunkWithRetry(buffered);
-        buffered.clear();
-        bufferedBytesByShard.clear();
-        return chunkSequence;
+        try {
+            return writeChunkWithRetry(toWrite);
+        } catch (IOException e) {
+            synchronized (this) {
+                buffered.addAll(0, toWrite);
+                if (perShardBudgetBytes > 0) {
+                    for (WalRecord record : toWrite) {
+                        ShardKey key = new ShardKey(record.indexUuid(), record.shardId());
+                        bufferedBytesByShard.merge(key, (long) record.payload().length, Long::sum);
+                    }
+                }
+            }
+            throw e;
+        }
     }
 
     @Override

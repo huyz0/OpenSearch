@@ -356,6 +356,91 @@ public class WalChunkServiceTests extends OpenSearchTestCase {
         service.append(new WalRecord("idx", 0, 1, 0, "a".getBytes("UTF-8")));
         IOException e = expectThrows(IOException.class, service::flush);
         assertTrue(e.getMessage().contains("CAS attempts"));
+        assertEquals(
+            "a failed flush must put the record back rather than lose it -- a later flush is what retries it",
+            1,
+            service.bufferedRecordCount()
+        );
+    }
+
+    // Regression test: flush() used to hold this service's monitor for the entire write, including
+    // the network I/O and its own bounded retry-with-backoff -- since one WalChunkService instance
+    // is shared by every writer shard on the node (legacy per-operation path), that serialized every
+    // shard's indexing thread behind whichever shard's flush happened to be uploading. flush() now
+    // only holds the lock for the cheap in-memory buffer swap; append() (and a second flush()) must
+    // be able to proceed concurrently while an earlier flush's write is still in flight.
+    public void testAppendDoesNotBlockWhileAnotherFlushsWriteIsStillInFlight() throws Exception {
+        BlobContainer blobContainer = newBlobContainer();
+        CountDownLatch writeStarted = new CountDownLatch(1);
+        CountDownLatch releaseWrite = new CountDownLatch(1);
+        WalChunkService service = new WalChunkService(new BlockingOnWriteBlobContainer(blobContainer, writeStarted, releaseWrite), "epoch-0");
+        service.append(new WalRecord("idx", 0, 1, 0, "a".getBytes("UTF-8")));
+
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<Long> firstFlush = executor.submit(service::flush);
+            assertTrue("the blocked write must actually have started", writeStarted.await(30, TimeUnit.SECONDS));
+
+            // While the first flush's write is still blocked inside writeBlob, append() must not be
+            // stuck waiting on the same monitor -- it only needs the lock for the buffer swap, which
+            // flush() already released before entering writeBlob. Run it on its own thread with a
+            // short timeout so a regression (append() stuck behind the in-flight write) fails fast
+            // and unambiguously, rather than only surfacing 30 seconds later via releaseWrite's own
+            // wait timing out inside the fake container.
+            Future<?> appendDuringFlush = executor.submit(() -> {
+                try {
+                    service.append(new WalRecord("idx", 1, 1, 0, "b".getBytes("UTF-8")));
+                } catch (IOException e) {
+                    throw new java.io.UncheckedIOException(e);
+                }
+            });
+            try {
+                appendDuringFlush.get(5, TimeUnit.SECONDS);
+            } catch (java.util.concurrent.TimeoutException e) {
+                fail("append() must not block while another flush's write is still in flight");
+            }
+            assertEquals(
+                "buffered already holds only the new record -- the first flush's own record was "
+                    + "already snapshotted out and cleared before the write started",
+                1,
+                service.bufferedRecordCount()
+            );
+
+            releaseWrite.countDown();
+            assertEquals(0L, (long) firstFlush.get(30, TimeUnit.SECONDS));
+        } finally {
+            executor.shutdown();
+        }
+    }
+
+    /** Blocks the first {@code writeBlob} call until released, letting a test observe/act while a write is genuinely in flight. */
+    private static final class BlockingOnWriteBlobContainer extends org.opensearch.serverless.storage.security.RegisterDelegatingBlobContainer {
+
+        private final CountDownLatch writeStarted;
+        private final CountDownLatch releaseWrite;
+
+        BlockingOnWriteBlobContainer(BlobContainer delegate, CountDownLatch writeStarted, CountDownLatch releaseWrite) {
+            super(delegate);
+            this.writeStarted = writeStarted;
+            this.releaseWrite = releaseWrite;
+        }
+
+        @Override
+        protected BlobContainer wrapChild(BlobContainer child) {
+            return new BlockingOnWriteBlobContainer(child, writeStarted, releaseWrite);
+        }
+
+        @Override
+        public void writeBlob(String blobName, InputStream inputStream, long blobSize, boolean failIfAlreadyExists) throws IOException {
+            writeStarted.countDown();
+            try {
+                assertTrue("test setup: release must be signaled well within the test timeout", releaseWrite.await(30, TimeUnit.SECONDS));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException(e);
+            }
+            super.writeBlob(blobName, inputStream, blobSize, failIfAlreadyExists);
+        }
     }
 
     /** Every {@code compareAndSwapRegister} attempt reports a conflict, forcing {@code claimNextChunkSequence} to exhaust its retry budget. */
