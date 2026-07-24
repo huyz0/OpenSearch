@@ -156,6 +156,18 @@ public final class LocalDiskCachingBundleStore implements BundleFileReader {
                 if (cached != null && cached.length == entry.length() && checksum(cached) == entry.checksum()) {
                     hitCount.incrementAndGet();
                     touch(cachedPath);
+                    // Also given a chance on every hit, not just after a fresh write below: eviction
+                    // is exclusively write-triggered otherwise, so a shard whose working set is
+                    // already fully warm (every read a hit, no new misses ever writing a fresh file)
+                    // would never get another chance to catch up if its directory is already over
+                    // budget for any reason that didn't originate from THIS call -- a lowered budget
+                    // setting after files were already cached, or an earlier sweep that failed and
+                    // gave up (see maybeEvict's own comment). Safe to call while still holding this
+                    // path's own lock: synchronized is reentrant, and evicting this exact entry (the
+                    // one just touched, so the least likely LRU candidate of the whole directory) is
+                    // harmless even if it happens to be picked -- the bytes to return are already in
+                    // hand, and the next read for this same key would simply be a correct re-fetch.
+                    maybeEvict();
                     return cached;
                 }
                 // A cached file that doesn't match its own name's recorded length/checksum can

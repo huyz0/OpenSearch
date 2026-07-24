@@ -313,6 +313,45 @@ public class LocalDiskCachingBundleStoreTests extends OpenSearchTestCase {
         assertEquals("the touched, surviving entry must still be a disk-cache hit", callsBeforeReread, counting.callCount.get());
     }
 
+    // Regression test for a real bug: eviction was only ever triggered from the miss path (right
+    // after writeAtomically), never from a hit. A shard whose working set is already fully warm --
+    // every subsequent read a hit, no new file ever written -- would never get another chance to
+    // evict if its directory ended up over budget for a reason that didn't originate from that same
+    // call (e.g. content that predates the cache, or a directory that grew over budget purely from
+    // touches without any fresh write crossing the line). Simulated here by dropping an oversized
+    // file into the cache directory directly (bypassing the cache's own write path entirely, so
+    // maybeEvict() is never triggered by it), then proving a plain HIT on an unrelated, already-
+    // cached entry is what finally triggers the sweep that reclaims it.
+    public void testAHitAloneCanTriggerEvictionWhenTheDirectoryIsAlreadyOverBudgetWithNoNewWrite() throws Exception {
+        SegmentBundle bundle = writeSampleBundle(); // "hello" == 5 bytes
+        BundleFileEntry entry = bundle.entries().get("a.bin");
+        CountingBundleFileReader counting = new CountingBundleFileReader(inMemoryReader(bundle));
+        Path cacheDir = createTempDir();
+        LocalDiskCachingBundleStore cache = new LocalDiskCachingBundleStore(counting, cacheDir, null, 25L);
+
+        Path cachedEntryPath = fileWrittenBy(cacheDir, () -> cache.readFile("bundle-1", entry));
+        Files.setLastModifiedTime(cachedEntryPath, FileTime.from(Instant.now()));
+
+        // Dropped in directly, not through the cache's own write path -- represents content that
+        // predates this instance (or a budget lowered after the fact), backdated older than the
+        // real entry above so it's the sweep's obvious eviction candidate.
+        Path oversizedLeftover = cacheDir.resolve("leftover-from-a-previous-session");
+        Files.write(oversizedLeftover, new byte[30]); // alone already exceeds the 25-byte budget
+        Files.setLastModifiedTime(oversizedLeftover, FileTime.from(Instant.now().minusSeconds(60)));
+
+        assertEquals("no eviction must have run yet -- the oversized file bypassed the cache's own write path", 0, cache.evictedCount());
+
+        cache.readFile("bundle-1", entry); // a plain hit -- the real entry is already on disk and valid
+
+        assertTrue(
+            "a hit against an already over-budget directory must still trigger a sweep",
+            cache.evictedCount() >= 1
+        );
+        assertFalse("the oldest, oversized entry must be the one reclaimed", Files.exists(oversizedLeftover));
+        assertTrue("the entry the hit itself just served must survive its own triggering read", Files.exists(cachedEntryPath));
+        assertEquals("the hit must still have been served from disk, not the delegate", 1, counting.callCount.get());
+    }
+
     public void testUnboundedByDefaultNeverEvictsRegardlessOfSize() throws Exception {
         SegmentBundle bundle = BundleWriter.write(
             List.of(
