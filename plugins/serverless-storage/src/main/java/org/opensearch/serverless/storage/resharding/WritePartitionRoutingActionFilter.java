@@ -243,27 +243,34 @@ public final class WritePartitionRoutingActionFilter implements ActionFilter {
         if (abstraction instanceof IndexAbstraction.Alias == false) {
             return;
         }
-        List<String> targetIndexNames = abstraction.getIndices().stream().map(index -> index.getIndex().getName()).toList();
-        if (targetIndexNames.isEmpty()) {
+        // abstraction.getIndices() is a cheap, already-materialized field on IndexAbstraction.Alias
+        // (see its own javadoc) -- unlike a .stream().map(...).toList() transformation of it, which
+        // would allocate on every single document write even on the overwhelmingly common
+        // resolvePartitionTarget cache-hit path below, where the transformed list is never actually
+        // used. Passing these IndexMetadata objects straight through also lets buildPartitionTable
+        // skip re-resolving each one by name via metadata.index(...) on a cache miss, since the
+        // caller already has them.
+        List<IndexMetadata> targetIndices = abstraction.getIndices();
+        if (targetIndices.isEmpty()) {
             return;
         }
-        String resolvedTargetIndexName = resolvePartitionTarget(metadata, aliasName, targetIndexNames, id);
+        String resolvedTargetIndexName = resolvePartitionTarget(metadata, aliasName, targetIndices, id);
         if (resolvedTargetIndexName != null) {
             request.index(resolvedTargetIndexName);
             alreadyRewritten.add(request);
         }
     }
 
-    private String resolvePartitionTarget(Metadata metadata, String aliasName, List<String> targetIndexNames, String id) {
+    private String resolvePartitionTarget(Metadata metadata, String aliasName, List<IndexMetadata> targetIndices, String id) {
         MetadataPartitionTableCache cache = tableCache;
         if (cache.metadata != metadata) {
             cache = new MetadataPartitionTableCache(metadata);
             tableCache = cache;
         }
-        Optional<PartitionTable> tableOpt = cache.tablesByAlias.computeIfAbsent(
-            aliasName,
-            a -> buildPartitionTable(metadata, a, targetIndexNames)
-        );
+        // targetIndices is only actually read inside buildPartitionTable, which computeIfAbsent only
+        // invokes on a genuine cache miss -- see rewriteIfAssigned's own comment for why the caller
+        // deliberately does no work to build it beyond the cheap getIndices() call.
+        Optional<PartitionTable> tableOpt = cache.tablesByAlias.computeIfAbsent(aliasName, a -> buildPartitionTable(a, targetIndices));
         if (tableOpt.isEmpty()) {
             return null;
         }
@@ -290,12 +297,11 @@ public final class WritePartitionRoutingActionFilter implements ActionFilter {
         }
     }
 
-    private static Optional<PartitionTable> buildPartitionTable(Metadata metadata, String aliasName, List<String> targetIndexNames) {
+    private static Optional<PartitionTable> buildPartitionTable(String aliasName, List<IndexMetadata> targetIndices) {
         Integer numPartitions = null;
         String[] byPartitionIndex = null;
-        for (String targetIndexName : targetIndexNames) {
-            IndexMetadata targetMetadata = metadata.index(targetIndexName);
-            if (targetMetadata == null || aliasName.equals(WritePartitionRoutingMetadata.writeRoutingAlias(targetMetadata)) == false) {
+        for (IndexMetadata targetMetadata : targetIndices) {
+            if (aliasName.equals(WritePartitionRoutingMetadata.writeRoutingAlias(targetMetadata)) == false) {
                 continue;
             }
             OptionalInt partitionIndex = WritePartitionRoutingMetadata.partitionIndex(targetMetadata);
@@ -308,7 +314,7 @@ public final class WritePartitionRoutingActionFilter implements ActionFilter {
                 byPartitionIndex = new String[numPartitions];
             }
             if (partitionIndex.getAsInt() < byPartitionIndex.length) {
-                byPartitionIndex[partitionIndex.getAsInt()] = targetIndexName;
+                byPartitionIndex[partitionIndex.getAsInt()] = targetMetadata.getIndex().getName();
             }
         }
         if (numPartitions == null) {
