@@ -274,6 +274,20 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * A coarse cap on how many compaction/partition-rewrite ticks (each a real Lucene merge,
+     * materializing segments and doing sustained CPU/disk work) may run concurrently across every
+     * shard on this node -- see {@code RewriteAdmissionController}'s javadoc. Every shard's own
+     * scheduled tick is otherwise independent, so nothing else stops many shards from deciding to
+     * compact/rewrite at once. Non-positive (the default) disables it entirely, same shape as every
+     * other optional-feature-off default in this plugin.
+     */
+    public static final Setting<Integer> SERVERLESS_STORAGE_MAX_CONCURRENT_REWRITES_SETTING = Setting.intSetting(
+        "serverless_storage.max_concurrent_rewrites",
+        -1,
+        Setting.Property.NodeScope
+    );
+
+    /**
      * Enables the node-level WAL service (rfc-serverless-opensearch.md &sect;6.4): every writer
      * shard's translog additionally mirrors each operation into a shared, node-scoped WAL chunk
      * stream, durable ahead of the next commit/publish. One {@link WalChunkService} instance is
@@ -1082,6 +1096,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     private volatile org.opensearch.serverless.storage.writerengine.EngineNativeSnapshotSupport engineNativeSnapshotSupport;
     private volatile long pitrWindowMillis = -1;
     private volatile ReaderShardAdmissionController readerShardAdmissionController;
+    // One shared instance node-wide, threaded into every shard's CompactionSchedulerConfig/
+    // PartitionRewriteSchedulerConfig -- see RewriteAdmissionController's own javadoc for why these
+    // two task types must share one cap, not one each.
+    private volatile org.opensearch.serverless.storage.scheduling.RewriteAdmissionController rewriteAdmissionController;
     private volatile WalChunkService sharedWalChunkService;
     // Resolved once in createComponents (same "read the NodeScope setting where Environment is
     // actually available" reasoning as every other field in this group), consumed lazily by
@@ -1185,6 +1203,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_PITR_WINDOW_SETTING,
             SERVERLESS_STORAGE_MAX_CONCURRENT_READER_SHARDS_SETTING,
             SERVERLESS_STORAGE_MAX_FILE_CACHE_USAGE_RATIO_SETTING,
+            SERVERLESS_STORAGE_MAX_CONCURRENT_REWRITES_SETTING,
             SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING,
             SERVERLESS_STORAGE_COMPACTION_INTERVAL_SETTING,
             SERVERLESS_STORAGE_PARTITION_REWRITE_INTERVAL_SETTING,
@@ -1485,6 +1504,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         readerShardAdmissionController = maxConcurrentReaderShards > 0
             ? new ReaderShardAdmissionController(maxConcurrentReaderShards, lazyDirectoryFileCache, maxFileCacheUsageRatio)
             : null;
+        int maxConcurrentRewrites = SERVERLESS_STORAGE_MAX_CONCURRENT_REWRITES_SETTING.get(environment.settings());
+        rewriteAdmissionController = maxConcurrentRewrites > 0
+            ? new org.opensearch.serverless.storage.scheduling.RewriteAdmissionController(maxConcurrentRewrites)
+            : null;
         try (SecureString encryptionKey = SERVERLESS_STORAGE_ENCRYPTION_KEY_SETTING.get(environment.settings())) {
             if (encryptionKey.length() > 0) {
                 byte[] rawKeyBytes = Base64.getDecoder().decode(new String(encryptionKey.getChars()));
@@ -1694,7 +1717,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                         new ObjectStoreCommitMaterializer(chainedBundleReadPath(scopedContainer, lineageChain)),
                         commitPublisher,
                         CompactionPolicy.withDefaults(),
-                        new CompactionRebaseExecutor(shardStateStore, 5)
+                        new CompactionRebaseExecutor(shardStateStore, 5),
+                        rewriteAdmissionController
                     );
                 // GC is the one tier &sect;15's credential-scoping model actually grants DELETE to
                 // ("the GC/reconciler role is the only DELETE-capable principal") -- built against
@@ -1742,7 +1766,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                                 new BlobContainerBundleStore(blobContainer),
                                 new BlobContainerManifestStore(blobContainer)
                             ),
-                            rawPartitionStore
+                            rawPartitionStore,
+                            rewriteAdmissionController
                         );
                 return Optional.of(
                     new ReaderEngineFactory(

@@ -11,6 +11,7 @@ package org.opensearch.serverless.storage.resharding;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.readerengine.ObjectStoreCommitMaterializer;
+import org.opensearch.serverless.storage.scheduling.RewriteAdmissionController;
 import org.opensearch.serverless.storage.shardstate.ShardStateStore;
 import org.opensearch.serverless.storage.writerengine.ObjectStoreCommitPublisher;
 
@@ -25,7 +26,7 @@ import org.opensearch.serverless.storage.writerengine.ObjectStoreCommitPublisher
  */
 public record PartitionRewriteSchedulerConfig(TimeValue interval, ShardStateStore shardStateStore, BlobContainerManifestStore manifestStore,
     ObjectStoreCommitMaterializer materializer, ObjectStoreCommitPublisher commitPublisher,
-    BlobContainerShardPartitionStore partitionStore) {
+    BlobContainerShardPartitionStore partitionStore, RewriteAdmissionController admissionController) {
 
     /**
      * Creates a config bundling everything needed to schedule background partition rewrite for one shard.
@@ -36,6 +37,8 @@ public record PartitionRewriteSchedulerConfig(TimeValue interval, ShardStateStor
      * @param materializer    materializes the pre-rewrite manifest's segments into a real Lucene directory
      * @param commitPublisher publishes the filtered result as a new commit manifest
      * @param partitionStore  reads (and, on success, clears) this shard's {@link ShardPartitionDescriptor}
+     * @param admissionController {@code null} to disable the node-wide concurrency cap on compaction/rewrite
+     *                             ticks entirely; see {@link PartitionRewriteSchedulerTask}'s own javadoc.
      */
     public PartitionRewriteSchedulerConfig {
     }
@@ -74,5 +77,11 @@ public record PartitionRewriteSchedulerConfig(TimeValue interval, ShardStateStor
     @Override
     public BlobContainerShardPartitionStore partitionStore() {
         return partitionStore;
+    }
+
+    /** {@code null} to disable the node-wide concurrency cap on compaction/rewrite ticks entirely. */
+    @Override
+    public RewriteAdmissionController admissionController() {
+        return admissionController;
     }
 }

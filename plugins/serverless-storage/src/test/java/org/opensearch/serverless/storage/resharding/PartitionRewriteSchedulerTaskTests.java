@@ -28,6 +28,7 @@ import org.opensearch.serverless.storage.manifest.CommitManifest;
 import org.opensearch.serverless.storage.manifest.PruningStats;
 import org.opensearch.serverless.storage.manifest.WalPosition;
 import org.opensearch.serverless.storage.readerengine.ObjectStoreCommitMaterializer;
+import org.opensearch.serverless.storage.scheduling.RewriteAdmissionController;
 import org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore;
 import org.opensearch.serverless.storage.shardstate.CasResult;
 import org.opensearch.serverless.storage.shardstate.ShardHead;
@@ -186,6 +187,80 @@ public class PartitionRewriteSchedulerTaskTests extends OpenSearchTestCase {
         try {
             // Must not throw -- a SecurityException here means it escaped this task's own catch.
             task.rewriteSafely();
+        } finally {
+            task.close();
+        }
+    }
+
+    public void testTickIsSkippedWhenTheNodeWideAdmissionCapIsAlreadyExhausted() throws Exception {
+        publishCommit();
+        partitionStore.writeDescriptor(new ShardPartitionDescriptor(0, 3));
+
+        PartitionRewritePublisher publisher = new PartitionRewritePublisher(
+            INDEX_UUID,
+            SHARD_ID,
+            shardStateStore,
+            manifestStore,
+            new ObjectStoreCommitMaterializer(bundleStore),
+            new ObjectStoreCommitPublisher(bundleStore, manifestStore),
+            partitionStore
+        );
+
+        RewriteAdmissionController admissionController = new RewriteAdmissionController(1);
+        // Simulates another shard's tick already holding the node's one permit.
+        assertTrue(admissionController.tryAcquire());
+
+        PartitionRewriteSchedulerTask task = new PartitionRewriteSchedulerTask(
+            threadPool,
+            TimeValue.timeValueHours(1), // never actually ticks on its own -- invoked directly below
+            publisher,
+            admissionController
+        );
+        try {
+            task.rewriteSafely();
+
+            assertTrue(
+                "the descriptor must survive untouched -- the tick must have been skipped entirely, not just failed",
+                partitionStore.readDescriptor().isPresent()
+            );
+        } finally {
+            task.close();
+        }
+    }
+
+    public void testTickReleasesItsAdmissionPermitOnceFinishedSoTheNextTickCanProceed() throws Exception {
+        publishCommit();
+        partitionStore.writeDescriptor(new ShardPartitionDescriptor(0, 3));
+
+        PartitionRewritePublisher publisher = new PartitionRewritePublisher(
+            INDEX_UUID,
+            SHARD_ID,
+            shardStateStore,
+            manifestStore,
+            new ObjectStoreCommitMaterializer(bundleStore),
+            new ObjectStoreCommitPublisher(bundleStore, manifestStore),
+            partitionStore
+        );
+
+        RewriteAdmissionController admissionController = new RewriteAdmissionController(1);
+
+        PartitionRewriteSchedulerTask task = new PartitionRewriteSchedulerTask(
+            threadPool,
+            TimeValue.timeValueHours(1), // never actually ticks on its own -- invoked directly below
+            publisher,
+            admissionController
+        );
+        try {
+            task.rewriteSafely();
+
+            assertTrue(
+                "the tick must have run and cleared the descriptor, proving admission was granted",
+                partitionStore.readDescriptor().isEmpty()
+            );
+            assertTrue(
+                "the permit acquired for this tick must be released once the tick finishes, freeing it for the next one",
+                admissionController.tryAcquire()
+            );
         } finally {
             task.close();
         }

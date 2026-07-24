@@ -15,6 +15,7 @@ import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.manifest.CommitManifest;
 import org.opensearch.serverless.storage.readerengine.ObjectStoreCommitMaterializer;
 import org.opensearch.serverless.storage.scheduling.JitteredScheduling;
+import org.opensearch.serverless.storage.scheduling.RewriteAdmissionController;
 import org.opensearch.serverless.storage.shardstate.ShardHead;
 import org.opensearch.serverless.storage.shardstate.ShardStateStore;
 import org.opensearch.serverless.storage.shardstate.VersionedShardHead;
@@ -61,6 +62,16 @@ import java.util.Optional;
  * IOException}. Compaction never actually calls delete today, so this was purely latent, but an
  * {@code IOException}-only catch would have let that unchecked exception escape this scheduled
  * task's documented "swallow and retry next tick" contract the moment it ever did.
+ *
+ * <p><b>{@code admissionController} ({@code null} disables the cap entirely)</b>: every shard's tick
+ * is otherwise scheduled independently, with only a one-time jitter offset (see {@link
+ * JitteredScheduling}) preventing lockstep -- nothing stops many shards on the same node from
+ * deciding, close together, that they are all compaction candidates and running real Lucene merges
+ * at once. A non-{@code null} {@link RewriteAdmissionController}, shared across every shard on the
+ * node (and with {@code PartitionRewriteSchedulerTask}, which competes for the same CPU/IO budget),
+ * caps how many such ticks actually run concurrently; a tick that can't get a permit skips this
+ * round entirely, exactly as safe as any other reason {@link #maybeCompact} might decide "not now,"
+ * and is re-evaluated on the shard's own next scheduled tick.
  */
 public final class CompactionSchedulerTask implements Closeable {
 
@@ -74,10 +85,12 @@ public final class CompactionSchedulerTask implements Closeable {
     private final CompactionRebaseExecutor rebaseExecutor;
     private final ObjectStoreCommitMaterializer materializer;
     private final ObjectStoreCommitPublisher commitPublisher;
+    private final RewriteAdmissionController admissionController;
     private final Scheduler.Cancellable task;
 
     /**
-     * Schedules background compaction for one shard, ticking on the given interval.
+     * Schedules background compaction for one shard, ticking on the given interval, with no node-wide
+     * concurrency cap.
      *
      * @param threadPool      thread pool used to schedule the recurring compaction check
      * @param interval        delay between successive compaction ticks
@@ -102,6 +115,49 @@ public final class CompactionSchedulerTask implements Closeable {
         CompactionPolicy policy,
         CompactionRebaseExecutor rebaseExecutor
     ) {
+        this(
+            threadPool,
+            interval,
+            indexUuid,
+            shardId,
+            shardStateStore,
+            manifestStore,
+            materializer,
+            commitPublisher,
+            policy,
+            rebaseExecutor,
+            null
+        );
+    }
+
+    /**
+     * Schedules background compaction for one shard, ticking on the given interval.
+     *
+     * @param threadPool      thread pool used to schedule the recurring compaction check
+     * @param interval        delay between successive compaction ticks
+     * @param indexUuid       UUID of the index the shard belongs to
+     * @param shardId         id of the shard within the index
+     * @param shardStateStore store used to read the shard's live head
+     * @param manifestStore   store used to read the manifest at the shard's currently published generation
+     * @param materializer    materializes a commit manifest's segments into a real Lucene directory
+     * @param commitPublisher publishes a merged commit as a new manifest
+     * @param policy          decides whether the shard is a compaction candidate, and how many segments to merge to
+     * @param rebaseExecutor  runs the rebase-on-conflict publish attempt once the policy says the shard is a candidate
+     * @param admissionController {@code null} to disable the node-wide concurrency cap entirely; see this class's own javadoc.
+     */
+    public CompactionSchedulerTask(
+        ThreadPool threadPool,
+        TimeValue interval,
+        String indexUuid,
+        int shardId,
+        ShardStateStore shardStateStore,
+        BlobContainerManifestStore manifestStore,
+        ObjectStoreCommitMaterializer materializer,
+        ObjectStoreCommitPublisher commitPublisher,
+        CompactionPolicy policy,
+        CompactionRebaseExecutor rebaseExecutor,
+        RewriteAdmissionController admissionController
+    ) {
         this.indexUuid = indexUuid;
         this.shardId = shardId;
         this.shardStateStore = shardStateStore;
@@ -110,6 +166,7 @@ public final class CompactionSchedulerTask implements Closeable {
         this.commitPublisher = commitPublisher;
         this.policy = policy;
         this.rebaseExecutor = rebaseExecutor;
+        this.admissionController = admissionController;
         // Jittered once per instance (rfc-serverless-opensearch.md §13's own "recovery stampede"
         // requirement) -- see JitteredScheduling's own javadoc for why a one-time offset is what
         // actually prevents lockstep ticking after a coordinated outage recovery.
@@ -122,6 +179,15 @@ public final class CompactionSchedulerTask implements Closeable {
 
     /** Package-private, not private, purely so this task's own catch behavior is directly testable without reflection. */
     void maybeCompactSafely() {
+        if (admissionController != null && admissionController.tryAcquire() == false) {
+            // See class javadoc: never worse than a no-op, re-evaluated on this shard's own next tick.
+            logger.debug(
+                "compaction tick skipped for shard [{}][{}]: node's compaction/rewrite admission cap reached",
+                indexUuid,
+                shardId
+            );
+            return;
+        }
         try {
             maybeCompact(indexUuid, shardId, shardStateStore, manifestStore, materializer, commitPublisher, policy, rebaseExecutor);
         } catch (Exception e) {
@@ -130,6 +196,10 @@ public final class CompactionSchedulerTask implements Closeable {
             // from a delete-denying RestrictingBlobContainer) can never escape this scheduled
             // task's own contract either.
             logger.warn("compaction tick failed for shard [" + indexUuid + "][" + shardId + "], will retry next tick", e);
+        } finally {
+            if (admissionController != null) {
+                admissionController.release();
+            }
         }
     }
 

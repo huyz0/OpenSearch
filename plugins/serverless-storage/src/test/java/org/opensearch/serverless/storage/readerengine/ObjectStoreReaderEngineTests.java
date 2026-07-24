@@ -1482,7 +1482,8 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
                     new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer)),
                     publisher,
                     new org.opensearch.serverless.storage.compaction.CompactionPolicy(2, 5L * 1024 * 1024 * 1024, 0.99),
-                    new org.opensearch.serverless.storage.compaction.CompactionRebaseExecutor(shardStateStore, 5)
+                    new org.opensearch.serverless.storage.compaction.CompactionRebaseExecutor(shardStateStore, 5),
+                    null
                 );
 
             try (

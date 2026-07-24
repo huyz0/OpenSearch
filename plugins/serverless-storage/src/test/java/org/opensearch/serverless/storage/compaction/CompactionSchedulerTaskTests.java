@@ -28,6 +28,7 @@ import org.opensearch.serverless.storage.manifest.CommitManifest;
 import org.opensearch.serverless.storage.manifest.PruningStats;
 import org.opensearch.serverless.storage.manifest.WalPosition;
 import org.opensearch.serverless.storage.readerengine.ObjectStoreCommitMaterializer;
+import org.opensearch.serverless.storage.scheduling.RewriteAdmissionController;
 import org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore;
 import org.opensearch.serverless.storage.shardstate.CasResult;
 import org.opensearch.serverless.storage.shardstate.ShardHead;
@@ -466,6 +467,109 @@ public class CompactionSchedulerTaskTests extends OpenSearchTestCase {
             task.maybeCompactSafely();
         } finally {
             task.close();
+        }
+    }
+
+    public void testTickIsSkippedWhenTheNodeWideAdmissionCapIsAlreadyExhausted() throws Exception {
+        try (Directory directory = new ByteBuffersDirectory()) {
+            SegmentInfos infos = commitSeparateSegments(directory, 12);
+            CommitManifest manifest = commitPublisher.publishCommit(
+                directory,
+                infos,
+                INDEX_UUID,
+                SHARD_ID,
+                1,
+                infos.getGeneration(),
+                11,
+                11,
+                new WalPosition("epoch-0", 0),
+                0,
+                PruningStats.empty()
+            );
+            ShardHead head = new ShardHead(1, "node-1", 1L, manifest.generation());
+            assertEquals(CasResult.SUCCESS, shardStateStore.compareAndSet(INDEX_UUID, SHARD_ID, Optional.empty(), head));
+
+            RewriteAdmissionController admissionController = new RewriteAdmissionController(1);
+            // Simulates another shard's tick already holding the node's one permit.
+            assertTrue(admissionController.tryAcquire());
+
+            CompactionSchedulerTask task = new CompactionSchedulerTask(
+                threadPool,
+                TimeValue.timeValueHours(1), // never actually ticks on its own -- invoked directly below
+                INDEX_UUID,
+                SHARD_ID,
+                shardStateStore,
+                manifestStore,
+                new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer)),
+                commitPublisher,
+                CompactionPolicy.withDefaults(),
+                new CompactionRebaseExecutor(shardStateStore, 10),
+                admissionController
+            );
+            try {
+                task.maybeCompactSafely();
+
+                ShardHead afterTick = shardStateStore.get(INDEX_UUID, SHARD_ID).orElseThrow().head();
+                assertEquals(
+                    "an over-threshold shard must still be skipped entirely while the node's admission cap is exhausted",
+                    manifest.generation(),
+                    afterTick.latestManifestGeneration()
+                );
+            } finally {
+                task.close();
+            }
+        }
+    }
+
+    public void testTickReleasesItsAdmissionPermitOnceFinishedSoTheNextTickCanProceed() throws Exception {
+        try (Directory directory = new ByteBuffersDirectory()) {
+            SegmentInfos infos = commitSeparateSegments(directory, 12);
+            CommitManifest manifest = commitPublisher.publishCommit(
+                directory,
+                infos,
+                INDEX_UUID,
+                SHARD_ID,
+                1,
+                infos.getGeneration(),
+                11,
+                11,
+                new WalPosition("epoch-0", 0),
+                0,
+                PruningStats.empty()
+            );
+            ShardHead head = new ShardHead(1, "node-1", 1L, manifest.generation());
+            assertEquals(CasResult.SUCCESS, shardStateStore.compareAndSet(INDEX_UUID, SHARD_ID, Optional.empty(), head));
+
+            RewriteAdmissionController admissionController = new RewriteAdmissionController(1);
+
+            CompactionSchedulerTask task = new CompactionSchedulerTask(
+                threadPool,
+                TimeValue.timeValueHours(1), // never actually ticks on its own -- invoked directly below
+                INDEX_UUID,
+                SHARD_ID,
+                shardStateStore,
+                manifestStore,
+                new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer)),
+                commitPublisher,
+                CompactionPolicy.withDefaults(),
+                new CompactionRebaseExecutor(shardStateStore, 10),
+                admissionController
+            );
+            try {
+                task.maybeCompactSafely();
+
+                ShardHead afterTick = shardStateStore.get(INDEX_UUID, SHARD_ID).orElseThrow().head();
+                assertTrue(
+                    "the tick must have run and published a newer generation, proving admission was granted",
+                    afterTick.latestManifestGeneration() > manifest.generation()
+                );
+                assertTrue(
+                    "the permit acquired for this tick must be released once the tick finishes, freeing it for the next one",
+                    admissionController.tryAcquire()
+                );
+            } finally {
+                task.close();
+            }
         }
     }
 }

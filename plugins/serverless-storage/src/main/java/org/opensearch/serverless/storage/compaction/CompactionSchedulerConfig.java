@@ -11,6 +11,7 @@ package org.opensearch.serverless.storage.compaction;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.readerengine.ObjectStoreCommitMaterializer;
+import org.opensearch.serverless.storage.scheduling.RewriteAdmissionController;
 import org.opensearch.serverless.storage.writerengine.ObjectStoreCommitPublisher;
 
 /**
@@ -23,7 +24,7 @@ import org.opensearch.serverless.storage.writerengine.ObjectStoreCommitPublisher
  */
 public record CompactionSchedulerConfig(TimeValue interval, BlobContainerManifestStore manifestStore,
     ObjectStoreCommitMaterializer materializer, ObjectStoreCommitPublisher commitPublisher, CompactionPolicy policy,
-    CompactionRebaseExecutor rebaseExecutor) {
+    CompactionRebaseExecutor rebaseExecutor, RewriteAdmissionController admissionController) {
 
     /**
      * Creates a config bundling everything needed to schedule background compaction for one shard.
@@ -34,6 +35,8 @@ public record CompactionSchedulerConfig(TimeValue interval, BlobContainerManifes
      * @param commitPublisher publishes a merged commit as a new manifest
      * @param policy          decides whether the shard is a compaction candidate, and how many segments to merge to
      * @param rebaseExecutor  runs the rebase-on-conflict publish attempt once the policy says the shard is a candidate
+     * @param admissionController {@code null} to disable the node-wide concurrency cap on compaction/rewrite
+     *                             ticks entirely; see {@link CompactionSchedulerTask}'s own javadoc.
      */
     public CompactionSchedulerConfig {
     }
@@ -72,5 +75,11 @@ public record CompactionSchedulerConfig(TimeValue interval, BlobContainerManifes
     @Override
     public CompactionRebaseExecutor rebaseExecutor() {
         return rebaseExecutor;
+    }
+
+    /** {@code null} to disable the node-wide concurrency cap on compaction/rewrite ticks entirely. */
+    @Override
+    public RewriteAdmissionController admissionController() {
+        return admissionController;
     }
 }

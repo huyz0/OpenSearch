@@ -229,7 +229,8 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
                 compactionConfig.materializer(),
                 compactionConfig.commitPublisher(),
                 compactionConfig.policy(),
-                compactionConfig.rebaseExecutor()
+                compactionConfig.rebaseExecutor(),
+                compactionConfig.admissionController()
             );
         // Same reasoning and same redundancy-is-safe argument as compactionSchedulerTask above --
         // see GcSchedulerTask's own javadoc for its own, separate safety design (retention window +
@@ -256,7 +257,8 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
                     partitionRewriteConfig.materializer(),
                     partitionRewriteConfig.commitPublisher(),
                     partitionRewriteConfig.partitionStore()
-                )
+                ),
+                partitionRewriteConfig.admissionController()
             );
         // Same reasoning as gcSchedulerTask above, applied to PITR: a reader shard outlives its
         // writer scaling to zero, so it -- not just ObjectStoreWriterEngine -- must keep reconciling
