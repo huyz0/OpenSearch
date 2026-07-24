@@ -167,6 +167,147 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
         }
     }
 
+    public void testCloseRemovesTheReaderEngineOwnShardDirectoryEntry() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ObjectStoreCommitPublisher publisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+
+        CommitManifest manifest;
+        try (Directory writerDirectory = new ByteBuffersDirectory()) {
+            try (IndexWriter writer = new IndexWriter(writerDirectory, new IndexWriterConfig())) {
+                Document doc = new Document();
+                doc.add(new StringField("id", "1", Field.Store.YES));
+                writer.addDocument(doc);
+                writer.commit();
+            }
+            SegmentInfos segmentInfos = SegmentInfos.readLatestCommit(writerDirectory);
+            manifest = publisher.publishCommit(
+                writerDirectory,
+                segmentInfos,
+                INDEX_UUID,
+                SHARD_ID,
+                1,
+                segmentInfos.getGeneration(),
+                0,
+                0,
+                new WalPosition("epoch-0", 0),
+                0,
+                PruningStats.empty()
+            );
+        }
+
+        ShardDirectory shardDirectory = new InMemoryShardDirectory();
+        try (Store store = createStore()) {
+            EngineConfig engineConfig = config(defaultSettings, store, createTempDir(), newMergePolicy(), null);
+            ObjectStoreCommitMaterializer materializer = new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer));
+
+            try (
+                ObjectStoreReaderEngine readerEngine = ObjectStoreReaderEngine.open(
+                    engineConfig,
+                    manifest,
+                    materializer,
+                    PRIMARY_TERM,
+                    new org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore(blobContainer),
+                    new BlobContainerManifestStore(blobContainer),
+                    shardDirectory,
+                    LOCAL_NODE_ID
+                )
+            ) {
+                assertTrue(
+                    "opening the engine must report an entry",
+                    shardDirectory.lookup(engineConfig.getShardId().getIndex().getUUID(), engineConfig.getShardId().getId())
+                        .isPresent()
+                );
+            }
+            // readerEngine is now closed -- its own entry must be gone, not left to linger until a
+            // TTL lapses (InMemoryShardDirectory has no active eviction otherwise).
+            assertTrue(
+                "closing the engine must remove its own directory entry",
+                shardDirectory.lookup(engineConfig.getShardId().getIndex().getUUID(), engineConfig.getShardId().getId()).isEmpty()
+            );
+        }
+    }
+
+    /**
+     * Regression test: a plain, unconditional drop() at close time would discard a DIFFERENT,
+     * newer entry some other engine instance already reported for this same shard (the real shape
+     * of a relocation: the shard reopens elsewhere before this instance's own close() gets around
+     * to running) -- ObjectStoreReaderEngine must use the conditional dropIfMatches instead, which
+     * only removes its own entry, never someone else's fresher one.
+     */
+    public void testCloseDoesNotRemoveADifferentNewerEntryReportedByAnotherEngineInstance() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ObjectStoreCommitPublisher publisher = new ObjectStoreCommitPublisher(
+            new BlobContainerBundleStore(blobContainer),
+            new BlobContainerManifestStore(blobContainer)
+        );
+
+        CommitManifest manifest;
+        try (Directory writerDirectory = new ByteBuffersDirectory()) {
+            try (IndexWriter writer = new IndexWriter(writerDirectory, new IndexWriterConfig())) {
+                Document doc = new Document();
+                doc.add(new StringField("id", "1", Field.Store.YES));
+                writer.addDocument(doc);
+                writer.commit();
+            }
+            SegmentInfos segmentInfos = SegmentInfos.readLatestCommit(writerDirectory);
+            manifest = publisher.publishCommit(
+                writerDirectory,
+                segmentInfos,
+                INDEX_UUID,
+                SHARD_ID,
+                1,
+                segmentInfos.getGeneration(),
+                0,
+                0,
+                new WalPosition("epoch-0", 0),
+                0,
+                PruningStats.empty()
+            );
+        }
+
+        ShardDirectory shardDirectory = new InMemoryShardDirectory();
+        try (Store store = createStore()) {
+            EngineConfig engineConfig = config(defaultSettings, store, createTempDir(), newMergePolicy(), null);
+            ObjectStoreCommitMaterializer materializer = new ObjectStoreCommitMaterializer(new BlobContainerBundleStore(blobContainer));
+
+            ObjectStoreReaderEngine readerEngine = ObjectStoreReaderEngine.open(
+                engineConfig,
+                manifest,
+                materializer,
+                PRIMARY_TERM,
+                new org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore(blobContainer),
+                new BlobContainerManifestStore(blobContainer),
+                shardDirectory,
+                LOCAL_NODE_ID
+            );
+            // Simulates the shard having relocated: a different (later) engine instance reports a
+            // fresh entry for the same shard into the same directory before this one closes.
+            ShardDirectoryEntry freshEntry = new ShardDirectoryEntry(
+                "a-different-node",
+                ShardRole.READER,
+                PRIMARY_TERM,
+                manifest.generation(),
+                Long.MAX_VALUE
+            );
+            String entryIndexUuid = engineConfig.getShardId().getIndex().getUUID();
+            int entryShardId = engineConfig.getShardId().getId();
+            shardDirectory.report(entryIndexUuid, entryShardId, freshEntry);
+
+            readerEngine.close();
+
+            assertEquals(
+                "the fresh entry from the relocated shard's new engine instance must survive this instance's close()",
+                freshEntry,
+                shardDirectory.lookup(entryIndexUuid, entryShardId).orElseThrow()
+            );
+        }
+    }
+
     public void testMillisSinceLastQueryUpdatesOnRealSearchesButNotOnInternalSearcherAcquisitions() throws Exception {
         FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
         BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());

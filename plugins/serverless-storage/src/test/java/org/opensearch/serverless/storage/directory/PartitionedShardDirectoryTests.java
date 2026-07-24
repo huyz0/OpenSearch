@@ -77,6 +77,31 @@ public class PartitionedShardDirectoryTests extends OpenSearchTestCase {
         assertTrue(directory.lookup("idx", 2).isPresent());
     }
 
+    public void testDropIfMatchesDelegatesToTheOwningPartition() {
+        List<ShardDirectory> partitions = newPartitions(4);
+        PartitionedShardDirectory directory = new PartitionedShardDirectory(partitions);
+
+        ShardDirectoryEntry entry = new ShardDirectoryEntry("node-1", ShardRole.WRITER, 1, 0, Long.MAX_VALUE);
+        directory.report("idx", 1, entry);
+
+        directory.dropIfMatches("idx", 1, entry);
+
+        assertTrue(directory.lookup("idx", 1).isEmpty());
+    }
+
+    public void testDropIfMatchesLeavesAMismatchedEntryUntouchedThroughTheFacade() {
+        List<ShardDirectory> partitions = newPartitions(4);
+        PartitionedShardDirectory directory = new PartitionedShardDirectory(partitions);
+
+        ShardDirectoryEntry freshEntry = new ShardDirectoryEntry("node-2", ShardRole.WRITER, 2, 0, Long.MAX_VALUE);
+        directory.report("idx", 1, freshEntry);
+
+        ShardDirectoryEntry staleEntry = new ShardDirectoryEntry("node-1", ShardRole.WRITER, 1, 0, Long.MAX_VALUE);
+        directory.dropIfMatches("idx", 1, staleEntry);
+
+        assertEquals(Optional.of(freshEntry), directory.lookup("idx", 1));
+    }
+
     public void testIndependentPartitionedDirectoriesWithTheSamePartitionCountAgreeOnRouting() {
         // Simulates two clients that each build their own PartitionedShardDirectory against the
         // same partition count/order -- the whole point of consistent hashing over an interface

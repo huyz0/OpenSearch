@@ -71,6 +71,14 @@ public final class InMemoryShardDirectory implements ShardDirectory {
         entriesByKey.remove(new Key(indexUuid, shardId));
     }
 
+    @Override
+    public void dropIfMatches(String indexUuid, int shardId, ShardDirectoryEntry expectedEntry) {
+        // Compare-and-remove, the same "only touch it if it's still the exact entry we're looking
+        // at" pattern lookup()'s own best-effort expired-entry cleanup already uses above -- never
+        // clobbers a different (newer) entry someone else reported in between.
+        entriesByKey.remove(new Key(indexUuid, shardId), expectedEntry);
+    }
+
     /** Exposed only for tests/metrics -- the number of entries currently held, expired or not. */
     int size() {
         return entriesByKey.size();

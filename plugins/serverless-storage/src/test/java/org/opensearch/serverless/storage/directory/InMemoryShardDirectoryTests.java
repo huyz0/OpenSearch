@@ -62,6 +62,46 @@ public class InMemoryShardDirectoryTests extends OpenSearchTestCase {
         assertTrue(directory.lookup(INDEX_UUID, SHARD_ID).isEmpty());
     }
 
+    public void testDropIfMatchesRemovesTheEntryWhenItIsStillTheExpectedOne() {
+        ShardDirectory directory = new InMemoryShardDirectory();
+        ShardDirectoryEntry entry = new ShardDirectoryEntry("node-1", ShardRole.READER, 1, 0, Long.MAX_VALUE);
+        directory.report(INDEX_UUID, SHARD_ID, entry);
+
+        directory.dropIfMatches(INDEX_UUID, SHARD_ID, entry);
+
+        assertTrue(directory.lookup(INDEX_UUID, SHARD_ID).isEmpty());
+    }
+
+    /**
+     * Regression test for the bug dropIfMatches exists to avoid: a shard that relocated (a newer
+     * entry from a different node/engine instance is now on record) must never have that newer
+     * entry discarded by a stale close() call from the OLD engine instance racing in afterward.
+     */
+    public void testDropIfMatchesLeavesADifferentNewerEntryUntouched() {
+        ShardDirectory directory = new InMemoryShardDirectory();
+        ShardDirectoryEntry staleEntry = new ShardDirectoryEntry("node-1", ShardRole.READER, 1, 0, Long.MAX_VALUE);
+        directory.report(INDEX_UUID, SHARD_ID, staleEntry);
+
+        // The shard relocated -- a different engine instance reports a genuinely newer entry.
+        ShardDirectoryEntry freshEntry = new ShardDirectoryEntry("node-2", ShardRole.READER, 2, 0, Long.MAX_VALUE);
+        directory.report(INDEX_UUID, SHARD_ID, freshEntry);
+
+        // The old (now-closing) engine instance's close() races in with its own stale entry.
+        directory.dropIfMatches(INDEX_UUID, SHARD_ID, staleEntry);
+
+        assertEquals(
+            "the fresh entry from the relocated shard's new engine instance must survive",
+            freshEntry,
+            directory.lookup(INDEX_UUID, SHARD_ID).orElseThrow()
+        );
+    }
+
+    public void testDropIfMatchesOnAnUnreportedShardIsANoOp() {
+        ShardDirectory directory = new InMemoryShardDirectory();
+        directory.dropIfMatches(INDEX_UUID, SHARD_ID, new ShardDirectoryEntry("node-1", ShardRole.READER, 1, 0, Long.MAX_VALUE));
+        assertTrue(directory.lookup(INDEX_UUID, SHARD_ID).isEmpty());
+    }
+
     public void testDifferentShardsAreIndependent() {
         ShardDirectory directory = new InMemoryShardDirectory();
         directory.report(INDEX_UUID, 0, new ShardDirectoryEntry("node-1", ShardRole.WRITER, 1, 0, Long.MAX_VALUE));

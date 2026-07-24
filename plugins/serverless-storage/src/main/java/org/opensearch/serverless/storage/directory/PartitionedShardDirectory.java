@@ -75,4 +75,9 @@ public final class PartitionedShardDirectory implements ShardDirectory {
     public void drop(String indexUuid, int shardId) {
         partitionFor(indexUuid, shardId).drop(indexUuid, shardId);
     }
+
+    @Override
+    public void dropIfMatches(String indexUuid, int shardId, ShardDirectoryEntry expectedEntry) {
+        partitionFor(indexUuid, shardId).dropIfMatches(indexUuid, shardId, expectedEntry);
+    }
 }

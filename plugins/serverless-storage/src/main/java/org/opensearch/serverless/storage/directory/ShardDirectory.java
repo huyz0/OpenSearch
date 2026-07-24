@@ -53,4 +53,18 @@ public interface ShardDirectory {
      * @param shardId the shard id within the index
      */
     void drop(String indexUuid, int shardId);
+
+    /**
+     * Removes the hint for this shard only if it is still exactly {@code expectedEntry} -- a no-op
+     * if the currently-held entry is anything else (including absent). For a caller that itself
+     * reported {@code expectedEntry} and is now closing/idling out, this is the safe way to clean
+     * up after itself: an unconditional {@link #drop} would also discard a <em>different</em>,
+     * newer entry some other caller reported in the meantime (e.g. this same shard already
+     * relocated and reopened on another node), silently discarding a hint that was still correct.
+     *
+     * @param indexUuid the index the shard belongs to
+     * @param shardId the shard id within the index
+     * @param expectedEntry the entry to remove, if it is still the one on record
+     */
+    void dropIfMatches(String indexUuid, int shardId, ShardDirectoryEntry expectedEntry);
 }

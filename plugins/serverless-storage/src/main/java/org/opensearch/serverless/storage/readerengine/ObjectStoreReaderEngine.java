@@ -124,6 +124,9 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
     private final BlobContainerManifestStore manifestStore;
     private final ObjectStoreCommitMaterializer materializer;
     private final ShardDirectory shardDirectory;
+    /** The entry this engine instance itself most recently reported -- see {@link #close()} for why this is tracked. */
+    private final java.util.concurrent.atomic.AtomicReference<ShardDirectoryEntry> lastReportedEntry =
+        new java.util.concurrent.atomic.AtomicReference<>();
     private final String localNodeId;
     private final Scheduler.Cancellable directoryRefreshTask;
     private final Scheduler.Cancellable manifestPollTask;
@@ -322,17 +325,15 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
     }
 
     private void refreshDirectoryEntry() {
-        shardDirectory.report(
-            indexUuid,
-            shardId,
-            new ShardDirectoryEntry(
-                localNodeId,
-                ShardRole.READER,
-                currentPrimaryTerm.get(),
-                currentManifestGeneration.get(),
-                System.currentTimeMillis() + DIRECTORY_ENTRY_TTL_MILLIS
-            )
+        ShardDirectoryEntry entry = new ShardDirectoryEntry(
+            localNodeId,
+            ShardRole.READER,
+            currentPrimaryTerm.get(),
+            currentManifestGeneration.get(),
+            System.currentTimeMillis() + DIRECTORY_ENTRY_TTL_MILLIS
         );
+        shardDirectory.report(indexUuid, shardId, entry);
+        lastReportedEntry.set(entry);
     }
 
     /**
@@ -646,6 +647,16 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
     public void close() throws IOException {
         manifestPollTask.cancel();
         directoryRefreshTask.cancel();
+        // Cleans up this engine's own directory entry rather than leaving it to linger until its
+        // TTL lapses (InMemoryShardDirectory has no active eviction, only lazy removal on a later
+        // lookup -- see its own javadoc). Conditional, not a plain drop(): an unconditional removal
+        // could just as easily discard a DIFFERENT, newer entry some other engine instance already
+        // reported for this same shard (e.g. it already relocated and reopened elsewhere before this
+        // instance got around to closing), which dropIfMatches's compare-and-remove semantics avoid.
+        ShardDirectoryEntry ownEntry = lastReportedEntry.get();
+        if (ownEntry != null) {
+            shardDirectory.dropIfMatches(indexUuid, shardId, ownEntry);
+        }
         if (compactionSchedulerTask != null) {
             compactionSchedulerTask.close();
         }
