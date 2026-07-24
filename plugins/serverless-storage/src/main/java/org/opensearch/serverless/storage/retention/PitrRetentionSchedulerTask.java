@@ -43,6 +43,18 @@ public final class PitrRetentionSchedulerTask implements Closeable {
 
     private static final Logger logger = LogManager.getLogger(PitrRetentionSchedulerTask.class);
 
+    /**
+     * The interval both {@code ObjectStoreWriterEngine} and {@code ObjectStoreReaderEngine} actually
+     * schedule this task at. A public, shared constant rather than each engine's own private copy so
+     * {@code ServerlessStoragePlugin#SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING}'s own minimum
+     * value can be defined relative to it: GC's retention window is the sole time-based margin that
+     * keeps a freshly-published manifest from being deleted before this task's own next tick ever
+     * gets a chance to pin it (see that setting's own javadoc). A retention window shorter than this
+     * task's own reconcile cadence would defeat that margin entirely for a manifest published just
+     * after one reconcile tick and superseded just before retention elapses.
+     */
+    public static final TimeValue DEFAULT_RECONCILE_INTERVAL = TimeValue.timeValueMinutes(5);
+
     private final String indexUuid;
     private final int shardId;
     private final BlobContainerManifestStore manifestStore;

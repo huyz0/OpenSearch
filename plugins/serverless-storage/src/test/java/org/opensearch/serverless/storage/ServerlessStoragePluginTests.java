@@ -540,4 +540,42 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
             );
         }
     }
+
+    /**
+     * S3-efficiency/data-safety regression test: the GC retention window is the sole time-based
+     * margin protecting a freshly-published manifest from deletion before
+     * PitrRetentionSchedulerTask's own next tick ever gets a chance to pin it -- a window shorter
+     * than that reconcile cadence would defeat the margin entirely.
+     */
+    public void testGcRetentionWindowRejectsAValueShorterThanThePitrReconcileInterval() {
+        long tooShortMillis =
+            org.opensearch.serverless.storage.retention.PitrRetentionSchedulerTask.DEFAULT_RECONCILE_INTERVAL.millis() * 2 - 1;
+        Settings settings = Settings.builder()
+            .put(
+                ServerlessStoragePlugin.SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING.getKey(),
+                org.opensearch.common.unit.TimeValue.timeValueMillis(tooShortMillis).getStringRep()
+            )
+            .build();
+        expectThrows(IllegalArgumentException.class, () -> ServerlessStoragePlugin.SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING.get(settings));
+    }
+
+    public void testGcRetentionWindowAcceptsTheDefaultAndValuesAtOrAboveTheMinimum() {
+        assertEquals(
+            org.opensearch.common.unit.TimeValue.timeValueMinutes(30),
+            ServerlessStoragePlugin.SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING.get(Settings.EMPTY)
+        );
+
+        long exactlyMinimumMillis = org.opensearch.serverless.storage.retention.PitrRetentionSchedulerTask.DEFAULT_RECONCILE_INTERVAL
+            .millis() * 2;
+        Settings settings = Settings.builder()
+            .put(
+                ServerlessStoragePlugin.SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING.getKey(),
+                org.opensearch.common.unit.TimeValue.timeValueMillis(exactlyMinimumMillis).getStringRep()
+            )
+            .build();
+        assertEquals(
+            org.opensearch.common.unit.TimeValue.timeValueMillis(exactlyMinimumMillis),
+            ServerlessStoragePlugin.SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING.get(settings)
+        );
+    }
 }

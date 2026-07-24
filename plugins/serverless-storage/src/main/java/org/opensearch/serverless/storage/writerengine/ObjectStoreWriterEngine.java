@@ -111,13 +111,6 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     /** Same well-inside-the-TTL rationale as {@link #DIRECTORY_REFRESH_INTERVAL}. */
     private static final TimeValue LEASE_RENEWAL_INTERVAL = TimeValue.timeValueMillis(LEASE_TTL_MILLIS / 3);
 
-    /**
-     * PITR reconciliation lists and reads every manifest the shard has ever written -- far heavier
-     * than the directory refresh -- and the retention window moves far more slowly than a
-     * directory entry's TTL, so this runs on its own, much longer interval.
-     */
-    private static final TimeValue PITR_RECONCILE_INTERVAL = TimeValue.timeValueMinutes(5);
-
     private final ObjectStoreCommitHeadPublisher headPublisher;
     private final String indexUuid;
     private final int shardId;
@@ -658,7 +651,7 @@ public class ObjectStoreWriterEngine extends InternalEngine {
             ? null
             : new PitrRetentionSchedulerTask(
                 engineConfig.getThreadPool(),
-                PITR_RECONCILE_INTERVAL,
+                PitrRetentionSchedulerTask.DEFAULT_RECONCILE_INTERVAL,
                 indexUuid,
                 shardId,
                 pitrRetentionConfig.manifestStore(),

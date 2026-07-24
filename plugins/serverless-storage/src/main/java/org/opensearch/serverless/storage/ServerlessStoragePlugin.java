@@ -354,10 +354,20 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      * manifest some reader still has open. Deliberately generous by default (30 minutes): comfortably
      * longer than any legitimate reader's own manifest-generation lag, bounded by {@code
      * ObjectStoreReaderEngine}'s 5 s poll interval.
+     *
+     * <p>Also the sole time-based margin protecting a freshly-published manifest from GC deletion
+     * before {@code PitrRetentionSchedulerTask}'s own next tick ever gets a chance to pin it -- see
+     * that task's {@code DEFAULT_RECONCILE_INTERVAL} javadoc. The minimum below (double that
+     * interval) keeps an operator from configuring this window shorter than one full reconcile
+     * cycle, which would defeat that margin for PITR the same way an unbounded window would defeat
+     * it for a slow reader.
      */
     public static final Setting<TimeValue> SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING = Setting.timeSetting(
         "serverless_storage.gc.retention_window",
         TimeValue.timeValueMinutes(30),
+        TimeValue.timeValueMillis(
+            org.opensearch.serverless.storage.retention.PitrRetentionSchedulerTask.DEFAULT_RECONCILE_INTERVAL.millis() * 2
+        ),
         Setting.Property.NodeScope
     );
 

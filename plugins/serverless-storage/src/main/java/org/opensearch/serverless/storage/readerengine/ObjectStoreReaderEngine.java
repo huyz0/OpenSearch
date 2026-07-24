@@ -112,9 +112,6 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
      */
     private static final TimeValue MANIFEST_POLL_INTERVAL = TimeValue.timeValueSeconds(5);
 
-    /** Matches {@code ObjectStoreWriterEngine}'s own PITR reconciliation cadence. */
-    private static final TimeValue PITR_RECONCILE_INTERVAL = TimeValue.timeValueMinutes(5);
-
     private final String indexUuid;
     private final int shardId;
     private final AtomicLong currentPrimaryTerm;
@@ -270,7 +267,7 @@ public final class ObjectStoreReaderEngine extends ReadOnlyEngine {
             ? null
             : new PitrRetentionSchedulerTask(
                 config.getThreadPool(),
-                PITR_RECONCILE_INTERVAL,
+                PitrRetentionSchedulerTask.DEFAULT_RECONCILE_INTERVAL,
                 indexUuid,
                 shardId,
                 pitrRetentionConfig.manifestStore(),
