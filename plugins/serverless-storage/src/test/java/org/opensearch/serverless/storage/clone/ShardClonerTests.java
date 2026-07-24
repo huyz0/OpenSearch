@@ -141,6 +141,9 @@ public class ShardClonerTests extends OpenSearchTestCase {
 
     public void testCloneRefusesToOverwriteATargetThatAlreadyHasAPublishedHead() throws Exception {
         publishSourceCommit();
+        // Simulates the target already being active for a reason that has nothing to do with this
+        // clone attempt at all -- an ordinary index creation, or a stale request against an
+        // already-active target -- so it has a head but no clone lineage yet.
         assertEquals(
             CasResult.SUCCESS,
             targetShardStateStore.compareAndSet(TARGET_INDEX_UUID, SHARD_ID, java.util.Optional.empty(), ShardHead.initial())
@@ -160,6 +163,18 @@ public class ShardClonerTests extends OpenSearchTestCase {
                 targetLineageStore,
                 1L
             )
+        );
+        // This attempt can never complete later -- the target will never become inactive again --
+        // so it must not leave behind a lineage record that would misdescribe this unrelated,
+        // legitimately-active target's real origin, nor a pin that would block the source shard's
+        // GC forever for a clone that will never exist.
+        assertTrue(
+            "a definitively failed clone attempt must not leave a bogus lineage record on the target",
+            targetLineageStore.readLineage().isEmpty()
+        );
+        assertTrue(
+            "a definitively failed clone attempt must not leave its pin on the source",
+            sourcePinRegistry.getPins(SOURCE_INDEX_UUID, SHARD_ID).isEmpty()
         );
     }
 
@@ -371,6 +386,43 @@ public class ShardClonerTests extends OpenSearchTestCase {
         // The abandoned lineage must be left untouched, not overwritten, so the pin it points at
         // remains discoverable/releasable later.
         assertEquals("some-other-abandoned-source-idx", targetLineageStore.readLineage().get().sourceIndexUuid());
+    }
+
+    public void testFailedCloneDoesNotRollBackADifferentConcurrentAttemptsLineage() throws Exception {
+        publishSourceCommit();
+        expectThrows(
+            java.io.IOException.class,
+            () -> ShardCloner.clone(
+                SOURCE_INDEX_UUID,
+                SHARD_ID,
+                sourceManifestStore,
+                sourceShardStateStore,
+                sourcePinRegistry,
+                TARGET_INDEX_UUID,
+                SHARD_ID,
+                targetManifestStore,
+                targetShardStateStore,
+                targetLineageStore,
+                1L,
+                () -> {
+                    // writeLineage is write-once (fails outright if the blob already exists -- see
+                    // BlobContainerCloneLineageStore#writeLineage's underlying writeBlobAtomic call),
+                    // so an ordinary concurrent clone() call can never silently overwrite this
+                    // attempt's own just-written lineage. The only way another attempt's record could
+                    // land here is an explicit delete followed by a different write, e.g. an
+                    // operator-triggered deleteClone racing a different clone() attempt -- simulated
+                    // directly here since it can't happen through a second writeLineage call alone.
+                    targetLineageStore.deleteLineage();
+                    targetLineageStore.writeLineage(new CloneLineage("racer-source-idx", SHARD_ID));
+                    throw new java.io.IOException("simulated failure after a concurrent racer already replaced the lineage");
+                }
+            )
+        );
+        assertEquals(
+            "this attempt's rollback must never touch a lineage record it can tell is no longer its own",
+            "racer-source-idx",
+            targetLineageStore.readLineage().get().sourceIndexUuid()
+        );
     }
 
     public void testDeleteCloneIsIdempotent() throws Exception {
