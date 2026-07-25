@@ -561,6 +561,41 @@ What that changes is the cost of a **full-state read** -- a node joining or a cl
 no longer fetches one blob per index in the cluster. The diff path was already unaffected, since an
 unchanged index's holder is carried forward by reference and never needed a descriptor.
 
+## What C6's descriptor costs the manifest
+
+The manifest is the one file rewritten in full on **every** cluster state version, so anything added to
+it is a recurring write cost rather than a one-off. C6 roughly doubles each index entry, which is worth
+knowing before turning the descriptor on at scale. `ManifestDescriptorSizeEstimate` measures it.
+
+**Uncompressed, one entry:**
+
+| aliases | without | with | increase |
+|---|---|---|---|
+| 0 | 149 B | 271 B | +82% |
+| 1 | 149 B | 307 B | +106% |
+| 3 | 149 B | 381 B | +156% |
+
+**Compressed, which is what actually gets written.** 100k entries, one alias each, DEFLATE:
+
+| | without | with | increase |
+|---|---|---|---|
+| manifest | 0.5 MB | 0.8 MB | **+64%** |
+
+Two things about that +64%. It is much better than the uncompressed +106%, because the entries share a
+name prefix, repeat every field name, and mostly repeat the same booleans. And it is much *worse* than
+the +17% a first version of this measurement produced, which reused a single descriptor across all
+100k entries and so compressed a redundancy no real fleet has. Distinct alias names per index is the
+number to plan from.
+
+**What it means.** At 100k indices the manifest goes from about 0.5 MB to about 0.8 MB per cluster
+state version. The descriptor is affordable; what is not obviously affordable is the 0.5 MB that was
+already there, since both scale linearly with index count and both are rewritten on every version. C6
+makes a pre-existing O(N)-per-version cost about 1.6x worse rather than introducing a new one.
+
+That raises manifest sharding -- C6's third piece, previously described here as gating nothing -- from
+optional to the thing that decides whether either half is usable at 100k+ indices. It is still
+independent of the descriptor work and can be done separately.
+
 ## What the plan got wrong
 
 | plan claim | measured | effect |

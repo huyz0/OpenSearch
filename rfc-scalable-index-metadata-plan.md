@@ -394,7 +394,11 @@ rather than one per index in the cluster. Both halves are off by default and ind
 `cluster.remote_store.state.index_metadata.descriptor.enabled` on the writer,
 `cluster.remote_store.state.index_metadata.defer.enabled` on the reader. An entry with no descriptor is
 fetched exactly as before, so an older repository degrades rather than fails. Manifest sharding, the
-third piece, is untouched -- it is about upload cost rather than residency and gates nothing.
+third piece, is untouched. It was described here as gating nothing; measurement says otherwise. The
+manifest is rewritten in full on every cluster state version, and at 100k indices it is about 0.5 MB
+compressed before the descriptor and about 0.8 MB after. Both scale linearly with index count, so
+sharding is what decides whether either half of C6 is usable at that scale -- see the manifest section
+of `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.md`.
 
 The manifest codec goes to `CODEC_V5` unconditionally, as every prior bump did. Making it conditional
 on whether any entry carries a descriptor was tried and reverted: it breaks the invariant that the
