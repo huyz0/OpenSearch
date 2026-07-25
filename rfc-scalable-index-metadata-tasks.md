@@ -44,7 +44,7 @@ request today, and the rest are latent. Nothing yet makes an index routing-absen
 | A7.3 snapshot shard status | done, inspection-only; sibling deferred to A7.7 |
 | A7.4 resize/merge/allocation | done, tested; latent rather than live |
 | A7.5 clusterless shard-started | reviewed, no change needed |
-| A7.6 integration coverage | open |
+| A7.6 integration coverage | done, tested |
 | C3b first slice (shard ref type) | done, tested |
 | C5 codec bump | blocked: needs a release-version decision |
 | A7.7 snapshot generation preconditions | done, tested |
@@ -86,9 +86,13 @@ Do them in this order, most reachable first:
   original NullPointerException. The other three are `shards()` overrides that a unit test cannot
   reach without disproportionate scaffolding (see `rfc-routing-absence-audit.md`); they are covered by
   inspection, and A7.6 below exists to close that.
-- A7.6 Integration coverage for the three `shards()` guards: stand up a node, put an index in metadata
-  without a routing entry, and assert analyze, get-field-mappings and update report no shard available
-  or retry rather than throwing. Needed anyway once cold indices exist.
+- A7.6 -- DONE. `RoutingAbsentIndexRequestPathsIT`. The state has no API that produces it, which is why
+  a unit test could not reach it; the test drives the cluster-manager's own `ClusterService` to remove
+  the routing entry, the same technique `RareClusterStateIT` uses to inject one. Analyze, get-field-
+  mappings and update are each asserted to report no shard available or retry rather than throw.
+  Verified by breaking the analyze guard and watching the original
+  `NullPointerException: Cannot invoke IndexRoutingTable.randomAllActiveShardsIt() because
+  "indexRoutingTable" is null` come back, so the coverage is real rather than incidental.
 - A7.3 -- PARTLY DONE. `SnapshotsService:3443` needed no decision: that method already marks a shard
   `MISSING` when the index's metadata is absent, and an index with no routing entry has no shards to
   snapshot either, so it takes the same branch. `SnapshotsService:3511` is left alone on purpose --
