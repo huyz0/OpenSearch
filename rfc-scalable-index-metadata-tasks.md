@@ -31,6 +31,25 @@ and small.
 correct once an index can legitimately be absent from routing, which is what A5 establishes. Do A1
 first for the audit, and do not land A2/A3 before A5 has a design.
 
+**Status.** A1 done, and A7 -- the category it uncovered -- done except for two follow-ups. Sixteen
+call sites that would have thrown `NullPointerException` on an index present in metadata and absent
+from routing are now guarded. That work stands on its own: four of them are reachable by an ordinary
+request today, and the rest are latent. Nothing yet makes an index routing-absent, which is A4 and A5.
+
+| task | state |
+|---|---|
+| A1 audit | done, `rfc-routing-absence-audit.md` |
+| A7.1 tiering health | done, tested |
+| A7.2 four request paths | done; one tested, three inspection-only |
+| A7.3 snapshot shard status | done, inspection-only; sibling deferred to A7.7 |
+| A7.4 resize/merge/allocation | done, tested; latent rather than live |
+| A7.5 clusterless shard-started | reviewed, no change needed |
+| A7.6 integration coverage | open |
+| A7.7 snapshot generation preconditions | open |
+| A2, A3 | blocked on A4 |
+| A4 spike | next |
+| A5, A6 | blocked on A4 |
+
 ### A1. Audit every caller that assumes a routing entry exists -- DONE
 
 See `rfc-routing-absence-audit.md`. 58 call sites classified. Three results changed this phase:
