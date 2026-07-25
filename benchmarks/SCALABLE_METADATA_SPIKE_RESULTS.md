@@ -722,3 +722,47 @@ a workload question this cannot answer, and it belongs in the D2 defaults decisi
 - Scale-to-zero is confirmed as the load-bearing mechanism: at ~101 KB resident per index and an
   allocator that binds around 100k active shards, keeping quiescent tenants out of both
   the routing table and the resident set is what makes any of this work.
+
+## S11: shard-count scaling, and why every earlier number understated the problem
+
+Every estimate above fixed the shard count at 1, with two at 3. That quietly made "per index" and "per
+shard" the same number. The stated target is 100M indices at 3-30 shards each, which is 300M to 3B
+shards, so they are not the same number and the per-shard dimension had never been measured.
+
+`ShardScalingRetainedHeapEstimate` sweeps it. Retained heap, 100k indices per point, assertions off:
+
+| shards | full (IndexMetadata + RoutingTable) | no routing entry | descriptor only |
+|---|---|---|---|
+| 1 | 3,652 B | 2,387 B | 175 B |
+| 3 | 5,193 B | 2,600 B | 195 B |
+| 10 | 10,540 B | 3,296 B | 192 B |
+| 30 | 26,594 B | 5,872 B | 193 B |
+
+Extrapolated to 100M indices at 30 shards: **2,477 GiB** full, **547 GiB** with the routing entry gone,
+**18 GiB** descriptor-only.
+
+**The descriptor is flat.** It carries `totalNumberOfShards` as an `int`, and the measurement confirms
+nothing reachable from it scales per shard -- 175 B at one shard, 193 B at thirty. That was the
+assumption C5 and C6 were built on and it now has a number behind it rather than a reading of the field
+list.
+
+**Routing absence is necessary and not sufficient.** Dropping the routing entry is the single largest
+structural saving, and it grows with shard count: 1.5x at one shard, 4.5x at thirty. But 547 GiB is
+still not a heap. Phase A was scoped as the enabling change for scale-to-zero; at this target it is a
+precondition for deferral rather than an alternative to it.
+
+**What changed in the conclusion.** Earlier framing treated C5/C6 deferral as a large optimization on
+top of a workable design. At 100M indices with real shard counts it is the only representation that
+fits at all, and the gap widens as shards grow -- 21x at one shard, 138x at thirty. The 100M target is
+not reachable by making the resident representation smaller; it is reachable only by not making it
+resident.
+
+**Cell sizing, re-based.** At 18 GiB for 100M descriptor-only, a 10M-index cell costs about 1.8 GiB of
+index metadata. That is affordable. The binding constraint stays where S6 put it -- the allocator, at
+tens of thousands of *active* shards -- which at 3-30 shards per index means a cell's active tenant
+count is bounded an order of magnitude below its resident tenant count.
+
+**What this does not settle.** Replicas are zero here. Each in-sync copy adds an allocation id per
+shard to `inSyncAllocationIds` and a `ShardRouting` to the routing table, so the `full` and
+`norouting` columns are floors, not estimates. The descriptor column is unaffected by replica count for
+the same reason it is unaffected by shard count.
