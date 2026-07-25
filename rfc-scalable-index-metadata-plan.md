@@ -445,15 +445,26 @@ and `OperationRouting` be satisfied from a compact entry — has been answered: 
 hot-path addition (`defaultSearchPipelineId`) and a short list of extra fields, plus three specific
 source changes so an absent routing entry degrades rather than fails. See S1.
 
+**Implementation status.** C1, C3, a new allocator change (the `balanceByWeights` weight-spread
+skip, from S9) and an auto-expand-replicas guard are implemented, measured and committed; see the
+"What was implemented" table in `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.md`. C2's priority has
+dropped: its headline saving assumed 100M indices, and at the allocator-capped reachable scale of
+~100k it is tens of MB per node rather than tens of GB, so C7 now outranks it.
+
 Revised ordering, with what each now rests on:
 
 1. **C1** — incremental `MetadataDiff.apply`. Still first. S7 verified the reuse condition is safe
    and found the trap: supply `previousMetadata` **without** seeding the index map.
 2. **C3** — local-node routing view. S6 measured the win: 52 ms per applied cluster state at 40k
    shards, on every data node. Promoted above dedup.
-3. **C2 mapping dedup** — S4 confirmed 1000× on homogeneous fleets, degrading as ≈`100/divergent%`.
-   Pair with `dynamic: strict`. Note S3: this helps cluster state only, not data-node capacity.
-4. **C7** — batch create-index/update-settings.
+3. **C7** — batch create-index/update-settings. Promoted above dedup: provisioning throughput
+   matters at any scale, and S6 showed cold allocation is superlinear, so batching creates helps
+   exactly where the cluster is most fragile.
+4. **C2 mapping dedup** — S4 confirmed 1000× on homogeneous fleets, degrading as ≈`100/divergent%`;
+   pair with `dynamic: strict`. But note S3 (helps cluster state only, 0.08% effect on the parsed
+   graph) and the recalibration above (tens of MB per node at reachable scale, not tens of GB). The
+   correct implementation is Elasticsearch's `mappingsByHash`, a wire-format change with BWC
+   implications — that cost is harder to justify against the corrected saving.
 5. **C4** — incremental routing rebuild. S6 raises its priority: the allocator is the binding
    constraint, so this is worth more than originally assigned.
 6. **C6** — manifest sharding and public per-index fetch. Needed before C5 is useful.

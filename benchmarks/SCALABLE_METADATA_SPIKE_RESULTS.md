@@ -359,6 +359,42 @@ shards it converts one 53 s reroute into a loop of 20 s reroutes that never conv
 
 ---
 
+## What was implemented off the back of these spikes
+
+Four core changes, each measured and each with a test verified to actually catch its failure mode
+(for a behaviour-preserving optimization a green suite proves nothing on its own -- it passes with
+and without the change -- so each was deliberately broken to confirm the guard fails, then restored):
+
+| change | what it removes | evidence |
+|---|---|---|
+| `MetadataDiff.apply` takes the reuse path | full `indicesLookup` rebuild on every node, every metadata change | S7 found the naive fix resurrects deleted indices; fixed via a non-seeding builder path |
+| `RoutingNodes.localRoutingNode` | cluster-wide `RoutingNodes` allocation on every data node, every applied state | S6 measured 43-52 ms/state at 40k shards |
+| `balanceByWeights` weight-spread skip | ~800k redundant decider calls per reroute | steady-state 445/355 ms -> 287 ms at 40k shards |
+| auto-expand-replicas guard | a *second* cluster-wide `RoutingNodes` build + per-index settings parse, every reroute | forcing the guard on fails 3 of 5 `AutoExpandReplicasTests` |
+
+All four are pre-existing waste in current OpenSearch rather than scaling-only concerns; the
+tenant-scale investigation simply made them visible.
+
+## Recalibration: C2's headline number does not survive S6
+
+S4 measured mapping dedup at up to 1000x on cluster state, and the plan quoted that as ~50 GB -> under
+1 GB. That figure assumes 100M indices. S6 then established the allocator caps a cluster around 100k
+*active shards*, so 100M indices is not reachable in one cluster and the saving must be read at
+attainable scale:
+
+| indices | mapping bytes/node (470 B each, S4) | saved by dedup |
+|---|---|---|
+| 10,000 | 4.5 MB | ~4.5 MB |
+| 40,000 | 17.9 MB | ~17.9 MB |
+| 100,000 | 44.8 MB | ~44.8 MB |
+| 100,000,000 | 43.8 GB | ~43.8 GB (not reachable) |
+
+So C2 is worth roughly **tens of MB per node** at reachable scale -- real, and it applies to every
+node, but not the order-of-magnitude win the headline implied. Combined with S3's finding that dedup
+does nothing for the parsed `MapperService` graph (0.08% effect), this moves C2 below C7
+(provisioning throughput, which matters at any scale) in priority. Recorded here because the
+1000x figure would otherwise justify a wire-format change on false pretences.
+
 ## What the plan got wrong
 
 | plan claim | measured | effect |
