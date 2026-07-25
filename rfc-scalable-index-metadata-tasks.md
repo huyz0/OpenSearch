@@ -175,10 +175,19 @@ one is done", so removing the routing entry would make reactivation silently rep
 index serving nothing. That is a worse failure than the exception the spike predicted, and it moves
 those two sites from A5's "tolerate absence" list to its "distinguish cold from gone" list.
 
-### A6. Measure
+### A6. Measure -- FIRST HALF DONE
 
-Build a cluster state with N routing-absent indices and M active ones. Confirm reroute cost scales
-with M and not with N. Compare against the S6 baseline at 40k shards so the numbers are comparable.
+`ColdIndexRerouteCostSpikeTests`, recorded in `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.md`. Today's
+held-down shape costs roughly 15 ms of steady-state reroute per 1,000 cold indices and is linear in
+them; routing-absent is flat. At 10,000 cold indices that is 154-171 ms against 9 ms, a 17x
+difference, paid on the cluster-manager on every cluster state change.
+
+So Phase A's premise holds, and the prize is quantified: cold-absence removes essentially all of the
+cold-tenant allocator cost rather than trimming it. Extrapolated, 100k cold indices is about 1.5 s per
+reroute today.
+
+Remaining half: re-measure with the real mechanism once A5 lands, and against a larger active set, to
+confirm the constant rather than just the shape.
 
 ---
 

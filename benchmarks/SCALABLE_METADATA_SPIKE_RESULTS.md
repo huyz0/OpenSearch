@@ -596,6 +596,41 @@ That raises manifest sharding -- C6's third piece, previously described here as 
 optional to the thing that decides whether either half is usable at 100k+ indices. It is still
 independent of the descriptor work and can be done separately.
 
+## A6 -- what a quiescent tenant costs the allocator today
+
+The A4 spike found that scale-to-zero does not remove an index from the routing table. It evicts the
+shards and holds them down with a decider that says no, so they stay present and `UNASSIGNED` and are
+re-evaluated on every reroute. The entire case for making cold indices routing-absent rests on what
+that costs, and nobody had measured it.
+
+`ColdIndexRerouteCostSpikeTests`. 500 active indices, 20 nodes, one replica, assertions disabled.
+`index.routing.allocation.enable: none` stands in for `SuspendedShardAllocationDecider`: same shape,
+no plugin needed. Two samples:
+
+| cold indices | held down, steady reroute | absent, steady reroute |
+|---|---|---|
+| 0 | 9 / 12 ms | 6 / 6 ms |
+| 2,000 | 25 / 24 ms | 7 / 11 ms |
+| 10,000 | 154 / 171 ms | 9 / 9 ms |
+
+**Held-down cost is linear in cold indices; absent is flat.** Roughly 15 ms per 1,000 cold indices per
+reroute in today's shape, against nothing measurable when the index is not in the routing table. At
+10,000 cold indices that is a 17x difference on the steady-state reroute, and the reroute is paid on
+the cluster-manager on every cluster state change.
+
+The `RoutingNodes` rebuild tracks it as expected (1 ms -> 6-8 ms held down, 0-1 ms absent), because it
+is O(shards in the routing table) and the held-down shards are in it.
+
+**What this settles.** Phase A's premise holds and is worth the work: cold-absence removes essentially
+all of the cold-tenant allocator cost rather than reducing it. Extrapolating the linear fit, 100k cold
+indices would be roughly 1.5 s of steady-state reroute per cluster state change, which is not a
+workable control plane. That is the wall scale-to-zero currently runs into, and it is separate from
+the ~100k *active* shard ceiling S6 measured.
+
+**What it does not settle.** The stand-in is a decider that refuses allocation, not
+`SuspendedShardAllocationDecider` itself, and the active set is small. The shape of the curve is the
+result, not the constant.
+
 ## What the plan got wrong
 
 | plan claim | measured | effect |
