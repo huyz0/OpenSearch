@@ -48,7 +48,7 @@ request today, and the rest are latent. Nothing yet makes an index routing-absen
 | A7.7 snapshot generation preconditions | open |
 | A5.1 cold-vs-gone | done, tested |
 | A5.2 + A5.3 prune + recreate | done, tested, off by default |
-| A5.4 decider still needed? | open |
+| A5.4 decider still needed? | decided: yes, unchanged |
 | A2, A3 | blocked on A5 |
 | A4 spike | done |
 | A6 | first half done |
@@ -191,11 +191,25 @@ brand new empty one. The entry is now built explicitly with `ExistingStoreRecove
 correct despite the empty in-sync set because the data lives in the object store and
 `ServerlessStorageExistingShardsAllocator` exists precisely to allocate such a shard.
 
-Remaining:
+**A5.4 -- DECIDED, no change. `SuspendedShardAllocationDecider` stays exactly as it is.** The A4
+spike expected pruning to make it "mostly dead for suspended shards". It does not, for three
+independent reasons, any one of which is sufficient:
 
-- **A5.4** Decide whether `SuspendedShardAllocationDecider` is still needed, now that the allocator
-  stops seeing a fully cold index at all. It still covers the window between marking and eviction,
-  and every partially suspended index.
+1. **It is what makes eviction stick.** Eviction is a `CancelAllocationCommand`, which unassigns the
+   copy; the reroute that follows immediately runs `allocateUnassigned`. Without `canAllocate` saying
+   `NO`, `ServerlessStorageExistingShardsAllocator` would assign the shard straight back on that same
+   pass. Suspension would not merely be slower to take effect, it would never take effect at all --
+   and this holds for every shard between eviction and the prune that follows some ticks later.
+2. **A partially suspended index is never pruned.** The routing entry is per-index and suspension is
+   per-shard-per-role, so an index with one hot shard keeps its entry indefinitely and its suspended
+   shards are held down by the decider alone, permanently. This is not an edge case; it is what any
+   index whose shards idle at different times looks like.
+3. **Pruning is off by default.** With the setting off the decider is the entire mechanism.
+
+**Corollary worth recording, because it bounds A6's number.** The 17x applies to *fully* cold indices.
+A partially suspended index still pays the held-down per-suspended-shard reroute cost, so the realised
+saving in a fleet depends on how many tenants go fully quiescent rather than how many shards do.
+A6's second half should measure a mixed fleet, not only the all-or-nothing shape it measured first.
 - Check whether `SuspendedShardAllocationDecider` is still needed for the window between marking and
   eviction, now that the allocator stops seeing the shard afterwards.
 
