@@ -9,6 +9,7 @@
 package org.opensearch.benchmark.clusterstate;
 
 import org.opensearch.Version;
+import org.opensearch.action.support.ActiveShardCount;
 import org.opensearch.cluster.metadata.AliasMetadata;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.routing.RoutingTable;
@@ -49,7 +50,7 @@ public final class TenantIndexRetainedHeapEstimate {
 
     public static void main(String[] args) throws Exception {
         if (args.length < 2) {
-            System.err.println("usage: TenantIndexRetainedHeapEstimate <full|compact|realistic> <count>");
+            System.err.println("usage: TenantIndexRetainedHeapEstimate <full|compact|realistic|descriptor> <count>");
             System.exit(1);
         }
         String mode = args[0];
@@ -136,8 +137,53 @@ public final class TenantIndexRetainedHeapEstimate {
                     true
                 );
                 list.add(new Object[] { compactIndex, shardRouting });
+            } else if (mode.equals("descriptor") || mode.equals("descriptor-noalias")) {
+                // "descriptor-noalias" is the common tenant shape: addressed by index name, no
+                // alias defined. Measured separately because a one-entry HashMap is a
+                // disproportionate share of the descriptor's footprint.
+                Map<String, AliasMetadata> aliases;
+                if (mode.equals("descriptor-noalias")) {
+                    aliases = Collections.emptyMap();
+                } else {
+                    aliases = new HashMap<>();
+                    AliasMetadata alias = AliasMetadata.builder(aliasName).build();
+                    aliases.put(alias.getAlias(), alias);
+                }
+                RoutingDescriptor.ShardPlacement[] shards = new RoutingDescriptor.ShardPlacement[] {
+                    new RoutingDescriptor.ShardPlacement(0, "node-0", null, "alloc-" + uuid, (byte) 2, true, false) };
+                list.add(
+                    new RoutingDescriptor(
+                        name,
+                        uuid,
+                        1,
+                        1,
+                        1,
+                        -1,
+                        1,
+                        0,
+                        0,
+                        IndexMetadata.State.OPEN,
+                        Version.CURRENT,
+                        ActiveShardCount.DEFAULT,
+                        null,
+                        false,
+                        false,
+                        false,
+                        false,
+                        false,
+                        false,
+                        false,
+                        false,
+                        1L,
+                        1L,
+                        1L,
+                        1L,
+                        aliases,
+                        shards
+                    )
+                );
             } else {
-                throw new IllegalArgumentException("mode must be 'full', 'compact', or 'realistic', got: " + mode);
+                throw new IllegalArgumentException("mode must be 'full', 'compact', 'realistic', or 'descriptor', got: " + mode);
             }
         }
         return list;
