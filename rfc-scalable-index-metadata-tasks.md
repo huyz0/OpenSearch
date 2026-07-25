@@ -464,11 +464,24 @@ over-approximation. A correct version needs a change signal from every producer 
 payoff is roughly 35 to 67 ms of a 300 ms steady-state reroute at 40k shards, where the balancer
 dominates. This wants a maintainer's judgement rather than another unilateral attempt.
 
-### E3. S1 sites 1 and 2, if Phase A does not happen
+### E3. S1 sites 1 and 2 -- MOOT, Phase A happened
 
-If cold-absent routing is not pursued, close A2 and A3 explicitly as "not doing" rather than leaving
-them open. They are only correct in service of that property, and shipping them alone changes live
-search and write behaviour for no benefit.
+This existed to force an explicit "not doing" if cold-absent routing was abandoned, so that A2 and A3
+did not sit open forever as changes to live search and write behaviour with no benefit behind them.
+
+Phase A was pursued and A5 landed the mechanism, so the conditional never fired and both are done. The
+concern it encoded was still the right one, and it shaped how they shipped: neither is a bare
+degradation. A2 synthesises empty shards rather than skipping the index, so a cold index produces
+per-shard failures rather than a silent 200 with zero hits, and a test asserts that equals the
+behaviour of an index whose shards merely happen to be unassigned. A3's null is returned only when the
+index has no routing entry, leaving `ShardNotFoundException` and `IndexNotFoundException` exactly where
+they were.
+
+**The residual worth naming:** A2 and A3 are live for every cluster, while the mechanism that creates
+routing-absent indices is behind a setting that defaults to off. So today they are pure tolerance for a
+state nothing produces. That is deliberate -- it is the same order A7 used, and it is what makes A5.2
+safe to enable -- but it does mean the first cluster to turn pruning on is the first to exercise them
+together. D1's integration test is where that gets covered, not here.
 
 ---
 
