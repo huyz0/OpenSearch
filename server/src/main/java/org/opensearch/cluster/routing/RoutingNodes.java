@@ -313,6 +313,57 @@ public class RoutingNodes implements Iterable<RoutingNode> {
         return nodesToShards.get(nodeId);
     }
 
+    /**
+     * Builds the {@link RoutingNode} for a single node without constructing the cluster-wide
+     * {@link RoutingNodes} inverse index.
+     *
+     * <p>Callers that only need their own node's shards -- notably
+     * {@code IndicesClusterStateService.applyClusterState}, which does this in every one of its
+     * sub-methods -- would otherwise go through {@link ClusterState#getRoutingNodes()}. That builds
+     * a {@link RoutingNode} for every node in the cluster plus an {@code assignedShards} entry (a
+     * map entry and an {@code ArrayList}) for every shard in the cluster, and retains all of it on
+     * the {@link ClusterState} instance. A node hosting a handful of shards pays for the whole
+     * cluster's inverse index on every applied state.
+     *
+     * <p>This still scans the routing table, since nothing indexes shards by node without building
+     * exactly that structure, but it allocates only for the shards belonging to {@code nodeId}.
+     *
+     * <p>Semantics deliberately match the {@link RoutingNodes} constructor:
+     * <ul>
+     *   <li>returns {@code null} for a node that is not a data node, matching the constructor's
+     *       pre-population of {@code nodesToShards} from {@code getDataNodes()} -- so a data node
+     *       with no shards yields an empty {@code RoutingNode}, not {@code null};</li>
+     *   <li>a shard relocating <em>to</em> this node contributes its
+     *       {@link ShardRouting#getTargetRelocatingShard()}, exactly as the constructor does.</li>
+     * </ul>
+     */
+    @Nullable
+    public static RoutingNode localRoutingNode(ClusterState clusterState, String nodeId) {
+        if (nodeId == null) {
+            return null;
+        }
+        final DiscoveryNode node = clusterState.nodes().getDataNodes().get(nodeId);
+        if (node == null) {
+            return null;
+        }
+        final List<ShardRouting> shards = new ArrayList<>();
+        for (final IndexRoutingTable indexRoutingTable : clusterState.routingTable().indicesRouting().values()) {
+            for (final IndexShardRoutingTable indexShard : indexRoutingTable) {
+                for (final ShardRouting shard : indexShard) {
+                    if (shard.assignedToNode() == false) {
+                        continue;
+                    }
+                    if (nodeId.equals(shard.currentNodeId())) {
+                        shards.add(shard);
+                    } else if (shard.relocating() && nodeId.equals(shard.relocatingNodeId())) {
+                        shards.add(shard.getTargetRelocatingShard());
+                    }
+                }
+            }
+        }
+        return new RoutingNode(nodeId, node, shards.toArray(new ShardRouting[0]));
+    }
+
     public Stream<RoutingNode> stream() {
         return nodesToShards.values().stream();
     }

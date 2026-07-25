@@ -47,6 +47,7 @@ import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.RecoverySource.Type;
 import org.opensearch.cluster.routing.RoutingNode;
+import org.opensearch.cluster.routing.RoutingNodes;
 import org.opensearch.cluster.routing.RoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.service.ClusterService;
@@ -322,7 +323,7 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
      * @param state new cluster state
      */
     private void updateFailedShardsCache(final ClusterState state) {
-        RoutingNode localRoutingNode = state.getRoutingNodes().node(state.nodes().getLocalNodeId());
+        RoutingNode localRoutingNode = RoutingNodes.localRoutingNode(state, state.nodes().getLocalNodeId());
         if (localRoutingNode == null) {
             failedShardsCache.clear();
             return;
@@ -431,7 +432,7 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
         assert localNodeId != null;
 
         final Set<Index> indicesWithShards = new HashSet<>();
-        RoutingNode localRoutingNode = state.getRoutingNodes().node(localNodeId);
+        RoutingNode localRoutingNode = RoutingNodes.localRoutingNode(state, localNodeId);
         if (localRoutingNode != null) { // null e.g. if we are not a data node
             for (ShardRouting shardRouting : localRoutingNode) {
                 indicesWithShards.add(shardRouting.index());
@@ -471,7 +472,7 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
      * @param state new cluster state
      */
     private void failMissingShards(final ClusterState state) {
-        RoutingNode localRoutingNode = state.getRoutingNodes().node(state.nodes().getLocalNodeId());
+        RoutingNode localRoutingNode = RoutingNodes.localRoutingNode(state, state.nodes().getLocalNodeId());
         if (localRoutingNode == null) {
             return;
         }
@@ -502,7 +503,7 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
         assert localNodeId != null;
 
         // remove shards based on routing nodes (no deletion of data)
-        RoutingNode localRoutingNode = state.getRoutingNodes().node(localNodeId);
+        RoutingNode localRoutingNode = RoutingNodes.localRoutingNode(state, localNodeId);
         for (AllocatedIndex<? extends Shard> indexService : indicesService) {
             for (Shard shard : indexService) {
                 ShardRouting currentRoutingEntry = shard.routingEntry();
@@ -540,7 +541,7 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
 
     private void createIndices(final ClusterState state) {
         // we only create indices for shards that are allocated
-        RoutingNode localRoutingNode = state.getRoutingNodes().node(state.nodes().getLocalNodeId());
+        RoutingNode localRoutingNode = RoutingNodes.localRoutingNode(state, state.nodes().getLocalNodeId());
         if (localRoutingNode == null) {
             return;
         }
@@ -636,7 +637,7 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
                     indicesService.removeIndex(indexService.index(), FAILURE, "removing index (" + reason + ")");
 
                     // fail shards that would be created or updated by createOrUpdateShards
-                    RoutingNode localRoutingNode = state.getRoutingNodes().node(state.nodes().getLocalNodeId());
+                    RoutingNode localRoutingNode = RoutingNodes.localRoutingNode(state, state.nodes().getLocalNodeId());
                     if (localRoutingNode != null) {
                         for (final ShardRouting shardRouting : localRoutingNode) {
                             if (shardRouting.index().equals(index) && failedShardsCache.containsKey(shardRouting.shardId()) == false) {
@@ -650,7 +651,7 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
     }
 
     private void createOrUpdateShards(final ClusterState state) {
-        RoutingNode localRoutingNode = state.getRoutingNodes().node(state.nodes().getLocalNodeId());
+        RoutingNode localRoutingNode = RoutingNodes.localRoutingNode(state, state.nodes().getLocalNodeId());
         if (localRoutingNode == null) {
             return;
         }
