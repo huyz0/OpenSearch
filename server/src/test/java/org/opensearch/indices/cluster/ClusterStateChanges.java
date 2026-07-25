@@ -57,8 +57,10 @@ import org.opensearch.action.support.clustermanager.ClusterManagerNodeRequest;
 import org.opensearch.action.support.clustermanager.TransportClusterManagerNodeAction;
 import org.opensearch.action.support.clustermanager.TransportClusterManagerNodeActionUtils;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.ClusterStateTaskConfig;
 import org.opensearch.cluster.ClusterStateTaskExecutor;
 import org.opensearch.cluster.ClusterStateTaskExecutor.ClusterTasksResult;
+import org.opensearch.cluster.ClusterStateTaskListener;
 import org.opensearch.cluster.ClusterStateUpdateTask;
 import org.opensearch.cluster.EmptyClusterInfoService;
 import org.opensearch.cluster.action.shard.ShardStateAction;
@@ -134,6 +136,7 @@ import static org.opensearch.env.Environment.PATH_HOME_SETTING;
 import static org.hamcrest.Matchers.notNullValue;
 import static com.carrotsearch.randomizedtesting.RandomizedTest.getRandom;
 import static org.junit.Assert.assertThat;
+import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.anyString;
 import static org.mockito.Mockito.doAnswer;
@@ -146,6 +149,9 @@ public class ClusterStateChanges {
     private static final Logger logger = LogManager.getLogger(ClusterStateChanges.class);
     private final AllocationService allocationService;
     private final ClusterService clusterService;
+    // Retained so tests can drive the batching create-index executor with a real multi-task batch;
+    // going through createIndex() only ever submits one task at a time.
+    private final MetadataCreateIndexService createIndexService;
     private final ShardStateAction.ShardFailedClusterStateTaskExecutor shardFailedClusterStateTaskExecutor;
     private final ShardStateAction.ShardStartedClusterStateTaskExecutor shardStartedClusterStateTaskExecutor;
 
@@ -306,7 +312,7 @@ public class ClusterStateChanges {
             threadPool,
             awarenessReplicaBalance
         );
-        MetadataCreateIndexService createIndexService = new MetadataCreateIndexService(
+        this.createIndexService = new MetadataCreateIndexService(
             SETTINGS,
             clusterService,
             indicesService,
@@ -392,6 +398,11 @@ public class ClusterStateChanges {
 
         nodeRemovalExecutor = new NodeRemovalClusterStateTaskExecutor(allocationService, logger);
         joinTaskExecutor = new JoinTaskExecutor(Settings.EMPTY, allocationService, logger, (s, p, r) -> {}, remoteStoreNodeService);
+    }
+
+    /** The real service, so tests can exercise its batching executor directly. */
+    public MetadataCreateIndexService getMetadataCreateIndexService() {
+        return createIndexService;
     }
 
     public ClusterState createIndex(ClusterState state, CreateIndexRequest request) {
@@ -540,6 +551,26 @@ public class ClusterStateChanges {
             result[0] = task.execute(state);
             return null;
         }).when(clusterService).submitStateUpdateTask(anyString(), any(ClusterStateUpdateTask.class));
+        // Some services (index creation) submit through the batched API with a shared executor so
+        // that concurrent requests collapse into one cluster-state update. Emulate that path too,
+        // otherwise those submissions are silently dropped here and the caller sees no state change.
+        doAnswer(invocationOnMock -> {
+            @SuppressWarnings("unchecked")
+            final Map<Object, ClusterStateTaskListener> tasks = (Map<Object, ClusterStateTaskListener>) invocationOnMock.getArguments()[1];
+            @SuppressWarnings("unchecked")
+            final ClusterStateTaskExecutor<Object> executor = (ClusterStateTaskExecutor<Object>) invocationOnMock.getArguments()[3];
+            final ClusterStateTaskExecutor.ClusterTasksResult<Object> taskResult = executor.execute(state, new ArrayList<>(tasks.keySet()));
+            // The single-task path above propagates a failure by letting execute() throw. The batched
+            // path records failures per task instead, so rethrow here to keep both paths equivalent
+            // for tests that assert on rejected requests.
+            for (ClusterStateTaskExecutor.TaskResult individualResult : taskResult.executionResults.values()) {
+                if (individualResult.isSuccess() == false) {
+                    throw individualResult.getFailure();
+                }
+            }
+            result[0] = taskResult.resultingState;
+            return null;
+        }).when(clusterService).submitStateUpdateTasks(anyString(), anyMap(), any(ClusterStateTaskConfig.class), any());
         runnable.run();
         assertThat(result[0], notNullValue());
         return result[0];

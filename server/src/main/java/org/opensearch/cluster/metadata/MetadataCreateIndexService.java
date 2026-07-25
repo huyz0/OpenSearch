@@ -47,6 +47,8 @@ import org.opensearch.action.support.ActiveShardCount;
 import org.opensearch.action.support.ActiveShardsObserver;
 import org.opensearch.cluster.AckedClusterStateUpdateTask;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.ClusterStateTaskConfig;
+import org.opensearch.cluster.ClusterStateTaskExecutor;
 import org.opensearch.cluster.ack.ClusterStateUpdateResponse;
 import org.opensearch.cluster.ack.CreateIndexClusterStateUpdateResponse;
 import org.opensearch.cluster.applicationtemplates.SystemTemplatesService;
@@ -386,36 +388,89 @@ public class MetadataCreateIndexService {
         final ActionListener<ClusterStateUpdateResponse> listener
     ) {
         normalizeRequestSetting(request);
-        clusterService.submitStateUpdateTask(
+        final CreateIndexTask task = new CreateIndexTask(request, listener);
+        clusterService.submitStateUpdateTasks(
             "create-index [" + request.index() + "], cause [" + request.cause() + "]",
-            new AckedClusterStateUpdateTask<ClusterStateUpdateResponse>(Priority.URGENT, request, listener) {
-                @Override
-                protected ClusterStateUpdateResponse newResponse(boolean acknowledged) {
-                    return new ClusterStateUpdateResponse(acknowledged);
-                }
-
-                @Override
-                public ClusterManagerTaskThrottler.ThrottlingKey getClusterManagerThrottlingKey() {
-                    return createIndexTaskKey;
-                }
-
-                @Override
-                public ClusterState execute(ClusterState currentState) throws Exception {
-                    return applyCreateIndexRequest(currentState, request, false);
-                }
-
-                @Override
-                public void onFailure(String source, Exception e) {
-                    if (e instanceof ResourceAlreadyExistsException) {
-                        logger.trace(() -> new ParameterizedMessage("[{}] failed to create", request.index()), e);
-                    } else {
-                        logger.debug(() -> new ParameterizedMessage("[{}] failed to create", request.index()), e);
-                    }
-                    super.onFailure(source, e);
-                }
-            }
+            Map.of(task, task),
+            ClusterStateTaskConfig.build(Priority.URGENT, request.clusterManagerNodeTimeout()),
+            createIndexExecutor
         );
     }
+
+    /**
+     * One pending index creation. Serves as both the batch element and its own
+     * {@link org.opensearch.cluster.AckedClusterStateTaskListener}, so each request keeps its own
+     * acknowledgement timeout and listener even though many are applied in a single cluster-state
+     * update.
+     *
+     * <p>The batch path in {@link #createIndexExecutor} is what actually runs; {@code execute} is
+     * implemented to perform the same single-request transition so the task remains correct if it is
+     * ever submitted without that executor.
+     */
+    // Package-private rather than private so tests can drive a genuine multi-task batch; no test
+    // path otherwise submits more than one creation per executor invocation.
+    class CreateIndexTask extends AckedClusterStateUpdateTask<ClusterStateUpdateResponse> {
+        final CreateIndexClusterStateUpdateRequest request;
+
+        CreateIndexTask(CreateIndexClusterStateUpdateRequest request, ActionListener<ClusterStateUpdateResponse> listener) {
+            super(Priority.URGENT, request, listener);
+            this.request = request;
+        }
+
+        @Override
+        protected ClusterStateUpdateResponse newResponse(boolean acknowledged) {
+            return new ClusterStateUpdateResponse(acknowledged);
+        }
+
+        @Override
+        public ClusterManagerTaskThrottler.ThrottlingKey getClusterManagerThrottlingKey() {
+            return createIndexTaskKey;
+        }
+
+        @Override
+        public ClusterState execute(ClusterState currentState) throws Exception {
+            return applyCreateIndexRequest(currentState, request, false);
+        }
+
+        @Override
+        public void onFailure(String source, Exception e) {
+            if (e instanceof ResourceAlreadyExistsException) {
+                logger.trace(() -> new ParameterizedMessage("[{}] failed to create", request.index()), e);
+            } else {
+                logger.debug(() -> new ParameterizedMessage("[{}] failed to create", request.index()), e);
+            }
+            super.onFailure(source, e);
+        }
+    }
+
+    /**
+     * Applies a batch of index creations as a single cluster-state update.
+     *
+     * <p>Index creation previously submitted an {@code AckedClusterStateUpdateTask} that was its own
+     * executor, and {@code ClusterStateUpdateTask}'s executor implementation asserts a batch size of
+     * one -- so N concurrent creations cost N full cluster-state cycles, each with its own diff,
+     * publication and cluster-wide acknowledgement round. Provisioning many indices at once is
+     * exactly the workload that made this expensive.
+     *
+     * <p>{@link #applyCreateIndexRequest} both takes and returns a {@link ClusterState}, so the batch
+     * is a straightforward fold. Each task is recorded as an individual success or failure, so one
+     * bad request (a duplicate name, a validation error) fails only itself and the rest of the batch
+     * still applies -- matching the per-request behaviour callers had before.
+     */
+    final ClusterStateTaskExecutor<CreateIndexTask> createIndexExecutor = (currentState, tasks) -> {
+        final ClusterStateTaskExecutor.ClusterTasksResult.Builder<CreateIndexTask> builder = ClusterStateTaskExecutor.ClusterTasksResult
+            .builder();
+        ClusterState state = currentState;
+        for (CreateIndexTask task : tasks) {
+            try {
+                state = applyCreateIndexRequest(state, task.request, false);
+                builder.success(task);
+            } catch (Exception e) {
+                builder.failure(task, e);
+            }
+        }
+        return builder.build(state);
+    };
 
     private void normalizeRequestSetting(CreateIndexClusterStateUpdateRequest createIndexClusterStateRequest) {
         Settings.Builder updatedSettingsBuilder = Settings.builder();
