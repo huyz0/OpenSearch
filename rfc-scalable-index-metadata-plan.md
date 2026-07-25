@@ -436,7 +436,35 @@ independent of anything in this document.
    as a follow-on.
 3. **C3** — local-node routing view. Contained, large data-node win.
 4. **C7** — batch create-index/update-settings.
-5. **C4** — incremental routing rebuild. Needs its own review.
+5. **C4 — incremental routing rebuild. The decision, stated so it can be made.**
+
+   The *callers* have been dealt with: `RoutingNodes.localRoutingNode` removed the cluster-wide
+   build from `IndicesClusterStateService`, `IncrementalClusterStateWriter` and `IndicesStore`, and
+   assertion-only work is out of the constructor. What remains is the rebuild algorithm itself,
+   which the cluster-manager pays twice per state-changing reroute.
+
+   S9 established the obstacle is ownership, not algorithm. The derived aggregates are already
+   maintained incrementally, `assignedShards` is naturally diff-addressable, `ShardRouting` identity
+   survives a `RoutingTable` rebuild, and `RoutingTableIncrementalDiff` already computes the needed
+   diff (for publication, after allocation). Two things block reuse:
+
+   - allocation **mutates `RoutingNodes` in place** (`initializeShard`, `relocateShard`,
+     `startShard`, `failShard`), so a reused instance carries the prior round's mutations;
+   - `AllocationService` is **deliberately stateless** -- `reroute(ClusterState, reason)` accepts an
+     arbitrary state, and nothing holds the previous `RoutingNodes`.
+
+   The options, with what each costs:
+
+   | option | cost | risk |
+   |---|---|---|
+   | Cache last `(ClusterState identity -> RoutingNodes)` on `AllocationService` | small code change | makes a stateless service stateful; a stale or wrongly-keyed entry yields **wrong allocation decisions**, i.e. shards moved incorrectly |
+   | Copy-on-write / undo journal for the mutating operations | larger, self-contained | must cover every mutation path; a missed one silently corrupts the reused instance |
+   | Leave as-is | none | cluster-manager keeps paying two O(total shards) rebuilds per reroute |
+
+   This is a correctness-sensitive trade on the allocator, so it wants a maintainer's call rather
+   than being taken unilaterally. Worth noting the payoff is now smaller than when C4 was first
+   listed: the `RoutingNodes` build measured ~35-67 ms of a ~300 ms steady-state reroute at 40k
+   shards, and the dominant term is the balancer, not the rebuild.
 6. **C6** — manifest sharding and public per-index fetch. Needed before C5 is useful.
 7. **C5** — the directory/hydration split. Largest, and gated on the spike below.
 
