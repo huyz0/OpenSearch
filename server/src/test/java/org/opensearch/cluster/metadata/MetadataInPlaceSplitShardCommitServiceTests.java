@@ -17,7 +17,6 @@ import org.opensearch.cluster.ClusterStateUpdateTask;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodeRole;
 import org.opensearch.cluster.node.DiscoveryNodes;
-import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.RoutingTable;
@@ -26,21 +25,23 @@ import org.opensearch.cluster.routing.ShardRoutingState;
 import org.opensearch.cluster.routing.TestShardRouting;
 import org.opensearch.cluster.routing.UnassignedInfo;
 import org.opensearch.cluster.routing.allocation.decider.MaxRetryAllocationDecider;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.test.OpenSearchTestCase;
-import org.mockito.ArgumentCaptor;
 
 import java.time.Instant;
 import java.util.Collections;
 import java.util.Set;
 
+import org.mockito.ArgumentCaptor;
+
+import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.any;
 
 public class MetadataInPlaceSplitShardCommitServiceTests extends OpenSearchTestCase {
 
@@ -87,7 +88,10 @@ public class MetadataInPlaceSplitShardCommitServiceTests extends OpenSearchTestC
 
         long recorded = afterCommit.metadata().index("test-index").getSplitShardsMetadata().getSplitCommitTimestamp(0);
         assertNotEquals(SplitShardsMetadata.NO_SPLIT_COMMIT_TIMESTAMP, recorded);
-        assertTrue("commit timestamp " + recorded + " should be within [" + before + ", " + after + "]", recorded >= before && recorded <= after);
+        assertTrue(
+            "commit timestamp " + recorded + " should be within [" + before + ", " + after + "]",
+            recorded >= before && recorded <= after
+        );
     }
 
     public void testApplyCommitRetiresParentShardRoutingAtomically() {

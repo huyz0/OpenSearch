@@ -37,9 +37,7 @@ public class AttemptEngineNativeSnapshotTests extends IndexShardTestCase {
         // classic snapshot path unchanged.
         IndexShard shard = newStartedShard(true, Settings.EMPTY, new EngineBackedIndexerFactory(new InternalEngineFactory()));
         try {
-            Optional<EngineNativeSnapshotPointer> result = shard.attemptEngineNativeSnapshot(
-                new SnapshotId("test-snap", "test-snap-uuid")
-            );
+            Optional<EngineNativeSnapshotPointer> result = shard.attemptEngineNativeSnapshot(new SnapshotId("test-snap", "test-snap-uuid"));
             assertTrue("a plain InternalEngine (the default attemptEngineNativeSnapshot()) must return empty", result.isEmpty());
         } finally {
             closeShards(shard);
@@ -57,9 +55,7 @@ public class AttemptEngineNativeSnapshotTests extends IndexShardTestCase {
 
         IndexShard shard = newStartedShard(true, Settings.EMPTY, new EngineBackedIndexerFactory(engineFactory));
         try {
-            Optional<EngineNativeSnapshotPointer> result = shard.attemptEngineNativeSnapshot(
-                new SnapshotId("test-snap", "test-snap-uuid")
-            );
+            Optional<EngineNativeSnapshotPointer> result = shard.attemptEngineNativeSnapshot(new SnapshotId("test-snap", "test-snap-uuid"));
             assertTrue("the pointer the engine returned must reach the IndexShard caller unchanged", result.isPresent());
             assertEquals(expected.engineId(), result.get().engineId());
             assertArrayEquals(expected.payload(), result.get().payload());

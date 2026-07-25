@@ -53,10 +53,13 @@ public class FilterRepositoryTests extends OpenSearchTestCase {
         final SnapshotId snapshotId = new SnapshotId("test-snap", "test-snap-uuid");
         final IndexId indexId = new IndexId("test-index", "test-index-uuid");
         final ShardId shardId = new ShardId("test-index", "test-index-uuid", 0);
-        final EngineNativeShardSnapshot expected = new EngineNativeShardSnapshot("test-snap", "test-engine/v1", 0L, 0L, new byte[] {
-            4,
-            5,
-            6 });
+        final EngineNativeShardSnapshot expected = new EngineNativeShardSnapshot(
+            "test-snap",
+            "test-engine/v1",
+            0L,
+            0L,
+            new byte[] { 4, 5, 6 }
+        );
         when(delegate.getEngineNativeShardSnapshotMetadata(snapshotId, indexId, shardId)).thenReturn(Optional.of(expected));
 
         assertEquals(Optional.of(expected), filter.getEngineNativeShardSnapshotMetadata(snapshotId, indexId, shardId));

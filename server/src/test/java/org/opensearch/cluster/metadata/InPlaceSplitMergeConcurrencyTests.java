@@ -15,9 +15,7 @@ import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
-import org.opensearch.cluster.routing.RecoverySource;
 import org.opensearch.cluster.routing.RoutingTable;
-import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.ShardRoutingState;
 import org.opensearch.cluster.routing.TestShardRouting;
 import org.opensearch.common.settings.Settings;
@@ -55,7 +53,10 @@ public class InPlaceSplitMergeConcurrencyTests extends OpenSearchTestCase {
         assertTrue(afterA.metadata().index("test-index").getSplitShardsMetadata().isSplitOfShardInProgress(0));
         Set<Integer> childrenAfterA = afterA.metadata().index("test-index").getSplitShardsMetadata().getChildShardIdsOfParent(0);
 
-        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> applySplit(afterA, splitRequest("test-index", 0, 2)));
+        IllegalArgumentException e = expectThrows(
+            IllegalArgumentException.class,
+            () -> applySplit(afterA, splitRequest("test-index", 0, 2))
+        );
         assertTrue(e.getMessage(), e.getMessage().contains("already in progress"));
 
         // The losing request left no trace: shard 0 still has exactly A's children, no second child set.
