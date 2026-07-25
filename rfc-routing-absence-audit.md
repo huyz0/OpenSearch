@@ -86,11 +86,23 @@ already skips an index whose routing entry is null instead of reporting on it. T
 constructor to accept null would have invented a health status for a state core deliberately excludes
 from health. The two validators now follow the existing convention: not healthy enough to tier.
 
-**Resize, merge and allocation paths:**
+**Resize, merge and allocation paths (ALL FOUR FIXED):**
 
 `MetadataCreateIndexService:1991`, `DiskThresholdDecider:668`, `MetadataInPlaceMergeShardService:232`,
-`MetadataInPlaceSplitShardService:193`. A cold index arguably should not reach any of these, but they
-should reject it rather than NPE. Lower priority than the request paths.
+`MetadataInPlaceSplitShardService:193`.
+
+Shrink validation and the disk decider now fall through to their existing behaviour: no routing entry
+means no started shards, which is the condition shrink's "must have all shards allocated on the same
+node" error already describes, and means the decider contributes no shard size and uses its default.
+The two in-place resharding services reject with a clear message, since splitting or merging an index
+with nothing to split or merge from is not a state worth continuing into.
+
+**Not reachable today, unlike the request paths.** These are only reached for a source index that has
+been closed or write-blocked, and closing goes through
+`RoutingTable.Builder#addAsFromOpenToClose`, which keeps the routing entry. What does *not* keep it is
+`addAsNew`, which skips an index whose state is `CLOSE` -- so the state is straightforward to
+construct, and is what the tests use, but no live path was found that produces it. Recorded as a
+latent guard rather than a live defect.
 
 **Clusterless mode:**
 

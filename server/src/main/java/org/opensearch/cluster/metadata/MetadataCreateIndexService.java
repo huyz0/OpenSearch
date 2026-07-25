@@ -1991,8 +1991,12 @@ public class MetadataCreateIndexService {
         final IndexRoutingTable table = state.routingTable().index(sourceIndex);
         Map<String, AtomicInteger> nodesToNumRouting = new HashMap<>();
         int numShards = sourceMetadata.getNumberOfShards();
-        for (ShardRouting routing : table.shardsWithState(ShardRoutingState.STARTED)) {
-            nodesToNumRouting.computeIfAbsent(routing.currentNodeId(), (s) -> new AtomicInteger(0)).incrementAndGet();
+        // No routing entry means no started shards, so no node holds a full copy. Falling through leaves
+        // nodesToAllocateOn empty and produces the existing, clearer error below.
+        if (table != null) {
+            for (ShardRouting routing : table.shardsWithState(ShardRoutingState.STARTED)) {
+                nodesToNumRouting.computeIfAbsent(routing.currentNodeId(), (s) -> new AtomicInteger(0)).incrementAndGet();
+            }
         }
         List<String> nodesToAllocateOn = new ArrayList<>();
         for (Map.Entry<String, AtomicInteger> entries : nodesToNumRouting.entrySet()) {

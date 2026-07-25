@@ -66,9 +66,9 @@ Do them in this order, most reachable first:
   or retry rather than throwing. Needed anyway once cold indices exist.
 - A7.3 Snapshot paths: `SnapshotsService:3443`, `:3511`. Needs a decision, not just a guard: is a cold
   index snapshotted from its remote state, or skipped?
-- A7.4 Resize, merge and allocation: `MetadataCreateIndexService:1991`, `DiskThresholdDecider:668`,
-  `MetadataInPlaceMergeShardService:232`, `MetadataInPlaceSplitShardService:193`. Should reject, not
-  NPE. Lower priority; a cold index probably should not reach them.
+- A7.4 -- DONE. All four guarded. Unlike the request paths these are **not reachable today**: they need
+  a closed or write-blocked source, and closing keeps the routing entry via `addAsFromOpenToClose`.
+  Latent guards rather than live defects, and the audit says so.
 - A7.5 `LocalShardStateAction:53`, clusterless mode only. Confirm absence is possible before touching.
 
 ### A2. `OperationRouting.indexRoutingTable` degrades instead of throwing

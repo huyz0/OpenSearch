@@ -230,6 +230,11 @@ public class MetadataInPlaceMergeShardService {
         // those extra entries verbatim.
         Index index = curIndexMetadata.getIndex();
         IndexRoutingTable currentIndexRoutingTable = currentState.routingTable().index(index.getName());
+        if (currentIndexRoutingTable == null) {
+            throw new IllegalStateException(
+                "cannot merge shards of index [" + index.getName() + "]: it has no routing table to merge from"
+            );
+        }
         IndexRoutingTable.Builder indexRoutingTableBuilder = IndexRoutingTable.builder(index);
         for (IndexShardRoutingTable shardTable : currentIndexRoutingTable) {
             indexRoutingTableBuilder.addIndexShard(shardTable);

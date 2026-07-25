@@ -189,8 +189,14 @@ public class MetadataInPlaceSplitShardService {
         // InPlaceSplitShardRecoverySource (an existing, previously-unused recovery source shaped after
         // LocalShardsRecoverySource); replicas recover from that primary the ordinary way, via PEER.
         Index index = curIndexMetadata.getIndex();
+        IndexRoutingTable existingRoutingTable = currentState.routingTable().index(index.getName());
+        if (existingRoutingTable == null) {
+            throw new IllegalStateException(
+                "cannot split shards of index [" + index.getName() + "]: it has no routing table to split from"
+            );
+        }
         IndexRoutingTable.Builder indexRoutingTableBuilder = IndexRoutingTable.builder(index);
-        for (IndexShardRoutingTable existingShardTable : currentState.routingTable().index(index.getName())) {
+        for (IndexShardRoutingTable existingShardTable : existingRoutingTable) {
             indexRoutingTableBuilder.addIndexShard(existingShardTable);
         }
         int numberOfReplicas = curIndexMetadata.getNumberOfReplicas();
