@@ -400,7 +400,21 @@ attainable scale:
 | 100,000,000 | 43.8 GB | ~43.8 GB (not reachable) |
 
 So C2 is worth roughly **tens of MB per node** at reachable scale -- real, and it applies to every
-node, but not the order-of-magnitude win the headline implied. Combined with S3's finding that dedup
+node, but not the order-of-magnitude win the headline implied. Expressed as a share of a
+cluster-manager heap, which is what actually decides whether it is worth building:
+
+| indices | saving | % of 16 GB heap | % of 32 GB heap |
+|---|---|---|---|
+| 10,000 | 4.5 MB | 0.03% | 0.01% |
+| 40,000 | 17.9 MB | 0.11% | 0.05% |
+| 100,000 | 44.8 MB | 0.27% | 0.14% |
+
+**Verdict: do not build it.** Even the wire-format-free variant (interning identical
+`CompressedXContent` instances at construction) means putting a global mutable cache into a core
+class, with the attendant concurrency and lifetime questions, to reclaim a quarter of a percent of
+heap in the best case reachable and a hundredth of a percent typically. The full `mappingsByHash`
+version additionally carries BWC cost. This is recorded as a measured decision rather than a
+judgement call so it does not get re-argued from the 1000x figure. Combined with S3's finding that dedup
 does nothing for the parsed `MapperService` graph (0.08% effect), this moves C2 below C7
 (provisioning throughput, which matters at any scale) in priority. Recorded here because the
 1000x figure would otherwise justify a wire-format change on false pretences.
