@@ -427,12 +427,34 @@ with no in-tree caller, which is fine but should be a stated decision rather tha
 
 These are not implementation work. Each is a call to make and record.
 
-### E1. C2 mapping dedup: decide against it, or justify it
+### E1. Mapping dedup: NOT DOING, and here is the number that made it look worth doing
 
-S4 measured 1000x on identical fleets. S3 showed it does nothing for the parsed `MapperService` graph
-(0.08%), and the ceiling recalibration puts it at tens of MB per node at reachable scale rather than
-tens of GB. The correct implementation is a wire-format change with BWC cost. Record the decision so
-the 1000x figure does not resurface as justification.
+**Decision: do not implement mapping deduplication.** Recorded here so the 1000x does not resurface.
+
+S4 measured 1000x compression on a fleet of identical mappings. That figure is real and it is also
+close to meaningless, for three independent reasons, any one of which is disqualifying:
+
+1. **It measures the wrong thing.** S3 measured what dedup does to the parsed `MapperService` graph,
+   which is what actually occupies a data node: **0.08%**. The compressed cluster-state bytes dedup
+   targets are roughly 1/255th of the resident cost. Deduplicating them leaves the number that matters
+   untouched.
+2. **The absolute size stopped being alarming.** The ceiling recalibration puts mapping bytes at tens
+   of MB per node at reachable scale, not the tens of GB the original framing implied. S6 established
+   that the allocator binds first, at roughly 100k active shards, well before mapping residency does.
+   Dedup optimises a resource that is not the constraint.
+3. **The 1000x is an artefact of the input.** It requires a fleet of *identical* mappings. Every
+   measurement in this project that assumed uniformity across tenants has been wrong in the same
+   direction -- the descriptor compression measurement flattered itself 4x by reusing one descriptor
+   across 100k entries until distinct per-index aliases were used. A tenant fleet with genuinely
+   identical mappings is a benchmark, not a deployment.
+
+Against that, the correct implementation is a wire-format change to how mappings travel in cluster
+state, with backwards-compatibility cost on every node in a mixed-version cluster. That is a large,
+permanent, cross-version commitment bought with a 0.08% improvement in the resource that binds.
+
+**What would reopen it.** A measurement showing parsed-graph residency, not compressed bytes, is the
+binding constraint on data nodes at a scale the allocator can actually reach. S3 and S6 together say
+it is not. Nothing short of overturning both should restart this.
 
 ### E2. C4 incremental routing rebuild: maintainer call
 
