@@ -400,6 +400,30 @@ compressed before the descriptor and about 0.8 MB after. Both scale linearly wit
 sharding is what decides whether either half of C6 is usable at that scale -- see the manifest section
 of `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.md`.
 
+**Audited before attempting it.** Two things were checked against the code:
+
+1. *The manifest really is rewritten whole every version.* `writeIncrementalMetadata` seeds
+   `allUploadedIndexMetadata` from `previousManifest.getIndices()` -- all N -- updates the entries that
+   changed, and writes the lot. Only the per-index **blobs** are incremental. So the O(N)-per-version
+   cost is real and sharding is the thing that removes it.
+2. *Sharding would touch the delete path.* `RemoteClusterStateCleanupManager.deleteClusterMetadata`
+   builds `filesToKeep` as a union over every retained manifest, adding each entry's uploaded filename,
+   then deletes whatever a stale manifest references that is not in that set. With sharding, the index
+   entries move into shard blobs, so keeping index metadata alive needs **two** changes there: keep the
+   shard blobs themselves, and resolve index blob names transitively *through* them. Miss the second and
+   the sweep deletes index metadata that is still referenced.
+
+That is a well-defined constraint rather than a blocker, but it puts sharding in the delete path, which
+is the highest-consequence code in this subsystem. It wants its own change with the cleanup behaviour
+tested directly, not an appendix to the descriptor work.
+
+**One gap in the shipped descriptor work, found by that audit and fixed.** An index that did not change
+reuses its previous manifest entry verbatim. So turning `descriptor.enabled` on would only ever have
+reached indices written *after* that point -- and for a quiescent tenant index, which is exactly what
+this mechanism is for, that may be never; it would have been fetched forever. The cluster-manager
+already holds the current metadata, so the descriptor is now filled in for carried-forward entries
+during publication, at no blob write and without materializing a deferred index to do it.
+
 The manifest codec goes to `CODEC_V5` unconditionally, as every prior bump did. Making it conditional
 on whether any entry carries a descriptor was tried and reverted: it breaks the invariant that the
 writer always writes `MANIFEST_CURRENT_CODEC_VERSION` (four tests encode it), and worse, it lets a

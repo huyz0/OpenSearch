@@ -538,6 +538,21 @@ public class RemoteClusterStateService implements Closeable {
         indicesToBeDeletedFromRemote.keySet().forEach(allUploadedIndexMetadata::remove);
         clusterStateCustomsDiff.getDeletes().forEach(allUploadedClusterStateCustomsMap::remove);
 
+        // An index that did not change reuses its previous manifest entry verbatim, so without this the
+        // descriptor would only ever reach indices that happen to be written after the setting is turned
+        // on -- and for a quiescent tenant index, which is exactly what this is for, that may be never.
+        // The descriptor is derived from the cluster state being published, so filling it in here costs
+        // no blob write, and reads only descriptor-level fields so it does not materialize a deferred
+        // index to do it.
+        if (remoteIndexMetadataManager.isWriteDescriptorEnabled()) {
+            for (Map.Entry<String, IndexMetadataHolder> holder : clusterState.metadata().indexHolders().entrySet()) {
+                UploadedIndexMetadata existing = allUploadedIndexMetadata.get(holder.getKey());
+                if (existing != null && existing.getDescriptor() == null) {
+                    allUploadedIndexMetadata.put(holder.getKey(), existing.withDescriptor(IndexDescriptor.of(holder.getValue())));
+                }
+            }
+        }
+
         if (!updateCoordinationMetadata) {
             uploadedMetadataResults.uploadedCoordinationMetadata = previousManifest.getCoordinationMetadata();
         }

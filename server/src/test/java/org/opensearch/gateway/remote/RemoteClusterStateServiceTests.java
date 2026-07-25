@@ -673,6 +673,86 @@ public class RemoteClusterStateServiceTests extends OpenSearchTestCase {
         assertTrue(exception.getMessage().startsWith("Some metadata components were not uploaded successfully"));
     }
 
+    /**
+     * An index that did not change reuses its previous manifest entry, so turning the descriptor on has
+     * to reach those entries too. Otherwise a quiescent tenant index -- the case this whole mechanism is
+     * for -- would never gain a descriptor and would always be fetched.
+     */
+    public void testDescriptorIsBackfilledOntoUnchangedIndices() throws IOException {
+        final ClusterState clusterState = generateClusterStateWithOneIndex().nodes(nodesWithLocalNodeClusterManager()).build();
+        mockBlobStoreObjects();
+        clusterSettings.applySettings(
+            Settings.builder().put(RemoteIndexMetadataManager.REMOTE_INDEX_METADATA_DESCRIPTOR_SETTING.getKey(), true).build()
+        );
+
+        // Previous state already holds the index at the same version, so it counts as unchanged and its
+        // entry is carried forward rather than rebuilt. The carried entry has no descriptor.
+        final IndexMetadata existing = clusterState.metadata().index("test-index");
+        final ClusterState previousClusterState = ClusterState.builder(ClusterName.DEFAULT)
+            .metadata(
+                Metadata.builder()
+                    .coordinationMetadata(CoordinationMetadata.builder().term(1L).build())
+                    .put(existing, false)
+                    .clusterUUID("cluster-uuid")
+            )
+            .build();
+        final ClusterMetadataManifest previousManifest = ClusterMetadataManifest.builder()
+            .indices(List.of(new UploadedIndexMetadata("test-index", "index-uuid", "metadata-filename__2")))
+            .build();
+        assertNull("the carried-forward entry starts without one", previousManifest.getIndices().get(0).getDescriptor());
+
+        remoteClusterStateService.start();
+        final ClusterMetadataManifest manifest = remoteClusterStateService.writeIncrementalMetadata(
+            previousClusterState,
+            clusterState,
+            previousManifest
+        ).getClusterMetadataManifest();
+
+        UploadedIndexMetadata entry = manifest.getIndices()
+            .stream()
+            .filter(i -> i.getIndexName().equals("test-index"))
+            .findFirst()
+            .orElseThrow(() -> new AssertionError("the index must still be in the manifest"));
+        assertNotNull("an unchanged index must still gain a descriptor", entry.getDescriptor());
+        assertEquals(IndexDescriptor.of(clusterState.metadata().index("test-index")), entry.getDescriptor());
+    }
+
+    /** With the setting off, a carried-forward entry is left exactly as it was. */
+    public void testUnchangedIndicesAreNotTouchedWhenDescriptorIsDisabled() throws IOException {
+        final ClusterState clusterState = generateClusterStateWithOneIndex().nodes(nodesWithLocalNodeClusterManager()).build();
+        mockBlobStoreObjects();
+        clusterSettings.applySettings(
+            Settings.builder().put(RemoteIndexMetadataManager.REMOTE_INDEX_METADATA_DESCRIPTOR_SETTING.getKey(), false).build()
+        );
+
+        final IndexMetadata existing = clusterState.metadata().index("test-index");
+        final ClusterState previousClusterState = ClusterState.builder(ClusterName.DEFAULT)
+            .metadata(
+                Metadata.builder()
+                    .coordinationMetadata(CoordinationMetadata.builder().term(1L).build())
+                    .put(existing, false)
+                    .clusterUUID("cluster-uuid")
+            )
+            .build();
+        final ClusterMetadataManifest previousManifest = ClusterMetadataManifest.builder()
+            .indices(List.of(new UploadedIndexMetadata("test-index", "index-uuid", "metadata-filename__2")))
+            .build();
+
+        remoteClusterStateService.start();
+        final ClusterMetadataManifest manifest = remoteClusterStateService.writeIncrementalMetadata(
+            previousClusterState,
+            clusterState,
+            previousManifest
+        ).getClusterMetadataManifest();
+
+        UploadedIndexMetadata entry = manifest.getIndices()
+            .stream()
+            .filter(i -> i.getIndexName().equals("test-index"))
+            .findFirst()
+            .orElseThrow(() -> new AssertionError("the index must still be in the manifest"));
+        assertNull("nothing should be added when the setting is off", entry.getDescriptor());
+    }
+
     public void testWriteIncrementalMetadataSuccess() throws IOException {
         final ClusterState clusterState = generateClusterStateWithOneIndex().nodes(nodesWithLocalNodeClusterManager()).build();
         mockBlobStoreObjects();

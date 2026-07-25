@@ -1373,6 +1373,15 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
             return descriptor;
         }
 
+        /**
+         * A copy of this entry carrying {@code descriptor}, at {@link ClusterMetadataManifest#CODEC_V5}.
+         * The blob this points at is unchanged, so this is how an index that did not change gains a
+         * descriptor without being re-uploaded.
+         */
+        public UploadedIndexMetadata withDescriptor(IndexDescriptor descriptor) {
+            return new UploadedIndexMetadata(indexName, indexUUID, uploadedFilename, componentPrefix, CODEC_V5, descriptor);
+        }
+
         @Override
         public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
             builder.field(INDEX_NAME_FIELD.getPreferredName(), getIndexName())

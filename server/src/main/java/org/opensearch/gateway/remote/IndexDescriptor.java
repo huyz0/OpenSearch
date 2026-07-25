@@ -81,6 +81,15 @@ public class IndexDescriptor implements Writeable, ToXContentObject {
 
     /** Taken from the index being written out, so the manifest and the blob cannot disagree. */
     public static IndexDescriptor of(IndexMetadata indexMetadata) {
+        return of((IndexMetadataHolder) indexMetadata);
+    }
+
+    /**
+     * Same, from a holder. Everything here is descriptor-level, so this does not materialize an index
+     * that is currently deferred -- which matters when filling the descriptor in for indices that did
+     * not change and so are not being written.
+     */
+    public static IndexDescriptor of(IndexMetadataHolder indexMetadata) {
         return new IndexDescriptor(
             indexMetadata.getState(),
             indexMetadata.getAliases(),
