@@ -290,14 +290,41 @@ Extend the S6 harness to 40k, 100k and 200k active shards, assertions disabled. 
 phase: `RoutingNodes` construction, decider evaluation, balancer iterations. S6 established the
 balancer dominates; get the curve, not one point.
 
-### B2. Can allocation be domain-scoped?
+### B2. Can allocation be domain-scoped? -- ANSWERED, and the question dissolves
 
-`RoutingPool` is the existing precedent: LOCAL_ONLY and REMOTE_CAPABLE are balanced separately, and it
-works because the node sets are disjoint. The question is whether tenant cells can be disjoint the
-same way, and what breaks if they are not (shard movement across domains, cluster-wide constraints
-like total shards per node, disk watermarks).
+**Yes, and it reduces to a deployment decision rather than an allocator change.**
 
-Output: a verdict with the specific constraints that are cluster-wide and therefore cannot be scoped.
+The precedent is real and stronger than the plan assumed. `RoutingPool` is not a filter inside one
+balancing pass; there are two balancers, `LocalShardsBalancer` and `RemoteShardsBalancer`, and the
+local one builds its index list by filtering `LOCAL_ONLY` before doing any weight work at all
+(`buildWeightOrderedIndices`). So scoped balancing already exists in core and is load-bearing.
+
+**Why it works is the whole answer.** Every constraint the plan listed as possibly cluster-wide --
+`ShardsLimitAllocationDecider`'s total-shards-per-node, `DiskThresholdDecider`'s watermarks, awareness
+and allocation filtering -- is **per node**, not per cluster. A per-node constraint is trivially
+satisfied within a scope whenever the scopes do not share nodes. That is exactly why `RoutingPool`
+works: warm and non-warm node sets are disjoint by construction.
+
+So the constraint list the task asked for is empty, conditionally:
+
+| constraint | scope | safe to domain-scope? |
+|---|---|---|
+| total shards per node | per node | yes, if domains do not share nodes |
+| disk watermarks | per node | yes, if domains do not share nodes |
+| awareness / filtering | per node | yes, if domains do not share nodes |
+| balancer weights | per domain by construction | yes |
+
+**And that condition is the finding.** Domain-scoped allocation is sound if and only if domains have
+disjoint node sets. Domains with disjoint nodes are not a logical partition of one cluster; they are
+separate clusters sharing a control plane, which is what the metadata-plane RFC already calls cells.
+
+So there is no allocator work here. A cell's allocator scales because a cell is a cluster, and its
+active-shard count is whatever the cell was sized for. Building a *logical* domain scope inside one
+cluster, over shared nodes, is unsound for every per-node constraint above and would have to
+reintroduce cluster-wide accounting for each -- which is the cost the scoping was meant to avoid.
+
+B4 should record this as "the ceiling is structural, cells are the answer" unless B3 finds something
+that changes it.
 
 ### B3. Can the balancer be incremental?
 
