@@ -3436,11 +3436,14 @@ public class SnapshotsService extends AbstractLifecycleComponent implements Clus
             final String indexName = index.getName();
             final boolean isNewIndex = repositoryData.getIndices().containsKey(indexName) == false;
             IndexMetadata indexMetadata = metadata.index(indexName);
-            if (indexMetadata == null) {
+            final IndexRoutingTable indexRoutingTable = indexMetadata == null ? null : routingTable.index(indexName);
+            // Both lookups have to be checked. An index in metadata with no routing entry has no shards to
+            // snapshot, which is the same situation as one that was deleted, so it takes the same branch
+            // rather than dereferencing null below.
+            if (indexMetadata == null || indexRoutingTable == null) {
                 // The index was deleted before we managed to start the snapshot - mark it as missing.
                 builder.put(new ShardId(indexName, IndexMetadata.INDEX_UUID_NA_VALUE, 0), ShardSnapshotStatus.MISSING);
             } else {
-                final IndexRoutingTable indexRoutingTable = routingTable.index(indexName);
                 for (int i = 0; i < indexMetadata.getNumberOfShards(); i++) {
                     final ShardId shardId = indexRoutingTable.shard(i).shardId();
                     final String shardRepoGeneration;

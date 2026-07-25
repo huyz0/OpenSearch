@@ -66,13 +66,25 @@ cold-index work will need one anyway.
 
 **Snapshot paths:**
 
-| site | expression |
-|---|---|
-| `SnapshotsService:3443` | `indexRoutingTable.shard(i).shardId()` |
-| `SnapshotsService:3511` | `indexRoutingTable.shard(i).shardId()` |
+| site | expression | status |
+|---|---|---|
+| `SnapshotsService:3443`, in `shards(...)` | `indexRoutingTable.shard(i).shardId()` | FIXED |
+| `SnapshotsService:3511`, in `buildShardsGenerationFromRepositoryData` | same | left alone, see below |
 
-Snapshotting a cold index is a real scenario, so these need a decision, not just a guard: is a cold
-index snapshotted from its remote state, or skipped?
+The first needed no decision after all. That method **already** marks a shard `MISSING` when the
+index's *metadata* is absent, with the comment "the index was deleted before we managed to start the
+snapshot". An index in metadata with no routing entry has no shards to snapshot either, so it takes
+the same branch. Same asymmetry as the `TransportBroadcastReplicationAction` defect: one lookup
+guarded, the neighbouring one not.
+
+The second is deliberately untouched. It dereferences `indexMetadata` without checking too, so the
+question there is what that method's callers guarantee, not what absent routing should mean. Guessing
+at a precondition in the snapshot path is not worth it on the strength of this audit; it needs its own
+look. Recorded as an open item rather than quietly guarded.
+
+Like the three `shards()` overrides above, the fixed site is covered by inspection: `shards(...)` is
+private static with seven parameters, and reaching it from a test needs reflection or a large harness.
+Folded into the same integration task.
 
 **Health, via a shared constructor (FIXED):**
 

@@ -64,12 +64,21 @@ Do them in this order, most reachable first:
 - A7.6 Integration coverage for the three `shards()` guards: stand up a node, put an index in metadata
   without a routing entry, and assert analyze, get-field-mappings and update report no shard available
   or retry rather than throwing. Needed anyway once cold indices exist.
-- A7.3 Snapshot paths: `SnapshotsService:3443`, `:3511`. Needs a decision, not just a guard: is a cold
-  index snapshotted from its remote state, or skipped?
+- A7.3 -- PARTLY DONE. `SnapshotsService:3443` needed no decision: that method already marks a shard
+  `MISSING` when the index's metadata is absent, and an index with no routing entry has no shards to
+  snapshot either, so it takes the same branch. `SnapshotsService:3511` is left alone on purpose --
+  it does not check `indexMetadata` either, so the question is what its callers guarantee rather than
+  what absent routing means. See A7.7.
+- A7.5 -- REVIEWED, no change. `LocalShardStateAction:53` is clusterless-mode only and runs while a
+  shard of that index is being marked started, so the index cannot be absent from routing there. A
+  guard that cannot fire and cannot be tested is worse than the note.
+- A7.7 Investigate `SnapshotsService.buildShardsGenerationFromRepositoryData`: it dereferences both
+  the metadata and the routing lookup unguarded. Establish what its single caller guarantees before
+  adding anything.
 - A7.4 -- DONE. All four guarded. Unlike the request paths these are **not reachable today**: they need
   a closed or write-blocked source, and closing keeps the routing entry via `addAsFromOpenToClose`.
   Latent guards rather than live defects, and the audit says so.
-- A7.5 `LocalShardStateAction:53`, clusterless mode only. Confirm absence is possible before touching.
+
 
 ### A2. `OperationRouting.indexRoutingTable` degrades instead of throwing
 
