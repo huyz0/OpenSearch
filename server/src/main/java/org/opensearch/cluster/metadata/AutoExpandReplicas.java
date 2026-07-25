@@ -181,6 +181,30 @@ public final class AutoExpandReplicas {
      * The map has the desired number of replicas as key and the indices to update as value, as this allows the result
      * of this method to be directly applied to RoutingTable.Builder#updateNumberOfReplicas.
      */
+    /**
+     * Returns {@code true} if any index in {@code metadata} actually sets
+     * {@link IndexMetadata#SETTING_AUTO_EXPAND_REPLICAS}.
+     *
+     * <p>Deliberately checks only for the setting's <em>presence</em> rather than parsing it, so the
+     * common case -- no index uses auto-expand -- costs a map lookup per index and allocates nothing.
+     * {@link #getAutoExpandReplicaChanges} otherwise parses the setting into an
+     * {@link AutoExpandReplicas} instance for every index on every reroute, and its caller builds a
+     * whole {@link org.opensearch.cluster.routing.RoutingNodes} first just to have something to pass
+     * it. Both are pure waste when nothing is auto-expanding.
+     *
+     * <p>An index that sets the value explicitly to {@code false} still counts here; that costs one
+     * needless parse for such an index but keeps this check strictly cheaper than, and never
+     * disagreeing with, the real computation.
+     */
+    public static boolean anyIndexHasAutoExpandReplicas(Metadata metadata) {
+        for (final IndexMetadata indexMetadata : metadata) {
+            if (indexMetadata.getSettings().hasValue(IndexMetadata.SETTING_AUTO_EXPAND_REPLICAS)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public static Map<Integer, List<String>> getAutoExpandReplicaChanges(Metadata metadata, RoutingAllocation allocation) {
         Map<Integer, List<String>> nrReplicasChanged = new HashMap<>();
 

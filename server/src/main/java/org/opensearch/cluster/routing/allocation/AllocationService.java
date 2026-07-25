@@ -364,6 +364,13 @@ public class AllocationService {
      * Returns an updated cluster state if changes were necessary, or the identical cluster if no changes were required.
      */
     public ClusterState adaptAutoExpandReplicas(ClusterState clusterState) {
+        // Bail out before constructing RoutingNodes when no index uses auto-expand at all, which is
+        // the common case. clusterState.getRoutingNodes() below builds a cluster-wide node-to-shard
+        // inverse index -- O(total shards) -- purely so it can be handed to a computation that will
+        // then find nothing to do.
+        if (AutoExpandReplicas.anyIndexHasAutoExpandReplicas(clusterState.metadata()) == false) {
+            return clusterState;
+        }
         RoutingAllocation allocation = new RoutingAllocation(
             allocationDeciders,
             clusterState.getRoutingNodes(),
