@@ -31,14 +31,37 @@ and small.
 correct once an index can legitimately be absent from routing, which is what A5 establishes. Do A1
 first for the audit, and do not land A2/A3 before A5 has a design.
 
-### A1. Audit every caller that assumes a routing entry exists
+### A1. Audit every caller that assumes a routing entry exists -- DONE
 
-Find all dereferences of `RoutingTable.index(...)`, `indicesRouting().get(...)` and
-`shardRoutingTable(...)`. For each, classify: does it want an exception, or does absence mean "no
-shards"? `RoutingTable.allShardsSatisfyingPredicate` is the model for the second, and
-`TransportBroadcastReplicationAction.shards` was already fixed to match it.
+See `rfc-routing-absence-audit.md`. 58 call sites classified. Three results changed this phase:
 
-Output: a table of call sites with a verdict each. No code change. This gates A2 and A3.
+- **A3 shrinks a lot.** `TransportReplicationAction:1041` and `TransportBulkAction:741` already have
+  the `primary == null` retry-and-wait branch the plan wanted them to reach. Only the lookup throws
+  first. So A3 adds a null-returning variant used by those two, rather than changing the contract of
+  `shardRoutingTable(ShardId)` across all 21 callers.
+- **A2 stands as written** and is a real behaviour change.
+- **A7 is new**, and is most of the actual work: twelve call sites that would throw
+  `NullPointerException` on a cold index, none of which the plan named.
+
+### A7. Fix the twelve unguarded dereferences found by A1
+
+From `rfc-routing-absence-audit.md` category 2. Independent of whether cold indices ever ship: these
+are latent defects today, reachable whenever metadata and routing disagree, exactly like the
+`TransportBroadcastReplicationAction` one already fixed.
+
+Do them in this order, most reachable first:
+
+- A7.1 `ClusterIndexHealth:157` iterates the routing table directly. Fixing it there fixes
+  `TieringRequestValidator:141` and `TieringServiceValidator:189` together, and any future caller.
+- A7.2 Request paths: `TransportAnalyzeAction:142`, `TransportGetFieldMappingsIndexAction:115`,
+  `TransportUpdateAction:214`, `TransportUpgradeAction:202`. All should report no shard available
+  rather than NPE.
+- A7.3 Snapshot paths: `SnapshotsService:3443`, `:3511`. Needs a decision, not just a guard: is a cold
+  index snapshotted from its remote state, or skipped?
+- A7.4 Resize, merge and allocation: `MetadataCreateIndexService:1991`, `DiskThresholdDecider:668`,
+  `MetadataInPlaceMergeShardService:232`, `MetadataInPlaceSplitShardService:193`. Should reject, not
+  NPE. Lower priority; a cold index probably should not reach them.
+- A7.5 `LocalShardStateAction:53`, clusterless mode only. Confirm absence is possible before touching.
 
 ### A2. `OperationRouting.indexRoutingTable` degrades instead of throwing
 
