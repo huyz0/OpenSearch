@@ -38,6 +38,7 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Manifest;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.routing.RoutingNode;
+import org.opensearch.cluster.routing.RoutingNodes;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Settings;
@@ -239,7 +240,9 @@ public class IncrementalClusterStateWriter {
     // exposed for tests
     static Set<Index> getRelevantIndices(ClusterState state) {
         assert state.nodes().getLocalNode().isDataNode();
-        final RoutingNode newRoutingNode = state.getRoutingNodes().node(state.nodes().getLocalNodeId());
+        // Runs on every data node on every persisted cluster state, and only this node's shards
+        // are read -- building the cluster-wide RoutingNodes index here is pure waste.
+        final RoutingNode newRoutingNode = RoutingNodes.localRoutingNode(state, state.nodes().getLocalNodeId());
         if (newRoutingNode == null) {
             throw new IllegalStateException("cluster state does not contain this node - cannot write index meta state");
         }
