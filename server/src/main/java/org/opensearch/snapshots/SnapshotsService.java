@@ -606,7 +606,6 @@ public class SnapshotsService extends AbstractLifecycleComponent implements Clus
             public void clusterStateProcessed(String source, ClusterState oldState, final ClusterState newState) {
                 final ShardGenerations shardGenerations = buildShardsGenerationFromRepositoryData(
                     newState.metadata(),
-                    newState.routingTable(),
                     newEntry.indices(),
                     repositoryData
                 );
@@ -3497,9 +3496,27 @@ public class SnapshotsService extends AbstractLifecycleComponent implements Clus
         return Collections.unmodifiableMap(builder);
     }
 
-    private static ShardGenerations buildShardsGenerationFromRepositoryData(
+    /**
+     * Builds the per-shard generation map for a snapshot-v2 finalize.
+     *
+     * <p><b>Deliberately does not consult the routing table, where it used to.</b> The old version
+     * took a {@link RoutingTable}, looked up each index in it, and read {@code
+     * indexRoutingTable.shard(i).shardId()} inside the loop -- but only {@code shardId.id()} is ever
+     * used, and that is just {@code i}. The lookup laundered the loop counter into itself and
+     * contributed nothing else. It also dereferenced the result unguarded, so an index present in
+     * metadata and absent from routing threw {@link NullPointerException} here.
+     *
+     * <p>That mattered because of where the index list comes from: {@code createSnapshotV2} builds it
+     * from {@code metadata().indices().keySet()} and never filters on routing, so the precondition
+     * was "every index in metadata has a routing entry" -- exactly the invariant cold-index absence
+     * removes, reached by an ordinary create-snapshot call. Dropping the parameter removes the
+     * requirement rather than guarding it, which is better than either alternative: a guard that
+     * skipped such an index would have silently left it out of the snapshot.
+     *
+     * <p>Package-private for {@code SnapshotShardGenerationsTests}.
+     */
+    static ShardGenerations buildShardsGenerationFromRepositoryData(
         Metadata metadata,
-        RoutingTable routingTable,
         List<IndexId> indices,
         RepositoryData repositoryData
     ) {
@@ -3511,23 +3528,17 @@ public class SnapshotsService extends AbstractLifecycleComponent implements Clus
             final boolean isNewIndex = repositoryData.getIndices().containsKey(indexName) == false;
             IndexMetadata indexMetadata = metadata.index(indexName);
 
-            final IndexRoutingTable indexRoutingTable = routingTable.index(indexName);
             for (int i = 0; i < indexMetadata.getNumberOfShards(); i++) {
-                final ShardId shardId = indexRoutingTable.shard(i).shardId();
                 final String shardRepoGeneration;
 
                 if (isNewIndex) {
-                    assert shardGenerations.getShardGen(index, shardId.getId()) == null : "Found shard generation for new index ["
-                        + index
-                        + "]";
+                    assert shardGenerations.getShardGen(index, i) == null : "Found shard generation for new index [" + index + "]";
                     shardRepoGeneration = ShardGenerations.NEW_SHARD_GEN;
                 } else {
-                    shardRepoGeneration = shardGenerations.getShardGen(index, shardId.id());
+                    shardRepoGeneration = shardGenerations.getShardGen(index, i);
                 }
-                builder.put(index, shardId.id(), shardRepoGeneration);
-
+                builder.put(index, i, shardRepoGeneration);
             }
-
         }
 
         return builder.build();

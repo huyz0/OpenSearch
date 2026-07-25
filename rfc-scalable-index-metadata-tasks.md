@@ -45,7 +45,7 @@ request today, and the rest are latent. Nothing yet makes an index routing-absen
 | A7.4 resize/merge/allocation | done, tested; latent rather than live |
 | A7.5 clusterless shard-started | reviewed, no change needed |
 | A7.6 integration coverage | open |
-| A7.7 snapshot generation preconditions | open |
+| A7.7 snapshot generation preconditions | done, tested |
 | A5.1 cold-vs-gone | done, tested |
 | A5.2 + A5.3 prune + recreate | done, tested, off by default |
 | A5.4 decider still needed? | decided: yes, unchanged |
@@ -94,9 +94,15 @@ Do them in this order, most reachable first:
 - A7.5 -- REVIEWED, no change. `LocalShardStateAction:53` is clusterless-mode only and runs while a
   shard of that index is being marked started, so the index cannot be absent from routing there. A
   guard that cannot fire and cannot be tested is worse than the note.
-- A7.7 Investigate `SnapshotsService.buildShardsGenerationFromRepositoryData`: it dereferences both
-  the metadata and the routing lookup unguarded. Establish what its single caller guarantees before
-  adding anything.
+- A7.7 -- DONE, and the answer was to delete the dependency rather than guard it. The caller,
+  `createSnapshotV2`, builds its index list from `metadata().indices().keySet()` and never filters on
+  routing, so the method's precondition was "every index in metadata has a routing entry" -- exactly
+  what cold-absence removes, reachable by an ordinary create-snapshot call. But the routing table was
+  never actually needed: the only thing read out of it was `indexRoutingTable.shard(i).shardId()`, and
+  only `.id()` of that is used, which is `i`. The lookup laundered the loop counter into itself. The
+  parameter is gone, so the requirement is gone rather than guarded -- better than the alternative,
+  since a guard that skipped such an index would have silently left it out of the snapshot. A probe
+  against the pre-fix code confirmed the `NullPointerException` was real.
 - A7.4 -- DONE. All four guarded. Unlike the request paths these are **not reachable today**: they need
   a closed or write-blocked source, and closing keeps the routing entry via `addAsFromOpenToClose`.
   Latent guards rather than live defects, and the audit says so.
