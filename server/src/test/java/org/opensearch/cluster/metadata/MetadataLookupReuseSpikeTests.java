@@ -96,6 +96,61 @@ public class MetadataLookupReuseSpikeTests extends OpenSearchTestCase {
         );
     }
 
+    /**
+     * The diff-apply path must still express deletions. This is the regression guard for the fix:
+     * {@code MetadataDiff.apply} now supplies the previous metadata as a reuse reference only, so a
+     * removed index must genuinely disappear rather than being carried over from the seed map.
+     */
+    public void testDiffApplyRemovesDeletedIndices() {
+        Metadata before = Metadata.builder().put(index("keep"), false).put(index("remove-me"), false).build();
+        Metadata after = Metadata.builder().put(index("keep"), false).build();
+
+        Metadata applied = after.diff(before).apply(before);
+
+        assertTrue(applied.hasIndex("keep"));
+        assertFalse("deleted index must not survive the diff-apply path", applied.hasIndex("remove-me"));
+        assertFalse(applied.getIndicesLookup().containsKey("remove-me"));
+        assertArrayEquals(after.getConcreteAllIndices(), applied.getConcreteAllIndices());
+    }
+
+    /** Additions and alias changes must also round-trip correctly through diff-apply. */
+    public void testDiffApplyHandlesAdditionsAndAliasChanges() {
+        Metadata before = Metadata.builder().put(index("a"), false).build();
+
+        IndexMetadata aliased = IndexMetadata.builder("a")
+            .settings(baseSettings())
+            .numberOfShards(1)
+            .numberOfReplicas(0)
+            .putAlias(AliasMetadata.builder("a-alias").build())
+            .build();
+        Metadata after = Metadata.builder().put(aliased, false).put(index("b"), false).build();
+
+        Metadata applied = after.diff(before).apply(before);
+
+        assertTrue(applied.hasIndex("a"));
+        assertTrue("added index must appear", applied.hasIndex("b"));
+        assertTrue("added alias must appear in the lookup", applied.getIndicesLookup().containsKey("a-alias"));
+        assertEquals(after.getIndicesLookup().keySet(), applied.getIndicesLookup().keySet());
+    }
+
+    /**
+     * The payoff case: when nothing about the index set changed, the applied metadata should reuse
+     * the previous lookup instance rather than rebuilding it.
+     */
+    public void testDiffApplyReusesLookupWhenIndicesUnchanged() {
+        Metadata before = Metadata.builder().put(index("a"), false).put(index("b"), false).build();
+        Metadata after = Metadata.builder(before).persistentSettings(Settings.builder().put("cluster.foo", "bar").build()).build();
+
+        Metadata applied = after.diff(before).apply(before);
+
+        assertEquals(before.getIndicesLookup().keySet(), applied.getIndicesLookup().keySet());
+        assertSame(
+            "an unchanged index set must reuse the previous lookup rather than rebuild it",
+            before.getIndicesLookup(),
+            applied.getIndicesLookup()
+        );
+    }
+
     /** With the index set genuinely unchanged, the reused lookup must equal a freshly computed one. */
     public void testUnchangedIndicesProduceEquivalentLookup() {
         Metadata previous = Metadata.builder().put(index("a"), false).put(index("b"), false).build();

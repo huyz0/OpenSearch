@@ -1122,7 +1122,12 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
 
         @Override
         public Metadata apply(Metadata part) {
-            Builder builder = builder();
+            // Hand the builder the pre-diff metadata as the reuse reference only -- deliberately not
+            // builder(part), which would also seed the index map and make the putAll in indices()
+            // below unable to express deletions. With the reference set, an unchanged index set lets
+            // build() reuse the previous indicesLookup and derived arrays instead of rebuilding them,
+            // which every node would otherwise redo on every metadata-touching cluster state.
+            Builder builder = builder().previousMetadata(part);
             builder.clusterUUID(clusterUUID);
             builder.clusterUUIDCommitted(clusterUUIDCommitted);
             builder.version(version);
@@ -1219,7 +1224,9 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
         private final Map<String, IndexMetadata> indices;
         private final Map<String, IndexTemplateMetadata> templates;
         private final Map<String, Custom> customs;
-        private final Metadata previousMetadata;
+        // Not final: callers that build the index map themselves rather than seeding it from a
+        // previous Metadata still want the lookup-reuse check. See #previousMetadata(Metadata).
+        private Metadata previousMetadata;
 
         private Map<String, SortedMap<Long, String>> systemTemplatesLookup;
 
@@ -1244,6 +1251,27 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
             this.templates = new HashMap<>(metadata.templates.getTemplates());
             this.customs = new HashMap<>(metadata.customs);
             this.previousMetadata = metadata;
+        }
+
+        /**
+         * Supplies the previous {@link Metadata} purely so {@link #build()} can evaluate its
+         * incremental lookup-reuse check, <em>without</em> seeding this builder's indices, templates
+         * or customs from it.
+         *
+         * <p>This exists because {@link #Builder(Metadata)} does both at once, and that combination
+         * is wrong for callers that already hold the complete post-change index map -- notably
+         * {@link MetadataDiff#apply}. {@link #indices(Map)} is a {@code putAll} and therefore cannot
+         * express a deletion, so seeding from the previous metadata and then applying the new map
+         * would silently resurrect deleted indices. Setting only the reuse reference avoids that
+         * while still letting an unchanged index set skip the full {@code indicesLookup} rebuild.
+         *
+         * <p>The reuse check itself remains the guard on correctness: {@link #build()} recomputes
+         * whenever the index map differs (including alias changes, which live inside
+         * {@link IndexMetadata} and so make it unequal) or data-stream metadata changes.
+         */
+        public Builder previousMetadata(Metadata previousMetadata) {
+            this.previousMetadata = previousMetadata;
+            return this;
         }
 
         public Builder put(IndexMetadata.Builder indexMetadataBuilder) {
