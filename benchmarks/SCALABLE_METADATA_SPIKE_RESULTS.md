@@ -1,13 +1,13 @@
-# Spike results S1-S7: scalable index and shard metadata
+# Spike results S1-S9: scalable index and shard metadata
 
-Seven spikes run to replace the estimated numbers in `rfc-scalable-index-metadata-plan.md` with
+Nine spikes run to replace the estimated numbers in `rfc-scalable-index-metadata-plan.md` with
 measured ones, after two earlier rounds in this investigation showed estimates breaking under
 scrutiny. Every figure below came from running code in this repo. Where a spike contradicted what
 the plan assumed, that is called out explicitly rather than quietly corrected.
 
 Harnesses:
 - `benchmarks/src/main/java/org/opensearch/benchmark/clusterstate/` — `RoutingDescriptor`,
-  `TenantIndexRetainedHeapEstimate`, `DescriptorPagingSimulation`
+  `TenantIndexRetainedHeapEstimate`, `DescriptorPagingSimulation`, `DescriptorWireSizeEstimate`
 - `server/src/test/java/org/opensearch/cluster/routing/allocation/AllocationCeilingSpikeTests.java`
 - `server/src/test/java/org/opensearch/cluster/metadata/MappingDedupRealismSpikeTests.java`
 - `server/src/test/java/org/opensearch/cluster/metadata/MetadataLookupReuseSpikeTests.java`
@@ -92,8 +92,8 @@ as a flat array with a null sentinel rather than a `HashMap`; tenant indices add
 name typically have none, so this is roughly a free 2× on the dominant case.
 
 **A distinction the plan conflated:** 289-577 B is *deserialized Java heap*, which governs cache
-capacity. The object-store page holds the *serialized* form (~120 B), which governs GET size and
-cost. Page sizing and cache sizing use different numbers.
+capacity. The object-store page holds the *serialized* form, which governs GET size and cost. Page
+sizing and cache sizing use different numbers; S8 measures the serialized side.
 
 ---
 
@@ -102,30 +102,53 @@ cost. Page sizing and cache sizing use different numbers.
 20 nodes, 1 shard/index, 1 replica, recovery throttles removed so the measurement is the allocator's
 own cost rather than how many shards it is permitted to start per round.
 
-| indices | total shards | cold reroute | steady-state reroute | `RoutingNodes` rebuild |
-|---|---|---|---|---|
-| 1,000 | 2,000 | 436 ms | 51 ms | 2 ms |
-| 5,000 | 10,000 | 1,250 ms | 237 ms | 39 ms |
-| 20,000 | 40,000 | 9,120 ms | 789 ms | 64 ms |
-| 50,000 | 100,000 | 53,656 ms | (run capped) | — |
+**Corrected after S9.** The first run left assertions on. Gradle enables `-ea -esa`
+(`OpenSearchTestBasePlugin.java:133`); production `jvm.options` does not, and the assertion paths
+here are expensive (`RoutingNodes.assertShardStats` does two full shard passes allocating a
+`HashSet` per `ShardId`; `RoutingNode#invariant` does three stream-and-collect passes per node).
+**Assertions roughly double the measured cost.** Production-representative figures are the `-da`
+column; the `-ea` column is kept to show the size of the distortion.
 
-**Cold allocation is superlinear**, roughly O(n^1.9): 2.5× the shards from 40k to 100k costs 5.9×
-the time. 53 seconds for one reroute at 100k shards, on a single-threaded cluster-manager.
+| shards | cold `-ea` | cold `-da` (2 runs) | steady `-ea` | steady `-da` (2 runs) | `RoutingNodes` `-ea` | `RoutingNodes` `-da` |
+|---|---|---|---|---|---|---|
+| 2,000 | 436 ms | 670 / 661 ms | 51 ms | **25 / 34 ms** | 2 ms | 1-2 ms |
+| 10,000 | 1,250 ms | 531 / 1,389 ms | 237 ms | **75 / 71 ms** | 39 ms | 5-6 ms |
+| 40,000 | 9,120 ms | 4,560 / 3,907 ms | 789 ms | **445 / 355 ms** | 64 ms | 43-52 ms |
+| 100,000 | 53,656 ms | (exceeds suite timeout) | — | — | — | — |
 
-**Steady state is roughly linear**, ~20 µs/shard: 789 ms at 40k active shards, extrapolating to
-~2 s at 100k and ~20 s at 1M.
+**Treat these as order-of-magnitude, not precise.** Two `-da` runs of the same harness differ by up
+to 2.6× on cold allocation at 10k shards (531 vs 1,389 ms), which is single-run noise on a shared
+machine, not signal. Steady-state is markedly more stable (within ~25% across runs) and is the
+figure to rely on. The 2,000-shard tier is dominated by JIT warmup in both directions and should not
+be read as meaningful. The 100,000 tier exceeds the 20-minute suite timeout — driving 100k shards to
+STARTED takes several rounds of an already-superlinear cold reroute — so it was measured once and
+then dropped from the harness to keep it repeatable; its 53.7 s figure carries assertions and is
+therefore also roughly 2× high.
 
-**`RoutingNodes` rebuild alone is ~1.6 µs/shard** — 64 ms at 40k shards. That is the cost every
-*data node* also pays per applied cluster state, because `ClusterState.getRoutingNodes()`
-constructs it lazily and `IndicesClusterStateService` calls it eight times just to read the local
-node. This is the C3 target and it is measurable, not theoretical.
+**Cold allocation is superlinear** and, even corrected, is seconds-scale: ~4 s at 40k shards on a
+single-threaded cluster-manager, with the 100k measurement (53.7 s, assertions on) suggesting tens
+of seconds there. This is a recovery-time and mass-provisioning concern rather than a steady-state
+one, and its run-to-run variance is too wide to fit a confident exponent to.
+
+**Steady state is ~9-11 µs/shard** (355-445 ms at 40k), about half the originally reported figure,
+and itself mildly superlinear at the top end (4× the shards from 10k to 40k costs ~5× the time).
+
+**`RoutingNodes` rebuild is ~1.3 µs/shard** — 52 ms at 40k. That is the cost every *data node* also
+pays per applied cluster state, because `ClusterState.getRoutingNodes()` constructs it lazily and
+`IndicesClusterStateService` calls it eight times just to read the local node. It is ~12% of a
+steady-state reroute, not the dominant term (see S9), but on data nodes it is pure waste.
 
 **This contradicts the plan's ceiling claim in both directions.** The plan said metadata residency
 capped a cluster at ~10M indices. In fact residency was never the binding constraint: the allocator
-is, and it binds at **tens of thousands of active shards**, far below where residency would bite.
-Cells are required, not optional — but they are sized by *active* shards, and each cell can hold
-millions of quiescent tenants provided scale-to-zero keeps them out of the routing table entirely.
-Cold-start time is the harsher of the two limits and is what should size a cell.
+is, and it binds at the order of **100k active shards** — where a steady-state reroute is ~1 s and
+cold allocation tens of seconds — far below where residency would bite. Cells are required, not
+optional, but they are sized by *active* shards, and each cell can hold millions of quiescent
+tenants provided scale-to-zero keeps them out of the routing table entirely. **Cold-start time, not
+steady-state cost, is what should size a cell**: a cell whose steady-state reroute is a comfortable
+445 ms still takes 4.6 s to cold-allocate, and that gap widens superlinearly.
+
+Note that S9 identifies a concrete optimization worth an estimated 30-50% of the steady-state
+figure, so these numbers are a measurement of the current implementation, not a hard floor.
 
 ---
 
@@ -356,5 +379,5 @@ shards it converts one 53 s reroute into a loop of 20 s reroutes that never conv
 - Remote cluster state already provides per-index blobs, incremental version-gated upload, and a
   single-index fetch primitive.
 - Scale-to-zero is confirmed as the load-bearing mechanism: at ~101 KB resident per index and an
-  allocator that binds at tens of thousands of active shards, keeping quiescent tenants out of both
+  allocator that binds around 100k active shards, keeping quiescent tenants out of both
   the routing table and the resident set is what makes any of this work.

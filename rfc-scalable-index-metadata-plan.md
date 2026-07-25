@@ -10,12 +10,15 @@ This supersedes `rfc-serverless-control-cell-diet.md`'s §2 mechanism, which pro
 compact object *alongside* the full `IndexMetadata` and therefore saved nothing. The
 investigation behind this document found a different seam that does work.
 
-> **Measured-results update.** Seven spikes (S1-S7) were run after this plan was first written, to
+> **Measured-results update.** Nine spikes (S1-S9) were run after this plan was first written, to
 > replace its estimated figures with measured ones. Results and harnesses are in
 > `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.md`. Four of this document's claims did not survive;
 > each is corrected inline below and summarised in that document's "What the plan got wrong" table.
 > The most important correction: **the allocator, not metadata residency, is the binding
-> constraint**, and it binds far earlier than this plan assumed. Read §5 with that in mind.
+> constraint**, and it binds far earlier than this plan assumed. Read §5 with that in mind. S9
+> additionally identifies a concrete, provably-sound allocator optimization worth an estimated
+> 30-50% of steady-state reroute cost, which should be added to §3 as a core change in its own
+> right.
 
 ---
 
@@ -194,9 +197,9 @@ deployment, tenant-scale or not. Axis B is the architectural one, and it splits 
 **Corrected after S2/S3/S6.** Axis C is *not* "largely solved" in the sense of being cheap — a
 resident index costs a measured ~101 KB in parsed `MapperService` graph alone (S3), so scale-to-zero
 is the load-bearing mechanism rather than an optimization. And the ranking between axes is wrong as
-originally written: **Axis A binds first**. The allocator's cost (S6) is ~20 µs/shard in steady
-state and superlinear on cold allocation, which caps a cluster at tens of thousands of *active
-shards* — reached long before Axis B's residency cost matters.
+originally written: **Axis A binds first**. The allocator's cost (S6, assertions disabled) is
+~11 µs/shard in steady state and superlinear on cold allocation, which caps a cluster on the order
+of 100k *active shards* — reached long before Axis B's residency cost matters.
 
 Measured per-index residency (S2): today's full object is 3,668 B; a routing descriptor is 289 B
 with no alias, 577 B with one. At 100M indices that is 27-54 GB, so non-residency is still required
@@ -396,10 +399,12 @@ only this one.
 **Rewritten after S2/S3/S6.** The original version of this section ranked the constraints wrong.
 
 **The binding constraint is the allocator, not metadata residency.** S6 measured a steady-state
-reroute at ~20 µs/shard (789 ms at 40k active shards) and cold allocation as superlinear, ~O(n^1.9)
-(9 s at 40k shards, 53 s at 100k). A cluster is therefore limited to **tens of thousands of active
+reroute at ~11 µs/shard (445 ms at 40k active shards) and cold allocation as superlinear, ~O(n^1.9)
+(4.6 s at 40k shards, 53 s at 100k). A cluster is therefore limited to roughly **100k active
 shards** — reached long before per-index residency matters. Cold-start time is the harsher of the
-two limits and should be what sizes a cell.
+two limits and should be what sizes a cell: a cell whose steady-state reroute is a comfortable
+445 ms still takes 4.6 s to cold-allocate. S9 identifies an optimization worth an estimated 30-50%
+of the steady-state figure, so this is a measurement of the current implementation, not a floor.
 
 **Reaches.** C1-C4 and C7 are pure efficiency and raise the practical ceiling of any cluster without
 architectural commitment; C3 in particular removes a measured 64 ms-per-applied-state cost from
@@ -444,7 +449,7 @@ Revised ordering, with what each now rests on:
 
 1. **C1** — incremental `MetadataDiff.apply`. Still first. S7 verified the reuse condition is safe
    and found the trap: supply `previousMetadata` **without** seeding the index map.
-2. **C3** — local-node routing view. S6 measured the win: 64 ms per applied cluster state at 40k
+2. **C3** — local-node routing view. S6 measured the win: 52 ms per applied cluster state at 40k
    shards, on every data node. Promoted above dedup.
 3. **C2 mapping dedup** — S4 confirmed 1000× on homogeneous fleets, degrading as ≈`100/divergent%`.
    Pair with `dynamic: strict`. Note S3: this helps cluster state only, not data-node capacity.

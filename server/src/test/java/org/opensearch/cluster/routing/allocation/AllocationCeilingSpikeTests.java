@@ -31,17 +31,31 @@ import org.opensearch.common.settings.Settings;
  * routing table on every reroute and {@code BalancedShardsAllocator} scans every shard and every
  * index. This measures that directly instead of asserting it.
  *
- * <p>Ignored by default because it is a measurement harness with long runtimes at the upper tiers,
- * not an assertion of behavior. Run explicitly:
+ * <p>This is a measurement harness, not an assertion of behavior. Run explicitly:
  *
  * <pre>{@code
- * ./gradlew :server:test --tests "*AllocationCeilingSpikeTests*" -Dtests.security.manager=false
+ * ./gradlew :server:test --tests "*AllocationCeilingSpikeTests*" -Dtests.jvm.argline="-da -dsa"
  * }</pre>
+ *
+ * <p><b>Pass {@code -da -dsa}.</b> Gradle test runs enable assertions ({@code -ea -esa}, set by
+ * {@code OpenSearchTestBasePlugin}) but production {@code jvm.options} does not, and the assertion
+ * paths here are expensive: {@code RoutingNodes.assertShardStats} makes two full shard passes
+ * allocating a {@code HashSet} per {@code ShardId}, and {@code RoutingNode#invariant} makes three
+ * stream-and-collect passes per node. Leaving assertions on roughly <em>doubles</em> the measured
+ * cost, so figures taken with them enabled do not represent production.
  */
 public class AllocationCeilingSpikeTests extends OpenSearchAllocationTestCase {
 
-    /** Index-count tiers to measure. Shard count is indices x shardsPerIndex x (1 + replicas). */
-    private static final int[] INDEX_TIERS = { 1_000, 5_000, 20_000, 50_000 };
+    /**
+     * Index-count tiers to measure. Shard count is indices x shardsPerIndex x (1 + replicas).
+     *
+     * <p>A 50,000-index tier was measured once and exceeds the 20-minute suite timeout, because
+     * driving 100,000 shards to STARTED takes several rounds of a cold reroute that is itself
+     * superlinear. Its cold-reroute figure (53.7 s with assertions enabled) is recorded in
+     * {@code benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.md}; it is excluded here so this harness
+     * stays repeatable.
+     */
+    private static final int[] INDEX_TIERS = { 1_000, 5_000, 20_000 };
     private static final int SHARDS_PER_INDEX = 1;
     private static final int REPLICAS = 1;
     private static final int NODES = 20;
