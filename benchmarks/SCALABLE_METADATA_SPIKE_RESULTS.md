@@ -240,6 +240,102 @@ indices map — a new builder method or setter, not `builder(part)`.
 
 ---
 
+## S8 — Serialized descriptor wire size
+
+S2 measured retained heap, which governs cache capacity. Page size and GET cost depend on the
+serialized form, which S5 assumed was ~120 B without measuring. Measured with
+`DescriptorWireSizeEstimate`, 1,000 descriptors per page, DEFLATE at `BEST_SPEED`:
+
+| form | uncompressed wire | in a 1,000-descriptor page |
+|---|---|---|
+| descriptor, 1 alias | 197.5 B | **36.0 B/index** (5.5× compression) |
+| descriptor, no alias | 146.7 B | **31.4 B/index** (4.7×) |
+| full `IndexMetadata` | 275.7 B | — |
+
+Two corrections:
+
+**The ~120 B assumption was low uncompressed but pessimistic once paged.** Pages of near-identical
+tenant descriptors compress ~5×, so effective wire cost is 31-36 B/index and a 1,000-descriptor page
+is ~36 KB, not 120 KB. This does not change S5's conclusions — its cost model was request-count
+driven and bytes were never the binding term — but it makes larger pages more attractive than
+modelled.
+
+**The descriptor's value is heap residency, not storage or transfer.** On the wire the descriptor
+beats full `IndexMetadata` by only 1.4× (197.5 B vs 275.7 B), against a **12.7×** heap difference
+(289 B vs 3,668 B). Almost the entire benefit is Java object overhead avoided, not data avoided.
+Design consequence: the object-store tier can store full `IndexMetadata` blobs and hydrate from
+them directly, with no separate descriptor blob — one fewer artifact to keep consistent — while
+nodes still hold only descriptors *in heap*.
+
+*Caveat:* the `IndexMetadata` measured here carries no mapping. A realistic tenant index with a
+100-field mapping adds ~408 B compressed, widening the wire gap to ~3.5×. The direction holds; the
+magnitude is workload-dependent.
+
+---
+
+## S9 — Can allocation be made incremental or domain-scoped?
+
+S6 established the allocator as the binding constraint, making this the highest-value open question.
+Investigated against the real code.
+
+**Where the steady-state cost actually goes.** `reroute()` short-circuits *before* the RoutingTable
+rebuild (`AllocationService.java:573` returns the original `ClusterState` when nothing changed), so
+`buildResult`/`RoutingTable.Builder.updateNodes` are **not** in the measured figure. The dominant
+terms are:
+
+1. `balanceByWeights()` (`LocalShardsBalancer.java:348-382`) — for every index, for every node, a
+   full `deciders.canAllocate(indexMetadata, node, allocation)` call **before** any delta check. At
+   40k indices × 20 nodes that is ~800k full decider-chain invocations even when perfectly balanced.
+2. `moveShards()` (`:578-668`) — no early exit; every started shard gets `canMoveAway` plus a full
+   `canRemain` decider chain.
+3. `new RoutingNodes(...)` — only ~8% (64 ms of 789 ms at 40k).
+4. `adaptAutoExpandReplicas` (`AllocationService.java:558`) constructs a **second**, read-only
+   `RoutingNodes` and scans every index parsing the auto-expand setting.
+
+**A flaw in the S6 measurement.** Gradle test runs enable assertions (`-ea -esa`, set by
+`OpenSearchTestBasePlugin.java:133`); production `jvm.options` does not. The S6 figures therefore
+include `RoutingNodes.assertShardStats` (two full shard passes plus a `HashSet` per `ShardId`,
+`RoutingNodes.java:1251-1310`) and `RoutingNode::invariant` (three stream+collect passes per node,
+`RoutingNode.java:499-524`). See the corrected table in S6 above.
+
+**Incremental `RoutingNodes`: feasible in principle, blocked by ownership not algorithm.** The
+derived aggregates are already maintained incrementally (`recoveriesPerNode`, `relocatingShards`,
+`inactivePrimaryCount` via `updateRecoveryCounts`, `RoutingNodes.java:192-240`), `assignedShards` is
+naturally diff-addressable, and `ShardRouting` object identity survives a RoutingTable rebuild so a
+diff can be identity-based. What blocks reuse: allocation **mutates `RoutingNodes` in place**
+(`initializeShard`/`relocateShard`/`startShard`/`failShard` at `:556, 584, 613, 677`), and
+`AllocationService` is deliberately stateless — `reroute(ClusterState, reason)` accepts an arbitrary
+state, and no field holds the previous `RoutingNodes`. `RoutingTableIncrementalDiff` already computes
+exactly the needed diff, but for remote-state publication, *after* allocation.
+
+**Domain-scoped allocation: partition nodes, not indices.** Per-`shardId` deciders are domain-safe
+(`SameShardAllocationDecider`, `AwarenessAllocationDecider`, `FilterAllocationDecider`). What breaks
+under index-partitioned domains is all per-*node* aggregate state: the weight function itself
+(`theta0 * (node.numShards() - avgShardsPerNode())`, `BalancedShardsAllocator.java:662-666`) would
+have each domain drive the same node toward its own average and oscillate; plus
+`ShardsLimitAllocationDecider`'s cluster-total-per-node, `DiskThresholdDecider.java:203-205`, and
+`ThrottlingAllocationDecider`'s global recovery counters. The existing `RoutingPool` precedent works
+precisely because the **node sets** are disjoint, not the index sets — that is the shape any further
+domain scheme must take.
+
+**The most promising concrete optimization.** Hoist the delta check above the `relevantNodes` decider
+loop in `balanceByWeights()` (`LocalShardsBalancer.java:361-381`). `buildWeightOrderedIndices()`
+already computes `deltas[i]` per index over all nodes (`:509-512`) and then **discards them**. Since
+`weight(node, index)` does not depend on which node subset is being sorted, the all-node delta is an
+upper bound on the relevant-node delta — so an index below threshold provably cannot move, and can be
+skipped. This eliminates up to indices × nodes decider-chain calls in the balanced case (~800k at
+40k/20). Estimated 30-50% of steady-state reroute, to be confirmed by profiling. Second-cheapest:
+guard `adaptAutoExpandReplicas` on whether any index actually sets `auto_expand_replicas`.
+
+**Dead ends identified.** Incremental RoutingTable rebuild for steady state (already short-circuited
+at `:573`; it only helps the small-delta `applyStartedShards` path). Sampling a subset of indices in
+`balanceByWeights` — the ordering at `:485-497` exists specifically to prevent over-allocation onto
+new nodes, and dropping indices reintroduces that bug; the delta-skip above is safe *because* it only
+drops indices that provably cannot move. And the allocator timeout is not a brake at all: at 100k
+shards it converts one 53 s reroute into a loop of 20 s reroutes that never converge.
+
+---
+
 ## What the plan got wrong
 
 | plan claim | measured | effect |
