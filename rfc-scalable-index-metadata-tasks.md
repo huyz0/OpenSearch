@@ -50,7 +50,7 @@ request today, and the rest are latent. Nothing yet makes an index routing-absen
 | A5.2 + A5.3 prune + recreate | done, tested, off by default |
 | A5.4 decider still needed? | decided: yes, unchanged |
 | A2 search degradation | done, tested |
-| A3 | next |
+| A3 shardRoutingTableOrNull | done, tested |
 | A4 spike | done |
 | A6 | done, both halves |
 
@@ -126,16 +126,25 @@ look like a state core already handles rather than being given a behaviour of it
 Three tests; the one that targets the change fails with it reverted and the two controls pass either
 way. The `*routing*` and `*search*` suites pass (16 min).
 
-### A3. `RoutingTable.shardRoutingTable(ShardId)` degrades instead of throwing
+### A3. A null-returning sibling, and two callers moved to it -- DONE
 
-`TransportReplicationAction.ReroutePhase` and `TransportBulkAction` should take their existing
-retry-and-wait-for-allocation branch rather than failing immediately.
+`shardRoutingTableOrNull(ShardId)` added; `TransportReplicationAction.ReroutePhase` and
+`TransportBulkAction` use it. A1 was right that this is small: both already had the "primary is not
+allocated yet, wait and retry" branch one statement below the lookup, and the throwing lookup simply
+never let them reach it.
 
-- Decide the shape first: return null, return empty, or add a separate `shardRoutingTableOrNull`. The
-  third avoids changing an existing contract and is probably right, with callers migrated one at a
-  time.
-- Test: a bulk request against a metadata-only index retries rather than failing.
-- Confirm the test fails with the change reverted.
+**The first attempt was too broad and an existing test caught it.** Returning null for an unknown
+*shard* of a *present* index turned a permanent error into retry-until-timeout, so
+`testUnknownIndexOrShardOnReroute` got `UnavailableShardsException` where it expected
+`ShardNotFoundException` -- the wrong error, after wasting the whole timeout. The contract is now
+narrow: null when and only when the index has no routing entry. An unknown shard still throws
+`ShardNotFoundException`, a mismatched index UUID still throws `IndexNotFoundException`. Absence of
+the index from routing is the only behaviour that changed.
+
+Four unit tests on the sibling plus one on `ReroutePhase` that mirrors `testNotStartedPrimary`
+assertion-for-assertion, since the claim is that a cold index behaves identically to an unallocated
+primary. It fails with the change reverted. The `*bulk*`, `*replication*` and `*routing*` suites pass
+(11 min).
 
 ### A4. Spike: how does an index become routing-absent? -- DONE
 

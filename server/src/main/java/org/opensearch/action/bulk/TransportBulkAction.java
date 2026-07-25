@@ -738,7 +738,11 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
                     bulkShardRequest.setParentTask(nodeId, task.getId());
                 }
                 final long startTimeNanos = relativeTime();
-                final ShardRouting primary = routingTable.shardRoutingTable(shardId).primaryShard();
+                // OrNull for the same reason as TransportReplicationAction: this line already copes
+                // with a null primary one statement later, and the throwing lookup meant an index
+                // present in metadata and absent from routing never got that far.
+                final IndexShardRoutingTable shardRoutingTable = routingTable.shardRoutingTableOrNull(shardId);
+                final ShardRouting primary = shardRoutingTable == null ? null : shardRoutingTable.primaryShard();
                 String targetNodeId = primary != null ? primary.currentNodeId() : null;
                 IndexMetadata indexMetaData = clusterState.metadata().index(shardId.getIndexName());
                 boolean bulkAdaptiveShardSelectionEnabled = indexMetaData.isAppendOnlyIndex()

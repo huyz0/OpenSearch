@@ -54,6 +54,7 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.ResolvedIndices;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.routing.AllocationId;
+import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.Nullable;
@@ -1038,7 +1039,12 @@ public abstract class TransportReplicationAction<
                 assert request.waitForActiveShards() != ActiveShardCount.DEFAULT
                     : "request waitForActiveShards must be set in resolveRequest";
 
-                final ShardRouting primary = state.getRoutingTable().shardRoutingTable(request.shardId()).primaryShard();
+                // OrNull, so that an index present in metadata and absent from the routing table
+                // reaches the retry branch immediately below rather than failing the request. That
+                // branch already existed and already handles a null primary; the throwing lookup
+                // simply never let it be reached.
+                final IndexShardRoutingTable shardRoutingTable = state.getRoutingTable().shardRoutingTableOrNull(request.shardId());
+                final ShardRouting primary = shardRoutingTable == null ? null : shardRoutingTable.primaryShard();
                 if (primary == null || primary.active() == false) {
                     logger.trace(
                         "primary shard [{}] is not yet active, scheduling a retry: action [{}], request [{}], "
