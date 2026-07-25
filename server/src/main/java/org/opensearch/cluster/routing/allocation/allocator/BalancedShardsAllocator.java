@@ -939,5 +939,31 @@ public class BalancedShardsAllocator implements ShardsAllocator {
         public float delta() {
             return weights[weights.length - 1] - weights[0];
         }
+
+        /**
+         * Returns the weight spread between the heaviest and lightest node for {@code index} across
+         * <em>all</em> nodes, without sorting, reordering, or otherwise mutating this sorter.
+         *
+         * <p>This is an upper bound on any spread {@code balanceByWeights} can observe for that
+         * index, because it only ever compares weights within a subset of these same nodes and
+         * {@link WeightFunction#weightWithRebalanceConstraints} depends solely on the node and on
+         * balancer-wide averages -- never on which nodes happen to be in the array. So an index
+         * whose spread here is already under the balance threshold provably cannot yield a
+         * relocation, and the expensive per-node decider scan for it can be skipped.
+         *
+         * <p>Deliberately does not sort: {@link #reset(String)} would reorder {@code modelNodes},
+         * and with tied weights a non-stable sort could change which node is later selected as the
+         * min or max candidate. Computing the bound must not perturb the decisions it is guarding.
+         */
+        public float weightSpreadAcrossAllNodes(String index) {
+            float min = Float.POSITIVE_INFINITY;
+            float max = Float.NEGATIVE_INFINITY;
+            for (ModelNode node : modelNodes) {
+                final float weight = function.weightWithRebalanceConstraints(balancer, node, index);
+                min = Math.min(min, weight);
+                max = Math.max(max, weight);
+            }
+            return max - min;
+        }
     }
 }
