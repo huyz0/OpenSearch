@@ -326,17 +326,70 @@ reintroduce cluster-wide accounting for each -- which is the cost the scoping wa
 B4 should record this as "the ceiling is structural, cells are the answer" unless B3 finds something
 that changes it.
 
-### B3. Can the balancer be incremental?
+### B3. Can the balancer be incremental? -- ANSWERED: not by caching weights
 
-The `balanceByWeights` weight-spread skip that shipped is a cheap version of this: skip indices that
-provably cannot move. Ask whether the balancer can maintain weights across reroutes rather than
-recomputing, and what invalidates them.
+**No, and the weight function says why in one line.**
 
-### B4. Write up and recommend
+```java
+float weightShard = node.numShards() - balancer.avgShardsPerNode();      // total shards on the node
+float weightIndex = node.numShards(index) - balancer.avgShardsPerNode(index);
+return theta0 * weightShard + theta1 * weightIndex;
+```
 
-One of: a scoped design worth implementing, or a statement that the ceiling is structural and cells
-are the answer. Either is a useful outcome. Do not manufacture an implementation task if B2 and B3 say
-no.
+The first term is the node's **total** shard count, across every index. So a node's weight for index A
+depends on how many shards of B, C and D it holds. Relocating a single shard of any index changes
+`numShards()` on two nodes, which invalidates the cached weight of **every index** on those two nodes,
+plus `avgShardsPerNode` globally. Invalidation is not sparse; one move dirties O(indices) entries. A
+cache whose every write invalidates most of itself is not a cache.
+
+**Core already knows this, and the evidence is in the code.** `balanceByWeights` recomputes
+`weightSpreadAcrossAllNodes(index)` fresh for each index inside a single pass, with a comment saying
+why: earlier indices in the same loop may have relocated shards, so a spread captured beforehand would
+be stale and could under-report. If maintenance is already unsafe *within* one pass, maintaining
+across passes is strictly harder, and the same term is the reason.
+
+**What does work is the shape that already shipped.** The weight-spread skip does not cache a result;
+it proves cheaply that an index cannot yield a relocation and skips the expensive per-node decider scan
+entirely. That composes safely because it is recomputed each time, and it is where any further work
+belongs -- more provably-empty skips, not memoized weights.
+
+**And the biggest such skip is A5.** An index absent from the routing table is not iterated at all,
+which is why A6 measured cold-absence removing essentially the whole cold-tenant cost rather than
+trimming it. Phase A already took the win Phase B was looking for, for the tenants this project cares
+about.
+
+### B4. Verdict -- the ceiling is structural, cells are the answer
+
+B2 and B3 both say no, in different ways that reinforce each other, so per this task's own instruction
+there is no implementation task here.
+
+- **B2:** domain-scoped allocation is sound exactly when domains do not share nodes, because every
+  constraint involved is per-node. Domains with disjoint nodes are separate clusters sharing a control
+  plane, which is what cells already are. There is no allocator change in it.
+- **B3:** weights cannot be maintained across reroutes, because the weight function's leading term is
+  the node's total shard count and couples every index on a node. One relocation invalidates O(indices)
+  cached weights, and core already recomputes within a single pass for exactly this reason.
+
+**So the ~100k active-shard ceiling S6 measured is structural.** It is a property of a balancer that
+must consider every shard against every node with a globally-coupled weight, and neither scoping nor
+caching removes that within one cluster.
+
+That is a useful answer rather than a disappointing one, because the thing this plan set out to fix
+was never the active-shard ceiling. It was the cost of *quiescent* tenants, and Phase A removed that
+directly: an index with no routing entry is not iterated at all. A6 measured 369 ms against 17 ms of
+steady-state reroute at 10,000 cold indices. Cells then bound the active-shard count per cluster, which
+is what they were for.
+
+**B1 is now optional.** It would refine the shape of the curve between 40k and 200k active shards, but
+no version of that curve changes the verdict: B2 and B3 rule out the two candidate mitigations
+independently of where exactly the knee sits. Worth doing if someone needs the number for cell sizing;
+not worth doing to decide this.
+
+**Folding in E2.** The incremental routing rebuild belongs here rather than in the decisions section.
+It is the one remaining idea in this space that is not ruled out -- it needs a change signal from every
+producer of a `RoutingTable`, which is a core-wide invariant and a maintainer's call. Its payoff is 35
+to 67 ms of a 300 ms reroute at 40k *active* shards, so it is squarely a Phase B item and does nothing
+for quiescent tenants.
 
 ---
 
