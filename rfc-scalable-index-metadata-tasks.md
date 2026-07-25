@@ -47,6 +47,8 @@ request today, and the rest are latent. Nothing yet makes an index routing-absen
 | A7.6 integration coverage | done, tested |
 | C3b first slice (shard ref type) | done, tested |
 | C5 codec bump | blocked: needs a release-version decision |
+| D1 integration test | done -- found deferral does not engage |
+| D1b diagnose the deferral gap | open, next |
 | A7.7 snapshot generation preconditions | done, tested |
 | A5.1 cold-vs-gone | done, tested |
 | A5.2 + A5.3 prune + recreate | done, tested, off by default |
@@ -532,11 +534,35 @@ Distinct per-index data, since compressing identical entries flatters the result
 **Why.** C5 and C6 are inert by default and nothing in the serverless plugin uses them.
 `Metadata.Builder#putStub` currently has only test callers.
 
-### D1. Integration test with both settings on
+### D1. Integration test with both settings on -- DONE, and it found that deferral does not engage
 
-Bring up a cluster with `...index_metadata.descriptor.enabled` and `...index_metadata.defer.enabled`
-set, create N indices, restart or join a node, and assert it does not fetch every index blob. Count
-blob reads; do not infer from timing.
+`DeferredIndexMetadataReadIT`. **The result is a failing test, and that is the finding.** With both
+settings on, five indices created and the whole cluster restarted, every holder in the restored
+`Metadata` comes back materialized. It is marked `@AwaitsFix` rather than deleted, because it
+documents a real gap and will pass when the gap closes.
+
+**Asserts on unresolved holders rather than blob-read counts**, deliberately. A blob-read count can
+fall for unrelated reasons -- caching, a changed retry -- while an unresolved holder can only exist
+because deferral worked. It is the property the fetches were avoided *by*, not a proxy for it.
+
+Two candidate explanations, neither eliminated:
+
+1. **The remote read path never runs.** An `internalCluster()` full restart recovers from the local
+   gateway, so the repository may not be read. This already fooled the test once: the first version
+   restarted only the cluster-manager, which rejoins by publication, and produced the identical
+   symptom for a definitely different reason.
+2. **Something resolves the stubs during `Metadata` construction.** The serious one. C5's premise is
+   that building `Metadata`, its derived arrays and its `indicesLookup` never materializes a holder.
+   `DeferredIndexMetadataTests` proves that for a hand-built `Metadata`; it does not prove it for the
+   path a real full-state read takes, and this test is the first thing to exercise that path.
+
+**Next task, D1b:** separate the two observations. Assert on `RemoteClusterStateService`'s read path
+directly so "the read ran" and "the read deferred" are distinguishable, rather than conflated into one
+assertion that fails for either reason.
+
+The control -- settings off, every holder materialized -- passes, which is what confirms the assertion
+mechanism reads what it claims to. Without it the failure would be indistinguishable from a broken
+test.
 
 ### D2. Serverless defaults -- DECIDED: all three stay off, and here is what unblocks each
 
