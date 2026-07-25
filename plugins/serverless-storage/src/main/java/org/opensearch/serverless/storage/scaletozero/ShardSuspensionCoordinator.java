@@ -15,6 +15,7 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.ClusterStateUpdateTask;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.allocation.command.CancelAllocationCommand;
@@ -292,7 +293,16 @@ public final class ShardSuspensionCoordinator {
             return;
         }
         String indexName = indexMetadata.getIndex().getName();
-        IndexShardRoutingTable shardRoutingTable = state.routingTable().index(indexName).shard(shardId);
+        IndexRoutingTable indexRoutingTable = state.routingTable().index(indexName);
+        if (indexRoutingTable == null) {
+            logger.debug(
+                "skipping eviction of suspended serverless-storage shard [{}][{}] -- index has no routing table",
+                indexUuid,
+                shardId
+            );
+            return;
+        }
+        IndexShardRoutingTable shardRoutingTable = indexRoutingTable.shard(shardId);
         // Writer suspension must evict every writer-role copy, not just the primary: a
         // serverless-storage index can have index.number_of_replicas > 0 (ServerlessStorageIndexSettingProvider
         // only rejects an explicitly requested SEGMENT replication.type, not ordinary writer

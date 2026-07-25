@@ -28,14 +28,24 @@ nobody has it yet. S6 measured 40k *active* shards; nothing has measured 40k sus
 
 ## What blocks simply removing the entry
 
-Reactivation reads the routing table to decide whether it has finished.
-`ShardReactivationActionFilter` iterates `state.routingTable().index(indexName)` in three places
-(around lines 226 and 306-312) to check whether the primary is `STARTED` and whether search replicas
-are back. With no routing entry there is nothing to iterate, and those three sites would throw
-`NullPointerException` in the same shape as the sixteen already fixed in core under A7.
+**Corrected after the A8 sweep.** The first version of this section said
+`ShardReactivationActionFilter` would throw `NullPointerException` at three sites. That was wrong:
+both of its routing reads are already guarded by `state.routingTable().hasIndex(...)`. The sweep
+found exactly one genuinely unguarded dereference in the plugin,
+`ShardSuspensionCoordinator`'s eviction path, now fixed.
 
-That is not merely another guard to add. It is the design problem: **the routing table is currently
-the completion signal for reactivation.** Take it away and reactivation needs a different one.
+The real problem is worse than an NPE, because it is silent. Those guards exist, but they give the
+**wrong answer** for a routing-absent index:
+
+- `readerCopyNotYetStarted` returns `false` when the index has no routing entry, meaning "no
+  reactivation needed". A cold index needs reactivation more than any other.
+- `allFullyReactivated` skips such an entry with `continue`, meaning "this one is done". It would
+  report reactivation complete for an index that has no shards at all.
+
+So the design problem stands, sharpened: **the routing table is the completion signal for
+reactivation, and absence currently reads as "nothing to do" rather than "not started".** Removing the
+entry without changing that would make reactivation silently succeed while serving nothing. An
+exception would at least have been loud.
 
 ## Options for A5
 
@@ -59,13 +69,14 @@ scale-to-zero already lives, and it leaves core's role as tolerating absence rat
 - The suspension path stops writing an `IndexRoutingTable` entry, or removes it after eviction.
 - `TransportReactivateShardsAction` adds the entry back in the same cluster-state update that clears
   the suspended flag.
-- The three `ShardReactivationActionFilter` sites tolerate absence, since they run before the
-  reactivation update completes.
+- `readerCopyNotYetStarted` and `allFullyReactivated` distinguish "no routing entry because cold" from
+  "no routing entry because gone". Today both read as done.
 - `SuspendedShardAllocationDecider` becomes mostly dead for suspended shards, because the allocator no
   longer sees them. Check whether it is still needed for the window between marking and eviction.
 - Whatever else in the plugin reads the routing table for a suspended index. This audit covered
   `server/src/main` only; the plugin has not been swept the way A1 swept core.
 
-That last point is its own task: **A8, sweep the plugin for the same assumption.** A1 found sixteen
-sites in core. The plugin is smaller but it is the component that would actually create this state, so
-its own dereferences matter more, not less.
+That last point was its own task, **A8, and it is done.** The plugin has four routing-entry reads:
+`WriterPublicationNotifier` (already guarded), `ShardSuspensionCoordinator` (was not, now is), and the
+two `ShardReactivationActionFilter` sites (guarded, but semantically wrong for a cold index, as above).
+Far fewer than core's sixteen, and the interesting ones are semantic rather than null-safety.

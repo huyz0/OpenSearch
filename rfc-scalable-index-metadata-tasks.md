@@ -158,11 +158,22 @@ Concretely, per the spike:
 
 Gated on A8, which establishes the full plugin-side call-site list the way A1 did for core.
 
-### A8. Sweep the plugin for the routing-entry assumption
+### A8. Sweep the plugin for the routing-entry assumption -- DONE
 
-Same exercise as A1, over `plugins/serverless-storage`. Three sites are already known from the A4
-spike (`ShardReactivationActionFilter`, around 226 and 306-312). Find the rest before A5 changes the
-state they run against.
+Four routing-entry reads in `plugins/serverless-storage`, against core's fifty-eight:
+
+| site | verdict |
+|---|---|
+| `WriterPublicationNotifier:89` | already guarded, both index and shard |
+| `ShardSuspensionCoordinator:295` | **was unguarded, now fixed** -- eviction skips a shard whose index has no routing table |
+| `ShardReactivationActionFilter:226` (`readerCopyNotYetStarted`) | guarded by `hasIndex`, but semantically wrong for a cold index |
+| `ShardReactivationActionFilter:306` (`allFullyReactivated`) | same |
+
+**This corrected the A4 spike, which had claimed three unguarded sites in the reactivation filter.**
+Both are guarded. What they are not is *correct*: absence currently reads as "nothing to do" and "this
+one is done", so removing the routing entry would make reactivation silently report success for an
+index serving nothing. That is a worse failure than the exception the spike predicted, and it moves
+those two sites from A5's "tolerate absence" list to its "distinguish cold from gone" list.
 
 ### A6. Measure
 
