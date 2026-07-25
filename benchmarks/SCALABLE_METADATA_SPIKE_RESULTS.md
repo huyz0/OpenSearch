@@ -553,6 +553,14 @@ not realized by this change on its own. What this change buys is that C6 no long
 `Metadata`: `Metadata.Builder#putStub` is the seam, and `LazyIndexMetadata` is a working
 implementation of it.
 
+**Since superseded on that last point.** C6's first two pieces are now implemented: the index descriptor
+rides in the cluster metadata manifest at `CODEC_V5`, and the full-state read path installs a deferred
+holder rather than fetching the blob. So there is a caller, behind two off-by-default settings
+(`...index_metadata.descriptor.enabled` on the writer, `...index_metadata.defer.enabled` on the reader).
+What that changes is the cost of a **full-state read** -- a node joining or a cluster-manager restarting
+no longer fetches one blob per index in the cluster. The diff path was already unaffected, since an
+unchanged index's holder is carried forward by reference and never needed a descriptor.
+
 ## What the plan got wrong
 
 | plan claim | measured | effect |

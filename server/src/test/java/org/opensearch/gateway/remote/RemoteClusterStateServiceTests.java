@@ -18,7 +18,9 @@ import org.opensearch.cluster.block.ClusterBlocks;
 import org.opensearch.cluster.coordination.CoordinationMetadata;
 import org.opensearch.cluster.metadata.DiffableStringMap;
 import org.opensearch.cluster.metadata.IndexGraveyard;
+import org.opensearch.cluster.metadata.AliasMetadata;
 import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.metadata.IndexMetadataHolder;
 import org.opensearch.cluster.metadata.IndexTemplateMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.metadata.TemplatesMetadata;
@@ -1328,6 +1330,169 @@ public class RemoteClusterStateServiceTests extends OpenSearchTestCase {
         assertNotNull(remoteClusterStateService.getDiffDownloadStats());
         assertEquals(1, remoteClusterStateService.getDiffDownloadStats().getSuccessCount());
         assertEquals(0, remoteClusterStateService.getDiffDownloadStats().getFailedCount());
+    }
+
+    /**
+     * With the descriptor in the manifest and deferral on, reading full cluster state must install the
+     * index as an unresolved holder and not fetch its blob at all. The blob container is stubbed to
+     * throw, so any fetch fails the test rather than passing silently.
+     */
+    public void testDeferredIndexIsInstalledWithoutFetchingItsBlob() throws IOException {
+        IndexMetadata indexMetadata = IndexMetadata.builder("test-index")
+            .settings(
+                Settings.builder()
+                    .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+                    .put(IndexMetadata.SETTING_INDEX_UUID, "test-index-uuid")
+            )
+            .numberOfShards(2)
+            .numberOfReplicas(1)
+            .putAlias(AliasMetadata.builder("test-alias").build())
+            .build();
+        UploadedIndexMetadata uploaded = new UploadedIndexMetadata(
+            "test-index",
+            "test-index-uuid",
+            "test-index-file__2",
+            UploadedIndexMetadata.COMPONENT_PREFIX,
+            ClusterMetadataManifest.CODEC_V5,
+            IndexDescriptor.of(indexMetadata)
+        );
+
+        ClusterState previousClusterState = generateClusterStateWithAllAttributes().build();
+        ClusterMetadataManifest manifest = generateClusterMetadataManifestWithAllAttributes().indices(List.of(uploaded)).build();
+        BlobContainer container = mockBlobStoreObjects();
+        when(container.readBlob(anyString())).thenAnswer(inv -> { throw new AssertionError("no blob should be read: " + inv); });
+        clusterSettings.applySettings(
+            Settings.builder().put(RemoteClusterStateService.REMOTE_CLUSTER_STATE_DEFER_INDEX_METADATA_SETTING.getKey(), true).build()
+        );
+        remoteClusterStateService.start();
+
+        ClusterState state = remoteClusterStateService.readClusterStateInParallel(
+            previousClusterState,
+            manifest,
+            manifest.getClusterUUID(),
+            NODE_ID,
+            List.of(uploaded),
+            emptyMap(),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            emptyList(),
+            false,
+            emptyMap(),
+            false,
+            false
+        );
+
+        IndexMetadataHolder holder = state.metadata().indexHolder("test-index");
+        assertNotNull("the index must be present", holder);
+        assertFalse("...and must not have been fetched", holder.isResolved());
+        // Everything the derived arrays and indicesLookup need has to be answerable from the manifest.
+        assertEquals(indexMetadata.getState(), holder.getState());
+        assertEquals(indexMetadata.getAliases(), holder.getAliases());
+        assertEquals(indexMetadata.getTotalNumberOfShards(), holder.getTotalNumberOfShards());
+        assertTrue(state.metadata().hasIndex("test-index"));
+        assertTrue(state.metadata().getIndicesLookup().containsKey("test-index"));
+        assertTrue(state.metadata().getIndicesLookup().containsKey("test-alias"));
+    }
+
+    /**
+     * The negative control for the test above: with deferral off, the same manifest entry is fetched, so
+     * the throwing blob container is reached. Without this, that test would pass even if the read path
+     * silently dropped the index.
+     */
+    public void testWithoutDeferralTheIndexBlobIsStillFetched() throws IOException {
+        IndexMetadata indexMetadata = IndexMetadata.builder("test-index")
+            .settings(
+                Settings.builder()
+                    .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+                    .put(IndexMetadata.SETTING_INDEX_UUID, "test-index-uuid")
+            )
+            .numberOfShards(2)
+            .numberOfReplicas(1)
+            .build();
+        UploadedIndexMetadata uploaded = new UploadedIndexMetadata(
+            "test-index",
+            "test-index-uuid",
+            "test-index-file__2",
+            UploadedIndexMetadata.COMPONENT_PREFIX,
+            ClusterMetadataManifest.CODEC_V5,
+            IndexDescriptor.of(indexMetadata)
+        );
+
+        ClusterState previousClusterState = generateClusterStateWithAllAttributes().build();
+        ClusterMetadataManifest manifest = generateClusterMetadataManifestWithAllAttributes().indices(List.of(uploaded)).build();
+        BlobContainer container = mockBlobStoreObjects();
+        String exceptionMsg = "fetched after all";
+        when(container.readBlob(anyString())).thenAnswer(inv -> { throw new IOException(exceptionMsg); });
+        clusterSettings.applySettings(
+            Settings.builder().put(RemoteClusterStateService.REMOTE_CLUSTER_STATE_DEFER_INDEX_METADATA_SETTING.getKey(), false).build()
+        );
+        remoteClusterStateService.start();
+
+        RemoteStateTransferException exception = expectThrows(
+            RemoteStateTransferException.class,
+            () -> remoteClusterStateService.readClusterStateInParallel(
+                previousClusterState,
+                manifest,
+                manifest.getClusterUUID(),
+                NODE_ID,
+                List.of(uploaded),
+                emptyMap(),
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                emptyList(),
+                false,
+                emptyMap(),
+                false,
+                false
+            )
+        );
+        assertEquals("Exception during reading cluster state from remote", exception.getMessage());
+    }
+
+    /** An entry with no descriptor is fetched even with deferral on, so an older repository still works. */
+    public void testEntryWithoutADescriptorIsFetchedEvenWhenDeferralIsOn() throws IOException {
+        UploadedIndexMetadata uploaded = new UploadedIndexMetadata("test-index", "test-index-uuid", "test-index-file__2");
+
+        ClusterState previousClusterState = generateClusterStateWithAllAttributes().build();
+        ClusterMetadataManifest manifest = generateClusterMetadataManifestWithAllAttributes().indices(List.of(uploaded)).build();
+        BlobContainer container = mockBlobStoreObjects();
+        when(container.readBlob(anyString())).thenAnswer(inv -> { throw new IOException("fetched, as it must be"); });
+        clusterSettings.applySettings(
+            Settings.builder().put(RemoteClusterStateService.REMOTE_CLUSTER_STATE_DEFER_INDEX_METADATA_SETTING.getKey(), true).build()
+        );
+        remoteClusterStateService.start();
+
+        RemoteStateTransferException exception = expectThrows(
+            RemoteStateTransferException.class,
+            () -> remoteClusterStateService.readClusterStateInParallel(
+                previousClusterState,
+                manifest,
+                manifest.getClusterUUID(),
+                NODE_ID,
+                List.of(uploaded),
+                emptyMap(),
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                emptyList(),
+                false,
+                emptyMap(),
+                false,
+                false
+            )
+        );
+        assertEquals("Exception during reading cluster state from remote", exception.getMessage());
     }
 
     public void testReadClusterStateInParallel_TimedOut() throws IOException {

@@ -57,6 +57,13 @@ public class RemoteClusterMetadataManifest extends AbstractClusterMetadataWritea
         new ChecksumBlobStoreFormat<>("cluster-metadata-manifest", METADATA_MANIFEST_NAME_FORMAT, ClusterMetadataManifest::fromXContentV3);
 
     /**
+     * Manifest format compatible with codec v4, i.e. before uploaded index entries could carry the
+     * index descriptor. Manifests already in a repository are read through this.
+     */
+    public static final ChecksumBlobStoreFormat<ClusterMetadataManifest> CLUSTER_METADATA_MANIFEST_FORMAT_V4 =
+        new ChecksumBlobStoreFormat<>("cluster-metadata-manifest", METADATA_MANIFEST_NAME_FORMAT, ClusterMetadataManifest::fromXContentV4);
+
+    /**
      * Manifest format compatible with codec v2, where we introduced codec versions/global metadata.
      */
     public static final ChecksumBlobStoreFormat<ClusterMetadataManifest> CLUSTER_METADATA_MANIFEST_FORMAT = new ChecksumBlobStoreFormat<>(
@@ -155,6 +162,8 @@ public class RemoteClusterMetadataManifest extends AbstractClusterMetadataWritea
         long codecVersion = getManifestCodecVersion();
         if (codecVersion == ClusterMetadataManifest.MANIFEST_CURRENT_CODEC_VERSION) {
             return CLUSTER_METADATA_MANIFEST_FORMAT;
+        } else if (codecVersion == ClusterMetadataManifest.CODEC_V4) {
+            return CLUSTER_METADATA_MANIFEST_FORMAT_V4;
         } else if (codecVersion == ClusterMetadataManifest.CODEC_V3) {
             return CLUSTER_METADATA_MANIFEST_FORMAT_V3;
         } else if (codecVersion == ClusterMetadataManifest.CODEC_V2) {

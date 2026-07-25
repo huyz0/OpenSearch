@@ -387,7 +387,24 @@ rather than a `HashMap`: S2 measured a single-entry `HashMap` doubling the descr
 
 ### C6. Remote cluster state: shard the manifest, expose per-index fetch
 
-**Scoped against the code, not started.** With C5 in, this is the change that decides whether the
+**Two of the three pieces are implemented.** The descriptor now rides in the manifest at `CODEC_V5`,
+`RemoteIndexMetadataManager.getIndexMetadata` is reachable, and the full-state read path installs a
+deferred holder instead of fetching, so a joining node fetches one blob per index it actually touches
+rather than one per index in the cluster. Both halves are off by default and independent:
+`cluster.remote_store.state.index_metadata.descriptor.enabled` on the writer,
+`cluster.remote_store.state.index_metadata.defer.enabled` on the reader. An entry with no descriptor is
+fetched exactly as before, so an older repository degrades rather than fails. Manifest sharding, the
+third piece, is untouched -- it is about upload cost rather than residency and gates nothing.
+
+The manifest codec goes to `CODEC_V5` unconditionally, as every prior bump did. Making it conditional
+on whether any entry carries a descriptor was tried and reverted: it breaks the invariant that the
+writer always writes `MANIFEST_CURRENT_CODEC_VERSION` (four tests encode it), and worse, it lets a
+cluster flap between writing V4 and V5 as descriptor-carrying indices come and go. A persisted format
+that changes version with the data in it is harder to reason about during recovery than one that
+does not. A V5 manifest with no descriptors is structurally identical to V4 anyway; the exposure is
+the ordinary one, that a node on an older build cannot read a manifest written by a newer one.
+
+**Original scoping, kept for the reasoning:** With C5 in, this is the change that decides whether the
 storage split ever pays: a `LazyIndexMetadata` needs its descriptor from somewhere, and on the diff
 path an unchanged index's holder is carried forward by reference so no descriptor is needed at all.
 It is only the **full-state read** -- node join, cluster-manager restart -- that has to build every

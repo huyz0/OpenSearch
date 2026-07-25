@@ -55,6 +55,8 @@ import org.opensearch.gateway.remote.model.RemoteCoordinationMetadata;
 import org.opensearch.gateway.remote.model.RemoteCustomMetadata;
 import org.opensearch.gateway.remote.model.RemoteDiscoveryNodes;
 import org.opensearch.gateway.remote.model.RemoteHashesOfConsistentSettings;
+import org.opensearch.cluster.metadata.IndexMetadataHolder;
+import org.opensearch.core.index.Index;
 import org.opensearch.gateway.remote.model.RemoteIndexMetadata;
 import org.opensearch.gateway.remote.model.RemotePersistentSettingsMetadata;
 import org.opensearch.gateway.remote.model.RemoteReadResult;
@@ -130,6 +132,22 @@ public class RemoteClusterStateService implements Closeable {
     /**
      * Gates the functionality of remote publication.
      */
+    /**
+     * When set, an index whose manifest entry carries an {@link IndexDescriptor} is installed into
+     * {@code Metadata} as a deferred holder rather than being fetched. Reading full cluster state then
+     * costs one blob per index the node actually touches instead of one per index in the cluster.
+     *
+     * <p>Requires the writer to have populated the descriptor
+     * ({@code cluster.remote_store.state.index_metadata.descriptor.enabled}); entries without one are
+     * fetched exactly as before, so a mixed or older repository degrades rather than fails.
+     */
+    public static final Setting<Boolean> REMOTE_CLUSTER_STATE_DEFER_INDEX_METADATA_SETTING = Setting.boolSetting(
+        "cluster.remote_store.state.index_metadata.defer.enabled",
+        false,
+        Property.NodeScope,
+        Property.Dynamic
+    );
+
     public static final String REMOTE_PUBLICATION_SETTING_KEY = "cluster.remote_store.publication.enabled";
     public static final String REMOTE_STATE_DOWNLOAD_TO_SERVE_READ_API_KEY = "cluster.remote_state.download.serve_read_api.enabled";
 
@@ -227,6 +245,7 @@ public class RemoteClusterStateService implements Closeable {
     private final LongSupplier applicationDurationMsSupplier;
     private final ThreadPool threadpool;
     private final List<IndexMetadataUploadListener> indexMetadataUploadListeners;
+    private volatile boolean deferIndexMetadata;
     private BlobStoreRepository blobStoreRepository;
     private BlobStoreTransferService blobStoreTransferService;
     private RemoteRoutingTableService remoteRoutingTableService;
@@ -282,6 +301,8 @@ public class RemoteClusterStateService implements Closeable {
         this.threadpool = threadPool;
         clusterSettings = clusterService.getClusterSettings();
         this.slowWriteLoggingThreshold = clusterSettings.get(SLOW_WRITE_LOGGING_THRESHOLD);
+        this.deferIndexMetadata = clusterSettings.get(REMOTE_CLUSTER_STATE_DEFER_INDEX_METADATA_SETTING);
+        clusterSettings.addSettingsUpdateConsumer(REMOTE_CLUSTER_STATE_DEFER_INDEX_METADATA_SETTING, this::setDeferIndexMetadata);
         clusterSettings.addSettingsUpdateConsumer(SLOW_WRITE_LOGGING_THRESHOLD, this::setSlowWriteLoggingThreshold);
         this.remoteStateReadTimeout = clusterSettings.get(REMOTE_STATE_READ_TIMEOUT_SETTING);
         clusterSettings.addSettingsUpdateConsumer(REMOTE_STATE_READ_TIMEOUT_SETTING, this::setRemoteStateReadTimeout);
@@ -789,7 +810,8 @@ public class RemoteClusterStateService implements Closeable {
                     blobStoreRepository.getNamedXContentRegistry(),
                     remoteIndexMetadataManager.getPathTypeSetting(),
                     remoteIndexMetadataManager.getPathHashAlgoSetting(),
-                    remotePathPrefix
+                    remotePathPrefix,
+                    remoteIndexMetadataManager.isWriteDescriptorEnabled()
                 ),
                 listener
             );
@@ -1126,6 +1148,10 @@ public class RemoteClusterStateService implements Closeable {
         remoteClusterStateCleanupManager.start();
     }
 
+    private void setDeferIndexMetadata(boolean deferIndexMetadata) {
+        this.deferIndexMetadata = deferIndexMetadata;
+    }
+
     private void setSlowWriteLoggingThreshold(TimeValue slowWriteLoggingThreshold) {
         this.slowWriteLoggingThreshold = slowWriteLoggingThreshold;
     }
@@ -1253,7 +1279,31 @@ public class RemoteClusterStateService implements Closeable {
         Consumer<Metadata.Builder> metadataTransformer,
         Consumer<RoutingTable> routingTableTransformer
     ) {
-        int totalReadTasks = indicesToRead.size() + customToRead.size() + (readCoordinationMetadata ? 1 : 0) + (readSettingsMetadata
+        // An index whose manifest entry already carries its descriptor does not have to be fetched: the
+        // descriptor is everything Metadata needs resident, and the blob can wait until something asks
+        // for the index itself. Everything else is read exactly as before, so an older manifest, or one
+        // written with the descriptor turned off, behaves identically.
+        final Map<String, IndexMetadataHolder> deferredIndices = new HashMap<>();
+        final List<UploadedIndexMetadata> indicesToFetch;
+        if (deferIndexMetadata) {
+            indicesToFetch = new ArrayList<>(indicesToRead.size());
+            for (UploadedIndexMetadata uploaded : indicesToRead) {
+                IndexDescriptor descriptor = uploaded.getDescriptor();
+                if (descriptor == null) {
+                    indicesToFetch.add(uploaded);
+                    continue;
+                }
+                Index index = new Index(uploaded.getIndexName(), uploaded.getIndexUUID());
+                deferredIndices.put(
+                    uploaded.getIndexName(),
+                    descriptor.toHolder(index, () -> remoteIndexMetadataManager.getIndexMetadata(uploaded, clusterUUID))
+                );
+            }
+        } else {
+            indicesToFetch = indicesToRead;
+        }
+
+        int totalReadTasks = indicesToFetch.size() + customToRead.size() + (readCoordinationMetadata ? 1 : 0) + (readSettingsMetadata
             ? 1
             : 0) + (readTemplatesMetadata ? 1 : 0) + (readDiscoveryNodes ? 1 : 0) + (readClusterBlocks ? 1 : 0)
             + (readTransientSettingsMetadata ? 1 : 0) + (readHashesOfConsistentSettings ? 1 : 0) + clusterStateCustomToRead.size()
@@ -1280,7 +1330,7 @@ public class RemoteClusterStateService implements Closeable {
             exceptionList.add(ex);
         }), latch);
 
-        for (UploadedIndexMetadata indexMetadata : indicesToRead) {
+        for (UploadedIndexMetadata indexMetadata : indicesToFetch) {
             remoteIndexMetadataManager.readAsync(
                 indexMetadata.getIndexName(),
                 new RemoteIndexMetadata(
@@ -1531,6 +1581,10 @@ public class RemoteClusterStateService implements Closeable {
         });
 
         metadataBuilder.indices(indexMetadataMap);
+        if (deferredIndices.isEmpty() == false) {
+            metadataBuilder.indexHolders(deferredIndices);
+            logger.debug("Deferred {} of {} indices; {} fetched", deferredIndices.size(), indicesToRead.size(), indexMetadataMap.size());
+        }
         metadataTransformer.accept(metadataBuilder);
         if (readDiscoveryNodes) {
             clusterStateBuilder.nodes(discoveryNodesBuilder.get().localNodeId(localNodeId));
