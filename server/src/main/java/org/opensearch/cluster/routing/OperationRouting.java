@@ -334,8 +334,14 @@ public class OperationRouting {
         final Set<IndexShardRoutingTable> set = new HashSet<>();
         // we use set here and not list since we might get duplicates
         for (String index : concreteIndices) {
-            final IndexRoutingTable indexRouting = indexRoutingTable(clusterState, index);
+            // Metadata first, deliberately. An index in neither metadata nor routing is genuinely
+            // missing and must still produce IndexNotFoundException; only an index that exists but
+            // has no routing entry takes the degraded path below.
             final IndexMetadata indexMetadata = indexMetadata(clusterState, index);
+            IndexRoutingTable indexRouting = clusterState.routingTable().index(index);
+            if (indexRouting == null) {
+                indexRouting = noShardsAvailable(indexMetadata);
+            }
             final Set<String> effectiveRouting = routing.get(index);
             if (effectiveRouting != null) {
                 for (String r : effectiveRouting) {
@@ -476,6 +482,29 @@ public class OperationRouting {
         } else {
             return indexShard.preferAttributesActiveInitializingShardsIt(awarenessAttributes, nodes);
         }
+    }
+
+    /**
+     * A routing table for an index that is present in metadata but has no {@link IndexRoutingTable}
+     * entry: the right number of shards, each with no copies anywhere.
+     *
+     * <p>This is what makes such an index behave like one whose shards merely happen to be
+     * unassigned -- a search returns HTTP 200 with a per-shard {@code NoShardAvailableActionException}
+     * for each -- rather than {@code IndexNotFoundException}, which is a 404 and says something that
+     * is not true.
+     *
+     * <p>Synthesising empty shards rather than skipping the index is the point. Skipping would leave
+     * the search with nothing to route to and it would return 200 with zero hits, silently, which is
+     * a worse answer than a loud failure for an index that exists and holds data. The failure a
+     * caller gets here is the same one it already knows how to handle and, for the serverless
+     * scale-to-zero case, the same one that reactivation is racing to prevent.
+     */
+    private static IndexRoutingTable noShardsAvailable(IndexMetadata indexMetadata) {
+        IndexRoutingTable.Builder builder = IndexRoutingTable.builder(indexMetadata.getIndex());
+        for (int shardId = 0; shardId < indexMetadata.getNumberOfShards(); shardId++) {
+            builder.addIndexShard(new IndexShardRoutingTable.Builder(new ShardId(indexMetadata.getIndex(), shardId)).build());
+        }
+        return builder.build();
     }
 
     protected IndexRoutingTable indexRoutingTable(ClusterState clusterState, String index) {

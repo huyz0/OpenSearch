@@ -49,7 +49,8 @@ request today, and the rest are latent. Nothing yet makes an index routing-absen
 | A5.1 cold-vs-gone | done, tested |
 | A5.2 + A5.3 prune + recreate | done, tested, off by default |
 | A5.4 decider still needed? | decided: yes, unchanged |
-| A2, A3 | blocked on A5 |
+| A2 search degradation | done, tested |
+| A3 | next |
 | A4 spike | done |
 | A6 | done, both halves |
 
@@ -108,15 +109,22 @@ Do them in this order, most reachable first:
   Latent guards rather than live defects, and the audit says so.
 
 
-### A2. `OperationRouting.indexRoutingTable` degrades instead of throwing
+### A2. Search degrades instead of throwing -- DONE
 
-Currently throws `IndexNotFoundException` when the routing entry is missing, turning a search that
-would return HTTP 200 with per-shard `NoShardAvailableActionException` into a 404.
+`computeTargetedShards` no longer routes through the throwing lookup. It reads metadata first, so an
+index in neither metadata nor routing still gets `IndexNotFoundException`, and only an index that
+exists without a routing entry takes the new path.
 
-- Change it to treat absence as no shards to route to.
-- Test: metadata has the index, routing does not, search returns per-shard failures rather than 404.
-- Confirm the test fails with the change reverted.
-- Watch for callers that *rely* on the exception to detect a missing index. A1 should have found them.
+**Synthesised empty shards, not a skip**, and that was the real decision. Skipping the index would
+have left the search with nothing to route to and returned HTTP 200 with zero hits for an index that
+exists and holds data -- a silent wrong answer, the same failure mode A5.1 was written to prevent.
+Instead the index gets one shard iterator per shard in metadata, each with no copies, which is
+byte-for-byte what an index whose shards merely happen to be unassigned already produces. A third
+test asserts that equivalence directly, because it is the justification: absence is being made to
+look like a state core already handles rather than being given a behaviour of its own.
+
+Three tests; the one that targets the change fails with it reverted and the two controls pass either
+way. The `*routing*` and `*search*` suites pass (16 min).
 
 ### A3. `RoutingTable.shardRoutingTable(ShardId)` degrades instead of throwing
 
