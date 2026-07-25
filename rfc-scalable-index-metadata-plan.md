@@ -460,6 +460,19 @@ Revised ordering, with what each now rests on:
 3. **C7** — batch create-index/update-settings. Promoted above dedup: provisioning throughput
    matters at any scale, and S6 showed cold allocation is superlinear, so batching creates helps
    exactly where the cluster is most fragile.
+
+   *Feasibility confirmed.* `MetadataCreateIndexService.applyCreateIndexRequest(ClusterState,
+   request, silent)` both takes and returns a `ClusterState`, so it composes: a batching
+   `ClusterStateTaskExecutor` folds N requests over one state, marking each task success or failure
+   independently. Today each request instead goes through `onlyCreateIndex`, which submits an
+   `AckedClusterStateUpdateTask` that is its own executor (`MetadataCreateIndexService.java:388`),
+   so N creations are N full cluster-state cycles.
+
+   The work is not the fold, it is the acknowledgement machinery: each request carries its own
+   listener, ack timeout and wait-for-active-shards condition, so the executor must preserve
+   per-task ack semantics and isolate one request's failure from the rest of the batch. Estimate
+   150-250 lines plus tests. Index creation is a safety-critical path, so this wants a session with
+   room to do it properly rather than being appended to an existing change.
 4. **C2 mapping dedup** — S4 confirmed 1000× on homogeneous fleets, degrading as ≈`100/divergent%`;
    pair with `dynamic: strict`. But note S3 (helps cluster state only, 0.08% effect on the parsed
    graph) and the recalibration above (tens of MB per node at reachable scale, not tens of GB). The
