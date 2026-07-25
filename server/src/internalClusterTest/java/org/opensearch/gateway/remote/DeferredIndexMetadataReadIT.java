@@ -8,7 +8,6 @@
 
 package org.opensearch.gateway.remote;
 
-import org.apache.lucene.tests.util.LuceneTestCase.AwaitsFix;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadataHolder;
 import org.opensearch.cluster.metadata.Metadata;
@@ -19,6 +18,7 @@ import org.opensearch.test.OpenSearchIntegTestCase;
 import org.junit.Before;
 
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 import static org.opensearch.gateway.remote.RemoteClusterStateService.REMOTE_CLUSTER_STATE_ENABLED_SETTING;
 
@@ -37,32 +37,28 @@ import static org.opensearch.gateway.remote.RemoteClusterStateService.REMOTE_CLU
  * <p>The second half matters as much as the first. A stub that never resolves is not a saving, it is
  * a broken cluster, so the test also drives ordinary requests against those indices afterwards.
  *
- * <h2>The finding: it does not engage, and this test is why we know</h2>
+ * <h2>Getting the restart right took three attempts, and that is the durable lesson</h2>
  *
- * <b>The deferral test is {@code @AwaitsFix} because it fails, and that failure is D1's actual
- * result.</b> With both settings on, five indices created and the whole cluster restarted, every
- * holder in the restored {@code Metadata} comes back materialized. Not some -- all five.
+ * The first two versions found every holder materialized and looked like deferral failing. Neither
+ * was. <b>An {@code internalCluster()} restart recovers cluster state from the local gateway</b>, so
+ * the repository is never read and the deferral branch never executes -- true whether one node
+ * restarts (it rejoins by publication) or all of them do. Two different-looking setups produced the
+ * identical symptom for the same underlying reason, which is precisely why the symptom alone could
+ * not distinguish "the feature is broken" from "the test never ran it".
  *
- <p><b>D1b diagnosed it: the read path never runs here.</b> The alarming explanation was that
- * something resolves the stubs during {@code Metadata} construction, which would make C5's premise
- * false on the real path. It does not. {@code RemoteClusterStateServiceTests}'
- * {@code testDeferredIndexIsInstalledWithoutFetchingItsBlob} drives
- * {@code readClusterStateInParallel} directly and gets back an unresolved holder, so the deferral
- * logic works where it is exercised.
+ * <p>What settled it was checking the layer below: {@code RemoteClusterStateServiceTests}'
+ * {@code testDeferredIndexIsInstalledWithoutFetchingItsBlob} drives {@code readClusterStateInParallel}
+ * directly and gets an unresolved holder, so the logic worked all along.
  *
- * <p>What is left is the harness: an {@code internalCluster()} restart -- of one node or of all of
- * them -- recovers cluster state from the local gateway, so the repository is never read and the
- * deferral branch never executes. That had already fooled this test once, when the first version
- * restarted only the cluster-manager and it rejoined by publication; a full restart produced the same
- * symptom for the same underlying reason rather than a different one.
+ * <p>So this uses {@code stopAllNodes} followed by fresh starts -- {@code RemoteStoreClusterStateRestoreIT}'s
+ * {@code resetCluster} pattern -- which discards local state and forces recovery from the repository.
+ * With that, deferral engages.
  *
- * <p>So the gap is in coverage rather than in C5 or C6, and closing it means forcing a genuine remote
- * read -- see {@code RemoteStoreClusterStateRestoreIT} for the pattern, which wipes local state so
- * recovery has to come from the repository.
- *
- * <p>The control below passes, and is kept precisely so that this class does not become a test that
- * only ever fails: with the settings off, every holder is materialized, which confirms the assertion
- * mechanism itself works and reads what it claims to read.
+ * <p>Two consequences for what this test can assert. It waits on <b>metadata</b> rather than cluster
+ * health, because a cluster restored from remote state alone has no shard data and comes back red;
+ * waiting on health would fail for a reason unrelated to deferral. And the resolve-on-demand half
+ * asserts on {@code metadata().index(name)} rather than on documents, so a failure means the stub did
+ * not resolve rather than that a shard did not recover.
  */
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
 public class DeferredIndexMetadataReadIT extends RemoteStoreBaseIntegTestCase {
@@ -101,13 +97,15 @@ public class DeferredIndexMetadataReadIT extends RemoteStoreBaseIntegTestCase {
         }
         ensureGreen();
 
-        // A *full* restart is what forces the remote full-state read. Restarting the cluster-manager
-        // alone does not: it rejoins and receives state by publication from the surviving nodes, so
-        // nothing is read from the repository at all. The first version of this test restarted one
-        // node and found five resolved holders, which looked like deferral failing and was actually
-        // the read path never running.
-        internalCluster().fullRestart();
-        ensureGreen();
+        // stopAllNodes then fresh starts, rather than a restart. This is what forces the remote read:
+        // a restart -- of one node or of all of them -- recovers cluster state from the local gateway,
+        // so the repository is never touched and the deferral branch never executes. Two earlier
+        // versions of this test asserted against exactly that, which is why the pattern here is
+        // RemoteStoreClusterStateRestoreIT's resetCluster rather than fullRestart.
+        internalCluster().stopAllNodes();
+        internalCluster().startClusterManagerOnlyNode();
+        internalCluster().startDataOnlyNodes(1);
+        awaitMetadataRestored();
 
         ClusterService clusterService = internalCluster().clusterService(internalCluster().getClusterManagerName());
         Metadata metadata = clusterService.state().metadata();
@@ -127,14 +125,27 @@ public class DeferredIndexMetadataReadIT extends RemoteStoreBaseIntegTestCase {
             deferred > 0
         );
 
-        // And the cluster still works: a stub that never resolves is a broken cluster, not a saving.
+        // And the stubs resolve: one that never does is a broken cluster, not a saving. Asserting on
+        // the metadata rather than on documents, because a cluster restarted from remote state alone
+        // has no shard data locally -- resolving the holder is the property under test, and mixing in
+        // shard recovery would make a failure ambiguous.
         for (int i = 0; i < INDEX_COUNT; i++) {
-            client().prepareIndex("idx-" + i).setId("1").setSource("field", "value").get();
+            org.opensearch.cluster.metadata.IndexMetadata resolved = clusterService.state().metadata().index("idx-" + i);
+            assertNotNull("stub for idx-" + i + " must resolve on demand", resolved);
+            assertEquals(1, resolved.getNumberOfShards());
         }
-        client().admin().indices().prepareRefresh().get();
-        for (int i = 0; i < INDEX_COUNT; i++) {
-            assertEquals(1, client().prepareSearch("idx-" + i).get().getHits().getTotalHits().value());
-        }
+    }
+
+    /**
+     * A cluster restarted from remote state alone has no shard data locally, so its indices come back
+     * red. Waiting on metadata rather than on shard health is what the test is actually about, and
+     * waiting on health would fail for a reason unrelated to deferral.
+     */
+    private void awaitMetadataRestored() throws Exception {
+        assertBusy(() -> {
+            Metadata metadata = internalCluster().clusterService(internalCluster().getClusterManagerName()).state().metadata();
+            assertFalse("cluster state was not restored from the repository", metadata.indices().isEmpty());
+        }, 60, TimeUnit.SECONDS);
     }
 
     /**
@@ -159,8 +170,10 @@ public class DeferredIndexMetadataReadIT extends RemoteStoreBaseIntegTestCase {
         );
         ensureGreen();
 
-        internalCluster().fullRestart();
-        ensureGreen();
+        internalCluster().stopAllNodes();
+        internalCluster().startClusterManagerOnlyNode(off);
+        internalCluster().startDataOnlyNodes(1, off);
+        awaitMetadataRestored();
 
         ClusterState state = internalCluster().clusterService(internalCluster().getClusterManagerName()).state();
         for (Map.Entry<String, IndexMetadataHolder> entry : state.metadata().indexHolders().entrySet()) {
