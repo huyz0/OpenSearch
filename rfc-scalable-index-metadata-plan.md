@@ -278,6 +278,37 @@ still a pure performance change with no new SPI and no semantic change.
 
 ### C5. Split `Metadata` into a resident directory and a hydrated index map
 
+**Implemented, in a narrower form than this section proposes.** What shipped is the storage split
+without the hydration protocol. `Metadata` now stores each index behind an `IndexMetadataHolder`:
+name, UUID, state, aliases, the hidden and system flags, the shard count and the routing-pool inputs
+are held directly, and the rest of the `IndexMetadata` is behind a `get()` that an implementation may
+defer. `IndexMetadata` implements that interface itself and returns `this`, so a materialized index is
+what sits in the map -- no wrapper, no allocation, and no measurable cost (see the C5 section of
+`benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.md`). Deferral is opt-in per index via
+`Metadata.Builder#putStub`, and `LazyIndexMetadata` is a working implementation.
+
+The parts of this section that did **not** ship, and why:
+
+- **`Metadata.index(name)` still never returns null for a present index.** The section proposed that a
+  cold index be absent, with hydration at the request boundary. That is a contract change across
+  hundreds of synchronous callers and it is not what the storage split needs: a deferred index resolves
+  on read, synchronously, so nothing downstream sees a different contract. The three routing-absence
+  fixes S1 identified are therefore still pending, and are still a prerequisite for taking cold indices
+  out of `RoutingTable`.
+- **Cold indices are still present in `RoutingTable`.** That is the S6-identified high-value property
+  and it is untouched by this change.
+- **Nothing installs a deferred index.** The saving is available to a store that can fetch one index at
+  a time -- C6 -- and is not realized by this change alone. C6 no longer needs to touch `Metadata` to
+  get it.
+
+Measured on 100k indices with one alias each: 2,944 B/index materialized, 698 B/index deferred, a 4.2x
+reduction. Building metadata, rebuilding the derived name arrays and `indicesLookup`, resolving names
+and aliases, computing a diff and applying a diff all leave an untouched index untouched;
+`DeferredIndexMetadataTests` asserts each of those against a counting loader.
+
+The original proposal follows, since the hydration half of it is still the open work.
+
+
 This is the architectural change, and it is where the prior round failed. The mechanism that
 works is different from what that round proposed.
 
@@ -494,8 +525,9 @@ and `OperationRouting` be satisfied from a compact entry — has been answered: 
 hot-path addition (`defaultSearchPipelineId`) and a short list of extra fields, plus three specific
 source changes so an absent routing entry degrades rather than fails. See S1.
 
-**Implementation status.** C1, C3, C7, a new allocator change (the `balanceByWeights` weight-spread
-skip, from S9) and an auto-expand-replicas guard are implemented, measured and committed; see the
+**Implementation status.** C1, C3, C5 (storage split only -- see that section), C7, a new allocator
+change (the `balanceByWeights` weight-spread skip, from S9) and an auto-expand-replicas guard are
+implemented, measured and committed; see the
 "What was implemented" table in `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.md`. C2's priority has
 dropped: its headline saving assumed 100M indices, and at the allocator-capped reachable scale of
 ~100k it is tens of MB per node rather than tens of GB, so C7 now outranks it.
@@ -529,8 +561,10 @@ Revised ordering, with what each now rests on:
    implications — that cost is harder to justify against the corrected saving.
 5. **C4** — incremental routing rebuild. S6 raises its priority: the allocator is the binding
    constraint, so this is worth more than originally assigned.
-6. **C6** — manifest sharding and public per-index fetch. Needed before C5 is useful.
-7. **C5** — the directory/hydration split, including S1's three routing-absence fixes.
+6. **C6** — manifest sharding and public per-index fetch. Now the change that turns C5's storage
+   split into an actual saving: `Metadata.Builder#putStub` exists, and nothing populates it.
+7. **C5's remaining half** — the hydration protocol and cold-absent routing, including S1's three
+   routing-absence fixes. The storage split under it has shipped.
 
 **What still needs proving, in priority order:**
 

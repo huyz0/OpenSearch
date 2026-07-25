@@ -361,7 +361,7 @@ shards it converts one 53 s reroute into a loop of 20 s reroutes that never conv
 
 ## What was implemented off the back of these spikes
 
-Four core changes, each measured and each with a test verified to actually catch its failure mode
+Six core changes, each measured and each with a test verified to actually catch its failure mode
 (for a behaviour-preserving optimization a green suite proves nothing on its own -- it passes with
 and without the change -- so each was deliberately broken to confirm the guard fails, then restored):
 
@@ -372,9 +372,11 @@ and without the change -- so each was deliberately broken to confirm the guard f
 | `balanceByWeights` weight-spread skip | ~800k redundant decider calls per reroute | steady-state 445/355 ms -> 287 ms at 40k shards |
 | auto-expand-replicas guard | a *second* cluster-wide `RoutingNodes` build + per-index settings parse, every reroute | forcing the guard on fails 3 of 5 `AutoExpandReplicasTests` |
 | batched index creation (C7) | N cluster-state cycles for N index creations, collapsed to one | breaking the fold fails `CreateIndexBatchingTests` |
+| `IndexMetadataHolder` storage split (C5) | the requirement that every index in cluster state be fully materialized | 2,944 -> 698 B/index deferred, no measurable cost materialized; see below |
 
-All five are pre-existing waste in current OpenSearch rather than scaling-only concerns; the
-tenant-scale investigation simply made them visible.
+The first five are pre-existing waste in current OpenSearch rather than scaling-only concerns; the
+tenant-scale investigation simply made them visible. C5 is the exception -- it is the one change here
+that exists only for the tenant-scale case, and it changes no behaviour on its own.
 
 Two lessons from the C7 change are worth carrying forward. First, its focused suites passed 2,400
 tests while a wider sweep found 10 failures: `ClusterStateChanges` mocked only the singular
@@ -488,6 +490,69 @@ deferred payoff, and pure cost permanently if the follow-on never lands. So C5 d
 into a safe, independently-valuable first step; it wants to be done as one reviewed piece of work
 with the trade already accepted.
 
+## C5 -- implemented, and two of S10's numbers corrected
+
+S10 measured a union in which every entry is a wrapper object holding the `IndexMetadata`. Two of its
+conclusions were artifacts of that shape rather than of C5:
+
+- resolved lookups cost +5-6%;
+- "C5 does not decompose into a safe, independently-valuable first step", because introducing the
+  indirection with everything pre-resolved would be pure cost.
+
+The shape that shipped has no wrapper. `IndexMetadata` implements the new `IndexMetadataHolder`
+interface itself and returns `this` from `get()`, so a materialized index is what sits in the map --
+nothing to allocate, nothing extra to traverse. That makes the pre-resolved state free, which is
+exactly the property S10 said C5 lacked, and it is what allows the change to ship ahead of C6.
+
+**Cost on a materialized index: below the noise floor.** `HolderLookupCostBenchmark`, 15 alternating
+rounds of 20M lookups, both arms in the same JVM:
+
+| run | direct `map.get(...)` | through `holder.get()` | delta |
+|---|---|---|---|
+| 1 | 3.240 ns | 3.178 ns | -0.063 ns (-1.9%) |
+| 2 | 3.160 ns | 3.157 ns | -0.003 ns (-0.1%) |
+
+Round-to-round spread was 0.25-0.49 ns, so neither delta means anything except "smaller than the
+noise". The first version of this benchmark compared `Metadata.index` across two JVMs, one on the
+pre-change tree and one after: 5.30 ns before, 5.13 ns after, with individual rounds ranging
+4.87-7.03 ns for identical code. Same conclusion, but with the spread roughly 10x the effect being
+measured, so the within-process A/B is the number to cite and the cross-JVM one is not evidence of
+anything.
+
+**Saving: 4.2x, not 14.2x.** S10 measured a bare `HashMap` of minimal stubs and got 2,074 -> 146
+B/index. `DeferredMetadataHeapEstimate` measures a real `Metadata` holding real `LazyIndexMetadata`,
+100k indices with one alias each -- the shipped thing rather than an upper bound:
+
+| | retained | per index |
+|---|---|---|
+| materialized | 280.8 MB | 2,944 B |
+| deferred | 66.6 MB | 698 B |
+
+The gap between 146 B and 698 B is what S10's isolation left out, in two parts. The descriptor has to
+carry everything `Metadata`'s build path reads -- aliases, the hidden and system flags, the shard
+count, the routing-pool inputs -- not just a name and a loader. And `Metadata` keeps per-index state
+that deferral does not touch at all: an `IndexAbstraction` per index and per alias, entries in the
+derived name arrays, and the map and `indicesLookup` entries themselves.
+
+**What stays lazy.** Building metadata, rebuilding the derived name arrays, building `indicesLookup`,
+resolving names and aliases, computing a diff, and applying a diff all leave an untouched index
+untouched. Diff computation compares holders, so an index both cluster states share is settled by
+reference without loading; diff application walks the deletes/diffs/upserts directly and loads only
+what actually changed. `DeferredIndexMetadataTests` asserts each of these with a loader that counts
+calls, and each assertion was confirmed to fail when the corresponding production change is undone.
+
+**What does not.** Serialization writes resolved metadata, so the wire format is byte-identical and
+writing out a full `Metadata` loads everything -- correct, since that is a full-state publication.
+Data-stream backing indices are materialized when the lookup is built, because
+`IndexAbstraction.DataStream` is `@PublicApi` and takes `IndexMetadata`; concrete indices and aliases,
+which is nearly all of them, are not.
+
+**What this is not.** No core path installs a deferred index, so nothing changes for an existing
+cluster. The 4.2x is available to a metadata store that can fetch one index at a time -- C6 -- and is
+not realized by this change on its own. What this change buys is that C6 no longer needs to touch
+`Metadata`: `Metadata.Builder#putStub` is the seam, and `LazyIndexMetadata` is a working
+implementation of it.
+
 ## What the plan got wrong
 
 | plan claim | measured | effect |
@@ -498,6 +563,8 @@ with the trade already accepted.
 | parsed mapper graph 30-80 KB | 45-237 KB, ~255× compressed | data-node capacity is tighter than assumed |
 | C1 is a trivially safe first PR | safe only with a non-seeding builder path | still first, but needs a specific implementation |
 | dedup helps broadly | cluster state only, 0.08% effect on parsed graph | scope narrowed, value confirmed for its actual scope |
+| S10: stub union costs +5-6% on resolved lookups | 0%, once `IndexMetadata` is its own holder | C5 shippable ahead of C6 |
+| S10: deferral saves 14.2x | 4.2x in a real `Metadata` | still large, but the headline was an isolated-map upper bound |
 
 ## What holds up
 

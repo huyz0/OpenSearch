@@ -88,3 +88,11 @@ spotless {
 
 // Add support for incubator modules on supported Java versions.
 run.jvmArgs += ['--add-modules=jdk.incubator.vector']
+
+// Prints the runtime classpath so the one-off spike mains under
+// org.opensearch.benchmark.clusterstate can be run with `java -cp`.
+tasks.register('printRuntimeClasspath') {
+    doLast {
+        println sourceSets.main.runtimeClasspath.asPath
+    }
+}
