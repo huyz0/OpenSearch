@@ -43,26 +43,22 @@ import static org.opensearch.gateway.remote.RemoteClusterStateService.REMOTE_CLU
  * result.</b> With both settings on, five indices created and the whole cluster restarted, every
  * holder in the restored {@code Metadata} comes back materialized. Not some -- all five.
  *
- * <p>Two candidate explanations, neither yet eliminated:
+ <p><b>D1b diagnosed it: the read path never runs here.</b> The alarming explanation was that
+ * something resolves the stubs during {@code Metadata} construction, which would make C5's premise
+ * false on the real path. It does not. {@code RemoteClusterStateServiceTests}'
+ * {@code testDeferredIndexIsInstalledWithoutFetchingItsBlob} drives
+ * {@code readClusterStateInParallel} directly and gets back an unresolved holder, so the deferral
+ * logic works where it is exercised.
  *
- * <ol>
- *   <li><b>The remote read path never runs.</b> An {@code internalCluster()} full restart recovers
- *       from the local gateway, so the repository may not be read at all. The first version of this
- *       test restarted only the cluster-manager and got the same result for a definitely-different
- *       reason -- it rejoined by publication -- so "the read path did not run" has already fooled
- *       this test once.</li>
- *   <li><b>Something resolves the stubs during {@code Metadata} construction.</b> This is the
- *       serious one. C5's premise is that building {@code Metadata}, its derived arrays and its
- *       {@code indicesLookup} never materializes a holder. {@code DeferredIndexMetadataTests} proves
- *       that for a hand-built {@code Metadata}; it does not prove it for the path a real full-state
- *       read takes, which runs validation and construction this test is the first thing to
- *       exercise.</li>
- * </ol>
+ * <p>What is left is the harness: an {@code internalCluster()} restart -- of one node or of all of
+ * them -- recovers cluster state from the local gateway, so the repository is never read and the
+ * deferral branch never executes. That had already fooled this test once, when the first version
+ * restarted only the cluster-manager and it rejoined by publication; a full restart produced the same
+ * symptom for the same underlying reason rather than a different one.
  *
- * <p>Distinguishing them is the next task: assert on {@code RemoteClusterStateService}'s own read
- * path directly, so "the read ran" and "the read deferred" are separate observations rather than one
- * conflated assertion. Until then D2's decision to keep both settings off has evidence behind it
- * rather than only a cost argument.
+ * <p>So the gap is in coverage rather than in C5 or C6, and closing it means forcing a genuine remote
+ * read -- see {@code RemoteStoreClusterStateRestoreIT} for the pattern, which wipes local state so
+ * recovery has to come from the repository.
  *
  * <p>The control below passes, and is kept precisely so that this class does not become a test that
  * only ever fails: with the settings off, every holder is materialized, which confirms the assertion

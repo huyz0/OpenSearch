@@ -48,7 +48,8 @@ request today, and the rest are latent. Nothing yet makes an index routing-absen
 | C3b first slice (shard ref type) | done, tested |
 | C5 codec bump | blocked: needs a release-version decision |
 | D1 integration test | done -- found deferral does not engage |
-| D1b diagnose the deferral gap | open, next |
+| D1b diagnose the deferral gap | done: harness, not code |
+| D1c force a real remote read in the IT | open |
 | A7.7 snapshot generation preconditions | done, tested |
 | A5.1 cold-vs-gone | done, tested |
 | A5.2 + A5.3 prune + recreate | done, tested, off by default |
@@ -556,9 +557,28 @@ Two candidate explanations, neither eliminated:
    `DeferredIndexMetadataTests` proves that for a hand-built `Metadata`; it does not prove it for the
    path a real full-state read takes, and this test is the first thing to exercise that path.
 
-**Next task, D1b:** separate the two observations. Assert on `RemoteClusterStateService`'s read path
-directly so "the read ran" and "the read deferred" are distinguishable, rather than conflated into one
-assertion that fails for either reason.
+### D1b. Which explanation? -- ANSWERED: the harness, not the code
+
+**The alarming one is ruled out.** `RemoteClusterStateServiceTests.testDeferredIndexIsInstalledWithoutFetchingItsBlob`
+drives `readClusterStateInParallel` directly and gets back an unresolved holder, alongside two
+siblings covering deferral-off and descriptor-absent. All three pass. So the deferral logic works
+where it is exercised, and C5's premise -- that building `Metadata` and its derived structures never
+materializes a holder -- is not falsified by the real read path.
+
+**What is left is the harness.** An `internalCluster()` restart, of one node or all of them, recovers
+cluster state from the local gateway, so the repository is never read and the deferral branch never
+executes. That had already fooled this test once: the first version restarted only the
+cluster-manager, which rejoins by publication, and a full restart then produced the same symptom for
+the same underlying reason rather than a different one.
+
+**So the gap is coverage, not correctness.** D1's `@AwaitsFix` now names that, and closing it means
+forcing a genuine remote read -- `RemoteStoreClusterStateRestoreIT` has the pattern, wiping local
+state so recovery must come from the repository. That is **D1c**, and it is the one remaining piece of
+end-to-end evidence for C5 and C6.
+
+**What this does and does not change for D2.** It removes the reason to suspect the feature is broken,
+which is worth a lot. It does not turn the settings on: the cost argument stands unchanged, and there
+is still no end-to-end run showing the saving in a real cluster.
 
 The control -- settings off, every holder materialized -- passes, which is what confirms the assertion
 mechanism reads what it claims to. Without it the failure would be indistinguishable from a broken
