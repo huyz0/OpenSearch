@@ -43,6 +43,7 @@ import org.opensearch.action.support.PlainActionFuture;
 import org.opensearch.action.support.broadcast.BroadcastRequest;
 import org.opensearch.action.support.broadcast.BroadcastResponse;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.routing.RoutingTable;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.routing.ShardRoutingState;
 import org.opensearch.cluster.service.ClusterService;
@@ -87,6 +88,8 @@ import static org.opensearch.action.support.replication.ClusterStateCreationUtil
 import static org.opensearch.action.support.replication.ClusterStateCreationUtils.stateWithNoShard;
 import static org.opensearch.test.ClusterServiceUtils.createClusterService;
 import static org.opensearch.test.ClusterServiceUtils.setState;
+import static org.hamcrest.Matchers.empty;
+import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.instanceOf;
 import static org.hamcrest.Matchers.lessThanOrEqualTo;
@@ -255,6 +258,28 @@ public class BroadcastReplicationTests extends OpenSearchTestCase {
         List<ShardId> shards = broadcastReplicationAction.shards(new DummyBroadcastRequest().indices(shardId.getIndexName()), clusterState);
         assertThat(shards.size(), equalTo(1));
         assertThat(shards.get(0), equalTo(shardId));
+    }
+
+    /**
+     * An index can be in metadata without being in the routing table. {@code shards()} guarded the
+     * metadata lookup but then dereferenced the routing lookup unconditionally, so that combination
+     * threw a NullPointerException out of the broadcast rather than resolving to no shards, which is
+     * what the rest of this family does with an absent routing entry.
+     */
+    public void testIndexWithoutRoutingTableEntryResolvesToNoShards() {
+        final String index = "test";
+        ClusterState withRouting = state(index, randomBoolean(), ShardRoutingState.STARTED);
+        // Same metadata, routing table emptied -- the shape the null check was missing.
+        ClusterState withoutRouting = ClusterState.builder(withRouting).routingTable(RoutingTable.builder().build()).build();
+        assertTrue("the index must still be in metadata", withoutRouting.metadata().hasIndex(index));
+        assertNull("...and absent from routing", withoutRouting.routingTable().index(index));
+
+        List<ShardId> shards = broadcastReplicationAction.shards(new DummyBroadcastRequest().indices(index), withoutRouting);
+
+        assertThat(shards, empty());
+        // The same request against the same metadata *with* routing still finds its shards, so this is
+        // not passing by resolving nothing at all.
+        assertThat(broadcastReplicationAction.shards(new DummyBroadcastRequest().indices(index), withRouting), not(empty()));
     }
 
     private class TestBroadcastReplicationAction extends TransportBroadcastReplicationAction<

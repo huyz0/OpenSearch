@@ -41,9 +41,9 @@ import org.opensearch.action.support.broadcast.BroadcastRequest;
 import org.opensearch.action.support.broadcast.BroadcastResponse;
 import org.opensearch.action.support.broadcast.BroadcastShardOperationFailedException;
 import org.opensearch.cluster.ClusterState;
-import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.ResolvedIndices;
+import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.util.concurrent.CountDown;
@@ -165,13 +165,13 @@ public abstract class TransportBroadcastReplicationAction<
         List<ShardId> shardIds = new ArrayList<>();
         Set<String> concreteIndices = resolveIndices(request, clusterState).namesOfConcreteIndices();
         for (String index : concreteIndices) {
-            IndexMetadata indexMetadata = clusterState.metadata().getIndices().get(index);
-            if (indexMetadata != null) {
-                for (IndexShardRoutingTable shardRouting : clusterState.getRoutingTable()
-                    .indicesRouting()
-                    .get(index)
-                    .getShards()
-                    .values()) {
+            // Both lookups have to be guarded. The metadata check alone was not enough: an index present
+            // in metadata but absent from the routing table dereferenced null here. The rest of this
+            // family already treats an absent routing entry as no shards -- see
+            // RoutingTable#allShardsSatisfyingPredicate -- so do the same rather than fail the request.
+            IndexRoutingTable indexRouting = clusterState.getRoutingTable().index(index);
+            if (clusterState.metadata().hasIndex(index) && indexRouting != null) {
+                for (IndexShardRoutingTable shardRouting : indexRouting.getShards().values()) {
                     shardIds.add(shardRouting.shardId());
                 }
             }

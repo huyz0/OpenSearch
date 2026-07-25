@@ -359,7 +359,19 @@ call sites convert graceful degradation into hard failure if an entry simply dis
   `ReroutePhase` and `TransportBulkAction:741` would fail immediately instead of taking their
   existing retry-and-wait-for-allocation branch.
 - `TransportBroadcastReplicationAction:170` dereferences `indicesRouting().get(index)` with no null
-  check — NPE.
+  check — NPE. **Fixed.** This one stands on its own: the same `if` guarded the metadata lookup and
+  not the routing lookup, so an index in metadata but not in routing threw a `NullPointerException`
+  out of the broadcast. It now resolves to no shards, which is what the rest of the family already
+  does (`RoutingTable.allShardsSatisfyingPredicate:329-332`).
+
+  The other two are **deliberately not done yet.** Both change the contract of a method that search
+  and replication depend on: `OperationRouting.indexRoutingTable` turning an `IndexNotFoundException`
+  into graceful degradation changes a 404 into a 200-with-per-shard-failures, and
+  `RoutingTable.shardRoutingTable(ShardId)` turning a throw into an absence changes what
+  `TransportReplicationAction`'s `ReroutePhase` sees. Neither is a bug today; they are only correct
+  once an index can legitimately be absent from the routing table, and that is the cold-absent-routing
+  work they are a prerequisite for. Shipping them before it would change live behaviour on the search
+  and write paths with nothing on the other side of the trade.
 
 The broadcast-by-node family already treats absent as no-shards
 (`RoutingTable.allShardsSatisfyingPredicate:329-332` skips missing indices explicitly), so this is
