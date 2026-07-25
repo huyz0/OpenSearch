@@ -371,9 +371,19 @@ and without the change -- so each was deliberately broken to confirm the guard f
 | `RoutingNodes.localRoutingNode` | cluster-wide `RoutingNodes` allocation on every data node, every applied state | S6 measured 43-52 ms/state at 40k shards |
 | `balanceByWeights` weight-spread skip | ~800k redundant decider calls per reroute | steady-state 445/355 ms -> 287 ms at 40k shards |
 | auto-expand-replicas guard | a *second* cluster-wide `RoutingNodes` build + per-index settings parse, every reroute | forcing the guard on fails 3 of 5 `AutoExpandReplicasTests` |
+| batched index creation (C7) | N cluster-state cycles for N index creations, collapsed to one | breaking the fold fails `CreateIndexBatchingTests` |
 
-All four are pre-existing waste in current OpenSearch rather than scaling-only concerns; the
+All five are pre-existing waste in current OpenSearch rather than scaling-only concerns; the
 tenant-scale investigation simply made them visible.
+
+Two lessons from the C7 change are worth carrying forward. First, its focused suites passed 2,400
+tests while a wider sweep found 10 failures: `ClusterStateChanges` mocked only the singular
+`submitStateUpdateTask`, so batched submissions were silently dropped. Run a wider net than the
+change appears to touch. Second, the first batching test was **vacuous** -- breaking the fold did
+not fail it, because that path submits one task per call and the batch is always size one. Only
+driving the executor directly with a real multi-task batch tested anything. For a behaviour-
+preserving change, a green suite proves nothing until you have broken the code and watched the test
+fail.
 
 ## Recalibration: C2's headline number does not survive S6
 

@@ -445,7 +445,7 @@ and `OperationRouting` be satisfied from a compact entry — has been answered: 
 hot-path addition (`defaultSearchPipelineId`) and a short list of extra fields, plus three specific
 source changes so an absent routing entry degrades rather than fails. See S1.
 
-**Implementation status.** C1, C3, a new allocator change (the `balanceByWeights` weight-spread
+**Implementation status.** C1, C3, C7, a new allocator change (the `balanceByWeights` weight-spread
 skip, from S9) and an auto-expand-replicas guard are implemented, measured and committed; see the
 "What was implemented" table in `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.md`. C2's priority has
 dropped: its headline saving assumed 100M indices, and at the allocator-capped reachable scale of
@@ -457,9 +457,9 @@ Revised ordering, with what each now rests on:
    and found the trap: supply `previousMetadata` **without** seeding the index map.
 2. **C3** — local-node routing view. S6 measured the win: 52 ms per applied cluster state at 40k
    shards, on every data node. Promoted above dedup.
-3. **C7** — batch create-index/update-settings. Promoted above dedup: provisioning throughput
-   matters at any scale, and S6 showed cold allocation is superlinear, so batching creates helps
-   exactly where the cluster is most fragile.
+3. **C7 — done for create-index.** A shared batching executor now folds N creations into one
+   cluster-state update with per-task failure isolation. `update-settings` remains unbatched and is
+   the natural follow-on, using the same shape.
 
    *Feasibility confirmed.* `MetadataCreateIndexService.applyCreateIndexRequest(ClusterState,
    request, silent)` both takes and returns a `ClusterState`, so it composes: a batching
