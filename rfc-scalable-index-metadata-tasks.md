@@ -51,8 +51,12 @@ are latent defects today, reachable whenever metadata and routing disagree, exac
 
 Do them in this order, most reachable first:
 
-- A7.1 `ClusterIndexHealth:157` iterates the routing table directly. Fixing it there fixes
-  `TieringRequestValidator:141` and `TieringServiceValidator:189` together, and any future caller.
+- A7.1 -- DONE, though not where expected. `ClusterIndexHealth` is `@PublicApi` and `ClusterStateHealth`
+  already *skips* an index with no routing entry rather than reporting on it, so teaching the
+  constructor to accept null would have invented a health semantic for a state core deliberately
+  excludes. Guarded the two callers instead, matching that convention:
+  `TieringRequestValidator:141` reports not-healthy, `TieringServiceValidator:189` rejects with
+  `INDEX_RED_STATUS`. Both tests reproduce the original NPE when the guard is removed.
 - A7.2 Request paths: `TransportAnalyzeAction:142`, `TransportGetFieldMappingsIndexAction:115`,
   `TransportUpdateAction:214`, `TransportUpgradeAction:202`. All should report no shard available
   rather than NPE.

@@ -119,6 +119,27 @@ public class TieringRequestValidatorTests extends OpenSearchTestCase {
         assertTrue(validateIndexHealth(clusterState, new Index(indexName, indexUuid)));
     }
 
+    /**
+     * An index can be in metadata without a routing entry. {@code ClusterIndexHealth} iterates the
+     * routing table it is handed, so this used to throw a NullPointerException out of validation.
+     * {@code ClusterStateHealth} already skips such an index rather than reporting on it; this must not
+     * report it healthy either.
+     */
+    public void testIndexWithoutRoutingTableIsNotHealthy() {
+        String indexUuid = UUID.randomUUID().toString();
+        String indexName = "test_index";
+        ClusterState withRouting = buildClusterState(indexName, indexUuid, Settings.EMPTY);
+        ClusterState withoutRouting = ClusterState.builder(withRouting).routingTable(RoutingTable.builder().build()).build();
+        Index index = new Index(indexName, indexUuid);
+
+        assertTrue("the index must still be in metadata", withoutRouting.metadata().hasIndex(indexName));
+        assertNull("...and absent from routing", withoutRouting.routingTable().index(indexName));
+
+        assertFalse(validateIndexHealth(withoutRouting, index));
+        // Not passing by rejecting everything: the same index with routing is still healthy.
+        assertTrue(validateIndexHealth(withRouting, index));
+    }
+
     public void testValidOpenIndex() {
         String indexUuid = UUID.randomUUID().toString();
         String indexName = "test_index";

@@ -139,6 +139,13 @@ public class TieringRequestValidator {
      */
     static boolean validateIndexHealth(final ClusterState currentState, final Index index) {
         final IndexRoutingTable indexRoutingTable = currentState.routingTable().index(index);
+        if (indexRoutingTable == null) {
+            // An index in metadata with no routing entry has no shards to assess, and
+            // ClusterIndexHealth iterates the routing table it is handed. Treat it the way
+            // ClusterStateHealth already treats such an index -- as not something to report healthy --
+            // rather than dereferencing null.
+            return false;
+        }
         final IndexMetadata indexMetadata = currentState.metadata().index(index);
         final ClusterIndexHealth indexHealth = new ClusterIndexHealth(indexMetadata, indexRoutingTable);
         return !ClusterHealthStatus.RED.equals(indexHealth.getStatus());

@@ -51,12 +51,17 @@ dereferenced without a null check.
 Snapshotting a cold index is a real scenario, so these need a decision, not just a guard: is a cold
 index snapshotted from its remote state, or skipped?
 
-**Health, via a shared constructor:**
+**Health, via a shared constructor (FIXED):**
 
 `TieringRequestValidator:141` and `TieringServiceValidator:189` both build
 `new ClusterIndexHealth(indexMetadata, indexRoutingTable)`, and that constructor iterates the routing
-table directly at `ClusterIndexHealth:157`. So the NPE is one level down and shared. Fixing
-`ClusterIndexHealth` to treat null as "no shards, status RED" fixes both call sites and any future one.
+table directly at `ClusterIndexHealth:157`. So the NPE is one level down and shared.
+
+Fixed at the two callers rather than in the constructor. `ClusterIndexHealth` is `@PublicApi`, and
+`ClusterStateHealth:98-102` -- the primary consumer, and the thing that defines what health means --
+already skips an index whose routing entry is null instead of reporting on it. Teaching the
+constructor to accept null would have invented a health status for a state core deliberately excludes
+from health. The two validators now follow the existing convention: not healthy enough to tier.
 
 **Resize, merge and allocation paths:**
 

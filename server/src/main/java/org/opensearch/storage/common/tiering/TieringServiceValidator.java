@@ -188,8 +188,12 @@ public class TieringServiceValidator {
     private static void validateIndexHealth(ClusterState clusterState, Index index, IndexModule.TieringState finalIndexType) {
         final IndexRoutingTable indexRoutingTable = clusterState.routingTable().index(index);
         final IndexMetadata indexMetadata = clusterState.metadata().index(index);
-        final ClusterIndexHealth indexHealth = new ClusterIndexHealth(indexMetadata, indexRoutingTable);
-        if (ClusterHealthStatus.RED.equals(indexHealth.getStatus())) {
+        // An index in metadata with no routing entry has no shards to assess, and ClusterIndexHealth
+        // iterates the routing table it is handed. Reject it for the same reason a RED index is
+        // rejected, rather than dereferencing null.
+        final boolean unhealthy = indexRoutingTable == null
+            || ClusterHealthStatus.RED.equals(new ClusterIndexHealth(indexMetadata, indexRoutingTable).getStatus());
+        if (unhealthy) {
             final String errorMsg = "Rejecting tiering request because index ["
                 + index.getName()
                 + "] is in RED status and cannot be migrated to ["
