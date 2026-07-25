@@ -51,7 +51,7 @@ request today, and the rest are latent. Nothing yet makes an index routing-absen
 | A5.4 decider still needed? | decided: yes, unchanged |
 | A2, A3 | blocked on A5 |
 | A4 spike | done |
-| A6 | first half done |
+| A6 | done, both halves |
 
 ### A1. Audit every caller that assumes a routing entry exists -- DONE
 
@@ -210,6 +210,13 @@ independent reasons, any one of which is sufficient:
 A partially suspended index still pays the held-down per-suspended-shard reroute cost, so the realised
 saving in a fleet depends on how many tenants go fully quiescent rather than how many shards do.
 A6's second half should measure a mixed fleet, not only the all-or-nothing shape it measured first.
+
+**A6 second half -- DONE, and it caps the headline.** With the cold population fixed at 10,000 and
+only the fully-quiescent fraction varying, steady reroute runs 369 / 195 / 41 / 17 ms at 0 / 50 / 90 /
+100 percent. Linear in the fraction, no threshold in either direction, so a partial rollout
+extrapolates. The 17x is the best case rather than the expected one: a fleet where suspension is
+spread thinly across many partly-idle indices saves nothing while still carrying all of A5's
+lifecycle risk. Whether that fleet shape occurs is a workload question, and it now belongs to D2.
 - Check whether `SuspendedShardAllocationDecider` is still needed for the window between marking and
   eviction, now that the allocator stops seeing the shard afterwards.
 

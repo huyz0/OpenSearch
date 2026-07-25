@@ -631,6 +631,38 @@ the ~100k *active* shard ceiling S6 measured.
 `SuspendedShardAllocationDecider` itself, and the active set is small. The shape of the curve is the
 result, not the constant.
 
+### A6 second half -- the saving tracks quiescent *tenants*, not quiescent shards
+
+The comparison above is all-or-nothing: every cold index is either held down or absent. Real fleets
+are not. A5.2 only prunes an index that is cold in every shard and every configured role, because the
+routing entry is per-index while suspension is per-shard-per-role. An index with one still-hot shard
+keeps its entry indefinitely, and its suspended shards go on being held down forever.
+
+So the question an operator actually has is what fraction of *tenants* go fully quiescent. Cold
+population fixed at 10,000, varying only that fraction:
+
+| fully cold | steady reroute | shards in routing |
+|---|---|---|
+| 0% | 369 ms | 21,000 |
+| 50% | 195 ms | 11,000 |
+| 90% | 41 ms | 3,000 |
+| 100% | 17 ms | 1,000 |
+
+**Linear in the fraction, with no threshold effect in either direction.** Half the tenants fully
+quiescent gives about half the saving; there is no point at which pruning starts paying off sharply,
+and no point past which it stops helping. That is the useful shape, because it means the feature can
+be evaluated on a partial rollout and the result extrapolates.
+
+The absolute numbers in this run are higher than the table above (369 ms at 0% against 154-171 ms for
+the same shape) because the two runs were taken on a differently loaded machine. Compare ratios across
+rows within a run, not milliseconds across runs; the 100% column reproduces the roughly 20x of the
+all-or-nothing comparison.
+
+**What this changes.** The 17x headline is the best case, not the expected case. A fleet where
+suspension is spread thinly across many partly-idle indices saves nothing at all, and would still pay
+the full held-down cost while carrying all of A5's lifecycle risk. Whether that fleet shape occurs is
+a workload question this cannot answer, and it belongs in the D2 defaults decision.
+
 ## What the plan got wrong
 
 | plan claim | measured | effect |

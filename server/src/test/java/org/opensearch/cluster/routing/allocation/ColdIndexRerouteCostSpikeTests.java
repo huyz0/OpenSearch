@@ -61,18 +61,70 @@ public class ColdIndexRerouteCostSpikeTests extends OpenSearchAllocationTestCase
         }
     }
 
+    /**
+     * What the saving actually looks like in a fleet, which is not what the all-or-nothing comparison
+     * above measures.
+     *
+     * <p>A5.2's pruning only fires when an index is cold in <em>every</em> shard and <em>every</em>
+     * configured role, because the routing entry is per-index while suspension is per-shard-per-role.
+     * An index with one still-hot shard keeps its entry indefinitely and its suspended shards go on
+     * being held down by {@code SuspendedShardAllocationDecider} forever. So the realised saving
+     * tracks the fraction of <em>tenants</em> that go fully quiescent, not the fraction of shards --
+     * and a fleet where suspension is spread thinly across many indices saves nothing at all.
+     *
+     * <p>Holds the cold population fixed and varies only that fraction, which is the number an
+     * operator would actually need to reason about.
+     */
+    public void testRerouteCostAgainstTheFractionOfFullyColdTenants() {
+        int coldIndices = 10_000;
+        logger.info("--- mixed fleet: {} cold indices, {} active, {} nodes ---", coldIndices, ACTIVE_INDICES, NODES);
+        logger.info("fullyColdPercent | steadyRerouteMs | routingNodesBuildMs | totalShardsInRouting");
+
+        for (int percent : new int[] { 0, 50, 90, 100 }) {
+            measureMixed(percent, coldIndices);
+        }
+    }
+
+    private void measureMixed(int fullyColdPercent, int coldIndices) {
+        AllocationService service = allocationService();
+        int prunable = (coldIndices * fullyColdPercent) / 100;
+
+        Metadata.Builder metadata = Metadata.builder();
+        RoutingTable.Builder routingTable = RoutingTable.builder();
+        addActiveIndices(metadata, routingTable);
+        for (int i = 0; i < coldIndices; i++) {
+            IndexMetadata indexMetadata = coldIndexMetadata("cold-" + i);
+            metadata.put(indexMetadata, false);
+            // Only the fully cold fraction is prunable; the rest keeps its entry, held down.
+            if (i >= prunable) {
+                routingTable.addAsNew(indexMetadata);
+            }
+        }
+
+        ClusterState state = settle(service, buildState(metadata, routingTable));
+        report(String.valueOf(fullyColdPercent) + "%", coldIndices, service, state);
+    }
+
     private void measure(String shape, int coldIndices, boolean coldInRoutingTable) {
-        AllocationService service = createAllocationService(
+        AllocationService service = allocationService();
+        ClusterState state = settle(service, buildState(coldIndices, coldInRoutingTable));
+        report(shape, coldIndices, service, state);
+    }
+
+    private AllocationService allocationService() {
+        return createAllocationService(
             Settings.builder()
                 .put("cluster.routing.allocation.node_concurrent_recoveries", Integer.MAX_VALUE)
                 .put("cluster.routing.allocation.node_initial_primaries_recoveries", Integer.MAX_VALUE)
                 .build()
         );
+    }
 
-        ClusterState state = buildState(coldIndices, coldInRoutingTable);
-
-        // Drive the active shards to STARTED. The cold ones never start: either they are unassignable
-        // or they are not in the routing table to begin with.
+    /**
+     * Drives the active shards to STARTED. The cold ones never start: either they are unassignable or
+     * they are not in the routing table to begin with.
+     */
+    private ClusterState settle(AllocationService service, ClusterState state) {
         state = service.reroute(state, "spike");
         int guard = 0;
         while (state.getRoutingNodes().shardsWithState(ShardRoutingState.INITIALIZING).isEmpty() == false) {
@@ -81,7 +133,10 @@ public class ColdIndexRerouteCostSpikeTests extends OpenSearchAllocationTestCase
                 fail("cluster did not settle");
             }
         }
+        return state;
+    }
 
+    private void report(String shape, int coldIndices, AllocationService service, ClusterState state) {
         long steadyStart = System.nanoTime();
         ClusterState steady = service.reroute(state, "spike-steady");
         long steadyMs = (System.nanoTime() - steadyStart) / 1_000_000;
@@ -106,7 +161,19 @@ public class ColdIndexRerouteCostSpikeTests extends OpenSearchAllocationTestCase
     private ClusterState buildState(int coldIndices, boolean coldInRoutingTable) {
         Metadata.Builder metadata = Metadata.builder();
         RoutingTable.Builder routingTable = RoutingTable.builder();
+        addActiveIndices(metadata, routingTable);
 
+        for (int i = 0; i < coldIndices; i++) {
+            IndexMetadata indexMetadata = coldIndexMetadata("cold-" + i);
+            metadata.put(indexMetadata, false);
+            if (coldInRoutingTable) {
+                routingTable.addAsNew(indexMetadata);
+            }
+        }
+        return buildState(metadata, routingTable);
+    }
+
+    private static void addActiveIndices(Metadata.Builder metadata, RoutingTable.Builder routingTable) {
         for (int i = 0; i < ACTIVE_INDICES; i++) {
             IndexMetadata indexMetadata = IndexMetadata.builder("active-" + i)
                 .settings(Settings.builder().put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT))
@@ -116,30 +183,29 @@ public class ColdIndexRerouteCostSpikeTests extends OpenSearchAllocationTestCase
             metadata.put(indexMetadata, false);
             routingTable.addAsNew(indexMetadata);
         }
+    }
 
-        for (int i = 0; i < coldIndices; i++) {
-            // allocation.enable=none stands in for the suspended-shard decider: the shard is in the
-            // routing table, unassigned, and no node will ever be allowed to take it.
-            IndexMetadata indexMetadata = IndexMetadata.builder("cold-" + i)
-                .settings(
-                    Settings.builder()
-                        .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
-                        .put("index.routing.allocation.enable", "none")
-                )
-                .numberOfShards(1)
-                .numberOfReplicas(REPLICAS)
-                .build();
-            metadata.put(indexMetadata, false);
-            if (coldInRoutingTable) {
-                routingTable.addAsNew(indexMetadata);
-            }
-        }
+    /**
+     * allocation.enable=none stands in for the suspended-shard decider: the shard is in the routing
+     * table, unassigned, and no node will ever be allowed to take it.
+     */
+    private static IndexMetadata coldIndexMetadata(String name) {
+        return IndexMetadata.builder(name)
+            .settings(
+                Settings.builder()
+                    .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+                    .put("index.routing.allocation.enable", "none")
+            )
+            .numberOfShards(1)
+            .numberOfReplicas(REPLICAS)
+            .build();
+    }
 
+    private ClusterState buildState(Metadata.Builder metadata, RoutingTable.Builder routingTable) {
         DiscoveryNodes.Builder nodes = DiscoveryNodes.builder();
         for (int i = 0; i < NODES; i++) {
             nodes.add(newNode("node-" + i));
         }
-
         return ClusterState.builder(ClusterName.DEFAULT).metadata(metadata).routingTable(routingTable.build()).nodes(nodes).build();
     }
 }
