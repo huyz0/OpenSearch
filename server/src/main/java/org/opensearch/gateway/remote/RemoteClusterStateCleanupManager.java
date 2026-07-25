@@ -248,6 +248,14 @@ public class RemoteClusterStateCleanupManager implements Closeable {
             // Recorded as the loops run rather than in a scan beforehand: a separate pass would fetch
             // every manifest a second time, and nothing is deleted until both loops have finished
             // anyway, so noticing partway through is early enough.
+            //
+            // This method runs once per cleanup batch, so the guard is per batch rather than per
+            // sweep -- an earlier batch could in principle delete before a later one meets the
+            // unreadable manifest. It does not, for a reason rather than by luck: the caller passes
+            // the same newest `manifestsToRetain` blobs to every batch, and during a rolling upgrade
+            // the newer node's manifests are the newest ones, so a future-codec manifest is in the
+            // retained set the first batch sees. A future-codec manifest that is *stale* rather than
+            // retained can be missed by an earlier batch, but that direction only under-deletes.
             AtomicInteger unreadableCodec = new AtomicInteger(ClusterMetadataManifest.CODEC_V0);
 
             Set<String> filesToKeep = new HashSet<>();
