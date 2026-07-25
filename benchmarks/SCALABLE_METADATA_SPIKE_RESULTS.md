@@ -437,6 +437,42 @@ does nothing for the parsed `MapperService` graph (0.08% effect), this moves C2 
 (provisioning throughput, which matters at any scale) in priority. Recorded here because the
 1000x figure would otherwise justify a wire-format change on false pretences.
 
+## S10 -- C5's open mechanism question, answered
+
+`rfc-serverless-control-cell-diet.md`'s adversarial review left C5 undecided: making `Metadata` stop
+holding a fully-materialized `IndexMetadata` per index needs its storage to become a union of the
+real object and a lazily-resolving stub, and it was not established whether that union can be
+free for indices that never opt in. `StubResolutionSpike` asks exactly that, in isolation, touching
+nothing in `server/`.
+
+**Heap: strongly favourable.**
+
+| | retained | per index |
+|---|---|---|
+| fully materialized | 395.7 MB | 2,074 B |
+| all stubs, unresolved | 27.9 MB | **146 B** |
+
+A **14.2x** reduction, with zero resolutions triggered -- stubs genuinely stay lazy.
+
+**Access cost: small but not zero.** Reading an *already-resolved* entry through the union, over four
+runs of 20M lookups each: +17%, +3.2%, +6.2%, +6.1%. The first is an outlier; the settled figure is
+**~5-6%**, about 0.2 ns per lookup (3.4 -> 3.6 ns). One volatile read and a null check, on the path
+every index lookup in OpenSearch takes.
+
+**What this decides.** The amendment's constraint 1 -- "zero behaviour or cost change for indices
+that don't opt in" -- is **not met**, and as literally written would reject this design. So C5's
+decision is no longer "is there a mechanism"; it is:
+
+- accept ~5-6% on resolved index lookups in exchange for 14.2x on metadata heap, relaxing
+  constraint 1 to "negligible" rather than "zero"; or
+- find a shape that avoids the indirection on the resolved path (harder -- the indirection *is* the
+  mechanism); or
+- decline C5 and accept that per-index residency stays as it is.
+
+Whether 0.2 ns/lookup matters depends on lookup volume per request, which this spike does not
+measure and which should be established before choosing. But the mechanism question itself is
+closed: it works, it is cheap, and it is not free.
+
 ## What the plan got wrong
 
 | plan claim | measured | effect |
