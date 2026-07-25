@@ -45,6 +45,8 @@ request today, and the rest are latent. Nothing yet makes an index routing-absen
 | A7.4 resize/merge/allocation | done, tested; latent rather than live |
 | A7.5 clusterless shard-started | reviewed, no change needed |
 | A7.6 integration coverage | open |
+| C3b first slice (shard ref type) | done, tested |
+| C5 codec bump | blocked: needs a release-version decision |
 | A7.7 snapshot generation preconditions | done, tested |
 | A5.1 cold-vs-gone | done, tested |
 | A5.2 + A5.3 prune + recreate | done, tested, off by default |
@@ -479,13 +481,40 @@ win is real; this implements it, and must also add the transitive cleanup resolu
 Read the top-level manifest, then the shards. For a full-state read that is all shards; check whether
 anything wants a single index without reading all of them.
 
-### C5. Codec bump
+### C5. Codec bump -- BLOCKED on a release decision that is not mine
 
-Follow the pattern C6 used and the four bumps before it: new `CODEC_V6`, its own parser, an entry in
+The mechanics are settled and unchanged: new `CODEC_V6`, its own parser, an entry in
 `VERSION_TO_CODEC_MAPPING`, a `CLUSTER_METADATA_MANIFEST_FORMAT_V5` for reading what is already in
 repositories, and `MANIFEST_CURRENT_CODEC_VERSION` moved unconditionally. Do not make the codec depend
 on the data in the manifest; that was tried during C6 and reverted, because it lets a cluster flap
 between versions as indices come and go.
+
+**What blocks it.** `VERSION_TO_CODEC_MAPPING` keys codec versions off release versions, and
+`Version.CURRENT` is `V_3_8_0`, which C6 already claimed for `CODEC_V5`:
+
+```java
+} else if (version.onOrAfter(Version.V_3_8_0)) {
+    versionToCodecMapping.put(version, ClusterMetadataManifest.CODEC_V5);
+}
+```
+
+There is no version left for `CODEC_V6` to map to. Two ways forward, and choosing between them needs
+to know something the repository does not say:
+
+1. **If 3.8 has not shipped**, move the mapping from `CODEC_V5` to `CODEC_V6` at `V_3_8_0`. Both are
+   unreleased, so no cluster in the world has written a V5 manifest, and two dev builds of 3.8
+   disagreeing is a development concern rather than a compatibility one.
+2. **If 3.8 has shipped**, `CODEC_V5` manifests exist in real repositories and `CODEC_V6` needs
+   `V_3_9_0` -- which means bumping `Version.CURRENT`, a release-management action.
+
+**Not guessing.** Picking wrong in direction 1 strands V5 manifests that a real cluster wrote; picking
+wrong in direction 2 bumps a release version for no reason. This is the same shape as E2: a decision
+someone with the release context should make in one sentence, recorded here so it is answered rather
+than rediscovered.
+
+**Consequence for the rest of Phase C.** C3b's write path, C4's read path and C6's measurement all
+need a codec to write into, so all three are blocked behind this. The first slice of C3b that does not
+-- the `UploadedManifestShard` reference type -- has landed.
 
 ### C6. Measure
 
