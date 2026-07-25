@@ -470,6 +470,27 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * Whether a fully cold index loses its {@code IndexRoutingTable} entry entirely, rather than
+     * keeping it with every shard {@code UNASSIGNED} for {@code SuspendedShardAllocationDecider} to
+     * keep rejecting.
+     *
+     * <p>This is what makes a quiescent tenant genuinely free to the allocator, and the size of the
+     * effect is measured rather than assumed: {@code ColdIndexRerouteCostSpikeTests} puts today's
+     * held-down shape at roughly 15 ms of steady-state reroute per 1,000 cold indices, growing
+     * linearly, against a flat ~9 ms when the entry is absent -- 154-171 ms versus 9 ms at 10,000
+     * cold indices, paid on the cluster-manager on every cluster state change.
+     *
+     * <p>Off by default because it changes the scale-to-zero lifecycle rather than tuning it. Note
+     * the asymmetry with {@code TransportReactivateShardsAction}, which recreates a missing entry
+     * unconditionally: turning this off must not strand indices pruned while it was on.
+     */
+    public static final Setting<Boolean> SERVERLESS_STORAGE_SCALE_TO_ZERO_PRUNE_ROUTING_ENTRY_SETTING = Setting.boolSetting(
+        "serverless_storage.scale_to_zero.prune_routing_entry",
+        false,
+        Setting.Property.NodeScope
+    );
+
+    /**
      * How long a reader shard's recorded cache-locality affinity (rfc-serverless-opensearch.md
      * &sect;10, {@code ReaderCacheAffinityMetadata}) stays honorable after being recorded. {@code
      * TimeValue.MINUS_ONE} (this setting's default) disables cache-locality preference entirely,
@@ -1242,6 +1263,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_SCALE_TO_ZERO_SUSPEND_ENABLED_SETTING,
             SERVERLESS_STORAGE_SCALE_TO_ZERO_SEARCH_REACTIVATION_WAIT_SETTING,
             SERVERLESS_STORAGE_SCALE_TO_ZERO_COOLDOWN_SETTING,
+            SERVERLESS_STORAGE_SCALE_TO_ZERO_PRUNE_ROUTING_ENTRY_SETTING,
             SERVERLESS_STORAGE_READER_CACHE_AFFINITY_TTL_SETTING,
             SERVERLESS_STORAGE_SCALE_UP_QPM_THRESHOLD_SETTING,
             SERVERLESS_STORAGE_SCALE_UP_MAX_SEARCH_REPLICAS_SETTING,
@@ -1345,7 +1367,12 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 client,
                 clusterService,
                 suspendEnabled
-                    ? new org.opensearch.serverless.storage.scaletozero.ShardSuspensionCoordinator(clusterService, client, cooldownMillis)
+                    ? new org.opensearch.serverless.storage.scaletozero.ShardSuspensionCoordinator(
+                        clusterService,
+                        client,
+                        cooldownMillis,
+                        SERVERLESS_STORAGE_SCALE_TO_ZERO_PRUNE_ROUTING_ENTRY_SETTING.get(environment.settings())
+                    )
                     : null
             );
             TimeValue nodeCapacityEvalInterval = SERVERLESS_STORAGE_NODE_CAPACITY_EVAL_INTERVAL_SETTING.get(environment.settings());

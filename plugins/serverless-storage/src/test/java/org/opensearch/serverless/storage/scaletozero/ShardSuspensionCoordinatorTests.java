@@ -18,7 +18,6 @@ import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.RoutingTable;
-import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.ShardRoutingState;
 import org.opensearch.cluster.routing.TestShardRouting;
 import org.opensearch.cluster.routing.allocation.command.CancelAllocationCommand;
@@ -34,7 +33,6 @@ import org.opensearch.transport.client.Client;
 import org.opensearch.transport.client.ClusterAdminClient;
 
 import java.util.List;
-import java.util.Map;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -70,7 +68,10 @@ public class ShardSuspensionCoordinatorTests extends OpenSearchTestCase {
      */
     public void testEvictWriterCancelsThePrimaryAndEveryOrdinaryReplica() {
         ClusterState state = buildClusterState(1);
-        ShardSuspensionCoordinator coordinator = new ShardSuspensionCoordinator(mock(org.opensearch.cluster.service.ClusterService.class), client);
+        ShardSuspensionCoordinator coordinator = new ShardSuspensionCoordinator(
+            mock(org.opensearch.cluster.service.ClusterService.class),
+            client
+        );
 
         coordinator.evictForTesting(state, indexUuid(state), 0, false);
 
@@ -89,7 +90,10 @@ public class ShardSuspensionCoordinatorTests extends OpenSearchTestCase {
     /** With zero replicas configured, only the primary is there to evict -- the pre-existing behavior must still hold. */
     public void testEvictWriterCancelsOnlyThePrimaryWhenThereAreNoReplicas() {
         ClusterState state = buildClusterState(0);
-        ShardSuspensionCoordinator coordinator = new ShardSuspensionCoordinator(mock(org.opensearch.cluster.service.ClusterService.class), client);
+        ShardSuspensionCoordinator coordinator = new ShardSuspensionCoordinator(
+            mock(org.opensearch.cluster.service.ClusterService.class),
+            client
+        );
 
         coordinator.evictForTesting(state, indexUuid(state), 0, false);
 
@@ -164,6 +168,138 @@ public class ShardSuspensionCoordinatorTests extends OpenSearchTestCase {
         verify(clusterService, times(1)).submitStateUpdateTask(anyString(), any(ClusterStateUpdateTask.class));
     }
 
+    /**
+     * The routing entry is per-index but suspension is per-shard-per-role, so pruning may only fire
+     * when the whole index is cold. A partially suspended index that lost its entry would take its
+     * still-serving shards down with it, which is the failure this predicate exists to prevent.
+     */
+    public void testPruningRequiresEveryShardOfTheIndexToBeSuspended() {
+        ClusterState halfSuspended = coldState(2, 0, ShardRoutingState.UNASSIGNED, true, false);
+        assertFalse(
+            "one suspended shard out of two is not a cold index",
+            ShardSuspensionCoordinator.isFullyColdAndEvictedForTesting(halfSuspended, halfSuspended.metadata().index(INDEX_NAME))
+        );
+
+        ClusterState fullySuspended = coldState(2, 0, ShardRoutingState.UNASSIGNED, true, true);
+        assertTrue(ShardSuspensionCoordinator.isFullyColdAndEvictedForTesting(fullySuspended, fullySuspended.metadata().index(INDEX_NAME)));
+    }
+
+    /**
+     * Eviction is an asynchronous reroute, so the suspended marker commits well before the copies
+     * are actually unassigned. Pruning on the marker alone would drop the entry out from under a
+     * still-assigned shard.
+     */
+    public void testPruningWaitsForEvictionToSettle() {
+        ClusterState markedButStillAssigned = coldState(1, 0, ShardRoutingState.STARTED, true, true);
+        assertFalse(
+            "a suspended-but-still-STARTED copy means eviction has not happened yet",
+            ShardSuspensionCoordinator.isFullyColdAndEvictedForTesting(
+                markedButStillAssigned,
+                markedButStillAssigned.metadata().index(INDEX_NAME)
+            )
+        );
+    }
+
+    /**
+     * An index with search-only replicas is not cold until the reader role is suspended too --
+     * otherwise a reader copy is still expected to serve queries. An index with none configured must
+     * not be held back waiting for a role it does not have.
+     */
+    public void testPruningAccountsForTheReaderRoleOnlyWhenSearchReplicasAreConfigured() {
+        ClusterState writerOnlySuspended = coldState(1, 1, ShardRoutingState.UNASSIGNED, true, true);
+        assertFalse(
+            "search replicas are configured, so writer-only suspension is not a cold index",
+            ShardSuspensionCoordinator.isFullyColdAndEvictedForTesting(
+                writerOnlySuspended,
+                writerOnlySuspended.metadata().index(INDEX_NAME)
+            )
+        );
+
+        IndexMetadata bothRoles = SuspendedShardsMetadata.withReaderShardSuspended(writerOnlySuspended.metadata().index(INDEX_NAME), 0);
+        ClusterState state = ClusterState.builder(writerOnlySuspended)
+            .metadata(Metadata.builder(writerOnlySuspended.metadata()).put(bothRoles, true))
+            .build();
+        assertTrue(ShardSuspensionCoordinator.isFullyColdAndEvictedForTesting(state, state.metadata().index(INDEX_NAME)));
+    }
+
+    /** Off by default: the same fully cold state must produce no cluster-state task at all. */
+    public void testPruningIsOffByDefault() {
+        ClusterState state = coldState(1, 0, ShardRoutingState.UNASSIGNED, true, true);
+        ClusterService clusterService = mock(ClusterService.class);
+        when(clusterService.state()).thenReturn(state);
+
+        new ShardSuspensionCoordinator(clusterService, client, 0L).maybePruneRoutingEntryForTesting(state, indexUuid(state));
+
+        verify(clusterService, never()).submitStateUpdateTask(anyString(), any(ClusterStateUpdateTask.class));
+    }
+
+    /** Enabled, the task is submitted and its execute() actually removes the entry. */
+    public void testPruningRemovesTheRoutingEntryWhenEnabled() throws Exception {
+        ClusterState state = coldState(1, 0, ShardRoutingState.UNASSIGNED, true, true);
+        ClusterService clusterService = mock(ClusterService.class);
+        when(clusterService.state()).thenReturn(state);
+
+        new ShardSuspensionCoordinator(clusterService, client, 0L, true).maybePruneRoutingEntryForTesting(state, indexUuid(state));
+
+        org.mockito.ArgumentCaptor<ClusterStateUpdateTask> captor = org.mockito.ArgumentCaptor.forClass(ClusterStateUpdateTask.class);
+        verify(clusterService, times(1)).submitStateUpdateTask(anyString(), captor.capture());
+
+        ClusterState pruned = captor.getValue().execute(state);
+        assertFalse("the cold index must no longer have a routing entry", pruned.routingTable().hasIndex(INDEX_NAME));
+        assertTrue(
+            "...and must still be in metadata, which is what makes it cold rather than gone",
+            pruned.metadata().hasIndex(INDEX_NAME)
+        );
+    }
+
+    /**
+     * Builds a state for one index with {@code shards} shards, optionally search-only replicas, each
+     * shard's writer copy in {@code writerState}, and writer suspension applied to shard 0 (and, when
+     * {@code suspendAll}, to every shard).
+     */
+    private static ClusterState coldState(
+        int shards,
+        int searchReplicas,
+        ShardRoutingState writerState,
+        boolean suspendFirst,
+        boolean suspendAll
+    ) {
+        Settings.Builder settings = Settings.builder()
+            .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, shards)
+            .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey(), true);
+        if (searchReplicas > 0) {
+            settings.put(IndexMetadata.SETTING_NUMBER_OF_SEARCH_REPLICAS, searchReplicas);
+        }
+        IndexMetadata indexMetadata = IndexMetadata.builder(INDEX_NAME).settings(settings.build()).build();
+        for (int i = 0; i < shards; i++) {
+            if (i == 0 ? suspendFirst : suspendAll) {
+                indexMetadata = SuspendedShardsMetadata.withShardSuspended(indexMetadata, i);
+            }
+        }
+
+        Index index = indexMetadata.getIndex();
+        RoutingTable.Builder routingTable = RoutingTable.builder();
+        IndexRoutingTable.Builder indexRoutingTable = IndexRoutingTable.builder(index);
+        for (int i = 0; i < shards; i++) {
+            ShardId shardId = new ShardId(index, i);
+            IndexShardRoutingTable.Builder shardRoutingBuilder = new IndexShardRoutingTable.Builder(shardId);
+            shardRoutingBuilder.addShard(
+                writerState == ShardRoutingState.UNASSIGNED
+                    ? TestShardRouting.newShardRouting(shardId, null, true, ShardRoutingState.UNASSIGNED)
+                    : TestShardRouting.newShardRouting(shardId, "node-primary", true, writerState)
+            );
+            indexRoutingTable.addIndexShard(shardRoutingBuilder.build());
+        }
+        routingTable.add(indexRoutingTable.build());
+
+        return ClusterState.builder(ClusterName.DEFAULT)
+            .metadata(Metadata.builder().put(indexMetadata, false).build())
+            .routingTable(routingTable.build())
+            .build();
+    }
+
     private static String indexUuid(ClusterState state) {
         return state.metadata().index(INDEX_NAME).getIndexUUID();
     }
@@ -181,9 +317,7 @@ public class ShardSuspensionCoordinatorTests extends OpenSearchTestCase {
         ShardId shardId = new ShardId(index, 0);
 
         IndexShardRoutingTable.Builder shardRoutingBuilder = new IndexShardRoutingTable.Builder(shardId);
-        shardRoutingBuilder.addShard(
-            TestShardRouting.newShardRouting(shardId, "node-primary", true, ShardRoutingState.STARTED)
-        );
+        shardRoutingBuilder.addShard(TestShardRouting.newShardRouting(shardId, "node-primary", true, ShardRoutingState.STARTED));
         List<String> replicaNodes = numberOfReplicas > 0 ? List.of("node-replica") : List.of();
         for (String node : replicaNodes) {
             shardRoutingBuilder.addShard(TestShardRouting.newShardRouting(shardId, node, false, ShardRoutingState.STARTED));

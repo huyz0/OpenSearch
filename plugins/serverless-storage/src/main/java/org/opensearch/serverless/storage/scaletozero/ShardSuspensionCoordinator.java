@@ -17,6 +17,7 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
+import org.opensearch.cluster.routing.RoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.allocation.command.CancelAllocationCommand;
 import org.opensearch.cluster.service.ClusterService;
@@ -85,6 +86,7 @@ public final class ShardSuspensionCoordinator {
     private final ClusterService clusterService;
     private final Client client;
     private final long cooldownMillis;
+    private final boolean pruneRoutingEntry;
 
     /**
      * Creates a coordinator with hysteresis disabled ({@code cooldownMillis = 0}) -- equivalent to
@@ -106,9 +108,24 @@ public final class ShardSuspensionCoordinator {
      *                       reactivation before it may be suspended again; non-positive disables the guard.
      */
     public ShardSuspensionCoordinator(ClusterService clusterService, Client client, long cooldownMillis) {
+        this(clusterService, client, cooldownMillis, false);
+    }
+
+    /**
+     * Creates a coordinator, optionally pruning the {@link IndexRoutingTable} of a fully cold index.
+     *
+     * @param pruneRoutingEntry when true, an index whose every shard is suspended in every
+     *                          configured role, and whose every copy has actually been evicted, has
+     *                          its routing entry removed entirely. This is the property that makes a
+     *                          quiescent tenant free to the allocator (A6 measured 17x on
+     *                          steady-state reroute at 10,000 cold indices), and it is off by
+     *                          default because it changes the scale-to-zero lifecycle.
+     */
+    public ShardSuspensionCoordinator(ClusterService clusterService, Client client, long cooldownMillis, boolean pruneRoutingEntry) {
         this.clusterService = clusterService;
         this.client = client;
         this.cooldownMillis = cooldownMillis;
+        this.pruneRoutingEntry = pruneRoutingEntry;
     }
 
     /**
@@ -194,6 +211,14 @@ public final class ShardSuspensionCoordinator {
                 // already-suspended candidate, every tick, safely self-heals a lost eviction without
                 // needing any new scheduling or state to track which attempts succeeded.
                 evict(currentState, indexUuid, shardId, reader);
+                // Deliberately here and not in clusterStateProcessed below. Pruning needs every copy
+                // to be actually UNASSIGNED, and the eviction that unassigns them is an asynchronous
+                // reroute -- at the moment the suspend flag commits, the shards are still assigned,
+                // so a prune attempt there would always find the condition unmet. This branch runs
+                // once per already-suspended candidate on every tick, so it is the one that
+                // eventually observes the settled state, and it self-heals a prune lost to a
+                // cluster-manager failover for the same reason evict() above does.
+                maybePruneRoutingEntry(currentState, indexUuid);
                 return;
             }
         }
@@ -335,6 +360,111 @@ public final class ShardSuspensionCoordinator {
         client.admin().cluster().reroute(reroute, ActionListener.wrap(response -> {
             logger.info("evicted suspended serverless-storage " + role + " shard [" + indexUuid + "][" + shardId + "]");
         }, e -> logger.warn("failed to evict suspended serverless-storage " + role + " shard [" + indexUuid + "][" + shardId + "]", e)));
+    }
+
+    /**
+     * Removes a fully cold index's {@link IndexRoutingTable} entry, which is what stops the allocator
+     * from paying for a quiescent tenant at all.
+     *
+     * <p>Today a suspended shard stays in the routing table as {@code UNASSIGNED} so {@code
+     * SuspendedShardAllocationDecider} can keep returning {@code NO} for it -- once per candidate
+     * node, on every reroute. A6 measured that: roughly 15 ms of steady-state reroute per 1,000 cold
+     * indices, linear in them, against a flat ~9 ms when the entry is simply absent. At 10,000 cold
+     * indices that is 154-171 ms versus 9 ms, paid on the cluster-manager on every cluster state
+     * change.
+     *
+     * <p>The entry is per-index but suspension is per-shard-per-role, so this fires only when the
+     * <em>whole</em> index is cold: every shard suspended in the writer role, every shard suspended
+     * in the reader role if the index has search-only replicas configured at all, and every copy
+     * already evicted. A partially suspended index keeps its entry, because removing it would take
+     * the still-serving shards down with it.
+     *
+     * <p>The inverse is {@link
+     * org.opensearch.serverless.storage.scaletozero.action.TransportReactivateShardsAction}, which
+     * recreates the entry in the same cluster-state update that clears the suspended marker.
+     * Recreation is deliberately not gated on this coordinator's setting: an entry pruned while the
+     * setting was on must still come back if it is turned off afterwards.
+     *
+     * <p>Called once per suspended shard per tick, so an N-shard index can queue up to N of these in
+     * the single tick where the condition first holds. They are cheap and every one after the first
+     * finds the entry already gone and no-ops in {@code execute()}, so this is left uncoordinated
+     * rather than given a per-index guard whose own staleness would be a second thing to get wrong.
+     */
+    private void maybePruneRoutingEntry(ClusterState state, String indexUuid) {
+        if (pruneRoutingEntry == false) {
+            return;
+        }
+        // Cheap pre-check against the locally known state, same shape as suspend()'s: in steady
+        // state a cold index is already pruned and this is the common case, and skipping the
+        // submission avoids queueing a no-op task per cold index per tick. The authoritative check
+        // runs again inside execute().
+        IndexMetadata preCheck = findByUuid(state.metadata(), indexUuid);
+        if (preCheck == null || isFullyColdAndEvicted(state, preCheck) == false) {
+            return;
+        }
+        clusterService.submitStateUpdateTask("serverless-storage-prune-cold-routing-entry", new ClusterStateUpdateTask(Priority.NORMAL) {
+            @Override
+            public ClusterState execute(ClusterState currentState) {
+                IndexMetadata indexMetadata = findByUuid(currentState.metadata(), indexUuid);
+                if (indexMetadata == null || isFullyColdAndEvicted(currentState, indexMetadata) == false) {
+                    return currentState;
+                }
+                return ClusterState.builder(currentState)
+                    .routingTable(RoutingTable.builder(currentState.routingTable()).remove(indexMetadata.getIndex().getName()).build())
+                    .build();
+            }
+
+            @Override
+            public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {
+                if (oldState != newState) {
+                    logger.info("pruned routing entry of fully cold serverless-storage index [{}]", indexUuid);
+                }
+            }
+
+            @Override
+            public void onFailure(String source, Exception e) {
+                logger.warn("failed to prune routing entry of cold serverless-storage index [" + indexUuid + "]", e);
+            }
+        });
+    }
+
+    /**
+     * True iff the index has a routing entry, every shard of it is suspended in every role the index
+     * actually configures, and no copy is still assigned to a node.
+     */
+    private static boolean isFullyColdAndEvicted(ClusterState state, IndexMetadata indexMetadata) {
+        IndexRoutingTable indexRoutingTable = state.routingTable().index(indexMetadata.getIndex().getName());
+        if (indexRoutingTable == null) {
+            return false; // already pruned
+        }
+        int shardCount = indexMetadata.getNumberOfShards();
+        boolean hasReaders = indexMetadata.getNumberOfSearchOnlyReplicas() > 0;
+        for (int shardId = 0; shardId < shardCount; shardId++) {
+            if (SuspendedShardsMetadata.isSuspended(indexMetadata, shardId) == false) {
+                return false;
+            }
+            if (hasReaders && SuspendedShardsMetadata.isReaderSuspended(indexMetadata, shardId) == false) {
+                return false;
+            }
+        }
+        for (IndexShardRoutingTable shardRoutingTable : indexRoutingTable) {
+            for (ShardRouting shardRouting : shardRoutingTable) {
+                if (shardRouting.unassigned() == false) {
+                    return false; // eviction has not settled yet; try again next tick
+                }
+            }
+        }
+        return true;
+    }
+
+    /** Invokes {@link #maybePruneRoutingEntry} against a caller-built state -- test-only visibility. */
+    void maybePruneRoutingEntryForTesting(ClusterState state, String indexUuid) {
+        maybePruneRoutingEntry(state, indexUuid);
+    }
+
+    /** Whether an index is in the state {@link #maybePruneRoutingEntry} would act on -- test-only visibility. */
+    static boolean isFullyColdAndEvictedForTesting(ClusterState state, IndexMetadata indexMetadata) {
+        return isFullyColdAndEvicted(state, indexMetadata);
     }
 
     /** Invokes {@link #evict} directly against a caller-built state -- test-only visibility. */

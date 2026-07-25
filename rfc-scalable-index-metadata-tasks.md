@@ -47,7 +47,8 @@ request today, and the rest are latent. Nothing yet makes an index routing-absen
 | A7.6 integration coverage | open |
 | A7.7 snapshot generation preconditions | open |
 | A5.1 cold-vs-gone | done, tested |
-| A5.2, A5.3, A5.4 | open |
+| A5.2 + A5.3 prune + recreate | done, tested, off by default |
+| A5.4 decider still needed? | open |
 | A2, A3 | blocked on A5 |
 | A4 spike | done |
 | A6 | first half done |
@@ -165,12 +166,36 @@ has cleared but whose routing entry has not yet been recreated would proceed. **
 marker and recreate the entry in the same cluster-state update**, which is what closes it. If that
 ordering is ever relaxed, this becomes a live gap.
 
+**A5.2 and A5.3 -- DONE, landed together.** They were planned as separate tasks and cannot be: an
+entry removed by one and never recreated by the other leaves every cold index permanently unservable,
+so neither is shippable alone. Both sit behind
+`serverless_storage.scale_to_zero.prune_routing_entry`, default false.
+
+`ShardSuspensionCoordinator` prunes from the already-suspended reconciliation branch rather than from
+`clusterStateProcessed`, because eviction is an asynchronous reroute -- at the moment the suspend flag
+commits the copies are still assigned, so a prune attempt there would always find the condition unmet.
+Pruning requires the *whole* index to be cold: the entry is per-index while suspension is
+per-shard-per-role, so a partially suspended index that lost its entry would take its still-serving
+shards down with it.
+
+`TransportReactivateShardsAction` recreates the entry in the same update that clears the marker, and
+recreation is deliberately *not* gated on the setting -- an entry pruned while pruning was enabled
+must still come back if it is turned off afterwards.
+
+**The test caught a data-loss bug the call site did not look like it had.** The obvious helper,
+`RoutingTable.Builder#addAsRecovery`, picks the recovery source from `inSyncAllocationIds` and falls
+back to `EmptyStoreRecoverySource` when the set is empty. It is empty here: the eviction that made the
+index cold goes through `CancelAllocationCommand`, which calls `RoutingAllocation#removeAllocationId`
+on the cancelled copy. So reactivation would have silently resurrected a scaled-to-zero index as a
+brand new empty one. The entry is now built explicitly with `ExistingStoreRecoverySource`, which is
+correct despite the empty in-sync set because the data lives in the object store and
+`ServerlessStorageExistingShardsAllocator` exists precisely to allocate such a shard.
+
 Remaining:
 
-- **A5.2** Suspension stops writing an `IndexRoutingTable` entry, or removes it after eviction.
-- **A5.3** `TransportReactivateShardsAction` adds it back in the same update that clears the
-  suspended flag. See the invariant above.
-- **A5.4** Decide whether `SuspendedShardAllocationDecider` is still needed.
+- **A5.4** Decide whether `SuspendedShardAllocationDecider` is still needed, now that the allocator
+  stops seeing a fully cold index at all. It still covers the window between marking and eviction,
+  and every partially suspended index.
 - Check whether `SuspendedShardAllocationDecider` is still needed for the window between marking and
   eviction, now that the allocator stops seeing the shard afterwards.
 

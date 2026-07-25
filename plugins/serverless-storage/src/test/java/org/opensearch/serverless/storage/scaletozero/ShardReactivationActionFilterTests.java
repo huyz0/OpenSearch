@@ -61,7 +61,11 @@ public class ShardReactivationActionFilterTests extends OpenSearchTestCase {
 
     private static IndexMetadata readerIndexMetadata() {
         return IndexMetadata.builder(INDEX)
-            .settings(Settings.builder().put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT).put(IndexMetadata.SETTING_INDEX_UUID, INDEX + "-uuid"))
+            .settings(
+                Settings.builder()
+                    .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+                    .put(IndexMetadata.SETTING_INDEX_UUID, INDEX + "-uuid")
+            )
             .numberOfShards(1)
             .numberOfReplicas(0)
             .numberOfSearchReplicas(1)
@@ -203,7 +207,10 @@ public class ShardReactivationActionFilterTests extends OpenSearchTestCase {
 
             ClusterServiceUtils.setState(
                 clusterService,
-                ClusterState.builder(new ClusterName("test")).metadata(Metadata.builder().build()).routingTable(RoutingTable.builder().build()).build()
+                ClusterState.builder(new ClusterName("test"))
+                    .metadata(Metadata.builder().build())
+                    .routingTable(RoutingTable.builder().build())
+                    .build()
             );
             assertBusy(() -> assertTrue("a deleted index must release the wait, not stall it until the timeout", proceeded.get()));
         } finally {
