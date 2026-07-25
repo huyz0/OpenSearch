@@ -461,6 +461,27 @@ independent of anything in this document.
    | Copy-on-write / undo journal for the mutating operations | larger, self-contained | must cover every mutation path; a missed one silently corrupts the reused instance |
    | Leave as-is | none | cluster-manager keeps paying two O(total shards) rebuilds per reroute |
 
+   **Attempted and reverted (this session).** A fourth option looked strictly better than all three:
+   derive the changed-index set from the existing `RoutingChangesObserver` callbacks and carry
+   unchanged `IndexRoutingTable` instances forward from the previous table, which is already in the
+   input `ClusterState`. That needs no cache and no statefulness, so the staleness risk disappears.
+
+   It does not work, and `IndicesClusterStateServiceRandomUpdatesTests` (the randomized fuzz suite)
+   caught it twice with different symptoms:
+
+   - first as `Shard [0] routing table has wrong number of replicas, expected [2], got [0]` -- a
+     newly created index appears in the new `RoutingNodes` but not in the previous table, and is not
+     in the changed set until something allocates it, so it was neither rebuilt nor carried forward;
+   - after fixing that, as the same assertion with `got [1]` -- because
+     `RoutingTable.Builder.updateNumberOfReplicas()` mutates the routing table from the **metadata**
+     side, never passing through `RoutingChangesObserver` at all.
+
+   The root cause generalizes: **`RoutingChangesObserver` observes allocation changes, but routing
+   table changes also originate outside allocation.** Any change set derived from it is therefore not
+   a sound over-approximation, and "unchanged" cannot be trusted to mean "safe to reuse". A correct
+   version would need a change signal emitted by every producer of routing tables, not just the
+   allocator -- which is a wider change than C4 was scoped as.
+
    This is a correctness-sensitive trade on the allocator, so it wants a maintainer's call rather
    than being taken unilaterally. Worth noting the payoff is now smaller than when C4 was first
    listed: the `RoutingNodes` build measured ~35-67 ms of a ~300 ms steady-state reroute at 40k
