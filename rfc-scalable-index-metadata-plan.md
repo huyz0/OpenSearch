@@ -387,6 +387,34 @@ rather than a `HashMap`: S2 measured a single-entry `HashMap` doubling the descr
 
 ### C6. Remote cluster state: shard the manifest, expose per-index fetch
 
+**Scoped against the code, not started.** With C5 in, this is the change that decides whether the
+storage split ever pays: a `LazyIndexMetadata` needs its descriptor from somewhere, and on the diff
+path an unchanged index's holder is carried forward by reference so no descriptor is needed at all.
+It is only the **full-state read** -- node join, cluster-manager restart -- that has to build every
+holder from scratch, and today `RemoteClusterStateService.readClusterStateInParallel` does that by
+fetching one blob per index. Until the descriptor is available without that fetch, every node still
+materializes everything on join.
+
+Three separable pieces, in dependency order:
+
+1. **Descriptor in the manifest.** `ClusterMetadataManifest.UploadedIndexMetadata` currently carries
+   `(indexName, indexUUID, uploadedFilename, componentPrefix)`. It needs the descriptor fields
+   `IndexMetadataHolder` declares: state, aliases, the hidden and system flags, `isRemoteSnapshot`,
+   `isWarmIndex`, and the total shard count. The versioning machinery for this already exists and has
+   been used four times -- `CODEC_V0` through `CODEC_V4`, each with its own `PARSER_Vn` and an entry in
+   `versionToCodecMapping` -- so a `CODEC_V5` is the established path rather than a new precedent. The
+   awkward field is aliases: it is a `Map<String, AliasMetadata>` rather than a scalar, and S2 measured
+   a single alias doubling the descriptor from 289 B to 577 B, so manifest size needs checking against
+   the index count this is meant to serve.
+2. **A public single-index fetch.** `RemoteIndexMetadataManager.getIndexMetadata` is package-private
+   today. A `LazyIndexMetadata` loader needs it reachable.
+3. **Manifest sharding.** Independent of 1 and 2, and about upload cost rather than residency: the
+   manifest is O(N) in indices and rewritten whole on every cluster-state version.
+
+Only 1 and 2 gate C5's payoff. All three touch a persisted format, so each wants its own change with
+round-trip tests across codec versions rather than being folded together.
+
+
 - **Shard `ClusterMetadataManifest`.** Today it lists every index and is rewritten per version. Split
   into a small root manifest plus per-shard-of-namespace index manifests, so a version bump rewrites
   the root and only touched shards. Relax `GatewayMetaState.verifyManifestAndClusterState:808`'s
