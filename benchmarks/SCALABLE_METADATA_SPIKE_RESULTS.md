@@ -473,6 +473,21 @@ Whether 0.2 ns/lookup matters depends on lookup volume per request, which this s
 measure and which should be established before choosing. But the mechanism question itself is
 closed: it works, it is cheap, and it is not free.
 
+**Sizing the implementation, since "large" was doing a lot of work.** `Metadata.index(name)` can
+resolve internally and keep returning `IndexMetadata`, so its **120** callers are untouched. What
+does change is everything reaching the raw map: **41** call sites in `server/` main, **51** in tests
+and the test framework, **9** across plugins and modules, plus `iterator()`, serialization and the
+diff path -- and **57** internal uses inside `Metadata.java` itself. Call it ~158 external sites plus
+the internals.
+
+**And the obvious de-risking move does not work.** The tempting first slice is to introduce the union
+with every entry pre-resolved, so no stub exists and behaviour is provably identical. But that
+delivers **zero benefit on its own** -- all entries materialized means no heap saved -- while adding
+indirection to the most central class in the codebase. Shipped standalone it is pure cost with
+deferred payoff, and pure cost permanently if the follow-on never lands. So C5 does not decompose
+into a safe, independently-valuable first step; it wants to be done as one reviewed piece of work
+with the trade already accepted.
+
 ## What the plan got wrong
 
 | plan claim | measured | effect |
