@@ -488,18 +488,62 @@ Bring up a cluster with `...index_metadata.descriptor.enabled` and `...index_met
 set, create N indices, restart or join a node, and assert it does not fetch every index blob. Count
 blob reads; do not infer from timing.
 
-### D2. Decide the serverless defaults
+### D2. Serverless defaults -- DECIDED: all three stay off, and here is what unblocks each
 
-Whether the plugin turns both on by default, and what the operational story is for a cluster that
-enables them on an existing repository. Note the descriptor is backfilled onto carried-forward entries
-during publication, so enabling it does reach existing indices, but only once a cluster state version
-is published after the setting changes.
+Three settings are now in play, not two. The decision differs for each, and the reasons are different.
 
-### D3. Decide whether the plugin needs its own store
+| setting | default | what would change it |
+|---|---|---|
+| `...index_metadata.descriptor.enabled` | **off** | C3's sharding measurement |
+| `...index_metadata.defer.enabled` | **off** | D1, plus the descriptor being on |
+| `serverless_storage.scale_to_zero.prune_routing_entry` | **off** | D1, plus a fleet-shape judgement |
 
-If serverless-storage is meant to own index metadata rather than use core's remote cluster state, that
-is what `putStub` is for and it needs a task of its own. If not, `putStub` stays a plugin-facing seam
-with no in-tree caller, which is fine but should be a stated decision rather than an accident.
+**The descriptor waits on sharding, and this is the one that surprised me.** It saves a full-state
+read from fetching one blob per index, which is real and only paid at node join or cluster-manager
+restart. It costs +64% on the manifest, which is rewritten on *every* cluster state version. At 100k
+indices that trades an occasional 100k-fetch storm for a permanent 0.5 to 0.8 MB per version. Turning
+it on before sharding makes the common case worse to make the rare case better. After C3 the recurring
+cost is divided by the shard count and the trade inverts.
+
+**Deferral follows the descriptor**, since a stub with no descriptor to stand on is not useful, and it
+additionally wants D1's blob-read count as evidence rather than the inference that it works.
+
+**Pruning is a different kind of decision, and A6's second half is why.** The other two are
+performance trades that a measurement settles. Pruning changes the scale-to-zero lifecycle and has a
+severe failure mode if reactivation is wrong, so the question is not only "does it pay" but "does it
+pay *here*". A6 measured the saving as linear in the fraction of tenants that go **fully** quiescent:
+369 / 195 / 41 / 17 ms at 0 / 50 / 90 / 100 percent. A fleet whose idleness is spread thinly across
+many partly-active indices gets nothing and carries all the risk. **Nobody has measured that fraction
+for a real fleet**, and it is a workload question, not a code one. Until someone does, off is the only
+defensible default.
+
+**Operational story for enabling on an existing repository.** The descriptor is backfilled onto
+carried-forward manifest entries during publication, so it does reach quiescent indices -- but only
+once a cluster state version is published after the setting changes, which for a fully idle cluster may
+be a while. Enabling deferral before that backfill completes means stubs whose descriptors are absent,
+so **enable the descriptor first, wait for a published version, then enable deferral.** That ordering
+should be in the operator documentation, not discovered.
+
+### D3. Does the plugin need its own metadata store? -- DECIDED: no, `putStub` stays a seam
+
+**serverless-storage is a storage engine, not a metadata plane.** It owns shard *data* -- the object
+store, the WAL, the manifest per shard -- and it deliberately uses core's cluster state for index
+metadata like every other plugin. Nothing in it wants to own `IndexMetadata`, and giving it a second
+metadata store would mean two sources of truth for the same thing.
+
+The scaling problem `putStub` exists for is a *control plane* problem, and the answer to it is cells
+(see `rfc-serverless-metadata-plane.md`), which B4 independently arrived at from the allocator side. A
+cell is a cluster; its metadata store is core's. So the seam's eventual consumer is a control plane
+above the cluster, not this plugin inside it.
+
+**So `putStub` keeps only test callers in-tree, and that is now a stated decision rather than an
+accident.** It is a public seam with a documented contract and full test coverage of the laziness,
+diff and serialization behaviour, which is the right state for an SPI whose consumer lives elsewhere.
+
+The thing to guard against is it rotting: a seam with no production caller is one refactor away from
+being subtly broken with nothing to notice. `DeferredIndexMetadataTests` covers the contract, and D1
+will exercise the same machinery through the settings path, which gives it an in-tree exercise even
+without an in-tree owner.
 
 ---
 
