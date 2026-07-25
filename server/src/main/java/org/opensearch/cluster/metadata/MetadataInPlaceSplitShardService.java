@@ -122,9 +122,7 @@ public class MetadataInPlaceSplitShardService {
         // than silently corrupt search/GET visibility.
         if (curIndexMetadata.isRoutingPartitionedIndex()) {
             throw new IllegalArgumentException(
-                "In-place shard split is not supported on index ["
-                    + request.getIndex()
-                    + "] with index.routing_partition_size > 1"
+                "In-place shard split is not supported on index [" + request.getIndex() + "] with index.routing_partition_size > 1"
             );
         }
 
@@ -152,9 +150,7 @@ public class MetadataInPlaceSplitShardService {
         // automatic cancellation, since the merge's revived parent may allocate successfully) if this
         // shard splits out from under it. Reject up front rather than wedge the merge permanently.
         if (splitShardsMetadata.isChildOfInProgressMerge(shardId)) {
-            throw new IllegalArgumentException(
-                "Cannot split shard [" + shardId + "] because it is a child of an in-progress merge"
-            );
+            throw new IllegalArgumentException("Cannot split shard [" + shardId + "] because it is a child of an in-progress merge");
         }
 
         ShardRouting primaryShard = currentState.routingTable()
