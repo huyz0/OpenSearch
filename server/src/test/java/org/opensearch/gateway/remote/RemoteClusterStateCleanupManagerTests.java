@@ -89,6 +89,7 @@ import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -326,6 +327,78 @@ public class RemoteClusterStateCleanupManagerTests extends OpenSearchTestCase {
         verify(container).deleteBlobsAsyncIgnoringIfNotExists(eq(new ArrayList<>(staleManifest)), any());
         verify(remoteRoutingTableService).deleteStaleIndexRoutingPaths(List.of(index3Metadata.getUploadedFilename()));
         verifyNoMoreInteractions(container);
+    }
+
+    /**
+     * C1. The sweep decides what is garbage by subtraction: everything a retained manifest references
+     * goes into the keep-set, and anything a stale manifest references that is not in it gets deleted.
+     * That is only sound while references can be enumerated.
+     *
+     * <p>A manifest written by a newer codec still parses here -- the parser dispatch falls back to
+     * the newest version this node knows -- but its unknown fields come back empty, so its references
+     * read as none and the subtraction deletes blobs that are still in use. Manifest sharding is
+     * exactly that kind of change: it moves the index list out of {@code getIndices()} and behind
+     * shard blobs, so a node running today's code against a sharded manifest would compute an empty
+     * keep-set for every index in the cluster.
+     *
+     * <p>So an unreadable codec must stop the sweep, not narrow it.
+     */
+    public void testSweepIsSkippedWhenAManifestUsesAnUnreadableCodec() throws IOException {
+        String clusterUUID = "clusterUUID";
+        String clusterName = "test-cluster";
+        List<BlobMetadata> inactiveBlobs = Arrays.asList(new PlainBlobMetadata("manifest1.dat", 1L));
+        List<BlobMetadata> activeBlobs = Arrays.asList(new PlainBlobMetadata("manifest2.dat", 1L));
+
+        UploadedMetadataAttribute coordinationMetadata = new UploadedMetadataAttribute(COORDINATION_METADATA, "coordination_metadata");
+        UploadedMetadataAttribute templateMetadata = new UploadedMetadataAttribute(TEMPLATES_METADATA, "template_metadata");
+        UploadedMetadataAttribute settingMetadata = new UploadedMetadataAttribute(SETTING_METADATA, "settings_metadata");
+        UploadedIndexMetadata index1Metadata = new UploadedIndexMetadata("index1", "indexUUID1", "index_metadata1__2");
+        UploadedIndexMetadata index2Metadata = new UploadedIndexMetadata("index2", "indexUUID2", "index_metadata2__2");
+
+        // The retained manifest is from the future: this node reads it, finds nothing, and would
+        // otherwise conclude that index1 is unreferenced.
+        ClusterMetadataManifest futureManifest = ClusterMetadataManifest.builder()
+            .indices(List.of())
+            .coordinationMetadata(coordinationMetadata)
+            .templatesMetadata(templateMetadata)
+            .settingMetadata(settingMetadata)
+            .clusterTerm(1L)
+            .stateVersion(1L)
+            .codecVersion(ClusterMetadataManifest.MANIFEST_CURRENT_CODEC_VERSION + 1)
+            .stateUUID(randomAlphaOfLength(10))
+            .clusterUUID(clusterUUID)
+            .nodeId("nodeA")
+            .opensearchVersion(VersionUtils.randomOpenSearchVersion(random()))
+            .previousClusterUUID(ClusterState.UNKNOWN_UUID)
+            .committed(true)
+            .routingTableVersion(0L)
+            .build();
+        ClusterMetadataManifest staleManifest = ClusterMetadataManifest.builder(futureManifest)
+            .codecVersion(CODEC_V2)
+            .indices(List.of(index1Metadata, index2Metadata))
+            .build();
+
+        AsyncMultiStreamBlobContainer blobContainer = mock(AsyncMultiStreamBlobContainer.class);
+        doAnswer(invocation -> {
+            ActionListener<Void> listener = invocation.getArgument(1);
+            listener.onResponse(null);
+            return null;
+        }).when(blobContainer).deleteBlobsAsyncIgnoringIfNotExists(any(), any());
+        when(blobStore.blobContainer(any())).thenReturn(blobContainer);
+        when((blobStoreRepository.basePath())).thenReturn(new BlobPath().add("random-path"));
+        when(remoteManifestManager.getManifestFolderPath(eq(clusterName), eq(clusterUUID))).thenReturn(
+            new BlobPath().add(encodeString(clusterName)).add(CLUSTER_STATE_PATH_TOKEN).add(clusterUUID).add(MANIFEST)
+        );
+        when(remoteManifestManager.fetchRemoteClusterMetadataManifest(eq(clusterName), eq(clusterUUID), any())).thenReturn(
+            futureManifest,
+            staleManifest
+        );
+        remoteClusterStateCleanupManager.start();
+
+        remoteClusterStateCleanupManager.deleteClusterMetadata(clusterName, clusterUUID, activeBlobs, inactiveBlobs);
+
+        verify(blobContainer, never()).deleteBlobsAsyncIgnoringIfNotExists(any(), any());
+        verify(remoteRoutingTableService, never()).deleteStaleIndexRoutingPaths(any());
     }
 
     public void testDeleteStaleIndicesRoutingDiffFile() throws IOException {

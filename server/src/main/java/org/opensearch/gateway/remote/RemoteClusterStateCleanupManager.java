@@ -43,6 +43,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.opensearch.gateway.remote.RemoteClusterStateUtils.GLOBAL_METADATA_PATH_TOKEN;
 import static org.opensearch.gateway.remote.model.RemoteClusterMetadataManifest.MANIFEST;
@@ -228,6 +229,27 @@ public class RemoteClusterStateCleanupManager implements Closeable {
         List<BlobMetadata> staleManifestBlobMetadata
     ) throws IOException {
         try {
+            // Refuse to decide what is garbage from a manifest this node cannot fully read.
+            //
+            // The whole method works by subtraction: everything a retained manifest references goes
+            // into filesToKeep, and anything a stale manifest references that is not in that set is
+            // deleted. That is only sound while "references" can be enumerated. A manifest written by
+            // a newer codec parses here -- the parser dispatch falls back to the newest version this
+            // node knows -- but its unknown fields come back empty, so its references silently read
+            // as none, and the subtraction deletes blobs that are very much still in use.
+            //
+            // Manifest sharding (Phase C) is exactly that kind of change: it moves the index list out
+            // of getIndices() and behind shard blobs, so a node running today's code against a
+            // sharded manifest would compute an empty keep-set for every index in the cluster. This
+            // guard lands first, deliberately, so that a mixed-version cluster during that rollout
+            // stops sweeping rather than corrupting the repository. It costs nothing until such a
+            // manifest exists.
+            //
+            // Recorded as the loops run rather than in a scan beforehand: a separate pass would fetch
+            // every manifest a second time, and nothing is deleted until both loops have finished
+            // anyway, so noticing partway through is early enough.
+            AtomicInteger unreadableCodec = new AtomicInteger(ClusterMetadataManifest.CODEC_V0);
+
             Set<String> filesToKeep = new HashSet<>();
             Set<String> staleManifestPaths = new HashSet<>();
             Set<String> staleIndexMetadataPaths = new HashSet<>();
@@ -244,6 +266,7 @@ public class RemoteClusterStateCleanupManager implements Closeable {
                     clusterUUID,
                     blobMetadata.name()
                 );
+                unreadableCodec.accumulateAndGet(clusterMetadataManifest.getCodecVersion(), Math::max);
                 clusterMetadataManifest.getIndices()
                     .forEach(
                         uploadedIndexMetadata -> filesToKeep.add(
@@ -292,6 +315,7 @@ public class RemoteClusterStateCleanupManager implements Closeable {
                     clusterUUID,
                     blobMetadata.name()
                 );
+                unreadableCodec.accumulateAndGet(clusterMetadataManifest.getCodecVersion(), Math::max);
                 staleManifestPaths.add(
                     remoteManifestManager.getManifestFolderPath(clusterName, clusterUUID).buildAsString() + blobMetadata.name()
                 );
@@ -372,6 +396,18 @@ public class RemoteClusterStateCleanupManager implements Closeable {
                 }
 
             });
+
+            if (unreadableCodec.get() > ClusterMetadataManifest.MANIFEST_CURRENT_CODEC_VERSION) {
+                logger.warn(
+                    "Skipping stale cluster metadata cleanup: a manifest was written with codec version [{}], newer than "
+                        + "this node understands [{}]. Its references cannot be enumerated, and the sets computed above are "
+                        + "therefore incomplete -- deleting on that basis would remove blobs still in use. Cleanup resumes "
+                        + "once every cluster-manager-eligible node is upgraded.",
+                    unreadableCodec.get(),
+                    ClusterMetadataManifest.MANIFEST_CURRENT_CODEC_VERSION
+                );
+                return;
+            }
 
             if (staleManifestPaths.isEmpty()) {
                 logger.debug("No stale Remote Cluster Metadata files found");

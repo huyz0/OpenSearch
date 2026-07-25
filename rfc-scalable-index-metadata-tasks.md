@@ -324,14 +324,34 @@ into these tasks: the manifest genuinely does list all N indices every version, 
 `RemoteClusterStateCleanupManager` computes `filesToKeep` as a union over retained manifests, so
 sharding must teach it to resolve index blob names transitively through shard blobs.
 
-### C1. Extend cleanup for transitive reachability, before anything writes shards
+### C1. Make the sweep refuse to run on a manifest it cannot read -- DONE, and not as written
 
-Deliberately first. The delete path must be safe before any shard blob exists, not after.
+**The task as specified cannot come first.** "Fetch each shard blob to add the index names it
+references" needs a shard blob format, and that is C2's job. Writing the resolver now would mean
+inventing the format inside the cleanup path, which is the wrong place to decide it.
 
-- `deleteClusterMetadata` adds shard blob names to `filesToKeep`, and fetches each shard to add the
-  index blob names it references.
-- Test: a sweep with a retained manifest whose indices live in shard blobs must not delete those index
-  blobs. Confirm it fails without the transitive pass, which is the corruption this prevents.
+What *can* come first, and is the safety C1 exists for, is a guard. The sweep works by subtraction:
+retained manifests contribute to `filesToKeep`, and anything a stale manifest references that is not
+in that set is deleted. That is sound only while references can be enumerated. A manifest written by a
+newer codec still **parses** here -- the parser dispatch falls back to the newest version the node
+knows -- but its unknown fields come back empty, so its references read as *none* and the subtraction
+deletes blobs that are still in use.
+
+Sharding is precisely that kind of change: it moves the index list out of `getIndices()` and behind
+shard blobs, so a node running today's code against a sharded manifest computes an empty keep-set for
+every index in the cluster. During a rolling upgrade that is a repository-wide delete.
+
+So `deleteClusterMetadata` now records the highest codec version it saw across both the retained and
+the stale manifests, and returns without deleting anything if it exceeds
+`MANIFEST_CURRENT_CODEC_VERSION`. Recorded inside the existing loops rather than in a pre-scan: a
+separate pass would fetch every manifest twice, and nothing is deleted until both loops finish anyway.
+Costs nothing until such a manifest exists.
+
+C3 still has to add the transitive resolution when it introduces shard blobs. This makes getting that
+wrong non-catastrophic instead of catastrophic, which is what "deliberately first" was for.
+
+Test confirmed to fail without the guard; the 27-test cleanup suite and the wider `gateway.remote`
+suite pass.
 
 ### C2. Design the shard scheme
 
