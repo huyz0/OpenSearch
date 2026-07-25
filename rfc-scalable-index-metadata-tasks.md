@@ -456,13 +456,32 @@ permanent, cross-version commitment bought with a 0.08% improvement in the resou
 binding constraint on data nodes at a scale the allocator can actually reach. S3 and S6 together say
 it is not. Nothing short of overturning both should restart this.
 
-### E2. C4 incremental routing rebuild: maintainer call
+### E2. Incremental routing rebuild: PARKED, with the question made answerable
 
 Attempted and reverted. The finding generalizes: `RoutingChangesObserver` observes allocation changes,
 but routing tables also change outside allocation, so a change set derived from it is not a sound
-over-approximation. A correct version needs a change signal from every producer of routing tables. The
-payoff is roughly 35 to 67 ms of a 300 ms steady-state reroute at 40k shards, where the balancer
-dominates. This wants a maintainer's judgement rather than another unilateral attempt.
+over-approximation. A correct version needs a change signal from every producer of routing tables.
+
+**Parked rather than closed**, because unlike E1 this is not a bad idea, it is a good idea whose
+correct implementation costs more than one contributor should commit unilaterally. Writing down the
+decision it needs, so it can be answered rather than rediscovered:
+
+> Is core willing to require every producer of a `RoutingTable` to declare what it changed?
+
+That is the whole question. Everything else follows: with the invariant, the rebuild is
+straightforward and the existing revert becomes sound; without it, no version is correct, and the
+attempt should not be repeated.
+
+**What this session changed about the payoff, in both directions.** A6 measured steady-state reroute
+directly and confirmed the balancer dominates -- the ~35 to 67 ms of a ~300 ms reroute at 40k shards
+stands. But A6 also showed that the cold-tenant portion of that cost, which is the part this project
+cares about, is removed entirely by A5's routing absence rather than trimmed by a faster rebuild. So
+the case for E2 is now narrower than when it was attempted: it helps clusters with many *active*
+shards, which is S6's ceiling and Phase B's subject, and does nothing for the quiescent-tenant problem
+this plan was written for.
+
+That makes E2 properly Phase B's concern rather than Phase C's, and B4 should fold it into its verdict
+instead of leaving it as a standalone item here.
 
 ### E3. S1 sites 1 and 2 -- MOOT, Phase A happened
 
