@@ -120,21 +120,49 @@ retry-and-wait-for-allocation branch rather than failing immediately.
 - Test: a bulk request against a metadata-only index retries rather than failing.
 - Confirm the test fails with the change reverted.
 
-### A4. Spike: how does an index become routing-absent?
+### A4. Spike: how does an index become routing-absent? -- DONE
 
-Do not implement yet. Establish the mechanism:
+See `rfc-routing-absence-mechanism.md`. Scale-to-zero does **not** produce this state; it produces the
+opposite, deliberately. A suspended shard stays in the routing table as `UNASSIGNED` so
+`SuspendedShardAllocationDecider` can keep returning `NO` for it, once per candidate node, on every
+reroute. That is the cost cold-absence removes, and it scales with suspended shards times nodes.
 
-- Does the serverless plugin's existing `ShardSuspensionCoordinator` / scale-to-zero already produce
-  this state, so core only has to tolerate it? If so, A5 is mostly deletion of assumptions.
-- Otherwise: what marks an index as cold, and who removes its `IndexRoutingTable`? Candidates are a
-  cluster-state flag read by `RoutingTable.Builder`, or the allocator skipping it.
-- What brings it back, and what is the latency of the first write to a cold index?
+The blocker is not a missing mechanism, it is that **the routing table is currently the completion
+signal for reactivation**: `ShardReactivationActionFilter` iterates
+`state.routingTable().index(indexName)` in three places to decide whether the primary is started and
+the search replicas are back.
 
-Output: a short design with one recommended mechanism, in this file or its own RFC.
+Recommendation for A5: recreate the entry in the same cluster-state update that clears the suspended
+flag, so the completion check works unchanged and the mechanism stays where the rest of scale-to-zero
+lives. Two alternatives and why they are worse are in the spike.
+
+Two tasks came out of it:
+
+- **A6 gains a first half.** Measure the *current* curve -- reroute time against suspended-shard count
+  with today's mechanism -- before measuring the improvement. S6 measured 40k active shards; nobody has
+  measured 40k suspended ones, and that number is the prize.
+- **A8 is new.** Sweep the plugin for the same assumption A1 swept core for. A1 found sixteen sites in
+  `server/src/main`; the plugin is smaller but it is the component that would create this state, so its
+  own dereferences matter more rather than less.
 
 ### A5. Implement the mechanism chosen in A4
 
-Gated on A1 through A4. Size unknown until A4 lands.
+Concretely, per the spike:
+
+- Suspension stops writing an `IndexRoutingTable` entry, or removes it after eviction.
+- `TransportReactivateShardsAction` adds it back in the same update that clears the suspended flag.
+- The three `ShardReactivationActionFilter` sites tolerate absence, since they run before that update
+  completes.
+- Check whether `SuspendedShardAllocationDecider` is still needed for the window between marking and
+  eviction, now that the allocator stops seeing the shard afterwards.
+
+Gated on A8, which establishes the full plugin-side call-site list the way A1 did for core.
+
+### A8. Sweep the plugin for the routing-entry assumption
+
+Same exercise as A1, over `plugins/serverless-storage`. Three sites are already known from the A4
+spike (`ShardReactivationActionFilter`, around 226 and 306-312). Find the rest before A5 changes the
+state they run against.
 
 ### A6. Measure
 
