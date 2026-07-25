@@ -169,7 +169,7 @@ public final class ManifestDescriptorSizeEstimate {
         return index(0, aliases);
     }
 
-    private static IndexMetadata index(int ordinal, int aliases) {
+    static IndexMetadata index(int ordinal, int aliases) {
         String name = String.format(Locale.ROOT, "tenant-%016x", ordinal);
         IndexMetadata.Builder builder = IndexMetadata.builder(name)
             .settings(

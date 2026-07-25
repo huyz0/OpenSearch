@@ -596,6 +596,41 @@ That raises manifest sharding -- C6's third piece, previously described here as 
 optional to the thing that decides whether either half is usable at 100k+ indices. It is still
 independent of the descriptor work and can be done separately.
 
+## C3a -- what manifest sharding saves, before writing any of it
+
+C2 attached a stop condition to its go decision: the saving is bounded by how many indices change per
+cluster state version, not by index count. `ManifestShardingWriteAmplificationEstimate` measures it.
+Nothing needs implementing first -- bytes written are fully determined by the design (top-level
+manifest plus every shard holding at least one changed index), so simulating the hash partition is
+exact.
+
+100,000 indices with C6 descriptors, DEFLATE per blob. Unsharded is **882 KB** on every version.
+
+| changed indices | 64 shards | 256 shards | 1,024 shards | 4,096 shards |
+|---|---|---|---|---|
+| 1 | 55x less | **125x less** | 61x less | 16x less |
+| 10 | 5.8x less | **22x less** | 37x less | 15x less |
+| 100 | 9.5% MORE | 2.4x less | **7.4x less** | 9.3x less |
+| 1,000 | 9.5% MORE | 7.2% MORE | 22% MORE | **1.9x less** |
+| 10,000 | 9.5% MORE | 7.2% MORE | 25% MORE | 92% MORE |
+
+**Verdict: go, and C2's default of 64 was wrong.** 64 saturates at 100 changed indices -- every shard
+is touched, and the sharded write is then 9.5% *worse* than not sharding, because N/S entries compress
+slightly worse per entry than N do. That saturation is a coupon-collector effect and it arrives much
+earlier than "changed indices ≈ shard count" intuition suggests.
+
+**256 is the right default.** It gives 125x at one changed index and 22x at ten, which is the steady
+state this is for, and still wins at 100. Raising it further trades the common case away: at 4,096
+shards a single changed index costs 55 KB, because the top-level manifest listing 4,096 references is
+itself the floor. That floor is the reason the curve is not monotonic in shard count, and it is why a
+measurement was worth doing rather than reasoning about the partition alone.
+
+**What this does not settle.** The right shard count depends on churn, and nobody has measured churn on
+a real fleet. 256 is chosen for a steady state of single-digit changed indices per version. A cluster
+doing bulk index creation lives at the right-hand end of the table, where sharding costs a few percent
+-- acceptable, but it means the setting exists for a reason and D2's "off by default" stands until a
+real churn distribution is known.
+
 ## A6 -- what a quiescent tenant costs the allocator today
 
 The A4 spike found that scale-to-zero does not remove an index from the routing table. It evicts the

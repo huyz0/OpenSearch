@@ -44,16 +44,21 @@ rewrite the entire manifest repeatedly, which is precisely the cost sharding exi
 
 So:
 
-- `cluster.remote_store.state.manifest.shard_count`, node-scoped, default **64**.
+- `cluster.remote_store.state.manifest.shard_count`, node-scoped, default **256**. (Was 64 in the
+  first version of this design; C3a measured 64 saturating at 100 changed indices and turning into a
+  9.5% *loss*. See `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.md`.)
 - The count in force is written into the top-level manifest. Readers use the value they find there,
   not the value they are configured with.
 - Changing it is an explicit operator action that costs one full rewrite, and takes effect on the next
   published version.
 
-64 at 100k indices is about 1,500 entries or roughly 8 KB compressed per shard, which is a sensible
-blob size and keeps a full-state read to 64 fetches rather than 100,000. At 1M indices the same 64
-gives 15,000 entries per shard, still fine; the setting exists for operators who want to trade
-round-trips against per-shard size, not because the default is expected to need changing.
+256 at 100k indices is about 390 entries per shard. C3a measured that at 125x less written for a
+single changed index and 22x at ten, against 55x and 5.8x for 64.
+
+**The curve is not monotonic in shard count**, which is the part worth knowing. Raising the count
+further trades the common case away, because the top-level manifest listing S references becomes the
+floor: at 4,096 shards a single changed index still costs 55 KB. 256 sits near the optimum for a steady
+state of single-digit changed indices per version.
 
 ## Blob layout and naming
 

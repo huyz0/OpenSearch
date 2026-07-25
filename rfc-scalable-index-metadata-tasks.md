@@ -452,10 +452,27 @@ saving is bounded by changed indices per version, not by index count; if most ve
 indices to touch most shards, it collapses and the rest of Phase C is not worth its cleanup risk. That
 measurement is cheap, and it is the last point where this can be stopped cheaply.
 
-### C3. Write path
+### C3a. Measure the write amplification reduction -- DONE, and it changed the design
 
-Write only shards whose contents changed; carry the rest forward by reference. This is where the win
-is, so measure the write amplification reduction as part of the task rather than after.
+C2's stop condition. `ManifestShardingWriteAmplificationEstimate`, recorded in
+`benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.md`. Nothing needed implementing first: bytes written are
+fully determined by the design, so simulating the hash partition is exact.
+
+**Go.** At 100k indices and 256 shards, a version changing one index writes 125x less than the 882 KB
+unsharded manifest, and ten changed indices writes 22x less.
+
+**And C2's shard count of 64 was wrong.** 64 saturates at 100 changed indices -- every shard touched,
+and the sharded write is then 9.5% *worse* than not sharding, since N/S entries compress slightly worse
+per entry than N do. Corrected to 256 in `rfc-manifest-sharding-design.md`.
+
+The non-monotonicity is the useful part: raising the count further makes the common case worse, because
+the top-level manifest listing S references becomes the floor. At 4,096 shards a single changed index
+still costs 55 KB. Reasoning about the partition alone would have missed that entirely.
+
+### C3b. Write path
+
+Write only shards whose contents changed; carry the rest forward by reference. C3a settled that the
+win is real; this implements it, and must also add the transitive cleanup resolution C1 could not.
 
 ### C4. Read path
 
