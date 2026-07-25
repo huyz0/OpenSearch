@@ -293,11 +293,29 @@ confirm the constant rather than just the shape.
 anything else here". Phase A reduces what the allocator sees; this asks whether the allocator itself
 can be made to scale. It is research first. Do not start with an implementation task.
 
-### B1. Profile reroute at increasing active-shard counts
+### B1. Profile reroute at increasing active-shard counts -- CLOSED, not run
 
-Extend the S6 harness to 40k, 100k and 200k active shards, assertions disabled. Break the time down by
-phase: `RoutingNodes` construction, decider evaluation, balancer iterations. S6 established the
-balancer dominates; get the curve, not one point.
+**The tiers this asks for are not reachable in this harness, and the verdict does not need them.**
+
+S6 already did the phase breakdown at every tier that runs: `RoutingNodes` construction against
+steady-state reroute at 2k, 10k and 40k active shards, assertions disabled. It also recorded why the
+tiers above stop: driving 100k shards to STARTED takes several rounds of an already-superlinear cold
+reroute and exceeds the 20-minute suite timeout, which is why that figure was measured once and then
+dropped to keep the harness repeatable. 200k is worse by the same mechanism.
+
+Making them reachable means a harness that is not a test -- a standalone driver with its own timeout
+budget, or a way to construct an already-settled 200k-shard state without allocating it. That is real
+work, and B4 already established it buys nothing: the verdict rests on B2 and B3 ruling out the two
+candidate mitigations, and neither argument depends on where the knee sits.
+
+**What would justify building it:** cell sizing. Deciding how many active shards a cell should hold
+wants the curve between 40k and 200k, and that is a capacity-planning question rather than a
+does-this-approach-work question. Recorded here so it is picked up for that reason rather than as
+leftover Phase B work.
+
+The `-da` figures S6 measured stand as the usable data: steady-state reroute 25-34 ms at 2k, 71-75 ms
+at 10k, 355-445 ms at 40k, with `RoutingNodes` construction 1-2 / 5-6 / 43-52 ms. Superlinear, and the
+balancer dominates.
 
 ### B2. Can allocation be domain-scoped? -- ANSWERED, and the question dissolves
 
