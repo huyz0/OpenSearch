@@ -157,4 +157,65 @@ public class ShardReactivationActionFilterTests extends OpenSearchTestCase {
             clusterService.close();
         }
     }
+
+    /**
+     * An index present in metadata with no routing entry at all -- the shape Phase A wants a cold
+     * tenant to have. Both routing reads in this filter guard against it, but before the fix they
+     * gave the wrong answer: {@code readerCopyNotYetStarted} returned "no reactivation needed" and
+     * {@code allFullyReactivated} returned "this one is done". The search proceeded against an index
+     * with no shard copy of any role, which is a silent failure rather than a loud one.
+     */
+    public void testSearchWaitsForAnIndexPresentInMetadataAndAbsentFromRouting() throws Exception {
+        IndexMetadata indexMetadata = readerIndexMetadata();
+        ClusterService clusterService = ClusterServiceUtils.createClusterService(threadPool);
+        try {
+            ClusterServiceUtils.setState(clusterService, clusterStateWithoutRouting(indexMetadata));
+
+            AtomicBoolean proceeded = new AtomicBoolean(false);
+            SearchRequest request = new SearchRequest(INDEX);
+            filter(clusterService).apply(null, SearchAction.NAME, request, null, null, recordingChain(proceeded));
+
+            assertFalse("an index with no routing entry has nothing to serve the search; it must be held", proceeded.get());
+
+            // Reactivation recreates the routing entry and the reader copy starts.
+            ClusterServiceUtils.setState(clusterService, clusterStateWithSearchReplica(indexMetadata, true));
+            assertBusy(() -> assertTrue("once routing exists and the reader copy is STARTED the search must proceed", proceeded.get()));
+        } finally {
+            clusterService.close();
+        }
+    }
+
+    /**
+     * The other reading of the same absence, and the reason the two cases cannot share an answer: an
+     * index gone from metadata is never coming back, so the wait must resolve rather than run to its
+     * timeout. This is what keeps the fix above from turning a deleted index into a 30-second stall.
+     */
+    public void testHeldSearchIsReleasedWhenTheIndexIsDeletedOutright() throws Exception {
+        IndexMetadata indexMetadata = readerIndexMetadata();
+        ClusterService clusterService = ClusterServiceUtils.createClusterService(threadPool);
+        try {
+            ClusterServiceUtils.setState(clusterService, clusterStateWithoutRouting(indexMetadata));
+
+            AtomicBoolean proceeded = new AtomicBoolean(false);
+            SearchRequest request = new SearchRequest(INDEX);
+            filter(clusterService).apply(null, SearchAction.NAME, request, null, null, recordingChain(proceeded));
+            assertFalse(proceeded.get());
+
+            ClusterServiceUtils.setState(
+                clusterService,
+                ClusterState.builder(new ClusterName("test")).metadata(Metadata.builder().build()).routingTable(RoutingTable.builder().build()).build()
+            );
+            assertBusy(() -> assertTrue("a deleted index must release the wait, not stall it until the timeout", proceeded.get()));
+        } finally {
+            clusterService.close();
+        }
+    }
+
+    /** In metadata, absent from routing: cold. */
+    private static ClusterState clusterStateWithoutRouting(IndexMetadata indexMetadata) {
+        return ClusterState.builder(new ClusterName("test"))
+            .metadata(Metadata.builder().put(indexMetadata, false).build())
+            .routingTable(RoutingTable.builder().build())
+            .build();
+    }
 }

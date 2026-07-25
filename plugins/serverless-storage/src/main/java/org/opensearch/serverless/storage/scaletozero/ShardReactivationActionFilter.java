@@ -221,7 +221,12 @@ public final class ShardReactivationActionFilter implements ActionFilter {
         }
         String indexName = indexMetadata.getIndex().getName();
         if (state.routingTable().hasIndex(indexName) == false) {
-            return false;
+            // The caller already established the index is in metadata, so no routing entry means
+            // cold, not gone. A cold index has no reader copy anywhere, which is the strongest form
+            // of "not yet started" -- answering false here would let the search proceed against an
+            // index serving nothing. Unreachable today (nothing removes the entry), and the reason
+            // this can land before the mechanism that does.
+            return true;
         }
         for (org.opensearch.cluster.routing.IndexShardRoutingTable shardRoutingTable : state.routingTable().index(indexName)) {
             List<org.opensearch.cluster.routing.ShardRouting> searchReplicas = shardRoutingTable.searchOnlyReplicas();
@@ -293,7 +298,12 @@ public final class ShardReactivationActionFilter implements ActionFilter {
                 return false;
             }
             if (state.routingTable().hasIndex(entry.indexName()) == false) {
-                continue;
+                // Absent routing means two different things, and they need opposite answers. The
+                // index-not-in-metadata case above is "gone" -- skip it, nothing will ever start.
+                // Reaching here the index IS in metadata, so it is cold: no shard copy of either
+                // role exists, so reactivation demonstrably has not finished. Continuing would
+                // report the wait satisfied for an index with nothing to serve the query.
+                return false;
             }
             // Clearing the suspended marker alone is not enough: the specific role's shard copy
             // still needs to actually finish recovering before it can serve a query. Checking only

@@ -46,9 +46,11 @@ request today, and the rest are latent. Nothing yet makes an index routing-absen
 | A7.5 clusterless shard-started | reviewed, no change needed |
 | A7.6 integration coverage | open |
 | A7.7 snapshot generation preconditions | open |
-| A2, A3 | blocked on A4 |
-| A4 spike | next |
-| A5, A6 | blocked on A4 |
+| A5.1 cold-vs-gone | done, tested |
+| A5.2, A5.3, A5.4 | open |
+| A2, A3 | blocked on A5 |
+| A4 spike | done |
+| A6 | first half done |
 
 ### A1. Audit every caller that assumes a routing entry exists -- DONE
 
@@ -147,12 +149,28 @@ Two tasks came out of it:
 
 ### A5. Implement the mechanism chosen in A4
 
-Concretely, per the spike:
+Split into four, because the pieces have very different risk. A5.1 is the one that makes the rest
+safe, and it lands first and alone.
 
-- Suspension stops writing an `IndexRoutingTable` entry, or removes it after eviction.
-- `TransportReactivateShardsAction` adds it back in the same update that clears the suspended flag.
-- The three `ShardReactivationActionFilter` sites tolerate absence, since they run before that update
-  completes.
+**A5.1 -- DONE.** `ShardReactivationActionFilter` distinguishes cold from gone. `readerCopyNotYetStarted`
+now answers *true* for an index present in metadata and absent from routing (the caller has already
+established metadata presence, so absence there can only mean cold), and `allFullyReactivated` answers
+*false* rather than skipping the entry. The `indexMetadata == null` branch above it keeps meaning
+"gone", so a deleted index still releases the wait instead of stalling to the timeout -- that pairing
+is what the two new tests pin down, and both fail with the change reverted.
+
+One case is deliberately left to A5.3 rather than guarded speculatively: an index with zero
+search-only replicas short-circuits before the routing read, so a cold writer-only index whose marker
+has cleared but whose routing entry has not yet been recreated would proceed. **A5.3 must clear the
+marker and recreate the entry in the same cluster-state update**, which is what closes it. If that
+ordering is ever relaxed, this becomes a live gap.
+
+Remaining:
+
+- **A5.2** Suspension stops writing an `IndexRoutingTable` entry, or removes it after eviction.
+- **A5.3** `TransportReactivateShardsAction` adds it back in the same update that clears the
+  suspended flag. See the invariant above.
+- **A5.4** Decide whether `SuspendedShardAllocationDecider` is still needed.
 - Check whether `SuspendedShardAllocationDecider` is still needed for the window between marking and
   eviction, now that the allocator stops seeing the shard afterwards.
 
