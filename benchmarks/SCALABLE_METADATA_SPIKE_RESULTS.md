@@ -385,6 +385,24 @@ driving the executor directly with a real multi-task batch tested anything. For 
 preserving change, a green suite proves nothing until you have broken the code and watched the test
 fail.
 
+## Cumulative effect of the shipped changes, and a correction
+
+40k shards, steady-state reroute, assertions disabled:
+
+| | samples | mean |
+|---|---|---|
+| baseline | 445, 355 ms | 400 ms |
+| after all shipped changes | 221, 276, 410 ms | 302 ms |
+
+**~24% mean improvement, not the ~45% first reported.** That earlier figure came from a single
+favourable sample; the run-to-run spread here is 1.9x (221-410 ms on identical code), which is wide
+enough to swamp the effect being measured. Reporting the minimum was cherry-picking, and is recorded
+here as a correction rather than quietly amended.
+
+The practical lesson for anyone using `AllocationCeilingSpikeTests`: it resolves order-of-magnitude
+differences (the superlinear cold-allocation curve, the assertions-on/off 2x) but not changes of
+tens of percent. Those need many samples or a different harness.
+
 ## Recalibration: C2's headline number does not survive S6
 
 S4 measured mapping dedup at up to 1000x on cluster state, and the plan quoted that as ~50 GB -> under

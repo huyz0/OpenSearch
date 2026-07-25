@@ -128,15 +128,11 @@ public class RoutingNodes implements Iterable<RoutingNode> {
         // also fill replicaSet information
         for (final IndexRoutingTable indexRoutingTable : routingTable.indicesRouting().values()) {
             for (IndexShardRoutingTable indexShard : indexRoutingTable) {
-                IndexMetadata idxMetadata = metadata.index(indexShard.shardId().getIndex());
-                boolean isSearchOnlyClusterBlockEnabled = false;
-                if (idxMetadata != null) {
-                    isSearchOnlyClusterBlockEnabled = idxMetadata.getSettings()
-                        .getAsBoolean(IndexMetadata.INDEX_BLOCKS_SEARCH_ONLY_SETTING.getKey(), false);
-                }
-                if (isSearchOnlyClusterBlockEnabled == false) {
-                    assert indexShard.primary != null : "Primary shard routing can't be null for non-search-only indices";
-                }
+                // Kept entirely inside the assert: the metadata lookup and settings parse below exist
+                // only to decide whether the primary-present invariant applies, so evaluating them as
+                // ordinary statements made every node pay a per-shard-table settings parse in
+                // production and then discard the result.
+                assert assertPrimaryPresentUnlessSearchOnly(metadata, indexShard);
                 for (ShardRouting shard : indexShard) {
                     // to get all the shards belonging to an index, including the replicas,
                     // we define a replica set and keep track of it. A replica set is identified
@@ -175,6 +171,18 @@ public class RoutingNodes implements Iterable<RoutingNode> {
             }
         }
         assert nodesToShards.values().stream().allMatch(RoutingNode::invariant);
+    }
+
+    /**
+     * Asserts that a non-search-only index's shard table has a primary. Reads the index's settings,
+     * so it must only ever be invoked from an {@code assert} -- see the call site in the constructor.
+     */
+    private static boolean assertPrimaryPresentUnlessSearchOnly(Metadata metadata, IndexShardRoutingTable indexShard) {
+        final IndexMetadata indexMetadata = metadata.index(indexShard.shardId().getIndex());
+        final boolean searchOnly = indexMetadata != null
+            && indexMetadata.getSettings().getAsBoolean(IndexMetadata.INDEX_BLOCKS_SEARCH_ONLY_SETTING.getKey(), false);
+        assert searchOnly || indexShard.primary != null : "Primary shard routing can't be null for non-search-only indices";
+        return true;
     }
 
     private void addRecovery(ShardRouting routing) {
