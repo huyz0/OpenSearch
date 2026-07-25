@@ -195,12 +195,14 @@ public class TransportUpgradeAction extends TransportBroadcastByNodeAction<Upgra
     /**
      * Finds all indices that have not all primaries available
      */
-    private Set<String> indicesWithMissingPrimaries(ClusterState clusterState, String[] concreteIndices) {
+    // Package-private and static so it can be tested directly: it reads nothing from the instance.
+    static Set<String> indicesWithMissingPrimaries(ClusterState clusterState, String[] concreteIndices) {
         Set<String> indices = new HashSet<>();
         RoutingTable routingTable = clusterState.routingTable();
         for (String index : concreteIndices) {
             IndexRoutingTable indexRoutingTable = routingTable.index(index);
-            if (indexRoutingTable.allPrimaryShardsActive() == false) {
+            // No routing entry means no primaries are active, which is what this is asking.
+            if (indexRoutingTable == null || indexRoutingTable.allPrimaryShardsActive() == false) {
                 indices.add(index);
             }
         }

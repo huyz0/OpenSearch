@@ -57,9 +57,13 @@ Do them in this order, most reachable first:
   excludes. Guarded the two callers instead, matching that convention:
   `TieringRequestValidator:141` reports not-healthy, `TieringServiceValidator:189` rejects with
   `INDEX_RED_STATUS`. Both tests reproduce the original NPE when the guard is removed.
-- A7.2 Request paths: `TransportAnalyzeAction:142`, `TransportGetFieldMappingsIndexAction:115`,
-  `TransportUpdateAction:214`, `TransportUpgradeAction:202`. All should report no shard available
-  rather than NPE.
+- A7.2 -- DONE. All four guarded. `TransportUpgradeAction` has a unit test that reproduces the
+  original NullPointerException. The other three are `shards()` overrides that a unit test cannot
+  reach without disproportionate scaffolding (see `rfc-routing-absence-audit.md`); they are covered by
+  inspection, and A7.6 below exists to close that.
+- A7.6 Integration coverage for the three `shards()` guards: stand up a node, put an index in metadata
+  without a routing entry, and assert analyze, get-field-mappings and update report no shard available
+  or retry rather than throwing. Needed anyway once cold indices exist.
 - A7.3 Snapshot paths: `SnapshotsService:3443`, `:3511`. Needs a decision, not just a guard: is a cold
   index snapshotted from its remote state, or skipped?
 - A7.4 Resize, merge and allocation: `MetadataCreateIndexService:1991`, `DiskThresholdDecider:668`,

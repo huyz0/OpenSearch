@@ -32,7 +32,7 @@ These are the actual work of Phase A, and none of them were in the plan's list. 
 shape as the `TransportBroadcastReplicationAction` defect fixed earlier: a lookup whose result is
 dereferenced without a null check.
 
-**Request paths, reachable by an ordinary user request against a cold index:**
+**Request paths, reachable by an ordinary user request against a cold index (ALL FOUR FIXED):**
 
 | site | expression | what should happen |
 |---|---|---|
@@ -40,6 +40,29 @@ dereferenced without a null check.
 | `TransportGetFieldMappingsIndexAction:115` | `.index(concreteIndex).randomAllActiveShardsIt()` | same |
 | `TransportUpdateAction:214` | `.index(...).shard(id).primaryShardIt()` | same |
 | `TransportUpgradeAction:202` | `indexRoutingTable.allPrimaryShardsActive()` | treat as not-active, skip the index |
+
+All four now guard. The first three return an empty iterator rather than null: an empty one becomes a
+`NoShardAvailableActionException` in `TransportSingleShardAction`, or a retry in
+`TransportInstanceSingleOperationAction` which already has that branch for "between index gateway
+recovery and shardIt initialization"; null would instead mean "execute locally", which is wrong here.
+
+**Test coverage is uneven, deliberately.** `TransportUpgradeAction.indicesWithMissingPrimaries` is
+covered by a unit test that reproduces the original NullPointerException, after making the method
+package-private and static -- it reads nothing from the instance, so that is honest rather than a
+testability hack.
+
+The other three are covered by inspection only. Each is a `shards()` override, and reaching one from a
+test needs more scaffolding than the guard deserves:
+
+- `TransportAnalyzeAction` and `TransportGetFieldMappingsIndexAction` take
+  `TransportSingleShardAction.InternalRequest`, a protected inner class whose constructor is
+  package-private, so only a test inside `org.opensearch.action.support.single.shard` can build one.
+- `TransportUpdateAction.shards` takes a public `UpdateRequest`, but `shardId` has no public setter, so
+  a test cannot put the request into the state the guarded branch requires.
+
+Left uncovered rather than either faking coverage or restructuring three production classes for it.
+The natural place to catch these is an integration test that stands up a node, which is where the
+cold-index work will need one anyway.
 
 **Snapshot paths:**
 

@@ -44,6 +44,8 @@ import org.opensearch.OpenSearchException;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.single.shard.TransportSingleShardAction;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.routing.IndexRoutingTable;
+import org.opensearch.cluster.routing.PlainShardsIterator;
 import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.ResolvedIndices;
@@ -73,6 +75,7 @@ import org.opensearch.transport.TransportService;
 import java.io.IOException;
 import java.io.Reader;
 import java.io.StringReader;
+import java.util.Collections;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -139,7 +142,13 @@ public class TransportAnalyzeAction extends TransportSingleShardAction<AnalyzeAc
             // just execute locally....
             return null;
         }
-        return state.routingTable().index(request.concreteIndex()).randomAllActiveShardsIt();
+        IndexRoutingTable indexRoutingTable = state.routingTable().index(request.concreteIndex());
+        if (indexRoutingTable == null) {
+            // In metadata but not in routing. An empty iterator makes this a NoShardAvailableActionException,
+            // which is what the caller already handles; returning null would instead mean "run it locally".
+            return new PlainShardsIterator(Collections.emptyList());
+        }
+        return indexRoutingTable.randomAllActiveShardsIt();
     }
 
     @Override

@@ -37,6 +37,8 @@ import org.opensearch.action.admin.indices.mapping.get.GetFieldMappingsResponse.
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.single.shard.TransportSingleShardAction;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.routing.IndexRoutingTable;
+import org.opensearch.cluster.routing.PlainShardsIterator;
 import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.block.ClusterBlockLevel;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
@@ -112,7 +114,12 @@ public class TransportGetFieldMappingsIndexAction extends TransportSingleShardAc
     @Override
     protected ShardsIterator shards(ClusterState state, InternalRequest request) {
         // Will balance requests between shards
-        return state.routingTable().index(request.concreteIndex()).randomAllActiveShardsIt();
+        IndexRoutingTable indexRoutingTable = state.routingTable().index(request.concreteIndex());
+        if (indexRoutingTable == null) {
+            // In metadata but not in routing; report no shard available rather than dereferencing null.
+            return new PlainShardsIterator(Collections.emptyList());
+        }
+        return indexRoutingTable.randomAllActiveShardsIt();
     }
 
     @Override
