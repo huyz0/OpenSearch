@@ -353,11 +353,24 @@ wrong non-catastrophic instead of catastrophic, which is what "deliberately firs
 Test confirmed to fail without the guard; the 27-test cleanup suite and the wider `gateway.remote`
 suite pass.
 
-### C2. Design the shard scheme
+### C2. Design the shard scheme -- DONE
 
-Partition function (hash of index name is the obvious choice), shard count and how it changes, blob
-naming, and how the top-level manifest references shards. Decide whether shard count is fixed or
-scales with index count, and what happens when it changes.
+See `rfc-manifest-sharding-design.md`. Verdict is go, with one condition.
+
+Decisions: partition on `murmurhash3(index UUID) mod shardCount`; shard count **fixed**, declared in
+the top-level manifest, defaulting to 64, and never derived from index count; shard blobs immutable
+and carried forward by reference when unchanged, which is where the entire saving comes from.
+
+The shard-count decision is the C6 scar applied again. Making the codec depend on the manifest's
+contents let a cluster flap between versions as indices came and went, and was reverted. Deriving
+shard count from index count is the same mistake with a worse ending: crossing the threshold rewrites
+every shard, so a cluster hovering near a boundary repeatedly rewrites the whole manifest -- exactly
+the cost sharding exists to remove.
+
+**The condition: C3 must measure the write amplification reduction before C4 and C5 are written.** The
+saving is bounded by changed indices per version, not by index count; if most versions change enough
+indices to touch most shards, it collapses and the rest of Phase C is not worth its cleanup risk. That
+measurement is cheap, and it is the last point where this can be stopped cheaply.
 
 ### C3. Write path
 
