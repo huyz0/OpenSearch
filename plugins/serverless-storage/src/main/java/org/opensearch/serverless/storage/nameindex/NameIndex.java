@@ -9,8 +9,12 @@
 package org.opensearch.serverless.storage.nameindex;
 
 import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.function.Consumer;
 
 /**
@@ -338,20 +342,28 @@ public final class NameIndex {
      * about 8.4 GiB, which is a capacity planning input rather than a detail.
      */
     public void rebuild() {
+        // Snapshot what will be folded, then build outside the write lock. A18 measured 983 ms for
+        // 300,000 names, which extrapolates to minutes at 100M; holding writers off for that long is
+        // not a limitation worth keeping. Reads never blocked, and now writes do not either.
+        State current = state;
+        Map<String, IndexNameEntry> foldedPuts = new LinkedHashMap<>(current.overlay.puts());
+        List<String> foldedTombstones = new ArrayList<>(current.overlay.tombstones());
+
+        CompactNameIndex rebuilt = CompactNameIndexBuilder.buildFromSorted(() -> mergedEntries(current, foldedPuts, foldedTombstones));
+        CompactNameIndex rebuiltReversed = reversedOf(rebuilt);
+
         synchronized (writeLock) {
-            State current = state;
-
-            // Streamed rather than buffered. A18 measured the buffered path at 13.8x the steady-state
-            // size during a rebuild, about 108 GiB at 100M names, because the builder held one object
-            // per name -- the very overhead the packed form exists to avoid. Both inputs here are
-            // already in the same byte order, so their merge is sorted by construction and needs no
-            // intermediate at all.
-            CompactNameIndex rebuilt = CompactNameIndexBuilder.buildFromSorted(() -> mergedEntries(current));
-
-            // Both structures are rebuilt from the same output. Producing one and forgetting the other
-            // is the A11c trap: the index would answer prefix queries correctly and suffix queries with
-            // stale data, which is worse than failing.
-            state = new State(rebuilt, reversedOf(rebuilt), new NameIndexOverlay());
+            // Swap in the new bases, then retire exactly what was folded. Anything that arrived while
+            // the build ran is still in the overlay and stays there, which is why this retires by
+            // (name, entry) rather than clearing: a create that landed mid-rebuild is not in the new
+            // base, and dropping it would lose an index without any error.
+            state = new State(rebuilt, rebuiltReversed, current.overlay);
+            for (Map.Entry<String, IndexNameEntry> folded : foldedPuts.entrySet()) {
+                current.overlay.retireIfUnchanged(folded.getKey(), folded.getValue());
+            }
+            for (String tombstone : foldedTombstones) {
+                current.overlay.retireTombstone(tombstone);
+            }
         }
     }
 
@@ -362,8 +374,14 @@ public final class NameIndex {
      * <p>Lazy, so nothing beyond the two cursors is alive at once. That is the whole point: this is what
      * lets a rebuild allocate only the arrays it is producing.
      */
-    private static java.util.Iterator<IndexNameEntry> mergedEntries(State current) {
-        java.util.Iterator<IndexNameEntry> overlayEntries = current.overlay.puts().values().iterator();
+    private static java.util.Iterator<IndexNameEntry> mergedEntries(
+        State current,
+        Map<String, IndexNameEntry> foldedPuts,
+        List<String> foldedTombstones
+    ) {
+        Set<String> covered = new HashSet<>(foldedPuts.keySet());
+        covered.addAll(foldedTombstones);
+        java.util.Iterator<IndexNameEntry> overlayEntries = foldedPuts.values().iterator();
 
         return new java.util.Iterator<>() {
             private int ordinal = 0;
@@ -374,8 +392,10 @@ public final class NameIndex {
                 while (ordinal < current.base.size()) {
                     int at = ordinal++;
                     String name = current.base.nameAt(at);
-                    if (current.overlay.covers(name)) {
+                    if (covered.contains(name)) {
                         // Deleted, or superseded by an overlay put that this merge emits instead.
+                        // Against the snapshot rather than the live overlay, so a change arriving
+                        // mid-rebuild cannot alter what this build is producing.
                         continue;
                     }
                     // entryAt rather than a (name, uuid, status) triple: an alias's targets live in the

@@ -94,6 +94,51 @@ public class NameIndexRebuildCostTests extends OpenSearchTestCase {
         assertTrue("expected close to 2x, got " + ratio, ratio > 1.8 && ratio < 2.2);
     }
 
+    /**
+     * A19. Writes must not be lost or duplicated by a rebuild that runs concurrently with them.
+     *
+     * <p>Rebuild builds outside the write lock and then retires only what it folded, by (name, entry)
+     * rather than by clearing. A create that lands mid-rebuild is not in the new base, so clearing the
+     * overlay would drop an index with nothing reporting an error -- which is precisely the failure this
+     * exercises.
+     */
+    public void testWritesDuringARebuildAreNeitherLostNorDuplicated() throws Exception {
+        NameIndex index = new NameIndex(build(50_000));
+        for (int i = 0; i < 500; i++) {
+            index.create("pre-" + String.format("%05d", i), uuid(i), IndexNameEntry.STATUS_OPEN);
+        }
+
+        java.util.concurrent.atomic.AtomicBoolean stop = new java.util.concurrent.atomic.AtomicBoolean();
+        java.util.concurrent.atomic.AtomicInteger written = new java.util.concurrent.atomic.AtomicInteger();
+        Thread writer = new Thread(() -> {
+            int i = 0;
+            while (stop.get() == false) {
+                index.create("during-" + String.format("%06d", i), uuid(i), IndexNameEntry.STATUS_OPEN);
+                written.incrementAndGet();
+                i++;
+            }
+        });
+        writer.start();
+        Thread.sleep(20);
+        index.rebuild();
+        stop.set(true);
+        writer.join(java.util.concurrent.TimeUnit.SECONDS.toMillis(30));
+
+        // Everything written before and during the rebuild must still resolve, exactly once each.
+        for (int i = 0; i < 500; i++) {
+            assertNotNull("pre-rebuild write lost", index.lookup("pre-" + String.format("%05d", i)));
+        }
+        int during = written.get();
+        assertTrue("the writer should have made progress", during > 0);
+        for (int i = 0; i < during; i++) {
+            assertNotNull("write during rebuild lost: during-" + i, index.lookup("during-" + String.format("%06d", i)));
+        }
+
+        java.util.List<String> all = new java.util.ArrayList<>();
+        index.forEachMatching("during-*", e -> all.add(e.getName()));
+        assertEquals("a name must not appear twice", all.size(), new java.util.HashSet<>(all).size());
+    }
+
     private static CompactNameIndex build(int count) {
         CompactNameIndexBuilder builder = new CompactNameIndexBuilder(count);
         for (int i = 0; i < count; i++) {

@@ -239,7 +239,7 @@ cannot have at any speed.
 | A12, persistence and bootstrap | open |
 | A13, transport action and service wrapper | open |
 | A14, coordinator integration | open |
-| Double-buffered rebuild so writers do not block | open |
+| A19, rebuild without blocking writers | done |
 
 ## Second review pass, after the reversed index landed
 
@@ -297,7 +297,7 @@ start-up time rather than on memory.
 | A12, persistence and bootstrap | open |
 | A13, transport action and service wrapper | open |
 | A14, coordinator integration | open |
-| Double-buffered rebuild so writers do not block | open |
+| A19, rebuild without blocking writers | done |
 
 ## Phase 5 detailed plan
 

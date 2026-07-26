@@ -122,6 +122,24 @@ public final class NameIndexOverlay {
         return Collections.unmodifiableSet(tombstones);
     }
 
+    /**
+     * Removes a put only if it is still exactly the entry that was folded into a new base.
+     *
+     * <p>Used by rebuild to retire what it consumed without discarding writes that arrived while it was
+     * building. A plain remove by name would drop a create that landed mid-rebuild and is not in the new
+     * base, which is a silently lost index.
+     */
+    public void retireIfUnchanged(String name, IndexNameEntry folded) {
+        if (puts.remove(name, folded)) {
+            reversedPuts.remove(NamePatterns.reverse(name), folded);
+        }
+    }
+
+    /** Removes a tombstone that a rebuild has applied, leaving any newer delete of the same name. */
+    public void retireTombstone(String name) {
+        tombstones.remove(name);
+    }
+
     /** Total pending changes, which is what the rebuild policy is measured against. */
     public int size() {
         return puts.size() + tombstones.size();
