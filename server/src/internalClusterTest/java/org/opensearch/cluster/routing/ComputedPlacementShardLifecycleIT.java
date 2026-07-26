@@ -16,6 +16,9 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.rest.RestStatus;
+import org.opensearch.index.IndexService;
+import org.opensearch.index.shard.IndexShard;
+import org.opensearch.index.shard.IndexShardState;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.test.OpenSearchIntegTestCase;
 import org.junit.After;
@@ -68,6 +71,32 @@ public class ComputedPlacementShardLifecycleIT extends OpenSearchIntegTestCase {
                 }
             }
             assertTrue("some data node must have opened the computed index", open > 0);
+        }, 30, TimeUnit.SECONDS);
+    }
+
+    /**
+     * The question underneath the write, asked directly.
+     *
+     * <p>A write that races the replication retry timeout tells you almost nothing: it takes sixty
+     * seconds whether it passes or fails, so the signal is buried in a race. Primary mode is what the
+     * write actually needs, the shard knows it locally, and asking the shard is both immediate and
+     * unambiguous. This is the assertion to fix C18 against.
+     */
+    public void testTheComputedShardEntersPrimaryMode() throws Exception {
+        registerComputedPlacement();
+        createComputedIndex();
+
+        assertBusy(() -> {
+            IndexShard shard = null;
+            for (IndicesService indices : internalCluster().getDataNodeInstances(IndicesService.class)) {
+                IndexService indexService = indices.indexService(resolveIndex(INDEX));
+                if (indexService != null && indexService.hasShard(0)) {
+                    shard = indexService.getShard(0);
+                }
+            }
+            assertNotNull("no data node holds the computed shard", shard);
+            assertEquals("the shard must reach STARTED", IndexShardState.STARTED, shard.state());
+            assertTrue("the shard must be in primary mode, or every write is rejected and retried", shard.isPrimaryMode());
         }, 30, TimeUnit.SECONDS);
     }
 
