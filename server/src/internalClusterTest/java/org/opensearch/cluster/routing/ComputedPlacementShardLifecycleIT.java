@@ -151,6 +151,58 @@ public class ComputedPlacementShardLifecycleIT extends OpenSearchIntegTestCase {
         assertTrue("the document must be readable back from the computed shard", client().prepareGet(INDEX, "1").get().isExists());
     }
 
+    /**
+     * C13. Whether a computed index survives a restart of the node holding it.
+     *
+     * <p>This is the A5 trap's home ground. A recovery source derived from absent
+     * {@code inSyncAllocationIds} silently becomes {@code EmptyStoreRecoverySource}, and a live index
+     * comes back blank rather than failing loudly. Computed placement recreates the exact condition,
+     * because a computed index has no published in-sync ids by construction.
+     *
+     * <p>Recovery for a computed index has been reasoned about and never observed, and A5 is what
+     * reasoning about recovery cost last time. So the assertion is the document, not the shard state: a
+     * blank index is STARTED, green, and empty, and every structural check passes while the data is
+     * gone.
+     */
+    public void testAComputedIndexSurvivesANodeRestart() throws Exception {
+        createComputedIndex();
+        awaitPrimaryMode();
+
+        client().prepareIndex(INDEX).setId("1").setSource("field", "value").setTimeout(TimeValue.timeValueSeconds(1)).get();
+        client().admin().indices().prepareRefresh(INDEX).get();
+        assertTrue(client().prepareGet(INDEX, "1").get().isExists());
+
+        RecoverySource.Type beforeRestart = recoverySourceOfComputedShard();
+        assertEquals("PROBE before-restart source", RecoverySource.Type.EMPTY_STORE, beforeRestart);
+
+        internalCluster().fullRestart();
+        ensureStableCluster(internalCluster().size());
+        awaitPrimaryMode();
+
+        client().admin().indices().prepareRefresh(INDEX).get();
+        assertTrue(
+            "the document must survive the restart, or the shard recovered from an empty store and the " + "index came back blank",
+            client().prepareGet(INDEX, "1").get().isExists()
+        );
+
+        // Assert what it recovered from, not only that the data is there. A5's lesson is that an empty
+        // store recovery is silent: the index is STARTED, green and blank, so a data assertion alone can
+        // pass for the wrong reason on a different day. Naming the source makes the guarantee explicit.
+        RecoverySource.Type afterRestart = recoverySourceOfComputedShard();
+        logger.info("DIAGC13 recovery source after restart={}", afterRestart);
+        assertEquals("a restarted computed shard must recover from its existing store", RecoverySource.Type.EXISTING_STORE, afterRestart);
+    }
+
+    private RecoverySource.Type recoverySourceOfComputedShard() {
+        for (IndicesService indices : internalCluster().getDataNodeInstances(IndicesService.class)) {
+            IndexService indexService = indices.indexService(resolveIndex(INDEX));
+            if (indexService != null && indexService.hasShard(0)) {
+                return indexService.getShard(0).recoveryState().getRecoverySource().getType();
+            }
+        }
+        throw new AssertionError("no data node holds the computed shard after restart");
+    }
+
     private void createComputedIndex() {
         assertAcked(
             prepareCreate(INDEX).setSettings(

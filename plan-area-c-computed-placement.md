@@ -490,3 +490,31 @@ the timing changed. Registrations now live for the class.
 
 **What the mutation says, precisely.** Removing the empty-in-sync guard fails two runs in three rather
 than three in three, because the condition it protects is itself a race. Recorded rather than rounded up.
+
+## C13 done: a computed index survives a restart, and it needed no production change
+
+Twenty documents indexed, the whole cluster restarted, twenty documents still there by count, asserted
+twice over. Recovery for a computed index had been reasoned about and never observed, which is what A5
+cost last time, and observing it says the reasoning was right.
+
+**No production change was required, and that is the finding.** C18's seams already do the work: the
+local view hands back an INITIALIZING entry after restart, the node opens the shard against the data
+directory it already has, and the start transition happens locally at recovery completion. This is the
+third task in this area planned as real work that turned out to need none, after C6 and C10, and always
+for the same reason. A computed index publishes no routing entry, so the machinery that would have
+needed teaching is never handed one.
+
+**The test asserts a count rather than a document.** A5 was silent data loss: a blank index is STARTED,
+green and empty, so every structural check passes. One document can survive a partial recovery; twenty
+by count is much harder to pass accidentally.
+
+**One open question, recorded rather than glossed.** The recovery source is `EMPTY_STORE` at creation
+and `EXISTING_STORE` after restart, which is correct in both cases, but the hook hardcodes `EMPTY_STORE`
+and something in the server upgrades it. `ShardRouting.moveToUnassigned` performs exactly that
+transformation for an active primary, but it sits on an allocator path a computed index should never
+reach. Until the mechanism is named, "a computed shard recovers from its existing store" is measured
+rather than guaranteed, and the assertion in the test is what would catch it changing.
+
+**What C13 does not cover.** One node holding the shard restarts and finds its own data. A node that
+comes back with an empty disk, or a shard whose computed placement moves to a different node while the
+old one still holds the data, are both different questions and neither is answered here.
