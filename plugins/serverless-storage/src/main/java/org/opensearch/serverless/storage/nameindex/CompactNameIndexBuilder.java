@@ -11,6 +11,7 @@ package org.opensearch.serverless.storage.nameindex;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
 
@@ -29,11 +30,14 @@ public final class CompactNameIndexBuilder {
         final byte[] name;
         final byte[] uuid;
         final byte status;
+        /** Target index names, for aliases only. Null for an ordinary index. */
+        final List<String> targets;
 
-        Entry(byte[] name, byte[] uuid, byte status) {
+        Entry(byte[] name, byte[] uuid, byte status, List<String> targets) {
             this.name = name;
             this.uuid = uuid;
             this.status = status;
+            this.targets = targets;
         }
     }
 
@@ -73,11 +77,42 @@ public final class CompactNameIndexBuilder {
         if (uuid.length != CompactNameIndex.UUID_LENGTH) {
             throw new IllegalArgumentException("uuid must be " + CompactNameIndex.UUID_LENGTH + " bytes, was " + uuid.length);
         }
-        entries.add(new Entry(name.getBytes(StandardCharsets.UTF_8), uuid.clone(), status));
+        entries.add(new Entry(name.getBytes(StandardCharsets.UTF_8), uuid.clone(), status, null));
+        return this;
+    }
+
+    /**
+     * Adds an alias, which names a set of indices rather than one.
+     *
+     * <p>Targets are given as names because ordinals do not exist until the sort has happened. They are
+     * resolved to ordinals in {@link #build()}, which is also where a target that does not exist gets
+     * dropped.
+     */
+    public CompactNameIndexBuilder addAlias(String name, byte[] uuid, List<String> targets) {
+        Objects.requireNonNull(name, "name");
+        Objects.requireNonNull(uuid, "uuid");
+        Objects.requireNonNull(targets, "targets");
+        if (name.isEmpty()) {
+            throw new IllegalArgumentException("name must not be empty");
+        }
+        if (uuid.length != CompactNameIndex.UUID_LENGTH) {
+            throw new IllegalArgumentException("uuid must be " + CompactNameIndex.UUID_LENGTH + " bytes, was " + uuid.length);
+        }
+        entries.add(
+            new Entry(
+                name.getBytes(StandardCharsets.UTF_8),
+                uuid.clone(),
+                IndexNameEntry.STATUS_ALIAS,
+                new ArrayList<>(new LinkedHashSet<>(targets))
+            )
+        );
         return this;
     }
 
     public CompactNameIndexBuilder add(IndexNameEntry entry) {
+        if (entry.isAlias()) {
+            return addAlias(entry.getName(), entry.getUuid(), entry.getTargets());
+        }
         return add(entry.getName(), entry.getUuid(), entry.getStatus());
     }
 
@@ -128,6 +163,49 @@ public final class CompactNameIndexBuilder {
         }
         offsets[count] = position;
 
-        return new CompactNameIndex(nameBlob, offsets, uuids, statuses);
+        CompactNameIndex withoutAliases = new CompactNameIndex(nameBlob, offsets, uuids, statuses);
+
+        // Alias targets resolve in a second pass, against the just-built structure rather than against a
+        // transient name-to-ordinal map. At 100M entries such a map would cost more than the index it
+        // describes, and the structure can already answer the question by binary search.
+        int aliasCount = 0;
+        for (Entry entry : entries) {
+            if (entry.targets != null) {
+                aliasCount++;
+            }
+        }
+        if (aliasCount == 0) {
+            return withoutAliases;
+        }
+
+        int[] aliasOrdinals = new int[aliasCount];
+        int[] aliasTargetOffsets = new int[aliasCount + 1];
+        List<Integer> flatTargets = new ArrayList<>();
+        int aliasPosition = 0;
+        for (int i = 0; i < count; i++) {
+            if (entries.get(i).targets == null) {
+                continue;
+            }
+            aliasOrdinals[aliasPosition] = i;
+            aliasTargetOffsets[aliasPosition] = flatTargets.size();
+            for (String target : entries.get(i).targets) {
+                int targetOrdinal = withoutAliases.ordinalOf(target);
+                // A target that is not present is dropped rather than rejected. An index can be deleted
+                // while an alias still names it, and a rebuild that threw would then be unable to make
+                // progress at all -- turning a stale reference into an outage.
+                if (targetOrdinal >= 0) {
+                    flatTargets.add(targetOrdinal);
+                }
+            }
+            aliasPosition++;
+        }
+        aliasTargetOffsets[aliasCount] = flatTargets.size();
+
+        int[] aliasTargets = new int[flatTargets.size()];
+        for (int i = 0; i < aliasTargets.length; i++) {
+            aliasTargets[i] = flatTargets.get(i);
+        }
+
+        return new CompactNameIndex(nameBlob, offsets, uuids, statuses, aliasOrdinals, aliasTargetOffsets, aliasTargets);
     }
 }

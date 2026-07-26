@@ -203,6 +203,22 @@ public final class NameIndex {
         create(new IndexNameEntry(name, uuid, status));
     }
 
+    /** Records an alias naming a set of indices. */
+    public void createAlias(String name, byte[] uuid, java.util.List<String> targets) {
+        create(new IndexNameEntry(name, uuid, IndexNameEntry.STATUS_ALIAS, targets));
+    }
+
+    /**
+     * Index names an alias points at, or an empty list if the name is not a known alias.
+     *
+     * <p>One level only: an alias naming another alias is not followed, because OpenSearch does not
+     * allow it and following it would turn a malformed input into an unbounded walk.
+     */
+    public java.util.List<String> resolveAlias(String name) {
+        IndexNameEntry entry = lookup(name);
+        return entry != null && entry.isAlias() ? entry.getTargets() : java.util.List.of();
+    }
+
     public void create(IndexNameEntry entry) {
         Objects.requireNonNull(entry, "entry");
         synchronized (writeLock) {
@@ -245,7 +261,9 @@ public final class NameIndex {
                 if (current.overlay.covers(name)) {
                     continue;
                 }
-                builder.add(name, current.base.uuidAt(ordinal), current.base.statusAt(ordinal));
+                // entryAt rather than the three-argument add: an alias's targets live in the side
+                // arrays, and rebuilding through (name, uuid, status) would drop every one of them.
+                builder.add(current.base.entryAt(ordinal));
             }
             for (IndexNameEntry entry : current.overlay.puts().values()) {
                 builder.add(entry);

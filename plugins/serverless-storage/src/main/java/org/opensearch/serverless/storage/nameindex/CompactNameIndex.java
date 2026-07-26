@@ -9,6 +9,10 @@
 package org.opensearch.serverless.storage.nameindex;
 
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
 import java.util.function.IntConsumer;
 
 /**
@@ -52,11 +56,42 @@ public final class CompactNameIndex {
     /** One status byte per entry, parallel to the name order. */
     private final byte[] statuses;
 
+    /**
+     * Ordinals of the entries that are aliases, sorted.
+     *
+     * <p>Alias targets are held in three sparse side arrays rather than a per-entry offset array,
+     * because aliases are a small minority of names. A dense {@code int[] targetOffsets} of length
+     * size+1 would cost 4 bytes for every entry, alias or not, which is about 400 MB at 100M names, to
+     * describe something almost all of them do not have. This costs nothing for a plain index.
+     */
+    private final int[] aliasOrdinals;
+
+    /** Start offset into {@link #aliasTargets} for each entry in {@link #aliasOrdinals}. */
+    private final int[] aliasTargetOffsets;
+
+    /** Flattened target entry ordinals for every alias, in {@link #aliasOrdinals} order. */
+    private final int[] aliasTargets;
+
     CompactNameIndex(byte[] nameBlob, int[] offsets, byte[] uuids, byte[] statuses) {
+        this(nameBlob, offsets, uuids, statuses, new int[0], new int[] { 0 }, new int[0]);
+    }
+
+    CompactNameIndex(
+        byte[] nameBlob,
+        int[] offsets,
+        byte[] uuids,
+        byte[] statuses,
+        int[] aliasOrdinals,
+        int[] aliasTargetOffsets,
+        int[] aliasTargets
+    ) {
         this.nameBlob = nameBlob;
         this.offsets = offsets;
         this.uuids = uuids;
         this.statuses = statuses;
+        this.aliasOrdinals = aliasOrdinals;
+        this.aliasTargetOffsets = aliasTargetOffsets;
+        this.aliasTargets = aliasTargets;
     }
 
     /** An index over no names. Useful as a starting base before the first rebuild. */
@@ -107,7 +142,7 @@ public final class CompactNameIndex {
     }
 
     public IndexNameEntry entryAt(int ordinal) {
-        return new IndexNameEntry(nameAt(ordinal), uuidAt(ordinal), statusAt(ordinal));
+        return new IndexNameEntry(nameAt(ordinal), uuidAt(ordinal), statusAt(ordinal), aliasTargetsAt(ordinal));
     }
 
     /**
@@ -146,14 +181,46 @@ public final class CompactNameIndex {
         }
     }
 
+    /** Whether the entry at this ordinal names a set of indices rather than one. */
+    public boolean isAliasAt(int ordinal) {
+        return statusAt(ordinal) == IndexNameEntry.STATUS_ALIAS;
+    }
+
+    /**
+     * Names the alias at this ordinal points at, or an empty list if it is not an alias.
+     *
+     * <p>Targets are stored as ordinals rather than names, so this resolves them on the way out. That
+     * costs four bytes per target instead of the length of a name, which matters when an alias in a
+     * tenant-per-index deployment can span a large number of indices.
+     */
+    public List<String> aliasTargetsAt(int ordinal) {
+        checkOrdinal(ordinal);
+        int position = Arrays.binarySearch(aliasOrdinals, ordinal);
+        if (position < 0) {
+            return Collections.emptyList();
+        }
+        int from = aliasTargetOffsets[position];
+        int to = aliasTargetOffsets[position + 1];
+        List<String> targets = new ArrayList<>(to - from);
+        for (int i = from; i < to; i++) {
+            targets.add(nameAt(aliasTargets[i]));
+        }
+        return targets;
+    }
+
+    /** Number of aliases held, which is what alias fan-out measurements are taken against. */
+    public int aliasCount() {
+        return aliasOrdinals.length;
+    }
+
     /** Bytes retained, so the sizing claim can be asserted in a test rather than assumed. */
     public long ramBytesUsed() {
         // Object headers and the four references, then the arrays themselves. Approximate by design:
         // the point is to catch a representation that has quietly stopped being compact, not to model
         // the JVM exactly.
-        return 16L + 4L * 8L + arrayBytes(nameBlob.length) + arrayBytes(4L * offsets.length) + arrayBytes(uuids.length) + arrayBytes(
+        return 16L + 7L * 8L + arrayBytes(nameBlob.length) + arrayBytes(4L * offsets.length) + arrayBytes(uuids.length) + arrayBytes(
             statuses.length
-        );
+        ) + arrayBytes(4L * aliasOrdinals.length) + arrayBytes(4L * aliasTargetOffsets.length) + arrayBytes(4L * aliasTargets.length);
     }
 
     private static long arrayBytes(long contentBytes) {

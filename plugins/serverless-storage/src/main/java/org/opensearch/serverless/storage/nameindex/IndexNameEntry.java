@@ -9,6 +9,8 @@
 package org.opensearch.serverless.storage.nameindex;
 
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
 import java.util.Objects;
 
 /**
@@ -31,11 +33,34 @@ public final class IndexNameEntry {
     /** A closed index. Still resolvable by name, which is why it is a status rather than an absence. */
     public static final byte STATUS_CLOSED = 1;
 
+    /**
+     * An alias, which names a set of indices rather than one.
+     *
+     * <p>Aliases share the name space with indices rather than living in a structure of their own,
+     * because OpenSearch forbids an alias and an index having the same name. Keeping them together makes
+     * that constraint checkable, and lets one prefix scan resolve both, which is what a wildcard over a
+     * mixed name space needs.
+     */
+    public static final byte STATUS_ALIAS = 2;
+
     private final String name;
     private final byte[] uuid;
     private final byte status;
 
+    /**
+     * Target index names, for an alias. Empty for an ordinary index.
+     *
+     * <p>Carried on the entry rather than only in {@link CompactNameIndex}'s side arrays because an
+     * alias created into {@link NameIndexOverlay} has no ordinals yet, and because a rebuild reads
+     * entries back out and would otherwise silently drop every alias's targets.
+     */
+    private final List<String> targets;
+
     public IndexNameEntry(String name, byte[] uuid, byte status) {
+        this(name, uuid, status, Collections.emptyList());
+    }
+
+    public IndexNameEntry(String name, byte[] uuid, byte status, List<String> targets) {
         this.name = Objects.requireNonNull(name, "name");
         Objects.requireNonNull(uuid, "uuid");
         if (uuid.length != CompactNameIndex.UUID_LENGTH) {
@@ -46,6 +71,7 @@ public final class IndexNameEntry {
         // what another caller sees.
         this.uuid = uuid.clone();
         this.status = status;
+        this.targets = List.copyOf(Objects.requireNonNull(targets, "targets"));
     }
 
     public String getName() {
@@ -64,6 +90,15 @@ public final class IndexNameEntry {
         return status == STATUS_CLOSED;
     }
 
+    public boolean isAlias() {
+        return status == STATUS_ALIAS;
+    }
+
+    /** Target index names for an alias, empty for an ordinary index. Immutable. */
+    public List<String> getTargets() {
+        return targets;
+    }
+
     @Override
     public boolean equals(Object o) {
         if (this == o) {
@@ -73,12 +108,12 @@ public final class IndexNameEntry {
             return false;
         }
         IndexNameEntry that = (IndexNameEntry) o;
-        return status == that.status && name.equals(that.name) && Arrays.equals(uuid, that.uuid);
+        return status == that.status && name.equals(that.name) && Arrays.equals(uuid, that.uuid) && targets.equals(that.targets);
     }
 
     @Override
     public int hashCode() {
-        return 31 * (31 * name.hashCode() + Arrays.hashCode(uuid)) + status;
+        return 31 * (31 * (31 * name.hashCode() + Arrays.hashCode(uuid)) + status) + targets.hashCode();
     }
 
     @Override
