@@ -125,3 +125,57 @@ claim the whole area exists to make, and it should be a number rather than an ar
 - **The A5 trap.** It has bitten once, silently, and this area recreates the exact condition.
 - **Hot-tenant skew.** A hash cannot know one tenant takes a thousand times the traffic. K=3 gives room to
   choose but does not solve it. An override list for known-hot indices may be needed.
+
+## C9 answered: neither observer is a problem, and one was not an observer
+
+The audit flagged `SnapshotsService` and `IndexService` as the only two places outside the allocator
+that appeared to watch shard state transitions. Reading them:
+
+**`IndexService` was a false positive.** The grep matched `startShardLevelRefreshTasks`, which names a
+refresh scheduler and has nothing to do with `ShardRouting` state. There is no transition observer there
+at all.
+
+**`SnapshotsService` reads current state rather than watching a transition.** It asks
+`primaryShard().started()`, `initializing()`, `relocating()` and `unassigned()` to decide what a
+snapshot should record for a shard. Under computed placement a shard is STARTED whenever the cluster has
+data nodes, so it takes the `started()` branch immediately and records the computed node.
+
+That is not merely tolerable, it is better than the allocator case: today the snapshot has to wait
+through INITIALIZING, and under computed placement there is nothing to wait for. The
+`initializing() || relocating()` branch simply never fires, and the `unassigned()` path already exists
+for the no-data-nodes window that `ComputedRoutingTable` produces.
+
+**No change required.** The risk the audit raised does not survive reading the code, which is the
+outcome an audit is supposed to be allowed to have.
+
+## Status after this pass
+
+| task | state |
+|---|---|
+| C0 surface audit | done |
+| C1 `RendezvousShardPlacement` | done, 12 tests |
+| C2 eligible node snapshot | done |
+| C4 `ComputedRoutingTable` | done, 11 tests |
+| C9 transition observers | done, no change required |
+| C3 holder seam in `RoutingTable` | **not started, and larger than it looked** |
+| C5 gate on index type | not started |
+| C6 bypass the allocator | not started |
+| C7 search path, C8 write path | not started |
+| C10 the other nineteen writers | not started |
+| C11 re-measure the ceiling | blocked on C3 |
+
+### C3 is bigger than the plan assumed, and that is worth recording
+
+The plan said "mirror C5 exactly". C5 changed `Metadata`'s internal map to holders, and the same move on
+`RoutingTable` means changing `Map<String, IndexRoutingTable> indicesRouting` to hold suppliers. The
+difference is what that map is entangled with: 38 internal references, and among them
+`RoutingTableDiff`, `writeTo`, `writeVerifiableTo` and `DiffableUtils.diff`. `Metadata`'s holder change
+was contained because the holder resolved before serialization; `RoutingTable` is diffed and serialized
+on every cluster state publication, so a lazy entry has to decide what a diff of an unresolved entry
+means.
+
+That is a real design question rather than a mechanical port, and it is the next thing to answer:
+either resolve on serialize (simple, loses the saving exactly when publication happens) or teach the
+diff to compare unresolved entries by their inputs (keeps the saving, needs the inputs to be part of the
+state). C5 took the first option for `Metadata` and it was the right call there; whether it is here
+depends on whether publication is the hot path, which S6 suggests it is.
