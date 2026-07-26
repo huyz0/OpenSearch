@@ -674,3 +674,44 @@ rather than instantaneous. `RendezvousShardPlacement` from C1 minimises movement
 does change, and the test should use it rather than modulo, but that only shrinks the blast radius: it
 does not make the input stable, and a shard whose winning node is briefly absent still moves. Until C2
 lands, a restart is not safe for a computed index, and no amount of work on recovery changes that.
+
+## C2 done: the node set is agreed rather than observed
+
+Placement no longer reads `DiscoveryNodes` as-of-now. It reads `ComputedPlacementMembership`, a sorted,
+versioned, deduplicated node set published as `Metadata.Custom` with `API_AND_GATEWAY` context. The
+gateway half is the requirement rather than a nicety: a membership that had to be rediscovered after a
+restart would be empty exactly when the shards need it.
+
+**The asymmetry is the design.** Nodes are added automatically on join, because a cluster that grows
+should use the new capacity without ceremony. Nodes are never removed, because absence has two causes
+that look identical from the cluster manager, restarting and gone for good, and guessing "gone" moves
+every shard that node owned to a node with none of its data, which recovers empty while looking healthy.
+Guessing "still here" only costs availability while it is away. `withNodes` has no counterpart and a test
+asserts membership never shrinks. Decommission is deliberate, needs to move data first, and is not
+implemented.
+
+**Verified rather than assumed.** Node ids are persisted in the data path and reloaded on restart, so a
+returning node is the same member holding the same data. Placement not changing when a node leaves is a
+test, mutation-verified: reverting `eligibleNodes` to the live view fails it with the message it was
+written for. That the maintainer actually runs in a live cluster is an assertion rather than a log probe,
+because a probe only prints when a test fails and this area has three times shipped a mechanism that was
+correct and never invoked.
+
+**Two things this surfaced that are worth keeping.**
+
+Growth is a placement change. Membership grows as nodes join, and with modulo every growth reshuffles
+every shard; harmless before there is data and destructive after. That is what rendezvous hashing is for,
+and the plugin path uses it over this same membership. The reasoning that "a membership that never
+shrinks makes modulo as stable as rendezvous" is true only once the set has settled, which was too narrow
+a claim when first made here.
+
+The maintainer is edge-triggered on cluster state changes, so a cluster that installs a supplier and then
+goes completely idle publishes nothing and keeps using the live view. A test has to force a change; a
+real cluster generates them constantly. Publishing on registration would close the window and is the
+obvious next refinement.
+
+**Where C13 stands now.** Placement is stable across a restart and the test's placement assertion is
+satisfied. The remaining failure is earlier and different: the documents are not searchable even before
+the restart. That is a new symptom rather than the old one, and it is recorded as its own investigation
+rather than folded into C13. The first suspect is the ordinary trigger index the test creates to force a
+state change, since it publishes routing and is the first thing the membership sees.

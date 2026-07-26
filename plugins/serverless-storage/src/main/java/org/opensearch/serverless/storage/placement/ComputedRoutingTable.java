@@ -11,6 +11,8 @@ package org.opensearch.serverless.storage.placement;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.node.DiscoveryNode;
+import org.opensearch.cluster.routing.ComputedPlacementMembership;
+import org.opensearch.cluster.routing.ComputedPlacementMembershipService;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.RecoverySource;
@@ -74,6 +76,17 @@ public final class ComputedRoutingTable {
      * fraction of every index nowhere.
      */
     public static List<String> eligibleNodes(ClusterState state) {
+        // The published membership when there is one, because placement has to be stable in time as well
+        // as across coordinators. Reading DiscoveryNodes directly means a node that is merely restarting
+        // drops out, its shards move to nodes holding none of their data, and those recover empty while
+        // looking healthy. C13 hit exactly that, and it is silent.
+        ComputedPlacementMembership membership = ComputedPlacementMembershipService.get(state);
+        if (membership.isEmpty() == false) {
+            return membership.nodeIds();
+        }
+        // Nothing published yet, which is the window between a cluster forming and the maintainer's
+        // first update. Fall back to the live view so a fresh cluster can place shards at all; it is
+        // only unsafe once there is data to lose, and by then the membership exists.
         List<String> nodeIds = new ArrayList<>();
         for (DiscoveryNode node : state.nodes()) {
             if (node.isDataNode()) {

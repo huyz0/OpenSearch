@@ -89,6 +89,7 @@ import org.opensearch.cluster.metadata.TemplateUpgradeService;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodeRole;
 import org.opensearch.cluster.routing.BatchedRerouteService;
+import org.opensearch.cluster.routing.ComputedPlacementMembershipService;
 import org.opensearch.cluster.routing.RerouteService;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.allocation.AwarenessReplicaBalance;
@@ -1459,6 +1460,11 @@ public class Node implements Closeable {
             );
             if (DiscoveryNode.isClusterManagerNode(settings)) {
                 clusterService.addListener(new SystemIndexMetadataUpgradeService(systemIndices, clusterService));
+                // Placement membership is written by whichever node is elected, so every
+                // cluster-manager-eligible node carries the maintainer and the service itself checks
+                // election. It stays inert until a placement supplier is installed, so an unconfigured
+                // cluster never acquires the metadata.
+                clusterService.addListener(new ComputedPlacementMembershipService(clusterService));
             }
             new TemplateUpgradeService(client, clusterService, threadPool, indexTemplateMetadataUpgraders);
             final Transport transport = networkModule.getTransportSupplier().get();

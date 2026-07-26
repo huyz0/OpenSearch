@@ -12,9 +12,11 @@ import org.opensearch.Version;
 import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodeRole;
 import org.opensearch.cluster.node.DiscoveryNodes;
+import org.opensearch.cluster.routing.ComputedPlacementMembership;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.RecoverySource;
@@ -195,6 +197,68 @@ public class ComputedRoutingTableTests extends OpenSearchTestCase {
             .build();
 
         assertEquals(List.of("alpha", "mike", "zulu"), ComputedRoutingTable.eligibleNodes(state));
+    }
+
+    /**
+     * C2, the property C13 needed and nothing asserted. A node leaving must not change placement.
+     *
+     * <p>Without this, a restarting node drops out of the live view, its shards move to nodes holding
+     * none of their data, and those recover empty while looking healthy. The membership is published and
+     * never shrinks precisely so that a node being briefly away is not a placement event.
+     */
+    public void testPlacementDoesNotChangeWhenANodeLeaves() {
+        ComputedPlacementMembership membership = ComputedPlacementMembership.of(List.of("data-1", "data-2", "data-3"), 1L);
+
+        ClusterState whole = withMembership(membership, "data-1", "data-2", "data-3");
+        ClusterState missingOne = withMembership(membership, "data-1", "data-3");
+
+        assertEquals(
+            "a node being away must not change the eligible set, or its shards move off their data",
+            ComputedRoutingTable.eligibleNodes(whole),
+            ComputedRoutingTable.eligibleNodes(missingOne)
+        );
+        assertEquals(List.of("data-1", "data-2", "data-3"), ComputedRoutingTable.eligibleNodes(missingOne));
+    }
+
+    /** And the membership wins over the live view even when the live view has more nodes. */
+    public void testPublishedMembershipWinsOverTheLiveView() {
+        ComputedPlacementMembership membership = ComputedPlacementMembership.of(List.of("data-1"), 3L);
+
+        ClusterState state = withMembership(membership, "data-1", "data-2");
+
+        assertEquals(
+            "an unpublished newcomer must not shift placement until the membership says so",
+            List.of("data-1"),
+            ComputedRoutingTable.eligibleNodes(state)
+        );
+    }
+
+    /**
+     * Before anything is published there is nothing to be stable about, so the live view is used. That
+     * window is only unsafe once there is data to lose, and by then the maintainer has published.
+     */
+    public void testFallsBackToTheLiveViewWhenNothingIsPublished() {
+        ClusterState state = ClusterState.builder(ClusterName.DEFAULT)
+            .nodes(
+                DiscoveryNodes.builder()
+                    .add(node("data-2", DiscoveryNodeRole.DATA_ROLE))
+                    .add(node("data-1", DiscoveryNodeRole.DATA_ROLE))
+                    .build()
+            )
+            .build();
+
+        assertEquals(List.of("data-1", "data-2"), ComputedRoutingTable.eligibleNodes(state));
+    }
+
+    private static ClusterState withMembership(ComputedPlacementMembership membership, String... liveNodeIds) {
+        DiscoveryNodes.Builder nodes = DiscoveryNodes.builder();
+        for (String nodeId : liveNodeIds) {
+            nodes.add(node(nodeId, DiscoveryNodeRole.DATA_ROLE));
+        }
+        return ClusterState.builder(ClusterName.DEFAULT)
+            .nodes(nodes.build())
+            .metadata(Metadata.builder().putCustom(ComputedPlacementMembership.TYPE, membership).build())
+            .build();
     }
 
     // ---------------------------------------------------------------- helpers

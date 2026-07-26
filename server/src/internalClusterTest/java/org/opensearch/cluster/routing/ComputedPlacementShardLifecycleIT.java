@@ -156,6 +156,28 @@ public class ComputedPlacementShardLifecycleIT extends OpenSearchIntegTestCase {
         assertTrue("the document must be readable back from the computed shard", client().prepareGet(INDEX, "1").get().isExists());
     }
 
+    /**
+     * C2. The membership must actually be published in a running cluster.
+     *
+     * <p>An assertion rather than a log probe, because a probe only prints when a test fails and this
+     * area has three times shipped a mechanism that was correct and never invoked. Asserting it makes
+     * the reachability permanent instead of something checked once by hand.
+     */
+    public void testPlacementMembershipIsPublished() throws Exception {
+        createComputedIndex();
+        awaitPrimaryMode();
+
+        assertBusy(() -> {
+            ClusterState state = client().admin().cluster().prepareState().get().getState();
+            ComputedPlacementMembership membership = ComputedPlacementMembershipService.get(state);
+
+            assertFalse("the membership must be published, or placement is still reading the live view", membership.isEmpty());
+            for (String dataNodeId : state.nodes().getDataNodes().keySet()) {
+                assertTrue("every live data node must be a member: " + membership, membership.contains(dataNodeId));
+            }
+        }, 30, TimeUnit.SECONDS);
+    }
+
     private void createComputedIndex() {
         assertAcked(
             prepareCreate(INDEX).setSettings(

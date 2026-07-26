@@ -53,6 +53,7 @@ import org.opensearch.cluster.metadata.RepositoriesMetadata;
 import org.opensearch.cluster.metadata.ViewMetadata;
 import org.opensearch.cluster.metadata.WeightedRoutingMetadata;
 import org.opensearch.cluster.metadata.WorkloadGroupMetadata;
+import org.opensearch.cluster.routing.ComputedPlacementMembership;
 import org.opensearch.cluster.routing.DelayedAllocationService;
 import org.opensearch.cluster.routing.RerouteService;
 import org.opensearch.cluster.routing.allocation.AllocationService;
@@ -197,6 +198,12 @@ public class ClusterModule extends AbstractModule {
         registerMetadataCustom(entries, SearchPipelineMetadata.TYPE, SearchPipelineMetadata::new, SearchPipelineMetadata::readDiffFrom);
         registerMetadataCustom(entries, ScriptMetadata.TYPE, ScriptMetadata::new, ScriptMetadata::readDiffFrom);
         registerMetadataCustom(entries, IndexGraveyard.TYPE, IndexGraveyard::new, IndexGraveyard::readDiffFrom);
+        registerMetadataCustom(
+            entries,
+            ComputedPlacementMembership.TYPE,
+            ComputedPlacementMembership::new,
+            ComputedPlacementMembership::readDiffFrom
+        );
         registerMetadataCustom(
             entries,
             PersistentTasksCustomMetadata.TYPE,

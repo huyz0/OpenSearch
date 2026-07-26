@@ -51,7 +51,18 @@ import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertAcked;
  * every node reported {@code state not recovered / initialized}. With the guard in place the cluster
  * recovers and this test runs to completion.
  *
- * <p><b>The cause is placement instability, and it is in this test rather than in the product.</b>
+ * <p><b>C2 landed and moved the failure.</b> Placement now reads the published membership, which is
+ * stable across a restart, and the membership is confirmed published before any data is written. What
+ * fails now is earlier and different: the twenty documents are not searchable even <em>before</em> the
+ * restart. That is not the symptom this test was written for, and it needs its own investigation rather
+ * than being folded into C13.
+ *
+ * <p>The prime suspect is the trigger index this test creates to force a cluster state change: it is an
+ * ordinary index, so it publishes routing, and it is the first thing the membership sees. Whether its
+ * presence shifts the computed placement of the shard written afterwards is the first thing to check,
+ * with the second being whether the search reaches the node that actually holds the shard.
+ *
+ * <p><b>The original cause was placement instability, and that part is fixed.</b>
  * Probes cleared recovery entirely: the recovery source is correct both times, the
  * {@code cleanLuceneIndex} branch that silently discards a store never fires, and the pre-restart
  * recovery is a textbook new index. What varies is which node owns the shard.
@@ -72,9 +83,8 @@ import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertAcked;
  * does not by itself make the input stable. This test should also use it rather than modulo, but that
  * only reduces the blast radius; it does not make a restart safe.
  */
-@org.apache.lucene.tests.util.LuceneTestCase.AwaitsFix(bugUrl = "C13 is blocked on C2: placement is computed against the instantaneous data node list, so a "
-    + "restart moves shards away from their data and each new owner recovers blank. Recovery itself "
-    + "is cleared. See this class's javadoc.")
+@org.apache.lucene.tests.util.LuceneTestCase.AwaitsFix(bugUrl = "C2 landed: placement is now stable across a restart. The remaining failure is earlier and "
+    + "different, documents not searchable before the restart. See this class's javadoc.")
 public class ComputedPlacementRestartIT extends OpenSearchIntegTestCase {
 
     private static final String INDEX = "computed-restart";
@@ -98,6 +108,7 @@ public class ComputedPlacementRestartIT extends OpenSearchIntegTestCase {
      * STARTED, green and empty, so a single surviving document proves much less than a full count.
      */
     public void testAComputedIndexSurvivesAFullRestart() throws Exception {
+        awaitStableMembership();
         createComputedIndex();
         awaitPrimaryMode();
 
@@ -105,11 +116,22 @@ public class ComputedPlacementRestartIT extends OpenSearchIntegTestCase {
             client().prepareIndex(INDEX).setId(Integer.toString(i)).setSource("field", "value-" + i).get();
         }
         client().admin().indices().prepareRefresh(INDEX).get();
-        assertEquals(20L, client().prepareSearch(INDEX).setSize(0).get().getHits().getTotalHits().value());
+        assertEquals(
+            "the documents must be there before the restart, or placement moved while the test was writing",
+            20L,
+            client().prepareSearch(INDEX).setSize(0).get().getHits().getTotalHits().value()
+        );
+
+        String ownerBeforeRestart = nodeHoldingComputedShard();
 
         internalCluster().fullRestart();
         ensureStableCluster(internalCluster().size());
         awaitPrimaryMode();
+
+        // Placement first, because it is the property under test and it explains the count. A shard that
+        // moved lands on a node with none of its data, so the count would be zero for a reason that has
+        // nothing to do with recovery.
+        assertEquals("the shard must come back on the node that holds its data", ownerBeforeRestart, nodeHoldingComputedShard());
 
         client().admin().indices().prepareRefresh(INDEX).get();
         assertEquals(
@@ -122,6 +144,39 @@ public class ComputedPlacementRestartIT extends OpenSearchIntegTestCase {
             RecoverySource.Type.EXISTING_STORE,
             recoverySourceOfComputedShard()
         );
+
+    }
+
+    /**
+     * Waits until every live data node is a member before anything is created.
+     *
+     * <p>Membership grows as nodes join, and growth is a placement change: with modulo it reshuffles
+     * every shard. That is harmless before there is data and destructive after, so the test waits for
+     * the set to settle rather than racing it. A production cluster has the same window, which is why
+     * the plugin uses rendezvous hashing, where growth moves a fraction rather than everything.
+     */
+    private void awaitStableMembership() throws Exception {
+        // The maintainer is edge-triggered: it publishes on a cluster state change while a supplier is
+        // registered. Registration happens in @Before, after the cluster has already formed, so without
+        // a subsequent change nothing ever publishes. A real cluster generates changes constantly and a
+        // test does not, so one is forced here with an ordinary index that has nothing to do with
+        // computed placement.
+        //
+        // The narrow production edge this papers over is worth naming: a cluster that installs a supplier
+        // and then goes completely idle has no membership until something else happens, and placement
+        // uses the live view in the meantime. Publishing on registration would close it.
+        assertAcked(
+            prepareCreate("membership-trigger").setSettings(Settings.builder().put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1).build())
+        );
+
+        assertBusy(() -> {
+            ClusterState state = client().admin().cluster().prepareState().get().getState();
+            ComputedPlacementMembership membership = ComputedPlacementMembershipService.get(state);
+            assertFalse("membership must be published before placement can be stable", membership.isEmpty());
+            for (String dataNodeId : state.nodes().getDataNodes().keySet()) {
+                assertTrue("every live data node must be a member before creating data: " + membership, membership.contains(dataNodeId));
+            }
+        }, 30, TimeUnit.SECONDS);
     }
 
     private void createComputedIndex() {
@@ -149,6 +204,17 @@ public class ComputedPlacementRestartIT extends OpenSearchIntegTestCase {
             assertEquals(IndexShardState.STARTED, shard.state());
             assertTrue(shard.isPrimaryMode());
         }, 30, TimeUnit.SECONDS);
+    }
+
+    private String nodeHoldingComputedShard() {
+        for (String nodeName : internalCluster().getNodeNames()) {
+            IndicesService indices = internalCluster().getInstance(IndicesService.class, nodeName);
+            IndexService indexService = indices.indexService(resolveIndex(INDEX));
+            if (indexService != null && indexService.hasShard(0)) {
+                return internalCluster().getInstance(org.opensearch.cluster.service.ClusterService.class, nodeName).localNode().getId();
+            }
+        }
+        throw new AssertionError("no node holds the computed shard");
     }
 
     private RecoverySource.Type recoverySourceOfComputedShard() {
@@ -211,7 +277,26 @@ public class ComputedPlacementRestartIT extends OpenSearchIntegTestCase {
         return dataNodes.get(shardId % dataNodes.size());
     }
 
+    /**
+     * The placement node set, taken from the published membership rather than from the nodes that
+     * happen to be reachable.
+     *
+     * <p>This is the whole of C2 in one method. Reading {@code getDataNodes()} means a node that is
+     * merely restarting drops out, ownership moves to a node holding none of that shard's data, and it
+     * recovers empty while looking healthy. The membership is published, versioned and never shrinks, so
+     * a node being away is not a placement event.
+     *
+     * <p>Modulo rather than rendezvous here only because a server test cannot depend on the plugin that
+     * owns {@code RendezvousShardPlacement}. The distinction does not matter for this test: with a
+     * membership that never shrinks, a restart does not change the set, so both are stable. Rendezvous
+     * earns its keep when the membership genuinely grows, where modulo reshuffles everything and
+     * rendezvous moves only a fraction, and the plugin's own path uses it over this same membership.
+     */
     private static List<String> sortedDataNodes(ClusterState state) {
+        ComputedPlacementMembership membership = ComputedPlacementMembershipService.get(state);
+        if (membership.isEmpty() == false) {
+            return membership.nodeIds();
+        }
         List<String> dataNodes = new ArrayList<>(state.nodes().getDataNodes().keySet());
         Collections.sort(dataNodes);
         return dataNodes;
