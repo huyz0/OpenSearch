@@ -1225,6 +1225,18 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     // shared instance -- see resolveContainer and the shared WAL container's own construction below.
     private final ObjectStoreRequestCounter requestCounter = new ObjectStoreRequestCounter();
 
+    /**
+     * Whether this node computes shard placement instead of reading it from the published routing table.
+     *
+     * <p>Off by default. C11 has not yet re-measured the ceiling with it on, so nothing has verified the
+     * claim the change exists to make.
+     */
+    public static final Setting<Boolean> COMPUTED_PLACEMENT_ENABLED_SETTING = Setting.boolSetting(
+        "serverless_storage.computed_placement.enabled",
+        false,
+        Setting.Property.NodeScope
+    );
+
     /** Whether the name index tier runs. Off until it replaces cluster-state resolution rather than duplicating it. */
     public static final Setting<Boolean> NAME_INDEX_ENABLED_SETTING = Setting.boolSetting(
         org.opensearch.serverless.storage.nameindex.NameIndexService.ENABLED_SETTING_KEY,
@@ -1236,6 +1248,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     public List<Setting<?>> getSettings() {
         return List.of(
             NAME_INDEX_ENABLED_SETTING,
+            COMPUTED_PLACEMENT_ENABLED_SETTING,
             SERVERLESS_STORAGE_ENABLED_SETTING,
             SERVERLESS_STORAGE_BASE_PATH_SETTING,
             SERVERLESS_STORAGE_ENCRYPTION_KEY_SETTING,
@@ -1606,6 +1619,13 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         if (nameIndexService.isEnabled()) {
             clusterService.addListener(nameIndexService);
         }
+
+        // Computed placement. Installing the supplier is the whole of the wiring: a serverless index
+        // publishes no routing entry and each node fills the gap locally, so there is nothing to
+        // subscribe to and nothing to keep in sync.
+        org.opensearch.serverless.storage.placement.ComputedPlacementGate.install(
+            COMPUTED_PLACEMENT_ENABLED_SETTING.get(environment.settings())
+        );
 
         return java.util.List.of(this, nameIndexService);
     }
