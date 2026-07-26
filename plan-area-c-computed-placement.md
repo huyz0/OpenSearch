@@ -448,3 +448,45 @@ argument had already reached the same conclusion less certainly.
 piece of state the cluster manager used to maintain as a side effect has to become a function of the
 placement instead: allocation identity, the started transition, and the in-sync set. That is a bigger
 claim than "routing is computed", and it is the claim the area is actually making.
+
+## C18 done: a computed index takes a write
+
+Three consecutive clean runs, seven tests across the two integration suites, none skipped. The write
+test asserts the document comes back, with a one second budget on the write itself, which fails outright
+if the request has to retry.
+
+**The five things the cluster manager used to do.** Computed placement takes it out of the loop, so
+everything it maintained as a side effect had to become a function of the placement. Only the first was
+predicted by reading the code:
+
+1. Allocation identity. `ComputedShardRouting` derives it from `(indexUuid, shardId, nodeId)`, pinned by
+   a test, because a rebuilt entry with a fresh id makes `updateShardState` throw and `removeShards`
+   tear the shard down on every cluster state.
+2. The started transition, at recovery completion rather than on the next applied cluster state. There
+   is no next state: nothing publishes one for a computed index, so a transition that waits for one
+   waits forever. A probe on that path printed nothing at all, which is how this was found.
+3. The in-sync set, read from the placement, because the started-shard message that normally populates
+   it is discarded for an allocation id in no published table.
+4. The primary term, set at creation in the branch that skips publication, because for a computed index
+   creation is the assignment. Setting it node-side instead trades "primary term must be positive" for
+   "term is only increased as part of primary promotion".
+5. The refusal to act on an unresolvable placement. An empty in-sync set clears every checkpoint while
+   setting a routing table that names an active allocation, and the shard is then failed and removed.
+   Reachable in production when an index is deleted while a shard is still recovering.
+
+**"Created" is a weaker promise for a computed index, and that is by construction.**
+`waitForActiveShards` counts the computed table, which reports STARTED from the moment the placement can
+be derived, which is before any node has opened the shard. So creation returns optimistically and a write
+issued immediately afterwards retries for between one and five seconds. The test asserts the two facts
+separately: wait for primary mode, then write with a one second budget. Whether creation should instead
+wait for the owning node to confirm is a real question and is not answered here.
+
+**The bug that was not in the product.** Most of the flakiness chased through this task was the test
+harness clearing the static registrations in `@After` while a shard was still recovering, so the recovery
+hook found no supplier. That is the documented "static registries leak across test suites" trap running
+backwards: not leaking into other suites, but being torn down underneath the suite that needs them.
+Shortening timeouts to iterate faster made it far more likely, which is why the failure moved every time
+the timing changed. Registrations now live for the class.
+
+**What the mutation says, precisely.** Removing the empty-in-sync guard fails two runs in three rather
+than three in three, because the condition it protects is itself a race. Recorded rather than rounded up.

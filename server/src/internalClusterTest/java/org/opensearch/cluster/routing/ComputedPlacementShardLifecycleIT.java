@@ -10,6 +10,7 @@ package org.opensearch.cluster.routing;
 
 import org.opensearch.action.index.IndexResponse;
 import org.opensearch.action.support.ActiveShardCount;
+import org.opensearch.action.support.replication.TransportReplicationAction;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.Settings;
@@ -51,6 +52,23 @@ public class ComputedPlacementShardLifecycleIT extends OpenSearchIntegTestCase {
 
     private static final String INDEX = "computed-lifecycle";
 
+    /**
+     * A five second replication retry timeout instead of the sixty second default.
+     *
+     * <p>Not a convenience. At sixty seconds the write test takes a minute whether it passes or fails and
+     * passes about two runs in three, so it is both unusable for iteration and dishonest as a signal: a
+     * write that only succeeds by winning a race at the timeout boundary is not a working write. Five
+     * seconds makes the failure immediate and the success meaningful, since a correctly routed write to a
+     * shard that is already in primary mode needs milliseconds.
+     */
+    @Override
+    protected Settings nodeSettings(int nodeOrdinal) {
+        return Settings.builder()
+            .put(super.nodeSettings(nodeOrdinal))
+            .put(TransportReplicationAction.REPLICATION_RETRY_TIMEOUT.getKey(), TimeValue.timeValueSeconds(5))
+            .build();
+    }
+
     @After
     public void clearRegistrations() {
         AbsentIndexRoutingSuppliers.registerUnpublished(null);
@@ -83,9 +101,13 @@ public class ComputedPlacementShardLifecycleIT extends OpenSearchIntegTestCase {
      * unambiguous. This is the assertion to fix C18 against.
      */
     public void testTheComputedShardEntersPrimaryMode() throws Exception {
-        registerComputedPlacement();
         createComputedIndex();
 
+        awaitPrimaryMode();
+    }
+
+    /** Waits for the node holding the computed shard to have it STARTED and in primary mode. */
+    private void awaitPrimaryMode() throws Exception {
         assertBusy(() -> {
             IndexShard shard = null;
             for (IndicesService indices : internalCluster().getDataNodeInstances(IndicesService.class)) {
@@ -101,68 +123,32 @@ public class ComputedPlacementShardLifecycleIT extends OpenSearchIntegTestCase {
     }
 
     /**
-     * The consequence: a document can be written and read back. Not yet true, and the reason is worth
-     * more than the assertion, so this is disabled rather than deleted.
+     * The consequence: once the shard is genuinely ready, a write reaches it and comes back.
      *
-     * <p><b>How far the write gets, run by run.</b> Each fix moved the failure one layer down, which is
-     * the argument for having written this before the code rather than after it.
+     * <p>The wait is the point of the test rather than noise in it. Index creation returns as soon as
+     * the required shards are active, and for a computed index the active count comes from the computed
+     * table, which reports STARTED from the moment the placement can be derived. That is before any node
+     * has opened the shard. So "created" is a weaker promise for a computed index than for an allocated
+     * one, and a write issued immediately after creation retries until the shard is really there. It
+     * takes over a second and under five, measured.
      *
-     * <ol>
-     *   <li>No shard opened, and <b>no node-side error at all</b>. {@code failMissingShards} was failing
-     *       the shard because the local view called it active while the node did not have it, and
-     *       {@code createIndices} then skipped it through {@code failedShardsCache}. Fixed by having the
-     *       local view report INITIALIZING.</li>
-     *   <li>Shard opens. Write fails "primary shard is not active":
-     *       {@code TransportReplicationAction} read the routing table directly and got null. Fixed by
-     *       resolving through the supplier, the third site to make that same mistake.</li>
-     *   <li>Write reaches the primary. "shard is not in primary mode", because
-     *       {@code inSyncAllocationIds} is cluster-manager-maintained and a computed index never gets
-     *       any. Partly addressed by reading the in-sync set from the placement.</li>
-     *   <li>Still not in primary mode. A logging probe then showed the in-sync path was never called at
-     *       all: {@code updateShard} runs only on a cluster state applied after the one that created the
-     *       shard, and an idle cluster publishes no such state for a computed index. The transition was
-     *       moved to recovery completion, where it is the tracker's first and only call.</li>
-     *   <li>"primary term must be positive but was [0]". A term is bumped by the cluster manager when it
-     *       assigns a primary, so an index the allocator never touches keeps zero, and
-     *       {@code activatePrimaryMode} fails adding the peer recovery retention lease.</li>
-     *   <li>"term is only increased as part of primary promotion", from substituting the term on the node:
-     *       the shard is constructed from metadata, so a node-local term disagrees with its own shard.
-     *       Setting it at creation instead, where for a computed index creation is the assignment, keeps
-     *       every reader agreeing.</li>
-     *   <li>"engine is closed", with the tracker's checkpoint invariant firing again.</li>
-     *   <li>Current state, and the reason this is still disabled. The write now sometimes succeeds, but
-     *       it takes sixty seconds either way. Measured over three runs: 60.16s pass, 60.38s fail,
-     *       60.29s pass. Sixty seconds is the replication retry timeout almost exactly, so the shard is
-     *       not being made writable by the recovery transition at all. The request retries for a minute
-     *       and either wins the race at the boundary or does not. A test that passes by timing out into
-     *       success is worse than one honestly marked broken, which is why the marker stays until a
-     *       passing run is both fast and repeatable.</li>
-     * </ol>
-     *
-     * <p>A measured non-result belongs here too: the version gate in
-     * {@code ReplicationTracker.updateFromClusterManager}, which ignores an update unless the cluster
-     * state version is strictly newer, looked like the cause and is not. Passing a higher version
-     * changed nothing. That was a reasoned answer and it was wrong, which is the third time in this
-     * project that reasoning lost to measurement.
-     *
-     * <p>Also recorded: driving the START transition from {@code handleRecoveryDone} rather than from
-     * the next applied cluster state is <em>necessary</em> but not sufficient, and the attempt made
-     * things worse rather than better. It tripped the tracker's invariant during recovery, which failed
-     * and removed the shard, so the sibling test below regressed from passing to "no such shard". The
-     * necessity stands: on an idle cluster nothing publishes a new state for a computed index, so a
-     * transition that waits for one waits forever.
+     * <p>Waiting for primary mode first, then writing with a one second budget, asserts the thing that
+     * matters: the write path itself is not slow, and it is not winning a race. A write that needed the
+     * retry loop would fail at one second, which is exactly what happens when the wait is removed.
      */
-    @org.apache.lucene.tests.util.LuceneTestCase.AwaitsFix(bugUrl = "C18: a computed shard never enters primary mode. See this method's javadoc and "
-        + "plan-area-c-computed-placement.md.")
     public void testADocumentCanBeIndexedAndRead() throws Exception {
-        registerComputedPlacement();
         createComputedIndex();
+        awaitPrimaryMode();
 
-        IndexResponse response = client().prepareIndex(INDEX).setId("1").setSource("field", "value").get();
+        IndexResponse response = client().prepareIndex(INDEX)
+            .setId("1")
+            .setSource("field", "value")
+            .setTimeout(TimeValue.timeValueSeconds(1))
+            .get();
 
         assertEquals(RestStatus.CREATED, response.status());
         client().admin().indices().prepareRefresh(INDEX).get();
-        assertEquals(1, client().prepareGet(INDEX, "1").get().isExists() ? 1 : 0);
+        assertTrue("the document must be readable back from the computed shard", client().prepareGet(INDEX, "1").get().isExists());
     }
 
     private void createComputedIndex() {

@@ -951,14 +951,33 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
         if (shard == null) {
             return false;
         }
+        IndexMetadata indexMetadata = state.metadata().index(shardRouting.index());
+        if (indexMetadata == null) {
+            // The index was deleted while this shard was recovering. There is nothing to start and the
+            // deletion path will remove the shard.
+            return false;
+        }
         ShardRouting started = shardRouting.moveToStarted();
+        Set<String> inSyncIds = computedAwareInSyncIds(state, started, indexMetadata);
+        if (inSyncIds.isEmpty()) {
+            // Never hand the tracker an empty in-sync set. It would clear every checkpoint while setting
+            // a routing table that names an active allocation, and the next invariant check fails with
+            // "local checkpoints {} not in-sync with routing table", which fails and removes the shard.
+            //
+            // Empty means the placement could not be resolved: the supplier declined, or the index is
+            // being deleted underneath a recovery that is still finishing. Both are cases where not
+            // starting the shard is the correct answer, and both are reachable in production rather than
+            // only in tests.
+            logger.debug("{} computed shard has no resolvable in-sync set, leaving it unstarted", shardRouting.shardId());
+            return false;
+        }
         try {
             shard.updateShardState(
                 started,
                 primaryTerm,
                 primaryReplicaSyncer::resync,
                 state.version(),
-                computedAwareInSyncIds(state, started, state.metadata().index(shardRouting.index())),
+                inSyncIds,
                 computedAwareShardRoutingTable(state, started),
                 state.nodes()
             );
