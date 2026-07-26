@@ -101,7 +101,14 @@ public final class NameIndex {
         this.rebuildFloor = rebuildFloor;
     }
 
-    /** Builds the reversed twin of a base. Aliases are carried by name, so targets survive unchanged. */
+    /**
+     * Builds the reversed twin of a base.
+     *
+     * <p>Deliberately does <em>not</em> carry alias targets. Target ordinals refer to positions in the
+     * forward structure and mean nothing in a differently-sorted one, and resolving them here would cost
+     * memory for data no caller reads: the suffix path looks entries up in the forward base. The twin
+     * exists only to answer "which names end with this".
+     */
     private static CompactNameIndex reversedOf(CompactNameIndex base) {
         CompactNameIndexBuilder builder = new CompactNameIndexBuilder(base.size());
         for (int ordinal = 0; ordinal < base.size(); ordinal++) {
@@ -227,7 +234,16 @@ public final class NameIndex {
                 return;
             }
             if (NamePatterns.matches(pattern, name)) {
-                matches.add(new IndexNameEntry(name, current.reversedBase.uuidAt(ordinal), current.reversedBase.statusAt(ordinal)));
+                // Read the entry from the forward base rather than reconstructing it here. The reversed
+                // twin is built for seeking and holds no alias targets, so building an entry from it
+                // returns an alias pointing at nothing -- the same failure the rebuild path had, in a
+                // second place. One extra binary search per match, paid only on the suffix path.
+                int forward = current.base.ordinalOf(name);
+                matches.add(
+                    forward >= 0
+                        ? current.base.entryAt(forward)
+                        : new IndexNameEntry(name, current.reversedBase.uuidAt(ordinal), current.reversedBase.statusAt(ordinal))
+                );
             }
         });
 

@@ -152,6 +152,26 @@ public class NameIndexReversedTests extends OpenSearchTestCase {
         assertEquals("a rebuild must change nothing observable", viaSuffix, names(index.resolve("*-logs")));
     }
 
+    /**
+     * Found by the review pass, and the same failure as the rebuild one in a second place. The reversed
+     * twin holds no alias targets, because target ordinals refer to the forward structure and mean
+     * nothing in a differently-sorted one. Building the result entry from the twin therefore returned an
+     * alias pointing at nothing, only ever on the suffix path.
+     */
+    public void testAliasResolvedViaTheSuffixPathKeepsItsTargets() {
+        CompactNameIndex forward = new CompactNameIndexBuilder().add("app-logs", uuid(1), IndexNameEntry.STATUS_OPEN)
+            .add("sys-logs", uuid(2), IndexNameEntry.STATUS_OPEN)
+            .addAlias("all-logs", uuid(3), List.of("app-logs", "sys-logs"))
+            .build();
+        NameIndex index = new NameIndex(forward);
+
+        List<IndexNameEntry> resolved = index.resolve("*-logs");
+        assertEquals(List.of("all-logs", "app-logs", "sys-logs"), names(resolved));
+
+        IndexNameEntry alias = resolved.stream().filter(IndexNameEntry::isAlias).findFirst().orElseThrow();
+        assertEquals(List.of("app-logs", "sys-logs"), alias.getTargets());
+    }
+
     // ------------------------------------------------------------- routing
 
     /** A pattern anchored at both ends should take the prefix path, which streams instead of collecting. */

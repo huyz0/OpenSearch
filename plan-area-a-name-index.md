@@ -240,3 +240,79 @@ cannot have at any speed.
 | A13, transport action and service wrapper | open |
 | A14, coordinator integration | open |
 | Double-buffered rebuild so writers do not block | open |
+
+## Second review pass, after the reversed index landed
+
+### A17: the suffix path returned aliases with no targets (done)
+
+The same failure class as the rebuild bug in phase 3, in a second place. `forEachMatchingBySuffix`
+built its result entries from the reversed twin, which holds no alias targets. An alias resolved by a
+suffix query therefore came back pointing at nothing, and only ever on that path, so a prefix query for
+the same alias was correct.
+
+The twin deliberately does not carry targets: target ordinals refer to positions in the forward
+structure and mean nothing in a differently-sorted one, and resolving them would cost memory for data
+no caller reads. The fix is for the suffix path to read the entry out of the forward base once it has
+the name, at the cost of one extra binary search per match.
+
+Worth noting the pattern: three separate places have now needed "read the whole entry rather than
+reconstruct it from a projection", and two of them shipped wrong first. Any future structure derived
+from the base should be assumed lossy until proven otherwise.
+
+### A18: rebuild now costs twice what it did (open)
+
+The reversed twin doubles rebuild work and rebuild peak memory. A rebuild already held two bases at
+once; it now holds four, so the transient at 100M names is roughly **16.8 GiB** rather than the 8.4 GiB
+recorded against A8. That is a capacity planning input and it has not been measured, only reasoned.
+
+### Remaining work
+
+| task | state |
+|---|---|
+| A1 to A11d, A15 to A17: the data structure | done |
+| A18, measure rebuild peak memory with the twin | open |
+| A12, persistence and bootstrap | open |
+| A13, transport action and service wrapper | open |
+| A14, coordinator integration | open |
+| Double-buffered rebuild so writers do not block | open |
+
+## Phase 5 detailed plan
+
+The four open items are one piece of work: turning a data structure into a replicated service. They are
+specified together because their decisions interact.
+
+**A18. Measure rebuild cost and peak memory.** Do this first, because it may change A12's design. Build
+a 5M-name index, rebuild, and record wall time and peak heap for forward-only and forward-plus-reversed.
+If the transient is genuinely 4x the steady state, the service needs either a rebuild that streams to
+disk or a scheme that rebuilds one direction at a time.
+
+**A19. Double-buffered rebuild.** Today `rebuild()` holds the write lock throughout, so writers block
+for its duration, which at 100M is seconds. Swap the write target to a fresh overlay before starting,
+build from the frozen pair, then swap in the new base plus the accumulated overlay. Reads already never
+block; this makes writes not block either. Needs a test that writes during a rebuild are neither lost
+nor duplicated.
+
+**A12. Persistence and bootstrap.** Two options, and A18 decides between them:
+   (a) rebuild from the manifest on start, adding no durable state but paying a start-up cost
+       proportional to the index count;
+   (b) checkpoint the packed arrays to object storage, making start fast at the cost of a second thing
+       to keep consistent with the manifest.
+   Measure manifest rebuild time at 5M and extrapolate before choosing. If (b), the checkpoint needs a
+   version stamp so a node cannot load a checkpoint older than its manifest without noticing.
+
+**A13. Transport action and service wrapper.** A read-only replicated service: one writer applies
+creates and deletes, replicas hold full copies. Needs a wire format for `IndexNameEntry` including
+alias targets (`Writeable`, following `UploadedManifestShard`'s shape), an action for lookup and
+resolve, and a decision on how replicas learn of changes: tail the manifest, or receive a change
+stream from the writer. Tailing the manifest is fewer moving parts and reuses machinery that already
+exists.
+
+**A14. Coordinator integration.** Route wildcard and alias resolution to this tier instead of
+`Metadata.indicesLookup`. This is where the surface area is largest and where the existing behaviour has
+to be matched exactly, including the options `IndicesOptions` carries: `expandWildcardsOpen`,
+`expandWildcardsClosed`, `allowNoIndices`, `ignoreUnavailable`. The status byte already distinguishes
+open from closed, which is why it is a status rather than an absence, but nothing maps those flags yet.
+
+**Acceptance for phase 5.** A cluster resolves wildcards and aliases through the name index tier with
+no reference to `Metadata.indicesLookup`, survives a restart of that tier, and matches core's existing
+`IndicesOptions` semantics under test.
