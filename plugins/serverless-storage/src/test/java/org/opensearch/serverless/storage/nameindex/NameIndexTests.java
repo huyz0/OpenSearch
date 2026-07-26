@@ -334,6 +334,47 @@ public class NameIndexTests extends OpenSearchTestCase {
         assertEquals(expected, index.resolve("*").size());
     }
 
+    /**
+     * A16. The overlay was a hash map, so every pattern query walked all of it. The rebuild policy lets
+     * the overlay reach a fraction of the base before folding, which at 100M names is millions of
+     * entries scanned per wildcard -- in a structure whose entire purpose is that cost tracks matches
+     * rather than population.
+     *
+     * <p>Asserted structurally rather than by timing: the range view a query walks must be a small
+     * fraction of the overlay, which is the property a hash map cannot have at any speed.
+     */
+    public void testOverlayPatternQueryScansARangeNotTheWholeOverlay() {
+        NameIndexOverlay overlay = new NameIndexOverlay();
+        for (int i = 0; i < 10_000; i++) {
+            String name = "prefix-" + String.format("%02d", i % 50) + "-" + String.format("%05d", i);
+            overlay.put(new IndexNameEntry(name, uuid(i), IndexNameEntry.STATUS_OPEN));
+        }
+
+        assertEquals(10_000, overlay.size());
+        // Every name at or after this prefix, which for the last bucket is only its own 200 entries.
+        int visited = 0;
+        for (String name : overlay.putsFrom("prefix-49").keySet()) {
+            if (name.startsWith("prefix-49") == false) {
+                break;
+            }
+            visited++;
+        }
+        assertEquals(200, visited);
+
+        // The range view itself is bounded, which is what a hash map could not offer.
+        assertTrue("the tail view should be far smaller than the overlay", overlay.putsFrom("prefix-49").size() < overlay.size() / 10);
+    }
+
+    public void testOverlayIterationIsInByteOrder() {
+        NameIndexOverlay overlay = new NameIndexOverlay();
+        for (String name : List.of("zulu", "alpha", "mike", "bravo")) {
+            overlay.put(new IndexNameEntry(name, uuid(1), IndexNameEntry.STATUS_OPEN));
+        }
+
+        // Sorted iteration is what lets the merge skip its per-query sort.
+        assertEquals(List.of("alpha", "bravo", "mike", "zulu"), new ArrayList<>(overlay.puts().keySet()));
+    }
+
     public void testRamUsageIsReportedFromTheBase() {
         NameIndex index = new NameIndex(base(namesArray("idx-", 1000)));
 

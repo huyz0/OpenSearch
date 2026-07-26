@@ -211,7 +211,7 @@ viable, and chunking that is never exercised is chunking that does not work. Rev
 calculation fails seven of the new tests and none of the 58 that existed before, which is the measure of
 how blind the original suite was to this.
 
-### A16: the overlay is scanned linearly on every pattern query (open)
+### A16: the overlay was scanned linearly on every pattern query (done)
 
 `NameIndex.forEachMatching` walks every overlay entry to find matches. That is fine while the overlay is
 small, and the rebuild policy is what keeps it small, but the policy allows it to reach
@@ -220,8 +220,11 @@ query**, on the order of hundreds of milliseconds, for a structure whose entire 
 tracks matches rather than population.
 
 The fix is to hold the overlay in a sorted structure, `ConcurrentSkipListMap` keyed by UTF-8 byte order,
-so a prefix query becomes a range scan. That also removes the sort currently done per query on the
-matched subset. Not done.
+so a prefix query becomes a range scan. That also removes the sort previously done per query on the
+matched subset. Done: the overlay is now a `ConcurrentSkipListMap` in UTF-8 byte order, and
+`forEachMatching` walks `putsFrom(prefix)` and stops at the first name that leaves the prefix.
+Asserted structurally rather than by timing, since a bounded range view is the property a hash map
+cannot have at any speed.
 
 ## Remaining work in this area
 
@@ -232,7 +235,7 @@ matched subset. Not done.
 | A11, leading-wildcard decision | decided: build the reversed index |
 | A15, chunked name blob | done |
 | A11a to A11d, reversed index implementation | open |
-| A16, sorted overlay | open |
+| A16, sorted overlay | done |
 | A12, persistence and bootstrap | open |
 | A13, transport action and service wrapper | open |
 | A14, coordinator integration | open |

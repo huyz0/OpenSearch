@@ -10,9 +10,11 @@ package org.opensearch.serverless.storage.nameindex;
 
 import java.util.Collections;
 import java.util.Map;
+import java.util.NavigableMap;
 import java.util.Objects;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.ConcurrentSkipListSet;
 
 /**
  * Creates and deletes since the last rebuild of the {@link CompactNameIndex} base.
@@ -35,8 +37,18 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public final class NameIndexOverlay {
 
-    private final Map<String, IndexNameEntry> puts = new ConcurrentHashMap<>();
-    private final Set<String> tombstones = ConcurrentHashMap.newKeySet();
+    /**
+     * Sorted rather than hashed, in UTF-8 byte order matching {@link CompactNameIndex}.
+     *
+     * <p>A hash map made every pattern query walk the whole overlay. That is harmless while the overlay
+     * is small, but the rebuild policy lets it reach a fraction of the base before folding, which at
+     * 100M names is millions of entries scanned per wildcard -- in a structure whose entire purpose is
+     * that cost tracks matches rather than population. Sorted, a prefix query is a range scan that stops
+     * at the first non-match, and the merge no longer has to sort its candidates per query.
+     */
+    private final ConcurrentSkipListMap<String, IndexNameEntry> puts = new ConcurrentSkipListMap<>(NamePatterns::compareUtf8);
+
+    private final ConcurrentSkipListSet<String> tombstones = new ConcurrentSkipListSet<>(NamePatterns::compareUtf8);
 
     /** Records a create or an update. Clears any tombstone, so a delete then create resolves to present. */
     public void put(IndexNameEntry entry) {
@@ -74,6 +86,14 @@ public final class NameIndexOverlay {
 
     public Map<String, IndexNameEntry> puts() {
         return Collections.unmodifiableMap(puts);
+    }
+
+    /**
+     * Entries at or after {@code fromInclusive} in byte order. The caller stops when names stop matching
+     * its prefix, which is what turns a full overlay walk into a range scan.
+     */
+    public NavigableMap<String, IndexNameEntry> putsFrom(String fromInclusive) {
+        return puts.tailMap(fromInclusive, true);
     }
 
     public Set<String> tombstones() {

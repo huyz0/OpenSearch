@@ -139,15 +139,19 @@ public final class NameIndex {
 
         String prefix = NamePatterns.literalPrefixOf(pattern);
 
-        // The overlay is small by design, so scanning all of it and sorting the matches costs little
-        // next to seeking the base. Sorting is what lets the two streams merge in order.
+        // A range scan over the sorted overlay, stopping at the first name that leaves the prefix. The
+        // overlay was a hash map originally, which meant walking all of it on every query; the rebuild
+        // policy lets it reach a fraction of the base, so at 100M that was millions of entries per
+        // wildcard. Already in byte order, so no per-query sort either.
         List<IndexNameEntry> overlayMatches = new ArrayList<>();
-        for (IndexNameEntry entry : current.overlay.puts().values()) {
-            if (entry.getName().startsWith(prefix) && NamePatterns.matches(pattern, entry.getName())) {
+        for (IndexNameEntry entry : current.overlay.putsFrom(prefix).values()) {
+            if (entry.getName().startsWith(prefix) == false) {
+                break;
+            }
+            if (NamePatterns.matches(pattern, entry.getName())) {
                 overlayMatches.add(entry);
             }
         }
-        overlayMatches.sort((a, b) -> NamePatterns.compareUtf8(a.getName(), b.getName()));
 
         // Merge the base scan with the sorted overlay matches, emitting in byte order. Base entries that
         // the overlay has tombstoned or replaced are skipped, so a name never appears twice.
