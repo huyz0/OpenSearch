@@ -51,25 +51,30 @@ import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertAcked;
  * every node reported {@code state not recovered / initialized}. With the guard in place the cluster
  * recovers and this test runs to completion.
  *
- * <p><b>What is left is the documents, and it is not the recovery source.</b> The cluster comes back,
- * the shard comes back, and it is empty: twenty indexed, zero found. A probe cleared C19 of it. The
- * node-local check runs twice and is right both times: {@code hasData=false} at creation, so the shard
- * correctly stays EMPTY_STORE, and {@code hasData=true} after the restart, so it correctly becomes
- * EXISTING_STORE. The node finds its data and asks for the right recovery.
+ * <p><b>The cause is placement instability, and it is in this test rather than in the product.</b>
+ * Probes cleared recovery entirely: the recovery source is correct both times, the
+ * {@code cleanLuceneIndex} branch that silently discards a store never fires, and the pre-restart
+ * recovery is a textbook new index. What varies is which node owns the shard.
  *
- * <p>So the store is opened and comes back empty, which points at history and translog rather than at
- * placement. The suspects are the ones computed placement changes: the primary term is synthesised at
- * creation, the in-sync set is derived from the placement, and the shard starts itself locally without
- * the cluster manager. Any of those can lead recovery to bootstrap a new history instead of replaying
- * the existing translog, and a new history on an existing store is a blank index.
+ * <p>{@link #owner} places by {@code shardId % dataNodes.size()} over the data nodes visible in the
+ * cluster state at that instant. During a restart that list grows as nodes rejoin, so ownership moves,
+ * and a node that gains the shard has none of its data. It then recovers empty, correctly by its own
+ * lights, because it really does have nothing. Different timing gives different symptoms: one run comes
+ * back with zero documents, the next cannot find the shard at all.
  *
- * <p>Probe the recovery itself next, in {@code StoreRecovery.internalRecoverFromStore}: whether the
- * translog is replayed or a new history is bootstrapped, and what the shard's global checkpoint and
- * translog UUID are on the way in. Every layer of this area has been named by exactly one log line, and
- * five confident guesses before it were wrong.
+ * <p>That is precisely the risk C2 named. "Two coordinators computing against different node lists
+ * produce different placement, so this is a correctness input, not a convenience." A restart is the same
+ * problem in time rather than in space: the same coordinator computing against a changing node list
+ * relocates shards away from their data, and every new owner starts blank while looking healthy.
+ *
+ * <p>So C13 is blocked on C2 rather than on recovery. The placement function needs a stable node set,
+ * agreed rather than instantaneous, and {@code RendezvousShardPlacement} from C1 minimises movement but
+ * does not by itself make the input stable. This test should also use it rather than modulo, but that
+ * only reduces the blast radius; it does not make a restart safe.
  */
-@org.apache.lucene.tests.util.LuceneTestCase.AwaitsFix(bugUrl = "C13: the cluster recovers and the shard opens from its existing store, but comes back "
-    + "empty. Recovery source is cleared as the cause. See this class's javadoc.")
+@org.apache.lucene.tests.util.LuceneTestCase.AwaitsFix(bugUrl = "C13 is blocked on C2: placement is computed against the instantaneous data node list, so a "
+    + "restart moves shards away from their data and each new owner recovers blank. Recovery itself "
+    + "is cleared. See this class's javadoc.")
 public class ComputedPlacementRestartIT extends OpenSearchIntegTestCase {
 
     private static final String INDEX = "computed-restart";

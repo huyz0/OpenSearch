@@ -652,5 +652,25 @@ starts itself locally without the cluster manager. Any of those can lead recover
 history rather than replay the existing translog, and a new history on an existing store is a blank
 index that looks perfectly healthy.
 
-Next probe: `StoreRecovery.internalRecoverFromStore`, for whether the translog is replayed or a new
-history is bootstrapped, and what the global checkpoint and translog UUID are on the way in.
+**Probed, and recovery is cleared entirely.** The recovery source is right both times, the
+`cleanLuceneIndex` branch that silently discards an existing store never fires, and the pre-restart
+recovery is a textbook new index with `si=null`. The cause is which node owns the shard.
+
+**C13 is blocked on C2, not on recovery.** Placement in the test is
+`shardId % dataNodes.size()` over the data nodes visible in the cluster state at that instant. During a
+restart that list grows as nodes rejoin, ownership moves, and a node that gains the shard has none of
+its data. It recovers empty, correctly by its own lights, because it really does have nothing. Different
+timing gives different symptoms, which is why one run returned zero documents and the next could not
+find the shard at all.
+
+C2 said it in advance: "Two coordinators computing against different node lists produce different
+placement, so this is a correctness input, not a convenience." A restart is that same problem in time
+rather than in space. The same coordinator, computing against a changing node list, relocates shards
+away from their data, and every new owner starts blank while looking healthy. Which is A5's signature
+again, arriving from a direction the recovery source cannot defend against.
+
+**What that means for the area.** The placement function needs a node set that is agreed and stable
+rather than instantaneous. `RendezvousShardPlacement` from C1 minimises movement when membership really
+does change, and the test should use it rather than modulo, but that only shrinks the blast radius: it
+does not make the input stable, and a shard whose winning node is briefly absent still moves. Until C2
+lands, a restart is not safe for a computed index, and no amount of work on recovery changes that.
