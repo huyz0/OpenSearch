@@ -432,6 +432,18 @@ because the missing thing is an event rather than a line. Worse, because the att
 tracker's invariant during recovery, which failed and removed the shard and regressed the sibling test
 from passing to "no such shard". It has been reverted, and the necessity stands.
 
+**Measured after the commit, and it changes the picture.** A logging probe in `computedAwareInSyncIds`
+printed nothing across a full run with node logging captured. `updateShard` never runs for a computed
+shard, because it only fires on a cluster state applied after the one that created the shard, and an
+idle cluster publishes no such state. So `computedAwareInSyncIds` and `startComputedShardLocally` are
+both correct and unreachable.
+
+That is the third time this area has shipped a mechanism nothing could reach: the supplier before
+`registerUnpublished`, the C1 to C11 run before C12, and now these two. The pattern is stable enough to
+act on. Reachability is not something to establish by reading the call graph and agreeing with yourself;
+a probe that prints nothing settles it in ninety seconds, and it settled this after the call-graph
+argument had already reached the same conclusion less certainly.
+
 **The shape of all of it.** Computed placement removes the cluster manager from the loop, and every
 piece of state the cluster manager used to maintain as a side effect has to become a function of the
 placement instead: allocation identity, the started transition, and the in-sync set. That is a bigger

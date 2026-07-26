@@ -25,18 +25,31 @@ Evidence for every number claimed: `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.m
 Start here: `ComputedPlacementShardLifecycleIT.testADocumentCanBeIndexedAndRead`, which is `@AwaitsFix`
 and whose javadoc has the run-by-run account of how the failure moved.
 
-**The call graph already narrows this to one thing.** `ReplicationTracker.updateFromClusterManager` has
-exactly one feeder, `IndexShard.updateShardState`, which has exactly one caller,
-`IndicesClusterStateService.updateShard`. That runs only when the shard already exists, meaning on a
-cluster state applied *after* the one that created it. A computed shard on an idle cluster never gets a
-later state, so `computedAwareInSyncIds` never executes. The checkpoint map is empty because nothing
-ever filled it, not because the wrong value was passed.
+**`updateShard` never runs for a computed shard, and this is measured rather than argued.** A logging
+probe in `computedAwareInSyncIds` produced no output at all across a full run in which node logging was
+captured. `ReplicationTracker.updateFromClusterManager` has one feeder, `IndexShard.updateShardState`,
+which has one caller, `IndicesClusterStateService.updateShard`, and that runs only when the shard
+already exists, meaning on a cluster state applied *after* the one that created it. A computed shard on
+an idle cluster never gets a later state. The checkpoint map is empty because nothing ever filled it.
+
+**So two pieces of the committed C18 code are dead in the scenario they were written for.**
+`computedAwareInSyncIds` and `startComputedShardLocally` both hang off `createOrUpdateShards`, which
+only reaches them via `updateShard`. They are correct and unreachable, which is precisely the failure
+this area has now produced three times: C3's supplier before `registerUnpublished`, the whole C1 to C11
+run before C12, and now these. **Check reachability before writing the next mechanism**, and prefer a
+probe that prints nothing over an argument that sounds right.
 
 So recovery completion is the only hook that can work, and the `handleRecoveryDone` attempt was the
-right shape done wrongly. The question to answer when retrying it: why did calling `updateShardState`
-from there trip "local checkpoints {} not in-sync with routing table", when that assertion runs at the
-*start* of `updateFromClusterManager` against the tracker's existing state and should pass on a fresh
-tracker? Something had already populated `this.routingTable`. Find what.
+right shape done wrongly. Since `updateShard` never runs, that attempt's `updateShardState` call was the
+tracker's **first**, so the invariant it tripped fired *after* its own update, not before: it left
+`checkpoints` empty while setting a routing table that has the allocation id. That means the in-sync set
+it passed was empty.
+
+The next step is therefore narrow and mechanical: restore the `handleRecoveryDone` variant (it is in
+this branch's history, commit `6b06c95798b` describes it), put the same logging probe inside
+`computedAwareInSyncIds`, and find why it returns empty when called from there. The candidates are that
+`resolveShard` declines, or that the early return on published in-sync ids fires. Do not reason about
+which; the probe answers it in ninety seconds.
 
 Two things already ruled out, so as not to spend the time again:
 
