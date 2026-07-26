@@ -590,3 +590,21 @@ carries the finding and is `@AwaitsFix`.
 beside the other tests turned one real failure into three misleading ones, with the siblings failing on a
 broken cluster rather than on anything they assert. Isolation here is not tidiness, it is the difference
 between one signal and three false ones.
+
+## C15 done: adaptive replica selection already ranks the computed candidates
+
+No production change, and the reason is the same property that made C3 and C5 small. ARS is applied by
+`OperationRouting#shardRoutings` to an `IndexShardRoutingTable`, and a computed entry *is* an
+`IndexShardRoutingTable`. The ranking neither knows nor cares where the table came from. Keeping the
+existing type rather than introducing a parallel one means existing behaviour composes for free.
+
+Verified rather than assumed, which is the point: "ARS applies to the K candidates" was an assumption
+the area rested on. Three computed candidates with the third node an order of magnitude slower, and the
+slow node ranks last. Moving the slow node moves the ranking, so the assertion is measuring the ranking
+and not the list order.
+
+**The open decision this surfaces.** The test builds the K-1 non-primary candidates as ordinary
+replicas, which is what makes them rankable. Whether they should be search-only copies outside the
+replication group, as C4 sketched, or full members of it, is not settled here and changes what the
+in-sync set from C18 has to contain. Recorded as a decision for whoever turns the setting on rather than
+as an omission.
