@@ -25,9 +25,14 @@ Evidence for every number claimed: `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.m
 Start here: `ComputedPlacementShardLifecycleIT.testADocumentCanBeIndexedAndRead`, which is `@AwaitsFix`
 and whose javadoc has the run-by-run account of how the failure moved.
 
-**Where it is now.** The write fails with `AlreadyClosedException: engine is closed` and the tracker's
-invariant `local checkpoints {} not in-sync with routing table`. That is two layers further along than
-"not in primary mode", and the shard-open test passes in about four seconds.
+**Where it is now, measured.** The write takes sixty seconds and passes about two runs in three:
+60.16s pass, 60.38s fail, 60.29s pass. Sixty seconds is the replication retry timeout almost exactly.
+So the recovery transition is not making the shard writable at all; the request retries for a minute and
+either wins the race at the boundary or does not. Do not read the passing runs as success.
+
+The failing run reports `AlreadyClosedException: engine is closed` with the tracker's invariant
+`local checkpoints {} not in-sync with routing table`. The shard-open test passes in four seconds
+throughout, so shard creation is solid and only the write path is in question.
 
 **What is already settled, so as not to re-derive it.**
 
@@ -41,9 +46,12 @@ invariant `local checkpoints {} not in-sync with routing table`. That is two lay
   constructed from metadata and a node-local term disagrees with its own shard.
 - The `ReplicationTracker` version gate is **not** a factor. Passing a higher version changed nothing.
 
-**How to make progress on the current failure.** Put the probe back inside
-`startComputedShardAfterRecovery` (the shape is in commit `fe093d9fbba`) and print what
-`updateShardState` throws. Every layer so far has been named exactly by one log line, and every attempt
+**How to make progress.** The question is no longer "why does it fail" but "why is it never promptly
+writable", and the sixty-second constant is the clue: find what makes the shard writable at the sixty
+second mark and make that happen at recovery completion instead. Put a probe inside
+`startComputedShardAfterRecovery` printing `shard.state()` and any exception, and note that
+internalClusterTest only dumps node logs when a test fails, so force a failure or assert on timing to
+see them. Every layer so far has been named exactly by one log line, and every attempt
 to reason ahead of the probe has been wrong: the version gate, then an empty in-sync set, both
 confidently argued and both false. Three log lines have beaten three arguments.
 

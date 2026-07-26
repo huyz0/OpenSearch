@@ -100,7 +100,14 @@ public class ComputedPlacementShardLifecycleIT extends OpenSearchIntegTestCase {
      *       the shard is constructed from metadata, so a node-local term disagrees with its own shard.
      *       Setting it at creation instead, where for a computed index creation is the assignment, keeps
      *       every reader agreeing.</li>
-     *   <li>"engine is closed", with the tracker's checkpoint invariant firing again. Current state.</li>
+     *   <li>"engine is closed", with the tracker's checkpoint invariant firing again.</li>
+     *   <li>Current state, and the reason this is still disabled. The write now sometimes succeeds, but
+     *       it takes sixty seconds either way. Measured over three runs: 60.16s pass, 60.38s fail,
+     *       60.29s pass. Sixty seconds is the replication retry timeout almost exactly, so the shard is
+     *       not being made writable by the recovery transition at all. The request retries for a minute
+     *       and either wins the race at the boundary or does not. A test that passes by timing out into
+     *       success is worse than one honestly marked broken, which is why the marker stays until a
+     *       passing run is both fast and repeatable.</li>
      * </ol>
      *
      * <p>A measured non-result belongs here too: the version gate in
