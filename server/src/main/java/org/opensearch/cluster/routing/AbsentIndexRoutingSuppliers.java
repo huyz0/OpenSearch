@@ -14,6 +14,7 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.shard.ShardNotFoundException;
 
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiFunction;
 import java.util.function.Predicate;
@@ -61,6 +62,12 @@ public final class AbsentIndexRoutingSuppliers {
      */
     private static final AtomicReference<Predicate<IndexMetadata>> UNPUBLISHED = new AtomicReference<>();
 
+    /**
+     * Notified when a supplier is installed. Copy-on-write because installation is rare and the list is
+     * read from whichever thread happens to register.
+     */
+    private static final List<Runnable> REGISTRATION_LISTENERS = new CopyOnWriteArrayList<>();
+
     private AbsentIndexRoutingSuppliers() {}
 
     /**
@@ -100,6 +107,42 @@ public final class AbsentIndexRoutingSuppliers {
      */
     public static void register(BiFunction<ClusterState, IndexMetadata, IndexRoutingTable> supplier) {
         SUPPLIER.set(supplier);
+        if (supplier != null) {
+            for (Runnable listener : REGISTRATION_LISTENERS) {
+                try {
+                    listener.run();
+                } catch (Exception e) {
+                    // A listener that fails must not prevent registration, for the same reason a supplier
+                    // that throws is treated as declining: this is installation, not a request path.
+                }
+            }
+        }
+    }
+
+    /**
+     * Runs when a supplier is installed.
+     *
+     * <p>Exists because anything that reacts to placement being enabled would otherwise have to wait for
+     * an unrelated cluster state change to notice. The membership maintainer hit exactly that: it
+     * publishes on cluster state changes, so a cluster that installed a supplier and then went idle kept
+     * computing placement against the live node list, which is the input this area exists to stop using.
+     *
+     * <p>Listeners are not removed, matching the registry's own lifetime, and a listener that throws is
+     * swallowed rather than allowed to break installation.
+     */
+    public static void addRegistrationListener(Runnable listener) {
+        REGISTRATION_LISTENERS.add(listener);
+    }
+
+    /**
+     * Stops notifying a listener.
+     *
+     * <p>Needed because a listener outlives the node that added it otherwise. This registry is static, so
+     * in a test JVM every node of every suite would accumulate here, each holding its {@code
+     * ClusterService} alive and each running against a cluster that has already closed.
+     */
+    public static void removeRegistrationListener(Runnable listener) {
+        REGISTRATION_LISTENERS.remove(listener);
     }
 
     /**

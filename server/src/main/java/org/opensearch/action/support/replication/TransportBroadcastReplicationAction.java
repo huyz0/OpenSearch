@@ -43,6 +43,7 @@ import org.opensearch.action.support.broadcast.BroadcastShardOperationFailedExce
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.ResolvedIndices;
+import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.service.ClusterService;
@@ -169,7 +170,13 @@ public abstract class TransportBroadcastReplicationAction<
             // in metadata but absent from the routing table dereferenced null here. The rest of this
             // family already treats an absent routing entry as no shards -- see
             // RoutingTable#allShardsSatisfyingPredicate -- so do the same rather than fail the request.
-            IndexRoutingTable indexRouting = clusterState.getRoutingTable().index(index);
+            //
+            // Resolving rather than looking up is what makes this work for a computed index. The guard
+            // above was correct for Phase A, where an absent entry really did mean no shards, but a
+            // computed index has shards and simply does not publish them. Looking up directly found
+            // nothing, so a refresh or a flush reported success having touched nothing at all, and every
+            // read afterwards saw a stale searcher. Silent, and indistinguishable from a broken write.
+            IndexRoutingTable indexRouting = AbsentIndexRoutingSuppliers.resolve(clusterState, index);
             if (clusterState.metadata().hasIndex(index) && indexRouting != null) {
                 for (IndexShardRoutingTable shardRouting : indexRouting.getShards().values()) {
                     shardIds.add(shardRouting.shardId());

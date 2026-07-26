@@ -8,6 +8,7 @@
 
 package org.opensearch.cluster.routing;
 
+import org.opensearch.OpenSearchException;
 import org.opensearch.action.support.ActiveShardCount;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
@@ -25,6 +26,8 @@ import org.junit.Before;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
 
 import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertAcked;
@@ -36,55 +39,32 @@ import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertAcked;
  * cannot recover from, so keeping it alongside them turned one real failure into three misleading ones:
  * the siblings failed on a broken shared cluster rather than on anything they were asserting.
  *
- * <p><b>It does not pass, and the reason moved.</b> The first version of this test passed for three runs
- * while restarting an ordinary index, because an edit had silently stripped the registrations that make
- * an index computed. With them restored the documents were gone after the restart, which is the A5 trap:
- * the local view stated {@code EmptyStoreRecoverySource} because that is what the placement function
- * says, and on restart that recovers a live index blank while leaving it STARTED and green.
+ * <p>It took four separate fixes to pass, and the sequence is worth keeping because each one moved the
+ * failure somewhere new rather than removing it.
  *
- * <p>C19 fixed that part. The node now corrects the recovery source from something only the node knows,
- * whether it already holds the data, because a placement function evaluated identically everywhere
- * cannot know which node has a store.
+ * <p>C19 came first. The local view stated {@code EmptyStoreRecoverySource}, because that is all a
+ * placement function evaluated identically on every node can state, and on restart that recovers a live
+ * index blank while leaving it STARTED and green. The node now corrects the recovery source from the one
+ * thing only it knows, whether it already holds the data.
  *
- * <p>C20 then fixed cluster recovery. State recovery had been republishing routing for the computed
- * index, which collided with the copy the node contributes for itself, and the cluster never came back:
- * every node reported {@code state not recovered / initialized}. With the guard in place the cluster
- * recovers and this test runs to completion.
+ * <p>C20 fixed cluster recovery. State recovery republished routing for the computed index, colliding
+ * with the copy the node contributes for itself, and the cluster never came back at all.
  *
- * <p><b>C2 landed and moved the failure.</b> Placement now reads the published membership, which is
- * stable across a restart, and the membership is confirmed published before any data is written. What
- * fails now is earlier and different: the twenty documents are not searchable even <em>before</em> the
- * restart. That is not the symptom this test was written for, and it needs its own investigation rather
- * than being folded into C13.
+ * <p>C2 fixed placement stability. Ownership had been computed against the data nodes visible at that
+ * instant, so a restart moved shards away from their data and every new owner started blank while
+ * looking healthy. Membership is now published, versioned and never shrinks, so a node being away is not
+ * a placement event.
  *
- * <p>The prime suspect is the trigger index this test creates to force a cluster state change: it is an
- * ordinary index, so it publishes routing, and it is the first thing the membership sees. Whether its
- * presence shifts the computed placement of the shard written afterwards is the first thing to check,
- * with the second being whether the search reaches the node that actually holds the shard.
+ * <p>C21 was the last and the least visible. Refresh resolved its shards with a direct routing lookup,
+ * found nothing for a computed index, and reported success having touched no shards at all. Since
+ * {@code Engine.docStats()} reads the internal searcher, which only advances on refresh, the twenty
+ * documents sat in the engine while both the shard's own count and the search read zero. Every earlier
+ * theory about this test, including blank recovery and lost writes, was downstream of that.
  *
- * <p><b>The original cause was placement instability, and that part is fixed.</b>
- * Probes cleared recovery entirely: the recovery source is correct both times, the
- * {@code cleanLuceneIndex} branch that silently discards a store never fires, and the pre-restart
- * recovery is a textbook new index. What varies is which node owns the shard.
- *
- * <p>{@link #owner} places by {@code shardId % dataNodes.size()} over the data nodes visible in the
- * cluster state at that instant. During a restart that list grows as nodes rejoin, so ownership moves,
- * and a node that gains the shard has none of its data. It then recovers empty, correctly by its own
- * lights, because it really does have nothing. Different timing gives different symptoms: one run comes
- * back with zero documents, the next cannot find the shard at all.
- *
- * <p>That is precisely the risk C2 named. "Two coordinators computing against different node lists
- * produce different placement, so this is a correctness input, not a convenience." A restart is the same
- * problem in time rather than in space: the same coordinator computing against a changing node list
- * relocates shards away from their data, and every new owner starts blank while looking healthy.
- *
- * <p>So C13 is blocked on C2 rather than on recovery. The placement function needs a stable node set,
- * agreed rather than instantaneous, and {@code RendezvousShardPlacement} from C1 minimises movement but
- * does not by itself make the input stable. This test should also use it rather than modulo, but that
- * only reduces the blast radius; it does not make a restart safe.
+ * <p>The pattern across all four is one thing: a read of the routing table that should have been a
+ * resolve. C21 is the one that survived six passes over that seam, because unlike the others it failed
+ * upward, returning success rather than an error.
  */
-@org.apache.lucene.tests.util.LuceneTestCase.AwaitsFix(bugUrl = "C2 landed: placement is now stable across a restart. The remaining failure is earlier and "
-    + "different, documents not searchable before the restart. See this class's javadoc.")
 public class ComputedPlacementRestartIT extends OpenSearchIntegTestCase {
 
     private static final String INDEX = "computed-restart";
@@ -112,12 +92,40 @@ public class ComputedPlacementRestartIT extends OpenSearchIntegTestCase {
         createComputedIndex();
         awaitPrimaryMode();
 
+        // Before writing anything, check that the node the coordinator will route writes to is the node
+        // that actually built the shard. If these differ every write goes to a shard nobody reads, and
+        // the resulting empty count would look exactly like a recovery failure.
+        assertEquals(
+            "placement must name the node that actually materialized the shard",
+            nodeComputedPlacementAssignsTheShardTo(),
+            nodeHoldingComputedShard()
+        );
+
         for (int i = 0; i < 20; i++) {
             client().prepareIndex(INDEX).setId(Integer.toString(i)).setSource("field", "value-" + i).get();
         }
-        client().admin().indices().prepareRefresh(INDEX).get();
+        // The refresh is asserted rather than fired and forgotten. A broadcast that reaches no shards
+        // reports success having touched nothing, so an index that was never refreshed is
+        // indistinguishable from a working one at the call site, and every count after it reads stale.
         assertEquals(
-            "the documents must be there before the restart, or placement moved while the test was writing",
+            "the refresh must reach the computed shard, or every count after it reads stale",
+            1,
+            client().admin().indices().prepareRefresh(INDEX).get().getSuccessfulShards()
+        );
+
+        // Ask the shard before asking the search. These two disagreeing is the difference between
+        // "the documents never landed" and "they landed somewhere the search does not look", and a
+        // search count alone cannot tell them apart.
+        Map<String, Long> perNode = documentCountPerNodeHoldingTheShard();
+        assertEquals(
+            "exactly one node must hold the shard and it must hold every document written to it, but the "
+                + "counts per node were "
+                + perNode,
+            "[20]",
+            new ArrayList<>(perNode.values()).toString()
+        );
+        assertEquals(
+            "the search must find the documents the shard holds, before any restart",
             20L,
             client().prepareSearch(INDEX).setSize(0).get().getHits().getTotalHits().value()
         );
@@ -133,12 +141,35 @@ public class ComputedPlacementRestartIT extends OpenSearchIntegTestCase {
         // nothing to do with recovery.
         assertEquals("the shard must come back on the node that holds its data", ownerBeforeRestart, nodeHoldingComputedShard());
 
-        client().admin().indices().prepareRefresh(INDEX).get();
-        assertEquals(
-            "every document must survive the restart, or the shard recovered blank",
-            20L,
-            client().prepareSearch(INDEX).setSize(0).get().getHits().getTotalHits().value()
-        );
+        // Retried rather than asked once, and the reason is the design rather than test flakiness. A
+        // membership that never shrinks means a node that is away is still assigned its shards, so
+        // requests to it fail and retry until it is back. That is the deliberate trade in C2: unavailable
+        // for a moment beats relocated onto a node with none of the data. Immediately after a full
+        // restart the cluster is still settling, and one run in three saw the query phase fail outright
+        // with every shard unavailable.
+        //
+        // This does not weaken the assertion. A shard that recovered blank stays blank, so retrying can
+        // only wait out an unavailable window, never turn a real zero into twenty.
+        assertBusy(() -> {
+            // The conversion is the load-bearing part. assertBusy retries on AssertionError and lets any
+            // other exception through, and an unavailable shard surfaces as SearchPhaseExecutionException
+            // rather than as a failed assertion. Wrapping the block without this changes nothing, which is
+            // how the first attempt at this retry still failed one run in three.
+            try {
+                assertEquals(
+                    "the refresh must reach the computed shard after the restart too",
+                    1,
+                    client().admin().indices().prepareRefresh(INDEX).get().getSuccessfulShards()
+                );
+                assertEquals(
+                    "every document must survive the restart, or the shard recovered blank",
+                    20L,
+                    client().prepareSearch(INDEX).setSize(0).get().getHits().getTotalHits().value()
+                );
+            } catch (OpenSearchException e) {
+                throw new AssertionError("the restarted cluster has not finished settling yet", e);
+            }
+        }, 30, TimeUnit.SECONDS);
         assertEquals(
             "a restarted computed shard must recover from its existing store",
             RecoverySource.Type.EXISTING_STORE,
@@ -156,19 +187,12 @@ public class ComputedPlacementRestartIT extends OpenSearchIntegTestCase {
      * the plugin uses rendezvous hashing, where growth moves a fraction rather than everything.
      */
     private void awaitStableMembership() throws Exception {
-        // The maintainer is edge-triggered: it publishes on a cluster state change while a supplier is
-        // registered. Registration happens in @Before, after the cluster has already formed, so without
-        // a subsequent change nothing ever publishes. A real cluster generates changes constantly and a
-        // test does not, so one is forced here with an ordinary index that has nothing to do with
-        // computed placement.
-        //
-        // The narrow production edge this papers over is worth naming: a cluster that installs a supplier
-        // and then goes completely idle has no membership until something else happens, and placement
-        // uses the live view in the meantime. Publishing on registration would close it.
-        assertAcked(
-            prepareCreate("membership-trigger").setSettings(Settings.builder().put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1).build())
-        );
-
+        // Nothing is created here to force a cluster state change, and that absence is the assertion. The
+        // maintainer used to publish only on a state change, so registering a supplier into an idle
+        // cluster published nothing and placement quietly used the live node list until something
+        // unrelated happened. This test papered over that by creating a throwaway index; the maintainer
+        // now publishes on registration instead, so the workaround is gone and its removal is what proves
+        // the fix.
         assertBusy(() -> {
             ClusterState state = client().admin().cluster().prepareState().get().getState();
             ComputedPlacementMembership membership = ComputedPlacementMembershipService.get(state);
@@ -204,6 +228,34 @@ public class ComputedPlacementRestartIT extends OpenSearchIntegTestCase {
             assertEquals(IndexShardState.STARTED, shard.state());
             assertTrue(shard.isPrimaryMode());
         }, 30, TimeUnit.SECONDS);
+    }
+
+    /**
+     * What every node that materialized the shard reports for its own document count.
+     *
+     * <p>Every node rather than the first one found, because the two failures this has to tell apart look
+     * identical from a single count. If one node reports zero the writes never landed; if two nodes hold
+     * the shard and only one has the documents, placement disagreed with itself and the search is reading
+     * a copy that was never written to. An empty map means nothing materialized at all.
+     */
+    private Map<String, Long> documentCountPerNodeHoldingTheShard() {
+        Map<String, Long> perNode = new TreeMap<>();
+        for (String nodeName : internalCluster().getNodeNames()) {
+            IndicesService indices = internalCluster().getInstance(IndicesService.class, nodeName);
+            IndexService indexService = indices.indexService(resolveIndex(INDEX));
+            if (indexService != null && indexService.hasShard(0)) {
+                perNode.put(nodeName, indexService.getShard(0).docStats().getCount());
+            }
+        }
+        return perNode;
+    }
+
+    /** The node the published placement names as holding shard 0, which is where requests will go. */
+    private String nodeComputedPlacementAssignsTheShardTo() {
+        ClusterState state = client().admin().cluster().prepareState().get().getState();
+        IndexRoutingTable routing = AbsentIndexRoutingSuppliers.resolve(state, INDEX);
+        assertNotNull("placement must resolve an entry for a computed index", routing);
+        return routing.shard(0).primaryShard().currentNodeId();
     }
 
     private String nodeHoldingComputedShard() {

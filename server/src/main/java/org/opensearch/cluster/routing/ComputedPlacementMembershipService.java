@@ -17,6 +17,7 @@ import org.opensearch.cluster.ClusterStateUpdateTask;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.lifecycle.Lifecycle;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -46,8 +47,37 @@ public class ComputedPlacementMembershipService implements ClusterStateListener 
 
     private final ClusterService clusterService;
 
+    /**
+     * Held as a field rather than passed as a method reference twice, because adding and removing have to
+     * refer to the same object for the removal to find anything.
+     */
+    private final Runnable onPlacementRegistered = this::publishIfElected;
+
     public ComputedPlacementMembershipService(ClusterService clusterService) {
         this.clusterService = clusterService;
+        // Publish as soon as placement is enabled rather than waiting for the next unrelated cluster
+        // state change. Without this, a cluster that installs a supplier and then goes idle keeps
+        // computing placement against the live node list, which is the input this whole mechanism exists
+        // to stop using, and it does so silently.
+        AbsentIndexRoutingSuppliers.addRegistrationListener(onPlacementRegistered);
+    }
+
+    private void publishIfElected() {
+        // The registry is static and outlives any single node, so a node that has shut down is still on
+        // its listener list. Leaving would mean submitting cluster state updates against a closed service,
+        // which in a test JVM means every node of every earlier suite waking up on the next registration.
+        if (clusterService.lifecycleState() != Lifecycle.State.STARTED) {
+            AbsentIndexRoutingSuppliers.removeRegistrationListener(onPlacementRegistered);
+            return;
+        }
+        ClusterState state = clusterService.state();
+        if (state.nodes().isLocalNodeElectedClusterManager() == false) {
+            return;
+        }
+        List<String> dataNodes = dataNodeIds(state);
+        if (dataNodes.isEmpty() == false && get(state).withNodes(dataNodes) != get(state)) {
+            submitUpdate(dataNodes);
+        }
     }
 
     /** The membership published in this state, or empty when nothing has been published yet. */
