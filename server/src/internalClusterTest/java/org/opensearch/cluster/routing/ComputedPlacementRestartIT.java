@@ -51,18 +51,25 @@ import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertAcked;
  * every node reported {@code state not recovered / initialized}. With the guard in place the cluster
  * recovers and this test runs to completion.
  *
- * <p><b>What is left is the documents.</b> The cluster comes back, the shard comes back, and it is
- * empty: twenty indexed, zero found. So C19's correction, which upgrades the recovery source from
- * EMPTY_STORE to EXISTING_STORE when the node finds it already holds data, is not taking effect on this
- * path. Either {@code ShardPath.loadShardPath} does not see the data at the moment the shard is created
- * after a restart, or the shard is created through a path that does not consult it.
+ * <p><b>What is left is the documents, and it is not the recovery source.</b> The cluster comes back,
+ * the shard comes back, and it is empty: twenty indexed, zero found. A probe cleared C19 of it. The
+ * node-local check runs twice and is right both times: {@code hasData=false} at creation, so the shard
+ * correctly stays EMPTY_STORE, and {@code hasData=true} after the restart, so it correctly becomes
+ * EXISTING_STORE. The node finds its data and asks for the right recovery.
  *
- * <p>That is the next thing to probe, and the probe is cheap: log what
- * {@code hasExistingShardData} returns during the post-restart creation. Every layer of this area has
- * been named by exactly one log line, and four confident guesses before it were wrong.
+ * <p>So the store is opened and comes back empty, which points at history and translog rather than at
+ * placement. The suspects are the ones computed placement changes: the primary term is synthesised at
+ * creation, the in-sync set is derived from the placement, and the shard starts itself locally without
+ * the cluster manager. Any of those can lead recovery to bootstrap a new history instead of replaying
+ * the existing translog, and a new history on an existing store is a blank index.
+ *
+ * <p>Probe the recovery itself next, in {@code StoreRecovery.internalRecoverFromStore}: whether the
+ * translog is replayed or a new history is bootstrapped, and what the shard's global checkpoint and
+ * translog UUID are on the way in. Every layer of this area has been named by exactly one log line, and
+ * five confident guesses before it were wrong.
  */
-@org.apache.lucene.tests.util.LuceneTestCase.AwaitsFix(bugUrl = "C13: the cluster now recovers, but the computed shard comes back empty. C19's node-local "
-    + "recovery source is not taking effect on the restart path. See this class's javadoc.")
+@org.apache.lucene.tests.util.LuceneTestCase.AwaitsFix(bugUrl = "C13: the cluster recovers and the shard opens from its existing store, but comes back "
+    + "empty. Recovery source is cleared as the cause. See this class's javadoc.")
 public class ComputedPlacementRestartIT extends OpenSearchIntegTestCase {
 
     private static final String INDEX = "computed-restart";

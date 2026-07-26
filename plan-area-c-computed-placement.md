@@ -639,9 +639,18 @@ gateway to recover. With the guard in place the cluster comes back and the resta
 completion. Correct in the letter, wrong in the conclusion, and running it settled in one attempt what
 the argument had settled wrongly.
 
-**What is left of C13 is the documents.** The cluster recovers, the shard recovers, and it is empty:
-twenty indexed, zero found. C19's correction, which upgrades EMPTY_STORE to EXISTING_STORE when the node
-finds it already holds data, is not taking effect on the restart path. Either
-`ShardPath.loadShardPath` does not see the data at the moment the shard is created after a restart, or
-the shard is created through a path that does not consult it. The probe is one log line inside
-`hasExistingShardData`.
+**What is left of C13 is the documents, and a probe cleared C19 of causing it.** The cluster recovers,
+the shard recovers from its existing store, and it is empty: twenty indexed, zero found. The node-local
+check runs twice and is right both times, `hasData=false` at creation so the shard stays EMPTY_STORE and
+`hasData=true` after the restart so it becomes EXISTING_STORE. The node finds its data and asks for the
+right recovery, which is exactly what C19 was built to do.
+
+So the store is opened and comes back empty, and that points at history and translog rather than at
+placement. The suspects are the three things computed placement changes about a shard's identity: the
+primary term is synthesised at creation, the in-sync set is derived from the placement, and the shard
+starts itself locally without the cluster manager. Any of those can lead recovery to bootstrap a new
+history rather than replay the existing translog, and a new history on an existing store is a blank
+index that looks perfectly healthy.
+
+Next probe: `StoreRecovery.internalRecoverFromStore`, for whether the translog is replayed or a new
+history is bootstrapped, and what the global checkpoint and translog UUID are on the way in.
