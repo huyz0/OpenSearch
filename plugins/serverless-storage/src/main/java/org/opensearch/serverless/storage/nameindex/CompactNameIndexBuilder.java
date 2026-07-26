@@ -11,9 +11,11 @@ package org.opensearch.serverless.storage.nameindex;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.function.Supplier;
 
 /**
  * Accumulates entries and packs them into a {@link CompactNameIndex}.
@@ -107,6 +109,147 @@ public final class CompactNameIndexBuilder {
             )
         );
         return this;
+    }
+
+    /**
+     * Packs an already-sorted stream directly, without buffering entries.
+     *
+     * <p>A18 measured the buffered path at 13.8x the steady-state size during a rebuild, which
+     * extrapolates to about 108 GiB at 100M names. The cause is this class's own intermediate list: one
+     * {@code Entry} object per name, each with its own arrays, which is exactly the per-entry overhead
+     * the packed form exists to avoid. Double-buffering the bases was never the expensive part.
+     *
+     * <p>Rebuild does not need the buffer at all. Its two inputs -- the existing base and the overlay --
+     * are both already in UTF-8 byte order, so a merge of them is sorted by construction. This takes two
+     * passes over that merge: one to count entries and name bytes so the arrays are allocated exactly
+     * once, and one to write. Walking a merge twice is free next to materializing it.
+     *
+     * <p>The supplier must return a fresh iterator each call, and both iterators must yield the same
+     * sequence.
+     */
+    public static CompactNameIndex buildFromSorted(Supplier<Iterator<IndexNameEntry>> sortedEntries) {
+        int count = 0;
+        long totalNameBytes = 0;
+        for (Iterator<IndexNameEntry> it = sortedEntries.get(); it.hasNext();) {
+            IndexNameEntry entry = it.next();
+            int nameLength = entry.getName().getBytes(StandardCharsets.UTF_8).length;
+            if (nameLength > CompactNameIndex.CHUNK_SIZE) {
+                throw new IllegalStateException("name of " + nameLength + " bytes exceeds the chunk size");
+            }
+            count++;
+            totalNameBytes += nameLength;
+        }
+        if (count == 0) {
+            return CompactNameIndex.empty();
+        }
+
+        int[] offsets = new int[count + 1];
+        byte[] uuids = new byte[count * CompactNameIndex.UUID_LENGTH];
+        byte[] statuses = new byte[count];
+        List<byte[]> chunks = new ArrayList<>();
+        List<Integer> chunkFirstOrdinals = new ArrayList<>();
+        List<Integer> chunkLengths = new ArrayList<>();
+        byte[] chunk = new byte[(int) Math.min(CompactNameIndex.CHUNK_SIZE, Math.max(totalNameBytes, 1))];
+        chunkFirstOrdinals.add(0);
+        int position = 0;
+        long packed = 0;
+
+        // Aliases are a small minority, so holding just their names and targets costs little next to the
+        // buffer this method exists to avoid.
+        List<Integer> aliasOrdinalList = new ArrayList<>();
+        List<List<String>> aliasTargetNames = new ArrayList<>();
+
+        int ordinal = 0;
+        byte[] previousName = null;
+        for (Iterator<IndexNameEntry> it = sortedEntries.get(); it.hasNext(); ordinal++) {
+            IndexNameEntry entry = it.next();
+            byte[] name = entry.getName().getBytes(StandardCharsets.UTF_8);
+            if (previousName != null) {
+                int cmp = NamePatterns.compareUtf8(previousName, name);
+                if (cmp == 0) {
+                    throw new IllegalStateException("duplicate name: " + entry.getName());
+                }
+                if (cmp > 0) {
+                    // The whole point of this path is that the input is already ordered. Silently
+                    // accepting an unsorted stream would produce a structure whose binary search is
+                    // wrong, which is far harder to diagnose than a failure here.
+                    throw new IllegalStateException("stream is not sorted at " + entry.getName());
+                }
+            }
+            previousName = name;
+
+            if (position + name.length > chunk.length) {
+                chunks.add(chunk);
+                chunkLengths.add(position);
+                chunkFirstOrdinals.add(ordinal);
+                packed += position;
+                chunk = new byte[(int) Math.min(CompactNameIndex.CHUNK_SIZE, Math.max(totalNameBytes - packed, name.length))];
+                position = 0;
+            }
+            offsets[ordinal] = position;
+            System.arraycopy(name, 0, chunk, position, name.length);
+            position += name.length;
+            System.arraycopy(entry.getUuid(), 0, uuids, ordinal * CompactNameIndex.UUID_LENGTH, CompactNameIndex.UUID_LENGTH);
+            statuses[ordinal] = entry.getStatus();
+            if (entry.isAlias()) {
+                aliasOrdinalList.add(ordinal);
+                aliasTargetNames.add(entry.getTargets());
+            }
+        }
+        chunks.add(chunk);
+        chunkLengths.add(position);
+        chunkFirstOrdinals.add(count);
+        offsets[count] = position;
+
+        byte[][] nameChunks = chunks.toArray(new byte[0][]);
+        int[] chunkFirstOrdinalArray = toIntArray(chunkFirstOrdinals);
+        int[] chunkLengthArray = toIntArray(chunkLengths);
+
+        CompactNameIndex withoutAliases = new CompactNameIndex(
+            nameChunks,
+            offsets,
+            chunkFirstOrdinalArray,
+            chunkLengthArray,
+            uuids,
+            statuses
+        );
+        if (aliasOrdinalList.isEmpty()) {
+            return withoutAliases;
+        }
+
+        int[] aliasOrdinals = toIntArray(aliasOrdinalList);
+        int[] aliasTargetOffsets = new int[aliasOrdinals.length + 1];
+        List<Integer> flatTargets = new ArrayList<>();
+        for (int i = 0; i < aliasOrdinals.length; i++) {
+            aliasTargetOffsets[i] = flatTargets.size();
+            for (String target : aliasTargetNames.get(i)) {
+                int targetOrdinal = withoutAliases.ordinalOf(target);
+                if (targetOrdinal >= 0) {
+                    flatTargets.add(targetOrdinal);
+                }
+            }
+        }
+        aliasTargetOffsets[aliasOrdinals.length] = flatTargets.size();
+
+        return new CompactNameIndex(
+            nameChunks,
+            offsets,
+            chunkFirstOrdinalArray,
+            chunkLengthArray,
+            uuids,
+            statuses,
+            aliasOrdinals,
+            aliasTargetOffsets,
+            toIntArray(flatTargets)
+        );
+    }
+
+    private static int[] toIntArray(List<Integer> values) {
+        int[] array = new int[values.size()];
+        for (int i = 0; i < array.length; i++) {
+            array[i] = values.get(i);
+        }
+        return array;
     }
 
     public CompactNameIndexBuilder add(IndexNameEntry entry) {

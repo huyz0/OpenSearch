@@ -259,18 +259,41 @@ Worth noting the pattern: three separate places have now needed "read the whole 
 reconstruct it from a projection", and two of them shipped wrong first. Any future structure derived
 from the base should be assumed lossy until proven otherwise.
 
-### A18: rebuild now costs twice what it did (open)
+### A18: rebuild measured, and the answer was not the one reasoned (done)
 
-The reversed twin doubles rebuild work and rebuild peak memory. A rebuild already held two bases at
-once; it now holds four, so the transient at 100M names is roughly **16.8 GiB** rather than the 8.4 GiB
-recorded against A8. That is a capacity planning input and it has not been measured, only reasoned.
+The reasoned figure was 16.8 GiB, four structures alive at once. Measurement at 300,000 names found
+something different and more useful.
+
+**The buffered rebuild allocated 13.8x the steady-state size**, which extrapolates to about 108 GiB at
+100M. The cause was not double-buffering the bases. It was `CompactNameIndexBuilder`'s own intermediate
+list: one `Entry` object per name, each with its own arrays, which is precisely the per-entry overhead
+the packed representation exists to avoid. The structure was careful and the thing that built it was not.
+
+Rebuild never needed that buffer. Its two inputs, the base and the overlay, are both already in UTF-8
+byte order, so their merge is sorted by construction. `buildFromSorted` now takes two passes over a lazy
+merge, one to count and one to write, and allocates only the arrays it produces. That took allocation
+from 13.8x to 7.2x.
+
+**A first pass at the measurement was itself wrong, and the correction is the more important finding.**
+Heap read immediately after a rebuild counts garbage the collector has not run on yet, so it measures
+allocation churn, not what the rebuild is holding. The figure that decides whether a rebuild can run out
+of memory is the retained delta after a collection, and that is **near zero**: the new structures
+replace the old ones. Capacity was never the problem.
+
+What remains real is GC pressure and wall time. 983 ms for 300,000 names extrapolates to minutes at
+100M, which is a strong argument for A19's double-buffering (so writers do not block for that long) and
+against any design that rebuilds often.
+
+**Consequence for A12:** checkpointing the packed arrays to object storage is viable after all, since
+the rebuild does not need headroom proportional to the index. The persistence choice can be made on
+start-up time rather than on memory.
 
 ### Remaining work
 
 | task | state |
 |---|---|
 | A1 to A11d, A15 to A17: the data structure | done |
-| A18, measure rebuild peak memory with the twin | open |
+| A18, measure rebuild cost, and stream the rebuild | done |
 | A12, persistence and bootstrap | open |
 | A13, transport action and service wrapper | open |
 | A14, coordinator integration | open |

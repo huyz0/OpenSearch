@@ -340,29 +340,73 @@ public final class NameIndex {
     public void rebuild() {
         synchronized (writeLock) {
             State current = state;
-            CompactNameIndexBuilder builder = new CompactNameIndexBuilder(current.base.size() + current.overlay.size());
 
-            for (int ordinal = 0; ordinal < current.base.size(); ordinal++) {
-                String name = current.base.nameAt(ordinal);
-                // Skip anything the overlay supersedes, in either direction. A put is added below from
-                // the overlay itself; adding it here too would trip the builder's duplicate check.
-                if (current.overlay.covers(name)) {
-                    continue;
-                }
-                // entryAt rather than the three-argument add: an alias's targets live in the side
-                // arrays, and rebuilding through (name, uuid, status) would drop every one of them.
-                builder.add(current.base.entryAt(ordinal));
-            }
-            for (IndexNameEntry entry : current.overlay.puts().values()) {
-                builder.add(entry);
-            }
+            // Streamed rather than buffered. A18 measured the buffered path at 13.8x the steady-state
+            // size during a rebuild, about 108 GiB at 100M names, because the builder held one object
+            // per name -- the very overhead the packed form exists to avoid. Both inputs here are
+            // already in the same byte order, so their merge is sorted by construction and needs no
+            // intermediate at all.
+            CompactNameIndex rebuilt = CompactNameIndexBuilder.buildFromSorted(() -> mergedEntries(current));
 
-            // Both structures are rebuilt from the same builder output. Producing one and forgetting the
-            // other is the A11c trap: the index would answer prefix queries correctly and suffix queries
-            // with stale data, which is worse than failing.
-            CompactNameIndex rebuilt = builder.build();
+            // Both structures are rebuilt from the same output. Producing one and forgetting the other
+            // is the A11c trap: the index would answer prefix queries correctly and suffix queries with
+            // stale data, which is worse than failing.
             state = new State(rebuilt, reversedOf(rebuilt), new NameIndexOverlay());
         }
+    }
+
+    /**
+     * The base and the overlay's puts merged into one ascending stream, with base entries the overlay
+     * supersedes or tombstones skipped.
+     *
+     * <p>Lazy, so nothing beyond the two cursors is alive at once. That is the whole point: this is what
+     * lets a rebuild allocate only the arrays it is producing.
+     */
+    private static java.util.Iterator<IndexNameEntry> mergedEntries(State current) {
+        java.util.Iterator<IndexNameEntry> overlayEntries = current.overlay.puts().values().iterator();
+
+        return new java.util.Iterator<>() {
+            private int ordinal = 0;
+            private IndexNameEntry pendingOverlay = overlayEntries.hasNext() ? overlayEntries.next() : null;
+            private IndexNameEntry pendingBase = nextBase();
+
+            private IndexNameEntry nextBase() {
+                while (ordinal < current.base.size()) {
+                    int at = ordinal++;
+                    String name = current.base.nameAt(at);
+                    if (current.overlay.covers(name)) {
+                        // Deleted, or superseded by an overlay put that this merge emits instead.
+                        continue;
+                    }
+                    // entryAt rather than a (name, uuid, status) triple: an alias's targets live in the
+                    // side arrays and reconstructing the entry without them drops every one.
+                    return current.base.entryAt(at);
+                }
+                return null;
+            }
+
+            @Override
+            public boolean hasNext() {
+                return pendingBase != null || pendingOverlay != null;
+            }
+
+            @Override
+            public IndexNameEntry next() {
+                if (pendingBase == null && pendingOverlay == null) {
+                    throw new java.util.NoSuchElementException();
+                }
+                boolean takeBase = pendingOverlay == null
+                    || (pendingBase != null && NamePatterns.compareUtf8(pendingBase.getName(), pendingOverlay.getName()) < 0);
+                if (takeBase) {
+                    IndexNameEntry result = pendingBase;
+                    pendingBase = nextBase();
+                    return result;
+                }
+                IndexNameEntry result = pendingOverlay;
+                pendingOverlay = overlayEntries.hasNext() ? overlayEntries.next() : null;
+                return result;
+            }
+        };
     }
 
     /** Rebuilds only if the policy says it is worth it. Returns whether it did. */
