@@ -113,6 +113,24 @@ public class MetadataInPlaceSplitShardService {
             );
         }
 
+        // An index whose placement is computed publishes no routing entry, and in-place resharding is
+        // built on manipulating one: it adds child primaries, retires parent entries and drives the
+        // commit off what the routing table reports. With nothing published, split reaches
+        // shardRoutingTable and throws IndexNotFoundException, merge dereferences a null index routing
+        // table, and both commit services read the absence as "still in progress" and stay pending
+        // forever. Rejecting up front turns three bad failure modes into one clear sentence.
+        //
+        // Making resharding work under computed placement is a redesign rather than a fix, because the
+        // children would have to be placed by the same function and the operation would have to reach
+        // agreement without publishing anything. That is not attempted here.
+        if (org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers.shouldPublishRouting(curIndexMetadata) == false) {
+            throw new IllegalArgumentException(
+                "In-place shard split is not supported on index ["
+                    + request.getIndex()
+                    + "] because its shard placement is computed rather than published"
+            );
+        }
+
         // An index with index.routing_partition_size > 1 spreads each routing value across a
         // partitionOffset-shifted band of the hash space (see OperationRouting#generateShardId). The
         // in-place split read-path filter (InPlaceSplitPartitionFilter, used by the plugin's

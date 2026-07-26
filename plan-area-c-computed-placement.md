@@ -518,3 +518,50 @@ rather than guaranteed, and the assertion in the test is what would catch it cha
 **What C13 does not cover.** One node holding the shard restarts and finds its own data. A node that
 comes back with an empty disk, or a shard whose computed placement moves to a different node while the
 old one still holds the data, are both different questions and neither is answered here.
+
+## Correction: C13 was not done, and a green suite was measuring nothing again
+
+An edit meant to move the test registrations to class scope did half its job. It removed the per-test
+`registerComputedPlacement()` calls and never added the `@Before` that was supposed to replace them,
+while `@After` kept clearing the registrations after every test. Three tests then created an ordinary
+index that merely happened to be named `computed-lifecycle`, and passed.
+
+**What that invalidates.** C13's result entirely: the restart test was restarting an allocated index. It
+also explains the anomaly recorded above as an open question, the recovery source moving from
+`EMPTY_STORE` to `EXISTING_STORE` across a restart with no mechanism to account for it. An ordinary index
+does exactly that. There was nothing to explain.
+
+**What survives.** C17, C18's shard-creation test, which kept its registration call throughout, and the
+write test, which still passes with the registrations restored. The production seams were all verified by
+failures that could only happen with computed placement active, and those failures are unaffected.
+
+**C13's real result, now that the test tests something.** A computed index does **not** survive a restart.
+The documents are gone and the index comes back blank while looking healthy, which is the A5 trap firing
+exactly where the plan predicted it. The local view supplies `EmptyStoreRecoverySource` because that is
+what the placement function states, and on restart that is the wrong answer.
+
+The fix is a design question rather than a patch. The recovery source cannot come from the placement
+function: placement is computed identically on every node, and only the node holding the data knows
+whether it has any. Either the node overrides the source at shard creation by consulting its own disk, or
+the hook is given enough context to decide per node. That is the next task and it is C19.
+
+**The durable fix for the harness.** `createComputedIndex` now asserts that the index it just created has
+no published routing entry. The premise of the suite can no longer be silently lost, which matters more
+than the specific bug: this is the second time in this area that a green suite was exercising nothing,
+after the C1 to C11 run that C12 exposed.
+
+## C14 done: resharding a computed index is rejected with a reason
+
+Split and merge now reject an index whose routing is not published, and the message says why. Before
+this, split threw `IndexNotFoundException` from a routing lookup, merge dereferenced a null index routing
+table, and both commit services read the absence as "still in progress" and stayed pending forever.
+"No such index" is a poor description of an index that plainly exists.
+
+Making resharding work under computed placement is a redesign rather than a fix: the children would have
+to be placed by the same function, and the operation would have to reach agreement without publishing
+anything. Not attempted, and recorded as a decision rather than an omission.
+
+Three unit tests, mutation-verified: both rejections fail without the guard, and the control confirms an
+index nobody claims is still rejected on its own merits rather than by the new branch. Unit rather than
+integration on purpose, since the guard is pure logic over a cluster state and the integration version
+spent its time on cluster teardown.
