@@ -271,3 +271,43 @@ loss rather than as misconfiguration. It was caught by a test written for C8, no
 
 C12 and C13 are the ones that gate turning the setting on anywhere real. C14 gates using resharding with
 it. C15 and C16 are optimisation rather than correctness.
+
+## C12 ran, and found the mechanism is still unreachable
+
+Two findings, one from writing the test and one from running it.
+
+**Writing it found that the supplier was never invoked.** `MetadataCreateIndexService` calls `addAsNew`
+for every index it creates, and a supplier only runs when an index has *no* published routing entry. So
+C3, C4 and C5 were installed and dead. Every unit test passed because each one constructed the absence
+it was testing. C6's earlier conclusion -- "nothing to bypass" -- was wrong: the real content of C6 is
+preventing publication, and without it nothing else in the area executes. Fixed with a second
+registration, `registerUnpublished`, kept separate from the supplier so that an index skipping
+publication with no supplier installed is a configuration error rather than a silent outage.
+
+**Running it found index creation hangs.** With routing unpublished, the create API waits for active
+shards and counts them from the routing table. No entry means no active shards, the wait never
+satisfies, and the suite times out at twenty minutes.
+
+**So skipping publication is necessary and not sufficient.** Everything that counts active shards needs
+the same supplier fallback that resolution now has, or creation has to stop waiting for an index whose
+placement is computed. That is a second seam rather than a tweak to this one.
+
+The test is marked `@AwaitsFix` rather than deleted: a hanging test in CI is worse than none, and the
+finding is worth more than the assertion.
+
+**What this says about the area.** C11 measured the algorithm and C12 shows the algorithm is not yet
+reachable in a live cluster. The measurement stands; the claim that computed placement *works* does not
+yet, and no amount of unit testing was going to reveal that, because unit tests construct the state they
+assert against.
+
+## Next cycle, revised
+
+| task | why |
+|---|---|
+| **C17** active-shard counting consults the supplier | the blocker C12 found; nothing works until this does |
+| **C13** node restart with a computed index | still unobserved, and A5 showed the price of reasoning about recovery |
+| **C14** resharding against a computed index | unchanged |
+| **C15** wire ARS to rank the K candidates | unchanged |
+| **C16** hot-tenant override | needs a product answer |
+
+C17 replaces C12 at the head of the queue. C12 itself becomes the test that passes when C17 lands.

@@ -35,6 +35,11 @@ import org.junit.After;
 public class AbsentIndexRoutingSuppliersTests extends OpenSearchTestCase {
 
     @After
+    public void clearUnpublished() {
+        AbsentIndexRoutingSuppliers.registerUnpublished(null);
+    }
+
+    @After
     public void clearSupplier() {
         // A static registry leaks into unrelated tests if it is not cleared, and the failure that
         // produces is another suite's test failing for reasons nothing in it explains.
@@ -94,6 +99,40 @@ public class AbsentIndexRoutingSuppliersTests extends OpenSearchTestCase {
         AbsentIndexRoutingSuppliers.register((state, index) -> second);
 
         assertSame(second, AbsentIndexRoutingSuppliers.supply(state(), metadata));
+    }
+
+    /**
+     * The gap the first pass through this area missed entirely. A supplier only runs when an index has no
+     * published routing entry, and index creation publishes one for every index it creates -- so without
+     * a way to opt an index out of publication, the supplier is installed and never invoked. The
+     * mechanism looked wired and was dead, and only asking what an integration test would exercise
+     * surfaced it.
+     */
+    public void testRoutingIsPublishedByDefault() {
+        assertTrue(AbsentIndexRoutingSuppliers.shouldPublishRouting(index("idx")));
+    }
+
+    public void testAnIndexCanBeOptedOutOfPublication() {
+        AbsentIndexRoutingSuppliers.registerUnpublished(metadata -> metadata.getIndex().getName().startsWith("computed-"));
+
+        assertFalse(AbsentIndexRoutingSuppliers.shouldPublishRouting(index("computed-idx")));
+        assertTrue("an unclaimed index must still publish", AbsentIndexRoutingSuppliers.shouldPublishRouting(index("classic-idx")));
+    }
+
+    /**
+     * Publishing routing that is then ignored is recoverable; not publishing routing that is then needed
+     * is an index with nowhere to live. A broken predicate therefore fails towards publishing.
+     */
+    public void testAThrowingPredicateFailsTowardsPublishing() {
+        AbsentIndexRoutingSuppliers.registerUnpublished(metadata -> { throw new IllegalStateException("plugin bug"); });
+
+        assertTrue(AbsentIndexRoutingSuppliers.shouldPublishRouting(index("idx")));
+    }
+
+    public void testNullMetadataPublishes() {
+        AbsentIndexRoutingSuppliers.registerUnpublished(metadata -> true);
+
+        assertTrue(AbsentIndexRoutingSuppliers.shouldPublishRouting(null));
     }
 
     private static ClusterState state() {

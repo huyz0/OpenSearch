@@ -42,11 +42,16 @@ public final class ComputedPlacementGate {
             return;
         }
         AbsentIndexRoutingSuppliers.register(ComputedPlacementGate::supply);
+        // Without this the supplier is installed and never invoked. Index creation publishes a routing
+        // entry for every index, and a supplier only runs when there is none, so the mechanism looks
+        // wired and is dead. Registering both together is what makes it reachable.
+        AbsentIndexRoutingSuppliers.registerUnpublished(ComputedPlacementGate::ownsIndex);
     }
 
     /** Removes the supplier, restoring Phase A's behaviour. Used on node shutdown and by tests. */
     public static void uninstall() {
         AbsentIndexRoutingSuppliers.register(null);
+        AbsentIndexRoutingSuppliers.registerUnpublished(null);
     }
 
     /**

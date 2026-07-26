@@ -13,6 +13,7 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiFunction;
+import java.util.function.Predicate;
 
 /**
  * Node-level hook for supplying a routing entry for an index that has none published.
@@ -46,7 +47,49 @@ public final class AbsentIndexRoutingSuppliers {
 
     private static final AtomicReference<BiFunction<ClusterState, IndexMetadata, IndexRoutingTable>> SUPPLIER = new AtomicReference<>();
 
+    /**
+     * Indices whose routing must <em>not</em> be published, because it will be supplied instead.
+     *
+     * <p>Separate from the supplier, and the separation is the whole point. A supplier only ever runs
+     * when an index has no published routing entry, and index creation publishes one for every index it
+     * creates. Without this predicate the supplier is installed and never invoked -- the mechanism looks
+     * wired and is dead. That was missed on the first pass through this area and found only by asking
+     * what an integration test would actually exercise.
+     */
+    private static final AtomicReference<Predicate<IndexMetadata>> UNPUBLISHED = new AtomicReference<>();
+
     private AbsentIndexRoutingSuppliers() {}
+
+    /**
+     * Declares which indices skip routing publication. Registering null clears it.
+     *
+     * <p>Deliberately not derived from the supplier. A supplier that declines still leaves the index
+     * with published routing, which is correct; an index that skips publication and has no supplier
+     * would have no routing at all, which is not. Keeping them separate makes the second case a
+     * configuration error rather than a silent outage.
+     */
+    public static void registerUnpublished(Predicate<IndexMetadata> unpublished) {
+        UNPUBLISHED.set(unpublished);
+    }
+
+    /**
+     * Whether an index should have its routing entry published at creation.
+     *
+     * <p>Defaults to true, so an unconfigured cluster behaves exactly as it always has. A predicate that
+     * throws is treated as "publish", because publishing routing that is then ignored is recoverable and
+     * not publishing routing that is then needed is not.
+     */
+    public static boolean shouldPublishRouting(IndexMetadata indexMetadata) {
+        Predicate<IndexMetadata> unpublished = UNPUBLISHED.get();
+        if (unpublished == null || indexMetadata == null) {
+            return true;
+        }
+        try {
+            return unpublished.test(indexMetadata) == false;
+        } catch (Exception e) {
+            return true;
+        }
+    }
 
     /**
      * Installs the supplier. Last registration wins, and a null clears it, which is what lets a test

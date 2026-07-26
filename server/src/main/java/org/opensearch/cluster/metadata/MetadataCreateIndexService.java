@@ -1654,8 +1654,14 @@ public class MetadataCreateIndexService {
 
         ClusterState updatedState = ClusterState.builder(currentState).blocks(blocks).metadata(newMetadata).build();
 
-        RoutingTable.Builder routingTableBuilder = RoutingTable.builder(updatedState.routingTable())
-            .addAsNew(updatedState.metadata().index(indexName));
+        // An index whose placement is computed publishes no routing entry: every node derives the same
+        // answer from the node list, so publishing it would be state that says nothing new and has to be
+        // diffed on every cluster state change. Skipping publication is what makes the supplier
+        // reachable at all -- with an entry published, it would never be consulted.
+        RoutingTable.Builder routingTableBuilder = RoutingTable.builder(updatedState.routingTable());
+        if (org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers.shouldPublishRouting(updatedState.metadata().index(indexName))) {
+            routingTableBuilder.addAsNew(updatedState.metadata().index(indexName));
+        }
         updatedState = ClusterState.builder(updatedState).routingTable(routingTableBuilder.build()).build();
         return rerouteRoutingTable.apply(updatedState, "index [" + indexName + "] created");
     }
