@@ -153,3 +153,38 @@ Measure manifest rebuild time at scale before choosing.
 - **Alias fan-out is unmeasured.**
 - **Consistency model must be stated explicitly**, not discovered. If a create is not instantly visible
   to a concurrent wildcard, say so.
+
+## A11 decided: build the reversed-name index
+
+Measured by `LeadingWildcardSpikeTests` over 200,000 names, comparing a full scan with glob matching
+against a seek into a second structure holding reversed names:
+
+| query | full scan | reversed seek | speedup |
+|---|---|---|---|
+| `*-logs`, 10,000 matches | 36,400 us | 1,142 us | 31.9x |
+| `*-nothing-matches-this`, 0 matches | 34,952 us | 301 us | 116x |
+
+Memory for both structures together is 2.00x one of them, as expected.
+
+**Decision: option (a), the reversed index.** Option (c), accepting the scan with a timeout, does not
+survive extrapolation. 100M names is 500 times this population and the scan is linear in it, so a single
+leading wildcard costs about **18 seconds**. That is not a slow query, it is an outage for whoever runs
+it, and a timeout converts it into a feature that never works rather than one that works slowly.
+
+Option (b), rejecting leading wildcards, is defensible but unnecessary once the cost is known: 4.2 GiB
+becomes 8.4 GiB, which is still one node.
+
+The miss case is the clearest argument. A leading wildcard matching nothing costs a full pass on the
+forward structure and 301 us on the reversed one, because the reversed seek's cost tracks matches while
+the scan's tracks population. That gap widens with every index added.
+
+**Follow-on tasks this creates:**
+
+- **A11a.** Second `CompactNameIndex` over reversed names, built alongside the forward one.
+- **A11b.** Route a pattern by shape: literal prefix to the forward structure, literal suffix to the
+  reversed one, and both wildcarded (`*-mid-*`) to whichever side has a longer literal run.
+- **A11c.** Keep the two in step. The overlay and rebuild currently know about one structure; both have
+  to be updated together or a create is visible to prefix queries and invisible to suffix ones.
+- **A11d.** Decide what a pattern with no literal run at all (`*`, `?x?`) does. It has no seekable
+  anchor in either direction and is a genuine full scan; `*` alone is common enough to special-case as
+  "everything" rather than as a pattern.
