@@ -340,7 +340,13 @@ public class OperationRouting {
             final IndexMetadata indexMetadata = indexMetadata(clusterState, index);
             IndexRoutingTable indexRouting = clusterState.routingTable().index(index);
             if (indexRouting == null) {
-                indexRouting = noShardsAvailable(indexMetadata);
+                // An installed supplier can compute the entry rather than reporting its absence, which
+                // is how a serverless index avoids publishing routing at all. Falls back to Phase A's
+                // pessimistic answer when nothing is installed or the supplier declines.
+                indexRouting = AbsentIndexRoutingSuppliers.supply(clusterState, indexMetadata);
+                if (indexRouting == null) {
+                    indexRouting = noShardsAvailable(indexMetadata);
+                }
             }
             final Set<String> effectiveRouting = routing.get(index);
             if (effectiveRouting != null) {
