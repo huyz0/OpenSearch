@@ -236,9 +236,9 @@ cannot have at any speed.
 | A15, chunked name blob | done |
 | A11a to A11d, reversed index implementation | done |
 | A16, sorted overlay | done |
-| A12, persistence and bootstrap | open |
-| A13, transport action and service wrapper | open |
-| A14, coordinator integration | open |
+| A12, checkpoint persistence | done |
+| A13, wire format for entries | done (transport action itself still open) |
+| A14, IndicesOptions resolver | done (wiring into core still open) |
 | A19, rebuild without blocking writers | done |
 
 ## Second review pass, after the reversed index landed
@@ -294,9 +294,9 @@ start-up time rather than on memory.
 |---|---|
 | A1 to A11d, A15 to A17: the data structure | done |
 | A18, measure rebuild cost, and stream the rebuild | done |
-| A12, persistence and bootstrap | open |
-| A13, transport action and service wrapper | open |
-| A14, coordinator integration | open |
+| A12, checkpoint persistence | done |
+| A13, wire format for entries | done (transport action itself still open) |
+| A14, IndicesOptions resolver | done (wiring into core still open) |
 | A19, rebuild without blocking writers | done |
 
 ## Phase 5 detailed plan

@@ -183,14 +183,23 @@ public final class NameIndex {
         // policy lets it reach a fraction of the base, so at 100M that was millions of entries per
         // wildcard. Already in byte order, so no per-query sort either.
         List<IndexNameEntry> overlayMatches = new ArrayList<>();
+        Set<String> supersededByOverlay = new HashSet<>();
         for (IndexNameEntry entry : current.overlay.putsFrom(prefix).values()) {
             if (entry.getName().startsWith(prefix) == false) {
                 break;
             }
             if (NamePatterns.matches(pattern, entry.getName())) {
                 overlayMatches.add(entry);
+                supersededByOverlay.add(entry.getName());
             }
         }
+        // Snapshot the tombstones alongside the puts, and use both for the base scan below rather than
+        // asking the live overlay. A19 made rebuild retire overlay entries after swapping the new base
+        // in, so an entry collected a moment ago can vanish from the overlay while this scan is running.
+        // Consulting the live overlay then reports the base copy as not superseded and emits the name
+        // twice -- once from each stream. Reading a consistent snapshot is what makes a query see one
+        // generation rather than a blend of two.
+        supersededByOverlay.addAll(current.overlay.tombstones());
 
         // Merge the base scan with the sorted overlay matches, emitting in byte order. Base entries that
         // the overlay has tombstoned or replaced are skipped, so a name never appears twice.
@@ -204,8 +213,8 @@ public final class NameIndex {
             if (NamePatterns.matches(pattern, name) == false) {
                 continue;
             }
-            if (current.overlay.covers(name)) {
-                // Either deleted, or superseded by a put that the overlay stream will emit.
+            if (supersededByOverlay.contains(name)) {
+                // Either deleted, or superseded by a put the overlay stream emits instead.
                 continue;
             }
             while (overlayPosition < overlayMatches.size()
@@ -231,10 +240,18 @@ public final class NameIndex {
         String reversedSuffix = NamePatterns.reverse(suffix);
         List<IndexNameEntry> matches = new ArrayList<>();
 
+        Set<String> supersededByOverlay = new HashSet<>(current.overlay.tombstones());
+        for (IndexNameEntry entry : current.overlay.reversedPutsFrom(reversedSuffix).values()) {
+            if (NamePatterns.reverse(entry.getName()).startsWith(reversedSuffix)) {
+                supersededByOverlay.add(entry.getName());
+            }
+        }
+
         current.reversedBase.forEachWithPrefix(reversedSuffix, ordinal -> {
             String name = NamePatterns.reverse(current.reversedBase.nameAt(ordinal));
-            if (current.overlay.covers(name)) {
-                // Deleted, or superseded by a put the overlay stream below will emit.
+            if (supersededByOverlay.contains(name)) {
+                // Deleted, or superseded by a put the overlay stream below emits. Snapshotted for the
+                // same reason as the prefix path: rebuild retires overlay entries concurrently.
                 return;
             }
             if (NamePatterns.matches(pattern, name)) {

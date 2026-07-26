@@ -8,6 +8,11 @@
 
 package org.opensearch.serverless.storage.nameindex;
 
+import org.opensearch.core.common.io.stream.StreamInput;
+import org.opensearch.core.common.io.stream.StreamOutput;
+import org.opensearch.core.common.io.stream.Writeable;
+
+import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -25,7 +30,7 @@ import java.util.Objects;
  * characters of its canonical text form. At 100M entries that difference is most of the reason the
  * compact representation costs 45 B/name against a {@code HashMap}'s 145.5 B.
  */
-public final class IndexNameEntry {
+public final class IndexNameEntry implements Writeable {
 
     /** An ordinary index. */
     public static final byte STATUS_OPEN = 0;
@@ -72,6 +77,20 @@ public final class IndexNameEntry {
         this.uuid = uuid.clone();
         this.status = status;
         this.targets = List.copyOf(Objects.requireNonNull(targets, "targets"));
+    }
+
+    public IndexNameEntry(StreamInput in) throws IOException {
+        this(in.readString(), in.readByteArray(), in.readByte(), in.readStringList());
+    }
+
+    @Override
+    public void writeTo(StreamOutput out) throws IOException {
+        out.writeString(name);
+        out.writeByteArray(uuid);
+        out.writeByte(status);
+        // Targets are written for every entry, not only aliases. An empty list costs one vInt, and a
+        // format that varies by status is a format two readers can disagree about.
+        out.writeStringCollection(targets);
     }
 
     public String getName() {
