@@ -859,3 +859,47 @@ the choosing needs a signal: OpenSearch's existing adaptive replica selection ra
 queue depth, and a cold node reads as a slow node, so it should drift traffic toward warm replicas on
 its own. That inference is untested here. Writers are unaffected either way, since a writer must be
 single-owner and `ShardHead` CAS already fences that in the object store rather than in cluster state.
+
+## S13: the global name index, the one part that cannot be partitioned
+
+Everything else in the partitioned design scales by hashing on the index: descriptors are fetched on
+demand and cached by whoever the hash names, and placement is computed rather than stored (S12).
+Wildcard and alias resolution cannot work that way. Answering `logs-*` requires knowing every index
+name, which is global by construction. Either one tier holds all 100M names, or every wildcard scatters
+to every partition.
+
+`NameIndexSpike` measures whether holding them is affordable, 2M names sampled:
+
+| representation | per name | at 100M |
+|---|---|---|
+| `HashMap<String, byte[]>`, the shape core uses | 145.5 B | 13.6 GiB |
+| compact: sorted name blob + offsets, raw 16-byte UUIDs, state byte | **45.0 B** | **4.2 GiB** |
+
+**4.2 GiB holds the entire name space for 100M indices**, which fits in a single node's heap with room
+to spare. The gap between the two rows is almost entirely per-entry object overhead -- a `String` header,
+its hash field, its backing array, and a map node, none of which survive when names live in one sorted
+byte array addressed by offsets.
+
+Prefix resolution against that structure is a binary search followed by a forward scan:
+
+| query | matches | time |
+|---|---|---|
+| `tenant-0000*` | 65,536 | 3.2 ms |
+| `zzzz-no-such-prefix*` | 0 | 9.2 us |
+
+**Cost is proportional to matches, not to the size of the index.** A miss costs microseconds against a
+2M-name structure, and a wildcard returning 65k indices costs milliseconds. That is the property that
+makes a single global tier viable rather than a bottleneck.
+
+**What this settles.** The highest-risk item in the partitioned design was that wildcards resist
+partitioning and might force either a scatter to every partition or a restriction on the query language.
+Neither is necessary. A dedicated name-index tier is small enough to replicate rather than shard, which
+also removes it as a scaling concern: replicate for availability, not for capacity.
+
+**What this does not settle.** Only prefix wildcards were measured, because they are what a sorted
+structure answers directly. Leading wildcards (`*-logs`) degenerate to a full scan of 100M names and
+need either a second structure indexed on reversed names or an explicit restriction. Aliases are not
+modelled here at all -- an alias is a name pointing at a set of indices, so the same structure serves it,
+but the fan-out on resolution was not measured. Updates are also unmeasured: the compact form is built
+sorted and is not designed for insertion, so index creation needs either periodic rebuild plus a small
+overlay of recent changes, or a different structure entirely.
