@@ -903,3 +903,35 @@ modelled here at all -- an alias is a name pointing at a set of indices, so the 
 but the fan-out on resolution was not measured. Updates are also unmeasured: the compact form is built
 sorted and is not designed for insertion, so index creation needs either periodic rebuild plus a small
 overlay of recent changes, or a different structure entirely.
+
+## S14 (C11): computed placement measured against the allocator it replaces
+
+S12 measured the placement *algorithm* in isolation and found it optimal. This measures the thing that
+actually replaces the allocator: building routing entries for a growing index population.
+
+`ComputedPlacementCostTests`, 50 nodes, 10 shards per index, K=3:
+
+| indices | shards | total | per shard |
+|---|---|---|---|
+| 1,000 | 10,000 | 42 ms | 4,241 ns |
+| 4,000 | 40,000 | 171 ms | 4,296 ns |
+| 16,000 | 160,000 | 558 ms | 3,491 ns |
+
+**Per-shard cost is flat.** The ratio across a 16x population increase is 0.82, and the slight fall is
+JIT warmup rather than a real improvement. S6's allocator over a comparable range went from 25 ms at
+2,000 shards to 445 ms at 40,000 -- a 4.5x rise in per-shard cost -- which is the superlinear curve that
+puts 10B shards out of reach.
+
+**Against S6 at the same shard count**: 40,000 shards cost the allocator 4,560 ms of cold allocation and
+cost this 171 ms. That is 27x, but the multiple is the least interesting part of the result.
+
+**A single index costs the same regardless of cluster size**: 35,277 ns alone, 32,723 ns after 16,000
+other indices exist. The allocator cannot say this, because its pass is over the whole cluster, and it is
+this property rather than the constant factor that removes the ceiling.
+
+**What this does not claim.** It is evidence about the algorithm, not about a running cluster; no cluster
+was started. And 27x understates the real difference in a way worth being precise about: building N
+entries at once is the pessimistic case, and under this design it never happens. A serverless index
+publishes no routing entry, so there is nothing to allocate at startup and nothing to reallocate on a
+membership change. The honest statement is not that the global pass got faster but that it stopped
+existing, and the flat per-shard curve is what makes that credible rather than the ratio.
