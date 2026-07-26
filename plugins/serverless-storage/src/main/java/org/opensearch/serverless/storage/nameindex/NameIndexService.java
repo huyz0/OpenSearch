@@ -119,6 +119,10 @@ public class NameIndexService implements ClusterStateListener {
         }
 
         for (Map.Entry<String, List<String>> alias : aliasTargets.entrySet()) {
+            // Sorted, because the order targets are discovered follows metadata iteration and is not
+            // stable across runs. An alias that resolves to the same set in a different order every time
+            // is a difference a caller comparing two responses will see and cannot explain.
+            alias.getValue().sort(NamePatterns::compareUtf8);
             IndexNameEntry existing = nameIndex.lookup(alias.getKey());
             if (existing == null || existing.isAlias() == false || existing.getTargets().equals(alias.getValue()) == false) {
                 nameIndex.createAlias(alias.getKey(), uuidBytes(alias.getKey()), alias.getValue());

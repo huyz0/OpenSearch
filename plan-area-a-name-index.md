@@ -339,3 +339,13 @@ open from closed, which is why it is a status rather than an absence, but nothin
 **Acceptance for phase 5.** A cluster resolves wildcards and aliases through the name index tier with
 no reference to `Metadata.indicesLookup`, survives a restart of that tier, and matches core's existing
 `IndicesOptions` semantics under test.
+
+**Met.** `ServerlessStorageNameIndexIT` runs a real cluster with the tier enabled and asserts the
+property that matters, which is not "the resolver behaves sensibly" but "the resolver agrees with
+core": every expression is resolved through both the name index and `IndexNameExpressionResolver` on
+the same cluster state, with the same options, and the two must match. It covers creates, deletes,
+create-after-delete, aliases, closed indices across three option presets, and the transport action.
+
+Writing it found one thing every unit test had missed: alias target order followed metadata iteration
+and was not stable across runs. An alias resolving to the same set in a different order each time is a
+difference a caller comparing two responses can see and cannot explain, so the service now sorts them.
