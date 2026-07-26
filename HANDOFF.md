@@ -18,16 +18,26 @@ Evidence for every number claimed: `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.m
 | **C. Computed placement** | **blocked on C18**, `plan-area-c-computed-placement.md`. C0 to C12 and C17 done. A computed index is creatable and its shard opens; it will not take a write. |
 | B, D, E, F, G | not started |
 
-## The blocker: C20, the cluster does not recover after a restart
+## The blocker: C13, a restarted computed shard comes back empty
 
-**After a full restart with a computed index present, the cluster never comes back.** Every node reports
-`state not recovered / initialized` and no cluster manager is discovered. Gateway-level rather than
-shard-level; the likely suspect is state recovery expecting each index in metadata to have a routing
-entry.
+The cluster recovers now. What fails is the data: twenty documents indexed, zero found after a full
+restart. `ComputedPlacementRestartIT` is `@AwaitsFix` and carries the account.
 
-Start from `ComputedPlacementRestartIT`, which is `@AwaitsFix` and carries the account. It lives in its
-own class because the restart leaves the shared test cluster unusable, and beside other tests it turned
-one real failure into three misleading ones.
+**Ruled out by probe, so do not spend time here.** The recovery source is correct.
+`withNodeLocalRecoverySource` runs twice and is right both times: `hasData=false` at creation so the
+shard stays `EMPTY_STORE`, `hasData=true` after restart so it becomes `EXISTING_STORE`. C19 works.
+
+**Where to look.** The store opens and comes back empty, which points at history and translog rather
+than placement. The suspects are the three things computed placement changes about a shard's identity:
+the primary term synthesised at creation, the in-sync set derived from the placement, and the shard
+starting itself locally without the cluster manager. Any of those can make recovery bootstrap a new
+history instead of replaying the existing translog, and a new history on an existing store is a blank
+index that looks perfectly healthy.
+
+**Next step is a probe, not an argument.** `StoreRecovery.internalRecoverFromStore`: is the translog
+replayed or a new history bootstrapped, and what are the global checkpoint and translog UUID on the way
+in. Five confident arguments in this area have been wrong and five probes have each been decisive in a
+single run.
 
 ## What is done, and what each of them cost
 
@@ -41,7 +51,13 @@ one real failure into three misleading ones.
   node knows whether it holds data.
 - **C14** resharding rejects a computed index with a sentence saying why, instead of throwing
   `IndexNotFoundException`, dereferencing null, or hanging pending forever.
-- **C13** reopened. It is blocked on C20 and its earlier "done" was wrong, see below.
+- **C20** state recovery no longer republishes routing for a computed index. It had been silently
+  turning every computed index back into an ordinary one on recovery, which also turned out to be what
+  stopped the cluster coming back at all after a restart.
+- **C15** adaptive replica selection already ranks the computed candidates, verified rather than
+  assumed, because a computed entry is an ordinary `IndexShardRoutingTable` and the ranking does not
+  care where it came from.
+- **C13** still open, and it is the blocker above.
 
 ## Three times a green suite measured nothing, and what stops the fourth
 
