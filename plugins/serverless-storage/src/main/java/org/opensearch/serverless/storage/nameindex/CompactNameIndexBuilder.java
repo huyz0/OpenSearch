@@ -134,36 +134,77 @@ public final class CompactNameIndexBuilder {
 
         entries.sort(BY_UTF8_BYTES);
 
-        // One pass to size the blob, so a large build allocates once rather than growing repeatedly.
+        // One pass to check ordering and size the chunks, so a large build allocates deliberately rather
+        // than growing repeatedly.
         long totalNameBytes = 0;
         for (int i = 0; i < entries.size(); i++) {
-            totalNameBytes += entries.get(i).name.length;
+            int nameLength = entries.get(i).name.length;
+            if (nameLength > CompactNameIndex.CHUNK_SIZE) {
+                throw new IllegalStateException("name of " + nameLength + " bytes exceeds the chunk size");
+            }
+            totalNameBytes += nameLength;
             if (i > 0 && BY_UTF8_BYTES.compare(entries.get(i - 1), entries.get(i)) == 0) {
                 throw new IllegalStateException("duplicate name: " + new String(entries.get(i).name, StandardCharsets.UTF_8));
             }
         }
-        if (totalNameBytes > Integer.MAX_VALUE) {
-            throw new IllegalStateException("total name bytes " + totalNameBytes + " exceeds what a single blob can address");
-        }
 
         int count = entries.size();
-        byte[] nameBlob = new byte[(int) totalNameBytes];
         int[] offsets = new int[count + 1];
         byte[] uuids = new byte[count * CompactNameIndex.UUID_LENGTH];
         byte[] statuses = new byte[count];
 
+        // Names are packed into chunks and never split across a boundary, because a single Java array
+        // cannot exceed Integer.MAX_VALUE elements and 100M names at a realistic 30 to 40 bytes each is
+        // 3 to 4 GB of text. A contiguous blob works at benchmark name lengths and fails at real ones.
+        List<byte[]> chunks = new ArrayList<>();
+        List<Integer> chunkFirstOrdinals = new ArrayList<>();
+        List<Integer> chunkLengths = new ArrayList<>();
+        byte[] chunk = new byte[(int) Math.min(CompactNameIndex.CHUNK_SIZE, Math.max(totalNameBytes, 1))];
+        chunkFirstOrdinals.add(0);
         int position = 0;
+        long packed = 0;
+
         for (int i = 0; i < count; i++) {
             Entry entry = entries.get(i);
+            if (position + entry.name.length > chunk.length) {
+                // Close this chunk short rather than splitting a name across the boundary, which would
+                // make every comparison and every substring read span two arrays.
+                chunks.add(chunk);
+                chunkLengths.add(position);
+                chunkFirstOrdinals.add(i);
+                packed += position;
+                chunk = new byte[(int) Math.min(CompactNameIndex.CHUNK_SIZE, Math.max(totalNameBytes - packed, entry.name.length))];
+                position = 0;
+            }
             offsets[i] = position;
-            System.arraycopy(entry.name, 0, nameBlob, position, entry.name.length);
+            System.arraycopy(entry.name, 0, chunk, position, entry.name.length);
             position += entry.name.length;
             System.arraycopy(entry.uuid, 0, uuids, i * CompactNameIndex.UUID_LENGTH, CompactNameIndex.UUID_LENGTH);
             statuses[i] = entry.status;
         }
+        chunks.add(chunk);
+        chunkLengths.add(position);
+        chunkFirstOrdinals.add(count);
         offsets[count] = position;
 
-        CompactNameIndex withoutAliases = new CompactNameIndex(nameBlob, offsets, uuids, statuses);
+        byte[][] nameChunks = chunks.toArray(new byte[0][]);
+        int[] chunkFirstOrdinalArray = new int[chunkFirstOrdinals.size()];
+        for (int i = 0; i < chunkFirstOrdinalArray.length; i++) {
+            chunkFirstOrdinalArray[i] = chunkFirstOrdinals.get(i);
+        }
+        int[] chunkLengthArray = new int[chunkLengths.size()];
+        for (int i = 0; i < chunkLengthArray.length; i++) {
+            chunkLengthArray[i] = chunkLengths.get(i);
+        }
+
+        CompactNameIndex withoutAliases = new CompactNameIndex(
+            nameChunks,
+            offsets,
+            chunkFirstOrdinalArray,
+            chunkLengthArray,
+            uuids,
+            statuses
+        );
 
         // Alias targets resolve in a second pass, against the just-built structure rather than against a
         // transient name-to-ordinal map. At 100M entries such a map would cost more than the index it
@@ -206,6 +247,16 @@ public final class CompactNameIndexBuilder {
             aliasTargets[i] = flatTargets.get(i);
         }
 
-        return new CompactNameIndex(nameBlob, offsets, uuids, statuses, aliasOrdinals, aliasTargetOffsets, aliasTargets);
+        return new CompactNameIndex(
+            nameChunks,
+            offsets,
+            chunkFirstOrdinalArray,
+            chunkLengthArray,
+            uuids,
+            statuses,
+            aliasOrdinals,
+            aliasTargetOffsets,
+            aliasTargets
+        );
     }
 }

@@ -188,3 +188,52 @@ the scan's tracks population. That gap widens with every index added.
 - **A11d.** Decide what a pattern with no literal run at all (`*`, `?x?`) does. It has no seekable
   anchor in either direction and is a genuine full scan; `*` alone is common enough to special-case as
   "everything" rather than as a pattern.
+
+## Review pass after phases 1 to 4
+
+A deliberate re-read of the committed, green code found one blocking defect and one performance defect
+that the tests could not have caught, because both only appear at populations no unit test builds.
+
+### A15: the name blob could not hold 100M names (done)
+
+The blob was a single `byte[]` addressed by `int` offsets. A Java array cannot exceed
+`Integer.MAX_VALUE` elements, about 2.15 GB, and 100M names at a realistic 30 to 40 bytes each is 3 to
+4 GB of text. **The structure could not hold the population it was designed for.**
+
+What makes it worth recording rather than quietly fixing: S13's synthetic names were 21 bytes, so 100M
+of them total 2.10 GB and land 2% under the limit. The benchmark that justified the entire design would
+have passed at full scale while any real deployment failed. The builder's guard threw rather than
+corrupting, so it was a hard failure rather than silent truncation, but the target was unreachable.
+
+Fixed by chunking the blob, with names never split across a boundary. `CHUNK_SIZE` is deliberately not
+final so a test can shrink it and cross a boundary; building a real 1 GB chunk in a unit test is not
+viable, and chunking that is never exercised is chunking that does not work. Reverting the chunk-end
+calculation fails seven of the new tests and none of the 58 that existed before, which is the measure of
+how blind the original suite was to this.
+
+### A16: the overlay is scanned linearly on every pattern query (open)
+
+`NameIndex.forEachMatching` walks every overlay entry to find matches. That is fine while the overlay is
+small, and the rebuild policy is what keeps it small, but the policy allows it to reach
+`DEFAULT_REBUILD_RATIO` of the base before folding. At 100M that is **5M entries scanned per wildcard
+query**, on the order of hundreds of milliseconds, for a structure whose entire purpose is that cost
+tracks matches rather than population.
+
+The fix is to hold the overlay in a sorted structure, `ConcurrentSkipListMap` keyed by UTF-8 byte order,
+so a prefix query becomes a range scan. That also removes the sort currently done per query on the
+matched subset. Not done.
+
+## Remaining work in this area
+
+| task | state |
+|---|---|
+| A1 to A8, base, overlay, merge, rebuild | done |
+| A9, A10, aliases and fan-out | done |
+| A11, leading-wildcard decision | decided: build the reversed index |
+| A15, chunked name blob | done |
+| A11a to A11d, reversed index implementation | open |
+| A16, sorted overlay | open |
+| A12, persistence and bootstrap | open |
+| A13, transport action and service wrapper | open |
+| A14, coordinator integration | open |
+| Double-buffered rebuild so writers do not block | open |

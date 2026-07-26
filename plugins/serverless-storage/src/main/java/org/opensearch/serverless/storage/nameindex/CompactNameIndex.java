@@ -44,11 +44,30 @@ public final class CompactNameIndex {
     /** Raw UUID width. 16 bytes rather than the 36 characters of the canonical text form. */
     public static final int UUID_LENGTH = 16;
 
-    /** All names concatenated, in sorted order, with no separators. */
-    private final byte[] nameBlob;
+    /**
+     * Largest chunk of the name blob. Names are never split across a chunk boundary.
+     *
+     * <p>The blob is chunked rather than contiguous because a single Java array cannot hold more than
+     * {@link Integer#MAX_VALUE} elements, and 100M names at a realistic 30 to 40 bytes each is 3 to 4 GB
+     * of text. At S13's 21-byte synthetic names the total lands just under the limit, which is exactly
+     * the kind of margin that holds in a benchmark and fails in production.
+     *
+     * <p>Not final so a test can shrink it and actually cross a boundary. Building a real 1 GB chunk in
+     * a unit test is not viable, and chunking that is never exercised is chunking that does not work.
+     */
+    static int CHUNK_SIZE = 1 << 30;
 
-    /** Start offset of each name, with a trailing entry so {@code offsets[i+1]} is always the end. */
+    /** Names concatenated in sorted order, split across chunks, with no separators. */
+    private final byte[][] nameChunks;
+
+    /** Start offset of each name <em>within its own chunk</em>. */
     private final int[] offsets;
+
+    /** First entry ordinal held by each chunk, with a trailing entry equal to {@link #size()}. */
+    private final int[] chunkFirstOrdinal;
+
+    /** Bytes actually used in each chunk, which gives the end of that chunk's last name. */
+    private final int[] chunkLengths;
 
     /** {@link #UUID_LENGTH} bytes per entry, parallel to the name order. */
     private final byte[] uuids;
@@ -72,21 +91,25 @@ public final class CompactNameIndex {
     /** Flattened target entry ordinals for every alias, in {@link #aliasOrdinals} order. */
     private final int[] aliasTargets;
 
-    CompactNameIndex(byte[] nameBlob, int[] offsets, byte[] uuids, byte[] statuses) {
-        this(nameBlob, offsets, uuids, statuses, new int[0], new int[] { 0 }, new int[0]);
+    CompactNameIndex(byte[][] nameChunks, int[] offsets, int[] chunkFirstOrdinal, int[] chunkLengths, byte[] uuids, byte[] statuses) {
+        this(nameChunks, offsets, chunkFirstOrdinal, chunkLengths, uuids, statuses, new int[0], new int[] { 0 }, new int[0]);
     }
 
     CompactNameIndex(
-        byte[] nameBlob,
+        byte[][] nameChunks,
         int[] offsets,
+        int[] chunkFirstOrdinal,
+        int[] chunkLengths,
         byte[] uuids,
         byte[] statuses,
         int[] aliasOrdinals,
         int[] aliasTargetOffsets,
         int[] aliasTargets
     ) {
-        this.nameBlob = nameBlob;
+        this.nameChunks = nameChunks;
         this.offsets = offsets;
+        this.chunkFirstOrdinal = chunkFirstOrdinal;
+        this.chunkLengths = chunkLengths;
         this.uuids = uuids;
         this.statuses = statuses;
         this.aliasOrdinals = aliasOrdinals;
@@ -96,7 +119,25 @@ public final class CompactNameIndex {
 
     /** An index over no names. Useful as a starting base before the first rebuild. */
     public static CompactNameIndex empty() {
-        return new CompactNameIndex(new byte[0], new int[] { 0 }, new byte[0], new byte[0]);
+        return new CompactNameIndex(new byte[0][], new int[] { 0 }, new int[] { 0 }, new int[0], new byte[0], new byte[0]);
+    }
+
+    /** Chunk holding this ordinal. Chunk count is tiny (a handful at 100M), so a linear walk is fine. */
+    private int chunkOf(int ordinal) {
+        for (int c = 0; c < chunkLengths.length; c++) {
+            if (ordinal < chunkFirstOrdinal[c + 1]) {
+                return c;
+            }
+        }
+        throw new IndexOutOfBoundsException("ordinal " + ordinal + " out of range for size " + size());
+    }
+
+    /**
+     * End position of a name within its chunk. The last name in a chunk ends at the chunk's used length
+     * rather than at the next entry's offset, because the next entry starts at zero in a new chunk.
+     */
+    private int endWithinChunk(int ordinal, int chunk) {
+        return (ordinal + 1 < chunkFirstOrdinal[chunk + 1]) ? offsets[ordinal + 1] : chunkLengths[chunk];
     }
 
     public int size() {
@@ -125,8 +166,9 @@ public final class CompactNameIndex {
 
     public String nameAt(int ordinal) {
         checkOrdinal(ordinal);
+        int chunk = chunkOf(ordinal);
         int start = offsets[ordinal];
-        return new String(nameBlob, start, offsets[ordinal + 1] - start, StandardCharsets.UTF_8);
+        return new String(nameChunks[chunk], start, endWithinChunk(ordinal, chunk) - start, StandardCharsets.UTF_8);
     }
 
     public byte[] uuidAt(int ordinal) {
@@ -218,9 +260,15 @@ public final class CompactNameIndex {
         // Object headers and the four references, then the arrays themselves. Approximate by design:
         // the point is to catch a representation that has quietly stopped being compact, not to model
         // the JVM exactly.
-        return 16L + 7L * 8L + arrayBytes(nameBlob.length) + arrayBytes(4L * offsets.length) + arrayBytes(uuids.length) + arrayBytes(
-            statuses.length
-        ) + arrayBytes(4L * aliasOrdinals.length) + arrayBytes(4L * aliasTargetOffsets.length) + arrayBytes(4L * aliasTargets.length);
+        long chunkBytes = arrayBytes(8L * nameChunks.length);
+        for (byte[] chunk : nameChunks) {
+            chunkBytes += arrayBytes(chunk.length);
+        }
+        return 16L + 9L * 8L + chunkBytes + arrayBytes(4L * offsets.length) + arrayBytes(4L * chunkFirstOrdinal.length) + arrayBytes(
+            4L * chunkLengths.length
+        ) + arrayBytes(uuids.length) + arrayBytes(statuses.length) + arrayBytes(4L * aliasOrdinals.length) + arrayBytes(
+            4L * aliasTargetOffsets.length
+        ) + arrayBytes(4L * aliasTargets.length);
     }
 
     private static long arrayBytes(long contentBytes) {
@@ -252,11 +300,13 @@ public final class CompactNameIndex {
      * ASCII without the mask.
      */
     private int compareAt(int ordinal, byte[] target) {
+        int chunk = chunkOf(ordinal);
+        byte[] blob = nameChunks[chunk];
         int start = offsets[ordinal];
-        int length = offsets[ordinal + 1] - start;
+        int length = endWithinChunk(ordinal, chunk) - start;
         int shared = Math.min(length, target.length);
         for (int i = 0; i < shared; i++) {
-            int diff = (nameBlob[start + i] & 0xFF) - (target[i] & 0xFF);
+            int diff = (blob[start + i] & 0xFF) - (target[i] & 0xFF);
             if (diff != 0) {
                 return diff;
             }
@@ -265,13 +315,15 @@ public final class CompactNameIndex {
     }
 
     private boolean startsWith(int ordinal, byte[] prefix) {
+        int chunk = chunkOf(ordinal);
+        byte[] blob = nameChunks[chunk];
         int start = offsets[ordinal];
-        int length = offsets[ordinal + 1] - start;
+        int length = endWithinChunk(ordinal, chunk) - start;
         if (length < prefix.length) {
             return false;
         }
         for (int i = 0; i < prefix.length; i++) {
-            if (nameBlob[start + i] != prefix[i]) {
+            if (blob[start + i] != prefix[i]) {
                 return false;
             }
         }
