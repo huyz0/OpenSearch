@@ -20,48 +20,52 @@ Evidence for every number claimed: `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.m
 
 ## The blocker: C18, and it is one question
 
-**A computed shard never enters primary mode, so every write is rejected.**
+**A write to a computed index retries for sixty seconds and succeeds about two times in three.**
 
 Start here: `ComputedPlacementShardLifecycleIT.testADocumentCanBeIndexedAndRead`, which is `@AwaitsFix`
 and whose javadoc has the run-by-run account of how the failure moved.
 
-**Where it is now, measured.** The write takes sixty seconds and passes about two runs in three:
-60.16s pass, 60.38s fail, 60.29s pass. Sixty seconds is the replication retry timeout almost exactly.
-So the recovery transition is not making the shard writable at all; the request retries for a minute and
-either wins the race at the boundary or does not. Do not read the passing runs as success.
+**The shard is not the problem, and this is now asserted rather than assumed.**
+`testTheComputedShardEntersPrimaryMode` passes in 3.2 seconds: a computed shard is created, recovers,
+starts itself locally without the cluster manager, and enters primary mode. C18's local half is done.
 
-The failing run reports `AlreadyClosedException: engine is closed` with the tracker's invariant
-`local checkpoints {} not in-sync with routing table`. The shard-open test passes in four seconds
-throughout, so shard creation is solid and only the write path is in question.
+**The write is a request-path problem.** It takes sixty seconds, the replication retry timeout, and
+passes about two runs in three: 60.16s pass, 60.38s fail, 60.29s pass. Something between the coordinator
+and the primary keeps retrying against a shard that was ready the whole time. Do not read the passing
+runs as success.
 
-**What is already settled, so as not to re-derive it.**
+Where to look, in order:
 
-- `updateShard` never runs for a computed shard. Measured: a probe on that path printed nothing across a
-  full run with node logging captured. It fires only on a cluster state applied after the one that
-  created the shard, and an idle cluster publishes no such state. The start transition therefore lives
-  in `handleRecoveryDone`, where an ordinary shard tells the cluster manager it started.
-- The primary term is set at creation, in the same branch that skips publication. Zero is not a legal
-  term and the allocator is what normally bumps it. Setting it node-side instead trades "primary term
-  must be positive" for "term is only increased as part of primary promotion", because the shard is
-  constructed from metadata and a node-local term disagrees with its own shard.
-- The `ReplicationTracker` version gate is **not** a factor. Passing a higher version changed nothing.
+1. `TransportReplicationAction.AsyncPrimaryAction`, comparing the allocation id the request carries with
+   the one the shard holds. `ComputedShardRouting` makes both deterministic, so a mismatch means two
+   different derivations exist somewhere.
+2. Whether the coordinator resolves the primary to the node that actually holds it. `compute` and
+   `localShards` in the lifecycle IT both sort data node ids, so a divergence there is a test bug rather
+   than a production one.
+3. `AlreadyClosedException: engine is closed` in the failing run, which may be a consequence of the
+   retrying rather than its cause.
 
-**How to make progress.** The question is no longer "why does it fail" but "why is it never promptly
-writable", and the sixty-second constant is the clue: find what makes the shard writable at the sixty
-second mark and make that happen at recovery completion instead. Put a probe inside
-`startComputedShardAfterRecovery` printing `shard.state()` and any exception, and note that
-internalClusterTest only dumps node logs when a test fails, so force a failure or assert on timing to
-see them. Every layer so far has been named exactly by one log line, and every attempt
-to reason ahead of the probe has been wrong: the version gate, then an empty in-sync set, both
-confidently argued and both false. Three log lines have beaten three arguments.
+**What already paid for itself, twice.** Ask the component that owns the property, not a request that
+travels through it. A write test measures everything between client and engine, so when it fails it
+names nothing; three log lines and one direct assertion each cracked a layer that arguments had not.
 
-**The framing that makes the rest of C18 predictable, and it has now paid four times.** Computed
-placement removes the cluster manager from the loop, so every piece of state it used to maintain as a
-side effect has to become a function of the placement instead. So far: allocation identity
-(`ComputedShardRouting`), the started transition (`handleRecoveryDone`), the in-sync set (from the
-placement), and the primary term (set at creation). Expect the next surprise to be a fifth item on that
-list rather than a new category, and look for it in `ReplicationTracker`, which is where the remaining
-cluster-manager-shaped assumptions live.
+**Three things ruled out by measurement, so as not to re-derive them.**
+
+- `updateShard` never runs for a computed shard. A probe on that path printed nothing across a full run
+  with node logging captured. It fires only on a state applied after the one that created the shard, and
+  an idle cluster publishes no such state, which is why the start transition lives in
+  `handleRecoveryDone`.
+- The primary term belongs at creation, in the branch that skips publication. Setting it node-side
+  instead trades "primary term must be positive" for "term is only increased as part of primary
+  promotion", because the shard is constructed from metadata.
+- The `ReplicationTracker` version gate is not a factor. Passing a higher version changed nothing.
+
+**The framing that got C18's local half finished.** Computed placement removes the cluster manager from
+the loop, so every piece of state it used to maintain as a side effect had to become a function of the
+placement: allocation identity (`ComputedShardRouting`), the started transition (`handleRecoveryDone`),
+the in-sync set (from the placement), and the primary term (set at creation). All four are done, and
+together they are why the shard now works. The remaining question is a different shape, since it is
+about a request finding a shard rather than a shard existing.
 
 Four seams exist now, and the fourth is the one that keeps being needed:
 
