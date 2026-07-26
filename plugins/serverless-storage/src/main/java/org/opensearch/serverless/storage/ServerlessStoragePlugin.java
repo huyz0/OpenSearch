@@ -725,12 +725,13 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      * size. A pair only becomes a merge candidate once enough data has been deleted for the two
      * siblings *together* to fit comfortably back inside one shard.
      */
-    public static final Setting<Long> SERVERLESS_STORAGE_RESHARDING_MERGE_CANDIDATE_COMBINED_SIZE_THRESHOLD_BYTES_SETTING = Setting.longSetting(
-        "serverless_storage.resharding.merge_candidate_combined_size_threshold_bytes",
-        4L * 1024 * 1024 * 1024,
-        0L,
-        Setting.Property.NodeScope
-    );
+    public static final Setting<Long> SERVERLESS_STORAGE_RESHARDING_MERGE_CANDIDATE_COMBINED_SIZE_THRESHOLD_BYTES_SETTING = Setting
+        .longSetting(
+            "serverless_storage.resharding.merge_candidate_combined_size_threshold_bytes",
+            4L * 1024 * 1024 * 1024,
+            0L,
+            Setting.Property.NodeScope
+        );
 
     /**
      * How often {@code InPlaceMergeTriggerSchedulerTask} re-evaluates merge candidates in the
@@ -1224,9 +1225,17 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     // shared instance -- see resolveContainer and the shared WAL container's own construction below.
     private final ObjectStoreRequestCounter requestCounter = new ObjectStoreRequestCounter();
 
+    /** Whether the name index tier runs. Off until it replaces cluster-state resolution rather than duplicating it. */
+    public static final Setting<Boolean> NAME_INDEX_ENABLED_SETTING = Setting.boolSetting(
+        org.opensearch.serverless.storage.nameindex.NameIndexService.ENABLED_SETTING_KEY,
+        false,
+        Setting.Property.NodeScope
+    );
+
     @Override
     public List<Setting<?>> getSettings() {
         return List.of(
+            NAME_INDEX_ENABLED_SETTING,
             SERVERLESS_STORAGE_ENABLED_SETTING,
             SERVERLESS_STORAGE_BASE_PATH_SETTING,
             SERVERLESS_STORAGE_ENCRYPTION_KEY_SETTING,
@@ -1588,7 +1597,17 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         // constructor-injected with it and reach blobContainerForDirectoryFactory -- the same
         // resolution ServerlessStorageLazyDirectoryFactory already depends on, just handed to a
         // different consumer via a different injection path (Guice component vs. direct reference).
-        return Collections.singletonList(this);
+        // The name index tier. Shipped disabled, as C5 and C6 were: it answers questions core already
+        // answers, so running both is pure cost until the switchover. Registered as a cluster state
+        // listener so a node's copy tracks index creates and deletes without anything else having to
+        // remember to update it.
+        org.opensearch.serverless.storage.nameindex.NameIndexService nameIndexService =
+            new org.opensearch.serverless.storage.nameindex.NameIndexService(NAME_INDEX_ENABLED_SETTING.get(environment.settings()));
+        if (nameIndexService.isEnabled()) {
+            clusterService.addListener(nameIndexService);
+        }
+
+        return java.util.List.of(this, nameIndexService);
     }
 
     /**
@@ -2340,6 +2359,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         getActions() {
         return java.util.List.of(
             new ActionHandler<>(
+                org.opensearch.serverless.storage.nameindex.action.ResolveIndexNamesAction.INSTANCE,
+                org.opensearch.serverless.storage.nameindex.action.TransportResolveIndexNamesAction.class
+            ),
+            new ActionHandler<>(
                 org.opensearch.serverless.storage.clone.action.ShardCloneAction.INSTANCE,
                 org.opensearch.serverless.storage.clone.action.TransportShardCloneAction.class
             ),
@@ -2497,6 +2520,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         java.util.function.Supplier<org.opensearch.cluster.node.DiscoveryNodes> nodesInCluster
     ) {
         return java.util.List.of(
+            new org.opensearch.serverless.storage.nameindex.action.RestResolveIndexNamesAction(),
             new org.opensearch.serverless.storage.clone.action.RestShardCloneAction(),
             new org.opensearch.serverless.storage.compaction.action.RestCompactionTriggerAction(),
             new org.opensearch.serverless.storage.writerengine.action.RestShardIdleTimeAction(),
