@@ -18,64 +18,60 @@ Evidence for every number claimed: `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.m
 | **C. Computed placement** | **blocked on C18**, `plan-area-c-computed-placement.md`. C0 to C12 and C17 done. A computed index is creatable and its shard opens; it will not take a write. |
 | B, D, E, F, G | not started |
 
-## The blocker: C18, and it is one question
+## The blocker: C20, the cluster does not recover after a restart
 
-**A write to a computed index retries for sixty seconds and succeeds about two times in three.**
+**After a full restart with a computed index present, the cluster never comes back.** Every node reports
+`state not recovered / initialized` and no cluster manager is discovered. Gateway-level rather than
+shard-level; the likely suspect is state recovery expecting each index in metadata to have a routing
+entry.
 
-Start here: `ComputedPlacementShardLifecycleIT.testADocumentCanBeIndexedAndRead`, which is `@AwaitsFix`
-and whose javadoc has the run-by-run account of how the failure moved.
+Start from `ComputedPlacementRestartIT`, which is `@AwaitsFix` and carries the account. It lives in its
+own class because the restart leaves the shared test cluster unusable, and beside other tests it turned
+one real failure into three misleading ones.
 
-**The shard is not the problem, and this is now asserted rather than assumed.**
-`testTheComputedShardEntersPrimaryMode` passes in 3.2 seconds: a computed shard is created, recovers,
-starts itself locally without the cluster manager, and enters primary mode. C18's local half is done.
+## What is done, and what each of them cost
 
-**The write is a request-path problem.** It takes sixty seconds, the replication retry timeout, and
-passes about two runs in three: 60.16s pass, 60.38s fail, 60.29s pass. Something between the coordinator
-and the primary keeps retrying against a shard that was ready the whole time. Do not read the passing
-runs as success.
+- **C17** counting active shards resolves through the supplier, and health counts computed entries
+  instead of reporting a false GREEN for a cluster with nothing placed.
+- **C18** a computed index is created, its shard opens, enters primary mode in about three seconds, and
+  takes a write. Five pieces of cluster-manager state had to become functions of the placement:
+  allocation identity, the started transition, the in-sync set, the primary term, and the refusal to act
+  on an unresolvable placement.
+- **C19** the recovery source comes from the node rather than the placement function, because only the
+  node knows whether it holds data.
+- **C14** resharding rejects a computed index with a sentence saying why, instead of throwing
+  `IndexNotFoundException`, dereferencing null, or hanging pending forever.
+- **C13** reopened. It is blocked on C20 and its earlier "done" was wrong, see below.
 
-Where to look, in order:
+## Three times a green suite measured nothing, and what stops the fourth
 
-1. `TransportReplicationAction.AsyncPrimaryAction`, comparing the allocation id the request carries with
-   the one the shard holds. `ComputedShardRouting` makes both deterministic, so a mismatch means two
-   different derivations exist somewhere.
-2. Whether the coordinator resolves the primary to the node that actually holds it. `compute` and
-   `localShards` in the lifecycle IT both sort data node ids, so a divergence there is a test bug rather
-   than a production one.
-3. `AlreadyClosedException: engine is closed` in the failing run, which may be a consequence of the
-   retrying rather than its cause.
+This is the failure mode of this area, and it has now happened three times.
 
-**What already paid for itself, twice.** Ask the component that owns the property, not a request that
-travels through it. A write test measures everything between client and engine, so when it fails it
-names nothing; three log lines and one direct assertion each cracked a layer that arguments had not.
+1. C1 through C11 were thirty green unit tests against a mechanism that never ran. C12 found it.
+2. `computedAwareInSyncIds` and `startComputedShardLocally` were committed correct and unreachable. A
+   probe that printed nothing found it.
+3. An edit stripped the registrations that make an index computed while failing to add the `@Before`
+   meant to replace them. Three tests then passed while exercising an ordinary index, and C13 was
+   declared done on that basis. It also manufactured a fake mystery: a recovery source moving from
+   `EMPTY_STORE` to `EXISTING_STORE` that nothing could explain, because an ordinary index simply does
+   that.
 
-**Three things ruled out by measurement, so as not to re-derive them.**
+**The guard against the fourth:** `createComputedIndex` in both IT classes asserts that the index it
+just created has no published routing entry. The premise cannot be silently lost. Keep that assertion in
+anything new, and treat an unexplained result as a reason to distrust the test rather than as a
+curiosity to record.
 
-- `updateShard` never runs for a computed shard. A probe on that path printed nothing across a full run
-  with node logging captured. It fires only on a state applied after the one that created the shard, and
-  an idle cluster publishes no such state, which is why the start transition lives in
-  `handleRecoveryDone`.
-- The primary term belongs at creation, in the branch that skips publication. Setting it node-side
-  instead trades "primary term must be positive" for "term is only increased as part of primary
-  promotion", because the shard is constructed from metadata.
-- The `ReplicationTracker` version gate is not a factor. Passing a higher version changed nothing.
+## Method that has actually worked
 
-**The framing that got C18's local half finished.** Computed placement removes the cluster manager from
-the loop, so every piece of state it used to maintain as a side effect had to become a function of the
-placement: allocation identity (`ComputedShardRouting`), the started transition (`handleRecoveryDone`),
-the in-sync set (from the placement), and the primary term (set at creation). All four are done, and
-together they are why the shard now works. The remaining question is a different shape, since it is
-about a request finding a shard rather than a shard existing.
+**Probe, do not reason.** Every layer of C18 was named by one log line, and four confident arguments
+were wrong: the version gate, an empty in-sync set, "the shard never enters primary mode", and the
+recovery-source mystery. **Ask the component that owns the property** rather than inferring from a
+request that travels through it: a write test measures everything between client and engine, so when it
+fails it names nothing, while `isPrimaryMode()` answers in three seconds.
 
-Four seams exist now, and the fourth is the one that keeps being needed:
-
-1. Skip publication: `registerUnpublished` plus the skip in `MetadataCreateIndexService`.
-2. Count active shards through the supplier: `ActiveShardCount` and `ClusterStateHealth`. C17.
-3. Materialize shards locally: `registerLocalShards` plus the hook in `RoutingNodes.localRoutingNode`,
-   deliberately not the `RoutingNodes` constructor, which the allocator uses.
-4. **Resolve, never look up.** `AbsentIndexRoutingSuppliers.resolve` and `resolveShard`. Three
-   open-coded lookups produced three bugs. When you find a fifth site, use these rather than pairing a
-   table read with a supplier call.
+**Watch for tests that pass by timing out into success.** C18's write assertion passed against its own
+mutation until it asserted `shardsAcknowledged`; the write test passed two runs in three at exactly the
+sixty second retry timeout. Both looked green.
 
 ## Key files
 
