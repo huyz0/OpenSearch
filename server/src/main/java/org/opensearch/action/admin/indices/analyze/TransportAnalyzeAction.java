@@ -44,11 +44,12 @@ import org.opensearch.OpenSearchException;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.single.shard.TransportSingleShardAction;
 import org.opensearch.cluster.ClusterState;
-import org.opensearch.cluster.routing.IndexRoutingTable;
-import org.opensearch.cluster.routing.PlainShardsIterator;
 import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.ResolvedIndices;
+import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
+import org.opensearch.cluster.routing.IndexRoutingTable;
+import org.opensearch.cluster.routing.PlainShardsIterator;
 import org.opensearch.cluster.routing.ShardsIterator;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
@@ -75,8 +76,8 @@ import org.opensearch.transport.TransportService;
 import java.io.IOException;
 import java.io.Reader;
 import java.io.StringReader;
-import java.util.Collections;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -142,10 +143,15 @@ public class TransportAnalyzeAction extends TransportSingleShardAction<AnalyzeAc
             // just execute locally....
             return null;
         }
-        IndexRoutingTable indexRoutingTable = state.routingTable().index(request.concreteIndex());
+        // Resolved rather than looked up, so that an index whose placement is computed is reachable
+        // here. The empty iterator below remains correct for an index that genuinely has no shards, but
+        // for a computed index it turned analyze into NoShardAvailableActionException against an index
+        // whose shard was open and serving writes.
+        IndexRoutingTable indexRoutingTable = AbsentIndexRoutingSuppliers.resolve(state, request.concreteIndex());
         if (indexRoutingTable == null) {
-            // In metadata but not in routing. An empty iterator makes this a NoShardAvailableActionException,
-            // which is what the caller already handles; returning null would instead mean "run it locally".
+            // In metadata but not in routing, and nothing supplied one. An empty iterator makes this a
+            // NoShardAvailableActionException, which is what the caller already handles; returning null
+            // would instead mean "run it locally".
             return new PlainShardsIterator(Collections.emptyList());
         }
         return indexRoutingTable.randomAllActiveShardsIt();

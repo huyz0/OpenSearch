@@ -51,6 +51,7 @@ import org.opensearch.action.support.single.instance.TransportInstanceSingleOper
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.PlainShardIterator;
@@ -213,7 +214,12 @@ public class TransportUpdateAction extends TransportInstanceSingleOperationActio
     @Override
     protected ShardIterator shards(ClusterState clusterState, UpdateRequest request) {
         if (request.getShardId() != null) {
-            IndexRoutingTable indexRoutingTable = clusterState.routingTable().index(request.concreteIndex());
+            // Resolved rather than looked up. This branch runs only on a retry, because the shard id is
+            // set after shards() has already succeeded once, so a computed index reaches it when a first
+            // attempt fails remotely. The empty iterator below means "not allocated yet, wait", which for
+            // an index whose routing is never published means waiting forever: a hang rather than an
+            // error, and harder to attribute than one.
+            IndexRoutingTable indexRoutingTable = AbsentIndexRoutingSuppliers.resolve(clusterState, request.concreteIndex());
             IndexShardRoutingTable shardRoutingTable = indexRoutingTable == null
                 ? null
                 : indexRoutingTable.shard(request.getShardId().getId());
