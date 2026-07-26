@@ -44,6 +44,7 @@ import org.opensearch.cluster.action.shard.ShardStateAction;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodes;
+import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.RecoverySource.Type;
 import org.opensearch.cluster.routing.RoutingNode;
@@ -659,7 +660,7 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
         DiscoveryNodes nodes = state.nodes();
         RoutingTable routingTable = state.routingTable();
 
-        for (final ShardRouting shardRouting : localRoutingNode) {
+        for (ShardRouting shardRouting : localRoutingNode) {
             ShardId shardId = shardRouting.shardId();
             if (failedShardsCache.containsKey(shardId) == false) {
                 AllocatedIndex<? extends Shard> indexService = indicesService.indexService(shardId.getIndex());
@@ -669,10 +670,33 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
                     assert shardRouting.initializing() : shardRouting + " should have been removed by failMissingShards";
                     createShard(nodes, routingTable, shardRouting, state);
                 } else {
-                    updateShard(nodes, shardRouting, shard, routingTable, state);
+                    updateShard(nodes, startComputedShardLocally(state, shardRouting, shard), shard, routingTable, state);
                 }
             }
         }
+    }
+
+    /**
+     * Moves a recovered computed shard to STARTED without asking the cluster manager.
+     *
+     * <p>A shard that finishes recovery sits in POST_RECOVERY until the cluster manager marks it started.
+     * For a computed shard that never happens: {@code ShardStateAction}'s started-shard executor looks
+     * the shard up by allocation id in the published routing table, finds nothing, and marks the task
+     * successful. So the transition has to be local, which is the same conclusion the rest of this area
+     * reaches for placement. Nothing here needs agreeing, because nothing here is shared.
+     *
+     * <p>Only for shards of an index with no published routing entry. Where the cluster manager does own
+     * the transition, it keeps owning it, and this returns the entry untouched.
+     */
+    private ShardRouting startComputedShardLocally(ClusterState state, ShardRouting shardRouting, Shard shard) {
+        if (shardRouting.initializing() == false || state.routingTable().hasIndex(shardRouting.index())) {
+            return shardRouting;
+        }
+        IndexShardState shardState = shard.state();
+        if (shardState == IndexShardState.POST_RECOVERY || shardState == IndexShardState.STARTED) {
+            return shardRouting.moveToStarted();
+        }
+        return shardRouting;
     }
 
     private void createShard(DiscoveryNodes nodes, RoutingTable routingTable, ShardRouting shardRouting, ClusterState state) {
@@ -731,8 +755,11 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
         try {
             final IndexMetadata indexMetadata = clusterState.metadata().index(shard.shardId().getIndex());
             primaryTerm = indexMetadata.primaryTerm(shard.shardId().id());
-            final Set<String> inSyncIds = indexMetadata.inSyncAllocationIds(shard.shardId().id());
-            final IndexShardRoutingTable indexShardRoutingTable = routingTable.shardRoutingTable(shardRouting.shardId());
+            final Set<String> inSyncIds = computedAwareInSyncIds(clusterState, shardRouting, indexMetadata);
+            // Resolved rather than read. shardRoutingTable throws IndexNotFoundException for an index
+            // with no published entry, and the catch below fails and removes the shard, so a computed
+            // shard would be destroyed on the first cluster state applied after it was created.
+            final IndexShardRoutingTable indexShardRoutingTable = computedAwareShardRoutingTable(clusterState, shardRouting);
             shard.updateShardState(
                 shardRouting,
                 primaryTerm,
@@ -776,6 +803,58 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
                 );
             }
         }
+    }
+
+    /**
+     * The in-sync allocation ids for a shard, from index metadata or from the computed entry.
+     *
+     * <p>{@code inSyncAllocationIds} is maintained by the cluster manager as shards start and fail, and
+     * a computed index never goes through that: its shards are not in the published routing table, so
+     * the started-shard task finds nothing to record. The set stays empty, {@code ReplicationTracker}
+     * never tracks the primary's own allocation id, primary mode never activates, and every write is
+     * rejected with "shard is not in primary mode".
+     *
+     * <p>So for a computed index the in-sync set is read from the placement rather than from metadata.
+     * That is the same trade the whole area makes: state that is a pure function of inputs every node
+     * has does not need to be published, and here the placement function is what defines the replication
+     * group.
+     *
+     * <p>This is the A5 trap's neighbourhood and worth naming as such. A5 was a recovery source silently
+     * derived from an absent in-sync set; this is primary mode silently denied by the same absence. Both
+     * come from treating cluster-manager-maintained state as if it were always there.
+     */
+    private static Set<String> computedAwareInSyncIds(ClusterState state, ShardRouting shardRouting, IndexMetadata indexMetadata) {
+        Set<String> published = indexMetadata.inSyncAllocationIds(shardRouting.id());
+        if (published.isEmpty() == false || state.routingTable().hasIndex(shardRouting.index())) {
+            return published;
+        }
+        IndexShardRoutingTable computed = AbsentIndexRoutingSuppliers.resolveShard(state, shardRouting.shardId());
+        if (computed == null) {
+            return published;
+        }
+        Set<String> ids = new HashSet<>();
+        for (ShardRouting candidate : computed) {
+            if (candidate.active() && candidate.allocationId() != null) {
+                ids.add(candidate.allocationId().getId());
+            }
+        }
+        return ids.isEmpty() ? published : ids;
+    }
+
+    /**
+     * The shard's routing table, from the published entry or the computed one.
+     *
+     * <p>Falls back to a single-shard table built from the entry the node is applying, for the case
+     * where nothing is published and no supplier answers. That is the honest answer rather than a
+     * convenient one: the node is being told to hold this shard, so a table containing exactly that
+     * shard describes the state it is in.
+     */
+    private static IndexShardRoutingTable computedAwareShardRoutingTable(ClusterState state, ShardRouting shardRouting) {
+        IndexShardRoutingTable resolved = AbsentIndexRoutingSuppliers.resolveShard(state, shardRouting.shardId());
+        if (resolved != null) {
+            return resolved;
+        }
+        return new IndexShardRoutingTable.Builder(shardRouting.shardId()).addShard(shardRouting).build();
     }
 
     /**

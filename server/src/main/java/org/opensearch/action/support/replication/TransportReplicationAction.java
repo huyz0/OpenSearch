@@ -53,6 +53,7 @@ import org.opensearch.cluster.block.ClusterBlockLevel;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.ResolvedIndices;
 import org.opensearch.cluster.node.DiscoveryNode;
+import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.AllocationId;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
@@ -1039,11 +1040,16 @@ public abstract class TransportReplicationAction<
                 assert request.waitForActiveShards() != ActiveShardCount.DEFAULT
                     : "request waitForActiveShards must be set in resolveRequest";
 
-                // OrNull, so that an index present in metadata and absent from the routing table
-                // reaches the retry branch immediately below rather than failing the request. That
-                // branch already existed and already handles a null primary; the throwing lookup
-                // simply never let it be reached.
-                final IndexShardRoutingTable shardRoutingTable = state.getRoutingTable().shardRoutingTableOrNull(request.shardId());
+                // Resolved, so that an index whose routing is computed rather than published finds its
+                // primary. Reading the table directly returns null here, the retry branch below fires on
+                // every attempt, and the write fails with "primary shard is not active" after the full
+                // request timeout. That is Phase A's pessimistic answer being given to a question that
+                // now has a better one.
+                //
+                // The OrNull behaviour is preserved for the case with no supplier: an index present in
+                // metadata and absent from routing still reaches the retry branch rather than throwing,
+                // which is what Phase A wanted and what that branch already handled.
+                final IndexShardRoutingTable shardRoutingTable = AbsentIndexRoutingSuppliers.resolveShard(state, request.shardId());
                 final ShardRouting primary = shardRoutingTable == null ? null : shardRoutingTable.primaryShard();
                 if (primary == null || primary.active() == false) {
                     logger.trace(

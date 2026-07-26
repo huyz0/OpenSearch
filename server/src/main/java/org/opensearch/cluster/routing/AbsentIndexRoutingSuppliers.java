@@ -10,7 +10,10 @@ package org.opensearch.cluster.routing;
 
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.index.shard.ShardNotFoundException;
 
+import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiFunction;
 import java.util.function.Predicate;
@@ -144,6 +147,82 @@ public final class AbsentIndexRoutingSuppliers {
             return null;
         }
         return supply(state, state.metadata().index(indexName));
+    }
+
+    /**
+     * One shard's routing table, from the published entry or the computed one, or null if neither has
+     * it.
+     *
+     * <p>The shard-level counterpart of {@link #resolve}, and here for the same reason: the request
+     * paths that ask this question are the ones that were missed last time. C3 hooked search and left
+     * the write path reading the table directly, and after that was fixed in {@code OperationRouting}
+     * the replication path was still reading it directly somewhere else. Each of those was one open-coded
+     * lookup that nobody thought of as a routing decision.
+     *
+     * <p>Delegates to {@link RoutingTable#shardRoutingTableOrNull} for the published case rather than
+     * reimplementing it, because the two absences it distinguishes are not the same absence. An index
+     * with no entry is a maybe-computed index and returns null; an index that <em>has</em> an entry
+     * without this shard is a caller asking for a shard that does not exist, and that must keep throwing
+     * {@link ShardNotFoundException}. Collapsing the two turned a hard error into a retry loop, which is
+     * what {@code TransportReplicationActionTests.testUnknownIndexOrShardOnReroute} noticed.
+     */
+    public static IndexShardRoutingTable resolveShard(ClusterState state, ShardId shardId) {
+        IndexShardRoutingTable published = state.routingTable().shardRoutingTableOrNull(shardId);
+        if (published != null) {
+            return published;
+        }
+        IndexRoutingTable computed = supplyIfRegistered(state, shardId.getIndex().getName());
+        return computed == null ? null : computed.shard(shardId.id());
+    }
+
+    /** The computed entry for an index, skipping the metadata lookup when no supplier is installed. */
+    private static IndexRoutingTable supplyIfRegistered(ClusterState state, String indexName) {
+        if (isRegistered() == false) {
+            return null;
+        }
+        return supply(state, state.metadata().index(indexName));
+    }
+
+    /**
+     * Computed shards assigned to one node, for indices with no published routing entry.
+     *
+     * <p>Separate from {@link #register} because it answers the inverse question. A supplier is asked
+     * "where does index X live", which is what a coordinator needs; a data node needs "which shards live
+     * here", and deriving that from the supplier means enumerating every index in the cluster on every
+     * applied cluster state. At the index counts this area exists for that enumeration is the cost the
+     * area was built to avoid, so the inverse is a registration of its own and the plugin decides how to
+     * answer it.
+     */
+    private static final AtomicReference<BiFunction<ClusterState, String, List<ShardRouting>>> LOCAL_SHARDS = new AtomicReference<>();
+
+    /** Installs the inverse lookup. Registering null clears it. */
+    public static void registerLocalShards(BiFunction<ClusterState, String, List<ShardRouting>> localShards) {
+        LOCAL_SHARDS.set(localShards);
+    }
+
+    /**
+     * The computed shards this node should host, or empty when nothing is installed.
+     *
+     * <p>Empty rather than null, and a throwing implementation reads as empty, for the same reason
+     * {@link #supply} declines rather than fails: a plugin bug must not stop a node from applying
+     * cluster state.
+     */
+    public static List<ShardRouting> localShards(ClusterState state, String nodeId) {
+        BiFunction<ClusterState, String, List<ShardRouting>> localShards = LOCAL_SHARDS.get();
+        if (localShards == null) {
+            return List.of();
+        }
+        try {
+            List<ShardRouting> shards = localShards.apply(state, nodeId);
+            return shards == null ? List.of() : shards;
+        } catch (Exception e) {
+            return List.of();
+        }
+    }
+
+    /** Whether an inverse lookup is installed. Lets a caller skip work it would otherwise discard. */
+    public static boolean hasLocalShards() {
+        return LOCAL_SHARDS.get() != null;
     }
 
     /** Whether a supplier is installed. Exposed so callers can skip work they would otherwise discard. */

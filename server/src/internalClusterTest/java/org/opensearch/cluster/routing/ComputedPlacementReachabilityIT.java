@@ -61,6 +61,7 @@ public class ComputedPlacementReachabilityIT extends OpenSearchIntegTestCase {
     public void clearRegistrations() {
         AbsentIndexRoutingSuppliers.registerUnpublished(null);
         AbsentIndexRoutingSuppliers.register(null);
+        AbsentIndexRoutingSuppliers.registerLocalShards(null);
     }
 
     public void testAnOptedOutIndexPublishesNoRoutingEntry() throws Exception {

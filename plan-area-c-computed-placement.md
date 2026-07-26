@@ -383,3 +383,56 @@ Three obstacles are already visible from reading, and each needs a decision rath
 
 C13 is blocked on this. Restarting a node to see whether a computed index recovers its data is not a
 question that can be asked while the index has no data, because it has no shard.
+
+## C18 in progress: the shard opens, and it will not take a write
+
+The seam works. A data node now creates the `IndexService` and the `IndexShard` for a computed index,
+asserted by `ComputedPlacementShardLifecycleIT.testADataNodeOpensTheComputedShard`, which passes in
+under a second having failed at thirty before the change. Writes still fail, and the way they fail is
+the useful part.
+
+**Five requirements came out of running the test, and reading had surfaced only one of them.**
+
+1. **Allocation ids cannot be random.** `ShardRouting.initialize` mints a fresh one when none is given.
+   An entry rebuilt on every cluster state would carry a new id every time, `updateShardState` throws
+   when handed a different allocation, and `removeShards` tears the shard down. `ComputedShardRouting`
+   derives it from `(indexUuid, shardId, nodeId)` and a test pins the value, for the reason C1 pins the
+   placement hash: two nodes disagreeing about a shard's identity is a split view, not a slow one.
+2. **The local view must say INITIALIZING while the coordinator's says STARTED.** `failMissingShards`
+   fails any shard the local view calls active that the node does not already have, and `createIndices`
+   then skips it through `failedShardsCache`. This is what the first run hit, and it produced **no
+   node-side error at all**, which is why reading did not find it.
+3. **`updateShard` must resolve.** It called `shardRoutingTable`, which throws for an unpublished index,
+   and the catch failed and removed the shard.
+4. **The write path had a third unhooked lookup.** `TransportReplicationAction.ReroutePhase` read the
+   routing table directly, got null, and retried "primary shard is not active" until the request timed
+   out. C3 missed the write path in `OperationRouting`; this is the same mistake one layer down, at a
+   site nobody would call a routing decision. Three open-coded lookups have now produced three bugs, so
+   `resolveShard` exists to stop there being a fourth.
+5. **`inSyncAllocationIds` never arrives.** It is maintained by the cluster manager as shards start, and
+   a computed shard's started message is discarded because the allocation id is in no published table.
+   The set stays empty, `ReplicationTracker` never tracks the primary's own id, and primary mode never
+   activates. Reading the in-sync set from the placement is the right shape and is not yet sufficient.
+
+**Where it stands.** The shard opens and refuses writes with "shard is not in primary mode", because
+`ReplicationTracker`'s checkpoint map is empty on the first call: the in-sync set reaching it is still
+empty on a path other than the one that was changed. The write test is `@AwaitsFix` with the run-by-run
+account; the shard-creation test stays enabled, because it asserts something that now works.
+
+**Two results worth keeping precisely because they are negative.**
+
+The version gate in `updateFromClusterManager`, which ignores an update unless the cluster state version
+is strictly newer, looked like the cause. It is not: passing a higher version changed nothing. That was
+reasoned and wrong, which is the third time in this project that reasoning lost to measurement.
+
+Driving the START transition from `handleRecoveryDone` rather than from the next applied cluster state
+is necessary and made things worse. Necessary, because on an idle cluster nothing publishes a new state
+for a computed index, so a transition waiting for one waits forever, and that is invisible from reading
+because the missing thing is an event rather than a line. Worse, because the attempt tripped the
+tracker's invariant during recovery, which failed and removed the shard and regressed the sibling test
+from passing to "no such shard". It has been reverted, and the necessity stands.
+
+**The shape of all of it.** Computed placement removes the cluster manager from the loop, and every
+piece of state the cluster manager used to maintain as a side effect has to become a function of the
+placement instead: allocation identity, the started transition, and the in-sync set. That is a bigger
+claim than "routing is computed", and it is the claim the area is actually making.

@@ -24,6 +24,7 @@ import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.common.transport.TransportAddress;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.index.shard.ShardNotFoundException;
 import org.opensearch.test.OpenSearchTestCase;
 import org.junit.After;
 
@@ -140,6 +141,23 @@ public class ComputedActiveShardCountingTests extends OpenSearchTestCase {
         ClusterStateHealth health = new ClusterStateHealth(state, new String[0]);
 
         assertFalse("percent must not be NaN", Double.isNaN(health.getActiveShardsPercent()));
+    }
+
+    /**
+     * Two absences that must stay distinguishable. An index with no routing entry may be computed and
+     * resolves to null; an index that has an entry without this shard is a caller asking for a shard
+     * that does not exist, and collapsing that into null turns a hard error into a retry until timeout.
+     */
+    public void testResolveShardKeepsShardNotFoundDistinctFromIndexAbsent() {
+        ClusterState computed = stateWithoutRouting(1);
+        assertNull(
+            "an index with no entry resolves to null so the supplier can answer",
+            AbsentIndexRoutingSuppliers.resolveShard(computed, new ShardId(computed.metadata().index(INDEX).getIndex(), 0))
+        );
+
+        ClusterState published = stateWithPublishedRouting(1, "node-1");
+        ShardId missing = new ShardId(published.metadata().index(INDEX).getIndex(), 7);
+        expectThrows(ShardNotFoundException.class, () -> AbsentIndexRoutingSuppliers.resolveShard(published, missing));
     }
 
     // ---------------------------------------------------------------- helpers
