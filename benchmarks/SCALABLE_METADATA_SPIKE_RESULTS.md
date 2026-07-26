@@ -766,3 +766,33 @@ count is bounded an order of magnitude below its resident tenant count.
 shard to `inSyncAllocationIds` and a `ShardRouting` to the routing table, so the `full` and
 `norouting` columns are floors, not estimates. The descriptor column is unaffected by replica count for
 the same reason it is unaffected by shard count.
+
+### S11b: the 18 GiB figure was isolated-object, and the real one is 65 GiB
+
+S11 measured `IndexDescriptor` on its own. That is the right way to ask "is the descriptor flat in
+shard count" and the wrong way to ask "what does a tenant cost", because `Metadata` keeps per-index
+state deferral never touches: an `IndexAbstraction` per index and per alias, entries in the derived
+name arrays, and the map and `indicesLookup` entries themselves. S10 had already been corrected once
+for exactly this (14.2x isolated -> 4.2x real), and S11 walked into the same trap.
+
+`DeferredMetadataHeapEstimate`, now parameterized by shard count, measures a real `Metadata` with one
+alias and one replica per index:
+
+| shards | materialized | deferred | reduction |
+|---|---|---|---|
+| 1 | 2,743 B/index | 698 B/index | 3.9x |
+| 3 | 2,939 B/index | 700 B/index | 4.2x |
+| 30 | 6,213 B/index | 698 B/index | 8.9x |
+
+**Deferred cost is flat in shard count** -- 698, 700, 698 -- which is the property the whole design
+rests on, now measured in a real `Metadata` rather than inferred from an isolated descriptor. The
+reduction grows with shards only because the materialized side grows; the deferred side does not move.
+
+**100M indices cost about 65 GiB of resident index metadata**, not 18 GiB. Use 698 B/index, flat,
+for all cell sizing. The 193 B descriptor figure is a component of that number, not a substitute for it.
+
+**This does not change the direction, only the arithmetic.** Deferral is still the only representation
+that fits, and it is still flat where every alternative is linear in shards. But 65 GiB does not fit in
+one heap, so cells stop being a scaling nicety and become arithmetic: even a generous 16 GiB metadata
+budget per cluster-manager holds about 24M tenants, which is four cells for 100M before any other
+constraint is considered.

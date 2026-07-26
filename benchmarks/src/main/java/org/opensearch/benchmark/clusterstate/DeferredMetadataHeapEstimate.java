@@ -40,8 +40,19 @@ public final class DeferredMetadataHeapEstimate {
 
     private static final int INDICES = 100_000;
 
+    /**
+     * Shards per index. Mutable because S11 found the whole package had measured only 1 and 3 shards,
+     * which made "per index" and "per shard" indistinguishable; the stated target is 3-30, so the
+     * question of whether the deferred per-index cost is flat in shard count has to be asked here, in a
+     * real {@link Metadata}, and not only against an isolated descriptor.
+     */
+    private static int shards = 3;
+
     public static void main(String[] args) throws Exception {
-        System.out.println("Metadata retained heap for " + INDICES + " indices\n");
+        if (args.length >= 1) {
+            shards = Integer.parseInt(args[0]);
+        }
+        System.out.println("Metadata retained heap for " + INDICES + " indices at " + shards + " shards\n");
 
         long materialized = measureRetained(() -> {
             Metadata.Builder builder = Metadata.builder();
@@ -93,7 +104,7 @@ public final class DeferredMetadataHeapEstimate {
                     .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
                     .put(IndexMetadata.SETTING_INDEX_UUID, name + "-uuid-000000000000")
             )
-            .numberOfShards(3)
+            .numberOfShards(shards)
             .numberOfReplicas(1)
             .putAlias(AliasMetadata.builder(name + "-alias").build())
             .build();
