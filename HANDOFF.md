@@ -25,46 +25,35 @@ Evidence for every number claimed: `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.m
 Start here: `ComputedPlacementShardLifecycleIT.testADocumentCanBeIndexedAndRead`, which is `@AwaitsFix`
 and whose javadoc has the run-by-run account of how the failure moved.
 
-**`updateShard` never runs for a computed shard, and this is measured rather than argued.** A logging
-probe in `computedAwareInSyncIds` produced no output at all across a full run in which node logging was
-captured. `ReplicationTracker.updateFromClusterManager` has one feeder, `IndexShard.updateShardState`,
-which has one caller, `IndicesClusterStateService.updateShard`, and that runs only when the shard
-already exists, meaning on a cluster state applied *after* the one that created it. A computed shard on
-an idle cluster never gets a later state. The checkpoint map is empty because nothing ever filled it.
+**Where it is now.** The write fails with `AlreadyClosedException: engine is closed` and the tracker's
+invariant `local checkpoints {} not in-sync with routing table`. That is two layers further along than
+"not in primary mode", and the shard-open test passes in about four seconds.
 
-**So two pieces of the committed C18 code are dead in the scenario they were written for.**
-`computedAwareInSyncIds` and `startComputedShardLocally` both hang off `createOrUpdateShards`, which
-only reaches them via `updateShard`. They are correct and unreachable, which is precisely the failure
-this area has now produced three times: C3's supplier before `registerUnpublished`, the whole C1 to C11
-run before C12, and now these. **Check reachability before writing the next mechanism**, and prefer a
-probe that prints nothing over an argument that sounds right.
+**What is already settled, so as not to re-derive it.**
 
-So recovery completion is the only hook that can work, and the `handleRecoveryDone` attempt was the
-right shape done wrongly. Since `updateShard` never runs, that attempt's `updateShardState` call was the
-tracker's **first**, so the invariant it tripped fired *after* its own update, not before: it left
-`checkpoints` empty while setting a routing table that has the allocation id. That means the in-sync set
-it passed was empty.
+- `updateShard` never runs for a computed shard. Measured: a probe on that path printed nothing across a
+  full run with node logging captured. It fires only on a cluster state applied after the one that
+  created the shard, and an idle cluster publishes no such state. The start transition therefore lives
+  in `handleRecoveryDone`, where an ordinary shard tells the cluster manager it started.
+- The primary term is set at creation, in the same branch that skips publication. Zero is not a legal
+  term and the allocator is what normally bumps it. Setting it node-side instead trades "primary term
+  must be positive" for "term is only increased as part of primary promotion", because the shard is
+  constructed from metadata and a node-local term disagrees with its own shard.
+- The `ReplicationTracker` version gate is **not** a factor. Passing a higher version changed nothing.
 
-The next step is therefore narrow and mechanical: restore the `handleRecoveryDone` variant (it is in
-this branch's history, commit `6b06c95798b` describes it), put the same logging probe inside
-`computedAwareInSyncIds`, and find why it returns empty when called from there. The candidates are that
-`resolveShard` declines, or that the early return on published in-sync ids fires. Do not reason about
-which; the probe answers it in ninety seconds.
+**How to make progress on the current failure.** Put the probe back inside
+`startComputedShardAfterRecovery` (the shape is in commit `fe093d9fbba`) and print what
+`updateShardState` throws. Every layer so far has been named exactly by one log line, and every attempt
+to reason ahead of the probe has been wrong: the version gate, then an empty in-sync set, both
+confidently argued and both false. Three log lines have beaten three arguments.
 
-Two things already ruled out, so as not to spend the time again:
-
-- The version gate in `ReplicationTracker.updateFromClusterManager` is **not** the cause. Passing a
-  higher version changes nothing. Measured.
-- Driving the START transition from `handleRecoveryDone` is **necessary but not sufficient**, and the
-  obvious attempt regresses the sibling test. It tripped the tracker's invariant during recovery, which
-  failed and removed the shard. The necessity is real: on an idle cluster nothing publishes a new state
-  for a computed index, so a transition waiting for one waits forever.
-
-**The framing that makes the rest of C18 predictable.** Computed placement removes the cluster manager
-from the loop, so every piece of state it used to maintain as a side effect has to become a function of
-the placement instead: allocation identity (done, `ComputedShardRouting`), the started transition (not
-done), and the in-sync set (started, insufficient). Expect the next surprise to be another item on that
-list rather than a new category.
+**The framing that makes the rest of C18 predictable, and it has now paid four times.** Computed
+placement removes the cluster manager from the loop, so every piece of state it used to maintain as a
+side effect has to become a function of the placement instead. So far: allocation identity
+(`ComputedShardRouting`), the started transition (`handleRecoveryDone`), the in-sync set (from the
+placement), and the primary term (set at creation). Expect the next surprise to be a fifth item on that
+list rather than a new category, and look for it in `ReplicationTracker`, which is where the remaining
+cluster-manager-shaped assumptions live.
 
 Four seams exist now, and the fourth is the one that keeps being needed:
 
