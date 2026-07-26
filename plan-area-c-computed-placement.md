@@ -608,3 +608,33 @@ replicas, which is what makes them rankable. Whether they should be search-only 
 replication group, as C4 sketched, or full members of it, is not settled here and changes what the
 in-sync set from C18 has to contain. Recorded as a decision for whoever turns the setting on rather than
 as an omission.
+
+## C20 in progress: state recovery was quietly republishing computed routing
+
+**A real bug, found by reading the recovery path rather than by a failure.**
+`ClusterStateUpdaters.updateRoutingTable` rebuilds the routing table from metadata on every state
+recovery, calling `addAsRecovery` for every index, with no equivalent of the guard index creation
+applies. So a single recovery turns every computed index into an ordinary one whose shards are all
+UNASSIGNED, while the node keeps contributing its own computed copy of the same shard id.
+
+It does not throw and does not look like a failure. That is the profile of every defect this area has
+produced: the supplier is consulted only when nothing is published, so republishing does not break
+loudly, it just stops the mechanism from ever running again. **This is the fifth seam, and the rule is
+now general: anywhere that decides what gets published has to respect the opt-out.** The four before it
+were publication at creation, counting active shards, materialising shards locally, and resolving rather
+than looking up.
+
+Guarded, with a unit test, mutation-verified.
+
+**A correction to the guess recorded with C13.** The `@AwaitsFix` note said state recovery expects each
+index in metadata to have routing. That is wrong in the letter: nothing in the recovery path throws or
+asserts on a missing entry, and `RoutingTable.validate` has no production caller and only checks the
+routing to metadata direction anyway.
+
+**And the missing cluster manager is not a routing problem at all.** `Coordinator`, `CoordinationState`
+and `JoinTaskExecutor` never read the routing table, so election is provably independent of it. The
+`state not recovered` block on every node is a consequence of no manager being elected
+(`GatewayService` only recovers on the elected manager), not evidence of a routing fault. Whatever
+prevents election is still unidentified, and instrumenting `RecoverStateUpdateTask.onFailure` and the
+cluster applier is the place to start: that `onFailure` only logs and retries, so an exception there is
+a silent permanent loop rather than a crash.

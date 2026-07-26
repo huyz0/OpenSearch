@@ -41,6 +41,7 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodes;
+import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.RoutingTable;
 import org.opensearch.common.settings.ClusterSettings;
 
@@ -120,6 +121,19 @@ public class ClusterStateUpdaters {
         // initialize all index routing tables as empty
         final RoutingTable.Builder routingTableBuilder = RoutingTable.builder(state.routingTable());
         for (final IndexMetadata cursor : state.metadata().indices().values()) {
+            // An index whose placement is computed must come back from a restart with no routing entry,
+            // exactly as it was created. Publishing one here does not throw and does not look like a
+            // failure, which is what makes it dangerous: the supplier is only ever consulted when
+            // nothing is published, so a single recovery silently turns every computed index into an
+            // ordinary one with a table full of UNASSIGNED shards. The node meanwhile still contributes
+            // its own computed shard, so the same shard id exists twice with different states.
+            //
+            // This is the same guard index creation applies, and it is here for the same reason: state
+            // recovery rebuilds the routing table from metadata, so it is the second place that decides
+            // what gets published.
+            if (AbsentIndexRoutingSuppliers.shouldPublishRouting(cursor) == false) {
+                continue;
+            }
             routingTableBuilder.addAsRecovery(cursor);
         }
         // start with 0 based versions for routing table
