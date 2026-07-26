@@ -18,26 +18,30 @@ Evidence for every number claimed: `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.m
 | **C. Computed placement** | **blocked on C18**, `plan-area-c-computed-placement.md`. C0 to C12 and C17 done. A computed index is creatable and its shard opens; it will not take a write. |
 | B, D, E, F, G | not started |
 
-## The blocker: C13, a restarted computed shard comes back empty
+## The blocker: C2, the node set is not stable, so a restart moves shards off their data
 
-The cluster recovers now. What fails is the data: twenty documents indexed, zero found after a full
-restart. `ComputedPlacementRestartIT` is `@AwaitsFix` and carries the account.
+**A computed index is not safe across a restart, and the cause is placement rather than recovery.**
+Placement is computed against the data nodes visible in the cluster state at that instant. During a
+restart that list grows as nodes rejoin, ownership moves, and the node that gains a shard has none of
+its data. It recovers empty, correctly by its own lights. Different timing gives different symptoms:
+one run returns zero documents, the next cannot find the shard at all.
 
-**Ruled out by probe, so do not spend time here.** The recovery source is correct.
-`withNodeLocalRecoverySource` runs twice and is right both times: `hasData=false` at creation so the
-shard stays `EMPTY_STORE`, `hasData=true` after restart so it becomes `EXISTING_STORE`. C19 works.
+C2 named this before any code was written: two coordinators computing against different node lists
+produce different placement, so the node set is a correctness input rather than a convenience. A restart
+is the same problem in time rather than in space.
 
-**Where to look.** The store opens and comes back empty, which points at history and translog rather
-than placement. The suspects are the three things computed placement changes about a shard's identity:
-the primary term synthesised at creation, the in-sync set derived from the placement, and the shard
-starting itself locally without the cluster manager. Any of those can make recovery bootstrap a new
-history instead of replaying the existing translog, and a new history on an existing store is a blank
-index that looks perfectly healthy.
+**Ruled out by probe, do not spend time here again.** Recovery is not the cause. The recovery source is
+correct at both creation and restart, the `cleanLuceneIndex` branch that silently discards an existing
+store never fires, and the pre-restart recovery is a textbook new index. C19 works.
 
-**Next step is a probe, not an argument.** `StoreRecovery.internalRecoverFromStore`: is the translog
-replayed or a new history bootstrapped, and what are the global checkpoint and translog UUID on the way
-in. Five confident arguments in this area have been wrong and five probes have each been decisive in a
-single run.
+**What C2 needs.** A node snapshot that every node and every moment agrees on, rather than
+`DiscoveryNodes` as-of-now, and placement that does not move a shard because a node is briefly absent.
+`RendezvousShardPlacement` from C1 minimises movement when membership genuinely changes and
+`ComputedPlacementRestartIT` should use it instead of modulo, but that only shrinks the blast radius; it
+does not make the input stable.
+
+**Until C2 lands, do not turn the setting on anywhere real.** A restart silently blanks indices, and a
+blank index is STARTED and green.
 
 ## What is done, and what each of them cost
 
@@ -57,7 +61,7 @@ single run.
 - **C15** adaptive replica selection already ranks the computed candidates, verified rather than
   assumed, because a computed entry is an ordinary `IndexShardRoutingTable` and the ranking does not
   care where it came from.
-- **C13** still open, and it is the blocker above.
+- **C13** open, blocked on C2 above. Recovery is cleared as its cause.
 
 ## Three times a green suite measured nothing, and what stops the fourth
 
