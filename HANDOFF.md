@@ -23,10 +23,20 @@ Evidence for every number claimed: `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.m
 **A computed shard never enters primary mode, so every write is rejected.**
 
 Start here: `ComputedPlacementShardLifecycleIT.testADocumentCanBeIndexedAndRead`, which is `@AwaitsFix`
-and whose javadoc has the run-by-run account of how the failure moved. The immediate symptom is that
-`ReplicationTracker`'s checkpoint map is empty on the first call, so the in-sync set reaching it is
-empty on a path other than `IndicesClusterStateService.computedAwareInSyncIds`, which was changed and
-was not enough. Find that path.
+and whose javadoc has the run-by-run account of how the failure moved.
+
+**The call graph already narrows this to one thing.** `ReplicationTracker.updateFromClusterManager` has
+exactly one feeder, `IndexShard.updateShardState`, which has exactly one caller,
+`IndicesClusterStateService.updateShard`. That runs only when the shard already exists, meaning on a
+cluster state applied *after* the one that created it. A computed shard on an idle cluster never gets a
+later state, so `computedAwareInSyncIds` never executes. The checkpoint map is empty because nothing
+ever filled it, not because the wrong value was passed.
+
+So recovery completion is the only hook that can work, and the `handleRecoveryDone` attempt was the
+right shape done wrongly. The question to answer when retrying it: why did calling `updateShardState`
+from there trip "local checkpoints {} not in-sync with routing table", when that assertion runs at the
+*start* of `updateFromClusterManager` against the tracker's existing state and should pass on a fresh
+tracker? Something had already populated `this.routingTable`. Find what.
 
 Two things already ruled out, so as not to spend the time again:
 
