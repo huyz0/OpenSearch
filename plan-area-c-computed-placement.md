@@ -179,3 +179,52 @@ either resolve on serialize (simple, loses the saving exactly when publication h
 diff to compare unresolved entries by their inputs (keeps the saving, needs the inputs to be part of the
 state). C5 took the first option for `Metadata` and it was the right call there; whether it is here
 depends on whether publication is the hot path, which S6 suggests it is.
+
+## C7 and C8 done, and they found the seam was half-installed
+
+C3 hooked `indexRoutingTable`, which is what `searchShards` resolves through. `ComputedRoutingResolutionTests`
+covered search and then failed on the write path, because `OperationRouting.shards()` -- the single-document
+route used by index, get and update -- reaches `clusterState.getRoutingTable().shardRoutingTable(...)`
+directly and never touches the hooked method.
+
+**A computed index would have answered searches and failed writes.** That is worse than not supplying at
+all: the failure surfaces as a missing index rather than as an unsupported configuration, so it would be
+diagnosed as data loss before anyone suspected routing. The same fallback is now applied there, verified
+by mutation.
+
+Worth naming the lesson, because C3's own commit message got this wrong. "The seam is one hook at the
+point where Phase A degrades" was true of the code I had read and false of the system: Phase A degraded
+in more than one place, and I only hooked the one the first test exercised. The test that found it was
+written for C8, not for C3.
+
+C8 also confirms the intended division of labour: routing hands back a single primary as a hint and
+`ShardHead` CAS decides. A wrong hint costs a retry, not correctness, which is what lets placement be
+computed rather than agreed.
+
+## C6 and C10: no work required, and why
+
+**C6, bypass the allocator.** Under the shipped design there is nothing to bypass. A serverless index
+publishes no routing entry, so `AllocationService` never sees one to allocate, no decider is consulted,
+and no balancer considers it. The plan assumed the allocator would need to be told to skip these indices;
+in fact it is never handed them. `SuspendedShardAllocationDecider` and
+`ServerlessStorageExistingShardsAllocator` remain live for indices that still publish routing, which is
+every non-serverless index, so neither becomes dead code.
+
+**C10, the other nineteen writers.** All are writers of *published* routing, and a serverless index has
+none for them to write. They fall into three groups, none of which needs changing:
+
+- Index lifecycle (`MetadataCreateIndexService`, `MetadataDeleteIndexService`, `MetadataIndexStateService`,
+  `MetadataUpdateSettingsService`) and recovery/restore (`RestoreService`, `RemoteStoreRestoreService`,
+  `LocalAllocateDangledIndices`, `ClusterStateUpdaters`): they add or remove published entries. A
+  serverless index simply has no entry added, and the supplier fills the gap on read.
+- Resharding (the four `MetadataInPlace*` services): these manipulate routing for split and merge. They
+  are the group the plan expected to need real work, and they still might -- but only once resharding runs
+  against a computed-placement index, which requires the setting on, which C11 has not yet justified.
+  Recorded as a dependency of turning the setting on rather than as work now.
+- Everything else (`ScaleIndexClusterStateBuilder`, `TieringService`, `TransportClusterStateAction`,
+  `ClusterManagerService`, `NoopRemoteRoutingTableService`, `LocalShardStateAction`, `AllocationService`,
+  `OperationRouting`): filtering, transport plumbing, or the allocator itself.
+
+**The honest form of this conclusion:** the nineteen writers are fine because computed placement does not
+change what gets published, it changes what happens when nothing was. That is the same property that made
+C3 and C5 small, and it traces back to Phase A.

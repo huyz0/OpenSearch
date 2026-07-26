@@ -530,7 +530,22 @@ public class OperationRouting {
     }
 
     protected IndexShardRoutingTable shards(ClusterState clusterState, String index, String id, String routing) {
-        int shardId = generateShardId(indexMetadata(clusterState, index), id, routing);
+        final IndexMetadata indexMetadata = indexMetadata(clusterState, index);
+        int shardId = generateShardId(indexMetadata, id, routing);
+
+        // The single-document path resolves separately from searchShards, so it needs the same
+        // supplier fallback. Without this a computed index answers searches and fails writes and gets,
+        // which is worse than not supplying at all: the failure looks like a missing index rather than
+        // like an unsupported configuration.
+        if (clusterState.routingTable().hasIndex(index) == false) {
+            IndexRoutingTable supplied = AbsentIndexRoutingSuppliers.supply(clusterState, indexMetadata);
+            if (supplied != null) {
+                IndexShardRoutingTable shard = supplied.shard(shardId);
+                if (shard != null) {
+                    return shard;
+                }
+            }
+        }
         return clusterState.getRoutingTable().shardRoutingTable(index, shardId);
     }
 
