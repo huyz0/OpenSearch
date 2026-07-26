@@ -18,30 +18,23 @@ Evidence for every number claimed: `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.m
 | **C. Computed placement** | **blocked on C18**, `plan-area-c-computed-placement.md`. C0 to C12 and C17 done. A computed index is creatable and its shard opens; it will not take a write. |
 | B, D, E, F, G | not started |
 
-## The blocker: C2, the node set is not stable, so a restart moves shards off their data
+## The blocker: C21, documents are not searchable before a restart even happens
 
-**A computed index is not safe across a restart, and the cause is placement rather than recovery.**
-Placement is computed against the data nodes visible in the cluster state at that instant. During a
-restart that list grows as nodes rejoin, ownership moves, and the node that gains a shard has none of
-its data. It recovers empty, correctly by its own lights. Different timing gives different symptoms:
-one run returns zero documents, the next cannot find the shard at all.
+C2 landed and moved the failure. In `ComputedPlacementRestartIT` twenty documents are indexed without
+error, and a refresh and count returns zero **before** any restart. The lifecycle IT's write test passes,
+so this is specific to something the restart test does.
 
-C2 named this before any code was written: two coordinators computing against different node lists
-produce different placement, so the node set is a correctness input rather than a convenience. A restart
-is the same problem in time rather than in space.
+**First suspect, and it is named in the test.** That test creates an ordinary index to force a cluster
+state change, because the membership maintainer is edge-triggered and would otherwise never publish. That
+index publishes routing and is the first thing the membership sees. Whether its presence shifts the
+computed placement of the shard written afterwards is the first thing to check. Second suspect: whether
+the search reaches the node that actually holds the shard.
 
-**Ruled out by probe, do not spend time here again.** Recovery is not the cause. The recovery source is
-correct at both creation and restart, the `cleanLuceneIndex` branch that silently discards an existing
-store never fires, and the pre-restart recovery is a textbook new index. C19 works.
+**Probe, do not reason.** Ask the shard for its own document count, and compare the node the write went
+to with the node the search reads from.
 
-**What C2 needs.** A node snapshot that every node and every moment agrees on, rather than
-`DiscoveryNodes` as-of-now, and placement that does not move a shard because a node is briefly absent.
-`RendezvousShardPlacement` from C1 minimises movement when membership genuinely changes and
-`ComputedPlacementRestartIT` should use it instead of modulo, but that only shrinks the blast radius; it
-does not make the input stable.
-
-**Until C2 lands, do not turn the setting on anywhere real.** A restart silently blanks indices, and a
-blank index is STARTED and green.
+**Ruled out already, do not revisit.** Recovery is not involved, this happens before any restart. The
+recovery source is correct. Placement is now stable across a restart and that assertion passes.
 
 ## What is done, and what each of them cost
 
@@ -61,7 +54,9 @@ blank index is STARTED and green.
 - **C15** adaptive replica selection already ranks the computed candidates, verified rather than
   assumed, because a computed entry is an ordinary `IndexShardRoutingTable` and the ranking does not
   care where it came from.
-- **C13** open, blocked on C2 above. Recovery is cleared as its cause.
+- **C2** the node set is published, versioned and never shrinks, so a node that is merely restarting no
+  longer takes its shards with it. Adding is automatic, removing is deliberate and unimplemented.
+- **C13** open. Placement stability is fixed; it now waits on C21 above.
 
 ## Three times a green suite measured nothing, and what stops the fourth
 
