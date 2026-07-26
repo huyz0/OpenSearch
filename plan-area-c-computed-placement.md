@@ -228,3 +228,46 @@ none for them to write. They fall into three groups, none of which needs changin
 **The honest form of this conclusion:** the nineteen writers are fine because computed placement does not
 change what gets published, it changes what happens when nothing was. That is the same property that made
 C3 and C5 small, and it traces back to Phase A.
+
+## Final gap review
+
+Every task C0 through C11 is addressed. Re-reading the area as a whole rather than task by task, three
+things stand out that the per-task work did not surface.
+
+**1. The area shrank because Phase A did the hard part.** C3 was planned as a restructuring of
+`RoutingTable`'s internal map; it became an 80-line hook. C5 was planned as keeping serverless entries
+out of the allocator's path; it became a predicate. C6 and C10 were planned as real work; they turned out
+to need none. All four collapsed for the same reason: a serverless index publishes no routing entry, and
+Phase A already made that legal. The plan treated Phase A as a prerequisite in the scheduling sense. It
+was a prerequisite in the design sense, and this area is mostly the payoff.
+
+**2. One defect, and it came from generalising a reading of the code.** C3's commit claimed "the seam is
+one hook at the point where Phase A degrades". Phase A degrades in more than one place, and the write
+path was left unhooked -- so a computed index answered searches and failed writes, which reads as data
+loss rather than as misconfiguration. It was caught by a test written for C8, not for C3.
+
+**3. What is genuinely untested.** Everything here is unit-level. No cluster has run with
+`serverless_storage.computed_placement.enabled` set, so:
+
+- **The setting has never been on in a live node.** C11 measured the algorithm, not the system.
+- **Resharding is unresolved rather than resolved.** The four `MetadataInPlace*` services manipulate
+  routing directly, and whether split and merge work against a computed-placement index cannot be
+  settled without running them.
+- **Recovery has never been exercised.** `ComputedRoutingTable` builds shards already STARTED. What
+  happens when a node holding a computed shard restarts, and the index has no published routing to
+  recover from, is reasoned about but not observed.
+- **Hot-tenant skew has no answer.** K=3 gives room to choose; nothing chooses yet, because C7 feeds the
+  entry to `OperationRouting` without adaptive replica selection ranking the candidates.
+
+## Next cycle
+
+| task | why |
+|---|---|
+| **C12** integration test with the setting on | the acceptance criterion, and the only thing that can find what unit tests cannot |
+| **C13** node restart with a computed index | recovery is reasoned, not observed, and A5 showed what reasoning about recovery costs |
+| **C14** resharding against a computed index | the one C10 dependency left open |
+| **C15** wire ARS to rank the K candidates | C7 resolves to candidates but nothing chooses among them |
+| **C16** hot-tenant override | needs a product answer before it needs code |
+
+C12 and C13 are the ones that gate turning the setting on anywhere real. C14 gates using resharding with
+it. C15 and C16 are optimisation rather than correctness.
