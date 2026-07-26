@@ -151,6 +151,7 @@ import org.opensearch.index.shard.IndexShard;
 import org.opensearch.index.shard.IndexShardState;
 import org.opensearch.index.shard.IndexingOperationListener;
 import org.opensearch.index.shard.IndexingStats;
+import org.opensearch.index.shard.ShardPath;
 import org.opensearch.index.store.remote.filecache.NodeCacheService;
 import org.opensearch.index.translog.InternalTranslogFactory;
 import org.opensearch.index.translog.RemoteBlobStoreInternalTranslogFactory;
@@ -1914,6 +1915,19 @@ public class IndicesService extends AbstractLifecycleComponent
         @Override
         public int compareTo(PendingDelete o) {
             return Integer.compare(shardId, o.shardId);
+        }
+    }
+
+    @Override
+    public boolean hasExistingShardData(ShardId shardId, String customDataPath) {
+        try {
+            return ShardPath.loadShardPath(logger, nodeEnv, shardId, customDataPath) != null;
+        } catch (Exception e) {
+            // Unreadable is not the same as absent, but treating it as absent here would recover the
+            // shard from an empty store, which is the outcome this call exists to prevent. Reporting
+            // "data present" makes the recovery fail loudly instead.
+            logger.warn(() -> new ParameterizedMessage("{} could not determine whether shard data exists", shardId), e);
+            return true;
         }
     }
 

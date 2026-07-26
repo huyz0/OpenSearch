@@ -565,3 +565,28 @@ Three unit tests, mutation-verified: both rejections fail without the guard, and
 index nobody claims is still rejected on its own merits rather than by the new branch. Unit rather than
 integration on purpose, since the guard is pure logic over a cluster state and the integration version
 spent its time on cluster teardown.
+
+## C19: the recovery source has to come from the node, and C13 is still not done
+
+**C19, done.** A computed shard's recovery source can no longer come from the placement function. The
+function is evaluated identically on every node from the same inputs, which is the point of the design
+and also why it cannot answer this question: it does not know which node holds a store. Stating
+`EMPTY_STORE` is right while an index is being created and catastrophic on restart.
+
+The node corrects it at shard creation, using `ShardPath.loadShardPath` to ask whether it already holds
+data, and only ever upgrades `EMPTY_STORE` to `EXISTING_STORE` for an index with no published routing.
+Anything the cluster manager allocates keeps the source it was given. The interface question is
+defaulted to false so implementations that do not manage local storage, including the test doubles, are
+untouched. An unreadable path reports "data present" rather than "absent", because absent would recover
+from an empty store, which is the outcome the call exists to prevent.
+
+**C13 is reopened, and the blocker is bigger than the recovery source.** After a full restart with a
+computed index present, the cluster does not recover: every node reports `state not recovered /
+initialized` and no cluster manager is discovered. That is a gateway-level question, and the likely
+suspect is state recovery expecting each index in metadata to have routing. `ComputedPlacementRestartIT`
+carries the finding and is `@AwaitsFix`.
+
+**It lives in its own class now.** The restart leaves the shared test cluster unusable, so keeping it
+beside the other tests turned one real failure into three misleading ones, with the siblings failing on a
+broken cluster rather than on anything they assert. Isolation here is not tidiness, it is the difference
+between one signal and three false ones.

@@ -45,7 +45,9 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
+import org.opensearch.cluster.routing.ComputedShardRouting;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
+import org.opensearch.cluster.routing.RecoverySource;
 import org.opensearch.cluster.routing.RecoverySource.Type;
 import org.opensearch.cluster.routing.RoutingNode;
 import org.opensearch.cluster.routing.RoutingNodes;
@@ -700,6 +702,7 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
     }
 
     private void createShard(DiscoveryNodes nodes, RoutingTable routingTable, ShardRouting shardRouting, ClusterState state) {
+        shardRouting = withNodeLocalRecoverySource(state, shardRouting);
         assert shardRouting.initializing() : "only allow shard creation for initializing shard but was " + shardRouting;
 
         DiscoveryNode sourceNode = null;
@@ -803,6 +806,46 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
                 );
             }
         }
+    }
+
+    /**
+     * Corrects a computed shard's recovery source using something only this node knows: whether it
+     * already holds the data.
+     *
+     * <p>A computed entry's recovery source comes from the placement function, which every node
+     * evaluates identically from the same inputs. That is the point of the design and it is also why the
+     * function cannot answer this question: it does not know which node has a store. Stating
+     * EMPTY_STORE is right when the index is being created and catastrophic on restart, where it means
+     * the shard recovers from an empty store and the index comes back blank while looking healthy.
+     *
+     * <p>This is the A5 trap in its own habitat. A5 was a recovery source derived from absent in-sync
+     * ids silently becoming EMPTY_STORE; here it is stated rather than derived, and is silently wrong
+     * for the same reason. Both fail the same way, which is why the assertion that caught it is a
+     * document count rather than a shard state: a blank index is STARTED and green.
+     *
+     * <p>Only ever upgrades EMPTY_STORE to EXISTING_STORE, and only for an index with no published
+     * routing entry. Anything the cluster manager allocates keeps the source it was given.
+     */
+    private ShardRouting withNodeLocalRecoverySource(ClusterState state, ShardRouting shardRouting) {
+        if (shardRouting.recoverySource() == null
+            || shardRouting.recoverySource().getType() != Type.EMPTY_STORE
+            || state.routingTable().hasIndex(shardRouting.index())) {
+            return shardRouting;
+        }
+        IndexMetadata indexMetadata = state.metadata().index(shardRouting.index());
+        if (indexMetadata == null) {
+            return shardRouting;
+        }
+        String customDataPath = IndexMetadata.INDEX_DATA_PATH_SETTING.get(indexMetadata.getSettings());
+        if (indicesService.hasExistingShardData(shardRouting.shardId(), customDataPath) == false) {
+            return shardRouting;
+        }
+        logger.debug("{} computed shard has existing data on this node, recovering from the existing store", shardRouting.shardId());
+        return ComputedShardRouting.initializing(
+            shardRouting.shardId(),
+            shardRouting.currentNodeId(),
+            RecoverySource.ExistingStoreRecoverySource.INSTANCE
+        );
     }
 
     /**
@@ -1250,6 +1293,21 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
                 return indexRef.getShardOrNull(shardId.id());
             }
             return null;
+        }
+
+        /**
+         * Whether this node already holds data for the shard.
+         *
+         * <p>Only the node can answer this, which is the whole reason it is asked here. A computed
+         * shard's routing entry is derived from a placement function that every node evaluates
+         * identically, so it cannot know which node has the data, and a recovery source taken from it is
+         * therefore right at creation and wrong at restart.
+         *
+         * <p>Defaulted to false so that implementations which do not manage local storage, including the
+         * test doubles, are unaffected and behave exactly as before.
+         */
+        default boolean hasExistingShardData(ShardId shardId, String customDataPath) {
+            return false;
         }
 
         void processPendingDeletes(Index index, IndexSettings indexSettings, TimeValue timeValue) throws IOException, InterruptedException,
