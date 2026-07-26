@@ -3,7 +3,7 @@ title: Plugin Fixes
 description: Correctness fixes made to the plugin during review, and the deliberate scope boundaries.
 ---
 
-For changes to OpenSearch **core** (outside `plugins/serverless-storage`) that were needed to make this plugin possible, see [Core Changes](/core-changes/). This page covers plugin-internal design decisions and the concurrency/correctness fixes made during review.
+For changes to OpenSearch **core** (outside `plugins/serverless-storage`) that were needed to make this plugin possible, see [Core Changes](/core-changes/).
 
 This plugin was built against a 40-task plan to move it from a fixed shard count decided at index creation toward unbounded, dynamic horizontal partitioning (`dynamic-partitioning-plan.md`). It was followed by many rounds of broadening-scope correctness review across the whole plugin, tracked in `dynamic-partitioning-progress.md`.
 
@@ -35,11 +35,15 @@ A recurring pattern across review rounds: any fix touching shared mutable state 
 
 ### Cache and lock safety
 
+Three separate bugs sharing one shape: a counter or lock entry mutated on the normal path without a matching cleanup on the racing or exceptional one.
+
 - **`LocalDiskCachingBundleStore` unbounded lock-map leak**, then a **self-caught regression**: the first fix (removing a per-key lock entry on eviction) was itself added without holding that key's own lock, which could let a concurrent in-flight writer's lock be silently dropped and re-minted, breaking mutual exclusion. Found by a dedicated adversarial self-review pass targeting the plugin's own recent diffs, not general review. Fixed by synchronizing the delete-and-remove on the entry's own lock.
 - **`InMemoryPlaintextBundleCache` double-counted bytes.** Two concurrent misses for the same key could both reach the cache's `put()`, and the byte-accounting unconditionally added the new entry's size — double-counting when the second `put()` overwrote the first. Fixed by subtracting the previous entry's size (from `Map.put`'s own return value) before adding the new one.
 - **`WalBatchingProcessor.put` backlog-bytes leak** on an interrupted queue put, and a **widened try/finally** elsewhere in the WAL path with the same shape — a byte counter incremented before a blocking call that could throw, without a matching decrement on the exceptional path.
 
 ### Scheduler and resource lifecycle
+
+Node shutdown has to account for every background task this plugin started; missing even one leaks a thread past the node's own lifetime.
 
 - **`ServerlessStoragePlugin#close()` leaked five node-level schedulers.** Only the WAL GC scheduler was being cancelled on plugin shutdown; the scale-to-zero, scale-up, data-stream shard-count advisor, in-place split, and in-place merge scheduler tasks were not, leaking their background threads past node shutdown.
 - **PITR reconciliation scheduled from the reader engine too**, closing the freeze-on-scale-to-zero gap described above.

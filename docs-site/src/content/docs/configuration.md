@@ -3,7 +3,7 @@ title: Configuration
 description: Node- and index-level settings registered by the serverless storage plugin.
 ---
 
-All node settings are defined in `ServerlessStoragePlugin.java`. Most background machinery ships **disabled by default** — see the [Plugin Fixes](/plugin-fixes/) page for which defaults were deliberately kept off even after their underlying fix landed (WAL batching).
+All node settings are defined in `ServerlessStoragePlugin.java`. Most background machinery ships **disabled by default** — WAL batching in particular stays off even though the underlying group-commit mechanism is safe (see [Core Changes](/core-changes/)).
 
 ## Enabling the engine
 

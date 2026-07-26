@@ -3,9 +3,9 @@ title: Core Changes
 description: Changes made to OpenSearch core (outside plugins/serverless-storage) to make a pluggable, per-shard-role storage engine possible.
 ---
 
-Everything on this page is a change to OpenSearch **core** (`server/`, `modules/`, blob-store repository plugins) — not to `plugins/serverless-storage` itself. These are the extension points and seams core needed before an external plugin could implement a writer/reader-split, object-store-native engine at all. For the plugin's own design and its internal correctness fixes, see [Architecture](/design/architecture/) and [Plugin Fixes](/plugin-fixes/).
+Everything on this page is a change to OpenSearch **core** (`server/`, `modules/`, blob-store repository plugins) — not to `plugins/serverless-storage` itself. These are the extension points and seams core needed before an external plugin could implement a writer/reader-split, object-store-native engine at all. For the plugin's own design, see [Architecture](/design/architecture/).
 
-`rfc-serverless-opensearch.md` and `rfc-serverless-metadata-plane.md` (repo root) are the design-level proposals behind this work — this page is the concrete, as-built list of what actually changed in core to realize them.
+`rfc-serverless-opensearch.md` and `rfc-serverless-metadata-plane.md` (repo root) are the design-level proposals behind this work.
 
 ## 1. Per-shard-role engine and directory selection
 
@@ -113,6 +113,8 @@ A classic `Engine` assumes local Lucene commits plus a local translog are the du
 **`Engine.java`** gained, alongside the existing abstract engine surface: `engineRecoveryOperations()` (replays ops from a non-local-translog durability source through the same `applyTranslogOperation` path core already uses for ordinary translog replay — called from `IndexShard.recoverAdditionalEngineOperations()` right after normal translog recovery), `onPrimaryTermBumped(long)` (fired atomically inside `IndexShard.bumpPrimaryTerm`, propagated through `Indexer`/`EngineBackedIndexer`, so an engine can capture activation-time state such as a WAL replay-fencing position at the exact moment a term bump happens instead of racing to observe it separately), and `globalCheckpointSupplierForCombinedDeletionPolicy()` (lets an engine widen local-commit retention when a remote store, not core's usual global-checkpoint/retention-lease chain, is the actual retention authority).
 
 ## 3. Shard-level write guards and recovery-source dispatch
+
+In-place split and merge each have a window where a parent shard is still routable for writes but a write landing in that window would be silently orphaned, acknowledged into a manifest generation no child shard ever references. Core needed a way to reject writes during exactly that window.
 
 **`IndexShard.java`** — a new pre-write check, called from the same place ordinary shard-state checks already run before a primary operation is accepted:
 
@@ -222,6 +224,8 @@ This generalizes CAS-over-blob as a repository capability, rather than something
 
 ## 6. REST handler serverless-scope annotation
 
+A serverless deployment wants to control which REST APIs are reachable at all, but core had no way for a handler to declare that intent, only to be wired into the routing table or not.
+
 **`RestHandler.java`** — a new default method and its enum:
 
 ```diff lang="java"
@@ -272,7 +276,72 @@ Roughly fifteen existing `Rest*Action` classes (e.g. `RestGetAction`, `RestBulkA
 
 ## 8. New in-place merge transport actions
 
-`InPlaceMergeShardAction` / `TransportInPlaceMergeShardAction` / `RestInPlaceMergeShardAction`, mirroring the pre-existing split actions. Combined with item 4's wiring fix and item 7's metadata support, this completes what had been a split-only, partially-wired feature into a full two-phase split-and-merge capability in core, which the plugin's resharding feature (see [Flows](/design/flows/)) builds on directly rather than reimplementing.
+Core had split actions but no merge counterpart, so reversing a split meant nothing existed to call. New actions close that gap: `InPlaceMergeShardAction` / `TransportInPlaceMergeShardAction` / `RestInPlaceMergeShardAction`, mirroring the pre-existing split actions. Combined with item 4's wiring fix and item 7's metadata support, this completes what had been a split-only, partially-wired feature into a full two-phase split-and-merge capability in core, which the plugin's resharding feature (see [Resharding](/design/resharding/)) builds on directly rather than reimplementing.
+
+## 9. Engine-native snapshot/restore extension point
+
+Classic `_snapshot` reads a real local Lucene commit via `Engine#acquireLastIndexCommit` and copies its files to the repository. An engine whose durability already lives entirely in a remote object store has nothing useful to copy locally: the durable copy already exists remotely, under a different addressing scheme than the classic path assumes.
+
+**`Engine.java`** gained one new hook, mirroring the shape and contract of the `recoverMissingLocalStore` family above rather than inventing a new pattern:
+
+```diff lang="java"
+ public abstract class Engine implements Closeable {
+     // ... acquireSafeIndexCommit() and the rest of the existing engine surface ...
+
++    /**
++     * Returns an opaque pointer to this engine's own already-durable remote copy of its current
++     * state, if it maintains one independent of core's copy-based snapshot path. Default returns
++     * Optional.empty(): core falls back to acquireLastIndexCommit-based snapshotting exactly as
++     * before. A non-empty result asserts the pointer bytes are sufficient, on their own, to
++     * reconstruct this exact point-in-time state later, including retaining/pinning whatever they
++     * reference for as long as the resulting snapshot exists.
++     */
++    public Optional<EngineNativeSnapshotPointer> attemptEngineNativeSnapshot(SnapshotId snapshotId) throws EngineException {
++        return Optional.empty();
++    }
+ }
+```
+
+**`EngineFactory.java`** gained the matching restore-side and delete-side hooks:
+
+```diff lang="java"
+ public interface EngineFactory {
+     Engine newReadWriteEngine(EngineConfig config);
+     // ... recoverMissingLocalStore and friends ...
+
++    /**
++     * Called by StoreRecovery exactly once, only when the shard is recovering from a snapshot
++     * this engine itself produced through attemptEngineNativeSnapshot. Default false: this engine
++     * never produces engine-native snapshots, so it never needs to consume one.
++     */
++    default boolean recoverFromEngineNativeSnapshot(IndexShard indexShard, Store store, byte[] snapshotPointer) throws IOException {
++        return false;
++    }
++
++    /**
++     * Cheap, purely local: whether this factory's engines ever produce engine-native snapshots at
++     * all. StoreRecovery checks this before ever calling the repository's real, remote
++     * getEngineNativeShardSnapshotMetadata probe, so a plain classic restore never pays that cost.
++     * Default false, matching every other engine-native default here.
++     */
++    default boolean supportsEngineNativeSnapshots() {
++        return false;
++    }
++
++    /**
++     * Called when a snapshot referencing a pointer this engine produced is deleted, so the engine
++     * can release whatever it pinned to keep that pointer valid. Unlike every other hook on this
++     * interface, this may run with no live IndexShard anywhere in the cluster: it's routed through
++     * a node-level EngineNativeSnapshotReleasers registry the owning plugin populates at startup,
++     * not through the shard itself. Default no-op.
++     */
++    default void releaseEngineNativeSnapshot(byte[] snapshotPointer) throws IOException {}
+ }
+```
+
+`EngineNativeSnapshotPointer` (an engine ID tag plus opaque payload bytes) and `EngineNativeShardSnapshot` (the on-disk envelope `BlobStoreRepository` writes) are two small new types alongside these. `Repository.java` gained matching `default` methods: `snapshotEngineNative(...)` throws `UnsupportedOperationException`, mirroring `snapshotRemoteStoreIndexShard`'s own default, and `getEngineNativeShardSnapshotMetadata(...)` returns `Optional.empty()`. Both are implemented for real once on `BlobStoreRepository` and forwarded by `FilterRepository` like everything else on that interface.
+
+Restore doesn't need a new flag on `SnapshotRecoverySource` to know which format a shard used. `StoreRecovery.recoverFromEngineNativeSnapshot` first checks a cheap, purely local capability flag — `EngineFactory#supportsEngineNativeSnapshots()`, default `false` — before ever calling `getEngineNativeShardSnapshotMetadata`, which is a real remote blob-existence check. Without that gate, every classic-shaped restore across every `BlobStoreRepository`-backed deployment would pay that round trip on every shard, even though almost no engine ever produces an engine-native snapshot. Only when the local flag is `true` does it call the probe; if that comes back empty too, it falls straight through to the original, unmodified `recoverFromRepository`. `SnapshotShardsService.snapshot()` gets the mirror-image branch on the write side: it tries `IndexShard#attemptEngineNativeSnapshot` ahead of the existing classic/remote-store-shallow-copy branching, and only takes the new path if that returns a pointer — cheap by construction, since the default there is a plain in-memory `Optional.empty()`, no remote call. See [Snapshot & Restore](/design/snapshot-restore-proposal/) for the plugin-side implementation this seam supports.
 
 :::note
 This list reflects a diff against the OpenSearch upstream merge-base, filtered to exclude `plugins/serverless-storage` and this docs site. Class and method names are transcribed from that diff — confirm against the current source before relying on exact signatures.

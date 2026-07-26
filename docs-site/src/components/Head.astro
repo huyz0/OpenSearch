@@ -1,0 +1,9 @@
+---
+import Default from '@astrojs/starlight/components/Head.astro';
+const { ...props } = Astro.props;
+---
+
+<Default {...props}><slot /></Default>
+<script>
+	import '../scripts/mermaid-diagrams.js';
+</script>
