@@ -46,13 +46,23 @@ import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertAcked;
  * whether it already holds the data, because a placement function evaluated identically everywhere
  * cannot know which node has a store.
  *
- * <p>What remains is larger. After a full restart with a computed index present, the cluster does not
- * recover at all: every node reports {@code state not recovered / initialized} and no cluster manager is
- * discovered. That is a gateway-level question rather than a shard-level one, and it is the next task.
- * The likely suspect is state recovery expecting each index in metadata to have routing.
+ * <p>C20 then fixed cluster recovery. State recovery had been republishing routing for the computed
+ * index, which collided with the copy the node contributes for itself, and the cluster never came back:
+ * every node reported {@code state not recovered / initialized}. With the guard in place the cluster
+ * recovers and this test runs to completion.
+ *
+ * <p><b>What is left is the documents.</b> The cluster comes back, the shard comes back, and it is
+ * empty: twenty indexed, zero found. So C19's correction, which upgrades the recovery source from
+ * EMPTY_STORE to EXISTING_STORE when the node finds it already holds data, is not taking effect on this
+ * path. Either {@code ShardPath.loadShardPath} does not see the data at the moment the shard is created
+ * after a restart, or the shard is created through a path that does not consult it.
+ *
+ * <p>That is the next thing to probe, and the probe is cheap: log what
+ * {@code hasExistingShardData} returns during the post-restart creation. Every layer of this area has
+ * been named by exactly one log line, and four confident guesses before it were wrong.
  */
-@org.apache.lucene.tests.util.LuceneTestCase.AwaitsFix(bugUrl = "C13: after a full restart with a computed index, the cluster does not recover and no "
-    + "cluster manager is discovered. See this class's javadoc and plan-area-c-computed-placement.md.")
+@org.apache.lucene.tests.util.LuceneTestCase.AwaitsFix(bugUrl = "C13: the cluster now recovers, but the computed shard comes back empty. C19's node-local "
+    + "recovery source is not taking effect on the restart path. See this class's javadoc.")
 public class ComputedPlacementRestartIT extends OpenSearchIntegTestCase {
 
     private static final String INDEX = "computed-restart";

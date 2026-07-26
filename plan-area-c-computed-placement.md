@@ -631,10 +631,17 @@ index in metadata to have routing. That is wrong in the letter: nothing in the r
 asserts on a missing entry, and `RoutingTable.validate` has no production caller and only checks the
 routing to metadata direction anyway.
 
-**And the missing cluster manager is not a routing problem at all.** `Coordinator`, `CoordinationState`
-and `JoinTaskExecutor` never read the routing table, so election is provably independent of it. The
-`state not recovered` block on every node is a consequence of no manager being elected
-(`GatewayService` only recovers on the elected manager), not evidence of a routing fault. Whatever
-prevents election is still unidentified, and instrumenting `RecoverStateUpdateTask.onFailure` and the
-cluster applier is the place to start: that `onFailure` only logs and retries, so an exception there is
-a silent permanent loop rather than a crash.
+**And the guard fixed cluster recovery, which corrects a second guess made here.** The reasoning above
+said the missing cluster manager could not be a routing problem, since election never reads the routing
+table. Election indeed does not, but the republished routing was still the cause: it collided with the
+copy each node contributes for itself, and cluster state application never got far enough for the
+gateway to recover. With the guard in place the cluster comes back and the restart test runs to
+completion. Correct in the letter, wrong in the conclusion, and running it settled in one attempt what
+the argument had settled wrongly.
+
+**What is left of C13 is the documents.** The cluster recovers, the shard recovers, and it is empty:
+twenty indexed, zero found. C19's correction, which upgrades EMPTY_STORE to EXISTING_STORE when the node
+finds it already holds data, is not taking effect on the restart path. Either
+`ShardPath.loadShardPath` does not see the data at the moment the shard is created after a restart, or
+the shard is created through a path that does not consult it. The probe is one log line inside
+`hasExistingShardData`.
