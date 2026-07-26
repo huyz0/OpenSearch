@@ -234,7 +234,7 @@ cannot have at any speed.
 | A9, A10, aliases and fan-out | done |
 | A11, leading-wildcard decision | decided: build the reversed index |
 | A15, chunked name blob | done |
-| A11a to A11d, reversed index implementation | open |
+| A11a to A11d, reversed index implementation | done |
 | A16, sorted overlay | done |
 | A12, persistence and bootstrap | open |
 | A13, transport action and service wrapper | open |

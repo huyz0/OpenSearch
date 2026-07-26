@@ -54,6 +54,34 @@ public final class NamePatterns {
         return pattern.substring(0, end);
     }
 
+    /**
+     * The trailing run of literal characters after the last wildcard, which is what a reversed index can
+     * seek on when the pattern has no usable leading prefix.
+     *
+     * <p>Returns empty for a pattern ending in a wildcard, which has no seekable suffix.
+     */
+    public static String literalSuffixOf(String pattern) {
+        int start = pattern.length();
+        while (start > 0) {
+            char c = pattern.charAt(start - 1);
+            if (c == '*' || c == '?') {
+                break;
+            }
+            start--;
+        }
+        // Never split a surrogate pair, for the same reason literalPrefixOf does not: half a pair is not
+        // valid UTF-16 and encodes to a replacement character that matches nothing.
+        if (start > 0 && start < pattern.length() && Character.isLowSurrogate(pattern.charAt(start))) {
+            start++;
+        }
+        return pattern.substring(start);
+    }
+
+    /** Reverses a name, preserving surrogate pairs. Used to turn a suffix query into a prefix query. */
+    public static String reverse(String value) {
+        return new StringBuilder(value).reverse().toString();
+    }
+
     /** Whether the pattern contains any wildcard at all. */
     public static boolean isPattern(String pattern) {
         return pattern.indexOf('*') >= 0 || pattern.indexOf('?') >= 0;

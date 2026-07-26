@@ -58,13 +58,22 @@ public final class NameIndex {
      */
     static final int DEFAULT_REBUILD_FLOOR = 1_000;
 
-    /** Base and overlay as one unit, so a reader can never mix generations. */
+    /** Base, reversed base and overlay as one unit, so a reader can never mix generations. */
     private static final class State {
         final CompactNameIndex base;
+        /**
+         * The same names reversed, so a suffix query becomes a prefix query.
+         *
+         * <p>A11 measured the alternative: a leading wildcard over 100M names by full scan is about 18
+         * seconds, against microseconds for a seek. Doubling memory from 4.2 to 8.4 GiB buys that, and
+         * 8.4 GiB is still one node.
+         */
+        final CompactNameIndex reversedBase;
         final NameIndexOverlay overlay;
 
-        State(CompactNameIndex base, NameIndexOverlay overlay) {
+        State(CompactNameIndex base, CompactNameIndex reversedBase, NameIndexOverlay overlay) {
             this.base = base;
+            this.reversedBase = reversedBase;
             this.overlay = overlay;
         }
     }
@@ -86,9 +95,19 @@ public final class NameIndex {
     }
 
     public NameIndex(CompactNameIndex base, double rebuildRatio, int rebuildFloor) {
-        this.state = new State(Objects.requireNonNull(base, "base"), new NameIndexOverlay());
+        Objects.requireNonNull(base, "base");
+        this.state = new State(base, reversedOf(base), new NameIndexOverlay());
         this.rebuildRatio = rebuildRatio;
         this.rebuildFloor = rebuildFloor;
+    }
+
+    /** Builds the reversed twin of a base. Aliases are carried by name, so targets survive unchanged. */
+    private static CompactNameIndex reversedOf(CompactNameIndex base) {
+        CompactNameIndexBuilder builder = new CompactNameIndexBuilder(base.size());
+        for (int ordinal = 0; ordinal < base.size(); ordinal++) {
+            builder.add(NamePatterns.reverse(base.nameAt(ordinal)), base.uuidAt(ordinal), base.statusAt(ordinal));
+        }
+        return builder.build();
     }
 
     // ---------------------------------------------------------------- reads
@@ -138,6 +157,15 @@ public final class NameIndex {
         }
 
         String prefix = NamePatterns.literalPrefixOf(pattern);
+        if (prefix.isEmpty()) {
+            String suffix = NamePatterns.literalSuffixOf(pattern);
+            if (suffix.isEmpty() == false) {
+                forEachMatchingBySuffix(current, pattern, suffix, consumer);
+                return;
+            }
+            // Neither end is anchored, so there is nothing to seek on in either direction and this is a
+            // genuine full scan. `*` alone is the common case and means everything.
+        }
 
         // A range scan over the sorted overlay, stopping at the first name that leaves the prefix. The
         // overlay was a hash map originally, which meant walking all of it on every query; the rebuild
@@ -180,6 +208,44 @@ public final class NameIndex {
         }
     }
 
+    /**
+     * Suffix-anchored resolution, seeking the reversed base instead of scanning the forward one.
+     *
+     * <p>Results are collected and sorted rather than streamed in order, because the reversed structure
+     * yields them in reversed-name order and callers are promised forward byte order. That is affordable
+     * precisely because this path exists for queries whose answer is small relative to the index; a
+     * pattern selecting most of the index has a prefix to seek on instead.
+     */
+    private void forEachMatchingBySuffix(State current, String pattern, String suffix, Consumer<IndexNameEntry> consumer) {
+        String reversedSuffix = NamePatterns.reverse(suffix);
+        List<IndexNameEntry> matches = new ArrayList<>();
+
+        current.reversedBase.forEachWithPrefix(reversedSuffix, ordinal -> {
+            String name = NamePatterns.reverse(current.reversedBase.nameAt(ordinal));
+            if (current.overlay.covers(name)) {
+                // Deleted, or superseded by a put the overlay stream below will emit.
+                return;
+            }
+            if (NamePatterns.matches(pattern, name)) {
+                matches.add(new IndexNameEntry(name, current.reversedBase.uuidAt(ordinal), current.reversedBase.statusAt(ordinal)));
+            }
+        });
+
+        for (IndexNameEntry entry : current.overlay.reversedPutsFrom(reversedSuffix)
+            .entrySet()
+            .stream()
+            .takeWhile(e -> e.getKey().startsWith(reversedSuffix))
+            .map(java.util.Map.Entry::getValue)
+            .collect(java.util.stream.Collectors.toList())) {
+            if (NamePatterns.matches(pattern, entry.getName())) {
+                matches.add(entry);
+            }
+        }
+
+        matches.sort((a, b) -> NamePatterns.compareUtf8(a.getName(), b.getName()));
+        matches.forEach(consumer);
+    }
+
     /** Convenience for callers that genuinely want the whole answer in memory. */
     public List<IndexNameEntry> resolve(String pattern) {
         List<IndexNameEntry> found = new ArrayList<>();
@@ -197,8 +263,10 @@ public final class NameIndex {
         return state.overlay.size();
     }
 
+    /** Both structures, since the reversed twin is a real cost and hiding it would understate sizing. */
     public long ramBytesUsed() {
-        return state.base.ramBytesUsed();
+        State current = state;
+        return current.base.ramBytesUsed() + current.reversedBase.ramBytesUsed();
     }
 
     // --------------------------------------------------------------- writes
@@ -273,7 +341,11 @@ public final class NameIndex {
                 builder.add(entry);
             }
 
-            state = new State(builder.build(), new NameIndexOverlay());
+            // Both structures are rebuilt from the same builder output. Producing one and forgetting the
+            // other is the A11c trap: the index would answer prefix queries correctly and suffix queries
+            // with stale data, which is worse than failing.
+            CompactNameIndex rebuilt = builder.build();
+            state = new State(rebuilt, reversedOf(rebuilt), new NameIndexOverlay());
         }
     }
 

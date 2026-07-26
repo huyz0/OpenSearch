@@ -50,6 +50,17 @@ public final class NameIndexOverlay {
 
     private final ConcurrentSkipListSet<String> tombstones = new ConcurrentSkipListSet<>(NamePatterns::compareUtf8);
 
+    /**
+     * The same entries keyed by reversed name, so a suffix query can range-scan the overlay the way a
+     * prefix query does.
+     *
+     * <p>Held here rather than in a second overlay object on purpose. The plan flagged "keep the forward
+     * and reversed structures in step" as the trap in this work, because a create that reaches one and
+     * not the other is visible to prefix queries and invisible to suffix ones. Putting both maps behind
+     * one {@link #put} makes that divergence impossible rather than a thing to remember.
+     */
+    private final ConcurrentSkipListMap<String, IndexNameEntry> reversedPuts = new ConcurrentSkipListMap<>(NamePatterns::compareUtf8);
+
     /** Records a create or an update. Clears any tombstone, so a delete then create resolves to present. */
     public void put(IndexNameEntry entry) {
         Objects.requireNonNull(entry, "entry");
@@ -57,6 +68,8 @@ public final class NameIndexOverlay {
         // name in both collections and has to guess which wins.
         tombstones.remove(entry.getName());
         puts.put(entry.getName(), entry);
+        reversedPuts.put(NamePatterns.reverse(entry.getName()), entry);
+
     }
 
     /**
@@ -66,6 +79,7 @@ public final class NameIndexOverlay {
     public void delete(String name) {
         Objects.requireNonNull(name, "name");
         puts.remove(name);
+        reversedPuts.remove(NamePatterns.reverse(name));
         tombstones.add(name);
     }
 
@@ -94,6 +108,14 @@ public final class NameIndexOverlay {
      */
     public NavigableMap<String, IndexNameEntry> putsFrom(String fromInclusive) {
         return puts.tailMap(fromInclusive, true);
+    }
+
+    /**
+     * Entries whose <em>reversed</em> name is at or after {@code fromInclusive}. The caller stops when
+     * reversed names stop matching its reversed suffix.
+     */
+    public NavigableMap<String, IndexNameEntry> reversedPutsFrom(String fromInclusive) {
+        return reversedPuts.tailMap(fromInclusive, true);
     }
 
     public Set<String> tombstones() {
