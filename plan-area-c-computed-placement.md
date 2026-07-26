@@ -311,3 +311,75 @@ assert against.
 | **C16** hot-tenant override | needs a product answer |
 
 C17 replaces C12 at the head of the queue. C12 itself becomes the test that passes when C17 lands.
+
+## C17 landed, and the audit behind it found a worse problem than the hang
+
+The blocker itself was small. `ActiveShardCount.enoughShardsActive(ClusterState, indices)` is the only
+place in the codebase that counts active shards from a whole cluster state, and index creation waits on
+it through `ActiveShardsObserver`. It read the routing table directly, found nothing, and either asserted
+or dereferenced null depending on whether assertions were on. Making it resolve through the supplier is
+one line.
+
+Two things came out of doing it that were not in the plan.
+
+**The pairing is now one function.** `AbsentIndexRoutingSuppliers.resolve(state, indexName)` returns the
+published entry or the computed one. C3 hooked resolution and left the write path unhooked because the
+pairing of "look up, then maybe supply" was open-coded at each site, and the second site was written by
+someone who had read the first. Three call sites later, that was going to happen again. Having one
+function to call is what makes the next site hard to get wrong, and it is cheap insurance against the
+one defect this area has actually produced.
+
+**Cluster health reported GREEN for indices with no shards anywhere.** `ClusterStateHealth` skipped an
+index with no routing entry, which does not throw and does not hang. It removes the index from every
+counter, so the cluster looks perfect. `ensureGreen()` in the test framework is a thin wrapper over that
+health response, so every integration test written for the rest of this area would have passed without
+exercising anything. That is worse than the hang: a hang is a finding, a false green is a false finding.
+Both health constructors now resolve, and the active-shards percentage counts computed entries rather
+than dividing by an empty routing table, which was also a NaN in the health response for a cluster whose
+indices are all computed.
+
+**What the test taught, again.** The first version of the integration test asserted `assertAcked` on
+creation, and it passed with the fix reverted. Creation does not hang any more once the null branch
+returns false instead of asserting: it waits out the thirty-second active-shards timeout and comes back
+acknowledged with `shardsAcknowledged=false`, which `assertAcked` does not look at. The clock said it too,
+6.3 seconds against 33.9. The assertion had to move to `isShardsAcknowledged`. A test that passes against
+the mutation is not a test, and this one only got caught because the mutation was run.
+
+## C18: the shards do not exist
+
+The audit that C17 started asked which code counts shards. Asking which code *creates* them gives a
+worse answer.
+
+`RoutingNodes.localRoutingNode` builds the local node's shard list by looping the published routing
+table, and all seven phases of `IndicesClusterStateService` take their work list from it. A computed
+index is in none of them, so no `IndexService` and no `IndexShard` is ever created, on any node. There is
+no second path: recovery from disk is a `RecoverySource` on a routing entry that already came from the
+table, and dangling index import publishes an entry rather than bypassing one.
+
+So a computed index today is a routing fiction. Coordinators resolve it, health counts it, creation
+completes, and every request lands on a node that was never told to open the shard. A write fails with
+`ShardNotFoundException`, which is a shard-not-available exception, so `TransportReplicationAction`
+retries it until the request timeout rather than failing fast.
+
+The seam is `localRoutingNode` and deliberately not the `RoutingNodes` constructor. The constructor is
+what `AllocationService` and `ClusterState#getRoutingNodes` build, so adding computed shards there hands
+these indices back to the allocator, which is the one thing this area exists to avoid. The local helper
+is read only by the data node's own shard lifecycle. Hooking it materializes shards locally and leaves
+allocation with nothing to allocate, which is the same split that made C6 and C10 turn out to need no
+work.
+
+Three obstacles are already visible from reading, and each needs a decision rather than a patch:
+
+- `createOrUpdateShards` and `createShard` both assert the routing entry is INITIALIZING. A computed
+  entry that is already STARTED cannot open a shard. So the coordinator view and the local view have to
+  disagree on purpose: STARTED to whoever is routing, INITIALIZING to the node that has not opened it
+  yet. The two registrations already separate those questions.
+- `updateShard` calls `routingTable.shardRoutingTable(shardId)`, which throws `IndexNotFoundException`
+  for a computed index, so the shard would be failed and removed on the next cluster state.
+- `ShardStateAction`'s started-shard executor looks the shard up by allocation id, finds nothing, logs,
+  and marks the task successful. The cluster manager will never move a computed shard to STARTED. The
+  transition has to be local, which fits the premise of the area but is a state machine that does not
+  exist yet.
+
+C13 is blocked on this. Restarting a node to see whether a computed index recovers its data is not a
+question that can be asked while the index has no data, because it has no shard.

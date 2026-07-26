@@ -34,6 +34,7 @@ package org.opensearch.action.support;
 
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.common.annotation.PublicApi;
@@ -170,14 +171,28 @@ public final class ActiveShardCount implements Writeable {
                 // and we can stop waiting
                 continue;
             }
-            final IndexRoutingTable indexRoutingTable = clusterState.routingTable().index(indexName);
+            // Resolution, not a raw lookup. An index whose placement is computed publishes no routing
+            // entry, so reading the table directly finds nothing, counts zero active shards, and the
+            // create API waits forever for shards that were never going to be published. That is what
+            // C12 hit: creation hung until the twenty-minute suite timeout. Counting has to consult the
+            // supplier the same way routing resolution does.
+            final IndexRoutingTable indexRoutingTable = AbsentIndexRoutingSuppliers.resolve(clusterState, indexName);
             if (indexRoutingTable == null && indexMetadata.getState() == IndexMetadata.State.CLOSE) {
                 // its possible the index was closed while waiting for active shard copies,
                 // in this case, we'll just consider it that we have enough active shard copies
                 // and we can stop waiting
                 continue;
             }
-            assert indexRoutingTable != null;
+            if (indexRoutingTable == null) {
+                // An open index with neither a published nor a computed entry. With no supplier installed
+                // that is impossible and the assertion says so, which is what this line has always meant.
+                // With one installed that declined it is a configuration error, and the honest answer is
+                // that the shards are not active: the caller then times out with its own message instead
+                // of an NPE thrown from a cluster state applier thread, where it would take down the
+                // listener rather than the request.
+                assert AbsentIndexRoutingSuppliers.isRegistered() : "open index [" + indexName + "] has no routing entry";
+                return false;
+            }
 
             if (indexRoutingTable.allPrimaryShardsActive() == false) {
                 if (indexMetadata.getSettings().getAsBoolean(IndexMetadata.INDEX_BLOCKS_SEARCH_ONLY_SETTING.getKey(), false) == false) {

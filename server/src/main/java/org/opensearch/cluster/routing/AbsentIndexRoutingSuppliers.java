@@ -119,6 +119,33 @@ public final class AbsentIndexRoutingSuppliers {
         }
     }
 
+    /**
+     * The routing entry for an index: the published one if there is one, otherwise the computed one, or
+     * null if neither exists.
+     *
+     * <p>Every caller that reads a routing entry and has to handle its absence should go through this
+     * rather than pairing {@code routingTable().index(name)} with its own call to {@link #supply}. C3
+     * hooked resolution and left the write path unhooked, so a computed index answered searches and
+     * failed writes; that divergence was possible because the pairing was open-coded at each site. One
+     * function is what makes the next site hard to get wrong.
+     *
+     * <p>Returns null rather than throwing for an index in neither table, because the callers disagree
+     * about what that means: routing treats it as no shard available, health skips it, and creation
+     * treats it as already deleted.
+     */
+    public static IndexRoutingTable resolve(ClusterState state, String indexName) {
+        IndexRoutingTable published = state.routingTable().index(indexName);
+        if (published != null) {
+            return published;
+        }
+        if (isRegistered() == false) {
+            // The metadata lookup is skipped rather than made and discarded. This runs once per index per
+            // health call, and the index count this area exists for is in the millions.
+            return null;
+        }
+        return supply(state, state.metadata().index(indexName));
+    }
+
     /** Whether a supplier is installed. Exposed so callers can skip work they would otherwise discard. */
     public static boolean isRegistered() {
         return SUPPLIER.get() != null;
