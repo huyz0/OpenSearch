@@ -1661,9 +1661,41 @@ public class MetadataCreateIndexService {
         RoutingTable.Builder routingTableBuilder = RoutingTable.builder(updatedState.routingTable());
         if (org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers.shouldPublishRouting(updatedState.metadata().index(indexName))) {
             routingTableBuilder.addAsNew(updatedState.metadata().index(indexName));
+        } else {
+            // Creation is the assignment, so creation sets the primary term. A term is normally bumped by
+            // the cluster manager when it assigns a primary, and for an index the allocator never touches
+            // it would stay at zero. Zero is not a legal term: activatePrimaryMode fails adding the peer
+            // recovery retention lease with "primary term must be positive but was [0]", and the shard is
+            // failed and removed after recovery. Setting it here rather than on the node keeps every later
+            // reader agreeing, which the node-local version did not: the shard is constructed from
+            // metadata, so a node that substituted its own term tripped "term is only increased as part of
+            // primary promotion" instead.
+            updatedState = ClusterState.builder(updatedState)
+                .metadata(
+                    Metadata.builder(updatedState.metadata()).put(withInitialPrimaryTerms(updatedState.metadata().index(indexName)), true)
+                )
+                .build();
         }
         updatedState = ClusterState.builder(updatedState).routingTable(routingTableBuilder.build()).build();
         return rerouteRoutingTable.apply(updatedState, "index [" + indexName + "] created");
+    }
+
+    /**
+     * The same index metadata with every shard's primary term at least one.
+     *
+     * <p>Only for indices whose routing is not published. A term orders primary failovers, and under
+     * computed placement the lease in {@code ShardHead} is the authority on who may write, so one is a
+     * legal starting value rather than a meaningful one. Failover, when it arrives, has to take its term
+     * from the lease.
+     */
+    private static IndexMetadata withInitialPrimaryTerms(IndexMetadata indexMetadata) {
+        IndexMetadata.Builder builder = IndexMetadata.builder(indexMetadata);
+        for (int shardId = 0; shardId < indexMetadata.getNumberOfShards(); shardId++) {
+            if (indexMetadata.primaryTerm(shardId) == 0) {
+                builder.primaryTerm(shardId, 1);
+            }
+        }
+        return builder.build();
     }
 
     static IndexMetadata buildIndexMetadata(

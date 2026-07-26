@@ -918,7 +918,55 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
 
     public void handleRecoveryDone(ReplicationState state, ShardRouting shardRouting, long primaryTerm) {
         RecoveryState recoveryState = (RecoveryState) state;
+        if (startComputedShardAfterRecovery(shardRouting, primaryTerm)) {
+            return;
+        }
         shardStateAction.shardStarted(shardRouting, primaryTerm, "after " + recoveryState.getRecoverySource(), SHARD_STATE_ACTION_LISTENER);
+    }
+
+    /**
+     * Starts a recovered computed shard here, instead of asking the cluster manager to do it.
+     *
+     * <p>Telling the cluster manager does nothing for a computed shard: the started-shard task looks it
+     * up by allocation id in the published routing table, finds no entry, logs, and reports success. The
+     * shard would sit in POST_RECOVERY forever.
+     *
+     * <p>It has to happen here rather than on the next applied cluster state, and that distinction was
+     * measured rather than reasoned. {@code updateShard} runs only when the shard already exists, which
+     * means on a state applied after the one that created it, and an idle cluster publishes no such
+     * state for a computed index. A probe placed on that path printed nothing at all.
+     *
+     * @return true when this shard was started locally and the cluster manager should not be told
+     */
+    private boolean startComputedShardAfterRecovery(ShardRouting shardRouting, long primaryTerm) {
+        ClusterState state = clusterService.state();
+        if (state.routingTable().hasIndex(shardRouting.index())) {
+            return false;
+        }
+        AllocatedIndex<? extends Shard> indexService = indicesService.indexService(shardRouting.index());
+        if (indexService == null) {
+            return false;
+        }
+        Shard shard = indexService.getShardOrNull(shardRouting.id());
+        if (shard == null) {
+            return false;
+        }
+        ShardRouting started = shardRouting.moveToStarted();
+        try {
+            shard.updateShardState(
+                started,
+                primaryTerm,
+                primaryReplicaSyncer::resync,
+                state.version(),
+                computedAwareInSyncIds(state, started, state.metadata().index(shardRouting.index())),
+                computedAwareShardRoutingTable(state, started),
+                state.nodes()
+            );
+        } catch (Exception e) {
+            failAndRemoveShard(shardRouting, false, "failed to start computed shard after recovery", e, state);
+            return true;
+        }
+        return true;
     }
 
     private void failAndRemoveShard(

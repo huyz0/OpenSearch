@@ -89,9 +89,18 @@ public class ComputedPlacementShardLifecycleIT extends OpenSearchIntegTestCase {
      *   <li>Write reaches the primary. "shard is not in primary mode", because
      *       {@code inSyncAllocationIds} is cluster-manager-maintained and a computed index never gets
      *       any. Partly addressed by reading the in-sync set from the placement.</li>
-     *   <li>Still not in primary mode. {@code ReplicationTracker}'s checkpoint map is empty on the first
-     *       call, so the in-sync set it is given is empty on a path other than the one that was fixed.
-     *       Not yet found.</li>
+     *   <li>Still not in primary mode. A logging probe then showed the in-sync path was never called at
+     *       all: {@code updateShard} runs only on a cluster state applied after the one that created the
+     *       shard, and an idle cluster publishes no such state for a computed index. The transition was
+     *       moved to recovery completion, where it is the tracker's first and only call.</li>
+     *   <li>"primary term must be positive but was [0]". A term is bumped by the cluster manager when it
+     *       assigns a primary, so an index the allocator never touches keeps zero, and
+     *       {@code activatePrimaryMode} fails adding the peer recovery retention lease.</li>
+     *   <li>"term is only increased as part of primary promotion", from substituting the term on the node:
+     *       the shard is constructed from metadata, so a node-local term disagrees with its own shard.
+     *       Setting it at creation instead, where for a computed index creation is the assignment, keeps
+     *       every reader agreeing.</li>
+     *   <li>"engine is closed", with the tracker's checkpoint invariant firing again. Current state.</li>
      * </ol>
      *
      * <p>A measured non-result belongs here too: the version gate in
