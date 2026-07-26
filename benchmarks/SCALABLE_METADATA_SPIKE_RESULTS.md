@@ -796,3 +796,66 @@ that fits, and it is still flat where every alternative is linear in shards. But
 one heap, so cells stop being a scaling nicety and become arithmetic: even a generous 16 GiB metadata
 budget per cluster-manager holds about 24M tenants, which is four cells for 100M before any other
 constraint is considered.
+
+## S12: computed placement, and the ceiling S6 found does not apply to it
+
+The target moved to 100M indices at up to 100 shards each, so up to 10B shards. S6 put the allocator's
+ceiling at the order of 100k *active* shards. Those two numbers are five orders of magnitude apart, and
+no amount of tuning closes that. The question is whether placement can stop being allocated and start
+being computed.
+
+First, the deferred cost holds at the new shard count. `DeferredMetadataHeapEstimate` at 100 shards:
+
+| shards | materialized | deferred | reduction |
+|---|---|---|---|
+| 1 | 2,743 B/index | 698 B/index | 3.9x |
+| 30 | 6,214 B/index | 698 B/index | 8.9x |
+| 100 | 15,522 B/index | **698 B/index** | 22.2x |
+
+Flat to three significant figures across a hundredfold change in shard count. 100M indices cost 65 GiB
+deferred against 1,446 GiB materialized.
+
+**`ComputedPlacementSpike` measures rendezvous (highest random weight) placement**, K=3 candidates per
+shard, 1M shards sampled:
+
+| nodes | lookup | distribution (min/max vs ideal) |
+|---|---|---|
+| 10 | 80 ns | 0.99x / 1.00x |
+| 50 | 168 ns | 0.99x / 1.02x |
+| 200 | 359 ns | 0.95x / 1.03x |
+
+Membership change, measured as the fraction of shards whose primary moves and the fraction that lose
+*every* previously-warm candidate:
+
+| nodes | change | primary moves (ideal) | lost all K warm |
+|---|---|---|---|
+| 200 | +1 | 0.50% (0.50%) | **0.000%** |
+| 200 | +100 | 33.29% (33.33%) | 3.614% |
+| 200 | +200 | 49.96% (50.00%) | 12.373% |
+
+**Placement quality is at the theoretical optimum.** Primary moves track `added/(N+added)` to two
+decimal places at every size, and distribution stays within 5% of even at 200 nodes. There is no tuning
+knob here to get wrong, which is the main practical advantage over a token ring.
+
+**Incremental scaling is free.** A single join leaves *no* shard without a warm candidate, and that is
+structural rather than lucky: one new node can displace at most one of K, so K-1 warm holders always
+survive. Autoscaling one node at a time costs nothing in cold reads.
+
+**Large jumps are the case that needs help.** Doubling the fleet leaves 12.4% of shards with no warm
+candidate at all. That is the deploy, zone-recovery and capacity-doubling case, and it is the argument
+for promoting the pre-warm task from optional to required: it was optional when placement was
+allocator-driven and moves were rare, but under computed placement every large scale event triggers it.
+
+**What this does to the ceiling.** The comparison is not lookup-versus-lookup. A stored routing table
+read is a hash map hit, call it 20-50 ns, so computed placement is several times *slower* per request
+at 359 ns. That is irrelevant next to a millisecond-scale search. What matters is that the allocator
+must do a global pass over every shard against every node, superlinearly, and computed placement never
+does one. The 10B-shard global pass that S6's curve says is impossible is not made faster here; it is
+never executed.
+
+**What this does not settle.** A hash does not know that one tenant takes a thousand times the traffic,
+nor that a node's cache is full. K=3 gives room to choose among candidates rather than solving it, and
+the choosing needs a signal: OpenSearch's existing adaptive replica selection ranks by service time and
+queue depth, and a cold node reads as a slow node, so it should drift traffic toward warm replicas on
+its own. That inference is untested here. Writers are unaffected either way, since a writer must be
+single-owner and `ShardHead` CAS already fences that in the object store rather than in cluster state.
