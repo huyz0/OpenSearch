@@ -112,6 +112,46 @@ public class IndexDescriptorPublisherTests extends OpenSearchTestCase {
         assertTrue("an installed publisher must be reported as invoked", IndexDescriptorPublisher.publish(indexMetadata("b", 1, 0)));
     }
 
+    /**
+     * H4e. Rebuilding metadata from scratch must not republish every index it touches.
+     *
+     * <p>Gateway recovery, remote cluster state restore and reading metadata from disk all build a
+     * Metadata from nothing. Publishing from those would mean a descriptor write per index on every
+     * recovery, which at a hundred million indices is slower than the recovery itself. The discriminator
+     * is whether the builder started from an existing metadata, which is what separates "one writer
+     * changed one index" from "we are rebuilding the world".
+     */
+    public void testBuildingFromScratchDoesNotRepublish() {
+        AtomicInteger published = new AtomicInteger();
+        IndexDescriptorPublisher.register(descriptor -> published.incrementAndGet());
+
+        Metadata.Builder fromScratch = Metadata.builder();
+        for (int i = 0; i < 10; i++) {
+            fromScratch.put(indexMetadata("restored-" + i, 1, 0), false);
+        }
+        fromScratch.build();
+
+        assertEquals("a restore must not write a descriptor per index it reads", 0, published.get());
+    }
+
+    /**
+     * The control, and the case that must not be lost to the optimisation above. A state received from
+     * the cluster manager arrives as a diff applied to the previous metadata, and the indices it changes
+     * must still update their descriptors.
+     */
+    public void testAnIncrementalUpdateStillPublishes() {
+        Metadata existing = Metadata.builder().put(indexMetadata("already-here", 1, 0), false).build();
+
+        AtomicInteger published = new AtomicInteger();
+        IndexDescriptorPublisher.register(descriptor -> published.incrementAndGet());
+
+        Metadata.Builder incremental = Metadata.builder(existing);
+        incremental.put(indexMetadata("changed", 1, 0), false);
+        incremental.build();
+
+        assertEquals("an incremental change must still record its descriptor", 1, published.get());
+    }
+
     // ---------------------------------------------------------------- helpers
 
     /** Reroute is not what these assert, so it is the identity rather than a mock with behaviour. */

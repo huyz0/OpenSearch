@@ -1492,7 +1492,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
             // The builder overload, which is what close and alias updates use. Hooking only the other one
             // left the descriptor stale for exactly those, and the test that caught it asserted the state
             // after a close rather than that some descriptor existed.
-            IndexDescriptorPublisher.publish(indexMetadata);
+            publishDescriptorIfIncremental(indexMetadata);
             return this;
         }
 
@@ -1505,16 +1505,33 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
                 indexMetadata = IndexMetadata.builder(indexMetadata).version(indexMetadata.getVersion() + 1).build();
             }
             indices.put(indexMetadata.getIndex().getName(), indexMetadata);
-            // Area H's descriptor follows the metadata rather than only its creation. Hooked here, at the
-            // one point every writer passes through, instead of at each of the twelve services that
-            // update index metadata: closing an index, changing an alias and resharding all reach this
-            // line, and enumerating those call sites is how a writer gets missed. H2c pinned the gap this
-            // closes, where a close left the descriptor saying OPEN.
-            //
-            // Fires per changed index rather than per index in the cluster, so it does not reintroduce
-            // the O(total) sweep this area exists to remove.
-            IndexDescriptorPublisher.publish(indexMetadata);
+            publishDescriptorIfIncremental(indexMetadata);
             return this;
+        }
+
+        /**
+         * Records the descriptor for an index whose metadata just changed, for Area H.
+         *
+         * <p>Hooked at the two {@code put} overloads rather than at each of the twelve services that
+         * update index metadata, because enumerating those call sites is how a writer gets missed. Closing
+         * an index, changing an alias and resharding all arrive here.
+         *
+         * <p><b>Only when this builder is incremental</b>, which is what {@code previousMetadata} being
+         * present means. A builder started from scratch is rebuilding the whole world rather than changing
+         * one index: gateway recovery, remote cluster state restore and reading metadata from disk all do
+         * that, and publishing from them would mean a descriptor write per index on every recovery. At a
+         * hundred million indices that is slower than the recovery it accompanies.
+         *
+         * <p>Diff application sets {@code previousMetadata} too, so a state received from the cluster
+         * manager still publishes what changed in it. That is the case this must not skip, and it is why
+         * the discriminator is "did this builder start from an existing metadata" rather than "was this
+         * built locally".
+         */
+        private void publishDescriptorIfIncremental(IndexMetadata indexMetadata) {
+            if (previousMetadata == null) {
+                return;
+            }
+            IndexDescriptorPublisher.publish(indexMetadata);
         }
 
         public IndexMetadata get(String index) {
