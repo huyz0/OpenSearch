@@ -55,6 +55,34 @@ public final class IndexDescriptorPublisher {
     }
 
     /**
+     * Records that an index was deleted, as a tombstoned descriptor rather than an absence.
+     *
+     * <p>Absence cannot be distinguished from not having looked, which is why {@link IndexGraveyard}
+     * exists at all: a node partitioned during a delete would otherwise adopt its dangling shard data on
+     * rejoin. A tombstoned descriptor answers that question durably, and unlike the graveyard it does not
+     * forget, since the graveyard keeps a bounded list and purges the oldest entries.
+     *
+     * <p>The uuid and shard count survive the tombstone deliberately. They are what identifies the
+     * dangling data that has to be reclaimed, so a tombstone that carried only the name would say an
+     * index is gone without saying what to delete.
+     *
+     * @return whether a publisher was invoked, so a caller can tell "nothing listening" from "recorded"
+     */
+    public static boolean publishTombstone(IndexMetadata indexMetadata) {
+        Consumer<IndexDescriptor> publisher = PUBLISHER.get();
+        if (publisher == null || indexMetadata == null) {
+            return false;
+        }
+        try {
+            publisher.accept(IndexDescriptor.from(indexMetadata).tombstoned());
+            return true;
+        } catch (Exception e) {
+            logger.warn("failed to publish tombstone for [" + indexMetadata.getIndex().getName() + "]", e);
+            return true;
+        }
+    }
+
+    /**
      * Records the descriptor for a newly created index, if anything is listening.
      *
      * @return whether a publisher was invoked, which is what lets a test tell "nothing installed" apart

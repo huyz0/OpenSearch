@@ -166,6 +166,16 @@ public class MetadataDeleteIndexService {
             logger.info("{} deleting index", index);
             routingTableBuilder.remove(indexName);
             clusterBlocksBuilder.removeIndexBlocks(indexName);
+            // Area H's tombstone, recorded before the metadata entry goes, since it is derived from it.
+            // Deletion has to be remembered rather than represented by absence: a node that was
+            // partitioned during the delete cannot tell "this index never existed" from "I have not
+            // looked yet", and adopting its dangling data on rejoin is the resurrection IndexGraveyard
+            // exists to prevent. A tombstoned descriptor is the durable no, and unlike the graveyard,
+            // which keeps a bounded list and forgets older deletions, it does not expire.
+            IndexMetadata deleted = metadataBuilder.get(indexName);
+            if (deleted != null) {
+                IndexDescriptorPublisher.publishTombstone(deleted);
+            }
             metadataBuilder.remove(indexName);
             if (backingIndices.containsKey(index)) {
                 DataStream parent = metadataBuilder.dataStream(backingIndices.get(index).getName());

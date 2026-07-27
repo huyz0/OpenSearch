@@ -167,6 +167,46 @@ public class DescriptorResolutionAgreementIT extends OpenSearchIntegTestCase {
         );
     }
 
+    /**
+     * H4a. Deleting an index must leave a durable no rather than an absence.
+     *
+     * <p>This is what replaces {@code IndexGraveyard}. A node partitioned during the delete cannot tell
+     * "this index never existed" from "I have not looked yet", and adopting its dangling shard data on
+     * rejoin is the resurrection the graveyard exists to prevent. The graveyard keeps a bounded list and
+     * purges the oldest entries; a tombstoned descriptor does not forget.
+     *
+     * <p>The uuid is asserted alongside the state because it is what identifies the data to reclaim. A
+     * tombstone carrying only the name would say an index is gone without saying what to delete.
+     */
+    public void testDeletingAnIndexLeavesATombstone() throws Exception {
+        IndexDescriptorPublisher.register(descriptor -> published.put(descriptor.name(), descriptor));
+        createIndex("to-delete", 2, 0);
+        String uuidBeforeDelete = published.get("to-delete").uuid();
+
+        assertAcked(client().admin().indices().prepareDelete("to-delete"));
+
+        IndexDescriptor tombstone = published.get("to-delete");
+        assertNotNull("deletion must leave a descriptor behind rather than removing it", tombstone);
+        assertFalse("the tombstoned descriptor must report the index as not existing", tombstone.exists());
+        assertEquals("the uuid must survive, since it identifies the dangling data to reclaim", uuidBeforeDelete, tombstone.uuid());
+        assertEquals("and the shard count, so that data can be enumerated", 2, tombstone.shardCount());
+    }
+
+    /** The seam must answer no for a deleted index, which is what stops resolution resurrecting it. */
+    public void testADeletedIndexDoesNotResolve() throws Exception {
+        IndexDescriptorPublisher.register(descriptor -> published.put(descriptor.name(), descriptor));
+        createIndex("delete-then-resolve", 1, 0);
+        assertAcked(client().admin().indices().prepareDelete("delete-then-resolve"));
+
+        AbsentIndexDescriptorSuppliers.register(published::get);
+        ClusterState state = client().admin().cluster().prepareState().get().getState();
+
+        assertFalse(
+            "a deleted index must not resolve through its tombstone",
+            AbsentIndexDescriptorSuppliers.exists(state.metadata(), "delete-then-resolve")
+        );
+    }
+
     // ---------------------------------------------------------------- helpers
 
     /**
