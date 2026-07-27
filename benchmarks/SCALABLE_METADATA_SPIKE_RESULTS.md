@@ -1010,3 +1010,86 @@ Then the harness was mutated. Adding a 20 ms sleep to `ClusterManagerService#pub
 per-publication from about 12 ms to 35 ms, while batched at 100 tasks stayed at 85 ms, because it still
 publishes twice. Both halves of that are the point: the timer responds to publication cost, and batching's
 advantage is precisely that it publishes less often. Reverted afterwards.
+
+## S16 (F1): what the allocation state actually costs, and which half of Area F is real
+
+Area F proposes emptying `inSyncAllocationIds` and `primaryTerms` for serverless indices, on the grounds
+that the object store and `ShardHead` already answer what they exist to answer. Its own risk note calls
+this the change most likely to produce a subtle correctness bug for the least benefit. The audit and the
+measurement disagree with each other about which half of that sentence to worry about.
+
+### The audit: `primaryTerms` is not redundant
+
+Every reader of `IndexMetadata#primaryTerm(int)`, classified:
+
+| reader | verdict |
+|---|---|
+| `TransportReplicationAction:1107` | **required**, sends the term with every write |
+| `IndicesClusterStateService:760` | **required**, reads it to open a shard |
+| `RestoreService:585` | **required** for restore |
+| `MetadataCreateIndexService:1694` | required, C18's initial-term assignment |
+| `IndexMetadataUpdater:387` | allocator path, serverless-irrelevant |
+| `ClusterState:374`, `IndexMetadata:2640` | debug string and serializer, irrelevant |
+| `ShardStateAction:470,483,756` | validation on state transitions, serverless-irrelevant |
+
+The plan's premise does not hold here. Core reads the metadata term on the write path, not the shard
+head, and this is not theoretical: C18 hit the literal error `primary term must be positive but was [0]`
+from exactly this path, which is why the term is now set at creation. Emptying `primaryTerms` would break
+writes rather than remove waste. Doing it would mean first teaching the write path to take the term from
+the shard head, which is a much larger change than F.2 describes.
+
+### The audit: `inSyncAllocationIds` is emptiable
+
+| reader | verdict |
+|---|---|
+| `IndexMetadataUpdater`, `PrimaryShardAllocator` | serverless-irrelevant, allocator maintenance |
+| `IndexRoutingTable` validation | serverless-irrelevant, validates a published entry a computed index has none of |
+| `IndicesClusterStateService:870` | already handled by C18's `computedAwareInSyncIds` |
+| `ClusterState:375` | debug string |
+| `ShardStateAction:502` | safe, with a behaviour change worth naming |
+| `SegmentReplicationSourceService:266` | safe, because of a union |
+
+Two needed probing rather than assuming. `ShardStateAction:502` is the shard-*failed* path: with the set
+empty, a failed copy resolves as "does not exist anymore" instead of being marked stale. No promotion
+safety is lost, since C18 made promotion a function of the placement. `SegmentReplicationSourceService`
+takes the **union** of the metadata set with the runtime replication tracker's in-sync ids, so emptying
+the metadata half leaves the authoritative half. The caveat: a shard not in primary mode contributes no
+tracker ids, so for such a shard the union would be empty and its handlers cancelled.
+
+### The measurement: much larger than the plan assumed
+
+`AllocationStateFieldCostEstimate`, 100,000 indices, one replica so two allocation ids per shard, three
+runs at 3 shards and one each at 10 and 30.
+
+| shards | with in-sync ids | empty | saving | share of total |
+|---|---|---|---|---|
+| 3 | 3,998 B/index | 2,939 B/index | 1,050 to 1,060 B/index | 26.4% |
+| 10 | 7,163 B/index | 3,638 B/index | 3,524 B/index | 49.2% |
+| 30 | 16,810 B/index | 6,231 B/index | 10,579 B/index | 62.9% |
+
+The three runs at 3 shards spread by 10 B, so the figure is stable.
+
+The saving is not flat per index: it is per shard, and the stated target is 3 to 30 shards. At the top of
+that range `inSyncAllocationIds` is **63% of what an index's metadata retains**. Extrapolated to 100M
+indices at 30 shards it is roughly a terabyte; at 3 shards, about 105 GB.
+
+**So the plan's risk sentence is half right.** It is the change most likely to produce a subtle
+correctness bug, and F2-before-F4 should stay non-negotiable. It is not for the least benefit. On the
+`inSyncAllocationIds` half it is the largest single metadata saving measured in this project.
+
+### C11: the ceiling, re-measured now that Area C is done
+
+`DeferredMetadataHeapEstimate`, unchanged harness, for comparison against the earlier figures:
+
+| shards | materialized | deferred | reduction |
+|---|---|---|---|
+| 3 | 2,944 B/index | 698 B/index | 4.2x |
+| 30 | 6,214 B/index | 698 B/index | 8.9x |
+
+The deferred figure is flat at 698 B/index regardless of shard count, which is the property the
+architecture depends on and which S11 warned had never been checked across shard counts. It holds.
+
+Note what this means next to S16 above: the deferred path already avoids the in-sync cost, because an
+unread index never materializes it. Area F's saving therefore applies to the **materialized** working
+set, the indices actually in use, and not to the 100M at rest. That narrows where the terabyte lands
+without making it less real.

@@ -25,8 +25,9 @@ Evidence for every number claimed: `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.m
 |---|---|
 | **A. Name index tier** | **done**, `plan-area-a-name-index.md`. 100 unit tests plus `ServerlessStorageNameIndexIT`. Disabled by default. |
 | **C. Computed placement** | **not blocked**, `plan-area-c-computed-placement.md`. C0 to C29 done. A computed index is creatable, writable, searchable, visible to cat and stats, and survives a full restart. What remains is reach rather than function: see the gaps below. |
-| **G. Validation** | **G1 done**, S15 in the spike results. Publication latency measured, batching decided. G2 to G5 not started. |
-| B, D, E, F | not started |
+| **G. Validation** | **G1 done**, S15. Publication latency measured, batching decided. G2 to G5 not started. |
+| **F. Cluster state diet** | **F1 done**, S16. Audit says `inSyncAllocationIds` is emptiable and `primaryTerms` is not. F2 to F4 not started. |
+| B, D, E | not started |
 
 ## The one finding that matters most: this seam fails by succeeding
 
@@ -118,6 +119,26 @@ submit plain `ClusterStateUpdateTask`s, so waking a thousand shards is a thousan
 Priority starvation is real and larger than the latency: a NORMAL task behind 300 queued URGENT tasks
 waited 2.3 to 14.8 seconds. Batching fixes this more directly than reordering priorities would, since
 suspension starves because each wake holds the queue for a whole publication.
+
+## F1's answer, which splits the plan's premise
+
+**`primaryTerms` cannot be emptied.** `TransportReplicationAction` sends the metadata term with every
+write and `IndicesClusterStateService` reads it to open a shard. C18 already hit `primary term must be
+positive but was [0]` from that path. The plan assumed the shard head made it redundant; core does not
+consult the shard head.
+
+**`inSyncAllocationIds` can**, and is worth more than the plan assumed: 26% of index metadata at 3 shards
+and **63% at 30**, because the cost is per shard rather than per index. Roughly a terabyte at 100M
+indices at 30 shards.
+
+Two readers needed probing rather than assuming, and both are safe:
+`SegmentReplicationSourceService` unions the metadata set with the runtime tracker's, and
+`ShardStateAction`'s stale-marking is a failure path whose promotion decision C18 already moved.
+
+**C11, finally re-measured:** deferred metadata is 698 B/index at both 3 and 30 shards. Flat in shard
+count, which is the property the architecture rests on and which had never been checked. Note the
+consequence for F: the deferred path never materializes in-sync ids anyway, so F's saving applies to the
+working set rather than to the 100M at rest.
 
 ## What is left
 
