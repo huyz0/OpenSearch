@@ -48,6 +48,7 @@ import org.opensearch.cluster.metadata.IndexAbstractionResolver;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.ResolvedIndices;
+import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.ShardsIterator;
 import org.opensearch.cluster.service.ClusterService;
@@ -427,7 +428,7 @@ public class DataStreamsStatsAction extends ActionType<DataStreamsStatsAction.Re
                     return Stream.empty();
                 }
             }).toArray(String[]::new);
-            return clusterState.getRoutingTable().allShards(concreteDatastreamIndices);
+            return AbsentIndexRoutingSuppliers.allShards(clusterState, concreteDatastreamIndices);
         }
 
         @Override

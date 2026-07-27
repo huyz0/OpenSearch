@@ -17,6 +17,7 @@ import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.block.ClusterBlockLevel;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
+import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.ShardsIterator;
 import org.opensearch.cluster.service.ClusterService;
@@ -98,7 +99,7 @@ public class TransportUpdateIngestionStateAction extends TransportBroadcastByNod
             shardFilter = shardFilter.and(shardRouting -> shardSet.contains(shardRouting.shardId().getId()));
         }
 
-        return clusterState.routingTable().allShardsSatisfyingPredicate(request.getIndex(), shardFilter);
+        return AbsentIndexRoutingSuppliers.allShards(clusterState, request.getIndex(), shardFilter, false);
     }
 
     @Override
