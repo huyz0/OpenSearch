@@ -883,3 +883,53 @@ declarations rather than trusting the note is what corrected it.
 `RestoreService` was found in the same sweep and is not in this group. It uses the no-argument
 predicate form, so it has C26's problem rather than C23's, and it is not a broadcast subclass so the
 guard does not cover it either. That is C29.
+
+## C28, C29 and C25: refusals, a check that failed the wrong way, and a test that proved nothing
+
+### C28, two features, two answers
+
+The probes contradicted the plan in both directions. Scaling was expected to throw and did, from
+`ScaleIndexShardSyncManager`, but on the cluster state applier thread via `clusterStateProcessed`, so the
+failure landed in an applier rather than in the request. The other two scaling sites were null-guarded
+and therefore silent: scale-up built a routing table with no trace of the index and reported success.
+
+Scaling is refused because it works by rewriting the published routing table, and a computed index has
+none to rewrite. Supporting it would mean the placement function had to express search-only scaling,
+which nobody has designed.
+
+Tiering was already refusing a computed index through the Phase A guard in `validateIndexHealth`, so only
+its explanation was wrong: a fully available index was rejected as "index is red". The check now names
+computed placement and runs **first** in the loop. The test forced that ordering: placed later it
+produced "index is not backed up by the remote store", so the message depended on which other
+prerequisite also failed. Of the five conditions there, four describe states an operator can change.
+A reason that cannot be acted on has to come first.
+
+Also found and deliberately not fixed: `ScaleDownClusterStateUpdateTask.execute` swallows exceptions and
+returns `currentState`, so a failed scale-down is answered `AcknowledgedResponse(true)`. It predates this
+area.
+
+### C29, the one that fails towards the damage
+
+Every other instance of this seam produced a visibly empty answer. `RestoreService`'s file cache capacity
+check produced a total that was too small, which looks normal, and a total that is too small admits a
+restore that overflows the cache.
+
+Reachability was established before deciding, since closing it as unreachable was a legitimate outcome.
+Restore publishes routing unconditionally, so a freshly restored index is always counted. State recovery
+does not: after a full restart it rebuilds routing from metadata and skips whatever the deployment's
+predicate calls unpublished, which is C20's guard. So a restored remote snapshot index matching that
+predicate comes back invisible. Configuration-dependent, not impossible.
+
+### C25, and the rule it produced
+
+Six unit tests for `ComputedPlacementMembershipService`, which had none. Deleting
+`removeRegistrationListener` from the production code left all six green.
+
+The self-removal test counted cluster state updates, and a stopped node's listener checks lifecycle first
+and returns without submitting anything whether or not it was removed. The count was identical either
+way. Rewritten to count the calls the listener *makes* rather than the work it skips, it fails against
+the same mutation with `TooManyActualInvocations`.
+
+**The rule, stated because this is the third time a green suite here measured nothing:** when the
+behaviour under test is an absence, assert on something the code must actively do. Absence is what a
+broken implementation produces for free.

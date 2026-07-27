@@ -24,16 +24,19 @@ Evidence for every number claimed: `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.m
 | area | state |
 |---|---|
 | **A. Name index tier** | **done**, `plan-area-a-name-index.md`. 100 unit tests plus `ServerlessStorageNameIndexIT`. Disabled by default. |
-| **C. Computed placement** | **not blocked**, `plan-area-c-computed-placement.md`. C0 to C27 done. A computed index is creatable, writable, searchable, visible to cat and stats, and survives a full restart. What remains is reach rather than function: see the gaps below. |
+| **C. Computed placement** | **not blocked**, `plan-area-c-computed-placement.md`. C0 to C29 done. A computed index is creatable, writable, searchable, visible to cat and stats, and survives a full restart. What remains is reach rather than function: see the gaps below. |
 | B, D, E, F, G | not started |
 
 ## The one finding that matters most: this seam fails by succeeding
 
-Seven times now, a computed index has made an operation return a **confident empty answer rather than an
+Eight times now, a computed index has made an operation return a **confident empty answer rather than an
 error**: refresh reaching no shards (C21), field mappings reporting no fields (C22), stats, segments,
-recovery and force merge all reporting nothing (C23), and cat listing no shard (C26). Not one threw.
-Force merge is the worst of them, because it accepted an instruction, reported success, and did no work
-at all.
+recovery and force merge all reporting nothing (C23), cat listing no shard (C26), and the file cache
+capacity check undercounting (C29). Not one threw.
+
+Two of them are worse than a wrong answer. Force merge accepted an instruction, reported success, and did
+no work at all. The capacity check in C29 fails **towards the damage**: a total that is too small admits a
+restore that overflows the cache, and a total that is too small looks entirely normal.
 
 **It caught the fix as well as the bug.** C26's first attempt walked metadata that the cluster state
 response did not contain, so it returned a shorter list with nothing to indicate anything was missing.
@@ -92,16 +95,29 @@ broken ones.
   proposed home and would have been useless: a check there only runs for callers that already resolve
   correctly, and the bug is a caller that does not.
 
-## What is left, in priority order
+- **C28** search-only scaling refuses a computed index with a reason, replacing a NullPointerException
+  thrown on the cluster state applier thread and a scale-up that silently built a routing table with no
+  trace of the index. Tiering already refused it; the refusal now names computed placement instead of
+  claiming the index is red, and runs first because it is the only condition there an operator cannot act
+  on.
+- **C29** the file cache capacity check resolves, so a computed remote snapshot shard counts. This one
+  failed towards the damage rather than away from it: an undercount admits a restore that overflows the
+  cache.
+- **C25** the membership maintainer has unit tests, including the self-removal that no integration test
+  looks for.
 
-- **C29** `RestoreService` uses the no-argument accessor, so it has C26's problem and no index list to
-  pass. Not covered by C24's guard either, since it is not a broadcast subclass, so a failure there is
-  silent. Probe whether restore is even reachable for a computed index before choosing between
-  converting it and rejecting it the way C14 rejected resharding.
-- **C28** search-only scaling and tiering read routing directly and one of them dereferences without a
-  null check, so a computed index is an NPE rather than a refusal. Probably the C14 answer: reject with a
-  reason rather than half-support.
-- **C25** `ComputedPlacementMembershipService` has no unit tests at all.
+## What is left
+
+Nothing in Area C is known broken. What remains is unclaimed rather than pending:
+
+- **Extend C24's guard beyond broadcast-by-node.** It protects that family only. The single-shard family
+  that analyze and field mappings use, the cat callers, and `RestoreService` have no equivalent, so an
+  unconverted caller in any of those is still silent.
+- **A latent scaling bug, unrelated to this area.** `ScaleDownClusterStateUpdateTask.execute` catches
+  `Exception` and returns `currentState`, so `clusterStateProcessed` sees an unchanged state and answers
+  `AcknowledgedResponse(true)`. A failed scale-down reports success. Found during C28 and deliberately
+  left alone, since fixing it is scope this area was not asked for.
+- **C16** hot-tenant override, which needs a product answer first.
 
 **What C24's guard does not cover.** It protects the broadcast-by-node family only. The single-shard
 family that analyze and get field mappings use, the cat callers, and `RestoreService` have no equivalent,
