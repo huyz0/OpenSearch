@@ -223,6 +223,23 @@ structure per `Metadata.build`, which is the ceiling this area exists to remove.
 Both are tracked as H1d. They matter because they are the counter-example to "Area H clears ceiling 3":
 it clears the part that flows through cluster state, and these two do not.
 
+## H.10b The limit H3 and H5 ship with, until H4c lands
+
+Gated indices have no cluster state entry, and every mapping update path resolves its target through
+`Metadata#getIndexSafe`, which throws when the index is not in the map. So **a gated index cannot accept a
+document carrying a new field**: dynamic mapping fails at the first unknown field rather than degrading.
+Proven by `GatedIndexMappingUpdateTests` rather than reasoned about.
+
+That inverts H4c's priority. Moving mappings to a compare-and-swap on an object-store generation was filed
+as a way to remove a global serialisation point from the write path, which is true and secondary. The
+reason to do it is that without it the gate is only safe for indices whose mapping is fully known at
+creation, which is not most of them.
+
+**The gate is therefore not ready for general use**, and that is a property of this design rather than a
+bug in it. H3 and H5 are correct and measured: creation is flat and leaves nothing resident. They are
+usable today for a fixed-mapping index and not for a dynamic one, and shipping them without saying so
+would be the dishonest version of a real result.
+
 ## H.11 Phasing, each phase falsifiable
 
 **H1. Audit.** Classify all 41 direct enumerations as convertible, refusable, or blocking. F1's precedent:
