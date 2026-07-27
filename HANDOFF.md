@@ -27,7 +27,7 @@ Evidence for every number claimed: `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.m
 | **C. Computed placement** | **not blocked**, `plan-area-c-computed-placement.md`. C0 to C29 done. A computed index is creatable, writable, searchable, visible to cat and stats, and survives a full restart. What remains is reach rather than function: see the gaps below. |
 | **G. Validation** | **G1 done**, S15. Publication latency measured, batching decided. G2 to G5 not started. |
 | **F. Cluster state diet** | **F1 done**, S16. Audit says `inSyncAllocationIds` is emptiable and `primaryTerms` is not. F2 to F4 not started. |
-| **H. Metadata off cluster state** | **proposed**, `plan-area-h-metadata-off-cluster-state.md`. Opened by S18: index creation is superlinear in the population and no existing area fixes it. |
+| **H. Metadata off cluster state** | **in progress**, `plan-area-h-metadata-off-cluster-state.md`. Ceilings 2 and 3 measured as cleared on the gated path: creation flat at 0.0005 ms against 57.777 ms at 50k indices, and a thousand gated creations leave zero cluster state entries. **Not general yet**: a gated index cannot take a dynamic mapping update until H4c. |
 | B, D, E | not started |
 
 ## The one finding that matters most: this seam fails by succeeding

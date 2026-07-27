@@ -1364,3 +1364,54 @@ coordination cost of the fan-out grows with shard count and that is untested her
 The prefix query ran with `size=0`, so it counted matches rather than returning names. Real wildcard
 resolution needs the names, and fetching ten thousand of them costs more than counting them. That is the
 next thing to measure rather than a limitation of the design.
+
+## S22 (H3 and H5): both uncleared ceilings, measured on the gated path
+
+Area H's two claims, each measured against the thing it replaces, in the same run and on the same machine.
+That last part matters: comparing S19's cluster measurement against S20's in-JVM measurement produced a
+wrong conclusion once, and the fix is to measure both arms together rather than to reason about the gap.
+
+### Ceiling 3, creation throughput
+
+Adding one index to an existing population, best of ten.
+
+| existing indices | through cluster state | descriptor only | ratio |
+|---|---|---|---|
+| 1,000 | 1.463 ms | 0.001 ms | 2,240x |
+| 10,000 | 9.819 ms | 0.001 ms | 16,842x |
+| 50,000 | 57.777 ms | 0.001 ms | 101,542x |
+
+Descriptor-only creation is 0.0006 ms at a thousand indices and 0.0005 ms at fifty thousand, a ratio of
+0.90. Flat, and the gap widens with population because the other arm grows rather than because this one
+shrinks.
+
+### Ceiling 2, residency
+
+A thousand gated creations leave zero metadata entries and zero routing entries, while all thousand are
+recorded as descriptors. Gated and ungated indices coexist in one cluster state with only the ungated
+resident.
+
+Asserted as a count rather than as retained heap: zero is a stronger claim than an improvement, cheaper to
+measure, and independent of a heap estimator being right about what it walks.
+
+| | per index | fits in an 8 GB metadata budget |
+|---|---|---|
+| materialized | 2,944 B | 2.9M indices |
+| deferred, C11 | 698 B | 12.3M indices |
+| gated | 0 B | bounded by an index on disk, not by heap |
+
+### The limit this ships with
+
+A gated index has no metadata entry, and every mapping update path resolves its target through
+`Metadata#getIndexSafe`, which throws when the index is absent. So a gated index cannot accept a document
+carrying a new field: dynamic mapping fails rather than degrading.
+
+That is H4c, and the probe inverted its priority. It was filed as an optimisation and is actually a
+prerequisite: without it the gate is usable only for indices whose mapping is fully known at creation.
+
+### One regression failure, investigated and unrelated
+
+`AutoExpandSearchReplicasIT` hangs and is killed by the suite timeout. With `Metadata.java` reverted to
+before the descriptor hook existed it hangs at 1199.703s against 1199.706s with it, three milliseconds
+apart on a twenty minute timeout. Pulled into the run for the first time by a widened glob, and recorded
+rather than adopted.
