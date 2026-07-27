@@ -19,6 +19,7 @@ import org.opensearch.action.support.HandledTransportAction;
 import org.opensearch.action.support.TimeoutTaskCancellationUtility;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.common.breaker.ResponseLimitBreachedException;
 import org.opensearch.common.breaker.ResponseLimitSettings;
 import org.opensearch.common.inject.Inject;
@@ -64,6 +65,13 @@ public class TransportCatShardsAction extends HandledTransportAction<CatShardsRe
         clusterStateRequest.clusterManagerNodeTimeout(shardsRequest.clusterManagerNodeTimeout());
         if (Objects.isNull(shardsRequest.getPageParams())) {
             clusterStateRequest.clear().nodes(true).routingTable(true).indices(shardsRequest.getIndices());
+            // Metadata is the only place an index whose routing is computed appears, so without it the
+            // listing silently omits those shards. Requested only when a placement supplier is installed,
+            // because metadata is the expensive part of a cluster state response and an ordinary cluster
+            // must keep paying exactly what it paid before.
+            if (AbsentIndexRoutingSuppliers.isRegistered()) {
+                clusterStateRequest.metadata(true);
+            }
         } else {
             clusterStateRequest.clear().nodes(true).routingTable(true).indices(shardsRequest.getIndices()).metadata(true);
         }
@@ -104,7 +112,7 @@ public class TransportCatShardsAction extends HandledTransportAction<CatShardsRe
                         catShardsResponse.setNodes(clusterStateResponse.getState().getNodes());
                         catShardsResponse.setResponseShards(
                             Objects.isNull(paginationStrategy)
-                                ? clusterStateResponse.getState().routingTable().allShards()
+                                ? AbsentIndexRoutingSuppliers.allShards(clusterStateResponse.getState())
                                 : paginationStrategy.getRequestedEntities()
                         );
                         catShardsResponse.setPageToken(Objects.isNull(paginationStrategy) ? null : paginationStrategy.getResponseToken());

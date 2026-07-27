@@ -289,6 +289,50 @@ public final class AbsentIndexRoutingSuppliers {
      */
     private static final Predicate<ShardRouting> ALL_SHARDS = shardRouting -> true;
 
+    /**
+     * Every shard in the cluster, including those of indices that publish no routing entry.
+     *
+     * <p>For the callers that name no indices at all, {@code _cat/shards} and {@code _cat/allocation}.
+     * They cannot use the array form because they have no list to pass, and
+     * {@link RoutingTable#allShards()} takes its list from the routing table's own key set, which a
+     * computed index is not in. So the index list has to come from metadata, which is the one place every
+     * index appears whether its routing is published or not.
+     *
+     * <p><b>Why enumerating metadata is acceptable here specifically.</b> This area exists to avoid
+     * walking millions of indices, so the cost deserves an argument rather than a shrug. These callers
+     * already produce one row per shard, so they are inherently linear in the number of shards, and the
+     * index count is bounded by the shard count. The walk adds no asymptotic cost to a caller that is
+     * already paying more. It would not be acceptable on a request path, which is why this is separate
+     * from {@link #resolve} rather than folded into it.
+     *
+     * <p>The paginated {@code _cat/shards} path already enumerates metadata for its own ordering, which
+     * is both precedent and a warning: it did that and then looked routing up unguarded, so a computed
+     * index was a NullPointerException there rather than a missing row.
+     */
+    public static List<ShardRouting> allShards(ClusterState state) {
+        if (isRegistered() == false) {
+            // Identical to what the caller used to do, by calling exactly that method.
+            return state.routingTable().allShards();
+        }
+        List<ShardRouting> shards = new ArrayList<>(state.routingTable().allShards());
+        for (IndexMetadata indexMetadata : state.metadata()) {
+            if (shouldPublishRouting(indexMetadata)) {
+                // Published, so allShards() above already returned it.
+                continue;
+            }
+            IndexRoutingTable computed = supply(state, indexMetadata);
+            if (computed == null) {
+                continue;
+            }
+            for (IndexShardRoutingTable shardRoutingTable : computed) {
+                for (ShardRouting shardRouting : shardRoutingTable) {
+                    shards.add(shardRouting);
+                }
+            }
+        }
+        return shards;
+    }
+
     /** Every shard of the named indices, the common case. */
     public static ShardsIterator allShards(ClusterState state, String[] concreteIndices) {
         return allShards(state, concreteIndices, ALL_SHARDS, false);
