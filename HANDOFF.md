@@ -132,7 +132,7 @@ Core:
 - `server/src/main/java/org/opensearch/cluster/routing/RoutingNodes.java` — `localRoutingNode` hook
 
 Tests to run first, both fast, and nothing is `@AwaitsFix` any more:
-- `:server:internalClusterTest --tests "*ComputedPlacement*IT" -Dbuild.docker=false` — 5 suites
+- `:server:internalClusterTest --tests "*ComputedPlacement*IT" -Dbuild.docker=false`, 5 suites
 - `:server:test --tests "org.opensearch.cluster.routing.Computed*" -Dbuild.docker=false`
 
 Plugin, `plugins/serverless-storage/src/main/java/org/opensearch/serverless/storage/`:
