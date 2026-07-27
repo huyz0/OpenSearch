@@ -860,3 +860,26 @@ zero to be interpreted. Six passing unit tests proved the logic; only the mutati
 The guard protects one family. `TransportSingleShardAction`, which analyze and get field mappings use,
 and the cat callers have no equivalent. A future unconverted caller there is still silent. Extending the
 same check to those families is unclaimed work rather than a decision against it.
+
+## C27: three more callers, and a note on what made them acceptable
+
+Ingestion state get and update, and data streams stats, pass an explicit index list and convert directly
+with the C23 helper. Nothing about the change is interesting; the evidence standard is.
+
+None of the three has a dedicated test, because exercising them needs streaming ingestion and data
+stream infrastructure the computed placement suites do not have. Converting on the grounds that they look
+like the nine already done is precisely the reasoning that produced the bugs in the first place, so it
+would have been the weakest change in this area on its own.
+
+What makes it acceptable is C24. All three are `TransportBroadcastByNodeAction` subclasses, so the guard
+covers them: an unconverted one asserts on first contact with a computed index instead of quietly
+reporting nothing. The failure mode these conversions prevent is no longer silent even where no test
+exists. That is the first concrete return on building the guard, and it is worth noticing that the return
+arrived one task later.
+
+A note in the task list had claimed the guard did not cover these. It was wrong, and reading the class
+declarations rather than trusting the note is what corrected it.
+
+`RestoreService` was found in the same sweep and is not in this group. It uses the no-argument
+predicate form, so it has C26's problem rather than C23's, and it is not a broadcast subclass so the
+guard does not cover it either. That is C29.
