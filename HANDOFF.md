@@ -29,10 +29,15 @@ Evidence for every number claimed: `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.m
 
 ## The one finding that matters most: this seam fails by succeeding
 
-Six times now, a computed index has made an operation return a **confident empty answer rather than an
-error**: refresh reaching no shards (C21), field mappings reporting no fields (C22), and stats, segments,
-recovery and force merge all reporting nothing (C23). Not one threw. Force merge is the worst of them,
-because it accepted an instruction, reported success, and did no work at all.
+Seven times now, a computed index has made an operation return a **confident empty answer rather than an
+error**: refresh reaching no shards (C21), field mappings reporting no fields (C22), stats, segments,
+recovery and force merge all reporting nothing (C23), and cat listing no shard (C26). Not one threw.
+Force merge is the worst of them, because it accepted an instruction, reported success, and did no work
+at all.
+
+**It caught the fix as well as the bug.** C26's first attempt walked metadata that the cluster state
+response did not contain, so it returned a shorter list with nothing to indicate anything was missing.
+When writing a fix here, ask what it does when its own input is empty.
 
 This is why C21 survived six passes over the same seam while every other instance was found quickly: the
 others failed loudly with a hang, an exception or a red cluster.
@@ -78,14 +83,14 @@ broken ones.
   Stats, segments, recovery and force merge are proven; clear cache, upgrade, upgrade status, remote store
   stats and segment replication stats are converted for consistency and not individually covered.
 
+- **C26** cat shards, paginated cat shards and cat allocation all show a computed shard now. Metadata is
+  the index list, since routing structurally cannot name a computed index. Both cat callers request
+  metadata only when a supplier is installed, so an ordinary cluster's response is unchanged.
+
 ## What is left, in priority order
 
-- **C26, the most operator-visible.** `_cat/shards` and `_cat/allocation` call the *no-argument*
-  `allShards()`, which takes its index list from the routing table's own key set. A computed index is not
-  a key there, so it cannot be named and simply does not appear. The C23 helper cannot fix this: there is
-  no index list to pass. Needs a decision rather than a conversion.
 - **C24** decide whether a broadcast that resolves zero shards for an index that exists should stay
-  silent. Six confirmed silent-empty cases now argue it should not.
+  silent. Seven confirmed silent-empty cases now argue it should not.
 - **C27** three more bulk callers that pass an explicit index list, so directly convertible.
 - **C28** search-only scaling and tiering read routing directly and one of them dereferences without a
   null check, so a computed index is an NPE rather than a refusal. Probably the C14 answer: reject with a

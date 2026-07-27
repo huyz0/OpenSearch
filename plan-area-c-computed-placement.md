@@ -775,3 +775,50 @@ bind to methods rather than to behaviour, and a no-op path exists precisely to b
 C13 passed with no further work once C21 landed, over seven consecutive runs with fresh seeds. Every
 theory the restart test had accumulated across two sessions, blank recovery and lost writes among them,
 was downstream of a refresh that reached no shards.
+
+## C26: two bugs in cat, and a fix that had the disease it was curing
+
+`_cat/shards` and `_cat/allocation` are where an operator looks to answer "where are my shards", and
+neither could show a computed one. Both call the no-argument `routingTable().allShards()`, which takes
+its index list from the routing table's own key set. A computed index is not a key there, so it cannot be
+resolved and cannot even be named. That is why C23's helper could not close this: there was no index list
+to pass.
+
+**The probe found a second bug nobody predicted.** Paginated `_cat/shards` does not use that accessor. It
+enumerates metadata for its ordering and then looks each index up in the routing map with an unguarded
+`get`, so a computed index was a `NullPointerException` rather than a missing row. One feature, two
+opposite failure modes, found only by checking the second branch rather than assuming the first was the
+whole story. The null guard also closes a pre-existing race, since an index deleted between the metadata
+read and the routing read hit the same dereference.
+
+### Why metadata is the index list
+
+The three candidates and why two lose.
+
+*Teach the no-argument accessors to consult the local-shards registration.* Fails on meaning rather than
+mechanics: that registration answers "which shards live on this node", and cat asks a cluster-wide
+question, so the cluster-manager would report only its own shards.
+
+*Give the callers an index list.* `_cat/shards` with no pattern means all, so this reduces to enumerating
+metadata anyway, while spreading the enumeration across callers instead of keeping it in the seam.
+
+*Enumerate metadata.* Chosen. The cost deserves an argument in an area built to avoid walking millions of
+indices, and the argument is that these callers are already linear in shards because they emit one row
+each, and the index count is bounded by the shard count. The walk adds no asymptotic cost to a caller
+already paying more. It would not be acceptable on a request path, which is why this is a separate helper
+rather than something folded into `resolve`. The paginated path was already doing exactly this.
+
+### The fix had to be fixed
+
+The unpaginated cat request is `clear().nodes(true).routingTable(true)`, with no metadata. So the first
+version of the resolver walked metadata that was not there, found nothing, and returned a shorter list
+with no indication anything was missing. That is the same "fails by succeeding" shape the whole task
+exists to remove, reproduced inside its own remedy.
+
+Both callers now request metadata, gated on whether a supplier is installed so an ordinary cluster keeps
+the response it always had. The trap is pinned by a test that asserts the failing shape directly, so a
+later attempt to trim the request for payload reasons discovers why it cannot.
+
+The allocation test was wrong on its first pass too, and in an instructive way: it asserted on
+`routingTable().allShards()`, the accessor that structurally cannot see a computed index. It was
+measuring the bug rather than the fix and could never have passed.
