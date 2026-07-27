@@ -67,6 +67,10 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
     private final State state;
     private final List<String> aliases;
     private final long createdVersion;
+    private final boolean system;
+    private final boolean hidden;
+    private final boolean remoteSnapshot;
+    private final boolean warm;
 
     public IndexDescriptor(
         String name,
@@ -76,7 +80,11 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         boolean serverless,
         State state,
         List<String> aliases,
-        long createdVersion
+        long createdVersion,
+        boolean system,
+        boolean hidden,
+        boolean remoteSnapshot,
+        boolean warm
     ) {
         this.name = Objects.requireNonNull(name, "descriptor needs a name");
         this.uuid = Objects.requireNonNull(uuid, "descriptor needs a uuid, since placement hashes it");
@@ -86,6 +94,10 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         this.state = Objects.requireNonNull(state, "descriptor needs a state");
         this.aliases = List.copyOf(aliases);
         this.createdVersion = createdVersion;
+        this.system = system;
+        this.hidden = hidden;
+        this.remoteSnapshot = remoteSnapshot;
+        this.warm = warm;
     }
 
     /**
@@ -104,7 +116,11 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
             indexMetadata.getSettings().getAsBoolean("index.serverless_storage.enabled", false),
             indexMetadata.getState() == IndexMetadata.State.CLOSE ? State.CLOSE : State.OPEN,
             List.copyOf(indexMetadata.getAliases().keySet()),
-            indexMetadata.getCreationVersion().id
+            indexMetadata.getCreationVersion().id,
+            indexMetadata.isSystem(),
+            indexMetadata.isHidden(),
+            indexMetadata.isRemoteSnapshot(),
+            indexMetadata.isWarmIndex()
         );
     }
 
@@ -117,6 +133,10 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         this.state = State.values()[in.readVInt()];
         this.aliases = List.copyOf(in.readStringList());
         this.createdVersion = in.readVLong();
+        this.system = in.readBoolean();
+        this.hidden = in.readBoolean();
+        this.remoteSnapshot = in.readBoolean();
+        this.warm = in.readBoolean();
     }
 
     @Override
@@ -129,6 +149,10 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         out.writeVInt(state.ordinal());
         out.writeStringCollection(aliases);
         out.writeVLong(createdVersion);
+        out.writeBoolean(system);
+        out.writeBoolean(hidden);
+        out.writeBoolean(remoteSnapshot);
+        out.writeBoolean(warm);
     }
 
     /** The index, which is what placement hashes and what every shard id is built from. */
@@ -173,9 +197,52 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         return createdVersion;
     }
 
+    /**
+     * The four flags resolution needs and placement does not, taken from {@link LazyIndexMetadata}'s
+     * field set rather than chosen independently.
+     *
+     * <p>This is a correction. H2a audited what <em>placement</em> reads and concluded the descriptor was
+     * sufficient, which was true of routing and false of resolution. Wildcard expansion consults hidden
+     * and system to decide what an expression may match, so a descriptor without them would silently
+     * include indices that should be excluded, and that is a security-relevant difference for system
+     * indices rather than only a correctness one.
+     *
+     * <p>Area A had already worked this out: {@code LazyIndexMetadata}, the holder that exists so an
+     * index can be described without materializing it, carries exactly these four. Matching its field set
+     * is deliberate.
+     */
+    public boolean system() {
+        return system;
+    }
+
+    public boolean hidden() {
+        return hidden;
+    }
+
+    public boolean remoteSnapshot() {
+        return remoteSnapshot;
+    }
+
+    public boolean warm() {
+        return warm;
+    }
+
     /** The same descriptor, tombstoned. Deletion records rather than removes, so absence stays meaningful. */
     public IndexDescriptor tombstoned() {
-        return new IndexDescriptor(name, uuid, shardCount, searchOnlyReplicaCount, serverless, State.DELETED, aliases, createdVersion);
+        return new IndexDescriptor(
+            name,
+            uuid,
+            shardCount,
+            searchOnlyReplicaCount,
+            serverless,
+            State.DELETED,
+            aliases,
+            createdVersion,
+            system,
+            hidden,
+            remoteSnapshot,
+            warm
+        );
     }
 
     @Override
@@ -189,6 +256,10 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         builder.field("state", state.name());
         builder.field("aliases", aliases);
         builder.field("created_version", createdVersion);
+        builder.field("system", system);
+        builder.field("hidden", hidden);
+        builder.field("remote_snapshot", remoteSnapshot);
+        builder.field("warm", warm);
         builder.endObject();
         return builder;
     }
@@ -209,12 +280,29 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
             && name.equals(other.name)
             && uuid.equals(other.uuid)
             && state == other.state
-            && aliases.equals(other.aliases);
+            && aliases.equals(other.aliases)
+            && system == other.system
+            && hidden == other.hidden
+            && remoteSnapshot == other.remoteSnapshot
+            && warm == other.warm;
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(name, uuid, shardCount, searchOnlyReplicaCount, serverless, state, aliases, createdVersion);
+        return Objects.hash(
+            name,
+            uuid,
+            shardCount,
+            searchOnlyReplicaCount,
+            serverless,
+            state,
+            aliases,
+            createdVersion,
+            system,
+            hidden,
+            remoteSnapshot,
+            warm
+        );
     }
 
     @Override

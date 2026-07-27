@@ -121,6 +121,42 @@ public class IndexDescriptorTests extends OpenSearchTestCase {
         assertTrue("a descriptor must stay small enough that a hundred million fit in one index: " + bytes + " B", bytes < 400);
     }
 
+    /**
+     * The four flags resolution reads and placement does not, added after comparing this type against
+     * LazyIndexMetadata. H2a audited what placement reads and declared the descriptor sufficient, which
+     * was true of routing and false of resolution: wildcard expansion consults hidden and system to decide
+     * what an expression may match, so a descriptor without them would silently include indices that
+     * should be excluded. For system indices that is a security-relevant difference rather than only a
+     * correctness one.
+     */
+    public void testResolutionFlagsSurvive() {
+        IndexMetadata hiddenSystem = IndexMetadata.builder("hidden-system")
+            .settings(
+                Settings.builder()
+                    .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+                    .put(IndexMetadata.SETTING_INDEX_UUID, "hidden-system-uuid-000000")
+                    .put(IndexMetadata.SETTING_INDEX_HIDDEN, true)
+                    .build()
+            )
+            .numberOfShards(1)
+            .numberOfReplicas(0)
+            .system(true)
+            .build();
+
+        IndexDescriptor descriptor = IndexDescriptor.from(hiddenSystem);
+
+        assertTrue("wildcard expansion must be able to see that an index is hidden", descriptor.hidden());
+        assertTrue("and that it is a system index, which governs who may match it", descriptor.system());
+    }
+
+    /** An ordinary index must report neither, or every expansion would over-include. */
+    public void testAnOrdinaryIndexIsNeitherHiddenNorSystem() {
+        IndexDescriptor descriptor = IndexDescriptor.from(indexMetadata("plain", 1, 0, true));
+
+        assertFalse(descriptor.hidden());
+        assertFalse(descriptor.system());
+    }
+
     private static IndexMetadata indexMetadata(String name, int shards, int searchReplicas, boolean serverless) {
         return IndexMetadata.builder(name)
             .settings(

@@ -114,7 +114,7 @@ public class AbsentIndexDescriptorSuppliersTests extends OpenSearchTestCase {
     // ---------------------------------------------------------------- helpers
 
     private static IndexDescriptor descriptor(String name, IndexDescriptor.State state) {
-        return new IndexDescriptor(name, name + "-uuid", 1, 0, true, state, List.of(), Version.CURRENT.id);
+        return new IndexDescriptor(name, name + "-uuid", 1, 0, true, state, List.of(), Version.CURRENT.id, false, false, false, false);
     }
 
     private static Metadata metadataWith(String name) {
