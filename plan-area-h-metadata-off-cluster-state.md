@@ -137,7 +137,74 @@ reachable, refuse what should be refused.
 - **Area A** (name index tier) is the substrate and must land first.
 - **Area C** is done, which is what makes routing derivable from the descriptor alone.
 
-## H.10 Phasing, each phase falsifiable
+## H.10 Detailed tasks
+
+Numbered so they can be worked one at a time. Each says what would make it fail, because in this area a
+task that cannot fail is a task that measures nothing.
+
+### H1. Audit the enumeration surface
+
+**H1a. Classify the 41 direct enumerations.** `metadata().indices()` (31 sites) and
+`for (IndexMetadata : metadata())` (10 sites). Each is convertible (becomes a descriptor query),
+refusable (rejects a computed index the way C14 and C28 reject resharding and scaling), or blocking
+(genuinely needs every index and cannot become a query). Blocking is a legitimate outcome and caps what
+this area can remove. F1's precedent: the plan assumed two fields were equally removable and one was
+load-bearing on the write path.
+
+**H1b. Classify the resolver's own paths.** `IndexNameExpressionResolver` has 25 internal sites. Separate
+those that resolve one name from those that expand a pattern, because the first becomes a GET and the
+second becomes a search, and only the second has the freshness problem.
+
+**H1c. Find what enumerates outside `server/`.** The plugin, and anything reading metadata through a
+different door. C23's sweep found nine callers where the plan expected fewer.
+
+### H2. Resolution through the descriptor index
+
+**H2a. Descriptor value type and its index.** Name, uuid, shard count, created version, state, blocks,
+aliases. A system index with a fixed name and uuid, placed by computed placement. Fails if the descriptor
+cannot answer everything `RendezvousShardPlacement` needs, which would mean routing still requires the
+map.
+
+**H2b. Write a descriptor on index creation, in addition to the cluster state entry.** Dual write,
+deliberately redundant, so H2c can compare. Fails if creation cost regresses measurably for ordinary
+indices.
+
+**H2d. Resolve through the descriptor when the map misses.** Behind the gate. The map still wins when
+present, so this changes nothing yet and proves the read path in isolation.
+
+**H2c. Compare both answers under load.** For a population of indices, resolve every name and every
+wildcard through both paths and assert they agree. This is the phase where correctness is established
+cheaply, while the old structure is still there to be right. Fails if the two disagree on aliases,
+hidden or system indices, or closed state, all of which the descriptor must carry.
+
+### H3. Creation without a cluster state update
+
+**H3a. Create writes only the descriptor**, behind the gate, for computed indices. No metadata entry, no
+publication.
+
+**H3b. Re-run G2a.** The kill criterion. Creation cost per index must be flat against population where
+today it is 7.4, 10.3, 34.6, 98.8 ms at 200, 1k, 3k, 6k. Not flat means stop and rediagnose.
+
+**H3c. Re-measure residency.** With no map entry, a manager node should hold O(nodes) plus the descriptor
+cache, not O(indices). The number to beat is C11's 698 B/index.
+
+### H4. Deletion and dynamic mappings
+
+**H4a. Tombstone in the descriptor.** State DELETED with a timestamp, not document removal. Fails if a
+node can adopt dangling shard data without consulting it, which is the dangling-index resurrection
+`IndexGraveyard` exists to prevent.
+
+**H4b. A node adopting local shard data must resolve the descriptor first** and delete its data when the
+descriptor is absent or tombstoned.
+
+**H4c. Mapping updates as a CAS on the mapping object generation**, replacing the cluster state update on
+the write path. Fails if two concurrent dynamic mapping updates can lose one.
+
+### H5. Remove the map for computed indices
+
+Only after H2 to H4 have soaked. Fails if any H1a blocking enumeration is still reachable.
+
+## H.11 Phasing, each phase falsifiable
 
 **H1. Audit.** Classify all 41 direct enumerations as convertible, refusable, or blocking. F1's precedent:
 the plan assumed two fields were equally removable and one was load-bearing on the write path. Expect at

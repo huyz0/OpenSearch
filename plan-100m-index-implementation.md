@@ -1,7 +1,63 @@
 # Implementation plan: 100M indices with index/search and compute/storage separation
 
-Status: proposed. Evidence recorded in `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.md` (S1 to S13) and
+Status: in progress. Evidence recorded in `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.md` (S1 to S19) and
 `rfc-100m-index-architecture.md`.
+
+---
+
+# Part 0: The three ceilings, and which are cleared
+
+Added after S15 to S19, because the plan had grown into eight lettered areas and the structure underneath
+them was no longer visible. There are only three things that stop this design reaching 100M indices. Each
+area is an attack on one of them, and reading the plan as three ceilings rather than eight workstreams is
+what makes the ordering obvious.
+
+| ceiling | what it is | measured | status |
+|---|---|---|---|
+| **1. Placement** | the allocator, the routing table, per-node shard limits | S6: cold allocation superlinear, 4.6 s at 40k shards. `cluster.max_shards_per_node` refuses at 3,000 on a 3-node cluster (S18) | **cleared by Area C** |
+| **2. Residency** | metadata bytes held on every cluster-manager-eligible node | 2,944 B/index materialized, 698 B deferred (C11). 100M x 698 B = 70 GB, on every such node | **not cleared** |
+| **3. Throughput** | work per cluster state change, proportional to the whole population | 107 ms to add one index at a population of 100k, and 31 ms even when nothing changes (S19) | **not cleared** |
+
+**Ceiling 2 in one line.** At a realistic 8 GB metadata budget, the materialized design holds ~2.7M
+indices and the deferred design ~11.5M. Deferral bought one order of magnitude; the target needs two. That
+is arithmetic on C11's measured figures rather than a separate measurement, and it is the reason Area A's
+deferral is necessary but not sufficient.
+
+**Ceiling 3 in one line.** Creation cost grows with the existing population because `Metadata.build()`
+rebuilds derived structures over every index on every change. At 100k indices one create costs 107 ms of
+single-threaded work before consensus even begins.
+
+**The two uncleared ceilings have one cause and one fix.** Both exist because cluster state contains one
+entry per index. Area H removes the entry, which is why it clears both, and why the areas that make the
+entry *cheaper* do not clear either.
+
+## The architecture the ceilings imply
+
+```
+cluster state  ->  nodes, membership, templates, settings         O(nodes), kilobytes
+descriptors    ->  an OpenSearch index: name -> uuid, shards      point lookup and prefix scan
+mappings       ->  object store, indices/{uuid}/metadata/{gen}    fetched on demand, cached
+placement      ->  hash(uuid) over published membership           derived, nothing stored
+```
+
+Nothing in that picture is per-index-per-node. That is the whole design, and it is the shape S3 uses to
+serve 10^14 objects with no global map: a sorted, partitioned, disk-backed index where memory is cache
+rather than the source of truth.
+
+## What the lettered areas mean under this reading
+
+- **C, placement.** Done. Cleared ceiling 1 and made the descriptor sufficient for routing.
+- **H, metadata off cluster state.** The spine. The only area that attacks ceilings 2 and 3.
+- **A, name index tier.** Not a peer of H. It is H's substrate: the descriptor store *is* the name index.
+- **F, cluster state diet.** Cancel if H lands. F1 already found `primaryTerms` unremovable, and with no
+  cluster state entry there is nothing left to diet.
+- **E, manifest sharding.** Re-scope. Most of its motivation is persisting a large cluster state, which
+  H makes small.
+- **B and D, routing affinity and cache warmth.** More important after H, not less: H trades a resident
+  map for a lookup plus a cache, and these two are what keep that cache warm.
+- **G, validation.** The gate at the end. G1 and G2a are done and are what produced Part 0.
+
+So the plan is one spine, C then H, with B and D as consequences and G as the proof.
 
 ---
 
