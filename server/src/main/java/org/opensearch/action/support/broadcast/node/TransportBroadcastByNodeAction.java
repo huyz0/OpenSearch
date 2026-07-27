@@ -74,8 +74,10 @@ import org.opensearch.transport.TransportService;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReferenceArray;
@@ -377,8 +379,10 @@ public abstract class TransportBroadcastByNodeAction<
             }
             ShardsIterator shardIt = shards(clusterState, request, concreteIndices);
             nodeIds = new HashMap<>();
+            final Set<String> indicesWithShards = new HashSet<>();
 
             for (ShardRouting shard : shardIt) {
+                indicesWithShards.add(shard.getIndexName());
                 // send a request to the shard only if it is assigned to a node that is in the local node's cluster state
                 // a scenario in which a shard can be assigned but to a node that is not in the local node's cluster state
                 // is when the shard is assigned to the cluster-manager node, the local node has detected the cluster-manager as failed
@@ -400,6 +404,8 @@ public abstract class TransportBroadcastByNodeAction<
                     );
                 }
             }
+
+            BroadcastEmptiness.assertEveryOpenIndexContributedShards(actionName, clusterState, concreteIndices, indicesWithShards);
 
             responses = new AtomicReferenceArray<>(nodeIds.size());
         }
