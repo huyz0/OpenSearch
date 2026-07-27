@@ -10,6 +10,7 @@ package org.opensearch.action.admin.indices.scale.searchonly;
 
 import org.opensearch.action.support.clustermanager.AcknowledgedResponse;
 import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.indices.replication.common.ReplicationType;
 
@@ -56,6 +57,25 @@ class ScaleIndexOperationValidator {
         try {
             if (indexMetadata == null) {
                 throw new IllegalArgumentException("Index [" + index + "] not found");
+            }
+            // Refused here rather than half-supported, and this has to come before every other check so
+            // that nothing downstream reads routing that does not exist. Scaling works by rewriting the
+            // published routing table to add and remove search-only shards, and a computed index has no
+            // published entry to rewrite. Supporting it would mean the placement function itself had to
+            // express search-only scaling, which is a design question nobody has asked yet.
+            //
+            // What this replaces is not a polite failure. ScaleIndexShardSyncManager dereferenced the
+            // absent entry and threw NullPointerException from clusterStateProcessed, which runs on the
+            // cluster state applier thread, so the failure landed in an applier rather than in the
+            // request that caused it. The scale-up path was worse in a quieter way: a null guard meant it
+            // built a routing table with no trace of the index and reported success.
+            if (AbsentIndexRoutingSuppliers.shouldPublishRouting(indexMetadata) == false) {
+                throw new IllegalArgumentException(
+                    "Index ["
+                        + index
+                        + "] cannot be scaled because its shard placement is computed rather than published, "
+                        + "and scaling works by rewriting the published routing table"
+                );
             }
             if (isScaleDown) {
                 if (indexMetadata.getSettings().getAsBoolean(IndexMetadata.INDEX_BLOCKS_SEARCH_ONLY_SETTING.getKey(), false)) {
