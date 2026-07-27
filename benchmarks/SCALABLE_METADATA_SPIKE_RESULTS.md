@@ -935,3 +935,78 @@ entries at once is the pessimistic case, and under this design it never happens.
 publishes no routing entry, so there is nothing to allocate at startup and nothing to reallocate on a
 membership change. The honest statement is not that the global pass got faster but that it stopped
 existing, and the flat per-shard curve is what makes that credible rather than the ratio.
+
+## S15 (G1): publication latency, and the batching decision it settles
+
+The plan called this the one unmeasured number that changes a decision: whether wake and sleep need the
+`ClusterStateTaskExecutor` batching that C7 gave create-index. They do, by between one and two orders of
+magnitude.
+
+Measured with `PublicationLatencyMeasurementIT`, which submits N cluster state updates and times them to
+completion. An integration test rather than a single-JVM spike, because publication is a property of
+coordination rather than of a data structure: the elected manager computes the state, sends it to every
+node, and waits for acknowledgements.
+
+### The numbers
+
+Five runs. The framework randomises the node count, so cluster size is recorded per run rather than
+chosen. Per-publication figures are at batch=100.
+
+| nodes | unbatched, per publication | batched, per task | publications for 100 tasks | ratio |
+|---|---|---|---|---|
+| 1 | 6.3 ms | 0.33 ms | 100 vs 2 | 19x |
+| 2 | 51.7 ms | 0.96 ms | 100 vs 2 | 54x |
+| 3 | 12.8 ms | 0.37 ms | 100 vs 2 | 35x |
+| 4 | 11.1 ms | 0.24 ms | 100 vs 2 | 46x |
+| 4 | 11.9 ms | 0.22 ms | 100 vs 2 | 54x |
+
+The absolute spread is wide, and the 2-node run at 51.7 ms is an outlier from a loaded machine rather
+than a property of two nodes. It does not matter to the decision: what is consistent across every run is
+the shape. Unbatched cost is linear in the number of tasks because each one publishes. Batched cost is
+nearly flat because a hundred tasks collapse into two publications, so total time barely moves between a
+batch of 10 and a batch of 100.
+
+### What it means for wake and sleep
+
+`TransportReactivateShardsAction` and `ShardSuspensionCoordinator` submit plain `ClusterStateUpdateTask`s
+with no executor, so each shard woken or slept costs a full publication, measured here at roughly 6 to 13
+ms on an idle small cluster. Waking a thousand shards is a thousand publications. Batched, the same
+thousand would be a handful.
+
+**Decision: both need an executor.** This is not a marginal optimisation to weigh against complexity, and
+the mechanism already exists and is already used by create-index.
+
+### Priority starvation is real, and worse than the latency
+
+A NORMAL task submitted behind 300 already-queued URGENT tasks waited:
+
+| nodes | wait |
+|---|---|
+| 1 | 2,339 ms |
+| 2 | 14,807 ms |
+| 3 | 2,934 ms |
+| 4 | 3,898 ms |
+
+The plan predicted this, from reactivation running at `Priority.URGENT` and suspension at
+`Priority.NORMAL`. Confirmed: seconds, not milliseconds, and it grows with the pressure.
+
+The first version of this measurement submitted the NORMAL task *first* and reported 24 ms, which says
+nothing at all: the queue was empty when it arrived. The claim is about a sleep waiting behind sustained
+wake traffic, so the wake traffic has to already be queued. Worth recording because the corrected number
+is 100x the original and the original looked perfectly reasonable.
+
+Batching addresses this too, and more directly than a priority change would. Suspension starves because
+each wake occupies the queue for a full publication; collapsing wakes into batches shortens the queue
+rather than reordering it.
+
+### Why the numbers can be believed
+
+The harness asserts what it measured: every task executed, elapsed time non-zero, and the cluster state
+version advanced by exactly the number of publications expected. That last one is what distinguishes the
+two modes rather than trusting the timer, and it is asserted rather than reported: unbatched must advance
+the version once per task, batched must advance it fewer times than it has tasks.
+
+Then the harness was mutated. Adding a 20 ms sleep to `ClusterManagerService#publish` moved unbatched
+per-publication from about 12 ms to 35 ms, while batched at 100 tasks stayed at 85 ms, because it still
+publishes twice. Both halves of that are the point: the timer responds to publication cost, and batching's
+advantage is precisely that it publishes less often. Reverted afterwards.

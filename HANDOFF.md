@@ -25,7 +25,8 @@ Evidence for every number claimed: `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.m
 |---|---|
 | **A. Name index tier** | **done**, `plan-area-a-name-index.md`. 100 unit tests plus `ServerlessStorageNameIndexIT`. Disabled by default. |
 | **C. Computed placement** | **not blocked**, `plan-area-c-computed-placement.md`. C0 to C29 done. A computed index is creatable, writable, searchable, visible to cat and stats, and survives a full restart. What remains is reach rather than function: see the gaps below. |
-| B, D, E, F, G | not started |
+| **G. Validation** | **G1 done**, S15 in the spike results. Publication latency measured, batching decided. G2 to G5 not started. |
+| B, D, E, F | not started |
 
 ## The one finding that matters most: this seam fails by succeeding
 
@@ -105,6 +106,18 @@ broken ones.
   cache.
 - **C25** the membership maintainer has unit tests, including the self-removal that no integration test
   looks for.
+
+## G1's answer, since it changes what to build next
+
+Publication costs 6 to 13 ms on an idle small cluster and is paid **once per task** without an executor.
+Batched, a hundred tasks collapse into two publications. Measured ratio at batch=100 is 19x to 54x.
+
+**Wake and sleep need the executor.** `TransportReactivateShardsAction` and `ShardSuspensionCoordinator`
+submit plain `ClusterStateUpdateTask`s, so waking a thousand shards is a thousand publications.
+
+Priority starvation is real and larger than the latency: a NORMAL task behind 300 queued URGENT tasks
+waited 2.3 to 14.8 seconds. Batching fixes this more directly than reordering priorities would, since
+suspension starves because each wake holds the queue for a whole publication.
 
 ## What is left
 
