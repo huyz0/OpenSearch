@@ -1,0 +1,224 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
+
+package org.opensearch.cluster.metadata;
+
+import org.opensearch.core.common.io.stream.StreamInput;
+import org.opensearch.core.common.io.stream.StreamOutput;
+import org.opensearch.core.common.io.stream.Writeable;
+import org.opensearch.core.index.Index;
+import org.opensearch.core.xcontent.ToXContentObject;
+import org.opensearch.core.xcontent.XContentBuilder;
+
+import java.io.IOException;
+import java.util.Collections;
+import java.util.List;
+import java.util.Objects;
+
+/**
+ * The irreducible per-index facts, small enough to store outside cluster state.
+ *
+ * <p>Area H's premise is that cluster state should hold no entry per index. The obstacle is that a
+ * coordinator receiving a request still has to answer two questions before it can do anything: does this
+ * name exist, and what are its bones. This type is that answer, and it is deliberately the smallest thing
+ * that suffices rather than a trimmed {@link IndexMetadata}.
+ *
+ * <p><b>Why these fields and no others.</b> The set is derived from what placement actually reads, which
+ * was audited rather than guessed: {@code ComputedRoutingTable} uses the index (name and uuid), the shard
+ * count, and the search-only replica count, and {@code ComputedPlacementGate} reads whether the index is
+ * serverless. State and aliases are here because resolution needs them to answer without materializing
+ * anything, and a resolver that had to load full metadata to decide whether an index is closed would
+ * defeat the point.
+ *
+ * <p>Mappings and settings are deliberately absent. They live in the object store under a convention and
+ * are fetched on demand, because they are the large part and the part a coordinator usually does not
+ * need. A descriptor is around 200 bytes, so a hundred million of them is a twenty gigabyte index rather
+ * than seventy gigabytes of heap on every cluster-manager-eligible node.
+ *
+ * <p>Immutable, and comparable by value, so two nodes resolving the same name agree by construction.
+ */
+public final class IndexDescriptor implements Writeable, ToXContentObject {
+
+    /** What a descriptor says about an index that is no longer there. */
+    public enum State {
+        OPEN,
+        CLOSE,
+        /**
+         * Deleted, and remembered rather than forgotten.
+         *
+         * <p>This is what replaces {@link IndexGraveyard}. A node adopting local shard data must consult
+         * the descriptor and delete that data when it finds this, which is what stops a node partitioned
+         * during a delete from resurrecting the index. The graveyard keeps a bounded list and forgets
+         * older deletions; a tombstoned descriptor does not.
+         */
+        DELETED
+    }
+
+    private final String name;
+    private final String uuid;
+    private final int shardCount;
+    private final int searchOnlyReplicaCount;
+    private final boolean serverless;
+    private final State state;
+    private final List<String> aliases;
+    private final long createdVersion;
+
+    public IndexDescriptor(
+        String name,
+        String uuid,
+        int shardCount,
+        int searchOnlyReplicaCount,
+        boolean serverless,
+        State state,
+        List<String> aliases,
+        long createdVersion
+    ) {
+        this.name = Objects.requireNonNull(name, "descriptor needs a name");
+        this.uuid = Objects.requireNonNull(uuid, "descriptor needs a uuid, since placement hashes it");
+        this.shardCount = shardCount;
+        this.searchOnlyReplicaCount = searchOnlyReplicaCount;
+        this.serverless = serverless;
+        this.state = Objects.requireNonNull(state, "descriptor needs a state");
+        this.aliases = List.copyOf(aliases);
+        this.createdVersion = createdVersion;
+    }
+
+    /**
+     * Derives a descriptor from full metadata, which is how the dual-write phase keeps the two in step.
+     *
+     * <p>Deriving rather than constructing separately is what makes H2c's comparison meaningful: if the
+     * descriptor were built from different inputs, agreement between the two resolution paths would prove
+     * only that both were built from the same mistake.
+     */
+    public static IndexDescriptor from(IndexMetadata indexMetadata) {
+        return new IndexDescriptor(
+            indexMetadata.getIndex().getName(),
+            indexMetadata.getIndexUUID(),
+            indexMetadata.getNumberOfShards(),
+            indexMetadata.getNumberOfSearchOnlyReplicas(),
+            indexMetadata.getSettings().getAsBoolean("index.serverless_storage.enabled", false),
+            indexMetadata.getState() == IndexMetadata.State.CLOSE ? State.CLOSE : State.OPEN,
+            List.copyOf(indexMetadata.getAliases().keySet()),
+            indexMetadata.getCreationVersion().id
+        );
+    }
+
+    public IndexDescriptor(StreamInput in) throws IOException {
+        this.name = in.readString();
+        this.uuid = in.readString();
+        this.shardCount = in.readVInt();
+        this.searchOnlyReplicaCount = in.readVInt();
+        this.serverless = in.readBoolean();
+        this.state = State.values()[in.readVInt()];
+        this.aliases = List.copyOf(in.readStringList());
+        this.createdVersion = in.readVLong();
+    }
+
+    @Override
+    public void writeTo(StreamOutput out) throws IOException {
+        out.writeString(name);
+        out.writeString(uuid);
+        out.writeVInt(shardCount);
+        out.writeVInt(searchOnlyReplicaCount);
+        out.writeBoolean(serverless);
+        out.writeVInt(state.ordinal());
+        out.writeStringCollection(aliases);
+        out.writeVLong(createdVersion);
+    }
+
+    /** The index, which is what placement hashes and what every shard id is built from. */
+    public Index index() {
+        return new Index(name, uuid);
+    }
+
+    public String name() {
+        return name;
+    }
+
+    public String uuid() {
+        return uuid;
+    }
+
+    public int shardCount() {
+        return shardCount;
+    }
+
+    public int searchOnlyReplicaCount() {
+        return searchOnlyReplicaCount;
+    }
+
+    public boolean serverless() {
+        return serverless;
+    }
+
+    public State state() {
+        return state;
+    }
+
+    /** Whether this index still exists, as opposed to being remembered so its data can be reclaimed. */
+    public boolean exists() {
+        return state != State.DELETED;
+    }
+
+    public List<String> aliases() {
+        return Collections.unmodifiableList(aliases);
+    }
+
+    public long createdVersion() {
+        return createdVersion;
+    }
+
+    /** The same descriptor, tombstoned. Deletion records rather than removes, so absence stays meaningful. */
+    public IndexDescriptor tombstoned() {
+        return new IndexDescriptor(name, uuid, shardCount, searchOnlyReplicaCount, serverless, State.DELETED, aliases, createdVersion);
+    }
+
+    @Override
+    public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
+        builder.startObject();
+        builder.field("name", name);
+        builder.field("uuid", uuid);
+        builder.field("shard_count", shardCount);
+        builder.field("search_only_replicas", searchOnlyReplicaCount);
+        builder.field("serverless", serverless);
+        builder.field("state", state.name());
+        builder.field("aliases", aliases);
+        builder.field("created_version", createdVersion);
+        builder.endObject();
+        return builder;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) {
+            return true;
+        }
+        if (o instanceof IndexDescriptor == false) {
+            return false;
+        }
+        IndexDescriptor other = (IndexDescriptor) o;
+        return shardCount == other.shardCount
+            && searchOnlyReplicaCount == other.searchOnlyReplicaCount
+            && serverless == other.serverless
+            && createdVersion == other.createdVersion
+            && name.equals(other.name)
+            && uuid.equals(other.uuid)
+            && state == other.state
+            && aliases.equals(other.aliases);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(name, uuid, shardCount, searchOnlyReplicaCount, serverless, state, aliases, createdVersion);
+    }
+
+    @Override
+    public String toString() {
+        return "IndexDescriptor{" + name + "/" + uuid + ", shards=" + shardCount + ", state=" + state + "}";
+    }
+}
