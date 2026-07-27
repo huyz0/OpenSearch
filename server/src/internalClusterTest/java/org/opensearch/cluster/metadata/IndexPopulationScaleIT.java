@@ -21,6 +21,8 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertAcked;
+
 /**
  * G2a. What an index population actually costs to build, before committing to the plan's 1M.
  *
@@ -52,10 +54,100 @@ public class IndexPopulationScaleIT extends OpenSearchIntegTestCase {
      */
     @Override
     protected Settings nodeSettings(int nodeOrdinal) {
-        return Settings.builder()
-            .put(super.nodeSettings(nodeOrdinal))
-            .put("cluster.max_shards_per_node", 100_000)
-            .build();
+        return Settings.builder().put(super.nodeSettings(nodeOrdinal)).put("cluster.max_shards_per_node", 100_000).build();
+    }
+
+    private static final String DESCRIPTOR_INDEX = "descriptors";
+
+    /**
+     * The Area H claim, measured against the thing it replaces in the same harness.
+     *
+     * <p>Index creation writes an entry into the cluster state metadata map, and H0a measured that
+     * rebuild at 107 ms for one index once a hundred thousand exist. Area H proposes writing a descriptor
+     * document instead, with {@code op_type=create} giving put-if-absent from the single shard owning the
+     * id, and no cluster state update at all.
+     *
+     * <p>If that claim holds, descriptor creation is flat in the population where index creation is not,
+     * and the two arms of this measurement diverge. If it does not hold, Area H is attacking the wrong
+     * thing and should stop before any production code depends on it.
+     *
+     * <p>The population here is descriptors in one index rather than indices in a cluster, which is
+     * exactly the substitution Area H proposes. Uniqueness is asserted rather than assumed: a create that
+     * silently overwrote an existing id would look flat and prove nothing.
+     */
+    public void testDescriptorCreationRateAgainstPopulation() throws Exception {
+        assertAcked(
+            client().admin()
+                .indices()
+                .prepareCreate(DESCRIPTOR_INDEX)
+                .setSettings(
+                    Settings.builder()
+                        .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 3)
+                        .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+                        .build()
+                )
+        );
+
+        StringBuilder table = new StringBuilder("\nH-spike descriptor creation cost, ").append(internalCluster().size()).append(" nodes\n");
+        int created = 0;
+        for (int population : POPULATIONS) {
+            int toCreate = population - created;
+            long startedAt = System.nanoTime();
+            createDescriptors(created, toCreate);
+            long elapsedNanos = System.nanoTime() - startedAt;
+            created = population;
+
+            double perDescriptorMillis = (elapsedNanos / 1_000_000.0) / toCreate;
+            table.append(
+                String.format(
+                    Locale.ROOT,
+                    "  population=%,7d  batch=%,6d  %6.3f ms/descriptor  projected 1M = %5.1f min%n",
+                    population,
+                    toCreate,
+                    perDescriptorMillis,
+                    perDescriptorMillis * 1_000_000 / 60_000
+                )
+            );
+        }
+        logger.warn(table.toString());
+
+        // Uniqueness, which is what makes a descriptor write a legitimate replacement for the cluster
+        // state entry rather than merely a faster one.
+        org.opensearch.action.index.IndexRequest duplicate = new org.opensearch.action.index.IndexRequest(DESCRIPTOR_INDEX).id("scale-0")
+            .source("name", "scale-0")
+            .create(true);
+        expectThrows(org.opensearch.index.engine.VersionConflictEngineException.class, () -> client().index(duplicate).actionGet());
+    }
+
+    private void createDescriptors(int from, int count) throws Exception {
+        CountDownLatch done = new CountDownLatch(count);
+        AtomicInteger failures = new AtomicInteger();
+        java.util.concurrent.Semaphore inFlight = new java.util.concurrent.Semaphore(IN_FLIGHT);
+        for (int i = 0; i < count; i++) {
+            inFlight.acquire();
+            String name = "scale-" + (from + i);
+            client().index(
+                new org.opensearch.action.index.IndexRequest(DESCRIPTOR_INDEX).id(name)
+                    .source("name", name, "uuid", name + "-uuid", "shards", 1)
+                    .create(true),
+                new ActionListener<>() {
+                    @Override
+                    public void onResponse(org.opensearch.action.index.IndexResponse response) {
+                        inFlight.release();
+                        done.countDown();
+                    }
+
+                    @Override
+                    public void onFailure(Exception e) {
+                        failures.incrementAndGet();
+                        inFlight.release();
+                        done.countDown();
+                    }
+                }
+            );
+        }
+        assertTrue("descriptor creation must finish within the budget", done.await(10, TimeUnit.MINUTES));
+        assertEquals("no descriptor write may fail, or the rate is meaningless", 0, failures.get());
     }
 
     /** Small enough to finish, large enough for the rate to be meaningful rather than startup noise. */

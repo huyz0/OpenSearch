@@ -1200,3 +1200,58 @@ creation throughput.
 
 That gap is what `plan-area-h-metadata-off-cluster-state.md` addresses, and S18 is the measurement that
 justifies opening it.
+
+## S19 (H0a and the Area H spike): the cause confirmed, and the replacement measured
+
+S18 measured index creation degrading with population and named `Metadata.Builder.build()` as the likely
+cause from reading the code. This confirms it and measures the alternative.
+
+### The cause, measured in isolation
+
+`Metadata.builder(existing).put(one index).build()`, which is exactly what creation does, against
+population. Best of twenty repeats, in-JVM so it reaches sizes a test cluster cannot.
+
+| indices | add one index | rebuild, no change | forced sweep |
+|---|---|---|---|
+| 1,000 | 0.67 ms | 0.33 ms | 0.33 ms |
+| 10,000 | 8.74 ms | 2.44 ms | 2.38 ms |
+| 50,000 | 54.44 ms | 15.90 ms | 14.67 ms |
+| 100,000 | **107.67 ms** | 31.54 ms | 33.22 ms |
+
+Adding one index to a hundred thousand costs 107 ms of metadata rebuild alone, on the cluster manager's
+single state-update thread, before consensus and before publication. That caps creation at roughly nine
+per second at that population, and it degrades from there. At a million it is about a second per create.
+
+**The fast path is O(N) too.** A rebuild that changes nothing still costs 31.5 ms at a hundred thousand,
+because it copies six arrays of length N. So every metadata change pays proportional to the whole
+population, not only creation. That is broader than S18 claimed.
+
+### The replacement, measured in the same harness
+
+Writing a descriptor document with `op_type=create` instead of creating an index, same cluster, same
+populations, in one run so the comparison is not across machines.
+
+| population | index creation | descriptor write |
+|---|---|---|
+| 200 | 6.51 ms | 1.64 ms |
+| 1,000 | 9.76 ms | 0.43 ms |
+| 3,000 | 37.24 ms | 0.26 ms |
+| 6,000 | 91.66 ms | 0.16 ms |
+| projected 1M | 25.5 hours | 2.7 minutes |
+
+Index creation degrades fourteenfold across the range. Descriptor writes do not degrade. The apparent
+improvement is warmup amortising over larger batches rather than anything superlinear in the good
+direction, and it should be read as flat.
+
+Uniqueness is asserted rather than assumed: a second `create` against an existing id throws
+`VersionConflictEngineException`, which is the put-if-absent guarantee Area H's creation path depends on.
+A create that silently overwrote would have looked equally flat and proved nothing.
+
+### What this settles
+
+Area H's premise holds. The superlinear term is the cluster state metadata rebuild, and replacing the
+cluster state entry with a document in an index removes it. The spike does not yet prove the rest of Area
+H, which is resolution, wildcards, deletion, and the forty-one enumerations. It proves the foundation:
+creation can be flat, and the mechanism that makes it flat is already in the product.
+
+The kill criterion set before the spike was "if the curve is not flat, stop". It is flat.

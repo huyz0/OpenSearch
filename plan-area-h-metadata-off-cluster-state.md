@@ -175,3 +175,20 @@ heap: the target is O(nodes), not O(indices).
 
 G2a, re-run after H3: creation cost per index against population size. Today it is 7.4, 10.3, 34.6, 98.8
 ms at 200, 1k, 3k, 6k. Flat is the claim. Anything else and the architecture has not changed, only moved.
+
+## H.13 Spike result: the premise holds
+
+Measured before committing to the work, and recorded as S19.
+
+The cause is confirmed rather than inferred. `Metadata.builder(existing).put(one).build()` costs 0.67 ms
+at a thousand indices and 107.67 ms at a hundred thousand. The no-change fast path is O(N) as well, 31.5
+ms at a hundred thousand, so every metadata change pays for the whole population and not only creation.
+
+The replacement was measured in the same harness on the same cluster: descriptor writes with
+`op_type=create` stay flat where index creation degrades fourteenfold, 0.16 ms against 91.66 ms at six
+thousand. Projected to a million that is 2.7 minutes against 25.5 hours. The duplicate-id write throws
+`VersionConflictEngineException`, so the put-if-absent guarantee this design rests on is real.
+
+**The kill criterion was "if the curve is not flat, stop". It is flat, so H1 onwards is justified.** What
+the spike does not prove is everything after creation: resolution, wildcards, deletion, and the
+forty-one enumerations. It proves the foundation only.
