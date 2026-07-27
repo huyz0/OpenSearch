@@ -13,6 +13,7 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.shard.ShardNotFoundException;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicReference;
@@ -216,6 +217,86 @@ public final class AbsentIndexRoutingSuppliers {
         }
         IndexRoutingTable computed = supplyIfRegistered(state, shardId.getIndex().getName());
         return computed == null ? null : computed.shard(shardId.id());
+    }
+
+    /**
+     * Every shard of the named indices, resolving each index rather than looking it up.
+     *
+     * <p>The bulk counterpart of {@link #resolve}, and the reason it lives here rather than on
+     * {@link RoutingTable} is a constraint rather than a preference. Those accessors receive a routing
+     * table and nothing else, while supplying an entry needs the {@link ClusterState} and the index
+     * metadata; and the no-argument forms take their index list from the routing table's own key set,
+     * which a computed index is not in. So a computed index cannot be resolved there, and cannot even be
+     * named there.
+     *
+     * <p>What this replaces failed by succeeding. Stats reported an index with no shards, segments
+     * reported no segments, recovery reported nothing recovering, and a force merge reported success
+     * having merged nothing. None of them threw, so the caller had no way to tell an unreachable index
+     * from an empty one, which is the same signature as the refresh in C21 and the field mappings in C22.
+     *
+     * <p>Missing indices are skipped rather than raising, matching
+     * {@link RoutingTable#allShardsSatisfyingPredicate} exactly, because these callers already depend on
+     * that for indices that disappear mid-request.
+     *
+     * @param includeRelocationTargets whether to add the target of a relocating shard, as recovery needs
+     */
+    public static ShardsIterator allShards(
+        ClusterState state,
+        String[] concreteIndices,
+        Predicate<ShardRouting> predicate,
+        boolean includeRelocationTargets
+    ) {
+        if (isRegistered() == false) {
+            // Untouched behaviour when nothing is installed, delegating to the exact method each caller
+            // used to call rather than to an equivalent one. The distinction is not pedantry: routing
+            // through allShardsSatisfyingPredicate where the caller used allShards is behaviourally
+            // identical and still wrong, because callers and tests bind to the method rather than to the
+            // behaviour. TransportRemoteStoreStatsActionTests stubs allShards(String[]) on a spy, and the
+            // equivalent-but-different call slipped straight past it.
+            if (includeRelocationTargets) {
+                return state.routingTable().allShardsIncludingRelocationTargets(concreteIndices);
+            }
+            if (predicate == ALL_SHARDS) {
+                return state.routingTable().allShards(concreteIndices);
+            }
+            return state.routingTable().allShardsSatisfyingPredicate(concreteIndices, predicate);
+        }
+        // A list rather than a set, because these callers rely on shard identity being preserved.
+        List<ShardRouting> shards = new ArrayList<>();
+        for (String index : concreteIndices) {
+            IndexRoutingTable indexRoutingTable = resolve(state, index);
+            if (indexRoutingTable == null) {
+                continue;
+            }
+            for (IndexShardRoutingTable shardRoutingTable : indexRoutingTable) {
+                for (ShardRouting shardRouting : shardRoutingTable) {
+                    if (predicate.test(shardRouting) == false) {
+                        continue;
+                    }
+                    shards.add(shardRouting);
+                    if (includeRelocationTargets && shardRouting.relocating()) {
+                        shards.add(shardRouting.getTargetRelocatingShard());
+                    }
+                }
+            }
+        }
+        return new PlainShardsIterator(shards);
+    }
+
+    /**
+     * The "no filter" predicate, held as a constant so the fast path can recognise it by identity and
+     * delegate to {@link RoutingTable#allShards(String[])} itself rather than to an equivalent method.
+     */
+    private static final Predicate<ShardRouting> ALL_SHARDS = shardRouting -> true;
+
+    /** Every shard of the named indices, the common case. */
+    public static ShardsIterator allShards(ClusterState state, String[] concreteIndices) {
+        return allShards(state, concreteIndices, ALL_SHARDS, false);
+    }
+
+    /** Every shard of the named indices, plus the targets of any that are relocating. */
+    public static ShardsIterator allShardsIncludingRelocationTargets(ClusterState state, String[] concreteIndices) {
+        return allShards(state, concreteIndices, ALL_SHARDS, true);
     }
 
     /** The computed entry for an index, skipping the metadata lookup when no supplier is installed. */

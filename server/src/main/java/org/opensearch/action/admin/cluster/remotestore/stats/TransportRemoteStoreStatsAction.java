@@ -15,6 +15,7 @@ import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.block.ClusterBlockLevel;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
+import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.PlainShardsIterator;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.ShardsIterator;
@@ -82,13 +83,13 @@ public class TransportRemoteStoreStatsAction extends TransportBroadcastByNodeAct
     protected ShardsIterator shards(ClusterState clusterState, RemoteStoreStatsRequest request, String[] concreteIndices) {
         final List<ShardRouting> newShardRoutings = new ArrayList<>();
         if (request.shards().length > 0) {
-            clusterState.routingTable().allShards(concreteIndices).getShardRoutings().forEach(shardRouting -> {
+            AbsentIndexRoutingSuppliers.allShards(clusterState, concreteIndices).getShardRoutings().forEach(shardRouting -> {
                 if (Arrays.asList(request.shards()).contains(Integer.toString(shardRouting.shardId().id()))) {
                     newShardRoutings.add(shardRouting);
                 }
             });
         } else {
-            newShardRoutings.addAll(clusterState.routingTable().allShards(concreteIndices).getShardRoutings());
+            newShardRoutings.addAll(AbsentIndexRoutingSuppliers.allShards(clusterState, concreteIndices).getShardRoutings());
         }
         return new PlainShardsIterator(
             newShardRoutings.stream()

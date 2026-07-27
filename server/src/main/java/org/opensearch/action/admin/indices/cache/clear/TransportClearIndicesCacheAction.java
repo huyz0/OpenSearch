@@ -41,6 +41,7 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.block.ClusterBlockLevel;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
+import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.ShardsIterator;
 import org.opensearch.cluster.service.ClusterService;
@@ -162,7 +163,7 @@ public class TransportClearIndicesCacheAction extends TransportBroadcastByNodeAc
      */
     @Override
     protected ShardsIterator shards(ClusterState clusterState, ClearIndicesCacheRequest request, String[] concreteIndices) {
-        return clusterState.routingTable().allShards(concreteIndices);
+        return AbsentIndexRoutingSuppliers.allShards(clusterState, concreteIndices);
     }
 
     @Override

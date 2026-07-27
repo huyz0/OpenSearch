@@ -38,6 +38,7 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.block.ClusterBlockLevel;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
+import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.ShardsIterator;
 import org.opensearch.cluster.service.ClusterService;
@@ -136,7 +137,7 @@ public class TransportRecoveryAction extends TransportBroadcastByNodeAction<Reco
 
     @Override
     protected ShardsIterator shards(ClusterState state, RecoveryRequest request, String[] concreteIndices) {
-        return state.routingTable().allShardsIncludingRelocationTargets(concreteIndices);
+        return AbsentIndexRoutingSuppliers.allShardsIncludingRelocationTargets(state, concreteIndices);
     }
 
     @Override
