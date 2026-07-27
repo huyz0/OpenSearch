@@ -204,6 +204,25 @@ the write path. Fails if two concurrent dynamic mapping updates can lose one.
 
 Only after H2 to H4 have soaked. Fails if any H1a blocking enumeration is still reachable.
 
+## H.10a What Area H does not fix, found during the audit
+
+Two costs scale with the index population and survive everything above, because they do not go through
+cluster state at all.
+
+**The plugin's periodic enumerations.** `ShardSuspensionCoordinator`, `ReaderCacheAffinityRecorder` and
+`InPlaceMergeTriggerCoordinator` each iterate every index on a scheduler tick. Emptying the map would make
+them iterate nothing and silently do no work, which is this project's characteristic failure and worse
+than the cost it replaces.
+
+**`ShardSuspensionCoordinator.findByUuid` is a full scan**, called from six places including two that run
+on the cluster manager's state update thread. Suspending one shard is O(total indices) and a tick
+suspending N shards is O(N x total). The cheap fix is unavailable: the candidate entry and the node reports
+it is built from carry only UUIDs, and `Metadata` has no UUID lookup. Adding one would build another O(N)
+structure per `Metadata.build`, which is the ceiling this area exists to remove.
+
+Both are tracked as H1d. They matter because they are the counter-example to "Area H clears ceiling 3":
+it clears the part that flows through cluster state, and these two do not.
+
 ## H.11 Phasing, each phase falsifiable
 
 **H1. Audit.** Classify all 41 direct enumerations as convertible, refusable, or blocking. F1's precedent:
