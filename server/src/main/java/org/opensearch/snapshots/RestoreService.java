@@ -61,12 +61,12 @@ import org.opensearch.cluster.metadata.MetadataIndexStateService;
 import org.opensearch.cluster.metadata.MetadataIndexUpgradeService;
 import org.opensearch.cluster.metadata.RepositoriesMetadata;
 import org.opensearch.cluster.node.DiscoveryNode;
+import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.RecoverySource;
 import org.opensearch.cluster.routing.RecoverySource.SnapshotRecoverySource;
 import org.opensearch.cluster.routing.RoutingChangesObserver;
 import org.opensearch.cluster.routing.RoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
-import org.opensearch.cluster.routing.ShardsIterator;
 import org.opensearch.cluster.routing.UnassignedInfo;
 import org.opensearch.cluster.routing.allocation.AllocationService;
 import org.opensearch.cluster.service.ClusterManagerTaskThrottler;
@@ -962,13 +962,29 @@ public class RestoreService implements ClusterStateApplier {
                         Predicate<ShardRouting> isRemoteSnapshotShard = shardRouting -> shardRouting.primary()
                             && clusterService.state().getMetadata().getIndexSafe(shardRouting.index()).isRemoteSnapshot();
 
-                        ShardsIterator shardsIterator = clusterService.state()
-                            .routingTable()
-                            .allShardsSatisfyingPredicate(isRemoteSnapshotShard);
+                        // Resolved rather than looked up. The no-argument accessor takes its index list
+                        // from the routing table's own key set, so an index with no published entry is
+                        // invisible to it and its shards are missing from this total.
+                        //
+                        // Reachability is configuration dependent rather than impossible, and the path is
+                        // worth naming. Restore publishes routing unconditionally, so a freshly restored
+                        // index is always visible here. State recovery does not: after a full cluster
+                        // restart it rebuilds routing from metadata and skips whatever the deployment's
+                        // predicate calls unpublished, so a restored remote snapshot index that matches
+                        // that predicate comes back without a published entry.
+                        //
+                        // The direction of the error is why this is worth fixing rather than noting. This
+                        // is a capacity check, so missing shards make the total too small, and a total
+                        // that is too small admits a restore that overflows the file cache. Unlike the
+                        // rest of this seam, it fails towards doing the damage rather than towards
+                        // reporting nothing.
+                        List<ShardRouting> routings = AbsentIndexRoutingSuppliers.allShards(clusterService.state())
+                            .stream()
+                            .filter(isRemoteSnapshotShard)
+                            .collect(Collectors.toList());
 
                         long totalRestoredRemoteIndicesSize = 0;
                         int missingSizeCount = 0;
-                        List<ShardRouting> routings = shardsIterator.getShardRoutings();
 
                         for (ShardRouting shardRouting : routings) {
                             Long shardSize = clusterInfo.getShardSize(shardRouting);
