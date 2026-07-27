@@ -1302,10 +1302,17 @@ production caller at all, so it is excluded.
 
 Two findings changed Area H's scope.
 
-**There is no point-lookup fast path.** `concreteSingleIndex` delegates to `concreteIndices`, so resolving
-a plain name runs the whole expression pipeline including wildcard machinery. Under H a plain name should
-be a realtime GET, and without a fast path every point lookup would inherit a freshness problem it has no
-reason to have.
+**There is no point-lookup fast path, and that turned out to matter less than it sounds.** `concreteSingleIndex`
+does delegate to `concreteIndices`, so a plain name enters the expression pipeline. But
+`WildcardExpressionResolver.innerResolve` calls `aliasOrIndexExists`, which is a single
+`getIndicesLookup().get(expression)`, and returns early on a hit. A plain name therefore costs one hash
+lookup rather than an enumeration, and the first version of this note was wrong to imply otherwise.
+
+The real obstacle is what that lookup consults. Both `aliasOrIndexExists` and the `concreteResolvedIndices`
+loop read `metadata.getIndicesLookup()`, which is the in-memory structure Area H removes. They need to fall
+back to the descriptor index when the map misses, which is the seam pattern
+`AbsentIndexRoutingSuppliers.resolve` established in Area C and proved across nine call sites: try
+published, then supplied.
 
 **The plugin has periodic enumerations.** `ShardSuspensionCoordinator`, `ReaderCacheAffinityRecorder` and
 `InPlaceMergeTriggerCoordinator` each iterate every index on a scheduler tick, not on a request or a state
