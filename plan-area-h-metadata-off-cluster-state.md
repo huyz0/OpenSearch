@@ -1,0 +1,177 @@
+# Area H: take index metadata out of cluster state entirely
+
+## H.0 Goal
+
+Index creation costs the same at 100 million indices as at zero, and no node holds a structure with one
+entry per index.
+
+## H.1 Why, measured rather than argued
+
+Three numbers from this session say the current design cannot reach the target, and that the areas
+already built do not fix it.
+
+**Creation is superlinear in the existing population.** G2a measured index creation at 7.4 ms/index with
+200 indices present, 10.3 at 1,000, 34.6 at 3,000 and 98.8 at 6,000. Projected to a million that is 27
+hours and still climbing. The plan's G2 assumed "per-index costs known to be flat so extrapolation is
+defensible", but what C11 established as flat was metadata *heap* (698 B/index at both 3 and 30 shards).
+Time is not flat, and the two were conflated.
+
+**The cause is structural.** `Metadata.Builder.build()` takes a fast path only when
+`indices.equals(previousMetadata.indices)`, and creating an index changes that map by definition. So every
+create runs `buildMetadataWithRecomputedIndicesLookups()`, sweeping every index in the cluster to rebuild
+six name arrays and the sorted `indicesLookup`. Creating the millionth index does a million units of work
+that have nothing to do with it. Even the fast path is six `Arrays.copyOf` of N-length arrays.
+
+**Deferral changed the constant, not the complexity.** `LazyIndexMetadata` reduces an unread index from
+2,944 B to 698 B, which is what makes the population fit in memory at all. But a stub is still an entry in
+the `indices` map, and `build()` iterates holders. 100M stubs is still a 100M-element sweep, and 70 GB
+resident.
+
+Areas A, E and F each reduce bytes per index. None removes the entry. That is the gap this area closes.
+
+## H.2 The shape to copy
+
+S3 serves on the order of 10^14 objects with no global map. Its key index is range-partitioned across many
+nodes, sorted, disk-backed, with memory as cache. A `HEAD` routes by key to the single partition that could
+hold it. A `LIST prefix` is a range scan over sorted keys in the partitions covering that range. Nothing
+enumerates, nothing is replicated everywhere. The old per-prefix rate limits and adaptive prefix splitting
+were this design leaking through the API.
+
+The two operations map exactly onto what OpenSearch needs from index metadata:
+
+| S3 | what OpenSearch asks | today |
+|---|---|---|
+| `HEAD key` | does `logs-2024` exist, what are its bones | lookup in a replicated `HashMap` |
+| `LIST prefix` | resolve `logs-*` | scan of that map |
+
+**An OpenSearch index already is that structure.** A term dictionary is sorted, sharded, disk-backed,
+cached by block, with point lookup and prefix scan as its two native operations. So this area does not
+build an S3-like index. It stores index metadata in the thing OpenSearch already is, instead of in a map
+bolted onto the consensus layer.
+
+## H.3 What cluster state keeps
+
+Everything with a bounded count stays. Everything with one entry per index leaves.
+
+Stays: nodes, computed placement membership, cluster settings, templates, security metadata, repository
+definitions, and exactly one index entry for the name index itself.
+
+Leaves: `indices` (the map), `IndexGraveyard` (per-index tombstones), and for serverless indices the
+routing table entry, which Area C already removed.
+
+## H.4 The descriptor, which is the irreducible piece
+
+A coordinator that receives `(index-name, query)` cannot route without knowing the index UUID and shard
+count, because those are the inputs to `RendezvousShardPlacement`. So something global must answer:
+
+```
+name -> { uuid, shardCount, createdVersion, state, blocks, aliases }
+```
+
+That is the descriptor, roughly 200 B. At 100M indices it is a 20 GB index: a large but ordinary
+OpenSearch index, sharded, and itself placed by computed placement. It is not held in memory anywhere.
+
+Mappings and settings do **not** belong in the descriptor. They live in the object store under a
+convention, `indices/{uuid}/metadata/{generation}`, fetched on demand and cached on the coordinator. Area
+B's affinity routing exists to keep that cache warm, which is what makes the fetch rare rather than
+per-request.
+
+## H.5 Index creation, redesigned
+
+The mechanism for uniqueness already exists and needs no invention. Indexing a document with
+`op_type=create` and `_id=<index name>` is put-if-absent, enforced by the single shard that owns that id.
+That is the same guarantee S3 gives on a conditional put, and it is one indexing request.
+
+```
+create index "logs-2024":
+  1. index descriptor into the name index, _id = "logs-2024", op_type = create
+     -> conflict means the name is taken, which is the uniqueness check
+  2. write mappings and settings object to the store at indices/{uuid}/metadata/0
+  3. done
+```
+
+**No cluster state update at all.** No consensus round, no publication, no `Metadata.build()`, no sweep.
+Cost is one indexing operation routed to one shard, independent of how many indices exist. That is the
+falsifiable claim of this area, and G2a is the measurement that tests it.
+
+Resolution and wildcards become the two S3 operations: a realtime GET by id, and a prefix search.
+
+## H.6 Deletion, which is the subtle one
+
+`IndexGraveyard` exists so a node partitioned during a delete does not resurrect the index's dangling data
+on rejoin. Convention-based storage cannot answer this on its own: absence of an object is
+indistinguishable from not having looked.
+
+The descriptor answers it, and better. Deletion writes `state: DELETED` with a timestamp into the name
+index rather than removing the document. A node adopting local shard data must resolve the descriptor
+first and delete its data if the descriptor is missing or tombstoned. This is strictly stronger than the
+graveyard, which keeps a bounded list (500 by default) and forgets older deletions.
+
+## H.7 Dynamic mappings
+
+Today a document with a new field triggers a cluster state update through the elected manager, which is a
+global serialisation point on the write path. Moving mappings to the store replaces it with a
+compare-and-swap on the mapping object's generation, scoped to one index. This removes a global bottleneck
+rather than adding one, and the plugin's `ShardHead` already establishes CAS as the write authority.
+
+## H.8 The enumeration surface, audited
+
+The reason this is a quarter of work rather than a year:
+
+| surface | count | shape |
+|---|---|---|
+| `IndexNameExpressionResolver` call sites | 95, of which 25 are inside the resolver | **one chokepoint** |
+| direct `metadata().indices()` | 31 | individual |
+| `for (IndexMetadata : metadata())` loops | 10 | individual |
+
+Almost everything funnels through one class. Teaching `IndexNameExpressionResolver` to resolve through the
+name index converts the bulk of the surface in one place. The ~41 direct enumerations are the residual,
+comparable in size to C23's nine callers and needing the same treatment: probe each, convert what is
+reachable, refuse what should be refused.
+
+## H.9 Hard preconditions
+
+- **Serverless indices only.** An index whose placement is computed, whose routing is not published, and
+  whose data is in the object store. Ordinary indices keep the `indices` map and get none of this. The two
+  coexist: the resolver consults the map first, then the name index.
+- **Area A** (name index tier) is the substrate and must land first.
+- **Area C** is done, which is what makes routing derivable from the descriptor alone.
+
+## H.10 Phasing, each phase falsifiable
+
+**H1. Audit.** Classify all 41 direct enumerations as convertible, refusable, or blocking. F1's precedent:
+the plan assumed two fields were equally removable and one was load-bearing on the write path. Expect at
+least one of these to be the same.
+
+**H2. Resolve through the name index, with indices still in cluster state.** Proves the read path against a
+population that still exists in the old structure, so any divergence is visible by comparing the two
+answers. This is the phase where correctness is established cheaply.
+
+**H3. Create without touching cluster state**, behind the gate. **Re-run G2a. The claim is that the curve
+goes flat.** If per-index creation cost still grows with population, this area has failed and should stop
+here.
+
+**H4. Tombstones and dynamic mappings** on the new path.
+
+**H5. Remove the map for serverless indices**, only after H2 to H4 have soaked. Then re-measure resident
+heap: the target is O(nodes), not O(indices).
+
+## H.11 What would kill this
+
+- **Wildcard freshness.** A newly created index is visible to a realtime GET immediately but not to a
+  prefix search until refresh. `logs-*` may not include an index created a second ago. That is a semantic
+  change to index resolution and it must be stated in the API contract rather than discovered.
+- **The name index becoming the bottleneck.** 100M creates is 100M indexing operations. That is ordinary
+  indexing throughput, but the name index's own shards are placed by computed placement, and a hot prefix
+  concentrates on one shard exactly as it did for S3 before adaptive splitting. This needs measuring, not
+  assuming.
+- **An enumeration that cannot be converted.** Upgrade-time version checks and some snapshot paths
+  genuinely want every index. If one of them is load-bearing and cannot become a query, it caps what this
+  area can remove.
+- **Bootstrapping.** The name index must be findable without itself. It gets a fixed name and UUID, its
+  placement computed, and the one cluster state entry that remains.
+
+## H.12 The single number that decides it
+
+G2a, re-run after H3: creation cost per index against population size. Today it is 7.4, 10.3, 34.6, 98.8
+ms at 200, 1k, 3k, 6k. Flat is the claim. Anything else and the architecture has not changed, only moved.

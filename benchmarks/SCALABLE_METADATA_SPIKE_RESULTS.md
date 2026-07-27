@@ -1142,3 +1142,61 @@ reports once for every task in it, into the executor, which must record it per t
 runs. Without that, one real suspension in a batch would make every task in the batch evict, and one real
 reactivation would make every request in the batch log and reroute. This is the part of the change most
 likely to be got wrong by someone copying the shape without noticing why the flag is there.
+
+## S18 (G2a): index creation is superlinear in the population, which no area on the plan fixes
+
+G2 asks for a synthetic 1M-index cluster. Before building it, this measured whether a million is
+reachable. It is not, and why it is not turns out to matter more than the test would have.
+
+### The curve
+
+Indices created with one shard, no replicas, bounded to 100 in flight, on a 2-node test cluster.
+
+| population reached | batch | per index | projected 1M |
+|---|---|---|---|
+| 200 | 200 | 7.38 ms | 2.1 hours |
+| 1,000 | 800 | 10.29 ms | 2.9 hours |
+| 3,000 | 2,000 | 34.57 ms | 9.6 hours |
+| 6,000 | 3,000 | 98.75 ms | 27.4 hours |
+
+Per-index cost grew 13x between 200 and 6,000 indices, and the rate was still worsening at the last
+point, so 27 hours is optimistic rather than an estimate of the answer.
+
+**The plan's premise for G2 does not hold.** It says 1M is chosen "with the per-index costs known to be
+flat so extrapolation is defensible". What C11 measured as flat is metadata *heap*: 698 B/index deferred at
+both 3 and 30 shards. Creation *time* is not flat. The two are independent and were conflated.
+
+### Two wrong answers found on the way, both worth recording
+
+The first attempt issued each batch concurrently and the cluster fell over at 2,000 simultaneous creations
+with nodes disconnecting. Reporting that as a capacity limit would have been wrong in the direction that
+makes the architecture look worse than it is: it measured the harness's tolerance for concurrent requests.
+Bounding in-flight requests to 100 separated the two.
+
+The second wall was `cluster.max_shards_per_node`, which defaults to 1,000, so three data nodes refuse the
+3,001st single-shard index with "this cluster currently has [3000]/[3000] maximum shards open". A
+configurable default, not a fundamental limit, and worth noting on its own: it is the ceiling S12 says
+computed placement removes, met here as a hard validation error. Reaching a million indices requires
+raising it by three orders of magnitude.
+
+Neither would have been visible without probing, and either could have been reported as the finding.
+
+### The cause, and why it is architectural
+
+`Metadata.Builder.build()` takes its fast path only when `indices.equals(previousMetadata.indices)`.
+Creating an index changes that map by definition, so every create runs
+`buildMetadataWithRecomputedIndicesLookups()` and sweeps every index in the cluster to rebuild six name
+arrays and the sorted `indicesLookup`. Creating the millionth index does a million units of work unrelated
+to it. Even the fast path copies six N-length arrays.
+
+This is stated as the likely cause rather than a proven one: it matches the shape and the code, and the
+next step is to profile `build()` against population size rather than to act on the reading. Everything in
+this project argued from reading has been wrong at least once.
+
+**No area currently on the plan removes it.** A and E and F each reduce bytes per index; `LazyIndexMetadata`
+takes an unread index from 2,944 B to 698 B. But a stub is still an entry in the map, and `build()`
+iterates holders, so 100M stubs is still a 100M-element sweep. Bytes were never the binding constraint for
+creation throughput.
+
+That gap is what `plan-area-h-metadata-off-cluster-state.md` addresses, and S18 is the measurement that
+justifies opening it.
