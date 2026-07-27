@@ -1,6 +1,10 @@
 # Session handoff
 
-Branch `feature/pluggable-engine-per-shard-role`, 34 commits ahead of origin, **nothing pushed**.
+Branch `feature/pluggable-engine-per-shard-role`, 185 commits ahead of its own remote and 894 ahead of
+`origin/main`. **Nothing from this work is pushed.**
+
+Measure it rather than incrementing it: `git rev-list --count origin/feature/pluggable-engine-per-shard-role..HEAD`.
+The count carried in earlier versions of this file was wrong and was being bumped by hand each session.
 Working tree clean.
 
 **Build note that costs an hour if you do not know it.** `:distribution:docker` shells out to the
