@@ -1312,3 +1312,48 @@ reason to have.
 change. That is O(total indices) recurring forever, and Area H does not fix it. Worse, emptying the map
 would make them iterate nothing and silently do no work, which is exactly the failure mode this project
 has hit eight times. They need converting independently.
+
+## S21 (H2a and H2f): the descriptor, and whether it can be read at scale
+
+S19 proved descriptor writes stay flat where index creation degrades. It said nothing about reads, and
+Area H's read path carries a risk its write path does not.
+
+### The descriptor
+
+99 bytes serialized for a realistic index name, against `IndexMetadata`'s measured 2,944 B. A hundred
+million descriptors is therefore about a ten gigabyte index, half what the plan estimated, and it lives on
+disk in an index rather than in heap on every cluster-manager-eligible node.
+
+Its field set was audited rather than chosen: `ComputedRoutingTable` reads the index, the uuid, the shard
+count and the search-only replica count, and `ComputedPlacementGate` reads the serverless flag. Each is
+asserted individually, so a field quietly dropped fails at the type rather than in a routing decision.
+
+### Reading it
+
+Five shards, three nodes, fifty realtime GETs per sample.
+
+| descriptors | point lookup | prefix hits | prefix query |
+|---|---|---|---|
+| 1,000 | 0.68 ms | 111 | 127.4 ms |
+| 10,000 | 0.48 ms | 1,111 | 23.0 ms |
+| 50,000 | 0.61 ms | 10,000 | 21.7 ms |
+
+**Point lookup is flat**: 0.888 ms at a thousand descriptors and 0.783 ms at fifty thousand. That is the
+property the whole area depends on, since resolution happens on every request and cannot scale with the
+number of indices in the system.
+
+**Wildcards did not turn out to be the problem the design review expected.** OpenSearch routes by hash
+where S3 partitions by range, so a prefix query is a scatter-gather across every shard rather than a range
+scan over the partitions covering the prefix. The fear was that this made wildcards expensive. Measured,
+it is about 22 ms regardless of population, with the 127 ms first sample being warmup rather than a
+signal.
+
+### What this does not establish
+
+Five shards, not the hundred a hundred million descriptors would need. The per-shard work is a term
+dictionary seek and does not grow with population, which is what the flat numbers show, but the
+coordination cost of the fan-out grows with shard count and that is untested here.
+
+The prefix query ran with `size=0`, so it counted matches rather than returning names. Real wildcard
+resolution needs the names, and fetching ten thousand of them costs more than counting them. That is the
+next thing to measure rather than a limitation of the design.
