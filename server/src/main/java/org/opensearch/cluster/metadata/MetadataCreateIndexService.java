@@ -1642,6 +1642,26 @@ public class MetadataCreateIndexService {
         BiFunction<ClusterState, String, ClusterState> rerouteRoutingTable,
         BiConsumer<Metadata.Builder, IndexMetadata> metadataTransformer
     ) {
+        // Area H's third phase. When the gate is open for this index, creation records a descriptor and
+        // writes nothing to cluster state: no metadata entry, no routing entry, no publication, and none
+        // of the O(total indices) rebuild that S20 measured at 69 ms per change at fifty thousand
+        // indices. The descriptor write is the creation, and it is the thing that must succeed.
+        //
+        // Failure semantics invert from H2b's here. During dual write a lost descriptor cost a
+        // comparison; now it costs the index, so publish is required to report that someone was
+        // listening rather than being allowed to no-op.
+        if (DescriptorOnlyCreation.skipsClusterState(indexMetadata)) {
+            if (IndexDescriptorPublisher.publish(indexMetadata) == false) {
+                throw new IllegalStateException(
+                    "index ["
+                        + indexMetadata.getIndex().getName()
+                        + "] is configured to skip its cluster state entry, but no descriptor publisher is "
+                        + "installed, so creating it would leave no record of it anywhere"
+                );
+            }
+            return currentState;
+        }
+
         Metadata.Builder builder = Metadata.builder(currentState.metadata()).put(indexMetadata, false);
         if (metadataTransformer != null) {
             metadataTransformer.accept(builder, indexMetadata);
