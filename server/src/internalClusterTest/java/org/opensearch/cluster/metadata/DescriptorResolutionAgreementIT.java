@@ -104,27 +104,48 @@ public class DescriptorResolutionAgreementIT extends OpenSearchIntegTestCase {
     }
 
     /**
-     * Closed state, which resolution needs in order to answer without loading metadata. Note that this
-     * asserts what the descriptor said <em>at creation</em>: the dual write records once, so a later
-     * close is not reflected. That gap is real and belongs to H4, and asserting it here rather than
-     * discovering it after the map is gone is the point of this phase.
+     * The gap H2c pinned, now closed.
+     *
+     * <p>The dual write used to fire only from index creation, so closing an index afterwards left the
+     * descriptor saying OPEN while cluster state said CLOSE. Harmless while the map was authoritative and
+     * fatal after H5, when a stale descriptor would be the only record and resolution would route on it.
+     *
+     * <p>The hook moved to {@code Metadata.Builder.put}, which every writer passes through, rather than
+     * being added to each of the twelve services that update index metadata. Enumerating those call sites
+     * is how a writer gets missed, and this area has already made that mistake in another form.
      */
-    public void testAnIndexClosedAfterCreationExposesTheDualWriteGap() throws Exception {
+    public void testClosingAnIndexUpdatesItsDescriptor() throws Exception {
         IndexDescriptorPublisher.register(descriptor -> published.put(descriptor.name(), descriptor));
 
         createIndex("to-close", 1, 0);
+        assertEquals("the descriptor must start open", IndexDescriptor.State.OPEN, published.get("to-close").state());
+
         assertAcked(client().admin().indices().prepareClose("to-close"));
 
-        IndexDescriptor descriptor = published.get("to-close");
         ClusterState state = client().admin().cluster().prepareState().get().getState();
-
         assertEquals("cluster state must show the index closed", IndexMetadata.State.CLOSE, state.metadata().index("to-close").getState());
         assertEquals(
-            "the descriptor still says OPEN, because the dual write records at creation and nothing "
-                + "updates it afterwards. This is the gap H4 has to close, and it is asserted here rather "
-                + "than left to be found once the cluster state entry is gone",
-            IndexDescriptor.State.OPEN,
-            descriptor.state()
+            "and the descriptor must have followed it, or after H5 resolution would route on a stale state",
+            IndexDescriptor.State.CLOSE,
+            published.get("to-close").state()
+        );
+    }
+
+    /**
+     * The same property for aliases, which change far more often than open state and are the other field
+     * a resolver answers from without materializing metadata.
+     */
+    public void testAddingAnAliasUpdatesTheDescriptor() throws Exception {
+        IndexDescriptorPublisher.register(descriptor -> published.put(descriptor.name(), descriptor));
+        createIndex("to-alias", 1, 0);
+        assertEquals("no alias to begin with", List.of(), published.get("to-alias").aliases());
+
+        assertAcked(client().admin().indices().prepareAliases().addAlias("to-alias", "added-later"));
+
+        assertEquals(
+            "the descriptor must carry an alias added after creation",
+            List.of("added-later"),
+            published.get("to-alias").aliases()
         );
     }
 

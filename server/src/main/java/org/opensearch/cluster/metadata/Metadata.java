@@ -1489,6 +1489,10 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
             indexMetadataBuilder.version(indexMetadataBuilder.version() + 1);
             IndexMetadata indexMetadata = indexMetadataBuilder.build();
             indices.put(indexMetadata.getIndex().getName(), indexMetadata);
+            // The builder overload, which is what close and alias updates use. Hooking only the other one
+            // left the descriptor stale for exactly those, and the test that caught it asserted the state
+            // after a close rather than that some descriptor existed.
+            IndexDescriptorPublisher.publish(indexMetadata);
             return this;
         }
 
@@ -1501,6 +1505,15 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
                 indexMetadata = IndexMetadata.builder(indexMetadata).version(indexMetadata.getVersion() + 1).build();
             }
             indices.put(indexMetadata.getIndex().getName(), indexMetadata);
+            // Area H's descriptor follows the metadata rather than only its creation. Hooked here, at the
+            // one point every writer passes through, instead of at each of the twelve services that
+            // update index metadata: closing an index, changing an alias and resharding all reach this
+            // line, and enumerating those call sites is how a writer gets missed. H2c pinned the gap this
+            // closes, where a close left the descriptor saying OPEN.
+            //
+            // Fires per changed index rather than per index in the cluster, so it does not reintroduce
+            // the O(total) sweep this area exists to remove.
+            IndexDescriptorPublisher.publish(indexMetadata);
             return this;
         }
 

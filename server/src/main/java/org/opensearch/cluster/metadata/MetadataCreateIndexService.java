@@ -1648,13 +1648,6 @@ public class MetadataCreateIndexService {
         }
         Metadata newMetadata = builder.build();
 
-        // Area H's dual write. The descriptor is recorded alongside the cluster state entry so the two
-        // resolution paths can be compared while the old structure is still there to be right. Derived
-        // from the same IndexMetadata rather than built separately, or agreement between the paths would
-        // prove only that they shared a mistake. Fire and forget by contract, because this is the cluster
-        // manager's state update thread and every cluster state change queues behind it.
-        IndexDescriptorPublisher.publish(indexMetadata);
-
         String indexName = indexMetadata.getIndex().getName();
         ClusterBlocks.Builder blocks = createClusterBlocksBuilder(currentState, indexName, clusterBlocks);
         blocks.updateBlocks(indexMetadata);
