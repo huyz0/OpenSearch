@@ -12,6 +12,9 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.admin.cluster.reroute.ClusterRerouteRequest;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.ClusterStateTaskConfig;
+import org.opensearch.cluster.ClusterStateTaskExecutor;
+import org.opensearch.cluster.ClusterStateTaskListener;
 import org.opensearch.cluster.ClusterStateUpdateTask;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
@@ -222,57 +225,181 @@ public final class ShardSuspensionCoordinator {
                 return;
             }
         }
-        String role = reader ? "reader" : "writer";
-        clusterService.submitStateUpdateTask("serverless-storage-suspend-shard", new ClusterStateUpdateTask(Priority.NORMAL) {
-            @Override
-            public ClusterState execute(ClusterState currentState) {
-                IndexMetadata indexMetadata = findByUuid(currentState.metadata(), indexUuid);
-                if (indexMetadata == null) {
-                    return currentState;
-                }
-                boolean alreadySuspended = reader
-                    ? SuspendedShardsMetadata.isReaderSuspended(indexMetadata, shardId)
-                    : SuspendedShardsMetadata.isSuspended(indexMetadata, shardId);
-                if (alreadySuspended) {
-                    return currentState;
-                }
-                if (SuspendedShardsMetadata.isSuspensionAllowed(
-                    indexMetadata,
-                    shardId,
-                    reader,
-                    System.currentTimeMillis(),
-                    cooldownMillis
-                ) == false) {
-                    logger.debug(
-                        "skipping suspend of serverless-storage "
-                            + role
-                            + " shard ["
-                            + indexUuid
-                            + "]["
-                            + shardId
-                            + "]: reactivated too recently (hysteresis)"
-                    );
-                    return currentState;
-                }
-                IndexMetadata updated = reader
-                    ? SuspendedShardsMetadata.withReaderShardSuspended(indexMetadata, shardId)
-                    : SuspendedShardsMetadata.withShardSuspended(indexMetadata, shardId);
-                return ClusterState.builder(currentState).metadata(Metadata.builder(currentState.metadata()).put(updated, true)).build();
-            }
+        SuspendShardTask task = new SuspendShardTask(indexUuid, shardId, reader);
+        clusterService.submitStateUpdateTask(
+            "serverless-storage-suspend-shard",
+            task,
+            ClusterStateTaskConfig.build(Priority.NORMAL),
+            suspendExecutor,
+            task
+        );
+    }
 
-            @Override
-            public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {
-                if (oldState != newState) {
-                    logger.info("suspended serverless-storage " + role + " shard [" + indexUuid + "][" + shardId + "]");
-                    evict(newState, indexUuid, shardId, reader);
+    /**
+     * One shard's suspension, as a batchable unit.
+     *
+     * <p>Batched because this is submitted once per candidate shard per tick, and G1 measured a plain
+     * submission at 6 to 13 ms of publication each, linear in the number of tasks. A hundred cold shards
+     * was a hundred publications; folded, it is one.
+     *
+     * <p>{@code suspended} is the part batching would otherwise lose. Unbatched, each task saw its own
+     * {@code oldState != newState} and evicted only if it had really changed something. A batch gets one
+     * pair of states for every task in it, so whether a particular shard was suspended has to be recorded
+     * while its transform runs. Without it, every task in a batch containing one real suspension would
+     * evict.
+     */
+    private final class SuspendShardTask implements ClusterStateTaskListener {
+        private final String indexUuid;
+        private final int shardId;
+        private final boolean reader;
+        private volatile boolean suspended;
+
+        SuspendShardTask(String indexUuid, int shardId, boolean reader) {
+            this.indexUuid = indexUuid;
+            this.shardId = shardId;
+            this.reader = reader;
+        }
+
+        String role() {
+            return reader ? "reader" : "writer";
+        }
+
+        @Override
+        public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {
+            onSuspendProcessed(this, newState);
+        }
+
+        @Override
+        public void onFailure(String source, Exception e) {
+            logger.warn("failed to suspend serverless-storage " + role() + " shard [" + indexUuid + "][" + shardId + "]", e);
+        }
+    }
+
+    /**
+     * Folds a batch of suspensions into one state, and answers each task individually.
+     *
+     * <p>The shape is {@code MetadataCreateIndexService#createIndexExecutor}'s, deliberately: every task
+     * is recorded as its own success or failure, so one shard that cannot be suspended fails only itself
+     * and the rest of the batch still applies. That also guarantees every task's listener runs, which
+     * matters more here than for create-index: a suspension whose listener never fires is a shard that
+     * is marked suspended in cluster state and never evicted, so it stays assigned and consuming a node.
+     */
+    private final ClusterStateTaskExecutor<SuspendShardTask> suspendExecutor = new ClusterStateTaskExecutor<>() {
+        @Override
+        public ClusterTasksResult<SuspendShardTask> execute(ClusterState currentState, List<SuspendShardTask> tasks) {
+            ClusterTasksResult.Builder<SuspendShardTask> builder = ClusterTasksResult.builder();
+            ClusterState state = currentState;
+            for (SuspendShardTask task : tasks) {
+                try {
+                    ClusterState next = applySuspend(state, task);
+                    task.suspended = next != state;
+                    state = next;
+                    builder.success(task);
+                } catch (Exception e) {
+                    task.suspended = false;
+                    builder.failure(task, e);
                 }
             }
+            return builder.build(state);
+        }
+    };
 
-            @Override
-            public void onFailure(String source, Exception e) {
-                logger.warn("failed to suspend serverless-storage " + role + " shard [" + indexUuid + "][" + shardId + "]", e);
+    /** Per-task completion, so a batch does not collapse many callbacks into one. */
+    private void onSuspendProcessed(SuspendShardTask task, ClusterState newState) {
+        if (task.suspended) {
+            logger.info("suspended serverless-storage " + task.role() + " shard [" + task.indexUuid + "][" + task.shardId + "]");
+            evict(newState, task.indexUuid, task.shardId, task.reader);
+        }
+    }
+
+    /**
+     * One index's cold routing entry, as a batchable unit. Submitted once per cold index per tick, so
+     * it has the same shape of cost as suspension and gets the same treatment.
+     */
+    private final class PruneRoutingEntryTask implements ClusterStateTaskListener {
+        private final String indexUuid;
+        private volatile boolean pruned;
+
+        PruneRoutingEntryTask(String indexUuid) {
+            this.indexUuid = indexUuid;
+        }
+
+        @Override
+        public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {
+            if (pruned) {
+                logger.info("pruned routing entry of fully cold serverless-storage index [{}]", indexUuid);
             }
-        });
+        }
+
+        @Override
+        public void onFailure(String source, Exception e) {
+            logger.warn("failed to prune routing entry of serverless-storage index [" + indexUuid + "]", e);
+        }
+    }
+
+    private final ClusterStateTaskExecutor<PruneRoutingEntryTask> pruneExecutor = (currentState, tasks) -> {
+        ClusterStateTaskExecutor.ClusterTasksResult.Builder<PruneRoutingEntryTask> builder = ClusterStateTaskExecutor.ClusterTasksResult
+            .builder();
+        ClusterState state = currentState;
+        for (PruneRoutingEntryTask task : tasks) {
+            try {
+                ClusterState next = applyPrune(state, task);
+                task.pruned = next != state;
+                state = next;
+                builder.success(task);
+            } catch (Exception e) {
+                task.pruned = false;
+                builder.failure(task, e);
+            }
+        }
+        return builder.build(state);
+    };
+
+    /** The prune transform, unchanged from the unbatched task. */
+    private ClusterState applyPrune(ClusterState currentState, PruneRoutingEntryTask task) {
+        IndexMetadata indexMetadata = findByUuid(currentState.metadata(), task.indexUuid);
+        if (indexMetadata == null || isFullyColdAndEvicted(currentState, indexMetadata) == false) {
+            return currentState;
+        }
+        return ClusterState.builder(currentState)
+            .routingTable(RoutingTable.builder(currentState.routingTable()).remove(indexMetadata.getIndex().getName()).build())
+            .build();
+    }
+
+    /** The transform the unbatched task used to perform inline, unchanged. */
+    private ClusterState applySuspend(ClusterState currentState, SuspendShardTask task) {
+        IndexMetadata indexMetadata = findByUuid(currentState.metadata(), task.indexUuid);
+        if (indexMetadata == null) {
+            return currentState;
+        }
+        boolean alreadySuspended = task.reader
+            ? SuspendedShardsMetadata.isReaderSuspended(indexMetadata, task.shardId)
+            : SuspendedShardsMetadata.isSuspended(indexMetadata, task.shardId);
+        if (alreadySuspended) {
+            return currentState;
+        }
+        if (SuspendedShardsMetadata.isSuspensionAllowed(
+            indexMetadata,
+            task.shardId,
+            task.reader,
+            System.currentTimeMillis(),
+            cooldownMillis
+        ) == false) {
+            logger.debug(
+                "skipping suspend of serverless-storage "
+                    + task.role()
+                    + " shard ["
+                    + task.indexUuid
+                    + "]["
+                    + task.shardId
+                    + "]: reactivated too recently (hysteresis)"
+            );
+            return currentState;
+        }
+        IndexMetadata updated = task.reader
+            ? SuspendedShardsMetadata.withReaderShardSuspended(indexMetadata, task.shardId)
+            : SuspendedShardsMetadata.withShardSuspended(indexMetadata, task.shardId);
+        return ClusterState.builder(currentState).metadata(Metadata.builder(currentState.metadata()).put(updated, true)).build();
     }
 
     /**
@@ -402,30 +529,14 @@ public final class ShardSuspensionCoordinator {
         if (preCheck == null || isFullyColdAndEvicted(state, preCheck) == false) {
             return;
         }
-        clusterService.submitStateUpdateTask("serverless-storage-prune-cold-routing-entry", new ClusterStateUpdateTask(Priority.NORMAL) {
-            @Override
-            public ClusterState execute(ClusterState currentState) {
-                IndexMetadata indexMetadata = findByUuid(currentState.metadata(), indexUuid);
-                if (indexMetadata == null || isFullyColdAndEvicted(currentState, indexMetadata) == false) {
-                    return currentState;
-                }
-                return ClusterState.builder(currentState)
-                    .routingTable(RoutingTable.builder(currentState.routingTable()).remove(indexMetadata.getIndex().getName()).build())
-                    .build();
-            }
-
-            @Override
-            public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {
-                if (oldState != newState) {
-                    logger.info("pruned routing entry of fully cold serverless-storage index [{}]", indexUuid);
-                }
-            }
-
-            @Override
-            public void onFailure(String source, Exception e) {
-                logger.warn("failed to prune routing entry of cold serverless-storage index [" + indexUuid + "]", e);
-            }
-        });
+        PruneRoutingEntryTask task = new PruneRoutingEntryTask(indexUuid);
+        clusterService.submitStateUpdateTask(
+            "serverless-storage-prune-cold-routing-entry",
+            task,
+            ClusterStateTaskConfig.build(Priority.NORMAL),
+            pruneExecutor,
+            task
+        );
     }
 
     /**

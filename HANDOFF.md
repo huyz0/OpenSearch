@@ -113,12 +113,17 @@ broken ones.
 Publication costs 6 to 13 ms on an idle small cluster and is paid **once per task** without an executor.
 Batched, a hundred tasks collapse into two publications. Measured ratio at batch=100 is 19x to 54x.
 
-**Wake and sleep need the executor.** `TransportReactivateShardsAction` and `ShardSuspensionCoordinator`
-submit plain `ClusterStateUpdateTask`s, so waking a thousand shards is a thousand publications.
+**Done, S17.** `TransportReactivateShardsAction` and both `ShardSuspensionCoordinator` submissions now
+use a `ClusterStateTaskExecutor`.
 
-Priority starvation is real and larger than the latency: a NORMAL task behind 300 queued URGENT tasks
-waited 2.3 to 14.8 seconds. Batching fixes this more directly than reordering priorities would, since
-suspension starves because each wake holds the queue for a whole publication.
+The starvation went with it: measured before and after in the same run, a NORMAL task behind 300 URGENT
+tasks waited 2.5 to 2.7 seconds unbatched and 23 to 82 ms batched, across four runs. **No priority change
+was needed**, and none was made. Suspension was not starving because URGENT outranks NORMAL but because
+each wake held the queue for a whole publication.
+
+The trap for anyone extending this: a batch reports one `clusterStateProcessed` to every task in it, so
+"did I change anything" has to be recorded per task inside the executor. Without it, one real suspension
+in a batch makes every task in that batch evict.
 
 ## F1's answer, which splits the plan's premise
 

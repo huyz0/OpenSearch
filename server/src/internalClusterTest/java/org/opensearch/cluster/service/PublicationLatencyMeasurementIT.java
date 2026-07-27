@@ -192,6 +192,92 @@ public class PublicationLatencyMeasurementIT extends OpenSearchIntegTestCase {
         );
     }
 
+    /**
+     * Whether batching shortens the queue enough to relieve the starvation, which is the claim behind
+     * fixing wake and sleep rather than reordering their priorities.
+     *
+     * <p>G1 measured a NORMAL task waiting seconds behind 300 plain URGENT tasks. If the URGENT work is
+     * batched instead, the same 300 tasks occupy far fewer publications, so the NORMAL task behind them
+     * should wait proportionally less. Measured rather than assumed, because if it does not hold the
+     * right response is to say so and leave the priorities alone.
+     */
+    public void testBatchingTheUrgentWorkRelievesTheStarvation() throws Exception {
+        ClusterService clusterService = internalCluster().getInstance(ClusterService.class, internalCluster().getClusterManagerName());
+
+        int urgentCount = 300;
+        CountDownLatch urgentDone = new CountDownLatch(urgentCount);
+        CountDownLatch normalDone = new CountDownLatch(1);
+        AtomicLong normalLatencyNanos = new AtomicLong();
+        AtomicInteger executed = new AtomicInteger();
+
+        ClusterStateTaskExecutor<Integer> executor = (currentState, tasks) -> {
+            executed.addAndGet(tasks.size());
+            return ClusterStateTaskExecutor.ClusterTasksResult.<Integer>builder()
+                .successes(tasks)
+                .build(bumpMetadata(currentState, "g1-urgent-batched-" + tasks.size()));
+        };
+        ClusterStateTaskListener urgentListener = new ClusterStateTaskListener() {
+            @Override
+            public void onFailure(String source, Exception e) {
+                urgentDone.countDown();
+            }
+
+            @Override
+            public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {
+                urgentDone.countDown();
+            }
+        };
+
+        for (int i = 0; i < urgentCount; i++) {
+            clusterService.submitStateUpdateTask(
+                "g1-urgent-batched",
+                i,
+                ClusterStateTaskConfig.build(Priority.URGENT),
+                executor,
+                urgentListener
+            );
+        }
+
+        long normalSubmittedAt = System.nanoTime();
+        clusterService.submitStateUpdateTask("g1-normal-behind-batch", new ClusterStateUpdateTask(Priority.NORMAL) {
+            @Override
+            public ClusterState execute(ClusterState currentState) {
+                return bumpMetadata(currentState, "g1-normal-behind-batch");
+            }
+
+            @Override
+            public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {
+                normalLatencyNanos.set(System.nanoTime() - normalSubmittedAt);
+                normalDone.countDown();
+            }
+
+            @Override
+            public void onFailure(String source, Exception e) {
+                normalLatencyNanos.set(System.nanoTime() - normalSubmittedAt);
+                normalDone.countDown();
+            }
+        });
+
+        assertTrue("the urgent batch must complete", urgentDone.await(300, TimeUnit.SECONDS));
+        assertTrue("the normal task must complete", normalDone.await(300, TimeUnit.SECONDS));
+        assertEquals(
+            "every urgent task must have been executed, or this measured a shorter queue than it claims",
+            urgentCount,
+            executed.get()
+        );
+        assertTrue("the normal task must have been timed", normalLatencyNanos.get() > 0);
+
+        logger.warn(
+            String.format(
+                java.util.Locale.ROOT,
+                "%nG1 starvation with batched urgent work, %d nodes: a NORMAL task behind %d batched URGENT tasks waited %.1f ms%n",
+                clusterSize(),
+                urgentCount,
+                normalLatencyNanos.get() / 1_000_000.0
+            )
+        );
+    }
+
     /** Recorded with every number, since the framework randomises the node count. */
     private int clusterSize() {
         return internalCluster().size();

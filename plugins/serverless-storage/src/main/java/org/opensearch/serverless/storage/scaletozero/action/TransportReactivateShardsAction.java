@@ -14,7 +14,9 @@ import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.clustermanager.AcknowledgedResponse;
 import org.opensearch.action.support.clustermanager.TransportClusterManagerNodeAction;
 import org.opensearch.cluster.ClusterState;
-import org.opensearch.cluster.ClusterStateUpdateTask;
+import org.opensearch.cluster.ClusterStateTaskConfig;
+import org.opensearch.cluster.ClusterStateTaskExecutor;
+import org.opensearch.cluster.ClusterStateTaskListener;
 import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.block.ClusterBlockLevel;
 import org.opensearch.cluster.metadata.IndexMetadata;
@@ -104,40 +106,98 @@ public final class TransportReactivateShardsAction extends TransportClusterManag
     ) {
         String indexName = request.indexName();
         boolean reader = request.reader();
-        String role = reader ? "reader" : "writer";
-        clusterService.submitStateUpdateTask("serverless-storage-reactivate-shards", new ClusterStateUpdateTask(Priority.URGENT) {
-            @Override
-            public ClusterState execute(ClusterState currentState) {
-                return reactivate(currentState, indexName, reader, threadPool.absoluteTimeInMillis());
-            }
-
-            @Override
-            public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {
-                if (oldState != newState) {
-                    logger.info("reactivating suspended serverless-storage " + role + " shard(s) of index [" + indexName + "]");
-                    clusterService.getRerouteService()
-                        .reroute(
-                            "serverless-storage reactivate " + indexName,
-                            Priority.URGENT,
-                            ActionListener.wrap(
-                                s -> {},
-                                e -> logger.warn(
-                                    "reroute after reactivating [" + indexName + "] failed, a later reroute will still pick it up",
-                                    e
-                                )
-                            )
-                        );
-                }
-                listener.onResponse(new AcknowledgedResponse(true));
-            }
-
-            @Override
-            public void onFailure(String source, Exception e) {
-                logger.warn("failed to reactivate suspended serverless-storage " + role + " shard(s) of index [" + indexName + "]", e);
-                listener.onFailure(e);
-            }
-        });
+        ReactivateTask task = new ReactivateTask(indexName, reader, listener);
+        clusterService.submitStateUpdateTask(
+            "serverless-storage-reactivate-shards",
+            task,
+            ClusterStateTaskConfig.build(Priority.URGENT),
+            reactivateExecutor,
+            task
+        );
     }
+
+    /**
+     * One reactivation request, as a batchable unit.
+     *
+     * <p>G1 measured a plain submission at 6 to 13 ms of publication, paid once per request. A burst of
+     * wakes, which is exactly what a returning tenant population looks like, was that cost multiplied by
+     * the burst. Folded, the burst is one publication.
+     *
+     * <p>{@code reactivated} exists for the same reason as the suspend path's flag: a batch reports one
+     * pair of states to every task in it, so whether this particular index was changed has to be recorded
+     * while its transform runs. Without it a batch containing one real reactivation would log and reroute
+     * for every request in the batch.
+     *
+     * <p>The listener answers per task rather than per batch. A caller that never gets a response is a
+     * wake that appears to hang, which is worse than a slow one.
+     */
+    private final class ReactivateTask implements ClusterStateTaskListener {
+        private final String indexName;
+        private final boolean reader;
+        private final ActionListener<AcknowledgedResponse> listener;
+        private volatile boolean reactivated;
+
+        ReactivateTask(String indexName, boolean reader, ActionListener<AcknowledgedResponse> listener) {
+            this.indexName = indexName;
+            this.reader = reader;
+            this.listener = listener;
+        }
+
+        @Override
+        public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {
+            if (reactivated) {
+                logger.info(
+                    "reactivating suspended serverless-storage " + (reader ? "reader" : "writer") + " shard(s) of index [" + indexName + "]"
+                );
+                // Still one reroute per changed task rather than one per batch. BatchedRerouteService
+                // already collapses concurrent requests, so the saving from doing it here as well would
+                // be small and the behaviour change would not be measured.
+                clusterService.getRerouteService()
+                    .reroute(
+                        "serverless-storage reactivate " + indexName,
+                        Priority.URGENT,
+                        ActionListener.wrap(
+                            s -> {},
+                            e -> logger.warn(
+                                "reroute after reactivating [" + indexName + "] failed, a later reroute will still pick it up",
+                                e
+                            )
+                        )
+                    );
+            }
+            listener.onResponse(new AcknowledgedResponse(true));
+        }
+
+        @Override
+        public void onFailure(String source, Exception e) {
+            logger.warn(
+                "failed to reactivate suspended serverless-storage "
+                    + (reader ? "reader" : "writer")
+                    + " shard(s) of index ["
+                    + indexName
+                    + "]",
+                e
+            );
+            listener.onFailure(e);
+        }
+    }
+
+    private final ClusterStateTaskExecutor<ReactivateTask> reactivateExecutor = (currentState, tasks) -> {
+        ClusterStateTaskExecutor.ClusterTasksResult.Builder<ReactivateTask> builder = ClusterStateTaskExecutor.ClusterTasksResult.builder();
+        ClusterState state = currentState;
+        for (ReactivateTask task : tasks) {
+            try {
+                ClusterState next = reactivate(state, task.indexName, task.reader, threadPool.absoluteTimeInMillis());
+                task.reactivated = next != state;
+                state = next;
+                builder.success(task);
+            } catch (Exception e) {
+                task.reactivated = false;
+                builder.failure(task, e);
+            }
+        }
+        return builder.build(state);
+    };
 
     /**
      * Clears one index's suspended markers for the given role and, if the index has no

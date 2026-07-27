@@ -12,7 +12,7 @@ import org.opensearch.Version;
 import org.opensearch.action.admin.cluster.reroute.ClusterRerouteRequest;
 import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.ClusterState;
-import org.opensearch.cluster.ClusterStateUpdateTask;
+import org.opensearch.cluster.ClusterStateTaskExecutor;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.routing.IndexRoutingTable;
@@ -44,7 +44,7 @@ import static org.mockito.Mockito.when;
 
 public class ShardSuspensionCoordinatorTests extends OpenSearchTestCase {
 
-    private static final String INDEX_NAME = "suspend-coordinator-idx";
+    static final String INDEX_NAME = "suspend-coordinator-idx";
 
     private Client client;
     private ClusterAdminClient clusterAdminClient;
@@ -122,7 +122,7 @@ public class ShardSuspensionCoordinatorTests extends OpenSearchTestCase {
 
         coordinator.suspendWriterShard(indexUuid(suspendedState), 0);
 
-        verify(clusterService, never()).submitStateUpdateTask(anyString(), any(ClusterStateUpdateTask.class));
+        verify(clusterService, never()).submitStateUpdateTask(anyString(), any(), any(), any(), any());
     }
 
     /**
@@ -147,7 +147,7 @@ public class ShardSuspensionCoordinatorTests extends OpenSearchTestCase {
 
         coordinator.suspendWriterShard(indexUuid(suspendedButStillAssignedState), 0);
 
-        verify(clusterService, never()).submitStateUpdateTask(anyString(), any(ClusterStateUpdateTask.class));
+        verify(clusterService, never()).submitStateUpdateTask(anyString(), any(), any(), any(), any());
         // A suspended shard with a surviving assigned copy must have its lost eviction retried.
         org.mockito.ArgumentCaptor<ClusterRerouteRequest> captor = org.mockito.ArgumentCaptor.forClass(ClusterRerouteRequest.class);
         verify(clusterAdminClient, times(1)).reroute(captor.capture(), any());
@@ -155,8 +155,18 @@ public class ShardSuspensionCoordinatorTests extends OpenSearchTestCase {
         assertTrue(captor.getValue().getCommands().commands().get(0) instanceof CancelAllocationCommand);
     }
 
-    /** Control: when the shard is genuinely not yet suspended, the pre-check must not skip the real submission. */
-    public void testSuspendStillSubmitsAClusterStateTaskWhenNotYetSuspended() {
+    /**
+     * Control: when the shard is genuinely not yet suspended, the pre-check must not skip the real
+     * submission.
+     *
+     * <p>Asserts the batched overload rather than the plain one, because suspension now submits through
+     * a {@code ClusterStateTaskExecutor}. G1 measured a plain submission at 6 to 13 ms of publication
+     * each and linear in the number of tasks, and this is submitted once per candidate shard per tick.
+     * The assertion changed because the mechanism changed, not to accommodate a broken one: what it
+     * checks is still that a task is submitted, and it now also pins that an executor is supplied, which
+     * is the property that makes a hundred cold shards one publication instead of a hundred.
+     */
+    public void testSuspendStillSubmitsABatchedClusterStateTaskWhenNotYetSuspended() {
         ClusterState state = buildClusterState(0);
 
         ClusterService clusterService = mock(ClusterService.class);
@@ -165,7 +175,7 @@ public class ShardSuspensionCoordinatorTests extends OpenSearchTestCase {
 
         coordinator.suspendWriterShard(indexUuid(state), 0);
 
-        verify(clusterService, times(1)).submitStateUpdateTask(anyString(), any(ClusterStateUpdateTask.class));
+        verify(clusterService, times(1)).submitStateUpdateTask(anyString(), any(), any(), any(), any());
     }
 
     /**
@@ -230,7 +240,7 @@ public class ShardSuspensionCoordinatorTests extends OpenSearchTestCase {
 
         new ShardSuspensionCoordinator(clusterService, client, 0L).maybePruneRoutingEntryForTesting(state, indexUuid(state));
 
-        verify(clusterService, never()).submitStateUpdateTask(anyString(), any(ClusterStateUpdateTask.class));
+        verify(clusterService, never()).submitStateUpdateTask(anyString(), any(), any(), any(), any());
     }
 
     /** Enabled, the task is submitted and its execute() actually removes the entry. */
@@ -241,15 +251,38 @@ public class ShardSuspensionCoordinatorTests extends OpenSearchTestCase {
 
         new ShardSuspensionCoordinator(clusterService, client, 0L, true).maybePruneRoutingEntryForTesting(state, indexUuid(state));
 
-        org.mockito.ArgumentCaptor<ClusterStateUpdateTask> captor = org.mockito.ArgumentCaptor.forClass(ClusterStateUpdateTask.class);
-        verify(clusterService, times(1)).submitStateUpdateTask(anyString(), captor.capture());
-
-        ClusterState pruned = captor.getValue().execute(state);
+        // Captured through the batched overload, and the executor is run with a single-task batch. The
+        // assertion below is unchanged: what the transform does is the same, only the mechanism that
+        // carries it changed. Running it through the executor rather than calling execute() directly is
+        // deliberate, since the executor is what a real submission now goes through.
+        ClusterState pruned = runCapturedBatch(clusterService, state);
         assertFalse("the cold index must no longer have a routing entry", pruned.routingTable().hasIndex(INDEX_NAME));
         assertTrue(
             "...and must still be in metadata, which is what makes it cold rather than gone",
             pruned.metadata().hasIndex(INDEX_NAME)
         );
+    }
+
+    /**
+     * Runs whatever single task was submitted through the batched overload, through its own executor.
+     *
+     * <p>Isolated here so the unchecked generics needed to capture a {@code ClusterStateTaskExecutor}
+     * from a mock live in one suppressed method rather than in every test that needs them.
+     */
+    @SuppressWarnings({ "unchecked", "rawtypes" })
+    private static ClusterState runCapturedBatch(ClusterService clusterService, ClusterState state) {
+        org.mockito.ArgumentCaptor<Object> taskCaptor = org.mockito.ArgumentCaptor.forClass(Object.class);
+        org.mockito.ArgumentCaptor<ClusterStateTaskExecutor> executorCaptor = org.mockito.ArgumentCaptor.forClass(
+            ClusterStateTaskExecutor.class
+        );
+        verify(clusterService, times(1)).submitStateUpdateTask(anyString(), taskCaptor.capture(), any(), executorCaptor.capture(), any());
+        ClusterStateTaskExecutor executor = executorCaptor.getValue();
+        try {
+            ClusterStateTaskExecutor.ClusterTasksResult result = executor.execute(state, java.util.List.of(taskCaptor.getValue()));
+            return result.resultingState;
+        } catch (Exception e) {
+            throw new AssertionError("the captured executor threw", e);
+        }
     }
 
     /**
@@ -300,7 +333,15 @@ public class ShardSuspensionCoordinatorTests extends OpenSearchTestCase {
             .build();
     }
 
-    private static String indexUuid(ClusterState state) {
+    /**
+     * A state with {@code shards} unsuspended writer shards, for the batching suite next door. Shared
+     * rather than duplicated so both suites agree on what an index looks like before suspension.
+     */
+    static ClusterState stateForBatching(int shards) {
+        return coldState(shards, 0, ShardRoutingState.STARTED, false, false);
+    }
+
+    static String indexUuid(ClusterState state) {
         return state.metadata().index(INDEX_NAME).getIndexUUID();
     }
 

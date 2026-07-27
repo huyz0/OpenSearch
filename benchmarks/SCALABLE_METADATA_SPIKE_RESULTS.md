@@ -1093,3 +1093,52 @@ Note what this means next to S16 above: the deferred path already avoids the in-
 unread index never materializes it. Area F's saving therefore applies to the **materialized** working
 set, the indices actually in use, and not to the 100M at rest. That narrows where the terabyte lands
 without making it less real.
+
+## S17: batching wake and sleep, and what it did to the starvation
+
+S15 measured the cost and made the decision; this is the change and the re-measurement.
+`TransportReactivateShardsAction` and both `ShardSuspensionCoordinator` submissions now go through a
+`ClusterStateTaskExecutor` shaped like `MetadataCreateIndexService#createIndexExecutor`.
+
+### The starvation, measured before and after in the same run
+
+Four runs, each measuring both shapes against the same cluster so the comparison is not across machines
+or node counts.
+
+| nodes | NORMAL behind 300 plain URGENT | NORMAL behind 300 batched URGENT | ratio |
+|---|---|---|---|
+| 4 | 2,734.9 ms | 82.2 ms | 33x |
+| 2 | 2,697.5 ms | 38.8 ms | 70x |
+| 2 | 2,490.8 ms | 22.9 ms | 109x |
+| 3 | 2,715.5 ms | 38.9 ms | 70x |
+
+The unbatched figure is stable at 2.5 to 2.7 seconds. The batched figure is 23 to 82 ms.
+
+**So the theory held and no priority change is needed.** Suspension was not starving because URGENT
+outranks NORMAL; it was starving because each of the 300 wakes held the queue for a whole publication.
+Batching shortens the queue, and `Priority.URGENT` on reactivation against `Priority.NORMAL` on
+suspension can stay exactly as it is. That matters because a priority change would have been a behaviour
+change with nothing measured behind it.
+
+### What is asserted, and why not a timer
+
+The unit tests assert the property rather than the speed: twenty-five suspensions must resolve to one
+state, every task must come back as a success or a failure, and folding must accumulate rather than
+letting the last task win. A timing assertion would be flakier and would not distinguish a batch that
+folded correctly from one that silently dropped tasks.
+
+That last one is the real hazard here. A dropped suspension is a shard marked suspended in cluster state
+that nothing ever evicts, so it stays assigned and holds a node. Fast and wrong would look exactly like
+fast and right.
+
+Proven by mutation: making the executor apply each task to the *original* state instead of the
+accumulating one, which is the plausible way to write this wrong, fails both tests. Twenty-five tasks
+then suspend one shard.
+
+### Cost of the change
+
+Batching moves the per-task "did I change anything" decision from `clusterStateProcessed`, which a batch
+reports once for every task in it, into the executor, which must record it per task while the transform
+runs. Without that, one real suspension in a batch would make every task in the batch evict, and one real
+reactivation would make every request in the batch log and reroute. This is the part of the change most
+likely to be got wrong by someone copying the shape without noticing why the flag is there.
