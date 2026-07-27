@@ -1255,3 +1255,60 @@ H, which is resolution, wildcards, deletion, and the forty-one enumerations. It 
 creation can be flat, and the mechanism that makes it flat is already in the product.
 
 The kill criterion set before the spike was "if the curve is not flat, stop". It is flat.
+
+## S20 (H0b and H1): where the per-change cost goes, and what the audit found
+
+### Ranking the terms
+
+S19 named `Metadata.build()` as the cause of creation degrading with population. That was too strong on
+one reading and correct on another, so both are recorded.
+
+Adding one index to an existing population, best of ten, single threaded:
+
+| indices | metadata build | routing build | diff | total |
+|---|---|---|---|---|
+| 1,000 | 1.61 ms | 0.13 ms | 0.47 ms | 2.21 ms |
+| 10,000 | 14.34 ms | 0.83 ms | 2.14 ms | 17.31 ms |
+| 50,000 | 69.31 ms | 7.03 ms | 14.46 ms | 90.80 ms |
+
+Among the costs of a cluster state change, metadata build is 76 percent, diffing 16, routing 8. Metadata
+and diff both grow about ninetyfold for a fiftyfold population increase.
+
+**The correction, and the correction to the correction.** After S19 the note was made that build() at
+G2a's population of 6,000 is roughly 4 to 5 ms while G2a measured 91.66 ms per index, so build() looked
+like 5 percent of the problem. That comparison was invalid: G2a measures end-to-end throughput with a
+hundred creations in flight through a batching executor, which includes queueing on a single-threaded
+manager, publication, and the temporary IndexService built to validate mappings. H0b measures one
+uncontended change. Against like for like, metadata build dominates. The lesson is that two of one's own
+measurements can be as misleading as a reading if they measure different things.
+
+**Diffing is O(N) too**, at 14.5 ms per change at fifty thousand indices, which matters because diffing is
+what publication does on every state change regardless of what changed.
+
+### The audit
+
+31 direct enumerations in `server`, and the distribution is the finding:
+
+| group | count | disposition under Area H |
+|---|---|---|
+| gateway and remote state persistence | 16 | eliminated: they enumerate cluster state, which would hold no indices |
+| per-cluster-state-change listeners | 2 | eliminated, and these were O(N) on every change |
+| user facing: cat, pagination, snapshots | ~5 | convertible to descriptor queries |
+| already refused for computed indices | 1 | done, via C28 |
+| local or CLI scope | ~3 | out of scope |
+
+`ClusterChangedEvent.indicesCreated()` was initially counted among the per-change costs and has no
+production caller at all, so it is excluded.
+
+Two findings changed Area H's scope.
+
+**There is no point-lookup fast path.** `concreteSingleIndex` delegates to `concreteIndices`, so resolving
+a plain name runs the whole expression pipeline including wildcard machinery. Under H a plain name should
+be a realtime GET, and without a fast path every point lookup would inherit a freshness problem it has no
+reason to have.
+
+**The plugin has periodic enumerations.** `ShardSuspensionCoordinator`, `ReaderCacheAffinityRecorder` and
+`InPlaceMergeTriggerCoordinator` each iterate every index on a scheduler tick, not on a request or a state
+change. That is O(total indices) recurring forever, and Area H does not fix it. Worse, emptying the map
+would make them iterate nothing and silently do no work, which is exactly the failure mode this project
+has hit eight times. They need converting independently.
