@@ -715,3 +715,63 @@ satisfied. The remaining failure is earlier and different: the documents are not
 the restart. That is a new symptom rather than the old one, and it is recorded as its own investigation
 rather than folded into C13. The first suspect is the ordinary trigger index the test creates to force a
 state change, since it publishes routing and is the first thing the membership sees.
+
+## C21, C22 and C23: the seam that fails by succeeding
+
+Three passes, one shape. A request path reads the routing table directly, finds nothing for an index
+that publishes no entry, and degrades the way Phase A chose. What makes this family different from
+everything else in the area is how it fails.
+
+**Six confirmed cases, none of which threw.** Refresh reached no shards and reported success with
+`successful_shards: 0`, which is what hid C21 for two sessions and made C13 look like a recovery bug.
+Get field mappings returned a well-formed response describing an index with no fields. Stats reported no
+shards and no documents, segments none, recovery nothing recovering. Force merge is the worst: it
+accepted the instruction, reported success, and did no work at all.
+
+Every other bug in this area announced itself with a hang, an exception, or a cluster that would not
+form. This one returns 200. That is the whole reason it survived six passes over the same seam, and it
+is why every test in these three tasks asserts a count rather than the absence of an exception.
+
+### What the probes overturned
+
+C22 predicted `TransportUpdateAction` would be the serious case, on the reasoning that an empty shard
+iterator makes the caller wait for an allocation that never arrives, so the request hangs rather than
+fails. The reasoning was sound and the conclusion was wrong. Bulk updates never enter that action, and
+an update routed by document id resolves already through `OperationRouting`. The branch is reachable only
+on a retry, because `TransportInstanceSingleOperationAction` assigns `request.shardId` *after* `shards()`
+has already succeeded once. It is converted, with a unit test rather than an integration test, and the
+difference is recorded in the suite instead of being smoothed over.
+
+Meanwhile the two call sites with no special reasoning attached, analyze and get field mappings, were the
+genuinely broken ones.
+
+### Where the bulk fix could not go, and why
+
+`RoutingTable.allShards` and its neighbours cannot resolve, for two structural reasons rather than one
+stylistic one. They receive a routing table and never a `ClusterState`, while supplying an entry needs
+the state and the index metadata. And the no-argument forms derive their index list from the routing
+table's own key set, which a computed index is not in, so it cannot even be *named* there.
+
+So the bulk counterpart lives beside `resolve` in `AbsentIndexRoutingSuppliers`, and nine callers use it.
+This keeps supplier knowledge in the one class that owns it. It also leaves a real gap: anything calling
+the no-argument form still cannot see a computed index, which is C26 and is why `_cat/shards` does not
+list one.
+
+### Two things a mechanical sweep got wrong
+
+Nine call sites were converted by regex and two needed correction on reading.
+
+Force merge filters one branch with `ShardRouting::primary`. The convenience overload would have dropped
+that silently and merged replicas.
+
+The fast path has to delegate to the *exact* method it replaces, not an equivalent one. Routing
+`allShards(indices)` through `allShardsSatisfyingPredicate(indices, alwaysTrue)` is behaviourally
+identical, since the first is implemented as the second, and still broke
+`TransportRemoteStoreStatsActionTests`, which stubs `allShards(String[])` on a spy. Callers and tests
+bind to methods rather than to behaviour, and a no-op path exists precisely to be indistinguishable.
+
+### Status
+
+C13 passed with no further work once C21 landed, over seven consecutive runs with fresh seeds. Every
+theory the restart test had accumulated across two sessions, blank recovery and lost writes among them,
+was downstream of a refresh that reached no shards.

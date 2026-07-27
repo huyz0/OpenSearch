@@ -1,7 +1,12 @@
 # Session handoff
 
-Branch `feature/pluggable-engine-per-shard-role`, 31 commits ahead of origin, **nothing pushed**.
-Working tree clean apart from `docs-site/` which is already committed.
+Branch `feature/pluggable-engine-per-shard-role`, 34 commits ahead of origin, **nothing pushed**.
+Working tree clean.
+
+**Build note that costs an hour if you do not know it.** `:distribution:docker` shells out to the
+`docker` binary at *configuration* time, so when Docker is unavailable every Gradle task fails,
+including `:server:compileJava`, with a message naming a project you are not building. Pass
+`-Dbuild.docker=false`. Nothing in this area needs a container.
 
 ## Goal
 
@@ -15,26 +20,28 @@ Evidence for every number claimed: `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.m
 | area | state |
 |---|---|
 | **A. Name index tier** | **done**, `plan-area-a-name-index.md`. 100 unit tests plus `ServerlessStorageNameIndexIT`. Disabled by default. |
-| **C. Computed placement** | **blocked on C18**, `plan-area-c-computed-placement.md`. C0 to C12 and C17 done. A computed index is creatable and its shard opens; it will not take a write. |
+| **C. Computed placement** | **not blocked**, `plan-area-c-computed-placement.md`. C0 to C23 done. A computed index is creatable, writable, searchable, and survives a full restart. What remains is reach rather than function: see the gaps below. |
 | B, D, E, F, G | not started |
 
-## The blocker: C21, documents are not searchable before a restart even happens
+## The one finding that matters most: this seam fails by succeeding
 
-C2 landed and moved the failure. In `ComputedPlacementRestartIT` twenty documents are indexed without
-error, and a refresh and count returns zero **before** any restart. The lifecycle IT's write test passes,
-so this is specific to something the restart test does.
+Six times now, a computed index has made an operation return a **confident empty answer rather than an
+error**: refresh reaching no shards (C21), field mappings reporting no fields (C22), and stats, segments,
+recovery and force merge all reporting nothing (C23). Not one threw. Force merge is the worst of them,
+because it accepted an instruction, reported success, and did no work at all.
 
-**First suspect, and it is named in the test.** That test creates an ordinary index to force a cluster
-state change, because the membership maintainer is edge-triggered and would otherwise never publish. That
-index publishes routing and is the first thing the membership sees. Whether its presence shifts the
-computed placement of the shard written afterwards is the first thing to check. Second suspect: whether
-the search reaches the node that actually holds the shard.
+This is why C21 survived six passes over the same seam while every other instance was found quickly: the
+others failed loudly with a hang, an exception or a red cluster.
 
-**Probe, do not reason.** Ask the shard for its own document count, and compare the node the write went
-to with the node the search reads from.
+**The consequences for how to work here.** Never fire a request and assert only that it did not throw.
+For every seam, find the number that is zero when it is broken and assert on that:
+`getSuccessfulShards`, a document count, a token count, a field count. Six of the eight bugs in this area
+would have been invisible to a test that only checked for exceptions.
 
-**Ruled out already, do not revisit.** Recovery is not involved, this happens before any restart. The
-recovery source is correct. Placement is now stable across a restart and that assertion passes.
+**And what actually finds them.** Every hypothesis argued from reading the code was wrong; every probe
+was right. C22 is the cleanest example: `TransportUpdateAction` was predicted to be the serious one and
+turned out to be nearly unreachable, while the two call sites with no special reasoning attached were the
+broken ones.
 
 ## What is done, and what each of them cost
 
@@ -56,7 +63,30 @@ recovery source is correct. Placement is now stable across a restart and that as
   care where it came from.
 - **C2** the node set is published, versioned and never shrinks, so a node that is merely restarting no
   longer takes its shards with it. Adding is automatic, removing is deliberate and unimplemented.
-- **C13** open. Placement stability is fixed; it now waits on C21 above.
+- **C13** done. A computed index survives a full restart with every document, on the same node, from its
+  existing store. Verified over seven consecutive runs with fresh seeds. It needed no recovery work in the
+  end: the documents had always been in the engine, and C21's refresh was what could not see them.
+- **C21** refresh and flush resolve their shards, so a computed index can be made visible. This is the
+  fix that unblocked C13, and every earlier theory about C13 was downstream of it.
+- **C22** analyze, get field mappings, and the retried-update branch resolve. Bulk update was found to be
+  already working and was left alone rather than converted for symmetry.
+- **C23** the sweep operations resolve through a bulk counterpart to `resolve`, across nine callers.
+  Stats, segments, recovery and force merge are proven; clear cache, upgrade, upgrade status, remote store
+  stats and segment replication stats are converted for consistency and not individually covered.
+
+## What is left, in priority order
+
+- **C26, the most operator-visible.** `_cat/shards` and `_cat/allocation` call the *no-argument*
+  `allShards()`, which takes its index list from the routing table's own key set. A computed index is not
+  a key there, so it cannot be named and simply does not appear. The C23 helper cannot fix this: there is
+  no index list to pass. Needs a decision rather than a conversion.
+- **C24** decide whether a broadcast that resolves zero shards for an index that exists should stay
+  silent. Six confirmed silent-empty cases now argue it should not.
+- **C27** three more bulk callers that pass an explicit index list, so directly convertible.
+- **C28** search-only scaling and tiering read routing directly and one of them dereferences without a
+  null check, so a computed index is an NPE rather than a refusal. Probably the C14 answer: reject with a
+  reason rather than half-support.
+- **C25** `ComputedPlacementMembershipService` has no unit tests at all.
 
 ## Three times a green suite measured nothing, and what stops the fourth
 
@@ -101,9 +131,9 @@ Core:
   lifecycle for computed indices, and where the remaining C18 work is
 - `server/src/main/java/org/opensearch/cluster/routing/RoutingNodes.java` — `localRoutingNode` hook
 
-Tests to run first, both fast:
-- `:server:internalClusterTest --tests "*ComputedPlacement*IT"` — 4 pass, 1 passes, 1 `@AwaitsFix`
-- `:server:test --tests "org.opensearch.cluster.routing.Computed*"`
+Tests to run first, both fast, and nothing is `@AwaitsFix` any more:
+- `:server:internalClusterTest --tests "*ComputedPlacement*IT" -Dbuild.docker=false` — 5 suites
+- `:server:test --tests "org.opensearch.cluster.routing.Computed*" -Dbuild.docker=false`
 
 Plugin, `plugins/serverless-storage/src/main/java/org/opensearch/serverless/storage/`:
 - `placement/` — `RendezvousShardPlacement`, `ComputedRoutingTable`, `ComputedPlacementGate`
@@ -148,15 +178,28 @@ Prefer an integration test early over more unit tests.
 - Static registries leak across test suites. Clear them in `@After`.
 - `:server:internalClusterTest` takes over 20 minutes. Run it in the background.
 
-## After C18
+## Two mistakes from the C21 and C23 passes, both worth not repeating
 
-C13 node restart with a computed index. It is blocked on C18 rather than merely scheduled after it:
-asking whether a computed index recovers its data is not a question you can ask while the index cannot
-accept a document. When it unblocks, the recovery source is the thing to watch, because A5 was exactly
-this and `ComputedShardRouting` makes the caller state it rather than derive it.
+**A retry that compiles is not a retry that runs.** `assertBusy` retries on `AssertionError` and lets
+every other exception through. Wrapping a block that throws `SearchPhaseExecutionException` changes
+nothing, and the run after that "fix" failed identically. Convert the exception inside the block.
 
-C14 resharding. C15 wire adaptive replica selection to rank the K candidates. C16 hot-tenant override,
-which needs a product answer first.
+**Re-running the seed that failed proves almost nothing.** It passed while the bug was fully present,
+because the failure was a timing race rather than seed-determined. Fresh seeds found it. Three clean runs
+minimum for anything involving a restart or a settling cluster.
+
+**A no-op path must be identical, not equivalent.** C23's fast path called
+`allShardsSatisfyingPredicate(indices, alwaysTrue)` where the caller had called `allShards(indices)`.
+Same results, since the former implements the latter, and still wrong:
+`TransportRemoteStoreStatsActionTests` stubs `allShards(String[])` on a spy, and the equivalent call
+walked past the stub. Callers and tests bind to methods, not to behaviour.
+
+**A mechanical sweep needs hand-reading.** Of nine call sites converted by regex in C23, two would have
+been wrong: force merge would have silently lost its `ShardRouting::primary` filter and merged replicas.
+
+## Still unscheduled
+
+C16 hot-tenant override, which needs a product answer first.
 
 ## What this pass adds to "how the work has been going"
 
