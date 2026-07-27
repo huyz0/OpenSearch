@@ -87,10 +87,12 @@ broken ones.
   the index list, since routing structurally cannot name a computed index. Both cat callers request
   metadata only when a supplier is installed, so an ordinary cluster's response is unchanged.
 
-## What is left, in priority order
+- **C24** a broadcast that resolves no shards for an open index now asserts in CI and warns in
+  production, from `TransportBroadcastByNodeAction` rather than from the resolver. The resolver was the
+  proposed home and would have been useless: a check there only runs for callers that already resolve
+  correctly, and the bug is a caller that does not.
 
-- **C24** decide whether a broadcast that resolves zero shards for an index that exists should stay
-  silent. Seven confirmed silent-empty cases now argue it should not.
+## What is left, in priority order
 - **C27** three more bulk callers that pass an explicit index list, so directly convertible.
 - **C28** search-only scaling and tiering read routing directly and one of them dereferences without a
   null check, so a computed index is an NPE rather than a refusal. Probably the C14 answer: reject with a

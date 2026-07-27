@@ -822,3 +822,41 @@ later attempt to trim the request for payload reasons discovers why it cannot.
 The allocation test was wrong on its first pass too, and in an instructive way: it asserted on
 `routingTable().allShards()`, the accessor that structurally cannot see a computed index. It was
 measuring the bug rather than the fix and could never have passed.
+
+## C24: a guard is only worth what it can reach
+
+C24 asked whether a broadcast resolving zero shards for an index that exists should assert, warn or
+fail, and whether the guard belonged beside the assert `ActiveShardCount` already carries.
+
+**The second half has a firm answer: no.** A check inside the resolver only ever runs for a caller that
+already resolves correctly. The bug is by definition a caller that does not, and an unconverted subclass
+reads the routing table directly and never reaches the resolver at all. A guard there would have felt
+like progress and caught nothing, which is the exact failure this area has shipped twice: a mechanism
+committed correct and unreachable.
+
+So it lives in `TransportBroadcastByNodeAction`, after the subclass has produced its answer, where a
+subclass cannot route around it. That covers fourteen subclasses today and any written later, which is
+the population that matters, since every instance so far was a caller nobody had thought about.
+
+**Assert and warn rather than fail.** Failing turns a degraded read into an outage and reverses Phase A's
+deliberate choice. The assertion is loud in CI where the mistake is introduced; the warning is findable
+in production, where the alternative is an operator concluding their index is empty.
+
+**Gated on registration.** Without a supplier an open index always has a published entry with at least
+unassigned shards, so a zero means something else, and a guard for this feature must not destabilise
+clusters that do not use it. That gate is what makes it safe on a base class every cluster executes.
+
+Most of the tests cover false positives rather than the catch, because a guard that cries wolf gets
+deleted: a closed index legitimately contributes nothing, an index deleted mid-request is a race, and an
+index that did contribute must never be named.
+
+**Proven by mutation, not inspection.** Reverting `TransportIndicesStatsAction` to its unconverted form
+makes the guard fire with `[indices:monitor/stats] resolved no shards for open indices
+[computed-broadcast]`, before the count assertion, so the failure names its cause rather than leaving a
+zero to be interpreted. Six passing unit tests proved the logic; only the mutation proved the wiring.
+
+### What this still does not cover
+
+The guard protects one family. `TransportSingleShardAction`, which analyze and get field mappings use,
+and the cat callers have no equivalent. A future unconverted caller there is still silent. Extending the
+same check to those families is unclaimed work rather than a decision against it.
