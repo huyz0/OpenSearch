@@ -162,6 +162,16 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     public static final String LAZY_DIRECTORY_STORE_TYPE = "serverless_storage_lazy";
 
     /** Per-index opt-in switch for serverless storage; final once set, since switching modes on a live index is unsupported. */
+    /**
+     * How many shards the descriptor index gets.
+     *
+     * <p>Fixed rather than settable because S23 measured descriptor point lookup as flat against the
+     * descriptor index's own shard count, 0.476 ms at one shard against 0.435 ms at sixty, so there is no
+     * lookup reason to tune it. More shards spread merging, which S29 made load-bearing, and that is the
+     * only reason this is above one.
+     */
+    static final int DESCRIPTOR_INDEX_SHARDS = 5;
+
     public static final Setting<Boolean> SERVERLESS_STORAGE_ENABLED_SETTING = Setting.boolSetting(
         "index.serverless_storage.enabled",
         false,
@@ -1627,7 +1637,19 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             COMPUTED_PLACEMENT_ENABLED_SETTING.get(environment.settings())
         );
 
-        return java.util.List.of(this, nameIndexService);
+        // Descriptor resolution. H2e built the seam, H8a taught the resolver to consult it and H17 added
+        // pagination, and until now nothing registered a supplier, so the fallback returned null on every
+        // node and a gated index could not be named by any request. Installing is the whole of the wiring
+        // for the same reason computed placement's is: the registries are static and each node answers
+        // locally.
+        org.opensearch.serverless.storage.descriptor.DescriptorStore descriptorStore =
+            new org.opensearch.serverless.storage.descriptor.DescriptorStore(client, DESCRIPTOR_INDEX_SHARDS);
+        org.opensearch.serverless.storage.descriptor.DescriptorGate.install(
+            descriptorStore,
+            SERVERLESS_STORAGE_ENABLED_SETTING.get(environment.settings())
+        );
+
+        return java.util.List.of(this, nameIndexService, descriptorStore);
     }
 
     /**
@@ -2750,6 +2772,13 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      */
     @Override
     public void close() throws IOException {
+        // Static registries outlive the node that installed them, so a node closing without clearing them
+        // leaves a dead Client answering resolution for whatever runs next. In a test JVM that is every
+        // subsequent suite; in production it is a restart inheriting a closed node's seams. Computed
+        // placement had the same leak and never cleared itself either, which is why both are here.
+        org.opensearch.serverless.storage.descriptor.DescriptorGate.uninstall();
+        org.opensearch.serverless.storage.placement.ComputedPlacementGate.uninstall();
+
         org.opensearch.serverless.storage.wal.WalGcSchedulerTask walGcTask = walGcSchedulerTask;
         if (walGcTask != null) {
             walGcTask.close();
