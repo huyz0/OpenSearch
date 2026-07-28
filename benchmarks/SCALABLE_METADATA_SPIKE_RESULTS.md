@@ -1703,3 +1703,57 @@ Both arms are single-JVM clusters. The claim is that segment count rather than p
 measured across one decade. It is not a demonstration at a hundred million, and a deployment that lets
 segments grow unbounded will see S28's curve rather than this one.
 
+## S30 (H24): the scaling curve, and a projection checked against an independent point
+
+Measured locally at four populations rather than attempting the target, which is the right shape of
+evidence: what decides the design is the slope of the cost, and a slope needs several points.
+
+Segments held at one per shard in the merged column, because S29 established that lookup tracks segment
+count rather than population. A single curve on naturally-merged indices would extrapolate merge policy
+while appearing to extrapolate scale.
+
+| population | creation/sec | segments | lookup (ms) | merged segments | merged lookup (ms) |
+|---|---|---|---|---|---|
+| 100,000 | 19,487 | 32 | 0.3159 | 5 | 0.2805 |
+| 250,000 | 25,663 | 24 | 0.2698 | 5 | 0.2965 |
+| 500,000 | 26,341 | 23 | 0.2820 | 5 | 0.3197 |
+| 1,000,000 | 26,554 | 25 | 0.2910 | 5 | 0.3360 |
+
+Merged lookup rises monotonically at **1.20x per decade**. Creation is flat once warm: the first
+checkpoint's 19,487 is residual warmup, and the last three sit within 3.5 percent of each other.
+
+### The projection, and the independent point that checks it
+
+Applying 1.20x twice past a million projects **0.482 ms at a hundred million**.
+
+That projection can be tested rather than merely stated, because S29 measured merged lookup at ten million
+on a separate run: **0.3199 ms**. This curve predicts 0.403 ms there. The projection therefore
+**overshoots the one point where it can be checked**, by about 26 percent, which makes 0.482 ms at a
+hundred million a conservative upper bound rather than a best guess.
+
+Taking S29's own two merged points, 0.3044 ms at one million and 0.3199 ms at ten, gives 1.05x per decade
+across that decade. Projecting from that slope instead lands near **0.35 ms**.
+
+So the honest range for merged lookup at a hundred million is roughly **0.35 to 0.48 ms**, with the
+independent check favouring the lower end. The slope flattening as population grows is what a term lookup
+should do, which is a further reason to treat the upper figure as a bound.
+
+### The first attempt at this measurement was wrong and passed
+
+Recorded because it is the most dangerous failure in this sequence. The first run warmed with 30 gets
+against a measured pass of 300, so the earliest checkpoint absorbed cold-JIT cost the later ones did not.
+The result was a curve where lookup *improved* with population, 0.44x per decade, projecting 0.013 ms at a
+hundred million. Every assertion passed, the output was well formed, and the absurd number arrived with an
+honest-sounding caveat attached.
+
+Three changes: warmup now costs exactly what the measurement costs at every checkpoint, a throwaway index
+absorbs the run's class loading before the first checkpoint, and an inversion guard fails the test if
+merged lookup falls with population. A falling curve is warmup leaking into the measurement, never a
+discovery, and the guard is what catches it without anyone reading the numbers.
+
+### What this does not say
+
+Four points across one decade, projected across two more. The assumption that the slope holds is exactly
+what a run at scale would test and this does not. What it does have, which no earlier extrapolation here
+did, is a validation point outside its own range.
+
