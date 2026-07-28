@@ -44,6 +44,7 @@ public class GatedCreationSwitchIT extends OpenSearchIntegTestCase {
             new DescriptorStore(client(), 1),
             new IndexBackedMappingStore(client()),
             new IndexBackedMappingStatsAggregator(client()),
+            new StoreBackedFieldRefresher(),
             enabled
         );
     }

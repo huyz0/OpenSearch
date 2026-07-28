@@ -50,7 +50,13 @@ public class DescriptorGateIT extends OpenSearchIntegTestCase {
     public void testAGatedNameResolvesOnceTheGateIsInstalled() {
         DescriptorStore store = new DescriptorStore(client(), 1);
         store.create(descriptor("gated-logs"));
-        DescriptorGate.install(store, new IndexBackedMappingStore(client()), new IndexBackedMappingStatsAggregator(client()), true);
+        DescriptorGate.install(
+            store,
+            new IndexBackedMappingStore(client()),
+            new IndexBackedMappingStatsAggregator(client()),
+            new StoreBackedFieldRefresher(),
+            true
+        );
 
         ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
         var resolved = resolver().concreteIndices(empty, IndicesOptions.strictExpandOpen(), "gated-logs");
@@ -83,6 +89,7 @@ public class DescriptorGateIT extends OpenSearchIntegTestCase {
             new DescriptorStore(client(), 1),
             new IndexBackedMappingStore(client()),
             new IndexBackedMappingStatsAggregator(client()),
+            new StoreBackedFieldRefresher(),
             true
         );
 
@@ -99,6 +106,7 @@ public class DescriptorGateIT extends OpenSearchIntegTestCase {
             new DescriptorStore(client(), 1),
             new IndexBackedMappingStore(client()),
             new IndexBackedMappingStatsAggregator(client()),
+            new StoreBackedFieldRefresher(),
             false
         );
 
@@ -112,6 +120,7 @@ public class DescriptorGateIT extends OpenSearchIntegTestCase {
             new DescriptorStore(client(), 1),
             new IndexBackedMappingStore(client()),
             new IndexBackedMappingStatsAggregator(client()),
+            new StoreBackedFieldRefresher(),
             true
         );
         assertTrue(AbsentIndexDescriptorSuppliers.isRegistered());
@@ -132,7 +141,13 @@ public class DescriptorGateIT extends OpenSearchIntegTestCase {
      */
     public void testCreatingAnIndexRecordsADescriptor() throws Exception {
         DescriptorStore store = new DescriptorStore(client(), 1);
-        DescriptorGate.install(store, new IndexBackedMappingStore(client()), new IndexBackedMappingStatsAggregator(client()), true);
+        DescriptorGate.install(
+            store,
+            new IndexBackedMappingStore(client()),
+            new IndexBackedMappingStatsAggregator(client()),
+            new StoreBackedFieldRefresher(),
+            true
+        );
 
         createIndex("recorded-index");
 
@@ -157,7 +172,13 @@ public class DescriptorGateIT extends OpenSearchIntegTestCase {
      */
     public void testDeletingAnIndexLeavesATombstoneRatherThanAnAbsence() throws Exception {
         DescriptorStore store = new DescriptorStore(client(), 1);
-        DescriptorGate.install(store, new IndexBackedMappingStore(client()), new IndexBackedMappingStatsAggregator(client()), true);
+        DescriptorGate.install(
+            store,
+            new IndexBackedMappingStore(client()),
+            new IndexBackedMappingStatsAggregator(client()),
+            new StoreBackedFieldRefresher(),
+            true
+        );
         createIndex("doomed-index");
         // assertBusy on the premise too. The write is asynchronous, so a bare read here races it, and this
         // test passed once by timing before failing on a later run.

@@ -144,6 +144,19 @@ public final class MappingGenerationStore {
         );
     }
 
+    /**
+     * The current mapping and its generation, or null when nothing is stored or no store is registered.
+     *
+     * <p>Added for W15, which needs the fields rather than only the generation: a shard that discovers it is
+     * behind has to merge the field it was missing, and a generation alone cannot tell it what type that
+     * field is. {@link #currentGeneration} remains for callers that only need to know whether they are
+     * stale.
+     */
+    public static MappingGeneration currentMapping(String indexUuid) {
+        Store store = STORE.get();
+        return store == null ? null : store.read(indexUuid);
+    }
+
     /** The current generation, for a caller deciding whether its cached mapping is stale. */
     public static long currentGeneration(String indexUuid) {
         Store store = STORE.get();

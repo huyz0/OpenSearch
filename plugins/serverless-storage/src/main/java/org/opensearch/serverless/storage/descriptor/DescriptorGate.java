@@ -16,6 +16,7 @@ import org.opensearch.cluster.metadata.DescriptorOnlyCreation;
 import org.opensearch.cluster.metadata.IndexDescriptor;
 import org.opensearch.cluster.metadata.IndexDescriptorPublisher;
 import org.opensearch.cluster.metadata.MappingGenerationStore;
+import org.opensearch.index.mapper.UnknownFieldRefresh;
 import org.opensearch.serverless.storage.placement.ComputedPlacementGate;
 
 import java.util.List;
@@ -91,6 +92,7 @@ public final class DescriptorGate {
         DescriptorStore store,
         MappingGenerationStore.Store mappingStore,
         GatedMappingStatsAggregator.Aggregator statsAggregator,
+        UnknownFieldRefresh.Refresher fieldRefresher,
         boolean enabled
     ) {
         if (enabled == false) {
@@ -140,6 +142,11 @@ public final class DescriptorGate {
         // a gated index has no cluster state entry, so it can have no published routing table, so its
         // placement must be derived. Deciding the two independently would allow an index with a published
         // routing entry and no metadata, or the reverse, and neither is serviceable.
+        // The refresher W14's trigger consults. Registered here rather than at the trigger so it shares
+        // this gate's lifetime: an unregistered refresher makes the trigger a null check, which is the
+        // pre-W15 behaviour and correct for a cluster with no gated indices.
+        UnknownFieldRefresh.register(fieldRefresher);
+
         DescriptorOnlyCreation.register(ComputedPlacementGate::ownsIndex);
         logger.info("descriptor resolution installed against [{}]", DescriptorStore.DESCRIPTOR_INDEX);
     }
@@ -153,6 +160,7 @@ public final class DescriptorGate {
         MappingGenerationStore.register(null);
         GatedMappingStatsAggregator.register(null);
         DescriptorOnlyCreation.register(null);
+        UnknownFieldRefresh.register(null);
         STORE.set(null);
     }
 

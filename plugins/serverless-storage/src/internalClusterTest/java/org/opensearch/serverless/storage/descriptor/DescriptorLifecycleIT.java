@@ -147,7 +147,7 @@ public class DescriptorLifecycleIT extends OpenSearchIntegTestCase {
         mappings = new IndexBackedMappingStore(client());
         suspensions = new GatedShardSuspensionRegistry();
 
-        DescriptorGate.install(store, mappings, new IndexBackedMappingStatsAggregator(client()), true);
+        DescriptorGate.install(store, mappings, new IndexBackedMappingStatsAggregator(client()), new StoreBackedFieldRefresher(), true);
         suspensions.install();
         AbsentIndexRoutingSuppliers.register((state, metadata) -> placement());
     }
