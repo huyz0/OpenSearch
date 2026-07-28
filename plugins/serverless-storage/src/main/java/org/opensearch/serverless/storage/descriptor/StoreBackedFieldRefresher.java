@@ -50,11 +50,33 @@ public final class StoreBackedFieldRefresher implements UnknownFieldRefresh.Refr
      * evicted entry costs one extra read, never a wrong answer, because the store remains the source of
      * truth and a re-read simply re-merges what is already there.
      */
-    /** What this node merged for an index, and when it last asked the store. */
-    private record Checked(long generation, long checkedAtNanos) {
+    /**
+     * What this node merged for an index, when it last asked the store, and when it was written.
+     *
+     * <p>{@code checkedAtNanos} answers the recheck window and {@code stamp} orders eviction. They are
+     * separate for the reason T4 found in {@code DescriptorStore}: entries written within one clock tick
+     * share a timestamp, and an eviction threshold taken from equal stamps evicts nothing.
+     */
+    private record Checked(long generation, long checkedAtNanos, long stamp) {
     }
 
-    private final Map<String, Checked> mergedGeneration;
+    /**
+     * Written on every merge and read on every unknown field, never reordered on read.
+     *
+     * <p><b>This was a {@code synchronizedMap} around an access-ordered {@code LinkedHashMap}.</b> P1
+     * measured exactly that structure at 57.4M reads per second on one thread falling to 9.1M on sixteen,
+     * because access ordering mutates the recency list on read and so requires the monitor on every lookup.
+     * P2 replaced it in {@code GatedShardSuspensionRegistry} and this one was left behind: P3's title said
+     * the mapping cache had the same read-mutating structure, but P3's fix moved the guard in front of the
+     * store read, which is a different problem. The titled one stayed open until the review after T8.
+     *
+     * <p>Recency is now stamped on write, so a read is a plain concurrent get that touches no shared
+     * mutable state. Eviction quality is approximate rather than exact LRU, which is the trade P1 measured
+     * as costing about six percent against an unbounded concurrent map.
+     */
+    private final java.util.concurrent.ConcurrentHashMap<String, Checked> mergedGeneration = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private final java.util.concurrent.atomic.AtomicLong stamps = new java.util.concurrent.atomic.AtomicLong();
     private final int capacity;
 
     /**
@@ -85,12 +107,24 @@ public final class StoreBackedFieldRefresher implements UnknownFieldRefresh.Refr
     StoreBackedFieldRefresher(int capacity, java.util.function.LongSupplier clock) {
         this.clock = clock;
         this.capacity = capacity;
-        this.mergedGeneration = java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<>(16, 0.75f, true) {
-            @Override
-            protected boolean removeEldestEntry(Map.Entry<String, Checked> eldest) {
-                return size() > StoreBackedFieldRefresher.this.capacity;
-            }
-        });
+    }
+
+    /** Records what this node merged, evicting the stalest tenth if that puts the map over its bound. */
+    private void record(String indexUuid, long generation, long now) {
+        mergedGeneration.put(indexUuid, new Checked(generation, now, stamps.incrementAndGet()));
+        if (mergedGeneration.size() <= capacity) {
+            return;
+        }
+        int toEvict = Math.max(1, capacity / 10);
+        long[] ordered = mergedGeneration.values().stream().mapToLong(Checked::stamp).sorted().toArray();
+        if (ordered.length == 0) {
+            return;
+        }
+        // A threshold from one pass rather than a sorted eviction list, matching what
+        // GatedShardSuspensionRegistry and DescriptorStore both do, so there is one eviction shape here
+        // rather than three.
+        long threshold = ordered[Math.min(toEvict, ordered.length - 1)];
+        mergedGeneration.entrySet().removeIf(entry -> entry.getValue().stamp() < threshold);
     }
 
     @Override
@@ -120,7 +154,7 @@ public final class StoreBackedFieldRefresher implements UnknownFieldRefresh.Refr
         if (type == null) {
             // The store does not have it either. Recording the check is what stops the next unknown field
             // on this shard re-reading a mapping that has not moved.
-            mergedGeneration.put(indexUuid, new Checked(stored.generation(), now));
+            record(indexUuid, stored.generation(), now);
             return false;
         }
 
@@ -128,7 +162,7 @@ public final class StoreBackedFieldRefresher implements UnknownFieldRefresh.Refr
             Map<String, Object> fragment = new HashMap<>();
             fragment.put("properties", Map.of(fieldName, Map.of("type", type)));
             mapperService.merge(MapperService.SINGLE_MAPPING_NAME, fragment, MapperService.MergeReason.MAPPING_UPDATE);
-            mergedGeneration.put(indexUuid, new Checked(stored.generation(), now));
+            record(indexUuid, stored.generation(), now);
             return mapperService.documentMapper() != null && mapperService.documentMapper().mappers().getMapper(fieldName) != null;
         } catch (Exception e) {
             // A merge that fails leaves the caller to reject or infer, which is a correct outcome. Failing

@@ -153,4 +153,35 @@ public class StoreBackedFieldRefresherIT extends OpenSearchIntegTestCase {
             refresher.trackedIndexCount() <= 10
         );
     }
+
+    /**
+     * T9. The bound must hold when every entry is written within one clock tick.
+     *
+     * <p>T9 replaced this cache's {@code synchronizedMap} around an access-ordered {@code LinkedHashMap},
+     * which P1 measured running backwards under contention, with the write-stamped concurrent map P2
+     * established. Eviction therefore takes a threshold from sorted stamps and drops everything strictly
+     * below it, and T4 found in {@code DescriptorStore} that a wall clock cannot supply those stamps:
+     * entries written within one tick share a value, the threshold equals every candidate, and nothing is
+     * evicted.
+     *
+     * <p>This cache uses a monotonic sequence for that reason, and this test is what stops it being
+     * simplified back to {@code checkedAtNanos} on the grounds that there is already a timestamp there.
+     */
+    public void testTheBoundHoldsWhenEveryEntrySharesATimestamp() {
+        createIndex(INDEX);
+        ensureGreen(INDEX);
+        MapperService mapperService = mapperServiceFor(INDEX);
+        MappingGenerationStore.register(new IndexBackedMappingStore(client()));
+
+        StoreBackedFieldRefresher refresher = new StoreBackedFieldRefresher(10, () -> 1_000_000_000L);
+        for (int i = 0; i < 100; i++) {
+            MappingGenerationStore.updateMapping("frozen-uuid-" + i, Map.of("f", "keyword"));
+            refresher.refresh(mapperService, "frozen-uuid-" + i, "f");
+        }
+
+        assertTrue(
+            "a hundred entries written at one instant must still evict down to the bound, but held " + refresher.trackedIndexCount(),
+            refresher.trackedIndexCount() <= 10
+        );
+    }
 }
