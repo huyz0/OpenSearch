@@ -31,7 +31,10 @@ import org.junit.After;
  * written to while having no routing at all. Nothing throws. That is the failure this area has produced at
  * every layer: a confident empty answer where an error would have been kinder.
  *
- * <p>Pinned here before being fixed, so the fix has a target that fails today.
+ * <p><b>Closed by P7.</b> The name is what makes the descriptor reachable, so the two resolution paths that
+ * lose it now pass it, and metadata is synthesised from the descriptor when cluster state has none. The
+ * routing seam and every supplier behind it are unchanged, which matters because C3 and every routing caller
+ * depend on that signature.
  */
 public class GatedPlacementOwnershipTests extends OpenSearchTestCase {
 
@@ -39,28 +42,76 @@ public class GatedPlacementOwnershipTests extends OpenSearchTestCase {
     public void clearRegistrations() {
         AbsentIndexRoutingSuppliers.register(null);
         AbsentIndexRoutingSuppliers.clearMemos();
+        org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.register(null);
         ComputedPlacementGate.uninstall();
     }
 
-    /** The gap. An index whose metadata is gone owns nothing, so it is placed nowhere. */
-    public void testAGatedIndexIsNotRecognisedAsOwned() {
-        assertFalse(
-            "ownsIndex cannot recognise an index whose metadata gating removed, which is every gated "
-                + "index. Closing this means deciding ownership from the descriptor when metadata is "
-                + "absent, which is what the descriptor seam exists for",
-            ComputedPlacementGate.ownsIndex(null)
-        );
+    /**
+     * ownsIndex still cannot judge a null, which is why the fix supplies it something to judge rather than
+     * teaching it to guess.
+     */
+    public void testOwnsIndexStillCannotJudgeAbsentMetadata() {
+        assertFalse("a null carries nothing to decide ownership from", ComputedPlacementGate.ownsIndex(null));
     }
 
-    /** And the consequence: resolution produces no routing table for it. */
-    public void testAGatedIndexResolvesToNoRouting() {
+    /** The property P6 pinned as broken and P7 closes: a gated index is placed. */
+    public void testAGatedIndexIsPlacedFromItsDescriptor() {
+        org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.register(
+            name -> "gated-index".equals(name)
+                ? new org.opensearch.cluster.metadata.IndexDescriptor(
+                    name,
+                    name + "-uuid",
+                    3,
+                    0,
+                    true,
+                    org.opensearch.cluster.metadata.IndexDescriptor.State.OPEN,
+                    java.util.List.of(),
+                    Version.CURRENT.id,
+                    false,
+                    false,
+                    false,
+                    false,
+                    0L,
+                    1_700_000_000_000L
+                )
+                : null
+        );
         ComputedPlacementGate.install(true);
-        ClusterState gated = ClusterState.builder(ClusterName.DEFAULT).build();
+        ClusterState gated = ClusterState.builder(ClusterName.DEFAULT)
+            .nodes(
+                org.opensearch.cluster.node.DiscoveryNodes.builder()
+                    .add(
+                        new org.opensearch.cluster.node.DiscoveryNode(
+                            "node-1",
+                            buildNewFakeTransportAddress(),
+                            java.util.Map.of(),
+                            java.util.Set.of(org.opensearch.cluster.node.DiscoveryNodeRole.DATA_ROLE),
+                            Version.CURRENT
+                        )
+                    )
+                    .localNodeId("node-1")
+                    .build()
+            )
+            .build();
+
+        org.opensearch.cluster.routing.IndexRoutingTable placed = AbsentIndexRoutingSuppliers.resolve(gated, "gated-index");
+
+        assertNotNull(
+            "a gated index must have somewhere to place its shards. Before P7 this was null: nameable "
+                + "after W3, gated after W12, and served by nothing",
+            placed
+        );
+        assertEquals("with the shard count its descriptor declares", 3, placed.shards().size());
+    }
+
+    /** A name with no descriptor is still unplaced, or the fallback would invent routing for typos. */
+    public void testAnUnknownNameIsStillUnplaced() {
+        org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.register(name -> null);
+        ComputedPlacementGate.install(true);
 
         assertNull(
-            "a gated index must not silently have nowhere to place its shards. It is nameable after W3 and "
-                + "gated after W12, so this is an index that can be created and addressed and never served",
-            AbsentIndexRoutingSuppliers.resolve(gated, "gated-index")
+            "a name no descriptor answers for must stay unplaced",
+            AbsentIndexRoutingSuppliers.resolve(ClusterState.builder(ClusterName.DEFAULT).build(), "never-existed")
         );
     }
 

@@ -183,6 +183,57 @@ public final class AbsentIndexRoutingSuppliers {
      * request. This is a degradation path already; turning it into an error would make a plugin bug
      * worse than the absence it was installed to handle.
      */
+    /**
+     * Placement for a named index, falling back to the descriptor when cluster state has no metadata.
+     *
+     * <p>P6 measured why this overload exists. Gating removes the cluster state entry, so a gated index
+     * reaches placement as a null and {@code ownsIndex} answers false for null, leaving the index with no
+     * routing at all and nothing thrown. The name is what makes the descriptor reachable, and the two
+     * resolution paths that lose it are the only ones that ever see a null.
+     *
+     * <p>The metadata is synthesised rather than the seam widened. Passing a descriptor through would
+     * change {@code supply}'s signature and the supplier interface behind it, which C3 and every routing
+     * caller depend on; synthesising keeps every existing supplier working unchanged and confines the fix
+     * to the one place the information was lost.
+     */
+    public static IndexRoutingTable supply(ClusterState state, String indexName, IndexMetadata indexMetadata) {
+        if (indexMetadata != null) {
+            return supply(state, indexMetadata);
+        }
+        IndexMetadata synthesised = synthesisedMetadata(indexName);
+        return synthesised == null ? supply(state, (IndexMetadata) null) : supply(state, synthesised);
+    }
+
+    /**
+     * The metadata synthesised from a gated index's descriptor, cached so it is stable.
+     *
+     * <p>Stability is the point, not just the saving. P5's memo keys on metadata identity, so synthesising
+     * a fresh instance per resolution would make that memo miss every time, which P5 measured as an 18x
+     * regression rather than a slow path. Keyed by descriptor identity so a descriptor change invalidates
+     * it.
+     */
+    private static IndexMetadata synthesisedMetadata(String indexName) {
+        org.opensearch.cluster.metadata.IndexDescriptor descriptor = org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.supply(
+            indexName
+        );
+        if (descriptor == null || descriptor.exists() == false) {
+            return null;
+        }
+        SynthesisedMetadata cached = SYNTHESISED.get(indexName);
+        if (cached != null && cached.descriptor == descriptor) {
+            return cached.metadata;
+        }
+        IndexMetadata metadata = descriptor.toIndexMetadata();
+        SYNTHESISED.put(indexName, new SynthesisedMetadata(descriptor, metadata));
+        return metadata;
+    }
+
+    private record SynthesisedMetadata(org.opensearch.cluster.metadata.IndexDescriptor descriptor, IndexMetadata metadata) {
+    }
+
+    private static final java.util.concurrent.ConcurrentHashMap<String, SynthesisedMetadata> SYNTHESISED =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
     public static IndexRoutingTable supply(ClusterState state, IndexMetadata indexMetadata) {
         BiFunction<ClusterState, IndexMetadata, IndexRoutingTable> supplier = SUPPLIER.get();
         if (supplier == null) {
@@ -246,6 +297,7 @@ public final class AbsentIndexRoutingSuppliers {
     /** Drops every memoised placement, which a test must do because this registry is static. */
     public static void clearMemos() {
         MEMOS.clear();
+        SYNTHESISED.clear();
     }
 
     /**
@@ -259,6 +311,7 @@ public final class AbsentIndexRoutingSuppliers {
         SUSPENDED_SHARDS.set(suspendedShards);
         // Any change to either input invalidates every memoised placement.
         MEMOS.clear();
+        SYNTHESISED.clear();
     }
 
     /** The shards of this index that are asleep, empty when nothing is registered or the source fails. */
@@ -328,7 +381,7 @@ public final class AbsentIndexRoutingSuppliers {
             // health call, and the index count this area exists for is in the millions.
             return null;
         }
-        return supply(state, state.metadata().index(indexName));
+        return supply(state, indexName, state.metadata().index(indexName));
     }
 
     /**
@@ -486,7 +539,7 @@ public final class AbsentIndexRoutingSuppliers {
         if (isRegistered() == false) {
             return null;
         }
-        return supply(state, state.metadata().index(indexName));
+        return supply(state, indexName, state.metadata().index(indexName));
     }
 
     /**

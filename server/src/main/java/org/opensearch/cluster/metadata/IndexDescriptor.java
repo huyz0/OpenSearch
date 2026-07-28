@@ -289,6 +289,32 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         );
     }
 
+    /**
+     * This descriptor as {@link IndexMetadata}, for the paths that still speak that language.
+     *
+     * <p>Placement is one of them. {@code ComputedPlacementGate.ownsIndex} decides from settings on an
+     * {@code IndexMetadata}, and a gated index has none, so P6 measured it owning nothing and being placed
+     * nowhere. Synthesising the metadata rather than widening the routing seam keeps the change off a
+     * signature that C3 and every routing caller depend on.
+     *
+     * <p>Deliberately minimal: the shard counts, the uuid and the serverless flag, which is what placement
+     * reads. It is not a general-purpose reconstruction and must not become one, because the whole reason
+     * the descriptor exists is that full {@code IndexMetadata} is what could not be afforded per index.
+     */
+    public IndexMetadata toIndexMetadata() {
+        return IndexMetadata.builder(name)
+            .settings(
+                org.opensearch.common.settings.Settings.builder()
+                    .put(IndexMetadata.SETTING_VERSION_CREATED, org.opensearch.Version.fromId((int) createdVersion))
+                    .put(IndexMetadata.SETTING_INDEX_UUID, uuid)
+                    .put("index.serverless_storage.enabled", serverless)
+                    .build()
+            )
+            .numberOfShards(Math.max(1, shardCount))
+            .numberOfReplicas(0)
+            .build();
+    }
+
     /** The same descriptor at a new mapping generation, which is what a mapping update records. */
     public IndexDescriptor withMappingGeneration(long generation) {
         return copyWith(generation);
