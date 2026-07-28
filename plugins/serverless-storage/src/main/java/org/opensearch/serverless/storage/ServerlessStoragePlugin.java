@@ -1196,6 +1196,9 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     ).millis();
     private volatile long scaleToZeroLagThreshold = SERVERLESS_STORAGE_SCALE_TO_ZERO_LAG_THRESHOLD_SETTING.getDefault(Settings.EMPTY);
     private volatile org.opensearch.serverless.storage.scaletozero.ScaleToZeroCandidatesSchedulerTask scaleToZeroCandidatesSchedulerTask;
+
+    /** Sleeping shards of gated indices, read by placement and written by the suspension coordinator. */
+    private volatile org.opensearch.serverless.storage.scaletozero.GatedShardSuspensionRegistry gatedShardSuspensions;
     private volatile org.opensearch.serverless.storage.nodecapacity.NodeCapacitySignalService nodeCapacitySignalService;
     private volatile org.opensearch.serverless.storage.nodecapacity.NodeSelfWarmupSchedulerTask nodeSelfWarmupSchedulerTask;
     // Same "resolved once in createComponents" reasoning as the scale-to-zero thresholds above --
@@ -1389,6 +1392,14 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             clusterService,
             SERVERLESS_STORAGE_READER_CACHE_AFFINITY_TTL_SETTING.get(environment.settings()).millis()
         );
+        // Where a gated index's sleeping shards are recorded. It has to be installed as well as
+        // constructed: placement reads it to decide which shards not to place, which is the only definition
+        // of asleep available to an index whose routing is computed rather than allocated (H9c).
+        this.gatedShardSuspensions = new org.opensearch.serverless.storage.scaletozero.GatedShardSuspensionRegistry();
+        if (SERVERLESS_STORAGE_ENABLED_SETTING.get(environment.settings())) {
+            this.gatedShardSuspensions.install();
+        }
+
         TimeValue scaleToZeroEvalInterval = SERVERLESS_STORAGE_SCALE_TO_ZERO_EVAL_INTERVAL_SETTING.get(environment.settings());
         if (scaleToZeroEvalInterval.millis() > 0) {
             boolean suspendEnabled = SERVERLESS_STORAGE_SCALE_TO_ZERO_SUSPEND_ENABLED_SETTING.get(environment.settings());
@@ -1403,7 +1414,13 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                         clusterService,
                         client,
                         cooldownMillis,
-                        SERVERLESS_STORAGE_SCALE_TO_ZERO_PRUNE_ROUTING_ENTRY_SETTING.get(environment.settings())
+                        SERVERLESS_STORAGE_SCALE_TO_ZERO_PRUNE_ROUTING_ENTRY_SETTING.get(environment.settings()),
+                        // H9a measured that without this a gated index can never sleep: the suspend task is
+                        // submitted, finds no IndexMetadata to rewrite, and returns the state unchanged. The
+                        // four-argument constructor above is that behaviour, and scaling to zero is what the
+                        // serverless design exists for, so an index that cannot do it is worse than one that
+                        // fails loudly.
+                        gatedShardSuspensions
                     )
                     : null
             );
@@ -2778,6 +2795,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         // placement had the same leak and never cleared itself either, which is why both are here.
         org.opensearch.serverless.storage.descriptor.DescriptorGate.uninstall();
         org.opensearch.serverless.storage.placement.ComputedPlacementGate.uninstall();
+        org.opensearch.serverless.storage.scaletozero.GatedShardSuspensionRegistry suspensions = gatedShardSuspensions;
+        if (suspensions != null) {
+            suspensions.uninstall();
+        }
 
         org.opensearch.serverless.storage.wal.WalGcSchedulerTask walGcTask = walGcSchedulerTask;
         if (walGcTask != null) {
