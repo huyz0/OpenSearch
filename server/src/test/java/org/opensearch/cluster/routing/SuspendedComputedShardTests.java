@@ -141,6 +141,23 @@ public class SuspendedComputedShardTests extends OpenSearchTestCase {
     }
 
     /**
+     * The key is the uuid, not the name. A name can be deleted and recreated; inheriting the old index's
+     * sleeping shards would leave a fresh index with shards that never come up.
+     */
+    public void testSuspensionIsKeyedByUuid() {
+        registerPlacementFor(SHARDS);
+        java.util.List<String> keys = new java.util.ArrayList<>();
+        AbsentIndexRoutingSuppliers.registerSuspendedShards(key -> {
+            keys.add(key);
+            return Set.of();
+        });
+
+        AbsentIndexRoutingSuppliers.resolve(stateWithout(INDEX), INDEX);
+
+        assertEquals("the suspension source must be asked by uuid", java.util.List.of(INDEX + "-uuid"), keys);
+    }
+
+    /**
      * A published index must not be filtered. Its shards are the allocator's business, and the decider
      * already handles them, so applying the filter here as well would suspend the same shard twice by two
      * different mechanisms.

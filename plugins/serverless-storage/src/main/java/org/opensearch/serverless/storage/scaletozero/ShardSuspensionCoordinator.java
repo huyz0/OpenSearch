@@ -94,6 +94,12 @@ public final class ShardSuspensionCoordinator {
     private final boolean pruneRoutingEntry;
 
     /**
+     * Where a gated index's suspensions are recorded, since it has no {@code IndexMetadata} to record them
+     * in. Null leaves gated indices on the old path, where H9a measured that they simply never sleep.
+     */
+    private final GatedShardSuspensionRegistry gatedSuspensions;
+
+    /**
      * Creates a coordinator with hysteresis disabled ({@code cooldownMillis = 0}) -- equivalent to
      * the 3-arg constructor with {@code 0}, kept for callers that predate the hysteresis guard.
      *
@@ -127,10 +133,28 @@ public final class ShardSuspensionCoordinator {
      *                          default because it changes the scale-to-zero lifecycle.
      */
     public ShardSuspensionCoordinator(ClusterService clusterService, Client client, long cooldownMillis, boolean pruneRoutingEntry) {
+        this(clusterService, client, cooldownMillis, pruneRoutingEntry, null);
+    }
+
+    /**
+     * Creates a coordinator that can also suspend gated indices.
+     *
+     * @param gatedSuspensions where an index absent from cluster state records its sleeping shards. Null
+     *                         keeps the pre-H9d behaviour, in which a gated index's suspension submits a
+     *                         cluster state task that can only be a no-op.
+     */
+    public ShardSuspensionCoordinator(
+        ClusterService clusterService,
+        Client client,
+        long cooldownMillis,
+        boolean pruneRoutingEntry,
+        GatedShardSuspensionRegistry gatedSuspensions
+    ) {
         this.clusterService = clusterService;
         this.client = client;
         this.cooldownMillis = cooldownMillis;
         this.pruneRoutingEntry = pruneRoutingEntry;
+        this.gatedSuspensions = gatedSuspensions;
     }
 
     /**
@@ -201,6 +225,23 @@ public final class ShardSuspensionCoordinator {
         // incorrect suspend.
         ClusterState currentState = clusterService.state();
         IndexMetadata preCheckMetadata = findByUuid(currentState.metadata(), indexUuid);
+        if (preCheckMetadata == null && gatedSuspensions != null) {
+            // A gated index. There is no metadata to rewrite, so there is nothing for a cluster state task
+            // to do: H9a measured that the task is submitted, finds nothing, and returns the state
+            // unchanged, which is how a gated index came to be unable to sleep at all.
+            //
+            // Recording it locally is not a workaround for the missing metadata, it is the only affordable
+            // design. Scale-to-zero suspends shards continuously, so at a hundred million indices a
+            // publication per suspension would leave the cluster manager doing nothing else. Placement
+            // reads this on the next routing resolution, with no publication and no round trip.
+            if (gatedSuspensions.suspend(indexUuid, shardId)) {
+                logger.debug("suspended gated shard [{}][{}] without a cluster state update", indexUuid, shardId);
+            }
+            // Eviction still runs on every tick for the same self-healing reason as the already-suspended
+            // branch below: the reroute that unassigns the copies is asynchronous and can be lost.
+            evict(currentState, indexUuid, shardId, reader);
+            return;
+        }
         if (preCheckMetadata != null) {
             boolean alreadySuspendedPreCheck = reader
                 ? SuspendedShardsMetadata.isReaderSuspended(preCheckMetadata, shardId)

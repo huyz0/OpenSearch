@@ -72,7 +72,7 @@ public final class AbsentIndexRoutingSuppliers {
     private static final List<Runnable> REGISTRATION_LISTENERS = new CopyOnWriteArrayList<>();
 
     /**
-     * Which shards of an index are asleep, by index name. Registering null clears it, and with nothing
+     * Which shards of an index are asleep, by index uuid. Registering null clears it, and with nothing
      * registered no shard is suspended, so an unconfigured cluster behaves exactly as before.
      *
      * <p>Suspension has to be expressed here rather than by a decider. {@code
@@ -86,8 +86,11 @@ public final class AbsentIndexRoutingSuppliers {
      * shard and wake it, and that is precisely the class of mistake this registry was built to make
      * impossible: C3 hooked resolution, left the write path open-coded, and the two disagreed.
      *
-     * <p>Keyed by name and holding only the shards that <em>are</em> asleep, so the hot-path read is a
-     * hash lookup against a small map rather than a descriptor fetch. The durable copy lives on {@link
+     * <p>Keyed by uuid rather than by name for two reasons: it is what scale-to-zero already carries, so
+     * no lookup is needed to record a suspension, and it does not survive a delete-and-recreate, so a new
+     * index reusing a name cannot inherit the old one's sleeping shards. Holding only the shards that
+     * <em>are</em> asleep keeps the hot-path read a hash lookup against a small map rather than a
+     * descriptor fetch. The durable copy lives on {@link
      * org.opensearch.cluster.metadata.IndexDescriptor}, which is what survives a restart; this is the
      * cached view placement reads on every request.
      */
@@ -202,13 +205,13 @@ public final class AbsentIndexRoutingSuppliers {
     }
 
     /** The shards of this index that are asleep, empty when nothing is registered or the source fails. */
-    public static Set<Integer> suspendedShards(String indexName) {
+    public static Set<Integer> suspendedShards(String indexUuid) {
         Function<String, Set<Integer>> source = SUSPENDED_SHARDS.get();
         if (source == null) {
             return Set.of();
         }
         try {
-            Set<Integer> suspended = source.apply(indexName);
+            Set<Integer> suspended = source.apply(indexUuid);
             return suspended == null ? Set.of() : suspended;
         } catch (Exception e) {
             // Treated as nothing suspended, matching how a throwing supplier is treated as no answer. A
@@ -228,7 +231,7 @@ public final class AbsentIndexRoutingSuppliers {
         if (computed == null) {
             return null;
         }
-        Set<Integer> suspended = suspendedShards(computed.getIndex().getName());
+        Set<Integer> suspended = suspendedShards(computed.getIndex().getUUID());
         if (suspended.isEmpty()) {
             return computed;
         }
