@@ -8,8 +8,9 @@
 
 package org.opensearch.cluster.metadata;
 
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -41,12 +42,56 @@ public final class MappingRefreshOnDemand {
         MappingGenerationStore.MappingGeneration load(String indexUuid, long atLeastGeneration);
     }
 
+    /**
+     * How many indices one node keeps mappings for.
+     *
+     * <p>A cap rather than no cap is the whole point. This map was unbounded, which meant a node
+     * accumulated an entry holding a full field map for every index it had ever served, and that grows
+     * with the number of indices <em>touched</em> rather than the number currently active. At the index
+     * counts this area exists for, that is the residency ceiling Area H removed from cluster state,
+     * rebuilt on the data nodes in a different data structure and holding whole mappings rather than
+     * 698 B.
+     *
+     * <p>The value is a working-set size, not a correctness parameter. Eviction is always safe, because
+     * the store is the source of truth and an evicted index is refetched on its next request. Too small
+     * costs fetches; it cannot cost correctness.
+     */
+    public static final int DEFAULT_CAPACITY = 10_000;
+
     private final MappingLoader loader;
-    private final Map<String, MappingGenerationStore.MappingGeneration> local = new ConcurrentHashMap<>();
+    private final Map<String, MappingGenerationStore.MappingGeneration> local;
     private final AtomicLong fetches = new AtomicLong();
+    private final AtomicLong evictions = new AtomicLong();
 
     public MappingRefreshOnDemand(MappingLoader loader) {
+        this(loader, DEFAULT_CAPACITY);
+    }
+
+    /**
+     * Creates a refresher holding at most {@code capacity} indices' mappings.
+     *
+     * <p>Access-ordered rather than insertion-ordered, so a sweep over cold indices does not evict the hot
+     * ones. That distinction is what makes the cap survivable: scale-to-zero means most indices are cold,
+     * and an insertion-ordered cache would let a background walk of them flush the working set on every
+     * pass, turning a bounded cache into a guaranteed miss.
+     *
+     * <p>Synchronized rather than concurrent because access-order maintenance is a write on every read, so
+     * a {@code ConcurrentHashMap} could not maintain it. The critical sections are map operations, and the
+     * loader is deliberately called outside them: holding the lock across a fetch would serialize every
+     * shard on the node behind one slow read.
+     */
+    public MappingRefreshOnDemand(MappingLoader loader, int capacity) {
         this.loader = loader;
+        this.local = Collections.synchronizedMap(new LinkedHashMap<>(16, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<String, MappingGenerationStore.MappingGeneration> eldest) {
+                if (size() > capacity) {
+                    evictions.incrementAndGet();
+                    return true;
+                }
+                return false;
+            }
+        });
     }
 
     /**
@@ -89,5 +134,21 @@ public final class MappingRefreshOnDemand {
      */
     public long fetchCount() {
         return fetches.get();
+    }
+
+    /** How many indices this node currently holds a mapping for, which is what the cap bounds. */
+    public int trackedIndexCount() {
+        return local.size();
+    }
+
+    /**
+     * How many mappings have been evicted.
+     *
+     * <p>Worth exposing for the same reason as {@link #fetchCount()}: a cache sized well below the working
+     * set is correct and slow, and only a count tells the two apart. A node evicting continuously is one
+     * whose capacity is wrong, not one that is broken.
+     */
+    public long evictionCount() {
+        return evictions.get();
     }
 }

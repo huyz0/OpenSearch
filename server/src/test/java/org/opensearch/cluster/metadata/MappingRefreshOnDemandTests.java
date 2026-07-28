@@ -126,13 +126,78 @@ public class MappingRefreshOnDemandTests extends OpenSearchTestCase {
         );
     }
 
+    /**
+     * H11. The cache is bounded, because an unbounded one is the residency ceiling rebuilt on the data
+     * nodes.
+     *
+     * <p>This map held an entry with a full field map for every index the node had ever served and never
+     * evicted, so it grew with indices <em>touched</em> rather than indices active. Area H exists to stop
+     * per-index state accumulating; leaving it here would move the ceiling rather than remove it.
+     */
+    public void testTheCacheDoesNotGrowWithTheNumberOfIndicesServed() {
+        CountingLoader loader = new CountingLoader(Map.of("f", "keyword"), 1L);
+        MappingRefreshOnDemand refresher = new MappingRefreshOnDemand(loader, 100);
+
+        for (int i = 0; i < 10_000; i++) {
+            refresher.ensureCurrent("idx-" + i, 1L);
+        }
+
+        assertEquals("ten thousand indices must not leave ten thousand entries", 100, refresher.trackedIndexCount());
+        assertTrue("and the evictions must be counted, not silent", refresher.evictionCount() > 0);
+    }
+
+    /**
+     * What eviction costs, which is the claim that makes the cap safe: a refetch, never a wrong answer.
+     * The store is the source of truth, so an evicted index is reloaded on its next request rather than
+     * served as though it had no fields.
+     */
+    public void testAnEvictedIndexIsRefetchedRatherThanServedEmpty() {
+        CountingLoader loader = new CountingLoader(Map.of("f", "keyword"), 3L);
+        MappingRefreshOnDemand refresher = new MappingRefreshOnDemand(loader, 2);
+
+        refresher.ensureCurrent("evicted", 3L);
+        refresher.ensureCurrent("other-a", 3L);
+        refresher.ensureCurrent("other-b", 3L);
+
+        assertNull("the premise: it really was evicted", refresher.localMapping("evicted"));
+
+        int loadsBefore = loader.loads.get();
+        MappingGenerationStore.MappingGeneration served = refresher.ensureCurrent("evicted", 3L);
+
+        assertEquals("eviction must cost exactly one refetch", loadsBefore + 1, loader.loads.get());
+        assertNotNull("an evicted index must never be served as though it had no mapping", served);
+        assertEquals("and it must be the right mapping", Map.of("f", "keyword"), served.fields());
+    }
+
+    /**
+     * A sweep over cold indices must not flush the hot one. Scale-to-zero means most indices are cold, so
+     * an insertion-ordered cache would let any background walk of them evict the working set on every
+     * pass, which turns a bounded cache into a guaranteed miss.
+     */
+    public void testAScanOfColdIndicesDoesNotEvictTheHotOne() {
+        CountingLoader loader = new CountingLoader(Map.of("f", "keyword"), 1L);
+        MappingRefreshOnDemand refresher = new MappingRefreshOnDemand(loader, 10);
+
+        refresher.ensureCurrent("hot", 1L);
+        for (int i = 0; i < 9; i++) {
+            refresher.ensureCurrent("cold-" + i, 1L);
+            // The hot index is used between each cold one, which is what "hot" means.
+            refresher.ensureCurrent("hot", 1L);
+        }
+        // One more cold index, which must push out the least recently used and not the most.
+        refresher.ensureCurrent("cold-overflow", 1L);
+
+        assertNotNull("the hot index must survive a sweep of cold ones", refresher.localMapping("hot"));
+        assertNull("the least recently used cold index must be the one evicted", refresher.localMapping("cold-0"));
+    }
+
     // ---------------------------------------------------------------- helpers
 
     /** Counts loads, which is the only way to tell "did not need to read" from "read and got the same". */
     private static final class CountingLoader implements MappingRefreshOnDemand.MappingLoader {
         private final Map<String, String> fields;
         private final long generation;
-        private final AtomicInteger loads = new AtomicInteger();
+        final AtomicInteger loads = new AtomicInteger();
 
         CountingLoader(Map<String, String> fields, long generation) {
             this.fields = fields;
