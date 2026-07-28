@@ -1513,3 +1513,45 @@ The answer is not consulting metadata here at all, which is H9c. Suspension stat
 `IndexMetadata` through `SuspendedShardsMetadata`, which is both why the lookup is needed and why a gated
 index cannot be suspended at all (S24's companion finding, H9a). Moving that state to the descriptor
 removes the lookup and fixes the gated case with one change.
+
+## S26 (H10): what gated creation actually costs, as opposed to what it avoids
+
+S22 reported descriptor-only creation at 0.0005 ms, flat against population, against 57.777 ms through
+cluster state at fifty thousand indices. That number is real and it is not creation. It measures the cost
+of *not* doing a cluster state update, in-JVM, with no descriptor written anywhere. Actual gated creation
+writes a descriptor document with `op_type=create`, and that write had never been measured.
+
+The distinction decides a different question from the one S22 answers. Publication cost is what stops a
+cluster from functioning; write cost is what stops a fleet from ever being filled. The plan had been
+quoting a number that describes neither.
+
+Measured concurrently, 500 requests in flight, descriptors in a 5-shard index.
+
+| created | elapsed | per index | indices/sec |
+|---|---|---|---|
+| 5,000 | 1.16 s | 0.2325 ms | 4,301 |
+| 20,000 | 1.34 s | 0.0892 ms | 11,207 |
+| 50,000 | 1.46 s | 0.0486 ms | 20,577 |
+
+At the last measured rate, 100M indices is roughly 1.4 hours of sustained writing on one small cluster.
+The answer to "can the fleet be filled" is hours, not months, and creation throughput is therefore not a
+ceiling.
+
+### The rate improves with population, which is warmup rather than a discovery
+
+Creating 10,000 descriptors from empty ran at 13,100/s; another 10,000 onto an existing 40,000 ran at
+20,790/s, a ratio of 1.59. The improvement is JIT and index warmup dominating the first batch, not
+something getting faster as it grows.
+
+What the second measurement is for is the opposite claim, and it is the one asserted: the rate does not
+*collapse* with population. A creation cost that degraded would mean the fleet cannot be filled regardless
+of where the rate starts, because the last million indices would cost more than the first.
+
+### What this does not say
+
+It is a small cluster, so the absolute rate is the shape of the cost and not a capacity figure. It measures
+descriptor writes, which is what gated creation does, and it deliberately does not materialize any shards,
+which is what makes gated creation cheap in the first place. An index whose shards are later woken pays
+that cost then, and scale-to-zero (H9c, H9d) is what keeps the population that is awake far below the
+population that exists.
+

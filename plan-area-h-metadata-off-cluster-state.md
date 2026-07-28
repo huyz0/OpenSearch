@@ -316,6 +316,41 @@ scanning metadata makes suspension work for a gated index and removes the O(tota
 index at the same time. That is H9b, and it is the first thing the next cycle should do, because a
 serverless index that never sleeps is a worse outcome than one that cannot be created.
 
+## H.10d The second wrong prediction in the same section, and what suspension actually needed
+
+The paragraph above says one fix addresses both problems, and that resolving the index through the
+descriptor seam would make suspension work. That is wrong, and it is wrong in the same way the first
+prediction was: it assumes the only thing missing is a lookup.
+
+Suspension is enforced by `SuspendedShardAllocationDecider`, which works by telling the allocator to
+refuse the shard. A computed index never reaches the allocator. Area C derives its placement instead, so
+a decider refusing the shard is a verdict delivered to something that is not running. Giving the state a
+new home while leaving the enforcement where it was would have produced a shard marked asleep in one
+place and placed on a node by another, which looks exactly like scale-to-zero silently not working.
+
+So suspension changes shape rather than address. It stops being a verdict handed to an allocator and
+becomes an input to placement: a shard that placement does not place is assigned nowhere, and that is the
+only definition of asleep available to an index whose routing is computed.
+
+**H9c** put the filter in `AbsentIndexRoutingSuppliers.supply`, the one method every computed routing read
+funnels through, so a supplier cannot forget it and wake a sleeping shard. `IndexDescriptor` carries the
+suspended set as the durable record; the registry carries the hot-path view, keyed by uuid so a
+delete-and-recreate cannot inherit the previous index's sleeping shards.
+
+**H9d** connected the two. The property worth stating is not that gated suspension works but that it
+submits no cluster state task at all. Scale-to-zero suspends shards continuously, so at a hundred million
+indices one publication per suspension is the entire cluster manager. The test asserts the absence of the
+submission for that reason: a version that suspended correctly while still publishing would pass a
+"does it work" test and fail at the scale the area exists for.
+
+The registry is bounded by shards currently asleep, not by indices, and an index whose last shard wakes
+loses its entry rather than keeping an empty set. A map with an entry per index that has ever slept is the
+residency ceiling rebuilt in another data structure.
+
+State is node-local, deliberately. Divergence is safe because of its direction: a node that has not
+learned of a suspension places the shard and serves reads from it, which is stale but correct, while the
+node that suspended it stops sending work there.
+
 ## H.11 Phasing, each phase falsifiable
 
 **H1. Audit.** Classify all 41 direct enumerations as convertible, refusable, or blocking. F1's precedent:
