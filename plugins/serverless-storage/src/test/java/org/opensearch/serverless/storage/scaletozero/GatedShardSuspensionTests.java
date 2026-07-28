@@ -150,6 +150,65 @@ public class GatedShardSuspensionTests extends OpenSearchTestCase {
         verify(clusterService).submitStateUpdateTask(anyString(), any(), any(), any(), any());
     }
 
+    /**
+     * H12. The registry is bounded, and H9d's argument that it did not need to be was backwards.
+     *
+     * <p>H9d reasoned that holding only the shards currently asleep was fewer than the index count. Under
+     * scale-to-zero it is not fewer: the steady state is that most indices are asleep, so a map of every
+     * sleeping shard approaches one entry per index. The property that makes the feature worth having is
+     * the one that invalidated the bound.
+     */
+    public void testTheRegistryDoesNotGrowWithTheSleepingPopulation() {
+        GatedShardSuspensionRegistry bounded = new GatedShardSuspensionRegistry(100);
+
+        for (int i = 0; i < 100_000; i++) {
+            bounded.suspend("idx-" + i + "-uuid", 0);
+        }
+
+        assertEquals("a hundred thousand sleeping indices must not leave a hundred thousand entries", 100, bounded.trackedIndexCount());
+        assertTrue("and the evictions must be counted, not silent", bounded.evictionCount() > 0);
+    }
+
+    /**
+     * What eviction costs, which is the argument H11 could not make. Evicting a mapping is a refetch and
+     * cannot be wrong; evicting a suspension wakes a shard, which is a real behaviour change. It is
+     * tolerable because of its direction: a shard wrongly awake serves requests, a shard wrongly asleep is
+     * an outage, and the next tick suspends it again.
+     */
+    public void testAnEvictedSuspensionWakesTheShardRatherThanLosingIt() {
+        GatedShardSuspensionRegistry bounded = new GatedShardSuspensionRegistry(2);
+
+        bounded.suspend("evicted-uuid", 0);
+        bounded.suspend("other-a", 0);
+        bounded.suspend("other-b", 0);
+
+        assertFalse("the evicted index's shard must read as awake, not as some third state", bounded.isSuspended("evicted-uuid", 0));
+        assertTrue(
+            "and suspending it again must report a change, so the next tick genuinely re-suspends it "
+                + "rather than treating it as already done",
+            bounded.suspend("evicted-uuid", 0)
+        );
+    }
+
+    /**
+     * A sweep over the sleeping majority must not evict the suspensions being actively maintained. The
+     * same argument as H11 and it binds harder here, because under scale-to-zero the population being
+     * swept is most of the cluster.
+     */
+    public void testASweepOfColdIndicesDoesNotEvictTheActiveOnes() {
+        GatedShardSuspensionRegistry bounded = new GatedShardSuspensionRegistry(10);
+
+        bounded.suspend("active-uuid", 0);
+        for (int i = 0; i < 9; i++) {
+            bounded.suspend("cold-" + i, 0);
+            bounded.isSuspended("active-uuid", 0);
+        }
+        bounded.suspend("cold-overflow", 0);
+
+        assertTrue("the actively maintained suspension must survive the sweep", bounded.isSuspended("active-uuid", 0));
+        assertFalse("the least recently used must be the one evicted", bounded.isSuspended("cold-0", 0));
+    }
+
     // ---------------------------------------------------------------- helpers
 
     private static ClusterService clusterServiceFor(ClusterState state) {

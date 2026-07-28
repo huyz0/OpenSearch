@@ -10,10 +10,12 @@ package org.opensearch.serverless.storage.scaletozero;
 
 import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 
+import java.util.Collections;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Which shards of a gated index are asleep.
@@ -28,10 +30,27 @@ import java.util.concurrent.ConcurrentHashMap;
  * the allocator. H9c is why placement rather than the allocator: a computed index never reaches the
  * allocator, so a decider refusing the shard would never run.
  *
- * <p>Bounded by the number of shards that are <em>currently asleep</em> rather than by index count, and an
- * index with nothing asleep is removed rather than left holding an empty set. That matters: the whole
- * point of Area H is that nothing may grow with the number of indices, and a map with an entry per index
- * would be the residency ceiling rebuilt in a different data structure.
+ * <p><b>Bounded, and the first attempt at bounding it was backwards.</b> H9d argued that holding only the
+ * shards currently asleep was enough, since that is fewer than the index count. Under scale-to-zero it is
+ * not fewer: the steady state is that <em>most</em> indices are asleep, so a map of every sleeping shard
+ * approaches one entry per index, which is precisely the residency ceiling Area H exists to remove. The
+ * reasoning was inverted by the very property that makes the feature worth having.
+ *
+ * <p>So it is a fixed-capacity cache over the durable record on {@link
+ * org.opensearch.cluster.metadata.IndexDescriptor}, holding the active working set rather than the whole
+ * sleeping population. An index with nothing asleep is still removed rather than left holding an empty
+ * set, which keeps the common case out of the cache entirely.
+ *
+ * <p><b>Why eviction is safe here, which is not the argument H11 could make.</b> Evicting a mapping costs
+ * a refetch, so that cache cannot be wrong. Evicting a suspension does change behaviour: the shard is
+ * placed again, and it wakes. That is tolerable for one reason only, and it is the same reason a failing
+ * suspension source leaves every shard placed: a shard wrongly awake serves requests, a shard wrongly
+ * asleep is an outage. The next scale-to-zero tick observes it idle and suspends it again, so the error
+ * is self-correcting and costs one tick of an idle shard being resident.
+ *
+ * <p>Access-ordered, so a sweep over cold indices cannot evict the suspensions that are being actively
+ * maintained. The same argument as H11, and it applies more strongly here, because the population being
+ * swept is the sleeping majority.
  *
  * <p>Node-local by design. Every node computes the same placement from the same inputs, and suspension is
  * one of those inputs, so it has to reach every node. What makes that safe rather than divergent is that a
@@ -42,7 +61,33 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public final class GatedShardSuspensionRegistry {
 
-    private final Map<String, Set<Integer>> suspendedByIndexUuid = new ConcurrentHashMap<>();
+    /**
+     * How many indices one node tracks suspensions for. A working-set size rather than a correctness
+     * parameter: too small wakes idle shards a tick early and costs residency, it cannot lose data,
+     * because the descriptor holds the durable record.
+     */
+    public static final int DEFAULT_CAPACITY = 50_000;
+
+    private final Map<String, Set<Integer>> suspendedByIndexUuid;
+
+    private final AtomicLong evictions = new AtomicLong();
+
+    public GatedShardSuspensionRegistry() {
+        this(DEFAULT_CAPACITY);
+    }
+
+    public GatedShardSuspensionRegistry(int capacity) {
+        this.suspendedByIndexUuid = Collections.synchronizedMap(new LinkedHashMap<>(16, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<String, Set<Integer>> eldest) {
+                if (size() > capacity) {
+                    evictions.incrementAndGet();
+                    return true;
+                }
+                return false;
+            }
+        });
+    }
 
     /** Installs this registry as the source placement consults. */
     public void install() {
@@ -112,8 +157,19 @@ public final class GatedShardSuspensionRegistry {
         return removed[0];
     }
 
-    /** How many indices have at least one shard asleep, which is what tests assert stays bounded. */
+    /** How many indices this node tracks suspensions for, which is what the capacity bounds. */
     public int trackedIndexCount() {
         return suspendedByIndexUuid.size();
+    }
+
+    /**
+     * How many indices have been evicted, each of which woke shards that were asleep.
+     *
+     * <p>Exposed because a node evicting continuously has a capacity below its active working set, and the
+     * symptom is shards that will not stay asleep. Without a counter that looks like scale-to-zero being
+     * broken rather than being under-provisioned.
+     */
+    public long evictionCount() {
+        return evictions.get();
     }
 }
