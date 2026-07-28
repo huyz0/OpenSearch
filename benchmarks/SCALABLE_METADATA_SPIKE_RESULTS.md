@@ -1415,3 +1415,36 @@ prerequisite: without it the gate is usable only for indices whose mapping is fu
 before the descriptor hook existed it hangs at 1199.703s against 1199.706s with it, three milliseconds
 apart on a twenty minute timeout. Pulled into the run for the first time by a widened glob, and recorded
 rather than adopted.
+
+## S23 (H7b): descriptor cost against the descriptor index's own shard count
+
+S21 measured lookups against descriptor population, found them flat, and flagged its own limitation: five
+shards, where a hundred million descriptors needs closer to a hundred. Per-shard work is a term dictionary
+seek and does not grow with population, which is what those flat numbers showed. What grows with shard
+count is the coordination of a scatter-gather, and that was invisible to a measurement that varied
+population.
+
+Population held constant at twenty thousand so shard count is the only variable, six nodes.
+
+| shards | point lookup | prefix hits | prefix query |
+|---|---|---|---|
+| 1 | 1.193 ms | 10,000 | 138.8 ms |
+| 5 | 0.685 ms | 10,000 | 17.1 ms |
+| 20 | 0.548 ms | 10,000 | 58.0 ms |
+| 60 | 0.486 ms | 10,000 | 29.2 ms |
+
+**The point lookup is flat and that is the load-bearing result**: 0.476 ms with one shard against 0.435 ms
+with sixty, a ratio of 0.91. A point lookup routes by id to exactly one shard, so it should not care how
+many shards exist, and it does not. Resolution scales.
+
+**The wildcard shows no growth trend, and the honest reading is that the fan-out cost is not measurable
+here rather than that it is absent.** 17, 58 and 29 milliseconds at five, twenty and sixty shards is
+variance rather than a curve, and the 138.8 ms at one shard is warmup: it is the first query of the run.
+Whatever the coordination cost of fanning out to sixty shards is, it sits below the noise of this harness.
+
+That is weaker than "wildcards are free at a hundred shards", and it is what was measured. Extrapolating a
+trend from numbers that do not show one would be the same mistake as G2's assumption that per-index costs
+were flat because a different quantity was flat.
+
+The test asserts `response.getTotalShards()` equals the configured shard count, so a wildcard that quietly
+searched one shard would fail rather than look like excellent scaling.
