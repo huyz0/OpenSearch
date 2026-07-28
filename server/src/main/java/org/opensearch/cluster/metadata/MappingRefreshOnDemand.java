@@ -33,6 +33,30 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <p>Being ahead is normal rather than an error. The shard that inferred the field swapped the mapping
  * itself, so it is at generation N while a coordinator that planned a moment earlier stamps N-1.
+ *
+ * <p><b>T9: nothing calls this.</b> Every reference outside this file is a test or a comment. H6c's design
+ * was for a coordinator to stamp each request with the generation it planned against, and W14 then chose a
+ * different trigger: a shard refreshes when it meets a field its mapping does not have, which
+ * {@code StoreBackedFieldRefresher} implements and which is what ships. This class is the earlier half of
+ * that idea, complete and tested and never wired.
+ *
+ * <p>That makes it the fourth mechanism in this area found correct and unreachable, after H7a, H8a and the
+ * W series, so the note is here rather than in a commit message: a reader arriving at this file should not
+ * have to discover by search that it does not run.
+ *
+ * <p>It is also why the {@code synchronizedMap} below is left alone. It is the same access-ordered
+ * structure P1 measured at 57.4M reads per second on one thread falling to 9.1M on sixteen, and T9 replaced
+ * the equivalent in {@code StoreBackedFieldRefresher} for that reason. Replacing it here would be optimising
+ * a path that never executes, which is the P10 lesson stated as a rule: a change with no measurable effect
+ * on a path that does not run is not an improvement.
+ *
+ * <p><b>The fix is not simply the one T9 applied</b>, and that is worth recording before someone reaches for
+ * it. T9 stamps recency on write, which suits a map whose hot entries are written often. Here the hot
+ * entries are <em>read</em> often and written only when a mapping generation advances, so write-stamping
+ * would let a sweep over cold indices take the freshest stamps and evict the working set, which is exactly
+ * what access ordering was chosen to prevent. A read-cheap structure that keeps recency, such as the SIEVE
+ * algorithm TiDB uses for the same read-hot and write-rare shape, is the shape of the answer if this is
+ * ever wired.
  */
 public final class MappingRefreshOnDemand {
 
