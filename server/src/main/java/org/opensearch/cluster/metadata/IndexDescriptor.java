@@ -72,6 +72,19 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
     private final boolean remoteSnapshot;
     private final boolean warm;
 
+    /**
+     * The generation of this index's mapping object, which is what makes a cached mapping checkable.
+     *
+     * <p>H.7's read half in one field. A coordinator already fetches the descriptor to route, so carrying
+     * the generation here means that same fetch says whether its cached mapping is stale. Without it every
+     * request would need a second lookup, or an invalidation protocol, to answer a question the routing
+     * fetch could have answered for free.
+     *
+     * <p>Advances only when the mapping actually changes. A generation that moved on every write would
+     * invalidate every cache continuously, and one that never moved would serve stale field types forever.
+     */
+    private final long mappingGeneration;
+
     public IndexDescriptor(
         String name,
         String uuid,
@@ -84,7 +97,8 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         boolean system,
         boolean hidden,
         boolean remoteSnapshot,
-        boolean warm
+        boolean warm,
+        long mappingGeneration
     ) {
         this.name = Objects.requireNonNull(name, "descriptor needs a name");
         this.uuid = Objects.requireNonNull(uuid, "descriptor needs a uuid, since placement hashes it");
@@ -98,6 +112,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         this.hidden = hidden;
         this.remoteSnapshot = remoteSnapshot;
         this.warm = warm;
+        this.mappingGeneration = mappingGeneration;
     }
 
     /**
@@ -120,7 +135,8 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
             indexMetadata.isSystem(),
             indexMetadata.isHidden(),
             indexMetadata.isRemoteSnapshot(),
-            indexMetadata.isWarmIndex()
+            indexMetadata.isWarmIndex(),
+            0L
         );
     }
 
@@ -137,6 +153,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         this.hidden = in.readBoolean();
         this.remoteSnapshot = in.readBoolean();
         this.warm = in.readBoolean();
+        this.mappingGeneration = in.readVLong();
     }
 
     @Override
@@ -153,6 +170,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         out.writeBoolean(hidden);
         out.writeBoolean(remoteSnapshot);
         out.writeBoolean(warm);
+        out.writeVLong(mappingGeneration);
     }
 
     /** The index, which is what placement hashes and what every shard id is built from. */
@@ -227,6 +245,30 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         return warm;
     }
 
+    /** The generation of this index's mapping object. */
+    public long mappingGeneration() {
+        return mappingGeneration;
+    }
+
+    /** The same descriptor at a new mapping generation, which is what a mapping update records. */
+    public IndexDescriptor withMappingGeneration(long generation) {
+        return new IndexDescriptor(
+            name,
+            uuid,
+            shardCount,
+            searchOnlyReplicaCount,
+            serverless,
+            state,
+            aliases,
+            createdVersion,
+            system,
+            hidden,
+            remoteSnapshot,
+            warm,
+            generation
+        );
+    }
+
     /** The same descriptor, tombstoned. Deletion records rather than removes, so absence stays meaningful. */
     public IndexDescriptor tombstoned() {
         return new IndexDescriptor(
@@ -241,7 +283,8 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
             system,
             hidden,
             remoteSnapshot,
-            warm
+            warm,
+            mappingGeneration
         );
     }
 
