@@ -1850,3 +1850,34 @@ serverless requires, so every ordinary creation publishes to a remote store. Bot
 14.4x ratio and the two-orders-of-magnitude gap against the quoted figure are the findings. The absolute
 rates are specific to a single-JVM test cluster and should not be quoted as capacity.
 
+## S32 (P10): skipping the cluster state queue changed nothing, so the hypothesis was wrong
+
+S31 found gated creation at 235 per second and blamed the queue: the gate returns the cluster state
+unchanged, but it does so from inside `CreateIndexTask` on the single-threaded cluster state executor, so
+every gated creation still took a turn.
+
+H3 says that queue is unnecessary for a gated index, because the descriptor write with `op_type=create` is
+the uniqueness gate rather than the cluster state entry. So the fast path was built: check the request's
+own settings, take a cluster state snapshot for template resolution, run the pipeline, and if the gate
+fires, answer without ever submitting a task.
+
+**It fired and it did not help.** Twenty hits, zero misses, and gated creation moved from 235 to 245 per
+second, which is noise on twenty samples.
+
+So the queue was not the bottleneck. What remains in a gated creation is the pipeline itself: settings
+aggregation, template resolution, validation and the temporary `IndexMetadata` build, plus the transport
+and action layers above it. The descriptor write is already asynchronous (W4) so it is not blocking either.
+
+**Reverted.** An optimisation with no measurable benefit on the path that creates indices is not worth its
+risk, and a bug there means an index that does not exist or exists twice. The measurement is kept and the
+hypothesis is recorded as disproved.
+
+### Why this is worth writing down
+
+The reasoning was sound and the answer was still wrong. Everything about the shape of the code said the
+serialisation point had to be the cap, and it was not. That is the same lesson as P5's first attempt, where
+identity keying looked equivalent to the identity keying one line above it and was an 18x regression: on a
+hot path, a hypothesis about where time goes is worth exactly as much as the measurement that follows it.
+
+Profiling the creation pipeline is the next step, and it is a different task from this one.
+

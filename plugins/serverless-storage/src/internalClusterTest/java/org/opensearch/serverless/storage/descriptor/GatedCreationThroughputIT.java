@@ -43,6 +43,13 @@ import java.util.concurrent.atomic.AtomicInteger;
  *
  * <p>Both arms run in the same cluster so the comparison is not across runs, which is the mistake S19 and
  * S20 made once already.
+ *
+ * <p><b>P10 used this to test a hypothesis that turned out to be wrong.</b> The gate returns the cluster
+ * state unchanged from inside a cluster state task, so queueing looked like the cap. Skipping the queue
+ * entirely, verified firing with twenty hits and no misses, moved gated creation from 235 to 245 per
+ * second, which is noise. The queue is not the bottleneck; the creation pipeline is, and the change was
+ * reverted rather than kept for a benefit that could not be measured on the most safety-critical path in
+ * the system.
  */
 public class GatedCreationThroughputIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
 
