@@ -30,7 +30,9 @@ import org.opensearch.serverless.storage.allocation.SuspendedShardsMetadata;
 import org.opensearch.serverless.storage.scaletozero.action.ScaleToZeroCandidateEntry;
 import org.opensearch.transport.client.Client;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * The "do the work" half of scale-to-zero suspension, both writer and reader (rfc-serverless-opensearch.md
@@ -583,12 +585,39 @@ public final class ShardSuspensionCoordinator {
         evict(state, indexUuid, shardId, reader);
     }
 
-    private static IndexMetadata findByUuid(Metadata metadata, String indexUuid) {
-        for (IndexMetadata indexMetadata : metadata.indices().values()) {
-            if (indexUuid.equals(indexMetadata.getIndexUUID())) {
-                return indexMetadata;
+    /**
+     * The uuid index for one {@link Metadata} instance, rebuilt only when that instance changes.
+     *
+     * <p>Two fields rather than a map keyed by metadata, because the access pattern is a tick walking
+     * many shards of the same cluster state: the previous entry is the one wanted almost every time, and
+     * a cache holding more would retain old {@code Metadata} instances, each of which can be gigabytes.
+     */
+    private volatile Metadata uuidIndexBuiltFrom;
+    private volatile Map<String, IndexMetadata> uuidIndex;
+
+    /**
+     * Resolves an index by uuid, scanning once per cluster state version rather than once per call.
+     *
+     * <p>{@code Metadata} has no uuid lookup, so this used to scan every index on each of its five call
+     * sites, and the suspend path runs per candidate shard per tick: a tick suspending a hundred shards
+     * scanned the whole cluster a hundred times. Memoising against the {@code Metadata} instance is safe
+     * because it is immutable and shared, so identity is a sound cache key.
+     *
+     * <p>This does not make the cost independent of the index count, it makes it paid once per state
+     * version instead of once per shard. Removing it entirely means not needing metadata here at all,
+     * which is H9c, since suspension state currently lives inside {@code IndexMetadata}.
+     */
+    private IndexMetadata findByUuid(Metadata metadata, String indexUuid) {
+        Map<String, IndexMetadata> index = uuidIndex;
+        if (metadata != uuidIndexBuiltFrom || index == null) {
+            Map<String, IndexMetadata> rebuilt = new HashMap<>(metadata.indices().size());
+            for (IndexMetadata indexMetadata : metadata.indices().values()) {
+                rebuilt.put(indexMetadata.getIndexUUID(), indexMetadata);
             }
+            index = rebuilt;
+            uuidIndex = rebuilt;
+            uuidIndexBuiltFrom = metadata;
         }
-        return null;
+        return index.get(indexUuid);
     }
 }

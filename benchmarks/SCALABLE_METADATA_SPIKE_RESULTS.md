@@ -1487,3 +1487,29 @@ multiplied.
 
 The count and the returned list are asserted equal, so a page loop that silently stopped early would fail
 rather than report an attractively small number.
+
+## S25 (H9b): the suspension uuid lookup, and what memoising it buys
+
+H1d recorded that `ShardSuspensionCoordinator.findByUuid` scans every index and is called per candidate
+shard per tick, so a tick suspending a hundred shards scanned the whole cluster a hundred times. It
+attached no number, which left the severity a matter of opinion. This attaches one.
+
+`Metadata` is immutable and shared, so the uuid map can be memoised against the instance and rebuilt only
+when the cluster state changes.
+
+| indices | first resolution | ninety-nine more |
+|---|---|---|
+| 50,000 | 20.4 ms | 7.0 ms total, about 0.07 ms each |
+
+Unmemoised, a hundred-shard tick at fifty thousand indices would be a hundred scans, roughly two seconds
+of the coordinator doing nothing but looking things up. Memoised it is about 27 ms, and the assertion is
+that ninety-nine further resolutions cost less than twenty times the first rather than ninety-nine times.
+
+**What this does not do.** The first resolution against a new cluster state still walks every index, so
+the cost is paid once per state version rather than once per shard. At a hundred million indices that
+first walk is still a hundred million entries, so this is a real improvement and not the answer.
+
+The answer is not consulting metadata here at all, which is H9c. Suspension state currently lives inside
+`IndexMetadata` through `SuspendedShardsMetadata`, which is both why the lookup is needed and why a gated
+index cannot be suspended at all (S24's companion finding, H9a). Moving that state to the descriptor
+removes the lookup and fixes the gated case with one change.
