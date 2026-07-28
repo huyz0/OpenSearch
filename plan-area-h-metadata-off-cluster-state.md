@@ -351,6 +351,35 @@ State is node-local, deliberately. Divergence is safe because of its direction: 
 learned of a suspension places the shard and serves reads from it, which is stale but correct, while the
 node that suspended it stops sending work there.
 
+## H.10e H13, which is a design question rather than a wiring gap
+
+`IndexDescriptor` carries a suspended-shard set and nothing writes it. The obvious reading is that the
+wiring was forgotten. It was not: the wiring is blocked on a question that has to be answered first, and
+implementing either half without answering it would be guessing.
+
+**The case for not persisting it.** A suspension is a derived decision, not a fact. Scale-to-zero
+recomputes it from idleness on every tick, so a node that comes up knowing nothing converges within one
+tick at no cost beyond a tick of residency. On that reading the descriptor field is dead weight and should
+be removed rather than wired, and H12's eviction argument already leans on exactly this reasoning.
+
+**The case for persisting it.** At the populations this area exists for, the transient costs everything. If
+99M of 100M indices are asleep, a cluster that restarts knowing nothing computes placement for all 100M
+before the first tick suspends anything. The steady state is fine and the first minute is not, which is
+the shape of failure that takes a fleet down rather than slowing it.
+
+**What decides it, and it is measurable rather than arguable.** Whether a computed shard appearing in
+placement actually costs anything before a request arrives. If placement is lazy, so that a started shard
+in a computed routing table opens no engine and reads nothing until addressed, then the restart transient
+is a table that is large and cheap, and the field should go. If placement drives recovery, the transient
+materializes every sleeping shard and the field is mandatory.
+
+Nobody has measured that, and the two answers point at opposite implementations, which is why H13 is
+recorded here rather than half built. The probe is small: bring up a cluster with a gated index, resolve
+its placement, and count engines opened.
+
+**Until then both comments say so.** `GatedShardSuspensionRegistry` and `IndexDescriptor` each state that
+the state is node-local and volatile today, rather than describing the durable half as though it exists.
+
 ## H.11 Phasing, each phase falsifiable
 
 **H1. Audit.** Classify all 41 direct enumerations as convertible, refusable, or blocking. F1's precedent:
