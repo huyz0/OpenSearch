@@ -139,13 +139,47 @@ MVCC-collected under the reader. It is worth noting as the class of hazard that 
 reads become storage reads: the read is no longer instantaneous, so anything that reclaims by time
 can reclaim what an in-flight read still needs.
 
-## Ranked takeaways
+## Ranked takeaways, and what happened to each
 
-1. Collapse concurrent descriptor misses. Small, local to `DescriptorStore`, fixes a real fan-out
-   gap.
-2. Make cache bounds byte budgets rather than entry counts, and settable at runtime.
-3. Close the residency list: one place naming every reason an index must stay in memory.
-4. Avoid deserialising during bulk descriptor reads when only name and uuid are needed.
-5. If `Metadata.build()` ever has to stay on the write path, the MVCC B-tree keyed by
-   `(name, version)` with tombstones and lazy-clone CAS is the structure that removes the per-version
-   O(N) rebuild.
+These were ranked before any of them was tried. Three of the five rankings turned out to be wrong,
+which is the main reason this section now records outcomes instead of intentions.
+
+1. **Collapse concurrent descriptor misses.** Done (T1, T2). T1 measured 64 callers issuing 64 reads;
+   after collapsing, one. But T8 then found the fix broke H18's realtime contract, because a read that
+   starts before a creation lands returns null and sharing that null hands it to callers who arrived
+   after. Hits collapse, misses do not.
+
+2. **Byte budgets rather than entry counts.** Done (T4b), but the ranking was right for the wrong
+   reason. The stated expectation was that TiDB's justification would not transfer, since a descriptor
+   is a fixed shape while a `TableInfo` grows with column count. Measured, a descriptor with twenty
+   aliases is 5.8x a typical one and two hundred aliases is 51.6x, against a threshold of 5x written
+   down beforehand. It transferred.
+
+   Ahead of it in importance, and not in the original list at all: T3 found the existing cache had a
+   capacity check and no eviction, so past its bound it held memory and served nothing.
+
+3. **Close the residency list.** Done (T7), and this was ranked far too low. We had no list at all,
+   and the audit found that gating an index drops its alias filters, alias routing and write-index
+   flag in silence. An alias filter restricts which documents a query may see, so gating widened a
+   restricted view. That is a correctness problem, not the housekeeping the ranking implied.
+
+4. **Avoid deserialising bulk reads.** Done (T5, T6), and the smallest of the five. Decoding is 25 to
+   36 percent of a page. Worth taking, since pagination reads two of fourteen fields, but nothing like
+   TiDB's win: their regex trick avoids unmarshalling an entire catalog during a cold start, while ours
+   avoids decoding one bounded page.
+
+5. **The MVCC B-tree.** Not done, and correctly conditional. It removes the per-version O(N)
+   `Metadata` rebuild, and P10 already established that the cluster state queue is not what bounds
+   gated creation. Building it now would be answering a question nothing has asked.
+
+## What the study missed
+
+Reading the code against TiDB found more than reading TiDB did. T3 (a bound with no release), T7 (a
+silently widened alias), T8 (a shared miss) and T9 (a read-mutating LRU that P3's title claimed and
+P3's fix did not touch) came from auditing our own components against the pattern, not from the list
+above.
+
+T10 is the counterexample worth keeping: `MappingRefreshOnDemand` has the same structure T9 fixed, on
+what its javadoc calls a per-request path, and no caller at all. Copying the fix across would have
+optimised dead code, and the fix itself would have been wrong there, because its entries are read-hot
+and write-rare so write-stamped recency would let a cold sweep evict the working set.
