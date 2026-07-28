@@ -1808,3 +1808,45 @@ registry's was not: reads there populate the map, so a sweep really can evict th
 The per-field cost in `DocumentParser` is one reference comparison against a local, short-circuiting before
 any volatile read. Measured by inspection rather than benchmark, and recorded as such.
 
+## S31 (P9): real gated creation is 235 per second, not 20,577
+
+S26 reported 20,577 creations per second and S30 about 26,500. Neither called `prepareCreate` for the
+indices it counted. Both wrote descriptor documents with `client.index` and timed that, so both measured
+descriptor write throughput and neither measured index creation.
+
+That is the same defect S22 had, where 0.0005 ms turned out to be the cost of *not* publishing rather than
+the cost of creating. S26 was written to replace S22 and reproduced its shape at one remove: it measured
+the storage operation creation performs instead of the operation it avoids, and still not creation.
+
+Measured through the real API, both arms in one cluster, twenty indices each:
+
+| arm | creations/sec |
+|---|---|
+| ordinary | 16 |
+| gated | 235 |
+| ordinary again, warmup control | 25 |
+
+**Gated creation is 14.4x ordinary**, so the gate does what it was built to do: it skips the `Metadata`
+rebuild S20 measured at 69 ms per change at fifty thousand indices, and it skips the publication.
+
+**And it is 87x slower than the figure the plan has been quoting.** At 235 per second a hundred million
+indices is about 4.9 days, not the 1.4 hours S26 implied.
+
+### Why it is not faster
+
+The gate returns the cluster state unchanged, but it does so from inside `CreateIndexTask`, an
+`AckedClusterStateUpdateTask` submitted to the single-threaded cluster state executor. So a gated creation
+still takes a cluster manager slot, and the whole settings and template pipeline runs before the result is
+discarded. What the gate removes is the rebuild and the publication. What it does not remove is the
+serialisation point, which is the thing that bounds the rate.
+
+That is the guard-after-the-work shape found three times on the read paths (P3, P5's first attempt, P8),
+appearing a fourth time and at the largest scale yet.
+
+### What the absolute numbers are worth
+
+The ordinary arm is 16 to 25 per second because this cluster runs with remote cluster state enabled, which
+serverless requires, so every ordinary creation publishes to a remote store. Both arms pay that, so the
+14.4x ratio and the two-orders-of-magnitude gap against the quoted figure are the findings. The absolute
+rates are specific to a single-JVM test cluster and should not be quoted as capacity.
+
