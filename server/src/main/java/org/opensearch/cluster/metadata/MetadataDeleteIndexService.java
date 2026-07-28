@@ -97,9 +97,34 @@ public class MetadataDeleteIndexService {
             throw new IllegalArgumentException("Index name is required");
         }
 
+        // What was deleted, captured while the transform runs so the tombstone write below knows which
+        // descriptors to store. Overwritten rather than appended to, because a cluster state task may be
+        // re-executed and only the run that commits is the one whose deletions happened.
+        final java.util.concurrent.atomic.AtomicReference<java.util.List<IndexMetadata>> deletedIndices =
+            new java.util.concurrent.atomic.AtomicReference<>(java.util.List.of());
+
+        // The acknowledgement is deferred until the tombstones are durable.
+        //
+        // The publish hook inside the transform is asynchronous and best-effort, because it runs on the
+        // cluster state thread where a blocking write deadlocks. Retries close transient failures but not a
+        // crash between the commit and the write landing, and inferring a tombstone from a missing
+        // descriptor was rejected: an unavailable store and a store with no record give the same answer, so
+        // acting on absence would discard live shard data.
+        //
+        // Ordering is what is left. This window, after the state is committed and before the client is told
+        // the delete succeeded, is the only place a write can be both off the cluster state thread and
+        // ahead of the acknowledgement. Nothing blocks: the listener is deferred, not waited on.
+        final ActionListener<ClusterStateUpdateResponse> durableListener = ActionListener.wrap(
+            response -> DurableTombstones.whenDurable(
+                deletedIndices.get(),
+                ActionListener.wrap(ignored -> listener.onResponse(response), listener::onFailure)
+            ),
+            listener::onFailure
+        );
+
         clusterService.submitStateUpdateTask(
             "delete-index " + Arrays.toString(request.indices()),
-            new AckedClusterStateUpdateTask<ClusterStateUpdateResponse>(Priority.URGENT, request, listener) {
+            new AckedClusterStateUpdateTask<ClusterStateUpdateResponse>(Priority.URGENT, request, durableListener) {
 
                 @Override
                 protected ClusterStateUpdateResponse newResponse(boolean acknowledged) {
@@ -113,6 +138,14 @@ public class MetadataDeleteIndexService {
 
                 @Override
                 public ClusterState execute(final ClusterState currentState) {
+                    java.util.List<IndexMetadata> deleted = new java.util.ArrayList<>();
+                    for (Index index : request.indices()) {
+                        IndexMetadata metadata = currentState.metadata().index(index);
+                        if (metadata != null) {
+                            deleted.add(metadata);
+                        }
+                    }
+                    deletedIndices.set(java.util.List.copyOf(deleted));
                     return deleteIndices(currentState, Sets.newHashSet(request.indices()));
                 }
             }
