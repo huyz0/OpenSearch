@@ -99,7 +99,15 @@ public final class DescriptorGate {
         // Asynchronous because this hook runs on the cluster state thread: Metadata calls it while building
         // a cluster state, so a blocking write deadlocks against the index operation it issues. Registering
         // the blocking put hung the node instead of failing, which is how the constraint was found.
-        IndexDescriptorPublisher.register(store::putAsync);
+        // Tombstones take the retrying path: they are the one descriptor write that is not safe to lose,
+        // since for a gated index there is no cluster state entry and no graveyard entry behind them.
+        IndexDescriptorPublisher.register(descriptor -> {
+            if (descriptor.exists()) {
+                store.putAsync(descriptor);
+            } else {
+                store.putTombstoneAsync(descriptor);
+            }
+        });
         // Mappings, which H4c required to leave cluster state and which have had no backing store since
         // H6a proved the swap converges. Blocking is safe here, unlike the publish hook above: a mapping
         // update runs on a transport thread handling a put-mapping or a dynamic field inference, not on

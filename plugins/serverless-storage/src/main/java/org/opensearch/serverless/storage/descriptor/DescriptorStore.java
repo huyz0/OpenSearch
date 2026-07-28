@@ -160,6 +160,65 @@ public final class DescriptorStore {
     }
 
     /**
+     * How many times a tombstone write is retried before giving up.
+     *
+     * <p>A tombstone is the one descriptor write that is not safe to lose (H4b): a node adopting dangling
+     * shard data must be able to read it, and for a gated index there is no cluster state entry and no
+     * graveyard entry to fall back on. Retrying closes the transient half of that risk, where the write
+     * fails because the mapping index is briefly unavailable or the node is busy.
+     */
+    private static final int TOMBSTONE_ATTEMPTS = 5;
+
+    /**
+     * Records a tombstone, retrying on failure.
+     *
+     * <p>Still asynchronous, because W4 established that this runs on the cluster state thread and a
+     * blocking write there deadlocks against the index operation it issues. Retrying is what can be done
+     * without blocking.
+     *
+     * <p><b>What this does not fix.</b> A crash between the cluster state commit and the last attempt
+     * landing still loses the tombstone. Closing that needs reconciliation on node join rather than
+     * retries: an index whose data is on disk but which appears in neither cluster state nor the descriptor
+     * index has been deleted, and a positive check against durable storage is a stronger statement than the
+     * local guess {@code IndexGraveyard} was built to avoid. That is a separate mechanism and is tracked
+     * rather than half-built here.
+     */
+    public void putTombstoneAsync(IndexDescriptor tombstone) {
+        submitTombstone(tombstone, 1);
+    }
+
+    private void submitTombstone(IndexDescriptor tombstone, int attempt) {
+        try {
+            client.index(
+                new IndexRequest(DESCRIPTOR_INDEX).id(tombstone.name()).source(DescriptorCodec.toSource(tombstone)),
+                new org.opensearch.core.action.ActionListener<>() {
+                    @Override
+                    public void onResponse(org.opensearch.action.index.IndexResponse response) {}
+
+                    @Override
+                    public void onFailure(Exception e) {
+                        if (attempt < TOMBSTONE_ATTEMPTS) {
+                            submitTombstone(tombstone, attempt + 1);
+                            return;
+                        }
+                        // Logged at warn rather than swallowed: a lost tombstone means a node may later
+                        // adopt this index's dangling shard data, so it is worth an operator seeing.
+                        logger.warn(
+                            "failed to record tombstone for [{}] after {} attempts; dangling data for this "
+                                + "index may be adopted on a node rejoin",
+                            tombstone.name(),
+                            TOMBSTONE_ATTEMPTS,
+                            e
+                        );
+                    }
+                }
+            );
+        } catch (Exception e) {
+            logger.warn("failed to submit tombstone write for [{}]", tombstone.name(), e);
+        }
+    }
+
+    /**
      * One page of descriptors whose name starts with {@code prefix}, ordered by name.
      *
      * <p>Refresh-bound, per H18, because it is a search. A descriptor written microseconds ago may not
