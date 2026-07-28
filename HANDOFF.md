@@ -159,15 +159,19 @@ Proven by measurement, both arms in the same run:
 | mapping CAS converges | eight concurrent inferences, eight fields survive |
 | lazy refresh cheaper than broadcast | one read per hundred requests at the same generation |
 
-**Distrust these three**, which carry more weight than their evidence:
+All three caveats from the previous review have been closed, and one of them changed a number materially:
 
-1. `MappingGenerationStore` and `MappingRefreshOnDemand` have **no production caller**. They are correct
-   units and nothing routes a real mapping update through them yet. C18 shipped two mechanisms in exactly
-   that state and both were dead.
-2. Descriptor reads were measured on **five shards**, not the hundred a hundred million descriptors would
-   need. Per-shard work is a term dictionary seek and does not grow; fan-out coordination does, untested.
-3. The wildcard measurement used `size=0`, so it **counted matches rather than returning names**. Real
-   resolution needs the names.
+1. **The mapping mechanism now has a caller** (H7a). A gated index's mapping update records through
+   `MappingGenerationStore` and makes no cluster state change. Proven by mutation: the first version of
+   that test called the store directly and passed with the wiring disabled, which is the
+   correct-and-unreachable failure this project has shipped twice.
+2. **Point lookups are flat against shard count** (H7b, S23): 0.476 ms at one shard, 0.435 ms at sixty.
+   The wildcard fan-out cost is not measurable up to sixty shards, which is weaker than saying it is
+   absent at a hundred, and is recorded that way.
+3. **Wildcards returning names cost 55x counting them** (H7c, S24): 5.9 ms against 327.5 ms at ten
+   thousand matches. The previously recorded 22 ms understated resolution by roughly fifteen times.
+   Wildcard resolution needs pagination in its contract or a bounded match set, at about 33 ms per
+   thousand names.
 
 ## What is left
 
