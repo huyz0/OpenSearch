@@ -762,3 +762,55 @@ unimplemented gap above it. The largest population ever exercised is one million
 known ceiling" and "demonstrated" is not closable by more work of this kind, and saying otherwise would be
 the same error as calling a measured question a decision.
 
+## Third review: the goal is not reached, and now I can say precisely what is missing
+
+The previous review claimed the remaining distance was "not closable by more work of this kind". That was
+overstated, and the correction is the substance of this cycle: it was true of a hundred million and false
+of ten, and running ten changed a load-bearing claim.
+
+### What this cycle closed
+
+- **H20**, the last known unimplemented gap. Mapping stats now include the gated population through an
+  aggregate that offers no way to iterate indices, so the repair that would fix correctness while
+  restoring the population-sized cost is inexpressible rather than merely discouraged.
+- **H21 / S28**, the demonstration pushed from one million to ten.
+
+### What ten million changed
+
+Creation is flat: 23,843 per second at 10M against 22,805 at 1M, putting a hundred million at about 70
+minutes of writing.
+
+**The lookup is not flat, and the plan had been resting on the claim that it was.** S27 measured 0.96x from
+fifty thousand to a million. The next decade gives 1.88x. The earlier figure was correct for its range and
+I generalised past it. Extrapolating the observed decade factor puts 100M near 1.3 ms, which is still an
+acceptable metadata lookup, so the architecture survives, but it survives as arithmetic on a growth rate
+rather than as a flat curve. Anything downstream that quotes "flat" needs rewording.
+
+### The ceilings, third pass
+
+| ceiling | state |
+|---|---|
+| placement | cleared by Area C |
+| residency | cleared; H11 and H12 closed two leaks that had rebuilt it on the data nodes |
+| throughput, creation | cleared and flat to 10M |
+| throughput, lookup | acceptable but **growing**, 1.88x per decade, ~1.3 ms projected at 100M |
+
+### What is left, and it is now short and specific
+
+1. **A run at a hundred million.** Ten million needed an 8 GB heap on a single-JVM cluster. A hundred
+   million is a fleet exercise, not a test-suite one. This is the only thing standing between the current
+   state and the goal, and no amount of work in this repository substitutes for it.
+2. **The serverless-only precondition.** A genuine product decision, unlike the two that were mislabelled
+   as such and turned out to be settled by measurements already taken.
+
+### Answer
+
+No, and for the first time the reason is a single missing measurement rather than a list. Every mechanism
+the plan calls for exists, is tested, and is mutation tested. Every enumeration found on a request path is
+either converted or pinned with a named fix. The largest population exercised is ten million, one order of
+magnitude short, and the curve that carries the extrapolation is known to grow rather than assumed to be
+flat.
+
+Claiming the goal is reached would require asserting that 1.3 ms at 100M holds without having measured a
+decade of it, which is exactly the generalisation S28 caught me making one decade lower down.
+
