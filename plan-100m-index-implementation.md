@@ -814,3 +814,52 @@ flat.
 Claiming the goal is reached would require asserting that 1.3 ms at 100M holds without having measured a
 decade of it, which is exactly the generalisation S28 caught me making one decade lower down.
 
+## Fourth review: the last technical unknown is closed, and the goal is still one measurement away
+
+### What this cycle produced
+
+**S29 reversed S28's central conclusion.** S28 found lookup growing 1.88x per decade and I concluded the
+extrapolation to 100M had to rest on a growth rate. H22 separated the two candidate causes by force
+merging, which collapses segments without shrinking the term dictionary. At five segments, one million
+descriptors cost 0.3044 ms and ten million cost 0.3199 ms: **1.05x across a tenfold increase**. The growth
+was merge policy. The term dictionary contributes about five percent per decade, not eighty-eight.
+
+So the descriptor index does not become the new ceiling, and 100M lookup is a design parameter rather than
+a fact to be accepted.
+
+### The ceilings, fourth pass
+
+| ceiling | state |
+|---|---|
+| placement | cleared by Area C |
+| residency | cleared; H11 and H12 closed two leaks that had rebuilt it on the data nodes |
+| throughput, creation | cleared and flat to 10M, about 70 minutes to write 100M |
+| throughput, lookup | cleared **conditionally**: flat at bounded segment count, 1.88x per decade if unbounded |
+
+### Two operational parameters that are now load-bearing
+
+Both were discovered rather than designed, and both can be got wrong in a way that looks like the
+architecture failing rather than like a misconfiguration.
+
+1. **Refresh interval** (H18) bounds wildcard staleness. Disabling it, which the measurement harnesses do,
+   makes wildcards permanently stale.
+2. **Merge policy** (S29) bounds lookup latency. Letting segments grow unbounded reproduces S28's curve.
+
+These belong in the deployment contract next to each other. Neither is a tuning preference.
+
+### What is left
+
+1. **A run at a hundred million.** Ten million needed an 8 GB heap on a single-JVM cluster. This is a fleet
+   exercise and nothing in this repository substitutes for it.
+2. **The serverless-only precondition.** A product decision, and the only genuine one remaining.
+
+### Answer
+
+No, and the reason is now a single missing measurement with every technical unknown around it closed.
+Every mechanism exists, is tested and is mutation tested. Every enumeration found on a request path is
+converted or pinned with a named fix. Both curves that carry the extrapolation have been measured across a
+decade rather than assumed, and the one that appeared to grow has been explained and shown controllable.
+
+What would change the answer is a hundred million indices on real hardware. That is the whole of the
+remaining gap, and it is a smaller and better characterised gap than at any previous review.
+
