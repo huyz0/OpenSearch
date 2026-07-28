@@ -910,3 +910,57 @@ hundred million would test whether the slope holds, and nothing here substitutes
 that no earlier extrapolation in this project had is a validation point outside the measured range, and a
 slope that flattens rather than steepens as population grows.
 
+## Sixth review: the machinery is connected, and that is a different claim from before
+
+The five earlier reviews all reported Area H's mechanisms as done. They were, in the sense that each was
+built, tested and mutation tested. None of them was reachable from a node that had started. That gap is
+what the W series closed, and finding it changes how the earlier reviews should be read rather than adding
+to them.
+
+### What was actually true before this cycle
+
+Zero production registrations for `AbsentIndexDescriptorSuppliers`, `IndexDescriptorPublisher`,
+`MappingGenerationStore` and `GatedMappingStatsAggregator`. `MappingRefreshOnDemand` constructed nowhere.
+The suspension registry never installed. No descriptor index in existence, so every measurement in the area
+had been reading from a fixture the tests built themselves. And `DescriptorOnlyCreation.register` never
+called, so no index was ever gated and the whole apparatus served a population of zero.
+
+### What the wiring produced that isolated testing could not
+
+Four defects that existed only once the seams were connected:
+
+1. **Self-reference recursion.** The descriptor supplier makes the store's own reads resolve through the
+   supplier that reads the store. It closes only when the descriptor index is absent from cluster state,
+   which is a fresh cluster. `StackOverflowError` on the first resolution miss. Found by a control test,
+   not the feature test, which had already created a descriptor and so never reached the supplier.
+2. **Cluster-state-thread deadlock.** The publish hook runs inside `Metadata` construction, so a blocking
+   descriptor write waits on an index operation that needs a cluster state. The suite hung for ten minutes
+   rather than failing.
+3. **Aggregation tension.** Not indexing user field names is necessary, since they are unbounded, and it
+   makes mappings unaggregatable, which cluster stats needs. Resolved with a bounded `{type, count}`
+   projection, because field types are a fixed vocabulary.
+4. **The stamping point that did not exist.** H6c's lazy refresh assumed a request carries the generation
+   it expects. Nothing does. The replacement, triggering on a mapping miss, is cheaper than the original.
+
+### The pattern worth carrying forward
+
+Every cycle's real output was a corrected assumption, not the code. H6c assumed a stamping point. W10
+proposed a reconciliation that H4b had already rejected three lines above the code being extended. S27's
+flat curve did not survive the next decade, and S28's growth turned out to be merge policy rather than
+population. A test labelled "pre-existing flakiness" was a locale bug.
+
+The discipline that caught each of them was the same: write the control, count rather than assert, mutate
+the change and check the test dies, and re-read the decision next to the gap before proposing to fix it.
+
+### Where the goal stands
+
+100M is answered by extrapolation from a measured and independently checked curve, not by a run at scale:
+creation flat at ~26,500/sec, merged lookup projecting to 0.35 to 0.48 ms with the 10M point falling below
+the projection. Two operational parameters are load-bearing and were discovered rather than designed, merge
+policy and refresh interval.
+
+What remains is a run at a hundred million on real hardware, and the serverless-only precondition, which is
+a product decision rather than a measurement. Neither is closable by more work of this kind, and this time
+that statement is made with every seam connected rather than with a set of unreachable mechanisms behind
+it.
+
