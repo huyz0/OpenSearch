@@ -214,6 +214,34 @@ public class DescriptorCacheCapacityIT extends OpenSearchIntegTestCase {
         );
     }
 
+    /**
+     * A descriptor larger than the whole budget is not cached, rather than being cached and never evicted.
+     *
+     * <p>Found reviewing T4b's own eviction rather than by running it, which is where T4's flaw came from
+     * too. Eviction drops the stalest entries until the cache is under budget, bounded to ten passes. An
+     * entry that alone exceeds the budget can never be evicted down to fit, so admitting it would leave the
+     * cache permanently over budget and run the scan on every subsequent admission forever. Same CPU sink
+     * as T4's equal-stamps case, reached a different way.
+     *
+     * <p>Refusing to cache it costs one read per resolution for one index. Admitting it costs the read path
+     * a full scan per admission for every index.
+     */
+    public void testADescriptorLargerThanTheWholeBudgetIsNotCached() {
+        // Far below one descriptor, which is a misconfiguration rather than a realistic setting. The point
+        // is that the failure is bounded rather than that the setting is sensible.
+        DescriptorStore store = new DescriptorStore(client(), 1, now::get, DescriptorStore.COLLAPSE_WAIT_MILLIS, 100, 32);
+        store.create(heavilyAliasedDescriptor(name(0)));
+
+        assertNotNull("the descriptor must still resolve, since not caching is not the same as not finding", store.get(name(0)));
+        assertEquals("but nothing may be cached, or the cache is stuck over budget forever", 0, store.cachedCount());
+        assertEquals("and the accounting must not drift", 0L, store.cachedBytes());
+
+        // Every resolution is a real read, which is the cost of the refusal and is bounded and stated.
+        long before = store.readCount();
+        store.get(name(0));
+        assertEquals("an uncacheable descriptor is re-read rather than served stale", before + 1, store.readCount());
+    }
+
     /** Twenty plain aliases, the case T4b measured at 5.8 times a typical descriptor. */
     private static IndexDescriptor heavilyAliasedDescriptor(String name) {
         List<String> aliases = new java.util.ArrayList<>();

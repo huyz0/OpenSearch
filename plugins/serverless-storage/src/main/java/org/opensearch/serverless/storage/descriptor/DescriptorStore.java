@@ -245,6 +245,16 @@ public final class DescriptorStore {
      */
     private void admit(String name, IndexDescriptor descriptor, long now) {
         long bytes = retainedSizeOf(name, descriptor);
+        if (bytes > cacheBytes) {
+            // An entry that alone exceeds the budget can never be evicted down to fit, so admitting it
+            // would leave the cache permanently over budget and run the eviction scan on every subsequent
+            // admission forever. That is the shape T4 caught once already, where eviction made no progress
+            // and kept re-sorting to discover it. Not caching this descriptor costs one read per
+            // resolution for one index; admitting it costs the read path a scan per admission for all of
+            // them.
+            logger.debug("descriptor for [{}] is {} bytes, above the whole cache budget of {}; not cached", name, bytes, cacheBytes);
+            return;
+        }
         CachedDescriptor replaced = cache.put(name, new CachedDescriptor(descriptor, now, admissions.incrementAndGet(), bytes));
         // Net, so refreshing an entry does not double count it. A refresh is the common case once the
         // window starts expiring, so getting this wrong would drift the total upward until the cache
