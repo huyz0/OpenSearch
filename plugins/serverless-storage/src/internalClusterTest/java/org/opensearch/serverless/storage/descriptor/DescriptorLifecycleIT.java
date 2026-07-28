@@ -87,14 +87,18 @@ public class DescriptorLifecycleIT extends OpenSearchIntegTestCase {
         assertEquals("a gated index must be nameable", 1, resolved.length);
         assertEquals("and carry its uuid, or a request cannot reach the shard", UUID, resolved[0].getUUID());
 
-        // 3. Findable by wildcard, but only after a refresh. H18 measured that this asymmetry is forced by
-        // the store rather than chosen: a get by id reads the translog, a search sees segments.
-        assertTrue(
-            "before a refresh a wildcard must not see it, which is the documented contract",
-            store.findByPrefix("lifecycle-", null, 10).isEmpty()
-        );
+        // 3. Findable by wildcard once refreshed.
+        //
+        // Deliberately only the positive half. The negative half, that a wildcard cannot see it *before* a
+        // refresh, is real but timing-dependent here: W8 gives the descriptor index a one second refresh
+        // interval, so an automatic refresh can land between the write and the check. Asserting it here
+        // would be asserting a race, which is what DescriptorFreshnessContractIT avoids by disabling
+        // refresh outright. That test owns the contract; this one owns the lifecycle.
+        //
+        // Recorded rather than quietly dropped because the first version of this test did assert the race,
+        // and it passed until W12's run happened to be slow enough to expose it.
         client().admin().indices().prepareRefresh(DescriptorStore.DESCRIPTOR_INDEX).get();
-        assertEquals("after a refresh it must appear", 1, store.findByPrefix("lifecycle-", null, 10).size());
+        assertEquals("a refreshed wildcard must find the gated index", 1, store.findByPrefix("lifecycle-", null, 10).size());
 
         // 4. Mapped, with the generation advancing and no shard informed. H4c required this to leave
         // cluster state; W5 gave it somewhere to live.

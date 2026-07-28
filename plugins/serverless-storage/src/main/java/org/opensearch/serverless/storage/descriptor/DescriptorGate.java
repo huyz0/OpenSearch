@@ -12,9 +12,11 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.admin.cluster.stats.GatedMappingStatsAggregator;
 import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
+import org.opensearch.cluster.metadata.DescriptorOnlyCreation;
 import org.opensearch.cluster.metadata.IndexDescriptor;
 import org.opensearch.cluster.metadata.IndexDescriptorPublisher;
 import org.opensearch.cluster.metadata.MappingGenerationStore;
+import org.opensearch.serverless.storage.placement.ComputedPlacementGate;
 
 import java.util.List;
 
@@ -30,6 +32,16 @@ import java.util.List;
  * <p>Modelled on {@code ComputedPlacementGate}, which is the one installer in this plugin that already
  * works. Installing is the whole of the wiring: the registries are static, each node fills the gap locally,
  * and there is nothing to subscribe to or keep in sync.
+ *
+ * <p><b>Gating is registered last and removed first.</b> An index is gated exactly when its placement is
+ * computed, because a gated index has no cluster state entry and therefore can have no published routing
+ * table. Deciding those two independently would permit an index with published routing and no metadata, or
+ * metadata with no way to place it, and neither is serviceable.
+ *
+ * <p><b>One-way door worth stating.</b> Turning the serverless setting off stops new indices being gated;
+ * it does not bring already-gated indices back into cluster state. Their metadata lives in the descriptor
+ * index and resolution for them stops working the moment this gate is uninstalled. Migrating them back is
+ * not implemented and is not implied by the setting.
  *
  * <p><b>Uninstalling matters and is easy to forget.</b> The registries outlive any one node, so a node that
  * closes without clearing them leaves a dead {@code Client} answering resolution for whatever runs next. In
@@ -118,6 +130,17 @@ public final class DescriptorGate {
         // the aggregate it was waiting for: one query whose cost is set by the number of field types
         // rather than by the number of indices.
         GatedMappingStatsAggregator.register(statsAggregator);
+        // The switch that turns the feature on, and it is deliberately last. Until this is registered,
+        // DescriptorOnlyCreation.skipsClusterState answers false for every index, so nothing is gated and
+        // every seam above serves a population of zero. Installing it before the seams existed would have
+        // created indices that nothing could resolve, which is why the order matters rather than being
+        // incidental.
+        //
+        // An index is gated exactly when its placement is computed. That agreement is not a convenience:
+        // a gated index has no cluster state entry, so it can have no published routing table, so its
+        // placement must be derived. Deciding the two independently would allow an index with a published
+        // routing entry and no metadata, or the reverse, and neither is serviceable.
+        DescriptorOnlyCreation.register(ComputedPlacementGate::ownsIndex);
         logger.info("descriptor resolution installed against [{}]", DescriptorStore.DESCRIPTOR_INDEX);
     }
 
@@ -129,6 +152,7 @@ public final class DescriptorGate {
         IndexDescriptorPublisher.register(null);
         MappingGenerationStore.register(null);
         GatedMappingStatsAggregator.register(null);
+        DescriptorOnlyCreation.register(null);
         STORE.set(null);
     }
 
