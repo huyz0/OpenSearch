@@ -1664,6 +1664,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         org.opensearch.serverless.storage.descriptor.DescriptorGate.install(
             descriptorStore,
             new org.opensearch.serverless.storage.descriptor.IndexBackedMappingStore(client),
+            new org.opensearch.serverless.storage.descriptor.IndexBackedMappingStatsAggregator(client),
             SERVERLESS_STORAGE_ENABLED_SETTING.get(environment.settings())
         );
 

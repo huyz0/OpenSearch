@@ -50,7 +50,7 @@ public class DescriptorGateIT extends OpenSearchIntegTestCase {
     public void testAGatedNameResolvesOnceTheGateIsInstalled() {
         DescriptorStore store = new DescriptorStore(client(), 1);
         store.create(descriptor("gated-logs"));
-        DescriptorGate.install(store, new IndexBackedMappingStore(client()), true);
+        DescriptorGate.install(store, new IndexBackedMappingStore(client()), new IndexBackedMappingStatsAggregator(client()), true);
 
         ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
         var resolved = resolver().concreteIndices(empty, IndicesOptions.strictExpandOpen(), "gated-logs");
@@ -79,7 +79,12 @@ public class DescriptorGateIT extends OpenSearchIntegTestCase {
 
     /** A genuinely missing name must still raise, or the gate turns every typo into a silent success. */
     public void testAMissingNameStillRaises() {
-        DescriptorGate.install(new DescriptorStore(client(), 1), new IndexBackedMappingStore(client()), true);
+        DescriptorGate.install(
+            new DescriptorStore(client(), 1),
+            new IndexBackedMappingStore(client()),
+            new IndexBackedMappingStatsAggregator(client()),
+            true
+        );
 
         ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
         expectThrows(
@@ -90,7 +95,12 @@ public class DescriptorGateIT extends OpenSearchIntegTestCase {
 
     /** Disabled means untouched, so an ordinary cluster carries none of this. */
     public void testInstallingWhileDisabledRegistersNothing() {
-        DescriptorGate.install(new DescriptorStore(client(), 1), new IndexBackedMappingStore(client()), false);
+        DescriptorGate.install(
+            new DescriptorStore(client(), 1),
+            new IndexBackedMappingStore(client()),
+            new IndexBackedMappingStatsAggregator(client()),
+            false
+        );
 
         assertFalse("a disabled gate must register no supplier", AbsentIndexDescriptorSuppliers.isRegistered());
         assertFalse("and no pager", AbsentIndexDescriptorSuppliers.isPagerRegistered());
@@ -98,7 +108,12 @@ public class DescriptorGateIT extends OpenSearchIntegTestCase {
 
     /** Uninstalling clears both, which node close depends on to avoid outliving itself. */
     public void testUninstallClearsBothRegistrations() {
-        DescriptorGate.install(new DescriptorStore(client(), 1), new IndexBackedMappingStore(client()), true);
+        DescriptorGate.install(
+            new DescriptorStore(client(), 1),
+            new IndexBackedMappingStore(client()),
+            new IndexBackedMappingStatsAggregator(client()),
+            true
+        );
         assertTrue(AbsentIndexDescriptorSuppliers.isRegistered());
         assertTrue(AbsentIndexDescriptorSuppliers.isPagerRegistered());
 
@@ -117,7 +132,7 @@ public class DescriptorGateIT extends OpenSearchIntegTestCase {
      */
     public void testCreatingAnIndexRecordsADescriptor() throws Exception {
         DescriptorStore store = new DescriptorStore(client(), 1);
-        DescriptorGate.install(store, new IndexBackedMappingStore(client()), true);
+        DescriptorGate.install(store, new IndexBackedMappingStore(client()), new IndexBackedMappingStatsAggregator(client()), true);
 
         createIndex("recorded-index");
 
@@ -142,7 +157,7 @@ public class DescriptorGateIT extends OpenSearchIntegTestCase {
      */
     public void testDeletingAnIndexLeavesATombstoneRatherThanAnAbsence() throws Exception {
         DescriptorStore store = new DescriptorStore(client(), 1);
-        DescriptorGate.install(store, new IndexBackedMappingStore(client()), true);
+        DescriptorGate.install(store, new IndexBackedMappingStore(client()), new IndexBackedMappingStatsAggregator(client()), true);
         createIndex("doomed-index");
         // assertBusy on the premise too. The write is asynchronous, so a bare read here races it, and this
         // test passed once by timing before failing on a later run.

@@ -10,6 +10,7 @@ package org.opensearch.serverless.storage.descriptor;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.action.admin.cluster.stats.GatedMappingStatsAggregator;
 import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.IndexDescriptor;
 import org.opensearch.cluster.metadata.IndexDescriptorPublisher;
@@ -74,7 +75,12 @@ public final class DescriptorGate {
      *
      * @param enabled whether gated indices are in use at all, so an ordinary cluster is untouched
      */
-    public static void install(DescriptorStore store, MappingGenerationStore.Store mappingStore, boolean enabled) {
+    public static void install(
+        DescriptorStore store,
+        MappingGenerationStore.Store mappingStore,
+        GatedMappingStatsAggregator.Aggregator statsAggregator,
+        boolean enabled
+    ) {
         if (enabled == false) {
             return;
         }
@@ -99,6 +105,11 @@ public final class DescriptorGate {
         // update runs on a transport thread handling a put-mapping or a dynamic field inference, not on
         // the cluster state thread where W4 found that a blocking write deadlocks.
         MappingGenerationStore.register(mappingStore);
+        // Cluster stats. H19 measured that _cluster/stats reports a plausible wrong number for a gated
+        // population, and H20 built a seam through which per-index iteration cannot be expressed. This is
+        // the aggregate it was waiting for: one query whose cost is set by the number of field types
+        // rather than by the number of indices.
+        GatedMappingStatsAggregator.register(statsAggregator);
         logger.info("descriptor resolution installed against [{}]", DescriptorStore.DESCRIPTOR_INDEX);
     }
 
@@ -109,6 +120,7 @@ public final class DescriptorGate {
         AbsentIndexDescriptorSuppliers.registerPager(null);
         IndexDescriptorPublisher.register(null);
         MappingGenerationStore.register(null);
+        GatedMappingStatsAggregator.register(null);
         STORE.set(null);
     }
 
