@@ -50,18 +50,44 @@ public final class StoreBackedFieldRefresher implements UnknownFieldRefresh.Refr
      * evicted entry costs one extra read, never a wrong answer, because the store remains the source of
      * truth and a re-read simply re-merges what is already there.
      */
-    private final Map<String, Long> mergedGeneration;
+    /** What this node merged for an index, and when it last asked the store. */
+    private record Checked(long generation, long checkedAtNanos) {
+    }
+
+    private final Map<String, Checked> mergedGeneration;
     private final int capacity;
 
+    /**
+     * How long a shard trusts its last look at the store before asking again.
+     *
+     * <p>Without this the cache cannot do its job. Knowing whether the store has moved requires asking it,
+     * so a generation check alone cannot avoid the read it is meant to avoid, and every unknown field cost
+     * a get against the mapping index even when this shard was already current. A document with ten new
+     * fields cost ten reads, which is precisely the cost H6c argued pulling avoids.
+     *
+     * <p>The window bounds reads to one per index per interval and bounds staleness by the same interval:
+     * a field another shard inferred becomes visible here within it. One second is short against how long
+     * a mapping change takes to matter and long against how fast documents arrive.
+     */
+    static final long RECHECK_WINDOW_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(1);
+
+    private final java.util.function.LongSupplier clock;
+
     public StoreBackedFieldRefresher() {
-        this(10_000);
+        this(10_000, System::nanoTime);
     }
 
     public StoreBackedFieldRefresher(int capacity) {
+        this(capacity, System::nanoTime);
+    }
+
+    /** Test seam for the clock, so the recheck window can be exercised without sleeping. */
+    StoreBackedFieldRefresher(int capacity, java.util.function.LongSupplier clock) {
+        this.clock = clock;
         this.capacity = capacity;
         this.mergedGeneration = java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<>(16, 0.75f, true) {
             @Override
-            protected boolean removeEldestEntry(Map.Entry<String, Long> eldest) {
+            protected boolean removeEldestEntry(Map.Entry<String, Checked> eldest) {
                 return size() > StoreBackedFieldRefresher.this.capacity;
             }
         });
@@ -72,24 +98,29 @@ public final class StoreBackedFieldRefresher implements UnknownFieldRefresh.Refr
         if (mapperService == null || indexUuid == null) {
             return false;
         }
+        // The guard comes before the read, which is the whole point of having it. Asking the store whether
+        // it has moved is itself the expensive operation, so a check performed afterwards prevents nothing:
+        // the first version of this method read the mapping index on every unknown field, and a document
+        // with ten new fields cost ten reads.
+        Checked checked = mergedGeneration.get(indexUuid);
+        long now = clock.getAsLong();
+        if (checked != null && now - checked.checkedAtNanos() < RECHECK_WINDOW_NANOS) {
+            // Looked recently. The field is treated as genuinely new, and the caller infers or rejects it
+            // exactly as it would have. A field another shard inferred becomes visible here once the window
+            // passes, which bounds staleness by the window rather than leaving it unbounded.
+            return false;
+        }
+
         MappingGenerationStore.MappingGeneration stored = MappingGenerationStore.currentMapping(indexUuid);
         if (stored == null) {
             return false;
         }
 
-        Long alreadyMerged = mergedGeneration.get(indexUuid);
-        if (alreadyMerged != null && alreadyMerged >= stored.generation()) {
-            // This shard is already at or ahead of the store, so the field is genuinely new rather than one
-            // it is behind on. Skipping the merge here is what keeps a document with many new fields from
-            // costing a merge each.
-            return false;
-        }
-
         String type = stored.fields().get(fieldName);
         if (type == null) {
-            // The store does not have it either. Record the generation anyway, so the next unknown field on
-            // this shard does not re-read a mapping that has not moved.
-            mergedGeneration.put(indexUuid, stored.generation());
+            // The store does not have it either. Recording the check is what stops the next unknown field
+            // on this shard re-reading a mapping that has not moved.
+            mergedGeneration.put(indexUuid, new Checked(stored.generation(), now));
             return false;
         }
 
@@ -97,7 +128,7 @@ public final class StoreBackedFieldRefresher implements UnknownFieldRefresh.Refr
             Map<String, Object> fragment = new HashMap<>();
             fragment.put("properties", Map.of(fieldName, Map.of("type", type)));
             mapperService.merge(MapperService.SINGLE_MAPPING_NAME, fragment, MapperService.MergeReason.MAPPING_UPDATE);
-            mergedGeneration.put(indexUuid, stored.generation());
+            mergedGeneration.put(indexUuid, new Checked(stored.generation(), now));
             return mapperService.documentMapper() != null && mapperService.documentMapper().mappers().getMapper(fieldName) != null;
         } catch (Exception e) {
             // A merge that fails leaves the caller to reject or infer, which is a correct outcome. Failing

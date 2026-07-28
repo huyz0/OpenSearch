@@ -90,10 +90,12 @@ public class StoreBackedFieldRefresherIT extends OpenSearchIntegTestCase {
     }
 
     /**
-     * The cost property. Once this shard is at the store's generation, further unknown fields must not each
-     * cost a store read and a merge, or pulling would be worse than broadcasting and H6c's argument fails.
+     * The cost property, at integration level. The read count itself is asserted by
+     * {@code FieldRefresherReadCountTests}, which counts store reads directly; P3 found that this test's
+     * earlier name claimed a no-refetch property it never observed, because it checked a boolean and a map
+     * size rather than counting anything.
      */
-    public void testASecondUnknownFieldAtTheSameGenerationDoesNotRefetch() {
+    public void testFurtherUnknownFieldsAreReportedAbsentWithoutRemerging() {
         createIndex(INDEX);
         ensureGreen(INDEX);
         String uuid = resolveIndex(INDEX).getUUID();
