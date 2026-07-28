@@ -107,12 +107,64 @@ index rather than removing the document. A node adopting local shard data must r
 first and delete its data if the descriptor is missing or tombstoned. This is strictly stronger than the
 graveyard, which keeps a bounded list (500 by default) and forgets older deletions.
 
-## H.7 Dynamic mappings
+## H.7 Dynamic mappings, and why no shard has to be informed
 
-Today a document with a new field triggers a cluster state update through the elected manager, which is a
-global serialisation point on the write path. Moving mappings to the store replaces it with a
-compare-and-swap on the mapping object's generation, scoped to one index. This removes a global bottleneck
-rather than adding one, and the plugin's `ShardHead` already establishes CAS as the write authority.
+Today a document with a new field triggers a cluster state update through the elected manager: a global
+serialisation point on the write path, plus the O(total indices) rebuild S20 measured. The same path
+serves the explicit `PUT _mapping` API, so for a gated index **both** fail identically at
+`Metadata#getIndexSafe`. The constraint is therefore not "no dynamic fields", it is "the mapping is
+immutable after creation", which is a far larger commitment and not one worth accepting.
+
+**The key realisation is that a broadcast is not required.** It exists because cluster state was the only
+distribution mechanism available, not because every shard must be told. Look at who needs the mapping and
+when.
+
+**Writers converge without being told.** A shard receiving `age: 30` infers `long`, which is what every
+other shard would infer from the same data. It does not need the answer pushed to it; it needs its
+inference not to conflict. An optimistic loop on a generation counter gives exactly that:
+
+```
+shard A: read gen 5, add age:long,     CAS 5 -> 6  ok
+shard B: read gen 5, add city:keyword, CAS 5 -> 6  conflict
+         re-read 6, merge city onto it, CAS 6 -> 7  ok
+```
+
+One CAS per **new field**, not per document. Mappings stabilise, so this is rare traffic rather than
+per-write traffic.
+
+**Readers get the version for free.** The mapping generation goes in the descriptor. A coordinator already
+fetches the descriptor to route, so that same fetch says whether its cached mapping is stale. No extra
+round trip, and no invalidation protocol.
+
+**Shards refresh lazily.** The coordinator stamps the request with the generation it planned against, and
+a shard behind that generation reads the mapping object before executing. Pull on demand rather than push
+on change.
+
+### What it costs at 100M indices and 100 shards each
+
+| | today | this design |
+|---|---|---|
+| a mapping change | publication to every node, plus the O(total indices) rebuild | one CAS, one descriptor write |
+| informing 100 shards | broadcast | nothing, because nobody is informed |
+| scaling in index count | O(N) | O(1) |
+| scaling in shard count | O(shards) | O(1) |
+
+Independent of both counts, because nothing fans out.
+
+### Three honest consequences
+
+**Type conflicts move rather than disappear.** `age:long` against `age:float` fails today at the manager
+and here at the second shard's merge. Same error, different location, and the retry loop must merge rather
+than last-writer-win or a field mapping is lost silently, which is the failure shape this project has hit
+eight times.
+
+**Cross-shard read-your-write is weakened slightly.** Writing a new field to shard A and immediately
+querying it on shard B before B refreshes will miss it. Publication is asynchronous today so this is
+comparable rather than worse, but it belongs in the API contract next to the wildcard freshness decision
+rather than being discovered.
+
+**The field limit needs a new home.** Nothing counts fields centrally any more, so `index.mapping.total_fields.limit`
+has to be enforced inside the mapping object at CAS time.
 
 ## H.8 The enumeration surface, audited
 
