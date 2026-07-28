@@ -27,7 +27,7 @@ Evidence for every number claimed: `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.m
 | **C. Computed placement** | **not blocked**, `plan-area-c-computed-placement.md`. C0 to C29 done. A computed index is creatable, writable, searchable, visible to cat and stats, and survives a full restart. What remains is reach rather than function: see the gaps below. |
 | **G. Validation** | **G1 done**, S15. Publication latency measured, batching decided. G2 to G5 not started. |
 | **F. Cluster state diet** | **F1 done**, S16. Audit says `inSyncAllocationIds` is emptiable and `primaryTerms` is not. F2 to F4 not started. |
-| **H. Metadata off cluster state** | **in progress**, `plan-area-h-metadata-off-cluster-state.md`. Ceilings 2 and 3 measured as cleared on the gated path: creation flat at 0.0005 ms against 57.777 ms at 50k indices, and a thousand gated creations leave zero cluster state entries. **Not general yet**: a gated index cannot take a dynamic mapping update until H4c. |
+| **H. Metadata off cluster state** | **in progress**, `plan-area-h-metadata-off-cluster-state.md`. Ceilings 2 and 3 measured as cleared on the gated path: creation flat at 0.0005 ms against 57.777 ms at 50k indices, and a thousand gated creations leave zero cluster state entries. Dynamic mappings are designed and proven in isolation (H6a to H6c) but **have no production caller yet**, which is the same shape as the two mechanisms C18 shipped correct and unreachable. |
 | B, D, E | not started |
 
 ## The one finding that matters most: this seam fails by succeeding
@@ -145,6 +145,29 @@ Two readers needed probing rather than assuming, and both are safe:
 count, which is the property the architecture rests on and which had never been checked. Note the
 consequence for F: the deferred path never materializes in-sync ids anyway, so F's saving applies to the
 working set rather than to the 100M at rest.
+
+## Area H, what is proven and what is only designed
+
+Proven by measurement, both arms in the same run:
+
+| claim | measured |
+|---|---|
+| creation independent of population | 0.0005 ms flat against 57.777 ms at 50k, 101,542x |
+| gated indices leave nothing resident | a thousand creations, zero cluster state entries |
+| descriptor point lookup flat | 0.78 ms at fifty thousand descriptors |
+| wildcards viable | about 22 ms, population-independent |
+| mapping CAS converges | eight concurrent inferences, eight fields survive |
+| lazy refresh cheaper than broadcast | one read per hundred requests at the same generation |
+
+**Distrust these three**, which carry more weight than their evidence:
+
+1. `MappingGenerationStore` and `MappingRefreshOnDemand` have **no production caller**. They are correct
+   units and nothing routes a real mapping update through them yet. C18 shipped two mechanisms in exactly
+   that state and both were dead.
+2. Descriptor reads were measured on **five shards**, not the hundred a hundred million descriptors would
+   need. Per-shard work is a term dictionary seek and does not grow; fan-out coordination does, untested.
+3. The wildcard measurement used `size=0`, so it **counted matches rather than returning names**. Real
+   resolution needs the names.
 
 ## What is left
 
