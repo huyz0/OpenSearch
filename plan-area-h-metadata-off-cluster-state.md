@@ -519,6 +519,32 @@ routing that through the refresher first. That is W14, and it is deliberately no
 is that the design changed, and building the wrong version quickly would have been worse than recording
 why.
 
+## H.10j W11: the reconciliation W10 proposed is unsafe, and H4b already rejected it
+
+W10 made tombstone writes asynchronous out of necessity and named the residue: a crash between the cluster
+state commit and the last retry landing loses the tombstone. It proposed closing that by reconciling on
+node join, treating an index whose data is on disk but which appears in neither cluster state nor the
+descriptor index as deleted.
+
+**That proposal was already considered and deliberately rejected, in the code W10 was reasoning about.**
+`DanglingIndicesState.isDeleted` consults the descriptor and its comment says why absence does not count:
+a supplier that is not installed, or one that declines, answers null, and importing nothing on that basis
+would discard live data on any cluster where the mechanism is off. Only an explicit tombstone counts.
+
+**W3 does not weaken that argument, it strengthens it.** The supplier is now installed, but
+`DescriptorStore.get` swallows failures and returns null, deliberately, so that a missing descriptor index
+is a missing descriptor rather than a failed request. That makes "no descriptor" and "the descriptor index
+is briefly unavailable" the same answer. Treating either as deletion would discard live shard data during a
+transient outage, which is a far worse failure than the one it would fix.
+
+So the reconciliation route is closed on its merits rather than deferred. The remaining viable approach is
+to make the tombstone durable rather than to infer it: write it off the cluster state thread in the delete
+action's completion path, before the delete is acknowledged, so a crash cannot fall between them. That is
+an ordering change in the delete path rather than a new inference rule, and it is the only option that does
+not require distinguishing absence from unavailability.
+
+Recorded as a closed question rather than an open task. What replaces it is W16.
+
 ## H.11 Phasing, each phase falsifiable
 
 **H1. Audit.** Classify all 41 direct enumerations as convertible, refusable, or blocking. F1's precedent:
