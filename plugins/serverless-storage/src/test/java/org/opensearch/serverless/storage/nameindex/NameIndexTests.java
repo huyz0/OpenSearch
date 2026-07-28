@@ -304,7 +304,7 @@ public class NameIndexTests extends OpenSearchTestCase {
     public void testReadsStayConsistentAcrossAConcurrentRebuild() throws Exception {
         NameIndex index = new NameIndex(base(namesArray("idx-", 2000)));
         for (int i = 0; i < 200; i++) {
-            index.create(entry("extra-" + String.format("%04d", i)));
+            index.create(entry("extra-" + String.format(java.util.Locale.ROOT, "%04d", i)));
         }
 
         int expected = 2200;
@@ -346,7 +346,10 @@ public class NameIndexTests extends OpenSearchTestCase {
     public void testOverlayPatternQueryScansARangeNotTheWholeOverlay() {
         NameIndexOverlay overlay = new NameIndexOverlay();
         for (int i = 0; i < 10_000; i++) {
-            String name = "prefix-" + String.format("%02d", i % 50) + "-" + String.format("%05d", i);
+            String name = "prefix-"
+                + String.format(java.util.Locale.ROOT, "%02d", i % 50)
+                + "-"
+                + String.format(java.util.Locale.ROOT, "%05d", i);
             overlay.put(new IndexNameEntry(name, uuid(i), IndexNameEntry.STATUS_OPEN));
         }
 
@@ -390,7 +393,7 @@ public class NameIndexTests extends OpenSearchTestCase {
     private static String[] namesArray(String prefix, int count) {
         List<String> names = new ArrayList<>(count);
         for (int i = 0; i < count; i++) {
-            names.add(prefix + String.format("%06d", i));
+            names.add(prefix + String.format(java.util.Locale.ROOT, "%06d", i));
         }
         return names.toArray(new String[0]);
     }
