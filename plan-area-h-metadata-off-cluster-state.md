@@ -476,8 +476,17 @@ by measurements already taken. A gated population's mapping stats have to come f
 `MappingGenerationStore`, because per-index enumeration is exactly what this area exists to remove and
 making the enumeration faster does not change that.
 
-Pinned by `GatedMappingStatsGapTests` rather than fixed. The aggregate is a larger piece of work than the
-pin, and shipping the pin first is what stops the gap being rediscovered as a production surprise.
+**Closed by H20.** `GatedMappingStatsAggregator` returns the whole gated population's field type counts in
+one call and deliberately offers no way to iterate indices. That last part is the design: handing back a
+per-index view would have fixed the correctness half while restoring the population-sized cost, and making
+that inexpressible in the interface is cheaper than catching it in review. Same reasoning as
+`MappingGenerationStore.updateMapping` taking fields to add rather than a replacement map.
+
+Backed in production by a terms aggregation over the descriptor index, which is one search regardless of
+how many indices it summarises. The counts are as fresh as the last refresh, per H18, and a statistic
+bounded by the refresh interval beats one bounded by nothing because it was too expensive to compute.
+
+Mutation tested: removing the fold kills the correctness test and the once-per-call test together.
 
 ## H.11 Phasing, each phase falsifiable
 

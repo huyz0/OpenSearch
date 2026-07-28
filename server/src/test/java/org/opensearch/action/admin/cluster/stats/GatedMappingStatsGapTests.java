@@ -37,16 +37,19 @@ import org.opensearch.test.OpenSearchTestCase;
  * have to come from an aggregate over {@code MappingGenerationStore}, since per-index enumeration is
  * precisely what Area H exists to remove and no amount of making the enumeration faster changes that.
  *
- * <p>Pinned rather than fixed. The aggregate is a larger piece of work than the pin, and shipping the pin
- * first is what stops the gap being rediscovered as a production surprise in the meantime.
+ * <p><b>Closed by H20.</b> {@code GatedMappingStatsAggregator} returns the whole gated population's counts
+ * in one call and offers no way to iterate indices, so the naive repair that would have fixed correctness
+ * while restoring the population-sized cost is not expressible through the interface.
  */
 public class GatedMappingStatsGapTests extends OpenSearchTestCase {
 
-    /**
-     * The gap. Fields belonging to a gated index are absent from the counts, and the response says nothing
-     * about it.
-     */
-    public void testGatedIndexFieldsAreMissingFromMappingStats() throws Exception {
+    @org.junit.After
+    public void clearAggregator() {
+        GatedMappingStatsAggregator.register(null);
+    }
+
+    /** With nothing registered, stats are unchanged, so an ungated cluster is untouched. */
+    public void testWithoutAnAggregatorOnlyClusterStateIndicesContribute() throws Exception {
         // One ordinary index with a mapping, standing in for a cluster whose gated indices contribute
         // nothing because they are not in metadata at all.
         ClusterState state = ClusterState.builder(ClusterName.DEFAULT)
@@ -61,15 +64,73 @@ public class GatedMappingStatsGapTests extends OpenSearchTestCase {
             .mapToLong(each -> each.getCount())
             .sum();
 
-        assertEquals(
-            "only the ordinary index contributes. A gated index's fields are absent from mapping stats "
-                + "with nothing in the response to say so, which for a statistic means a plausible wrong "
-                + "number rather than a visible gap. Closing this means aggregating over "
-                + "MappingGenerationStore rather than enumerating indices, since the enumeration is what "
-                + "Area H exists to remove",
-            1L,
-            keywordCount
+        assertEquals("only the ordinary index contributes", 1L, keywordCount);
+    }
+
+    /** The gap H19 pinned, now closed. Gated field types appear in the counts. */
+    public void testGatedFieldTypesAppearInMappingStats() throws Exception {
+        GatedMappingStatsAggregator.register(
+            () -> new GatedMappingStatsAggregator.GatedFieldTypeCounts(
+                java.util.Map.of("keyword", 40, "long", 7),
+                java.util.Map.of("keyword", 30, "long", 5)
+            )
         );
+        ClusterState state = ClusterState.builder(ClusterName.DEFAULT)
+            .metadata(Metadata.builder().put(ordinaryIndexWithKeywordField("ordinary"), false).build())
+            .build();
+
+        MappingStats stats = MappingStats.of(state);
+
+        assertEquals("the ordinary keyword field plus forty gated ones", 41L, countOf(stats, "keyword"));
+        assertEquals("and a type only gated indices use must appear at all", 7L, countOf(stats, "long"));
+        assertEquals(
+            "index counts must fold in too, or the per-type index count silently excludes the gated population",
+            31,
+            stats.getFieldTypeStats().stream().filter(each -> "keyword".equals(each.getName())).findFirst().orElseThrow().getIndexCount()
+        );
+    }
+
+    /**
+     * The property that rules out the repair H19 warned against. The aggregate is consulted once, and the
+     * count does not change with the size of the population being summarised, because the interface has no
+     * way to express per-index iteration.
+     */
+    public void testTheAggregateIsConsultedOnceRegardlessOfPopulation() throws Exception {
+        java.util.concurrent.atomic.AtomicInteger calls = new java.util.concurrent.atomic.AtomicInteger();
+        GatedMappingStatsAggregator.register(() -> {
+            calls.incrementAndGet();
+            return new GatedMappingStatsAggregator.GatedFieldTypeCounts(
+                java.util.Map.of("keyword", 1_000_000),
+                java.util.Map.of("keyword", 1_000_000)
+            );
+        });
+
+        Metadata.Builder metadata = Metadata.builder();
+        for (int i = 0; i < 200; i++) {
+            metadata.put(ordinaryIndexWithKeywordField("idx-" + i), false);
+        }
+        MappingStats.of(ClusterState.builder(ClusterName.DEFAULT).metadata(metadata.build()).build());
+
+        assertEquals(
+            "the gated population must cost one aggregate call, not one per index. A per-index view would "
+                + "fix the correctness half of H19 while restoring the cost half",
+            1,
+            calls.get()
+        );
+    }
+
+    /** A failing aggregate leaves ordinary stats intact rather than failing the whole stats call. */
+    public void testAFailingAggregateLeavesOrdinaryStatsIntact() throws Exception {
+        GatedMappingStatsAggregator.register(() -> { throw new IllegalStateException("descriptor index down"); });
+        ClusterState state = ClusterState.builder(ClusterName.DEFAULT)
+            .metadata(Metadata.builder().put(ordinaryIndexWithKeywordField("ordinary"), false).build())
+            .build();
+
+        assertEquals("the ordinary index must still be counted", 1L, countOf(MappingStats.of(state), "keyword"));
+    }
+
+    private static long countOf(MappingStats stats, String type) {
+        return stats.getFieldTypeStats().stream().filter(each -> type.equals(each.getName())).mapToLong(each -> each.getCount()).sum();
     }
 
     /**

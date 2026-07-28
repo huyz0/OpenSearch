@@ -92,7 +92,31 @@ public final class MappingStats implements ToXContentFragment, Writeable {
                 });
             }
         }
+        foldInGatedIndices(fieldTypes);
         return new MappingStats(fieldTypes.values());
+    }
+
+    /**
+     * Adds the gated population's field types, which the walk above cannot see.
+     *
+     * <p>H19 pinned the gap: a gated index is not in {@code state.metadata()}, so its fields were simply
+     * missing from the counts and nothing in the response said so. For a statistic that is worse than a
+     * missing entry in a listing, because a plausible wrong number is indistinguishable from a right one.
+     *
+     * <p>One aggregate rather than a walk, and the interface offers no way to walk. Folding gated indices
+     * in by iterating them would fix the correctness half while restoring the population-sized cost that
+     * is the other half of the same finding.
+     */
+    private static void foldInGatedIndices(Map<String, IndexFeatureStats> fieldTypes) {
+        GatedMappingStatsAggregator.GatedFieldTypeCounts gated = GatedMappingStatsAggregator.aggregate();
+        if (gated == null) {
+            return;
+        }
+        for (Map.Entry<String, Integer> each : gated.fieldCounts().entrySet()) {
+            IndexFeatureStats stats = fieldTypes.computeIfAbsent(each.getKey(), IndexFeatureStats::new);
+            stats.count += each.getValue();
+            stats.indexCount += gated.indexCounts().getOrDefault(each.getKey(), 0);
+        }
     }
 
     private final Set<IndexFeatureStats> fieldTypeStats;
