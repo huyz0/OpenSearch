@@ -1,6 +1,6 @@
 # Session handoff
 
-Branch `feature/pluggable-engine-per-shard-role`, 185 commits ahead of its own remote and 894 ahead of
+Branch `feature/pluggable-engine-per-shard-role`, 237 commits ahead of its own remote and 946 ahead of
 `origin/main`. **Nothing from this work is pushed.**
 
 Measure it rather than incrementing it: `git rev-list --count origin/feature/pluggable-engine-per-shard-role..HEAD`.
@@ -173,6 +173,17 @@ All three caveats from the previous review have been closed, and one of them cha
    Wildcard resolution needs pagination in its contract or a bounded match set, at about 33 ms per
    thousand names.
 
+**What is built but has no production caller.** Three mechanisms are proven and not yet load-bearing, and
+the distinction matters because a test that exercises them directly passes whether or not they are wired.
+That failure has shipped twice here (H7a, H8a).
+
+- `MappingRefreshOnDemand` has no construction site outside tests. Lazy refresh is proven, not in use.
+- `IndexDescriptor.suspendedShards` is written by no production path (H13), so suspension is node-local and
+  volatile today: a full-cluster restart wakes every sleeping shard, which then sleep again on the next
+  idle tick.
+- The gated suspension registry has to be constructed and installed by the plugin's node setup, which is
+  the last hop between H9d being correct and H9d being on.
+
 ## What is left
 
 Nothing in Area C is known broken. What remains is unclaimed rather than pending:
@@ -190,6 +201,34 @@ Nothing in Area C is known broken. What remains is unclaimed rather than pending
 family that analyze and get field mappings use, the cat callers, and `RestoreService` have no equivalent,
 so an unconverted caller in any of those is still silent. Extending the check to them is unclaimed work
 rather than a decision against it.
+
+## The defect class this pass kept finding: per-index state that moved rather than left
+
+Two instances in one review sweep, neither found by a failing test, both the same shape. Area H removes
+per-index state from cluster state, which creates pressure to cache it somewhere else, and the replacement
+does not get audited the way the original did.
+
+- **H11**, the mapping cache. `MappingRefreshOnDemand` held an entry with a full field map for every index
+  a node had ever served, and never evicted. Per-node memory grew with indices *touched*, not indices
+  active, and each entry is larger than the 698 B of deferred `IndexMetadata` it replaced.
+- **H12**, the suspension registry. H9d argued it was bounded because it held only sleeping shards. That is
+  true and the conclusion is backwards: under scale-to-zero most indices are asleep, so the map approaches
+  one entry per index. The feature's defining property is what invalidated the bound, which is why the
+  argument read as convincing when it was written.
+
+Both are now fixed-capacity access-ordered caches. Access order is load-bearing rather than a detail:
+scale-to-zero means most indices are cold, so an insertion-ordered cache lets any sweep over them flush the
+working set on every pass. Mutation testing confirms it, since switching to insertion order kills exactly
+the hot-versus-cold test in each suite and nothing else.
+
+**Their eviction arguments are not the same, and conflating them would be a mistake.** Evicting a mapping
+costs a refetch and cannot be wrong. Evicting a suspension wakes a shard, which is a real behaviour change,
+acceptable only because of its direction: a shard wrongly awake serves requests, a shard wrongly asleep is
+an outage, and the next tick re-suspends it.
+
+**What to check next in this class**: any cache added when per-index state is removed from somewhere. The
+sweep across Area H's own classes found no third instance, but the pattern is structural rather than
+accidental.
 
 ## Three times a green suite measured nothing, and what stops the fourth
 
