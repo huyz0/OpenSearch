@@ -362,7 +362,17 @@ public final class DescriptorStore {
      */
     private IndexDescriptor awaitOrReadDirectly(java.util.concurrent.CompletableFuture<IndexDescriptor> reader, String name) {
         try {
-            return reader.get(collapseWaitMillis, java.util.concurrent.TimeUnit.MILLISECONDS);
+            IndexDescriptor shared = reader.get(collapseWaitMillis, java.util.concurrent.TimeUnit.MILLISECONDS);
+            if (shared != null) {
+                return shared;
+            }
+            // A miss is never shared, for the same reason P8 never caches one. H18 makes an exact-name get
+            // realtime, so an index is nameable the instant its creation is acknowledged, and the read we
+            // waited on may have started before that creation landed. Handing its null to a caller that
+            // arrived afterwards makes a freshly created index unnameable for the length of one read.
+            // Collapsing hits is where the load saving is anyway: T1's fan-out is many callers resolving an
+            // index that exists.
+            return readFromIndex(name, clock.getAsLong());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return null;

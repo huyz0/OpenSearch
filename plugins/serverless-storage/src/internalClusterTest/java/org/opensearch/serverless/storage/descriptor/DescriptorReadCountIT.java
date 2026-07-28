@@ -120,6 +120,34 @@ public class DescriptorReadCountIT extends OpenSearchIntegTestCase {
         assertFalse("the test's stand-in reader is still stuck, which is the point", neverCompletes.isDone());
     }
 
+    /**
+     * T8. Collapsing must not let one caller's miss answer for a name that exists by the time we are asked.
+     *
+     * <p>H18 pinned the contract that an exact-name get is realtime, so an index is nameable the instant its
+     * creation is acknowledged, and P8 preserved it by never caching a miss. T2 then made concurrent callers
+     * wait on one in-flight read, and a read that started before the creation landed answers null. Sharing
+     * that null hands it to callers who arrived afterwards, which the contract says must see the index.
+     *
+     * <p>So the window is small, one read, and inside it a freshly created index becomes unnameable. That is
+     * the same class of bug this area keeps producing, introduced by the fix for a different one, which is
+     * why the review after T4b went looking for it rather than assuming collapsing was free.
+     */
+    public void testAWaiterDoesNotInheritAMissForAnIndexThatNowExists() {
+        DescriptorStore store = new DescriptorStore(client(), 1, now::get);
+
+        // A read for this name is already in flight and is about to come back empty, because it started
+        // before the creation below.
+        var staleRead = store.pretendReadIsInFlight("late-idx");
+        store.create(descriptor("late-idx"));
+        staleRead.complete(null);
+
+        assertNotNull(
+            "an index must be nameable the moment it is created (H18), so a caller arriving after the "
+                + "creation must not be handed the null from a read that predates it",
+            store.get("late-idx")
+        );
+    }
+
     private static IndexDescriptor descriptor(String name) {
         return new IndexDescriptor(
             name,

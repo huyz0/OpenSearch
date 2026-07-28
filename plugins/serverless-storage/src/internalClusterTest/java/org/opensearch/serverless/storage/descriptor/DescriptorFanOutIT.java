@@ -50,6 +50,11 @@ import java.util.concurrent.TimeUnit;
  *
  * <p>This counts reads rather than asserting a collapser exists, following the P8 lesson that the failure
  * shape in this area is a mechanism that is present and useless.
+ *
+ * <p><b>Only hits collapse.</b> This test resolves a name that exists, which is the fan-out case: many
+ * callers resolving one gated index. A read that comes back empty is never shared, because T8 found that
+ * sharing it makes a freshly created index unnameable for the length of one read and so breaks the realtime
+ * contract H18 pinned. {@code DescriptorReadCountIT} holds that boundary.
  */
 public class DescriptorFanOutIT extends OpenSearchIntegTestCase {
 
