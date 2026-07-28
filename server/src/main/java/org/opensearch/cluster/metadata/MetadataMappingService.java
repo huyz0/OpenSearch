@@ -50,9 +50,11 @@ import org.opensearch.common.compress.CompressedXContent;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.io.IOUtils;
+import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.Strings;
 import org.opensearch.core.index.Index;
+import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.index.IndexService;
 import org.opensearch.index.compositeindex.CompositeIndexValidator;
 import org.opensearch.index.mapper.DocumentMapper;
@@ -233,6 +235,16 @@ public class MetadataMappingService {
             try {
                 for (PutMappingClusterStateUpdateRequest request : tasks) {
                     try {
+                        // A gated index has no metadata entry by design (H3, H5), so getIndexSafe below
+                        // would throw and a document carrying a new field would fail. Its mapping lives in
+                        // the store instead, updated by compare-and-swap scoped to that index, and no
+                        // cluster state change happens at all. Handled before the loop rather than inside
+                        // it so the request never reaches a mapper service that has nothing to merge into.
+                        if (MappingGenerationStore.isRegistered() && isGated(currentState, request)) {
+                            recordGatedMapping(request);
+                            builder.success(request);
+                            continue;
+                        }
                         for (Index index : request.indices()) {
                             final IndexMetadata indexMetadata = currentState.metadata().getIndexSafe(index);
                             if (indexMapperServices.containsKey(indexMetadata.getIndex()) == false) {
@@ -257,6 +269,45 @@ public class MetadataMappingService {
         @Override
         public ClusterManagerTaskThrottler.ThrottlingKey getClusterManagerThrottlingKey() {
             return putMappingTaskKey;
+        }
+
+        /** Whether every index in this request is absent from cluster state, which is what gated means. */
+        private boolean isGated(ClusterState currentState, PutMappingClusterStateUpdateRequest request) {
+            for (Index index : request.indices()) {
+                if (currentState.metadata().hasIndex(index.getName())) {
+                    return false;
+                }
+            }
+            return request.indices().length > 0;
+        }
+
+        /**
+         * Records the request's fields against the index's mapping generation.
+         *
+         * <p>Only top-level properties are extracted today, so a nested or object field is not yet
+         * carried. That is a limitation of this wiring rather than of the store, which holds whatever it
+         * is given, and it is stated here rather than discovered: an index using object fields must not
+         * be gated until this parses them.
+         */
+        private void recordGatedMapping(PutMappingClusterStateUpdateRequest request) throws IOException {
+            Map<String, Object> parsed = XContentHelper.convertToMap(MediaTypeRegistry.JSON.xContent(), request.source(), false);
+            Object properties = parsed.get("properties");
+            if (properties instanceof Map == false) {
+                return;
+            }
+            Map<String, String> fields = new HashMap<>();
+            for (Map.Entry<?, ?> property : ((Map<?, ?>) properties).entrySet()) {
+                Object definition = property.getValue();
+                if (definition instanceof Map && ((Map<?, ?>) definition).get("type") != null) {
+                    fields.put(String.valueOf(property.getKey()), String.valueOf(((Map<?, ?>) definition).get("type")));
+                }
+            }
+            if (fields.isEmpty()) {
+                return;
+            }
+            for (Index index : request.indices()) {
+                MappingGenerationStore.updateMapping(index.getUUID(), fields);
+            }
         }
 
         private ClusterState applyRequest(
