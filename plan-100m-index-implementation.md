@@ -705,3 +705,60 @@ having reached 100M. Every mechanism the plan calls for exists and is tested at 
 allows. What separates this from a demonstrated result is a run at a population two to three orders of
 magnitude larger than anything measured, and that is now the single most valuable thing to do next.
 
+## Second review: what changed, and the answer is still no
+
+The first review said the remaining work was breadth rather than architecture, and named two open product
+decisions. Both claims were wrong, and how they were wrong is the most useful thing this cycle produced.
+
+### Neither open item was a product decision
+
+**Pagination (H16, H17).** The choice looked like resolving pages through the descriptor index versus
+refusing gated clusters, pending an ordering the descriptor index could produce cheaply. S24 had already
+measured that ordering months of work earlier: paging by sorted name with `search_after`, about 33 ms per
+thousand. Nothing was waiting on anyone. Gated indices now appear in paginated listings, folded in as a
+merge of two sorted runs whose cost is ordinary-index-count plus page-size, with the hundred million in
+neither term.
+
+**Wildcard freshness (H18).** Deferred three times. It is not a decision at all: the two resolution paths
+read the same descriptors by different means, so the store decides. An exact name is fetched by id, which
+reads through the translog and is realtime. A wildcard is a search, which sees refreshed segments. Measured
+both arms with refresh disabled: nameable immediately, wildcard-visible only after a refresh. The
+asymmetry lands the right way round, since the client that must not be told an index is missing is the one
+that just created it.
+
+The lesson is not about these two items. It is that "product decision" was being used to describe
+questions whose evidence had already been gathered, and the cost of that mislabel is a cycle.
+
+### Breadth turned up architecture twice
+
+Sweeping request paths for enumerations found two, not the tidy residue the first review implied. H16 in
+pagination, closed. **H19 in cluster stats**, pinned: `MappingStats.of` walks every index, so at 100M the
+walk is the request, and gated indices contribute nothing to the counts. That one is the least visible
+instance of the area's signature failure yet, because a statistic that silently omits a population returns
+a plausible number rather than an obvious gap.
+
+### The ceilings, restated
+
+| ceiling | state |
+|---|---|
+| placement | cleared by Area C |
+| residency | cleared; H11 and H12 closed two leaks that had rebuilt it on the data nodes |
+| throughput | cleared; 20,577 creations/sec (S26), lookup flat 50k to 1M at ratio 0.96 (S27) |
+
+### What is genuinely left
+
+1. **The MappingStats aggregate** (H19). Pinned, not built. The only piece of implementation work
+   remaining that is known and specified.
+2. **A demonstration above one million.** S27 is twenty times more evidence than anything before it and it
+   is still two orders of magnitude short of the target. This needs a fleet, not a test cluster.
+3. **The serverless-only precondition.** Genuinely a product decision, unlike the two that were mislabelled
+   as such, because it is a question about what the product promises rather than about what the code can
+   do.
+
+### Answer
+
+Still no, on narrower grounds than last time. There is no known ceiling below 100M and one known
+unimplemented gap above it. The largest population ever exercised is one million. That gap between "no
+known ceiling" and "demonstrated" is not closable by more work of this kind, and saying otherwise would be
+the same error as calling a measured question a decision.
+
