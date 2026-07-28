@@ -138,17 +138,46 @@ public final class DescriptorGate {
         // created indices that nothing could resolve, which is why the order matters rather than being
         // incidental.
         //
-        // An index is gated exactly when its placement is computed. That agreement is not a convenience:
-        // a gated index has no cluster state entry, so it can have no published routing table, so its
-        // placement must be derived. Deciding the two independently would allow an index with a published
-        // routing entry and no metadata, or the reverse, and neither is serviceable.
+        // Gating is a strict subset of computed placement, and the direction matters. A gated index has no
+        // cluster state entry, so it can have no published routing table, so its placement must be derived:
+        // gating without computed placement would leave an index nothing can route to.
+        //
+        // The subset is narrower than ownsIndex because a descriptor cannot carry everything metadata can.
+        // T7 found that an alias filter, alias routing and the write index flag are all dropped in silence
+        // by IndexDescriptor.from, and an alias filter restricts which documents a query may see, so gating
+        // such an index widens a restricted view rather than breaking it. DescriptorRepresentable names
+        // every such reason in one place. An index it rejects keeps its cluster state entry and still gets
+        // computed placement, which is exactly the arrangement that existed before W12 turned gating on.
         // The refresher W14's trigger consults. Registered here rather than at the trigger so it shares
         // this gate's lifetime: an unregistered refresher makes the trigger a null check, which is the
         // pre-W15 behaviour and correct for a cluster with no gated indices.
         UnknownFieldRefresh.register(fieldRefresher);
 
-        DescriptorOnlyCreation.register(ComputedPlacementGate::ownsIndex);
+        DescriptorOnlyCreation.register(DescriptorGate::gatable);
         logger.info("descriptor resolution installed against [{}]", DescriptorStore.DESCRIPTOR_INDEX);
+    }
+
+    /**
+     * Whether this index may skip its cluster state entry.
+     *
+     * <p>Two conditions, and they are separate questions. The plugin has to own the index at all, and the
+     * descriptor has to be able to carry everything the index declares. Before T7 only the first was asked,
+     * so an index with a filtered alias was gated and its filter went nowhere.
+     *
+     * <p>Logged at info rather than silently declined, because an operator who asked for a gated index and
+     * got a cluster state entry needs to know which feature kept it there. A silent decline here would be
+     * the same failure this whole area is about, one layer up.
+     */
+    private static boolean gatable(org.opensearch.cluster.metadata.IndexMetadata indexMetadata) {
+        if (ComputedPlacementGate.ownsIndex(indexMetadata) == false) {
+            return false;
+        }
+        String reason = org.opensearch.cluster.metadata.DescriptorRepresentable.whyNotRepresentable(indexMetadata);
+        if (reason != null) {
+            logger.info("index [{}] keeps its cluster state entry: {}", indexMetadata.getIndex().getName(), reason);
+            return false;
+        }
+        return true;
     }
 
     /** Clears both registrations, which a node shutting down must do. */
