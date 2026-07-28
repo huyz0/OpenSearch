@@ -61,7 +61,8 @@ public class GatedIndexResolutionGapTests extends OpenSearchTestCase {
                 false,
                 false,
                 false,
-                0L
+                0L,
+                java.util.Set.of()
             )
         );
 

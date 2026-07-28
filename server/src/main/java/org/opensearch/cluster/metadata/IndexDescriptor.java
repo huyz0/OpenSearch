@@ -19,6 +19,7 @@ import java.io.IOException;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * The irreducible per-index facts, small enough to store outside cluster state.
@@ -85,6 +86,26 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
      */
     private final long mappingGeneration;
 
+    /**
+     * The shards of this index that are asleep, which is where scale-to-zero state lives for a gated
+     * index.
+     *
+     * <p>Suspension is recorded in {@code IndexMetadata} today, through {@code SuspendedShardsMetadata},
+     * and a gated index has no {@code IndexMetadata} to record it in. H9a measured the consequence: the
+     * suspend task runs, finds nothing, and returns the state unchanged, so a gated index can never sleep
+     * and scale-to-zero is what the serverless design exists for.
+     *
+     * <p><b>Why the descriptor rather than a decider.</b> {@code SuspendedShardAllocationDecider} works by
+     * telling the allocator to refuse a shard, and a computed index never reaches the allocator: Area C
+     * derives its placement instead. So for a gated index suspension has to be an input to the placement
+     * function rather than a verdict handed to an allocator that is not running. A placement that omits a
+     * suspended shard is a shard that is not assigned anywhere, which is what asleep means.
+     *
+     * <p>Bounded by shard count rather than index count, so it does not reintroduce the residency problem
+     * this area exists to remove.
+     */
+    private final Set<Integer> suspendedShards;
+
     public IndexDescriptor(
         String name,
         String uuid,
@@ -98,7 +119,8 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         boolean hidden,
         boolean remoteSnapshot,
         boolean warm,
-        long mappingGeneration
+        long mappingGeneration,
+        Set<Integer> suspendedShards
     ) {
         this.name = Objects.requireNonNull(name, "descriptor needs a name");
         this.uuid = Objects.requireNonNull(uuid, "descriptor needs a uuid, since placement hashes it");
@@ -113,6 +135,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         this.remoteSnapshot = remoteSnapshot;
         this.warm = warm;
         this.mappingGeneration = mappingGeneration;
+        this.suspendedShards = suspendedShards == null ? Set.of() : Set.copyOf(suspendedShards);
     }
 
     /**
@@ -136,7 +159,8 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
             indexMetadata.isHidden(),
             indexMetadata.isRemoteSnapshot(),
             indexMetadata.isWarmIndex(),
-            0L
+            0L,
+            Set.of()
         );
     }
 
@@ -154,6 +178,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         this.remoteSnapshot = in.readBoolean();
         this.warm = in.readBoolean();
         this.mappingGeneration = in.readVLong();
+        this.suspendedShards = Set.copyOf(in.readSet(StreamInput::readVInt));
     }
 
     @Override
@@ -171,6 +196,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         out.writeBoolean(remoteSnapshot);
         out.writeBoolean(warm);
         out.writeVLong(mappingGeneration);
+        out.writeCollection(suspendedShards, (o, shard) -> o.writeVInt(shard));
     }
 
     /** The index, which is what placement hashes and what every shard id is built from. */
@@ -250,8 +276,37 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         return mappingGeneration;
     }
 
-    /** The same descriptor at a new mapping generation, which is what a mapping update records. */
-    public IndexDescriptor withMappingGeneration(long generation) {
+    /** The shards that are asleep. Empty for an index that has never been suspended. */
+    public Set<Integer> suspendedShards() {
+        return suspendedShards;
+    }
+
+    /** Whether this shard is asleep, which placement reads to decide whether to place it at all. */
+    public boolean isShardSuspended(int shardId) {
+        return suspendedShards.contains(shardId);
+    }
+
+    /** The same descriptor with a shard marked asleep, or {@code this} when it already was. */
+    public IndexDescriptor withShardSuspended(int shardId) {
+        if (suspendedShards.contains(shardId)) {
+            return this;
+        }
+        Set<Integer> updated = new java.util.HashSet<>(suspendedShards);
+        updated.add(shardId);
+        return copyWith(mappingGeneration, updated);
+    }
+
+    /** The same descriptor with a shard woken, or {@code this} when it already was awake. */
+    public IndexDescriptor withShardReactivated(int shardId) {
+        if (suspendedShards.contains(shardId) == false) {
+            return this;
+        }
+        Set<Integer> updated = new java.util.HashSet<>(suspendedShards);
+        updated.remove(shardId);
+        return copyWith(mappingGeneration, updated);
+    }
+
+    private IndexDescriptor copyWith(long generation, Set<Integer> suspended) {
         return new IndexDescriptor(
             name,
             uuid,
@@ -265,8 +320,14 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
             hidden,
             remoteSnapshot,
             warm,
-            generation
+            generation,
+            suspended
         );
+    }
+
+    /** The same descriptor at a new mapping generation, which is what a mapping update records. */
+    public IndexDescriptor withMappingGeneration(long generation) {
+        return copyWith(generation, suspendedShards);
     }
 
     /** The same descriptor, tombstoned. Deletion records rather than removes, so absence stays meaningful. */
@@ -284,7 +345,8 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
             hidden,
             remoteSnapshot,
             warm,
-            mappingGeneration
+            mappingGeneration,
+            suspendedShards
         );
     }
 

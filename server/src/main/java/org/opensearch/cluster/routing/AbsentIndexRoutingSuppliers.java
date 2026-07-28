@@ -15,9 +15,11 @@ import org.opensearch.index.shard.ShardNotFoundException;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiFunction;
+import java.util.function.Function;
 import java.util.function.Predicate;
 
 /**
@@ -68,6 +70,28 @@ public final class AbsentIndexRoutingSuppliers {
      * read from whichever thread happens to register.
      */
     private static final List<Runnable> REGISTRATION_LISTENERS = new CopyOnWriteArrayList<>();
+
+    /**
+     * Which shards of an index are asleep, by index name. Registering null clears it, and with nothing
+     * registered no shard is suspended, so an unconfigured cluster behaves exactly as before.
+     *
+     * <p>Suspension has to be expressed here rather than by a decider. {@code
+     * SuspendedShardAllocationDecider} works by telling the allocator to refuse a shard, and a computed
+     * index never reaches the allocator: Area C derives its placement instead. So the only way a computed
+     * shard can be asleep is for placement not to place it, which means the filter belongs at the point
+     * where placement is read.
+     *
+     * <p>It is applied in {@link #supply} rather than left to each supplier because every routing read for
+     * a computed index funnels through there. A supplier that forgets the check would place a sleeping
+     * shard and wake it, and that is precisely the class of mistake this registry was built to make
+     * impossible: C3 hooked resolution, left the write path open-coded, and the two disagreed.
+     *
+     * <p>Keyed by name and holding only the shards that <em>are</em> asleep, so the hot-path read is a
+     * hash lookup against a small map rather than a descriptor fetch. The durable copy lives on {@link
+     * org.opensearch.cluster.metadata.IndexDescriptor}, which is what survives a restart; this is the
+     * cached view placement reads on every request.
+     */
+    private static final AtomicReference<Function<String, Set<Integer>>> SUSPENDED_SHARDS = new AtomicReference<>();
 
     private AbsentIndexRoutingSuppliers() {}
 
@@ -160,10 +184,64 @@ public final class AbsentIndexRoutingSuppliers {
             return null;
         }
         try {
-            return supplier.apply(state, indexMetadata);
+            return withoutSuspendedShards(supplier.apply(state, indexMetadata));
         } catch (Exception e) {
             return null;
         }
+    }
+
+    /**
+     * Installs the source of truth for which shards are asleep. Registering null clears it.
+     *
+     * <p>A function rather than a map so the caller keeps ownership of the lifetime: this registry is
+     * static and outlives any one node, and a map handed over here would be a leak across test suites in
+     * the same JVM.
+     */
+    public static void registerSuspendedShards(Function<String, Set<Integer>> suspendedShards) {
+        SUSPENDED_SHARDS.set(suspendedShards);
+    }
+
+    /** The shards of this index that are asleep, empty when nothing is registered or the source fails. */
+    public static Set<Integer> suspendedShards(String indexName) {
+        Function<String, Set<Integer>> source = SUSPENDED_SHARDS.get();
+        if (source == null) {
+            return Set.of();
+        }
+        try {
+            Set<Integer> suspended = source.apply(indexName);
+            return suspended == null ? Set.of() : suspended;
+        } catch (Exception e) {
+            // Treated as nothing suspended, matching how a throwing supplier is treated as no answer. A
+            // failing source must not take an index's routing away: a shard wrongly awake is a served
+            // request, a shard wrongly asleep is an outage.
+            return Set.of();
+        }
+    }
+
+    /**
+     * The same routing entry with sleeping shards removed, or the entry unchanged when none are.
+     *
+     * <p>Returns the original instance when nothing is suspended, which is the overwhelmingly common case,
+     * so a cluster that never scales to zero pays one hash lookup and no allocation.
+     */
+    private static IndexRoutingTable withoutSuspendedShards(IndexRoutingTable computed) {
+        if (computed == null) {
+            return null;
+        }
+        Set<Integer> suspended = suspendedShards(computed.getIndex().getName());
+        if (suspended.isEmpty()) {
+            return computed;
+        }
+        IndexRoutingTable.Builder awake = IndexRoutingTable.builder(computed.getIndex());
+        boolean removedAny = false;
+        for (IndexShardRoutingTable shard : computed) {
+            if (suspended.contains(shard.shardId().id())) {
+                removedAny = true;
+                continue;
+            }
+            awake.addIndexShard(shard);
+        }
+        return removedAny ? awake.build() : computed;
     }
 
     /**
