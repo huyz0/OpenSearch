@@ -488,6 +488,37 @@ bounded by the refresh interval beats one bounded by nothing because it was too 
 
 Mutation tested: removing the fold kills the correctness test and the once-per-call test together.
 
+## H.10i W13: the stamping point H6c assumed does not exist, and what replaces it
+
+H6c's design is pull-on-demand: a shard refreshes its mapping only when a request tells it the mapping has
+moved, by carrying the generation the request expects. `MappingRefreshOnDemand.ensureCurrent` takes that
+`requiredGeneration` and does no read when the shard is already at or ahead of it, which is the property
+that makes it cheaper than a broadcast.
+
+**Nothing carries that generation.** No request type in the write or search path has a mapping generation
+field, and none of the shard-level entry points accepts one. The assumption was never checked, and
+constructing the refresher without it would produce a component whose only argument no caller can supply,
+which is the correct-and-unreachable failure this area has now shipped four times.
+
+**The replacement is better than the original, which is why this is recorded as a design change rather than
+a gap.** A shard does not need to be told the mapping moved. It finds out when it meets a field it does not
+know: that is precisely and only when being behind matters. So the trigger is a mapping miss rather than a
+stamped generation.
+
+- **No stamping.** No request format changes, no coordinator-to-shard plumbing, nothing to keep in sync.
+- **Strictly fewer fetches.** A stamped design refreshes when the generation moved, whether or not this
+  shard ever sees the new field. A miss-triggered design refreshes only when this shard actually needs it.
+- **The cost is one fetch per unknown field per shard**, which is the case where a fetch is warranted, and
+  it is bounded by the mapping cache H11 added.
+
+The one thing it gives up is distinguishing "this field exists and I am behind" from "this field does not
+exist anywhere" without a fetch. That distinction costs one read and is only paid on a genuine miss.
+
+Implementing it means finding the point where a shard rejects or dynamically maps an unknown field and
+routing that through the refresher first. That is W14, and it is deliberately not started here: the finding
+is that the design changed, and building the wrong version quickly would have been worse than recording
+why.
+
 ## H.11 Phasing, each phase falsifiable
 
 **H1. Audit.** Classify all 41 direct enumerations as convertible, refusable, or blocking. F1's precedent:
