@@ -393,6 +393,30 @@ was unnecessary. Building it was not wasted, since it is what made the design co
 right question, but the honest summary is that the state was designed before the measurement that would
 have said whether to design it. The measurement was cheap and could have come first.
 
+## H.10f Pagination cannot see a gated index, found opening the next cycle
+
+The review that closed the last cycle said what remained was breadth rather than architecture. The first
+thing breadth turned up is not breadth.
+
+`PaginationStrategy.getSortedIndexMetadata` streams `metadata().indices()`, so a gated index is not
+missing from the page, it is missing from the input. `_list/indices` and paginated `_cat/shards` return a
+well-formed page with a next-page token and no gated index in it. Nothing throws, and the caller cannot
+tell an incomplete answer from a complete one. That is the ninth instance of this area's signature
+failure, alongside C21's refresh reaching zero shards and C22's field mappings returning nothing.
+
+**The second problem constrains the fix for the first.** The strategy sorts the entire population to
+produce one page, so at a hundred million indices the sort is the request rather than an overhead on it.
+That rules out the obvious repair: making gated indices visible by adding them to the same sort would make
+the cost problem dramatically worse while appearing to solve the correctness one.
+
+So the choice is between resolving the page through the descriptor index, which needs an ordering the
+descriptor index can produce cheaply and is the same question wildcard pagination raises, and refusing the
+request outright for a cluster containing gated indices. Both are product decisions rather than
+implementation ones, and they belong next to the wildcard freshness contract that is already open.
+
+Pinned by `GatedIndexPaginationGapTests`, which asserts the measured behaviour and says what to decide the
+day someone closes it.
+
 ## H.11 Phasing, each phase falsifiable
 
 **H1. Audit.** Classify all 41 direct enumerations as convertible, refusable, or blocking. F1's precedent:
