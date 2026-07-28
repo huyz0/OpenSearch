@@ -110,6 +110,14 @@ public class TenMillionDescriptorIT extends OpenSearchIntegTestCase {
     }
 
     public void testDescriptorPathAtAMillionIndices() throws Exception {
+        assumeTrue(
+            "Opt-in only. This populates a multi-million document index, needs a raised heap via both "
+                + "-Dtests.heap.size and -Poptions.forkOptions.memoryMaximumSize, and takes minutes. A "
+                + "default suite run would OOM at the 3 GB default rather than skip it, which reads as a "
+                + "product failure. Enable with -Dtests.scale.large=true.",
+            Boolean.parseBoolean(System.getProperty("tests.scale.large", "false"))
+        );
+
         assertAcked(
             client().admin()
                 .indices()

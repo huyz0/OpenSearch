@@ -79,6 +79,14 @@ public class LookupGrowthCauseAtTenMillionIT extends OpenSearchIntegTestCase {
     }
 
     public void testWhetherSegmentCountOrDictionarySizeDrivesTheGrowth() throws Exception {
+        assumeTrue(
+            "Opt-in only. This populates a multi-million document index, needs a raised heap via both "
+                + "-Dtests.heap.size and -Poptions.forkOptions.memoryMaximumSize, and takes minutes. A "
+                + "default suite run would OOM at the 3 GB default rather than skip it, which reads as a "
+                + "product failure. Enable with -Dtests.scale.large=true.",
+            Boolean.parseBoolean(System.getProperty("tests.scale.large", "false"))
+        );
+
         assertAcked(
             client().admin()
                 .indices()
@@ -125,7 +133,10 @@ public class LookupGrowthCauseAtTenMillionIT extends OpenSearchIntegTestCase {
         assertTrue("both lookup measurements must be non-zero, or this measured nothing", beforeMillis > 0 && afterMillis > 0);
         assertTrue(
             "the force merge must actually have collapsed segments, or the comparison is between two "
-                + "identical states and says nothing: " + segmentsBefore + " -> " + segmentsAfter,
+                + "identical states and says nothing: "
+                + segmentsBefore
+                + " -> "
+                + segmentsAfter,
             segmentsAfter < segmentsBefore
         );
     }
