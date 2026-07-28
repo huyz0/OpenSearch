@@ -91,7 +91,17 @@ public final class DescriptorStore {
      */
     static final long COLLAPSE_WAIT_MILLIS = 3_000;
 
-    private record CachedDescriptor(IndexDescriptor descriptor, long readAtNanos) {
+    /**
+     * A cached descriptor, carrying two independent clocks.
+     *
+     * <p>{@code readAtNanos} answers "is this still fresh" and {@code admittedAt} answers "is this the
+     * stalest thing here". They are separate because a wall clock cannot do the second job: entries admitted
+     * within one {@code nanoTime} tick share a value, and an eviction threshold taken from equal stamps
+     * evicts nothing, so a bulk warm-up could leave the cache over its bound while re-sorting every entry on
+     * every admission and making no progress. A monotonic sequence is unique by construction, which is what
+     * {@code GatedShardSuspensionRegistry} stamps for the same reason.
+     */
+    private record CachedDescriptor(IndexDescriptor descriptor, long readAtNanos, long admittedAt) {
     }
 
     private final java.util.concurrent.ConcurrentHashMap<String, CachedDescriptor> cache = new java.util.concurrent.ConcurrentHashMap<>();
@@ -106,7 +116,10 @@ public final class DescriptorStore {
         new java.util.concurrent.ConcurrentHashMap<>();
     private final java.util.function.LongSupplier clock;
     private final long collapseWaitMillis;
+    private final int cacheCapacity;
     private final java.util.concurrent.atomic.AtomicLong reads = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong evictions = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong admissions = new java.util.concurrent.atomic.AtomicLong();
 
     private final Client client;
     private final int shardCount;
@@ -118,7 +131,7 @@ public final class DescriptorStore {
 
     /** Test seam for the clock, so the cache window can be exercised without sleeping. */
     DescriptorStore(Client client, int shardCount, java.util.function.LongSupplier clock) {
-        this(client, shardCount, clock, COLLAPSE_WAIT_MILLIS);
+        this(client, shardCount, clock, COLLAPSE_WAIT_MILLIS, CACHE_CAPACITY);
     }
 
     /**
@@ -128,10 +141,19 @@ public final class DescriptorStore {
      * fallback is how this area produced mechanisms that were correct and never reached.
      */
     DescriptorStore(Client client, int shardCount, java.util.function.LongSupplier clock, long collapseWaitMillis) {
+        this(client, shardCount, clock, collapseWaitMillis, CACHE_CAPACITY);
+    }
+
+    /**
+     * Test seam for the capacity, so behaviour at and past the bound can be measured without creating
+     * fifty thousand descriptors to reach it.
+     */
+    DescriptorStore(Client client, int shardCount, java.util.function.LongSupplier clock, long collapseWaitMillis, int cacheCapacity) {
         this.client = client;
         this.shardCount = shardCount;
         this.clock = clock;
         this.collapseWaitMillis = collapseWaitMillis;
+        this.cacheCapacity = cacheCapacity;
     }
 
     /**
@@ -147,6 +169,61 @@ public final class DescriptorStore {
     /** How many times this store has actually gone to the index, which is what a test counts. */
     public long readCount() {
         return reads.get();
+    }
+
+    /** How many cached descriptors have been evicted, which distinguishes a small cache from a broken one. */
+    public long evictionCount() {
+        return evictions.get();
+    }
+
+    /** How many descriptors are cached, which is what the capacity bounds and what a test checks. */
+    int cachedCount() {
+        return cache.size();
+    }
+
+    /**
+     * Caches a descriptor, evicting the stalest entries if that puts the cache over its bound.
+     *
+     * <p><b>The admission is unconditional, which T3 is the reason for.</b> This used to be gated on
+     * {@code cache.size() < cacheCapacity}, and since nothing ever removed an entry, that was not an
+     * eviction policy but a freeze. The first {@code cacheCapacity} names held every slot permanently, and
+     * because an expired entry was re-read and then not re-admitted, every entry went stale after one
+     * second and could never be refreshed. Past the bound the cache held its memory and served nothing:
+     * T3 measured twenty names costing twenty reads on every pass, forever.
+     *
+     * <p>Recency is stamped on write and never touched on read, which is the structure P2 established for
+     * the suspension registry after P1 measured a read-mutating LRU running backwards under contention.
+     * The same reasoning applies here for the same reason: this is read on every resolution.
+     */
+    private void admit(String name, IndexDescriptor descriptor, long now) {
+        cache.put(name, new CachedDescriptor(descriptor, now, admissions.incrementAndGet()));
+        evictIfOverCapacity();
+    }
+
+    /**
+     * Drops the stalest tenth when the cache is over its bound.
+     *
+     * <p>A threshold from one pass over the stamps rather than a sorted eviction list, matching
+     * {@code GatedShardSuspensionRegistry}. Evicting a tenth rather than a single entry keeps this from
+     * running on every admission once the cache is full.
+     */
+    private void evictIfOverCapacity() {
+        if (cache.size() <= cacheCapacity) {
+            return;
+        }
+        int toEvict = Math.max(1, cacheCapacity / 10);
+        long[] stamps = cache.values().stream().mapToLong(CachedDescriptor::admittedAt).sorted().toArray();
+        if (stamps.length == 0) {
+            return;
+        }
+        long threshold = stamps[Math.min(toEvict, stamps.length - 1)];
+        cache.entrySet().removeIf(entry -> {
+            if (entry.getValue().admittedAt() < threshold) {
+                evictions.incrementAndGet();
+                return true;
+            }
+            return false;
+        });
     }
 
     /** Drops every cached descriptor, which a write must do so it does not serve its own stale value. */
@@ -227,9 +304,7 @@ public final class DescriptorStore {
                 return null;
             }
             IndexDescriptor descriptor = DescriptorCodec.fromSource(response.getSourceAsMap());
-            if (cache.size() < CACHE_CAPACITY) {
-                cache.put(name, new CachedDescriptor(descriptor, now));
-            }
+            admit(name, descriptor, now);
             return descriptor;
         } catch (Exception e) {
             // A missing index is a missing descriptor, not a failure: before the first gated creation the
