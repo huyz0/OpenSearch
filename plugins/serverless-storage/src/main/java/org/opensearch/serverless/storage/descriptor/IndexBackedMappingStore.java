@@ -1,0 +1,182 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
+
+package org.opensearch.serverless.storage.descriptor;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.opensearch.action.admin.indices.create.CreateIndexRequest;
+import org.opensearch.action.index.IndexRequest;
+import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.metadata.MappingGenerationStore;
+import org.opensearch.common.settings.Settings;
+import org.opensearch.index.VersionType;
+import org.opensearch.index.engine.VersionConflictEngineException;
+import org.opensearch.transport.client.Client;
+
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * Mappings for gated indices, stored outside cluster state.
+ *
+ * <p>H4c established that mappings have to leave cluster state or H3 and H5 are unusable, and H6a proved
+ * the compare-and-swap converges under concurrent field inference. Neither had a backing store, so
+ * {@code MappingGenerationStore} has never had a {@code Store} registered in production and the whole
+ * no-broadcast mapping design was proven and inert.
+ *
+ * <p><b>The swap is external versioning rather than sequence numbers.</b> The generation is exactly what
+ * the swap is conditioned on, and OpenSearch's external versioning rejects a write whose version is not
+ * greater than the current one. So writing generation N+1 succeeds only when the stored generation is still
+ * N, which is the compare-and-swap the interface asks for, expressed in one field rather than in a pair of
+ * sequence numbers the caller would have to carry.
+ *
+ * <p>A {@code VersionConflictEngineException} is therefore a lost race and a correct answer. The caller
+ * re-reads and merges, which is what {@code MappingGenerationStore}'s retry loop already does.
+ *
+ * <p>Reads and writes here are blocking, unlike the descriptor publish path. That is safe because a mapping
+ * update runs on a transport thread handling a put-mapping or a dynamic-field inference, not on the cluster
+ * state thread, which is where W4 found that blocking deadlocks.
+ */
+public final class IndexBackedMappingStore implements MappingGenerationStore.Store {
+
+    private static final Logger logger = LogManager.getLogger(IndexBackedMappingStore.class);
+
+    /** Where gated mappings live. Separate from the descriptor index because they change independently. */
+    public static final String MAPPING_INDEX = ".opensearch-index-mappings";
+
+    private final Client client;
+    private final AtomicBoolean indexKnownToExist = new AtomicBoolean();
+
+    public IndexBackedMappingStore(Client client) {
+        this.client = client;
+    }
+
+    @Override
+    public MappingGenerationStore.MappingGeneration read(String indexUuid) {
+        try {
+            var response = client.prepareGet(MAPPING_INDEX, indexUuid).get();
+            if (response.isExists() == false) {
+                return null;
+            }
+            @SuppressWarnings("unchecked")
+            Map<String, String> fields = (Map<String, String>) response.getSourceAsMap().getOrDefault("fields", Map.of());
+            return new MappingGenerationStore.MappingGeneration(response.getVersion(), fields);
+        } catch (Exception e) {
+            // No mapping index yet means no mapping, which is what an index with no fields looks like.
+            logger.debug("mapping read for [{}] failed", indexUuid, e);
+            return null;
+        }
+    }
+
+    @Override
+    public boolean compareAndSwap(String indexUuid, long expectedGeneration, MappingGenerationStore.MappingGeneration updated) {
+        ensureIndexExists();
+        try {
+            Map<String, Object> source = new HashMap<>();
+            source.put("uuid", indexUuid);
+            source.put("fields", updated.fields());
+            source.put("generation", updated.generation());
+            // A bounded, aggregatable projection of the mapping, written alongside it.
+            //
+            // The fields object above is stored with indexing disabled, because user field names are
+            // unbounded and indexing them would grow this index's own mapping with the union of every
+            // gated index's fields. That is the residency problem this area exists to remove, one level
+            // down. The consequence is that fields cannot be aggregated, and cluster stats needs exactly
+            // that (W7).
+            //
+            // Field *types* are a bounded vocabulary of a couple of dozen names, so a nested array of
+            // {type, count} is safe to index and gives an exact answer rather than an estimate: a terms
+            // aggregation on type with a sum on count yields both the field count and the index count per
+            // type, in one query whose cost does not grow with the number of gated indices.
+            source.put("fieldTypeCounts", typeCountsOf(updated.fields()));
+            client.index(
+                new IndexRequest(MAPPING_INDEX).id(indexUuid).source(source).versionType(VersionType.EXTERNAL).version(updated.generation())
+            ).actionGet();
+            return true;
+        } catch (VersionConflictEngineException e) {
+            // Someone advanced the generation first. The caller re-reads and merges, which is the whole
+            // point of returning false rather than throwing.
+            return false;
+        }
+    }
+
+    /** Collapses a mapping into one {type, count} entry per distinct field type. */
+    private static java.util.List<Map<String, Object>> typeCountsOf(Map<String, String> fields) {
+        Map<String, Long> perType = new HashMap<>();
+        for (String type : fields.values()) {
+            perType.merge(type, 1L, Long::sum);
+        }
+        java.util.List<Map<String, Object>> counts = new java.util.ArrayList<>(perType.size());
+        for (Map.Entry<String, Long> each : perType.entrySet()) {
+            counts.add(Map.of("type", each.getKey(), "count", each.getValue()));
+        }
+        return counts;
+    }
+
+    /**
+     * Creates the mapping index if it is not already there.
+     *
+     * <p>{@code fields} is deliberately not indexed as an object with dynamic mapping: it holds arbitrary
+     * user field names, so mapping it would make the mapping index's own mapping grow with the union of
+     * every gated index's fields. That is the residency problem this area exists to remove, reproduced one
+     * level down, and it is the reason the field is stored as a disabled object.
+     */
+    private void ensureIndexExists() {
+        if (indexKnownToExist.get()) {
+            return;
+        }
+        try {
+            client.admin()
+                .indices()
+                .create(
+                    new CreateIndexRequest(MAPPING_INDEX).settings(
+                        Settings.builder()
+                            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 5)
+                            .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 1)
+                            .build()
+                    )
+                        .mapping(
+                            Map.of(
+                                "properties",
+                                Map.of(
+                                    "uuid",
+                                    Map.of("type", "keyword"),
+                                    "generation",
+                                    Map.of("type", "long"),
+                                    // Stored, not indexed. Indexing it would grow this index's own mapping
+                                    // with the union of every gated index's field names.
+                                    "fields",
+                                    Map.of("type", "object", "enabled", false),
+                                    // Nested so a terms-and-sum aggregation can answer per type exactly.
+                                    // Bounded because field types are a fixed vocabulary, unlike field
+                                    // names.
+                                    "fieldTypeCounts",
+                                    Map.of(
+                                        "type",
+                                        "nested",
+                                        "properties",
+                                        Map.of("type", Map.of("type", "keyword"), "count", Map.of("type", "long"))
+                                    )
+                                )
+                            )
+                        )
+                )
+                .actionGet();
+            indexKnownToExist.set(true);
+        } catch (Exception e) {
+            if (e instanceof org.opensearch.ResourceAlreadyExistsException
+                || e.getCause() instanceof org.opensearch.ResourceAlreadyExistsException) {
+                indexKnownToExist.set(true);
+                return;
+            }
+            throw e instanceof RuntimeException runtime ? runtime : new RuntimeException(e);
+        }
+    }
+}

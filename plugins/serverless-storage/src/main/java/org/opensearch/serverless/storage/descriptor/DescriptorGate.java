@@ -13,6 +13,7 @@ import org.apache.logging.log4j.Logger;
 import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.IndexDescriptor;
 import org.opensearch.cluster.metadata.IndexDescriptorPublisher;
+import org.opensearch.cluster.metadata.MappingGenerationStore;
 
 import java.util.List;
 
@@ -73,7 +74,7 @@ public final class DescriptorGate {
      *
      * @param enabled whether gated indices are in use at all, so an ordinary cluster is untouched
      */
-    public static void install(DescriptorStore store, boolean enabled) {
+    public static void install(DescriptorStore store, MappingGenerationStore.Store mappingStore, boolean enabled) {
         if (enabled == false) {
             return;
         }
@@ -93,6 +94,11 @@ public final class DescriptorGate {
         // a cluster state, so a blocking write deadlocks against the index operation it issues. Registering
         // the blocking put hung the node instead of failing, which is how the constraint was found.
         IndexDescriptorPublisher.register(store::putAsync);
+        // Mappings, which H4c required to leave cluster state and which have had no backing store since
+        // H6a proved the swap converges. Blocking is safe here, unlike the publish hook above: a mapping
+        // update runs on a transport thread handling a put-mapping or a dynamic field inference, not on
+        // the cluster state thread where W4 found that a blocking write deadlocks.
+        MappingGenerationStore.register(mappingStore);
         logger.info("descriptor resolution installed against [{}]", DescriptorStore.DESCRIPTOR_INDEX);
     }
 
@@ -102,6 +108,7 @@ public final class DescriptorGate {
         AbsentIndexDescriptorSuppliers.register(null);
         AbsentIndexDescriptorSuppliers.registerPager(null);
         IndexDescriptorPublisher.register(null);
+        MappingGenerationStore.register(null);
         STORE.set(null);
     }
 
