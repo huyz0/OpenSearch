@@ -360,6 +360,18 @@ public class IndexNameExpressionResolver {
         for (String expression : expressions) {
             IndexAbstraction indexAbstraction = metadata.getIndicesLookup().get(expression);
             if (indexAbstraction == null) {
+                // Area H: an index whose metadata is not in cluster state resolves from its descriptor,
+                // which carries the uuid the concrete Index needs. Consulted only on a miss, so a name
+                // present in the lookup never reaches the seam and no cluster that has not opted in pays
+                // a lookup it did not pay before.
+                IndexDescriptor descriptor = AbsentIndexDescriptorSuppliers.supply(expression);
+                if (descriptor != null && descriptor.exists()) {
+                    acceptedExpressions.add(expression);
+                    concreteIndices.add(new Index(expression, descriptor.uuid()));
+                    continue;
+                }
+            }
+            if (indexAbstraction == null) {
                 if (failNoIndices) {
                     IndexNotFoundException infe;
                     if (expression.equals(Metadata.ALL)) {
@@ -1193,7 +1205,10 @@ public class IndexNameExpressionResolver {
         private static boolean aliasOrIndexExists(Context context, IndicesOptions options, Metadata metadata, String expression) {
             IndexAbstraction indexAbstraction = metadata.getIndicesLookup().get(expression);
             if (indexAbstraction == null) {
-                return false;
+                // Area H: an index whose metadata is not in cluster state answers from the descriptor
+                // instead. The order matters and is asserted: a name present in the lookup never reaches
+                // the seam, so no cluster that has not opted in pays a lookup it did not pay before.
+                return AbsentIndexDescriptorSuppliers.exists(metadata, expression);
             }
 
             // treat aliases as unavailable indices when ignoreAliases is set to true (e.g. delete index and update aliases api)
