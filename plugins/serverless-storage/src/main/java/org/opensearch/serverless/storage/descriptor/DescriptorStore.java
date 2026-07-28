@@ -64,13 +64,54 @@ public final class DescriptorStore {
      */
     public static final int PAGE_SIZE = 1_000;
 
+    /**
+     * How long a descriptor read is served from memory before going to the index again.
+     *
+     * <p>{@code AbsentIndexDescriptorSuppliers} states that a supplier is expected to answer from a cache,
+     * and this one had none: every resolution of an unresolved name issued a real get. P7 then made it
+     * per-request for gated indices, because synthesising placement metadata reads the descriptor on every
+     * routing resolution.
+     *
+     * <p>One second is the same window {@code StoreBackedFieldRefresher} uses, and for the same reason: it
+     * bounds staleness by an interval rather than leaving it unbounded, and a descriptor changes far less
+     * often than it is read. Exact-name resolution stays realtime for a <em>newly created</em> index because
+     * a miss is not cached, only a hit.
+     */
+    static final long CACHE_TTL_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(1);
+
+    /** How many descriptors one node keeps in memory, bounding this the way H11 and H12 bound theirs. */
+    static final int CACHE_CAPACITY = 50_000;
+
+    private record CachedDescriptor(IndexDescriptor descriptor, long readAtNanos) {
+    }
+
+    private final java.util.concurrent.ConcurrentHashMap<String, CachedDescriptor> cache = new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.function.LongSupplier clock;
+    private final java.util.concurrent.atomic.AtomicLong reads = new java.util.concurrent.atomic.AtomicLong();
+
     private final Client client;
     private final int shardCount;
     private final AtomicBoolean indexKnownToExist = new AtomicBoolean();
 
     public DescriptorStore(Client client, int shardCount) {
+        this(client, shardCount, System::nanoTime);
+    }
+
+    /** Test seam for the clock, so the cache window can be exercised without sleeping. */
+    DescriptorStore(Client client, int shardCount, java.util.function.LongSupplier clock) {
         this.client = client;
         this.shardCount = shardCount;
+        this.clock = clock;
+    }
+
+    /** How many times this store has actually gone to the index, which is what a test counts. */
+    public long readCount() {
+        return reads.get();
+    }
+
+    /** Drops every cached descriptor, which a write must do so it does not serve its own stale value. */
+    public void invalidate(String name) {
+        cache.remove(name);
     }
 
     /**
@@ -81,12 +122,26 @@ public final class DescriptorStore {
      * to it.
      */
     public IndexDescriptor get(String name) {
+        // The guard precedes the read, which P3 and P5 both had to learn the hard way: a cache consulted
+        // after the expensive call prevents nothing.
+        CachedDescriptor cached = cache.get(name);
+        long now = clock.getAsLong();
+        if (cached != null && now - cached.readAtNanos() < CACHE_TTL_NANOS) {
+            return cached.descriptor();
+        }
         try {
+            reads.incrementAndGet();
             var response = client.prepareGet(DESCRIPTOR_INDEX, name).get();
             if (response.isExists() == false) {
+                // A miss is deliberately not cached. An index created a moment ago must be nameable
+                // immediately (H18), and caching absence would delay that by the window.
                 return null;
             }
-            return DescriptorCodec.fromSource(response.getSourceAsMap());
+            IndexDescriptor descriptor = DescriptorCodec.fromSource(response.getSourceAsMap());
+            if (cache.size() < CACHE_CAPACITY) {
+                cache.put(name, new CachedDescriptor(descriptor, now));
+            }
+            return descriptor;
         } catch (Exception e) {
             // A missing index is a missing descriptor, not a failure: before the first gated creation the
             // descriptor index does not exist, and every resolution would otherwise throw.
@@ -107,6 +162,7 @@ public final class DescriptorStore {
         try {
             client.index(new IndexRequest(DESCRIPTOR_INDEX).id(descriptor.name()).source(DescriptorCodec.toSource(descriptor)).create(true))
                 .actionGet();
+            invalidate(descriptor.name());
             return true;
         } catch (VersionConflictEngineException e) {
             // Someone else created this name first. That is the mechanism working.
@@ -118,6 +174,7 @@ public final class DescriptorStore {
     public void put(IndexDescriptor descriptor) {
         ensureIndexExists();
         client.index(new IndexRequest(DESCRIPTOR_INDEX).id(descriptor.name()).source(DescriptorCodec.toSource(descriptor))).actionGet();
+        invalidate(descriptor.name());
     }
 
     /**
