@@ -292,6 +292,30 @@ bug in it. H3 and H5 are correct and measured: creation is flat and leaves nothi
 usable today for a fixed-mapping index and not for a dynamic one, and shipping them without saying so
 would be the dishonest version of a real result.
 
+## H.10c A gated index cannot scale to zero, which is the point of the design
+
+Found by asking whether the plugin's suspension path works for an index Area H has removed from cluster
+state. It does not, and the way it fails is worse than not working.
+
+`ShardSuspensionCoordinator.findByUuid` resolves a shard's index by scanning `metadata.indices()`. H1d
+recorded that as O(total indices) on a path that runs per candidate shard per tick. For a gated index the
+scan also finds nothing, because the index is not in metadata at all.
+
+**The prediction was wrong and the correction is the finding.** The guess was that the pre-check would
+find nothing and skip the submission, making suspension a cheap no-op. What happens is that the pre-check
+falls through on a null, a cluster state task *is* submitted, and the transform inside it then finds
+nothing and returns the state unchanged. The publication slot is spent and the work is not done, so every
+candidate shard of every gated index queues a task per tick that can only be a no-op.
+
+So an index that uses Area H cannot scale to zero, and scaling to zero is what the serverless design is
+for. Pinned by `GatedIndexSuspensionGapTests`, which asserts the no-op rather than an absence of
+exceptions.
+
+**One fix addresses both problems.** Resolving the index through the descriptor seam rather than by
+scanning metadata makes suspension work for a gated index and removes the O(total indices) cost for every
+index at the same time. That is H9b, and it is the first thing the next cycle should do, because a
+serverless index that never sleeps is a worse outcome than one that cannot be created.
+
 ## H.11 Phasing, each phase falsifiable
 
 **H1. Audit.** Classify all 41 direct enumerations as convertible, refusable, or blocking. F1's precedent:
