@@ -98,6 +98,28 @@ public class DescriptorReadCountIT extends OpenSearchIntegTestCase {
         assertEquals("a write must not leave its own stale value readable", 7L, store.get("evolving-idx").mappingGeneration());
     }
 
+    /**
+     * T2. A waiter must not hang behind a read that never finishes.
+     *
+     * <p>Collapsing concurrent misses trades N independent reads for one read that N-1 callers depend on,
+     * which is a new failure mode rather than a free win: before it, a caller that hung hung alone. The
+     * bounded wait is what keeps the blast radius unchanged, and it is tested here rather than left to a
+     * slow-read scenario nothing can arrange, because an untested fallback is how this area has repeatedly
+     * produced mechanisms that were correct and never reached.
+     */
+    public void testAWaiterFallsBackWhenTheReaderNeverFinishes() {
+        DescriptorStore store = new DescriptorStore(client(), 1, now::get, 50);
+        store.create(descriptor("stuck-idx"));
+        store.invalidate("stuck-idx");
+
+        var neverCompletes = store.pretendReadIsInFlight("stuck-idx");
+        long before = store.readCount();
+
+        assertNotNull("a waiter must read for itself rather than block on a reader that never finishes", store.get("stuck-idx"));
+        assertEquals("and that fallback must be a real read", before + 1, store.readCount());
+        assertFalse("the test's stand-in reader is still stuck, which is the point", neverCompletes.isDone());
+    }
+
     private static IndexDescriptor descriptor(String name) {
         return new IndexDescriptor(
             name,

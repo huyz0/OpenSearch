@@ -82,11 +82,30 @@ public final class DescriptorStore {
     /** How many descriptors one node keeps in memory, bounding this the way H11 and H12 bound theirs. */
     static final int CACHE_CAPACITY = 50_000;
 
+    /**
+     * How long a caller waits for another caller's in-flight read before going to the index itself.
+     *
+     * <p>Generous relative to the 2.7 ms T1 measured for an uncontended read, because the point is to bound
+     * a pathological wait rather than to race a healthy one. TiDB sets a 3 s timeout on the equivalent
+     * storage read for the same reason, so a slow meta region leader does not stall every reader behind it.
+     */
+    static final long COLLAPSE_WAIT_MILLIS = 3_000;
+
     private record CachedDescriptor(IndexDescriptor descriptor, long readAtNanos) {
     }
 
     private final java.util.concurrent.ConcurrentHashMap<String, CachedDescriptor> cache = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * The name currently being read, so concurrent misses on it wait rather than each issuing a read.
+     *
+     * <p>An entry lives only for the duration of one read, which is why this needs no capacity bound while
+     * {@link #cache} does.
+     */
+    private final java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.CompletableFuture<IndexDescriptor>> inFlight =
+        new java.util.concurrent.ConcurrentHashMap<>();
     private final java.util.function.LongSupplier clock;
+    private final long collapseWaitMillis;
     private final java.util.concurrent.atomic.AtomicLong reads = new java.util.concurrent.atomic.AtomicLong();
 
     private final Client client;
@@ -99,9 +118,30 @@ public final class DescriptorStore {
 
     /** Test seam for the clock, so the cache window can be exercised without sleeping. */
     DescriptorStore(Client client, int shardCount, java.util.function.LongSupplier clock) {
+        this(client, shardCount, clock, COLLAPSE_WAIT_MILLIS);
+    }
+
+    /**
+     * Test seam for the collapse wait, so the fallback can be exercised without waiting three seconds.
+     *
+     * <p>Worth a seam rather than being left to a slow-read scenario nothing can arrange: an untested
+     * fallback is how this area produced mechanisms that were correct and never reached.
+     */
+    DescriptorStore(Client client, int shardCount, java.util.function.LongSupplier clock, long collapseWaitMillis) {
         this.client = client;
         this.shardCount = shardCount;
         this.clock = clock;
+        this.collapseWaitMillis = collapseWaitMillis;
+    }
+
+    /**
+     * Pretends a read for this name is already in flight and will never finish, so a test can prove a
+     * waiter falls back rather than hanging behind it.
+     */
+    java.util.concurrent.CompletableFuture<IndexDescriptor> pretendReadIsInFlight(String name) {
+        java.util.concurrent.CompletableFuture<IndexDescriptor> never = new java.util.concurrent.CompletableFuture<>();
+        inFlight.put(name, never);
+        return never;
     }
 
     /** How many times this store has actually gone to the index, which is what a test counts. */
@@ -129,6 +169,55 @@ public final class DescriptorStore {
         if (cached != null && now - cached.readAtNanos() < CACHE_TTL_NANOS) {
             return cached.descriptor();
         }
+
+        // The window above only helps a caller arriving after some other caller finished reading. Callers
+        // arriving together all see the same empty slot, and T1 measured that they all go to the index:
+        // sixty-four concurrent resolutions of one name issued sixty-four reads. So one of them reads and
+        // the rest wait on it.
+        java.util.concurrent.CompletableFuture<IndexDescriptor> mine = new java.util.concurrent.CompletableFuture<>();
+        java.util.concurrent.CompletableFuture<IndexDescriptor> reader = inFlight.putIfAbsent(name, mine);
+        if (reader != null) {
+            return awaitOrReadDirectly(reader, name);
+        }
+        try {
+            IndexDescriptor descriptor = readFromIndex(name, now);
+            mine.complete(descriptor);
+            return descriptor;
+        } finally {
+            // Completing an already-completed future is a no-op, so this only fires if readFromIndex threw
+            // an Error. Without it a waiter would block until its own timeout for no reason.
+            mine.complete(null);
+            inFlight.remove(name, mine);
+        }
+    }
+
+    /**
+     * Waits for the caller that is already reading this name, and reads directly if that takes too long.
+     *
+     * <p>The fallback is the point. Collapsing turns N independent reads into one read with N-1 threads
+     * depending on it, which is a new way to fail: before, a caller that hung hung alone. A bounded wait
+     * keeps the failure blast radius what it was, at the cost of occasionally issuing the read this exists
+     * to avoid.
+     */
+    private IndexDescriptor awaitOrReadDirectly(java.util.concurrent.CompletableFuture<IndexDescriptor> reader, String name) {
+        try {
+            return reader.get(collapseWaitMillis, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
+        } catch (java.util.concurrent.TimeoutException e) {
+            logger.debug("waited [{}] ms on an in-flight descriptor read for [{}]; reading directly", collapseWaitMillis, name);
+            // The clock is read again rather than reused from before the wait. A timestamp taken up to
+            // collapseWaitMillis ago would stamp the entry as already expired against a one second window,
+            // so the cache would be populated with something nothing can ever read.
+            return readFromIndex(name, clock.getAsLong());
+        } catch (Exception e) {
+            logger.debug("in-flight descriptor read for [{}] failed", name, e);
+            return null;
+        }
+    }
+
+    private IndexDescriptor readFromIndex(String name, long now) {
         try {
             reads.incrementAndGet();
             var response = client.prepareGet(DESCRIPTOR_INDEX, name).get();
