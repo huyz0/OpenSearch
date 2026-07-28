@@ -1571,7 +1571,9 @@ wrong conclusion once already in this project.
 | 1,000,000 | 18,853 | 0.4070 |
 
 **Lookup ratio 0.96x across a twentyfold population increase.** That is the number this run existed to
-produce. A point lookup that grew with population would mean the descriptor index had become the new
+produce. **Superseded by S28**, which found 1.88x over the next decade: the flatness here is real for this
+range and does not continue, so this number must not be quoted as evidence that lookup is
+population-independent. A point lookup that grew with population would mean the descriptor index had become the new
 ceiling, which is the single failure that would invalidate the whole approach, and it does not.
 
 Creation appears 1.58x faster at the larger population. That is warmup dominating the first batch, the
@@ -1604,4 +1606,48 @@ area's signature failure appearing in the test written to measure it.
 A million is twenty times more evidence for the same extrapolation, not a demonstration at a hundred
 million. It also runs against a small in-JVM cluster with the framework's leak detection disabled, so it
 measures the shape of the cost rather than a capacity figure.
+
+## S28 (H21): ten million indices, and the flatness claim was wrong
+
+The previous review said closing the gap between "no known ceiling" and "demonstrated" needed a fleet.
+That is true of a hundred million and it was not true of ten, so ten was run.
+
+| population | creation (indices/sec) | point lookup (ms) |
+|---|---|---|
+| 1,000,000 | 22,805 | 0.3809 |
+| 10,000,000 | 23,843 | 0.7147 |
+
+**Creation is flat.** 1.05x across a tenfold population increase, consistent with S26 and S27. At this rate
+a hundred million indices is about 70 minutes of writing.
+
+### The lookup is not flat, and every previous claim that it was came from too narrow a range
+
+S27 measured 0.96x from fifty thousand to a million and concluded flatness. Across the next decade the
+same measurement gives **1.88x**. The earlier number was not wrong, it was taken over a range where the
+growth had not yet shown itself.
+
+That matters more than the absolute figures, because the extrapolation to 100M on this plan has been
+resting on "flat" rather than on "grows slowly". Those are different claims and only the second is
+supported.
+
+Extrapolating the observed decade-over-decade factor, 100M lands near 1.3 ms. That is still an acceptable
+cost for a metadata point lookup, so the conclusion survives, but it survives as arithmetic on a growth
+rate rather than as an appeal to a curve that does not move.
+
+The growth is consistent with a term lookup over a larger dictionary and more segments, which is sublinear
+and expected. What was not expected is that it was invisible below a million, which is exactly why the run
+was worth doing.
+
+### What this run needed, which is part of the result
+
+Ten million did not fit the default 3 GB test heap, and raising it needs **both**
+`-Dtests.heap.size=8g` and `-Poptions.forkOptions.memoryMaximumSize=8g`. Setting only the first produces
+`Initial heap size set to a larger value than the maximum heap size`, because `gradle.properties` pins the
+maximum and Gradle appends it after the plugin's arguments.
+
+### What it still does not say
+
+Ten million is one order of magnitude from the target rather than two. It is not a demonstration at a
+hundred million, and the single-JVM cluster with leak detection disabled remains a shape measurement
+rather than a capacity figure.
 
