@@ -1555,3 +1555,53 @@ which is what makes gated creation cheap in the first place. An index whose shar
 that cost then, and scale-to-zero (H9c, H9d) is what keeps the population that is awake far below the
 population that exists.
 
+## S27 (H14): the descriptor path at a million indices
+
+Every Area H figure before this topped out at fifty thousand. The curves were flat where flatness was the
+claim, which is the best evidence available without a fleet, and flat to 50k is not flat to 100M. The
+review that closed the last cycle named this run as the single most valuable next step for exactly that
+reason.
+
+Both populations measured on the same machine in the same run, since comparing across runs produced a
+wrong conclusion once already in this project.
+
+| population | creation (indices/sec) | point lookup (ms) |
+|---|---|---|
+| 50,000 | 11,934 | 0.4243 |
+| 1,000,000 | 18,853 | 0.4070 |
+
+**Lookup ratio 0.96x across a twentyfold population increase.** That is the number this run existed to
+produce. A point lookup that grew with population would mean the descriptor index had become the new
+ceiling, which is the single failure that would invalidate the whole approach, and it does not.
+
+Creation appears 1.58x faster at the larger population. That is warmup dominating the first batch, the
+same artefact S26 recorded, not something getting faster as it grows. The claim asserted is that it does
+not collapse.
+
+### It took five runs, and four of them were this file's fault
+
+Worth recording because each failure looked like the finding the test exists to look for, and reporting a
+harness limit as a scaling ceiling would have been worse than not running it.
+
+1. **Out of memory.** The test set `indices.memory.index_buffer_size` to 512 MB with a thousand requests in
+   flight. Every node of an `internalClusterTest` shares one JVM, so that buffer was allocated per node
+   inside a single 3 GB heap.
+2. **Out of memory again**, which is the useful one: the first diagnosis was correct and insufficient. The
+   remaining cost was the test framework's own mock plugins, whose leak-tracking directories and engines
+   retain per-operation state precisely so correctness tests can catch leaks. That accounting is what
+   cannot hold a million documents.
+3. **`Unsupported http.type []`.** Emptying the mock list entirely leaves the node unable to start. The
+   transport, HTTP and seed plugins have to stay; only the accounting ones come out.
+4. **The population check passed on ten thousand documents.** `getTotalHits()` is capped at 10,000 by
+   default, so the assertion that every descriptor was present would have "verified" a million-document
+   index by counting ten thousand of them. Fixed with `trackTotalHits(true)`.
+
+The fourth is the one to remember. It did not fail loudly, it very nearly succeeded quietly, which is this
+area's signature failure appearing in the test written to measure it.
+
+### What it still does not say
+
+A million is twenty times more evidence for the same extrapolation, not a demonstration at a hundred
+million. It also runs against a small in-JVM cluster with the framework's leak detection disabled, so it
+measures the shape of the cost rather than a capacity figure.
+
