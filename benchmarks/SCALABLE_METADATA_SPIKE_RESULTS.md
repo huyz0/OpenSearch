@@ -1448,3 +1448,42 @@ were flat because a different quantity was flat.
 
 The test asserts `response.getTotalShards()` equals the configured shard count, so a wildcard that quietly
 searched one shard would fail rather than look like excellent scaling.
+
+## S24 (H7c): what a wildcard costs when it has to return the names
+
+S21 and S23 both measured prefix queries with `size=0` and both flagged it: that counts matches rather
+than returning them, and real resolution needs the names. This measures the difference, and the difference
+is large enough that the earlier numbers should not be quoted for resolution cost.
+
+Twenty thousand descriptors, five shards, paged with `search_after` at a thousand per page rather than one
+large `size`, because `index.max_result_window` caps a single response at ten thousand and a real resolver
+faces an unbounded match set.
+
+| matches | counting | first page | every name |
+|---|---|---|---|
+| 100 | 121.4 ms | 40.1 ms | 70.1 ms |
+| 1,000 | 14.0 ms | 46.3 ms | 47.2 ms |
+| 10,000 | 22.3 ms | 55.8 ms | **373.2 ms** |
+
+Warmed, at ten thousand matches: **counting 5.9 ms against returning names 327.5 ms, a ratio of 55**. The
+121 ms in the first row is the first query of the run rather than a hundred-match effect, which is the
+same warmup artefact S21 and S23 each reported before annotating it.
+
+**So the ~22 ms figure previously recorded understates wildcard resolution by roughly fifteen times.** A
+bounded wildcard, one page, stays in the 40 to 56 ms band regardless of how many match. An unbounded one
+scales with the match set: ten thousand names is 327 ms, and a hundred thousand would be about 3.3
+seconds.
+
+### What this decides
+
+Wildcard resolution needs pagination in its contract, or a bound on the match set. That is not a design
+flaw, since resolving a hundred thousand index names is inherently proportional work and no storage
+arrangement makes it free, but it is a semantic that belongs next to the freshness decision rather than
+being met when a tenant runs `logs-*` against a hundred thousand indices.
+
+The per-page cost is the number to design against: about 33 ms per thousand names, flat across match set
+size. A resolver that streams pages pays that per page; one that materialises the whole list pays it
+multiplied.
+
+The count and the returned list are asserted equal, so a page loop that silently stopped early would fail
+rather than report an attractively small number.
