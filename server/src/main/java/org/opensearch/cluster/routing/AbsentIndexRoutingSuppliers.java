@@ -135,6 +135,8 @@ public final class AbsentIndexRoutingSuppliers {
      */
     public static void register(BiFunction<ClusterState, IndexMetadata, IndexRoutingTable> supplier) {
         SUPPLIER.set(supplier);
+        // Any change to either input invalidates every memoised placement.
+        MEMOS.clear();
         if (supplier != null) {
             for (Runnable listener : REGISTRATION_LISTENERS) {
                 try {
@@ -187,10 +189,63 @@ public final class AbsentIndexRoutingSuppliers {
             return null;
         }
         try {
-            return withoutSuspendedShards(supplier.apply(state, indexMetadata));
+            if (indexMetadata == null) {
+                // No metadata means no memo key and, for every supplier that exists, no table either. Kept
+                // ahead of the cache so the null case stays a single call rather than a map lookup first.
+                return withoutSuspendedShards(supplier.apply(state, indexMetadata));
+            }
+
+            String uuid = indexMetadata.getIndexUUID();
+            Set<Integer> suspended = suspendedShards(uuid);
+            Memo memo = MEMOS.get(uuid);
+            // Identity on the metadata, equality on the suspension set, and the asymmetry is deliberate.
+            //
+            // IndexMetadata is immutable, large, and replaced on every cluster state change that touches
+            // the index, so identity is exactly the invalidation signal and costs one reference compare.
+            //
+            // The suspension set is small and its source is a registered function this class does not
+            // control. Identity there looked equivalent and was not: a source that builds a fresh set per
+            // call, which the obvious lambda does, makes the memo miss every time. That is not a slow memo,
+            // it is a negative one, because every resolution then pays the rebuild plus a map write. It
+            // measured 159,499 ns against 8,728 ns without the memo at all. Equality on a set of a few
+            // shard ids costs almost nothing and cannot be defeated by how a caller allocates.
+            if (memo != null && memo.metadata == indexMetadata && memo.suspended.equals(suspended)) {
+                return memo.result;
+            }
+
+            IndexRoutingTable result = withoutSuspendedShards(supplier.apply(state, indexMetadata));
+            MEMOS.put(uuid, new Memo(indexMetadata, suspended, result));
+            return result;
         } catch (Exception e) {
             return null;
         }
+    }
+
+    /**
+     * One memoised placement per index.
+     *
+     * <p>P4 measured why. {@code ComputedRoutingTable.build} allocates a fresh table on every resolution
+     * and the suspension filter then rebuilds it again when anything is asleep, so a hundred-shard index
+     * with one cold shard cost about nine microseconds per request, linear in shard count, on a path taken
+     * once per index per request.
+     *
+     * <p>Bounded by the number of computed indices this node resolves, which is the same bound the routing
+     * table itself has, so this cannot grow past what the node already holds. Entries are replaced rather
+     * than accumulated: the key is the index uuid and each new cluster state for that index overwrites it.
+     *
+     * <p>A {@code ConcurrentHashMap} with no access ordering, deliberately. P1 measured an access-ordered
+     * synchronized map on this same path at 9M reads per second across sixteen threads against 1,084M for a
+     * concurrent one, because access ordering makes a read mutate shared structure. Repeating that here
+     * would give back more than the memo saves.
+     */
+    private static final java.util.concurrent.ConcurrentHashMap<String, Memo> MEMOS = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private record Memo(IndexMetadata metadata, Set<Integer> suspended, IndexRoutingTable result) {
+    }
+
+    /** Drops every memoised placement, which a test must do because this registry is static. */
+    public static void clearMemos() {
+        MEMOS.clear();
     }
 
     /**
@@ -202,6 +257,8 @@ public final class AbsentIndexRoutingSuppliers {
      */
     public static void registerSuspendedShards(Function<String, Set<Integer>> suspendedShards) {
         SUSPENDED_SHARDS.set(suspendedShards);
+        // Any change to either input invalidates every memoised placement.
+        MEMOS.clear();
     }
 
     /** The shards of this index that are asleep, empty when nothing is registered or the source fails. */

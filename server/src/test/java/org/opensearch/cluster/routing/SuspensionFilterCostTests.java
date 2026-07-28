@@ -66,6 +66,7 @@ public class SuspensionFilterCostTests extends OpenSearchTestCase {
     public void clearRegistrations() {
         AbsentIndexRoutingSuppliers.register(null);
         AbsentIndexRoutingSuppliers.registerSuspendedShards(null);
+        AbsentIndexRoutingSuppliers.clearMemos();
     }
 
     public void testFilterCostAgainstShardCount() {
@@ -115,6 +116,63 @@ public class SuspensionFilterCostTests extends OpenSearchTestCase {
         );
 
         assertTrue("both measurements must be non-zero, or this measured nothing", atTen > 0 && atHundred > 0);
+    }
+
+    /**
+     * P5. The memo, measured against the cost it exists to remove.
+     *
+     * <p>The supplier here rebuilds the table on every call, which is what
+     * {@code ComputedRoutingTable.build} actually does in production, so this measures build plus filter
+     * rather than the filter alone. That is the real per-resolution cost P4 could not see, because P4's
+     * supplier returned a constant.
+     */
+    public void testMemoisingRemovesTheRebuildFromEveryResolution() {
+        ClusterState state = ClusterState.builder(ClusterName.DEFAULT)
+            .metadata(org.opensearch.cluster.metadata.Metadata.builder().put(indexMetadata(100), false).build())
+            .build();
+        // Rebuilt per call, as production does, so the memo has something real to save.
+        AbsentIndexRoutingSuppliers.register((s, m) -> placement(100));
+        AbsentIndexRoutingSuppliers.registerSuspendedShards(uuid -> Set.of(0));
+
+        double memoised = nanosPerResolutionOf(state, "gated");
+
+        logger.warn(String.format(Locale.ROOT, "%nP5 build plus filter at 100 shards, memoised: %.1f ns per resolution%n", memoised));
+
+        assertTrue("the measurement must be non-zero", memoised > 0);
+        assertTrue(
+            String.format(
+                Locale.ROOT,
+                "a memoised resolution must cost far less than the %.1f ns P4 measured for the filter alone "
+                    + "at this shard count, since the memo removes the build as well: measured %.1f ns",
+                9079.1,
+                memoised
+            ),
+            memoised < 9079.1
+        );
+    }
+
+    private static org.opensearch.cluster.metadata.IndexMetadata indexMetadata(int shards) {
+        return org.opensearch.cluster.metadata.IndexMetadata.builder("gated")
+            .settings(
+                org.opensearch.common.settings.Settings.builder()
+                    .put(org.opensearch.cluster.metadata.IndexMetadata.SETTING_VERSION_CREATED, org.opensearch.Version.CURRENT)
+                    .put(org.opensearch.cluster.metadata.IndexMetadata.SETTING_INDEX_UUID, "gated-uuid")
+                    .build()
+            )
+            .numberOfShards(shards)
+            .numberOfReplicas(0)
+            .build();
+    }
+
+    private static double nanosPerResolutionOf(ClusterState state, String name) {
+        for (int i = 0; i < RESOLUTIONS; i++) {
+            AbsentIndexRoutingSuppliers.resolve(state, name);
+        }
+        long startedAt = System.nanoTime();
+        for (int i = 0; i < RESOLUTIONS; i++) {
+            AbsentIndexRoutingSuppliers.resolve(state, name);
+        }
+        return (System.nanoTime() - startedAt) / (double) RESOLUTIONS;
     }
 
     private static double nanosPerResolution(ClusterState state) {
