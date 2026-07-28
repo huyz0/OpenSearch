@@ -429,6 +429,35 @@ Mutation tested both ways. Disabling the merge kills the two correctness tests; 
 repair this section warned about. A fix that made gated indices visible while quietly restoring the
 population-sized cost would pass every correctness test and fail that one alone.
 
+## H.10g The wildcard freshness contract, which was never a decision
+
+Deferred three times as a product question. It is not one. H18 measured that the two resolution paths have
+different freshness because they read the descriptor index by different means, and nobody gets to choose
+otherwise.
+
+- **Exact names are immediately consistent.** Resolving a name fetches a descriptor by id, and a get by id
+  reads through the translog, so the descriptor is visible the instant the write is acknowledged. Measured
+  across a hundred consecutive creations with refresh disabled entirely: every one readable by name with no
+  refresh in between.
+- **Wildcards are refresh-bound.** Matching a pattern runs a search, and a search sees segments. With
+  refresh disabled, a freshly created index matched zero times; after one refresh, once.
+
+So the contract writes itself: an index is nameable the moment it exists, and a client that creates
+`logs-2026-07` and immediately runs `logs-*` may not see it, bounded by the refresh interval.
+
+**Why this is the right way round rather than an unfortunate one.** The strict guarantee lands on the path
+that needs it. A client creating an index and immediately writing to it must not be told the index does not
+exist, and it is not. A client enumerating by pattern is doing a survey, and a survey that misses an index
+created microseconds ago is not wrong in any way the caller can act on.
+
+**What it obliges.** The refresh interval on the descriptor index becomes an API-visible parameter rather
+than an internal tuning knob, since it is exactly the staleness bound for wildcard resolution. Turning it
+off, which S27 and H18 both do for measurement reasons, would make wildcards permanently stale in
+production.
+
+Pinned by `DescriptorFreshnessContractIT`, with refresh disabled outright rather than left at its default,
+so neither arm can pass by being slower than a one second interval.
+
 ## H.11 Phasing, each phase falsifiable
 
 **H1. Audit.** Classify all 41 direct enumerations as convertible, refusable, or blocking. F1's precedent:
