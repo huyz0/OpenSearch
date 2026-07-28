@@ -85,6 +85,16 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
      */
     private final long mappingGeneration;
 
+    /**
+     * When the index was created, which pagination orders by.
+     *
+     * <p>Carried because {@code IndexPaginationStrategy} orders by creation date then name, and a gated
+     * index that cannot express that ordering cannot appear in a page at all (H16). Unlike the
+     * suspended-shard field this replaced, it is written at creation from {@link IndexMetadata}, so it is
+     * not another wire field with no producer.
+     */
+    private final long creationDate;
+
     public IndexDescriptor(
         String name,
         String uuid,
@@ -98,7 +108,8 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         boolean hidden,
         boolean remoteSnapshot,
         boolean warm,
-        long mappingGeneration
+        long mappingGeneration,
+        long creationDate
     ) {
         this.name = Objects.requireNonNull(name, "descriptor needs a name");
         this.uuid = Objects.requireNonNull(uuid, "descriptor needs a uuid, since placement hashes it");
@@ -113,6 +124,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         this.remoteSnapshot = remoteSnapshot;
         this.warm = warm;
         this.mappingGeneration = mappingGeneration;
+        this.creationDate = creationDate;
     }
 
     /**
@@ -136,7 +148,8 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
             indexMetadata.isHidden(),
             indexMetadata.isRemoteSnapshot(),
             indexMetadata.isWarmIndex(),
-            0L
+            0L,
+            indexMetadata.getCreationDate()
         );
     }
 
@@ -154,6 +167,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         this.remoteSnapshot = in.readBoolean();
         this.warm = in.readBoolean();
         this.mappingGeneration = in.readVLong();
+        this.creationDate = in.readLong();
     }
 
     @Override
@@ -171,6 +185,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         out.writeBoolean(remoteSnapshot);
         out.writeBoolean(warm);
         out.writeVLong(mappingGeneration);
+        out.writeLong(creationDate);
     }
 
     /** The index, which is what placement hashes and what every shard id is built from. */
@@ -250,6 +265,11 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         return mappingGeneration;
     }
 
+    /** When the index was created, which is what pagination orders by. */
+    public long creationDate() {
+        return creationDate;
+    }
+
     private IndexDescriptor copyWith(long generation) {
         return new IndexDescriptor(
             name,
@@ -264,7 +284,8 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
             hidden,
             remoteSnapshot,
             warm,
-            generation
+            generation,
+            creationDate
         );
     }
 
@@ -288,7 +309,8 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
             hidden,
             remoteSnapshot,
             warm,
-            mappingGeneration
+            mappingGeneration,
+            creationDate
         );
     }
 

@@ -10,6 +10,8 @@ package org.opensearch.action.pagination;
 
 import org.opensearch.OpenSearchParseException;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
+import org.opensearch.cluster.metadata.IndexDescriptor;
 import org.opensearch.cluster.metadata.IndexMetadata;
 
 import java.util.ArrayList;
@@ -60,13 +62,100 @@ public class IndexPaginationStrategy implements PaginationStrategy<String> {
         // Trim sortedIndicesList to get the list of indices metadata to be sent as response
         List<IndexMetadata> metadataSublist = getMetadataSubList(sortedIndices, pageParams.getSize());
         // Get list of index names from the trimmed metadataSublist
-        this.requestedIndices = metadataSublist.stream().map(metadata -> metadata.getIndex().getName()).collect(Collectors.toList());
+        List<String> clusterStateNames = metadataSublist.stream()
+            .map(metadata -> metadata.getIndex().getName())
+            .collect(Collectors.toList());
+        this.requestedIndices = mergeGatedIndices(
+            clusterStateNames,
+            metadataSublist,
+            pageParams,
+            Objects.isNull(requestedToken) ? null : requestedToken.lastIndexName,
+            Objects.isNull(requestedToken) ? 0L : requestedToken.lastIndexCreationTime
+        );
         this.pageToken = getResponseToken(
             pageParams.getSize(),
             sortedIndices.size(),
             metadataSublist.isEmpty() ? null : metadataSublist.get(metadataSublist.size() - 1)
         );
     }
+
+    /**
+     * Folds one page of gated indices into the page built from cluster state.
+     *
+     * <p>H16 recorded why this is a merge rather than a bigger sort. A gated index is not in
+     * {@code metadata().indices()} at all, so the page was silently missing it, and the repair anyone
+     * reaches for first, adding gated indices to the existing sort, would have made the cost problem worse:
+     * that sort already walks the whole population to produce one page.
+     *
+     * <p>What makes a merge affordable is an asymmetry the design guarantees rather than hopes for. The
+     * cluster state side is bounded by the number of <em>ordinary</em> indices, which is small by
+     * construction because the massive population is exactly the part that is gated. The gated side is
+     * bounded by the page size, because a pager is asked for a page. So the work is ordinary-count plus
+     * page-size, with the hundred million appearing in neither term.
+     *
+     * <p>With no pager installed this returns the cluster state page unchanged, so a cluster that has never
+     * gated an index behaves exactly as before.
+     */
+    private static List<String> mergeGatedIndices(
+        List<String> clusterStateNames,
+        List<IndexMetadata> clusterStatePage,
+        PageParams pageParams,
+        String lastIndexName,
+        long lastIndexCreationTime
+    ) {
+        if (AbsentIndexDescriptorSuppliers.isPagerRegistered() == false) {
+            return clusterStateNames;
+        }
+        boolean ascending = PageParams.PARAM_ASC_SORT_VALUE.equals(pageParams.getSort());
+        List<IndexDescriptor> gatedPage = AbsentIndexDescriptorSuppliers.page(
+            lastIndexName,
+            lastIndexCreationTime,
+            ascending,
+            pageParams.getSize()
+        );
+        if (gatedPage.isEmpty()) {
+            return clusterStateNames;
+        }
+
+        // Both sides are already in page order, so this is a merge of two sorted runs rather than a sort of
+        // their union. Sorting the union would reintroduce the cost this exists to avoid.
+        List<Sortable> merged = new ArrayList<>(clusterStatePage.size() + gatedPage.size());
+        for (IndexMetadata metadata : clusterStatePage) {
+            merged.add(new Sortable(metadata.getIndex().getName(), metadata.getCreationDate()));
+        }
+        for (IndexDescriptor descriptor : gatedPage) {
+            merged.add(new Sortable(descriptor.name(), descriptor.creationDate()));
+        }
+        merged.sort(ascending ? SORTABLE_ASC : SORTABLE_DESC);
+
+        List<String> page = new ArrayList<>(pageParams.getSize());
+        for (Sortable each : merged) {
+            if (page.size() >= pageParams.getSize()) {
+                break;
+            }
+            page.add(each.name);
+        }
+        return page;
+    }
+
+    /** One entry's position in page order, which is all the merge needs from either side. */
+    private static final class Sortable {
+        private final String name;
+        private final long creationDate;
+
+        private Sortable(String name, long creationDate) {
+            this.name = name;
+            this.creationDate = creationDate;
+        }
+    }
+
+    private static final Comparator<Sortable> SORTABLE_ASC = (a, b) -> a.creationDate == b.creationDate
+        ? a.name.compareTo(b.name)
+        : Long.compare(a.creationDate, b.creationDate);
+
+    private static final Comparator<Sortable> SORTABLE_DESC = (a, b) -> a.creationDate == b.creationDate
+        ? b.name.compareTo(a.name)
+        : Long.compare(b.creationDate, a.creationDate);
 
     private static List<IndexMetadata> getEligibleIndices(
         ClusterState clusterState,

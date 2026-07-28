@@ -11,10 +11,14 @@ package org.opensearch.action.pagination;
 import org.opensearch.Version;
 import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
+import org.opensearch.cluster.metadata.IndexDescriptor;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.test.OpenSearchTestCase;
+
+import java.util.List;
 
 /**
  * H16. Whether a paginated listing can see an index that cluster state does not hold.
@@ -34,13 +38,16 @@ import org.opensearch.test.OpenSearchTestCase;
  * because a fix that made gated indices visible by adding them to the same sort would make the cost
  * problem worse while appearing to solve the correctness one.
  *
- * <p>This pins the gap rather than a hypothetical fix, in the shape that worked for H4c, H8a and H9a: it
- * fails the day someone closes it, and the message says what to decide then.
+ * <p><b>Closed by folding one page of gated indices into the page built from cluster state.</b> A merge
+ * rather than a bigger sort, because the two problems constrain each other: the cluster state side is
+ * bounded by the ordinary index count, which is small by construction since the massive population is
+ * exactly the gated part, and the gated side is bounded by the page size because a pager is asked for a
+ * page. The hundred million appears in neither term.
  */
 public class GatedIndexPaginationGapTests extends OpenSearchTestCase {
 
-    /** The gap. A gated index is missing from the page and nothing says so. */
-    public void testAGatedIndexIsInvisibleToPagination() {
+    /** With no pager installed, nothing changes, so a cluster that never gated an index is untouched. */
+    public void testWithoutAPagerOnlyClusterStateIndicesAppear() {
         // Two ordinary indices in cluster state, standing in for a population that also contains gated
         // indices which are not in the map at all.
         ClusterState state = ClusterState.builder(ClusterName.DEFAULT)
@@ -49,16 +56,72 @@ public class GatedIndexPaginationGapTests extends OpenSearchTestCase {
 
         IndexPaginationStrategy strategy = new IndexPaginationStrategy(new PageParams(null, PageParams.PARAM_ASC_SORT_VALUE, 10), state);
 
+        assertEquals("only the two cluster state indices", 2, strategy.getRequestedEntities().size());
+    }
+
+    /**
+     * The gap H16 pinned, now closed. A gated index appears in the page alongside ordinary ones.
+     */
+    public void testAGatedIndexAppearsInThePage() {
+        AbsentIndexDescriptorSuppliers.registerPager((after, afterDate, asc, size) -> List.of(descriptor("gated-a", 5L)));
+        ClusterState state = twoOrdinaryIndices();
+
+        IndexPaginationStrategy strategy = new IndexPaginationStrategy(new PageParams(null, PageParams.PARAM_ASC_SORT_VALUE, 10), state);
+
+        assertEquals("the gated index must be in the page", 3, strategy.getRequestedEntities().size());
+        assertTrue("by name", strategy.getRequestedEntities().contains("gated-a"));
+        assertTrue("and the ordinary ones must still be there", strategy.getRequestedEntities().contains("ordinary-a"));
+    }
+
+    /**
+     * The property that rules out the fix anyone reaches for first. The pager is asked for a page, never
+     * for the population, so folding gated indices in does not reintroduce the cost H16 recorded.
+     */
+    public void testThePagerIsAskedForAPageAndNotThePopulation() {
+        java.util.concurrent.atomic.AtomicInteger requestedSize = new java.util.concurrent.atomic.AtomicInteger(-1);
+        AbsentIndexDescriptorSuppliers.registerPager((after, afterDate, asc, size) -> {
+            requestedSize.set(size);
+            return List.of(descriptor("gated-a", 5L));
+        });
+
+        new IndexPaginationStrategy(new PageParams(null, PageParams.PARAM_ASC_SORT_VALUE, 7), twoOrdinaryIndices());
+
         assertEquals(
-            "pagination can only ever see indices present in cluster state, so a gated index is missing "
-                + "from the page with no exception and no signal. Closing this means either resolving the "
-                + "page through the descriptor index or refusing the request for a cluster containing gated "
-                + "indices, and adding them to the existing sort is not an option: that sort already walks "
-                + "the whole population to produce one page",
-            2,
-            strategy.getRequestedEntities().size()
+            "the pager must be asked for the page size and nothing more. Asking it for the population is "
+                + "the fix H16 warned against: it would make gated indices visible while making the cost "
+                + "problem worse",
+            7,
+            requestedSize.get()
         );
-        assertFalse("and the page is well formed, which is what makes the omission silent", strategy.getRequestedEntities().isEmpty());
+    }
+
+    /** The page respects its size even when both sides together exceed it. */
+    public void testTheMergedPageIsStillBoundedByTheRequestedSize() {
+        AbsentIndexDescriptorSuppliers.registerPager(
+            (after, afterDate, asc, size) -> List.of(descriptor("gated-a", 1L), descriptor("gated-b", 2L))
+        );
+
+        IndexPaginationStrategy strategy = new IndexPaginationStrategy(
+            new PageParams(null, PageParams.PARAM_ASC_SORT_VALUE, 2),
+            twoOrdinaryIndices()
+        );
+
+        assertEquals("a page of two must stay a page of two", 2, strategy.getRequestedEntities().size());
+    }
+
+    /**
+     * A pager that throws must leave the ordinary page intact. A listing missing its gated indices is bad;
+     * a listing that fails outright because the descriptor index hiccuped is worse.
+     */
+    public void testAFailingPagerLeavesTheOrdinaryPageIntact() {
+        AbsentIndexDescriptorSuppliers.registerPager((after, afterDate, asc, size) -> { throw new IllegalStateException("pager down"); });
+
+        IndexPaginationStrategy strategy = new IndexPaginationStrategy(
+            new PageParams(null, PageParams.PARAM_ASC_SORT_VALUE, 10),
+            twoOrdinaryIndices()
+        );
+
+        assertEquals("the ordinary indices must still be listed", 2, strategy.getRequestedEntities().size());
     }
 
     /**
@@ -82,6 +145,36 @@ public class GatedIndexPaginationGapTests extends OpenSearchTestCase {
 
         IndexPaginationStrategy strategy = new IndexPaginationStrategy(new PageParams(null, PageParams.PARAM_ASC_SORT_VALUE, 1), state);
         assertEquals("while the page itself is one entry", 1, strategy.getRequestedEntities().size());
+    }
+
+    @org.junit.After
+    public void clearPager() {
+        AbsentIndexDescriptorSuppliers.registerPager(null);
+    }
+
+    private static ClusterState twoOrdinaryIndices() {
+        return ClusterState.builder(ClusterName.DEFAULT)
+            .metadata(Metadata.builder().put(indexMetadata("ordinary-a"), false).put(indexMetadata("ordinary-b"), false).build())
+            .build();
+    }
+
+    private static IndexDescriptor descriptor(String name, long creationDate) {
+        return new IndexDescriptor(
+            name,
+            name + "-uuid",
+            1,
+            0,
+            true,
+            IndexDescriptor.State.OPEN,
+            List.of(),
+            Version.CURRENT.id,
+            false,
+            false,
+            false,
+            false,
+            0L,
+            creationDate
+        );
     }
 
     private static IndexMetadata indexMetadata(String name) {

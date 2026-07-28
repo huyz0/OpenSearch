@@ -409,13 +409,25 @@ produce one page, so at a hundred million indices the sort is the request rather
 That rules out the obvious repair: making gated indices visible by adding them to the same sort would make
 the cost problem dramatically worse while appearing to solve the correctness one.
 
-So the choice is between resolving the page through the descriptor index, which needs an ordering the
-descriptor index can produce cheaply and is the same question wildcard pagination raises, and refusing the
-request outright for a cluster containing gated indices. Both are product decisions rather than
-implementation ones, and they belong next to the wildcard freshness contract that is already open.
+**Closed by H17, and calling it a product decision was wrong.** The choice looked like one between
+resolving the page through the descriptor index and refusing the request for gated clusters, pending an
+ordering the descriptor index could produce cheaply. That ordering had already been measured: S24 paged by
+sorted name with `search_after` at roughly 33 ms per thousand names. There was nothing left to decide.
 
-Pinned by `GatedIndexPaginationGapTests`, which asserts the measured behaviour and says what to decide the
-day someone closes it.
+The page is now a merge of two already-sorted runs rather than a sort of their union. What makes it
+affordable is an asymmetry the design guarantees rather than hopes for: the cluster state side is bounded
+by the number of *ordinary* indices, small by construction because the massive population is exactly the
+part that is gated, and the gated side is bounded by the page size, because a pager is asked for a page.
+The hundred million appears in neither term.
+
+`IndexDescriptor` gained a `creationDate` so a gated index can express the `(creationDate, name)` ordering
+pagination uses. Unlike the suspended-shard field deleted in H15, it is written at creation from
+`IndexMetadata`, which was checked deliberately rather than assumed.
+
+Mutation tested both ways. Disabling the merge kills the two correctness tests; asking the pager for
+`Integer.MAX_VALUE` instead of the page size kills only the cost test, which is the guard against the
+repair this section warned about. A fix that made gated indices visible while quietly restoring the
+population-sized cost would pass every correctness test and fail that one alone.
 
 ## H.11 Phasing, each phase falsifiable
 

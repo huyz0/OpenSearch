@@ -107,6 +107,7 @@ public class DanglingIndicesTombstoneTests extends OpenSearchTestCase {
             false,
             false,
             false,
+            0L,
             0L
         );
     }

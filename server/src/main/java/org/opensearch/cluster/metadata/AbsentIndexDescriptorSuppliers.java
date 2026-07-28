@@ -99,6 +99,61 @@ public final class AbsentIndexDescriptorSuppliers {
      * ten-index request into ten sequential lookups, which is the shape of mistake that made wake and
      * sleep cost a publication each before they were batched.
      */
+    /**
+     * Supplies one page of gated indices in pagination order.
+     *
+     * <p>The whole point is the {@code size} argument. H16 measured that pagination sorts the entire
+     * population to produce one page, so making gated indices visible by folding them into that sort would
+     * have made the cost problem worse while appearing to fix the correctness one. A pager is asked for a
+     * page and returns a page, which is what the descriptor index can actually do cheaply: S24 measured
+     * paging by sorted name with {@code search_after} at roughly 33 ms per thousand names.
+     */
+    @FunctionalInterface
+    public interface DescriptorPager {
+        /**
+         * The next {@code size} gated indices after the given position, in the given order.
+         *
+         * @param afterName the last name of the previous page, or null for the first page
+         * @param afterCreationDate the last creation date of the previous page, ignored when afterName is null
+         * @param ascending whether the order is ascending
+         * @param size how many to return, which bounds the work
+         */
+        List<IndexDescriptor> page(String afterName, long afterCreationDate, boolean ascending, int size);
+    }
+
+    private static final AtomicReference<DescriptorPager> PAGER = new AtomicReference<>();
+
+    /** Installs the pager. Registering null clears it, which is how a test restores the default. */
+    public static void registerPager(DescriptorPager pager) {
+        PAGER.set(pager);
+    }
+
+    /** Whether anything can supply gated pages. With nothing installed, pagination behaves as before. */
+    public static boolean isPagerRegistered() {
+        return PAGER.get() != null;
+    }
+
+    /**
+     * One page of gated indices, or empty when nothing is installed or the pager fails.
+     *
+     * <p>Failing to empty rather than throwing matches how a failing supplier is treated everywhere else in
+     * this class. It does mean a broken pager silently returns short pages, which is the failure mode this
+     * area exists to be suspicious of, so callers that need to distinguish the two should ask {@link
+     * #isPagerRegistered()} rather than inferring it from an empty result.
+     */
+    public static List<IndexDescriptor> page(String afterName, long afterCreationDate, boolean ascending, int size) {
+        DescriptorPager pager = PAGER.get();
+        if (pager == null || size <= 0) {
+            return List.of();
+        }
+        try {
+            List<IndexDescriptor> page = pager.page(afterName, afterCreationDate, ascending, size);
+            return page == null ? List.of() : page;
+        } catch (Exception e) {
+            return List.of();
+        }
+    }
+
     public static List<IndexDescriptor> supplyAll(List<String> indexNames) {
         if (isRegistered() == false) {
             return List.of();
