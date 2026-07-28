@@ -36,9 +36,13 @@ import java.util.concurrent.atomic.AtomicLong;
  * approaches one entry per index, which is precisely the residency ceiling Area H exists to remove. The
  * reasoning was inverted by the very property that makes the feature worth having.
  *
- * <p>So it is a fixed-capacity cache over the durable record on {@link
- * org.opensearch.cluster.metadata.IndexDescriptor}, holding the active working set rather than the whole
- * sleeping population. An index with nothing asleep is still removed rather than left holding an empty
+ * <p>So it is a fixed-capacity cache holding the active working set rather than the whole sleeping
+ * population. It is intended to sit over a durable record on {@link
+ * org.opensearch.cluster.metadata.IndexDescriptor}, which carries a suspended-shard set for exactly this
+ * purpose. <b>Nothing writes that record yet</b> (H13), so today this state is node-local and volatile: a
+ * full-cluster restart wakes every sleeping shard, and they sleep again on the next tick that finds them
+ * idle. Stated rather than implied, because the eviction argument below reads as stronger than it is if
+ * the durable half is assumed to exist. An index with nothing asleep is still removed rather than left holding an empty
  * set, which keeps the common case out of the cache entirely.
  *
  * <p><b>Why eviction is safe here, which is not the argument H11 could make.</b> Evicting a mapping costs
@@ -63,8 +67,9 @@ public final class GatedShardSuspensionRegistry {
 
     /**
      * How many indices one node tracks suspensions for. A working-set size rather than a correctness
-     * parameter: too small wakes idle shards a tick early and costs residency, it cannot lose data,
-     * because the descriptor holds the durable record.
+     * parameter: too small wakes idle shards, which the next tick puts back to sleep. It costs residency
+     * and a re-suspension, not data, because a suspension is a derived decision that scale-to-zero
+     * recomputes rather than a fact only this map knows.
      */
     public static final int DEFAULT_CAPACITY = 50_000;
 

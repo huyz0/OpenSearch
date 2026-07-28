@@ -103,6 +103,10 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
      *
      * <p>Bounded by shard count rather than index count, so it does not reintroduce the residency problem
      * this area exists to remove.
+     *
+     * <p><b>Not yet written by any production path</b> (H13). Suspension is recorded node-locally by the
+     * plugin's registry, which is where placement reads it. This field is the durable home that registry
+     * is meant to sit over, and until something writes it a restart wakes every sleeping shard.
      */
     private final Set<Integer> suspendedShards;
 

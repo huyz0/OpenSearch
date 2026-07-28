@@ -644,3 +644,64 @@ a shape to test against.
 
 **Hot-tenant policy.** K=3 gives room to spread a hot shard but nothing decides when a tenant is hot
 enough to warrant an override. Needs a product answer.
+
+## Review: where the 100M goal actually stands
+
+Written after Area H's task list emptied, against the three ceilings rather than against the task list,
+because a finished task list is not evidence of a cleared ceiling.
+
+### Ceiling 1, placement: cleared
+
+Area C. Nothing here changed it and nothing found since has challenged it.
+
+### Ceiling 2, residency: cleared in mechanism, at the scale measured
+
+A thousand gated creations leave zero metadata entries and zero routing entries (S22). Zero is the right
+kind of claim: it does not degrade with population the way an improvement would.
+
+Two things nearly undid it, both found in one review pass and neither by a failing test. The mapping cache
+held an entry with a full field map for every index a node had ever served (H11). The suspension registry
+held an entry for every sleeping shard, which under scale-to-zero is most of the cluster (H12). Both moved
+the ceiling from the cluster manager to the data nodes rather than removing it, and both were invisible:
+nothing was slow, nothing threw, a node just used more memory the longer it ran.
+
+That pattern is the finding worth carrying forward. Removing per-index state from one place creates
+pressure to cache it in another, and the replacement is not audited the way the original was.
+
+### Ceiling 3, throughput: cleared, and the number that was quoted was the wrong one
+
+Gated creation bypasses `Metadata.build()`: 101,542x at fifty thousand indices, flat against population
+(S22). End to end, including the descriptor write that S22 did not measure, 20,577 indices per second,
+which puts filling 100M at roughly 1.4 hours on one small cluster (S26). Creation throughput is not a
+ceiling, and it was the plausible next one.
+
+### What is not established
+
+**Nothing has run above fifty thousand indices.** Every measurement here extrapolates. The curves are flat
+where flatness is the claim, which is the strongest evidence available without a fleet, but flat to 50k is
+not flat to 100M and should not be quoted as though it were.
+
+**The enumeration surface is not fully converted.** Of the 41 direct enumerations, 16 vanish with the map
+and about 5 need conversion. Not all conversions are done, and an unconverted enumeration on a request path
+is a full scan of the index population.
+
+**Wildcards have no pagination contract.** Returning ten thousand names costs 55x counting them (327.5 ms
+against 5.9 ms, S24). A tenant with a hundred thousand indices running `logs-*` is a different operation
+from anything measured, and the contract question belongs next to the freshness question rather than being
+discovered in production.
+
+**Suspension has no durable record** (H13). `IndexDescriptor` carries the field and nothing writes it, so a
+full-cluster restart wakes every sleeping shard. They sleep again on the next idle tick, so this is a
+thundering-herd risk at restart rather than data loss, but the design is described in two places as though
+the durable half exists.
+
+**Two product decisions remain open**: whether serverless-only is a formal precondition, and fork versus
+upstream.
+
+### Honest answer
+
+The architecture no longer has a known ceiling below 100M, which is a different and weaker statement than
+having reached 100M. Every mechanism the plan calls for exists and is tested at the scale a test cluster
+allows. What separates this from a demonstrated result is a run at a population two to three orders of
+magnitude larger than anything measured, and that is now the single most valuable thing to do next.
+
