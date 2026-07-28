@@ -1571,9 +1571,9 @@ wrong conclusion once already in this project.
 | 1,000,000 | 18,853 | 0.4070 |
 
 **Lookup ratio 0.96x across a twentyfold population increase.** That is the number this run existed to
-produce. **Superseded by S28**, which found 1.88x over the next decade: the flatness here is real for this
-range and does not continue, so this number must not be quoted as evidence that lookup is
-population-independent. A point lookup that grew with population would mean the descriptor index had become the new
+produce. **Refined by S28 and S29.** S28 found 1.88x over the next decade, and S29 showed that growth is segment
+count rather than population: at equal segment counts, one million and ten million differ by 1.05x. The
+flatness reported here is real, and it holds at scale only where merge policy keeps segment count bounded. A point lookup that grew with population would mean the descriptor index had become the new
 ceiling, which is the single failure that would invalidate the whole approach, and it does not.
 
 Creation appears 1.58x faster at the larger population. That is warmup dominating the first batch, the
@@ -1620,6 +1620,10 @@ That is true of a hundred million and it was not true of ten, so ten was run.
 **Creation is flat.** 1.05x across a tenfold population increase, consistent with S26 and S27. At this rate
 a hundred million indices is about 70 minutes of writing.
 
+> **Superseded in part by S29.** The lookup growth reported below is real but is driven by segment count,
+> not by population. At equal segment counts the same decade costs 1.05x. Read S29 before quoting the
+> 1.88x figure.
+
 ### The lookup is not flat, and every previous claim that it was came from too narrow a range
 
 S27 measured 0.96x from fifty thousand to a million and concluded flatness. Across the next decade the
@@ -1650,4 +1654,52 @@ maximum and Gradle appends it after the plugin's arguments.
 Ten million is one order of magnitude from the target rather than two. It is not a demonstration at a
 hundred million, and the single-JVM cluster with leak detection disabled remains a shape measurement
 rather than a capacity figure.
+
+## S29 (H22): the lookup growth is merge policy, and at equal segment counts it is flat
+
+S28 measured point lookup rising 1.88x from one million descriptors to ten million and concluded the
+extrapolation to 100M had to rest on a growth rate rather than a flat curve. That conclusion is wrong, and
+this is what replaces it.
+
+Two causes were consistent with S28's number and they have opposite consequences. A get by id consults
+every segment that could hold the id, so more segments means more work per lookup, and that is controllable.
+A larger term dictionary costs more to search, logarithmically, and that is not. Force merging separates
+them cleanly because it collapses segments without shrinking the dictionary.
+
+| population | segments | lookup before | lookup after | ratio |
+|---|---|---|---|---|
+| 1,000,000 | 29 → 5 | 0.3755 ms | 0.3044 ms | 0.81 |
+| 10,000,000 | 39 → 5 | 0.5314 ms | 0.3199 ms | 0.60 |
+
+**The row that matters is the comparison between the two after-columns.** At five segments, one million
+descriptors cost 0.3044 ms and ten million cost 0.3199 ms. That is **1.05x across a tenfold population
+increase**, which is flat by any reading.
+
+So the growth S28 found is an artefact of merge policy rather than a property of the index. The term
+dictionary contribution across that decade is roughly five percent, not eighty-eight.
+
+### What this changes
+
+**100M lookup is a design parameter, not a fact to be accepted.** Keeping segment count bounded, by merge
+policy or by a rollover scheme that keeps each descriptor index small, holds lookup near 0.32 ms
+irrespective of population. The plan's extrapolation is back on a flat curve, but for a stated reason and
+with an operational obligation attached rather than as an assumption.
+
+**The obligation is real and belongs next to the refresh interval.** H18 made the descriptor index's
+refresh interval API-visible because it bounds wildcard staleness. This makes its merge policy equally
+load-bearing, because it bounds lookup latency. Both are now things a deployment can get wrong in a way
+that looks like the architecture failing.
+
+### Why the one million arm could not settle it, which was my error
+
+The same experiment at one million alone gave 0.81 and was reported as inconclusive. It could not be
+conclusive: the growth being explained happens between one million and ten million, so the experiment had
+to run where the effect lives. The justification given at the time, that shape does not need size, was
+wrong for this question.
+
+### What it still does not say
+
+Both arms are single-JVM clusters. The claim is that segment count rather than population drives lookup,
+measured across one decade. It is not a demonstration at a hundred million, and a deployment that lets
+segments grow unbounded will see S28's curve rather than this one.
 
