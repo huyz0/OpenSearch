@@ -458,6 +458,27 @@ production.
 Pinned by `DescriptorFreshnessContractIT`, with refresh disabled outright rather than left at its default,
 so neither arm can pass by being slower than a one second interval.
 
+## H.10h Cluster stats, the same pair of problems and the least visible instance
+
+Found by sweeping request paths for enumerations after H17. `MappingStats.of` walks `state.metadata()`
+building field usage counts across every index, which is the H16 pairing again: an enumeration that was
+correct while every index lived in cluster state.
+
+The cost half is familiar. The correctness half is worse than pagination's, and that is the reason to
+record it separately. A paginated listing that omits an index at least returns something a careful caller
+could notice. A statistic that omits it returns a plausible number that is simply wrong, and nothing in
+the response distinguishes it from a correct one. Tenth instance of this area's signature failure and the
+least visible of them.
+
+**The fix follows from the architecture rather than needing a product decision**, which is worth saying
+explicitly because the previous two gaps were both mislabelled that way and both turned out to be settled
+by measurements already taken. A gated population's mapping stats have to come from an aggregate over
+`MappingGenerationStore`, because per-index enumeration is exactly what this area exists to remove and
+making the enumeration faster does not change that.
+
+Pinned by `GatedMappingStatsGapTests` rather than fixed. The aggregate is a larger piece of work than the
+pin, and shipping the pin first is what stops the gap being rediscovered as a production surprise.
+
 ## H.11 Phasing, each phase falsifiable
 
 **H1. Audit.** Classify all 41 direct enumerations as convertible, refusable, or blocking. F1's precedent:
