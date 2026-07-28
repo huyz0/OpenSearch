@@ -10,6 +10,8 @@ package org.opensearch.serverless.storage.nameindex;
 
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.util.Locale;
+
 /**
  * A18. Rebuild cost and peak memory, which the reversed index changed and nothing had measured.
  *
@@ -32,7 +34,7 @@ public class NameIndexRebuildCostTests extends OpenSearchTestCase {
 
         long steadyState = index.ramBytesUsed();
         for (int i = 0; i < NAME_COUNT / 20; i++) {
-            index.create("added-" + String.format("%08d", i), uuid(i), IndexNameEntry.STATUS_OPEN);
+            index.create("added-" + String.format(Locale.ROOT, "%08d", i), uuid(i), IndexNameEntry.STATUS_OPEN);
         }
 
         forceGc();
@@ -55,7 +57,7 @@ public class NameIndexRebuildCostTests extends OpenSearchTestCase {
             elapsedMillis,
             steadyState / (1024 * 1024),
             grownDuring / (1024 * 1024),
-            String.format("%.2f", churnRatio),
+            String.format(Locale.ROOT, "%.2f", churnRatio),
             (settled - before) / (1024 * 1024)
         );
 
@@ -88,7 +90,7 @@ public class NameIndexRebuildCostTests extends OpenSearchTestCase {
             "forward {} MB, forward plus reversed {} MB, ratio {}",
             forward.ramBytesUsed() / (1024 * 1024),
             withTwin.ramBytesUsed() / (1024 * 1024),
-            String.format("%.2f", ratio)
+            String.format(Locale.ROOT, "%.2f", ratio)
         );
 
         assertTrue("expected close to 2x, got " + ratio, ratio > 1.8 && ratio < 2.2);
@@ -105,7 +107,7 @@ public class NameIndexRebuildCostTests extends OpenSearchTestCase {
     public void testWritesDuringARebuildAreNeitherLostNorDuplicated() throws Exception {
         NameIndex index = new NameIndex(build(50_000));
         for (int i = 0; i < 500; i++) {
-            index.create("pre-" + String.format("%05d", i), uuid(i), IndexNameEntry.STATUS_OPEN);
+            index.create("pre-" + String.format(Locale.ROOT, "%05d", i), uuid(i), IndexNameEntry.STATUS_OPEN);
         }
 
         java.util.concurrent.atomic.AtomicBoolean stop = new java.util.concurrent.atomic.AtomicBoolean();
@@ -113,7 +115,7 @@ public class NameIndexRebuildCostTests extends OpenSearchTestCase {
         Thread writer = new Thread(() -> {
             int i = 0;
             while (stop.get() == false) {
-                index.create("during-" + String.format("%06d", i), uuid(i), IndexNameEntry.STATUS_OPEN);
+                index.create("during-" + String.format(Locale.ROOT, "%06d", i), uuid(i), IndexNameEntry.STATUS_OPEN);
                 written.incrementAndGet();
                 i++;
             }
@@ -126,12 +128,12 @@ public class NameIndexRebuildCostTests extends OpenSearchTestCase {
 
         // Everything written before and during the rebuild must still resolve, exactly once each.
         for (int i = 0; i < 500; i++) {
-            assertNotNull("pre-rebuild write lost", index.lookup("pre-" + String.format("%05d", i)));
+            assertNotNull("pre-rebuild write lost", index.lookup("pre-" + String.format(Locale.ROOT, "%05d", i)));
         }
         int during = written.get();
         assertTrue("the writer should have made progress", during > 0);
         for (int i = 0; i < during; i++) {
-            assertNotNull("write during rebuild lost: during-" + i, index.lookup("during-" + String.format("%06d", i)));
+            assertNotNull("write during rebuild lost: during-" + i, index.lookup("during-" + String.format(Locale.ROOT, "%06d", i)));
         }
 
         java.util.List<String> all = new java.util.ArrayList<>();

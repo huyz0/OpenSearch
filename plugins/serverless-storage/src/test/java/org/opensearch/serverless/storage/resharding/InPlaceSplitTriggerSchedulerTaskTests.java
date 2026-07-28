@@ -241,15 +241,7 @@ public class InPlaceSplitTriggerSchedulerTaskTests extends OpenSearchTestCase {
                 ActionListener<Response> listener
             ) {
                 if (action == ShardSplitCandidatesAction.INSTANCE) {
-                    ShardSplitCandidateEntry candidate = new ShardSplitCandidateEntry(
-                        "idx-uuid",
-                        0,
-                        "my-index",
-                        99_999L,
-                        0L,
-                        true,
-                        false
-                    );
+                    ShardSplitCandidateEntry candidate = new ShardSplitCandidateEntry("idx-uuid", 0, "my-index", 99_999L, 0L, true, false);
                     ShardSplitCandidatesResponse response = new ShardSplitCandidatesResponse(
                         new org.opensearch.cluster.ClusterName("test"),
                         List.<NodeShardSplitCandidatesResponse>of(),

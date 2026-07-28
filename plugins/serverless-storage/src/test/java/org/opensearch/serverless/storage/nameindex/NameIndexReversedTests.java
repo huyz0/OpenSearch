@@ -12,6 +12,7 @@ import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.stream.Collectors;
 
 /**
@@ -134,10 +135,10 @@ public class NameIndexReversedTests extends OpenSearchTestCase {
         NameIndex index = new NameIndex(base(generated(200, "-logs")));
 
         for (int i = 0; i < 50; i++) {
-            index.create(entry("added-" + String.format("%03d", i) + "-logs"));
+            index.create(entry("added-" + String.format(Locale.ROOT, "%03d", i) + "-logs"));
         }
         for (int i = 0; i < 50; i++) {
-            index.delete("tenant-" + String.format("%03d", i) + "-logs");
+            index.delete("tenant-" + String.format(Locale.ROOT, "%03d", i) + "-logs");
         }
 
         List<String> viaSuffix = names(index.resolve("*-logs"));
@@ -211,7 +212,7 @@ public class NameIndexReversedTests extends OpenSearchTestCase {
     private static String[] generated(int count, String suffix) {
         List<String> names = new ArrayList<>(count);
         for (int i = 0; i < count; i++) {
-            names.add("tenant-" + String.format("%03d", i) + suffix);
+            names.add("tenant-" + String.format(Locale.ROOT, "%03d", i) + suffix);
         }
         return names.toArray(new String[0]);
     }

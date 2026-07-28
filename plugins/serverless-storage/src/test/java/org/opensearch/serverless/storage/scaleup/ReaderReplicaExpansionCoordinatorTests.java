@@ -266,14 +266,7 @@ public class ReaderReplicaExpansionCoordinatorTests extends OpenSearchTestCase {
 
     public void testHeadroomExhaustionLeavesTheStreakIntactForTheNextTick() {
         java.util.concurrent.atomic.AtomicInteger headroom = new java.util.concurrent.atomic.AtomicInteger(0);
-        ReaderReplicaExpansionCoordinator coordinator = new ReaderReplicaExpansionCoordinator(
-            client,
-            5,
-            1,
-            0,
-            () -> false,
-            headroom::get
-        );
+        ReaderReplicaExpansionCoordinator coordinator = new ReaderReplicaExpansionCoordinator(client, 5, 1, 0, () -> false, headroom::get);
         ScaleUpCandidateEntry candidate = new ScaleUpCandidateEntry("uuid-1", 0, "my-index", 900L, 1, true);
 
         // requiredConsecutiveTicks=1 -- the candidate would qualify immediately if headroom allowed

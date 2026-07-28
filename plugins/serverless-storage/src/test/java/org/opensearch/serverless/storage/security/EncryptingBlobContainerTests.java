@@ -251,7 +251,11 @@ public class EncryptingBlobContainerTests extends OpenSearchTestCase {
             assertArrayEquals(plaintext, in.readAllBytes());
         }
 
-        assertEquals("a full-object read must issue exactly one delegate call, not a header fetch plus a separate body fetch", 1, recording.unrangedReadCalls);
+        assertEquals(
+            "a full-object read must issue exactly one delegate call, not a header fetch plus a separate body fetch",
+            1,
+            recording.unrangedReadCalls
+        );
         assertEquals("must not fall back to any ranged delegate read either", 0, recording.rangedReadCalls.size());
     }
 

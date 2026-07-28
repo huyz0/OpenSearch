@@ -15,6 +15,7 @@ import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 /**
  * C11. The claim the whole area exists to make, as a number rather than an argument.
@@ -66,7 +67,7 @@ public class ComputedPlacementCostTests extends OpenSearchTestCase {
                 indexCount,
                 shards,
                 elapsedNanos / 1_000_000,
-                String.format("%.0f", perShardNanos)
+                String.format(Locale.ROOT, "%.0f", perShardNanos)
             );
 
             if (i == 0) {
@@ -80,7 +81,7 @@ public class ComputedPlacementCostTests extends OpenSearchTestCase {
         // increase. Flat means the ratio stays near 1; the bound is loose because a unit test on a
         // shared machine is noisy, and anything under 2x already separates this from a superlinear curve.
         double ratio = lastPerShard / firstPerShard;
-        logger.info("per-shard cost ratio across a 16x population increase: {}", String.format("%.2f", ratio));
+        logger.info("per-shard cost ratio across a 16x population increase: {}", String.format(Locale.ROOT, "%.2f", ratio));
         assertTrue("per-shard cost climbed " + ratio + "x across a 16x population increase", ratio < 2.0);
     }
 
@@ -120,7 +121,7 @@ public class ComputedPlacementCostTests extends OpenSearchTestCase {
     private static List<IndexMetadata> population(int count) {
         List<IndexMetadata> population = new ArrayList<>(count);
         for (int i = 0; i < count; i++) {
-            population.add(index("tenant-" + String.format("%07d", i), SHARDS_PER_INDEX));
+            population.add(index("tenant-" + String.format(Locale.ROOT, "%07d", i), SHARDS_PER_INDEX));
         }
         return population;
     }

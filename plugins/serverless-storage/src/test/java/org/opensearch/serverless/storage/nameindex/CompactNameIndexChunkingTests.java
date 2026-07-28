@@ -15,6 +15,7 @@ import org.junit.Before;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 /**
  * A15. The blocking defect a review pass found after phases 1 to 4 were already committed and green.
@@ -95,10 +96,10 @@ public class CompactNameIndexChunkingTests extends OpenSearchTestCase {
     public void testPrefixScanAcrossChunkBoundaries() {
         List<String> names = new ArrayList<>();
         for (int i = 0; i < 300; i++) {
-            names.add("logs-" + String.format("%05d", i));
+            names.add("logs-" + String.format(Locale.ROOT, "%05d", i));
         }
         for (int i = 0; i < 100; i++) {
-            names.add("metrics-" + String.format("%05d", i));
+            names.add("metrics-" + String.format(Locale.ROOT, "%05d", i));
         }
         names.sort(null);
         CompactNameIndex index = build(names);
@@ -115,7 +116,7 @@ public class CompactNameIndexChunkingTests extends OpenSearchTestCase {
         CompactNameIndexBuilder builder = new CompactNameIndexBuilder();
         List<String> targets = new ArrayList<>();
         for (int i = 0; i < 100; i++) {
-            String name = "target-" + String.format("%05d", i);
+            String name = "target-" + String.format(Locale.ROOT, "%05d", i);
             targets.add(name);
             builder.add(name, uuid(i), IndexNameEntry.STATUS_OPEN);
         }
@@ -161,7 +162,7 @@ public class CompactNameIndexChunkingTests extends OpenSearchTestCase {
         // Each of these encodes to 3 UTF-8 bytes per character, so boundaries land inside characters
         // unless the packer refuses to split a name.
         for (int i = 0; i < 120; i++) {
-            names.add("名前-" + String.format("%04d", i));
+            names.add("名前-" + String.format(Locale.ROOT, "%04d", i));
         }
         names.sort(null);
         CompactNameIndex index = build(names);
@@ -184,7 +185,7 @@ public class CompactNameIndexChunkingTests extends OpenSearchTestCase {
     private static List<String> names(int count) {
         List<String> names = new ArrayList<>(count);
         for (int i = 0; i < count; i++) {
-            names.add("name-" + String.format("%06d", i));
+            names.add("name-" + String.format(Locale.ROOT, "%06d", i));
         }
         return names;
     }

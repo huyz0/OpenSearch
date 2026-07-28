@@ -548,15 +548,18 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
      * than that reconcile cadence would defeat the margin entirely.
      */
     public void testGcRetentionWindowRejectsAValueShorterThanThePitrReconcileInterval() {
-        long tooShortMillis =
-            org.opensearch.serverless.storage.retention.PitrRetentionSchedulerTask.DEFAULT_RECONCILE_INTERVAL.millis() * 2 - 1;
+        long tooShortMillis = org.opensearch.serverless.storage.retention.PitrRetentionSchedulerTask.DEFAULT_RECONCILE_INTERVAL.millis() * 2
+            - 1;
         Settings settings = Settings.builder()
             .put(
                 ServerlessStoragePlugin.SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING.getKey(),
                 org.opensearch.common.unit.TimeValue.timeValueMillis(tooShortMillis).getStringRep()
             )
             .build();
-        expectThrows(IllegalArgumentException.class, () -> ServerlessStoragePlugin.SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING.get(settings));
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> ServerlessStoragePlugin.SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING.get(settings)
+        );
     }
 
     public void testGcRetentionWindowAcceptsTheDefaultAndValuesAtOrAboveTheMinimum() {

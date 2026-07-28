@@ -364,7 +364,20 @@ public class LazyBundleDirectoryTests extends OpenSearchTestCase {
             var entry = e.getValue();
             fileMap.put(e.getKey(), new FileReference("bundle-many-files-test", entry.offset(), entry.length(), entry.checksum()));
         }
-        return new CommitManifest(INDEX_UUID, SHARD_ID, 1, 1, "file-0", fileMap, 0, 0, null, 0, PruningStats.empty(), System.currentTimeMillis());
+        return new CommitManifest(
+            INDEX_UUID,
+            SHARD_ID,
+            1,
+            1,
+            "file-0",
+            fileMap,
+            0,
+            0,
+            null,
+            0,
+            PruningStats.empty(),
+            System.currentTimeMillis()
+        );
     }
 
     public void testPrefetchBootSetEventuallyPrefetchesEveryFile() throws Exception {

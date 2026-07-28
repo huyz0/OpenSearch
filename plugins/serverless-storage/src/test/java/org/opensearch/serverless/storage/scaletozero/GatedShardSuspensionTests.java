@@ -191,22 +191,56 @@ public class GatedShardSuspensionTests extends OpenSearchTestCase {
     }
 
     /**
-     * A sweep over the sleeping majority must not evict the suspensions being actively maintained. The
-     * same argument as H11 and it binds harder here, because under scale-to-zero the population being
-     * swept is most of the cluster.
+     * A sweep over the sleeping majority must not evict the suspensions being actively maintained.
+     *
+     * <p><b>What counts as actively maintained changed with P2, and this test changed with it.</b> H12 kept
+     * the entry alive by reading it, because the map was access-ordered. That ordering made every read
+     * mutate the recency list, so every lookup took a monitor, and P1 measured the result: 57.8M reads per
+     * second on one thread falling to 7.9M on sixteen. Recency is now stamped on write.
+     *
+     * <p>That is not a weakening, because it matches what the coordinator actually does.
+     * {@code ShardSuspensionCoordinator.suspendCandidates} calls suspend once per candidate on every tick,
+     * and its own comment records that in steady state most candidates are already suspended. So an active
+     * suspension is re-suspended continuously, which restamps it. A read never kept anything alive in
+     * production; only the test did that.
      */
     public void testASweepOfColdIndicesDoesNotEvictTheActiveOnes() {
-        GatedShardSuspensionRegistry bounded = new GatedShardSuspensionRegistry(10);
+        GatedShardSuspensionRegistry bounded = new GatedShardSuspensionRegistry(20);
 
         bounded.suspend("active-uuid", 0);
-        for (int i = 0; i < 9; i++) {
+        for (int i = 0; i < 30; i++) {
             bounded.suspend("cold-" + i, 0);
-            bounded.isSuspended("active-uuid", 0);
+            // What the coordinator does every tick for a shard that is still idle and still suspended.
+            bounded.suspend("active-uuid", 0);
         }
-        bounded.suspend("cold-overflow", 0);
 
-        assertTrue("the actively maintained suspension must survive the sweep", bounded.isSuspended("active-uuid", 0));
-        assertFalse("the least recently used must be the one evicted", bounded.isSuspended("cold-0", 0));
+        assertTrue("the continuously re-suspended entry must survive the sweep", bounded.isSuspended("active-uuid", 0));
+        assertFalse("while the stalest cold entries are evicted", bounded.isSuspended("cold-0", 0));
+    }
+
+    /**
+     * The semantic P2 changed, asserted rather than left to be discovered. Reading a suspension no longer
+     * protects it from eviction, because reads deliberately touch no shared mutable state.
+     *
+     * <p>Safe because eviction wakes a shard, which is the direction that serves requests, and the next
+     * tick suspends it again. Worth pinning so that a future change relying on reads refreshing recency
+     * fails here rather than in production.
+     */
+    public void testReadingASuspensionDoesNotProtectItFromEviction() {
+        GatedShardSuspensionRegistry bounded = new GatedShardSuspensionRegistry(20);
+        bounded.suspend("read-only-uuid", 0);
+
+        for (int i = 0; i < 30; i++) {
+            bounded.suspend("cold-" + i, 0);
+            // A read, which under H12's access ordering would have kept it alive and no longer does.
+            bounded.isSuspended("read-only-uuid", 0);
+        }
+
+        assertFalse(
+            "a read must not refresh recency, since that is exactly what forced every lookup to take a "
+                + "monitor. Eviction here wakes a shard, and the next tick puts it back to sleep",
+            bounded.isSuspended("read-only-uuid", 0)
+        );
     }
 
     // ---------------------------------------------------------------- helpers

@@ -12,6 +12,7 @@ import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 /**
  * A11. The one question the Area A plan left explicitly open, answered with a measurement rather than
@@ -90,8 +91,8 @@ public class LeadingWildcardSpikeTests extends OpenSearchTestCase {
             NAME_COUNT,
             scanMicros,
             seekMicros,
-            scanMicros == 0 ? "n/a" : String.format("%.1f", (double) scanMicros / Math.max(seekMicros, 1)),
-            String.format("%.2f", memoryRatio)
+            scanMicros == 0 ? "n/a" : String.format(Locale.ROOT, "%.1f", (double) scanMicros / Math.max(seekMicros, 1)),
+            String.format(Locale.ROOT, "%.2f", memoryRatio)
         );
 
         // The decision-relevant properties, asserted as shape rather than as absolute timings.

@@ -172,10 +172,9 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
             index(engine, "1");
             engine.flush(true, true);
 
-            org.opensearch.serverless.storage.shardstate.ShardHead head = shardStateStore.get(
-                shardId.getIndex().getUUID(),
-                shardId.getId()
-            ).orElseThrow().head();
+            org.opensearch.serverless.storage.shardstate.ShardHead head = shardStateStore.get(shardId.getIndex().getUUID(), shardId.getId())
+                .orElseThrow()
+                .head();
             CommitManifest manifest = new BlobContainerManifestStore(blobContainer).readManifest(
                 head.primaryTerm(),
                 head.latestManifestGeneration()

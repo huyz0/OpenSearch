@@ -122,14 +122,7 @@ public class WritePartitionRoutingActionFilterTests extends OpenSearchTestCase {
             String idForPartition1 = idLandingOn(1, 2);
             IndexRequest requestBeforeTarget1Exists = new IndexRequest(ALIAS).id(idForPartition1).source("f", "v");
             AtomicReference<Boolean> proceeded = new AtomicReference<>(false);
-            filter.apply(
-                null,
-                IndexAction.NAME,
-                requestBeforeTarget1Exists,
-                null,
-                null,
-                recordingChain(proceeded)
-            );
+            filter.apply(null, IndexAction.NAME, requestBeforeTarget1Exists, null, null, recordingChain(proceeded));
             assertTrue(proceeded.get());
             // No target assigned to partition 1 yet -- request passes through unrewritten.
             assertEquals(ALIAS, requestBeforeTarget1Exists.index());

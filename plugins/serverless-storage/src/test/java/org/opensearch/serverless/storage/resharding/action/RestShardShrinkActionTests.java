@@ -54,8 +54,7 @@ public class RestShardShrinkActionTests extends OpenSearchTestCase {
 
     public void testPrepareRequestRejectsANonArraySourcesField() {
         RestRequest request = requestWithBody(
-            "{\"sources\":{\"index_uuid\":\"source-idx\",\"shard_id\":0},"
-                + "\"target\":{\"index_uuid\":\"target-idx\",\"shard_id\":0}}"
+            "{\"sources\":{\"index_uuid\":\"source-idx\",\"shard_id\":0}," + "\"target\":{\"index_uuid\":\"target-idx\",\"shard_id\":0}}"
         );
         IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> action.prepareRequest(request, null));
         assertTrue(e.getMessage().contains("sources"));
@@ -76,9 +75,7 @@ public class RestShardShrinkActionTests extends OpenSearchTestCase {
     }
 
     public void testPrepareRequestRejectsAMissingIndexUuidInSourcesEntry() {
-        RestRequest request = requestWithBody(
-            "{\"sources\":[{\"shard_id\":0}],\"target\":{\"index_uuid\":\"target-idx\",\"shard_id\":0}}"
-        );
+        RestRequest request = requestWithBody("{\"sources\":[{\"shard_id\":0}],\"target\":{\"index_uuid\":\"target-idx\",\"shard_id\":0}}");
         IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> action.prepareRequest(request, null));
         assertTrue(e.getMessage().contains("sources[]"));
     }

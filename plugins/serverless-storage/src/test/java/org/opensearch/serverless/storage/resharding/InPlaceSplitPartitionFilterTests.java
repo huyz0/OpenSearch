@@ -25,24 +25,27 @@ public class InPlaceSplitPartitionFilterTests extends OpenSearchTestCase {
         String id = "doc-excluded";
         int hash = Murmur3HashFunction.hash(id);
         ShardRange range = new ShardRange(0, hash + 1, Integer.MAX_VALUE);
-        assertFalse(
-            "a range that starts strictly after this id's hash must not match it",
-            InPlaceSplitPartitionFilter.matches(id, range)
-        );
+        assertFalse("a range that starts strictly after this id's hash must not match it", InPlaceSplitPartitionFilter.matches(id, range));
     }
 
     public void testBoundaryValueAtRangeStartMatches() {
         String id = "doc-boundary-start";
         int hash = Murmur3HashFunction.hash(id);
         ShardRange range = new ShardRange(0, hash, hash + 1000);
-        assertTrue("a hash exactly equal to the range's start must match (inclusive lower bound)", InPlaceSplitPartitionFilter.matches(id, range));
+        assertTrue(
+            "a hash exactly equal to the range's start must match (inclusive lower bound)",
+            InPlaceSplitPartitionFilter.matches(id, range)
+        );
     }
 
     public void testBoundaryValueAtRangeEndMatches() {
         String id = "doc-boundary-end";
         int hash = Murmur3HashFunction.hash(id);
         ShardRange range = new ShardRange(0, hash - 1000, hash);
-        assertTrue("a hash exactly equal to the range's end must match (inclusive upper bound)", InPlaceSplitPartitionFilter.matches(id, range));
+        assertTrue(
+            "a hash exactly equal to the range's end must match (inclusive upper bound)",
+            InPlaceSplitPartitionFilter.matches(id, range)
+        );
     }
 
     public void testJustOutsideRangeStartIsExcluded() {
@@ -87,7 +90,10 @@ public class InPlaceSplitPartitionFilterTests extends OpenSearchTestCase {
 
             boolean matchesLower = InPlaceSplitPartitionFilter.matches(id, lower);
             boolean matchesUpper = InPlaceSplitPartitionFilter.matches(id, upper);
-            assertTrue("id [" + id + "] with hash " + hash + " must match exactly one of the two disjoint ranges", matchesLower ^ matchesUpper);
+            assertTrue(
+                "id [" + id + "] with hash " + hash + " must match exactly one of the two disjoint ranges",
+                matchesLower ^ matchesUpper
+            );
         }
     }
 }

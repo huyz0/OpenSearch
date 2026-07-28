@@ -202,7 +202,11 @@ public class ObjectStoreCommitHeadPublisherTests extends OpenSearchTestCase {
             // yet -- primaryTerm on the head is still 1.
             assertTrue(headPublisher.acquireOrRenewLease(INDEX_UUID, SHARD_ID, 2, "node-b", Long.MAX_VALUE));
             ShardHead afterAcquire = shardStateStore.get(INDEX_UUID, SHARD_ID).orElseThrow().head();
-            assertEquals("primaryTerm must stay pointing at the last real manifest, not the lease acquirer's term", 1, afterAcquire.primaryTerm());
+            assertEquals(
+                "primaryTerm must stay pointing at the last real manifest, not the lease acquirer's term",
+                1,
+                afterAcquire.primaryTerm()
+            );
             assertEquals("leaseTerm must advance immediately on acquisition, ahead of any publish", 2, afterAcquire.leaseTerm());
 
             // Node A, still unaware it has been superseded (e.g. partitioned from the cluster
@@ -374,12 +378,7 @@ public class ObjectStoreCommitHeadPublisherTests extends OpenSearchTestCase {
             );
             // Simulates the FIRST attempt of a snapshot request that pinned generation 1, whose
             // response the client never received (so it will retry under the same pinId).
-            Optional<CommitManifest> firstAttempt = localHeadPublisher.readLatestManifestWithPin(
-                INDEX_UUID,
-                SHARD_ID,
-                pinRegistry,
-                pinId
-            );
+            Optional<CommitManifest> firstAttempt = localHeadPublisher.readLatestManifestWithPin(INDEX_UUID, SHARD_ID, pinRegistry, pinId);
             assertTrue(firstAttempt.isPresent());
             assertEquals(1, pinRegistry.getPins(INDEX_UUID, SHARD_ID).size());
 

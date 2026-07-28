@@ -140,11 +140,7 @@ public class InPlaceMergeTriggerSchedulerTaskTests extends OpenSearchTestCase {
         );
         try {
             task.evaluateForTesting();
-            assertEquals(
-                "a non-cluster-manager node must never trigger the cluster-wide fan-out itself",
-                0,
-                requestCount.get()
-            );
+            assertEquals("a non-cluster-manager node must never trigger the cluster-wide fan-out itself", 0, requestCount.get());
         } finally {
             task.close();
             clusterService.close();
@@ -192,7 +188,15 @@ public class InPlaceMergeTriggerSchedulerTaskTests extends OpenSearchTestCase {
                 ActionListener<Response> listener
             ) {
                 if (action == ShardSplitCandidatesAction.INSTANCE) {
-                    ShardSplitCandidateEntry childSignal = new ShardSplitCandidateEntry("idx-uuid", 1, "my-index", 10L, 1024L, false, false);
+                    ShardSplitCandidateEntry childSignal = new ShardSplitCandidateEntry(
+                        "idx-uuid",
+                        1,
+                        "my-index",
+                        10L,
+                        1024L,
+                        false,
+                        false
+                    );
                     ShardSplitCandidatesResponse response = new ShardSplitCandidatesResponse(
                         new org.opensearch.cluster.ClusterName("test"),
                         List.<NodeShardSplitCandidatesResponse>of(),

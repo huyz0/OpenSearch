@@ -174,13 +174,7 @@ public class RestrictingBlobContainerTests extends OpenSearchTestCase {
 
         expectThrows(
             SecurityException.class,
-            () -> restricted.writeBlobWithMetadata(
-                "a",
-                new ByteArrayInputStream(content),
-                content.length,
-                true,
-                java.util.Map.of("k", "v")
-            )
+            () -> restricted.writeBlobWithMetadata("a", new ByteArrayInputStream(content), content.length, true, java.util.Map.of("k", "v"))
         );
         expectThrows(
             SecurityException.class,
@@ -211,13 +205,7 @@ public class RestrictingBlobContainerTests extends OpenSearchTestCase {
 
         expectThrows(
             UnsupportedOperationException.class,
-            () -> restricted.writeBlobWithMetadata(
-                "a",
-                new ByteArrayInputStream(content),
-                content.length,
-                true,
-                java.util.Map.of("k", "v")
-            )
+            () -> restricted.writeBlobWithMetadata("a", new ByteArrayInputStream(content), content.length, true, java.util.Map.of("k", "v"))
         );
     }
 }

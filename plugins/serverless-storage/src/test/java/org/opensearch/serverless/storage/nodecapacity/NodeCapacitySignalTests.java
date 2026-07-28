@@ -27,13 +27,7 @@ public class NodeCapacitySignalTests extends OpenSearchTestCase {
 
     public void testRoleCapacitySignalRoundTrip() throws Exception {
         NodeCapacityEntry entry = new NodeCapacityEntry("node-1", "reader-1", 3, true, 3, 0, false);
-        RoleCapacitySignal signal = new RoleCapacitySignal(
-            List.of(entry),
-            5,
-            List.of("node-1"),
-            4,
-            Map.of("my-index", 5)
-        );
+        RoleCapacitySignal signal = new RoleCapacitySignal(List.of(entry), 5, List.of("node-1"), 4, Map.of("my-index", 5));
         BytesStreamOutput out = new BytesStreamOutput();
         signal.writeTo(out);
         RoleCapacitySignal roundTripped = new RoleCapacitySignal(out.bytes().streamInput());

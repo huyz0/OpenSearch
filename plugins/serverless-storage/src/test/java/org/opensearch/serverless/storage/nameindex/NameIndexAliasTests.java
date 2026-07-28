@@ -12,6 +12,7 @@ import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.stream.Collectors;
 
 /**
@@ -169,7 +170,7 @@ public class NameIndexAliasTests extends OpenSearchTestCase {
         CompactNameIndexBuilder builder = new CompactNameIndexBuilder(targetCount + 1);
         List<String> targets = new ArrayList<>(targetCount);
         for (int i = 0; i < targetCount; i++) {
-            String name = "tenant-" + String.format("%06d", i);
+            String name = "tenant-" + String.format(Locale.ROOT, "%06d", i);
             targets.add(name);
             builder.add(name, uuid(i), IndexNameEntry.STATUS_OPEN);
         }

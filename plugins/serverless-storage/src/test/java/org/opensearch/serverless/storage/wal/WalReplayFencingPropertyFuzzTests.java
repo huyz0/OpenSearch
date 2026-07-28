@@ -54,7 +54,8 @@ public class WalReplayFencingPropertyFuzzTests extends OpenSearchTestCase {
     private static final int MAX_TERM = 5;
     private static final int COMBOS_PER_TRIAL = 15;
 
-    private record GroundTruthRecord(long chunkSequence, long primaryTerm, long seqNo) {}
+    private record GroundTruthRecord(long chunkSequence, long primaryTerm, long seqNo) {
+    }
 
     public void testReplayReturnsExactlyTheRecordsSatisfyingBothTheTermFloorAndThePositionCutoff() throws Exception {
         for (int trial = 0; trial < TRIAL_COUNT; trial++) {
@@ -104,9 +105,13 @@ public class WalReplayFencingPropertyFuzzTests extends OpenSearchTestCase {
             int fromChunkIndex = random.nextInt(CHUNK_COUNT);
             int uptoChunkIndex = fromChunkIndex + random.nextInt(CHUNK_COUNT - fromChunkIndex + 1);
             long fromChunkSequenceInclusive = chunkSequences[fromChunkIndex];
-            long activationWalPosition = uptoChunkIndex < CHUNK_COUNT ? chunkSequences[uptoChunkIndex] : chunkSequences[CHUNK_COUNT - 1] + 1;
+            long activationWalPosition = uptoChunkIndex < CHUNK_COUNT
+                ? chunkSequences[uptoChunkIndex]
+                : chunkSequences[CHUNK_COUNT - 1] + 1;
 
-            WalPosition lastDurable = fromChunkSequenceInclusive == 0 ? null : new WalPosition("fuzz-epoch", fromChunkSequenceInclusive - 1);
+            WalPosition lastDurable = fromChunkSequenceInclusive == 0
+                ? null
+                : new WalPosition("fuzz-epoch", fromChunkSequenceInclusive - 1);
 
             List<Translog.Operation> replayed = WalReplayRecovery.replayOperations(
                 container,
@@ -149,6 +154,12 @@ public class WalReplayFencingPropertyFuzzTests extends OpenSearchTestCase {
         Translog.NoOp op = new Translog.NoOp(seqNo, primaryTerm, "fuzz");
         BytesStreamOutput out = new BytesStreamOutput();
         Translog.Operation.writeOperation(out, op);
-        return new WalRecord(INDEX_UUID, SHARD_ID, primaryTerm, seqNo, org.opensearch.core.common.bytes.BytesReference.toBytes(out.bytes()));
+        return new WalRecord(
+            INDEX_UUID,
+            SHARD_ID,
+            primaryTerm,
+            seqNo,
+            org.opensearch.core.common.bytes.BytesReference.toBytes(out.bytes())
+        );
     }
 }

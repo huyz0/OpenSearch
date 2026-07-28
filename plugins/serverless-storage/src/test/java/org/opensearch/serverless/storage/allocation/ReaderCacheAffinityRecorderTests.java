@@ -147,6 +147,10 @@ public class ReaderCacheAffinityRecorderTests extends OpenSearchTestCase {
         ReaderCacheAffinityRecorder recorder = new ReaderCacheAffinityRecorder(clusterService);
         recorder.recordStarted(List.of());
 
-        assertEquals("an empty batch must never submit a cluster-state update task at all", versionBefore, clusterService.state().version());
+        assertEquals(
+            "an empty batch must never submit a cluster-state update task at all",
+            versionBefore,
+            clusterService.state().version()
+        );
     }
 }

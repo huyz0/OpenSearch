@@ -48,8 +48,7 @@ public class RestShardSplitActionTests extends OpenSearchTestCase {
 
     public void testPrepareRequestRejectsAMissingSourceObject() {
         RestRequest request = requestWithBody(
-            "{\"target\":{\"index_uuid\":\"target-idx\",\"shard_id\":0},"
-                + "\"partition_index\":0,\"num_partitions\":2}"
+            "{\"target\":{\"index_uuid\":\"target-idx\",\"shard_id\":0}," + "\"partition_index\":0,\"num_partitions\":2}"
         );
         IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> action.prepareRequest(request, null));
         assertTrue(e.getMessage().contains("source"));
@@ -57,8 +56,7 @@ public class RestShardSplitActionTests extends OpenSearchTestCase {
 
     public void testPrepareRequestRejectsAMissingTargetObject() {
         RestRequest request = requestWithBody(
-            "{\"source\":{\"index_uuid\":\"source-idx\",\"shard_id\":0},"
-                + "\"partition_index\":0,\"num_partitions\":2}"
+            "{\"source\":{\"index_uuid\":\"source-idx\",\"shard_id\":0}," + "\"partition_index\":0,\"num_partitions\":2}"
         );
         IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> action.prepareRequest(request, null));
         assertTrue(e.getMessage().contains("target"));
@@ -75,8 +73,7 @@ public class RestShardSplitActionTests extends OpenSearchTestCase {
 
     public void testPrepareRequestRejectsMissingPartitionIndexOrNumPartitions() {
         RestRequest request = requestWithBody(
-            "{\"source\":{\"index_uuid\":\"source-idx\",\"shard_id\":0},"
-                + "\"target\":{\"index_uuid\":\"target-idx\",\"shard_id\":0}}"
+            "{\"source\":{\"index_uuid\":\"source-idx\",\"shard_id\":0}," + "\"target\":{\"index_uuid\":\"target-idx\",\"shard_id\":0}}"
         );
         IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> action.prepareRequest(request, null));
         assertTrue(e.getMessage().contains("partition_index"));

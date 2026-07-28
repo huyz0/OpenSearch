@@ -218,8 +218,7 @@ public class ObjectStoreReaderEngineTests extends EngineTestCase {
             ) {
                 assertTrue(
                     "opening the engine must report an entry",
-                    shardDirectory.lookup(engineConfig.getShardId().getIndex().getUUID(), engineConfig.getShardId().getId())
-                        .isPresent()
+                    shardDirectory.lookup(engineConfig.getShardId().getIndex().getUUID(), engineConfig.getShardId().getId()).isPresent()
                 );
             }
             // readerEngine is now closed -- its own entry must be gone, not left to linger until a

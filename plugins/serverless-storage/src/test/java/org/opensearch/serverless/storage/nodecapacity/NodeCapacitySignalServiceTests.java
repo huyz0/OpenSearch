@@ -103,9 +103,7 @@ public class NodeCapacitySignalServiceTests extends OpenSearchTestCase {
 
     public void testCountsUnassignedAndAssignedShardsSeparatelyByRole() {
         IndexMetadata serverlessIndex = IndexMetadata.builder(SERVERLESS_INDEX)
-            .settings(
-                settings(Version.CURRENT).put(ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey(), true).build()
-            )
+            .settings(settings(Version.CURRENT).put(ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey(), true).build())
             .numberOfShards(2)
             .numberOfReplicas(0)
             .build();
@@ -208,7 +206,11 @@ public class NodeCapacitySignalServiceTests extends OpenSearchTestCase {
         Metadata metadata = Metadata.builder().put(classicIndex, false).build();
         RoutingTable routingTable = RoutingTable.builder().addAsNew(classicIndex).build();
         DiscoveryNode local = node("only-node");
-        DiscoveryNodes discoveryNodes = DiscoveryNodes.builder().add(local).localNodeId("only-node").clusterManagerNodeId("only-node").build();
+        DiscoveryNodes discoveryNodes = DiscoveryNodes.builder()
+            .add(local)
+            .localNodeId("only-node")
+            .clusterManagerNodeId("only-node")
+            .build();
 
         ClusterState state = ClusterState.builder(new ClusterName("test"))
             .metadata(metadata)
@@ -228,9 +230,7 @@ public class NodeCapacitySignalServiceTests extends OpenSearchTestCase {
 
     public void testNonClusterManagerNodeNeverEvaluates() {
         IndexMetadata serverlessIndex = IndexMetadata.builder(SERVERLESS_INDEX)
-            .settings(
-                settings(Version.CURRENT).put(ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey(), true).build()
-            )
+            .settings(settings(Version.CURRENT).put(ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey(), true).build())
             .numberOfShards(1)
             .numberOfReplicas(0)
             .build();
@@ -269,7 +269,11 @@ public class NodeCapacitySignalServiceTests extends OpenSearchTestCase {
             .put(NodeWarmupCoordinator.WARMING_NAMES_SETTING_KEY, "live-node,departed-node");
         Metadata metadata = Metadata.builder().transientSettings(transientSettings.build()).build();
         DiscoveryNode local = node("live-node");
-        DiscoveryNodes discoveryNodes = DiscoveryNodes.builder().add(local).localNodeId("live-node").clusterManagerNodeId("live-node").build();
+        DiscoveryNodes discoveryNodes = DiscoveryNodes.builder()
+            .add(local)
+            .localNodeId("live-node")
+            .clusterManagerNodeId("live-node")
+            .build();
 
         ClusterState state = ClusterState.builder(new ClusterName("test"))
             .metadata(metadata)

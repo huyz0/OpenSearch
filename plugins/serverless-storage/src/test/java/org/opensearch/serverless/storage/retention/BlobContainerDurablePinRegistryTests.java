@@ -221,11 +221,7 @@ public class BlobContainerDurablePinRegistryTests extends OpenSearchTestCase {
         }
 
         Set<PinRecord> pins = registry.getPins(INDEX_UUID, SHARD_ID);
-        assertEquals(
-            "exactly one pin must survive concurrent replacePin calls for the same pinId -- never zero",
-            1,
-            pins.size()
-        );
+        assertEquals("exactly one pin must survive concurrent replacePin calls for the same pinId -- never zero", 1, pins.size());
         assertEquals("snapshot-1", pins.iterator().next().pinId());
     }
 }

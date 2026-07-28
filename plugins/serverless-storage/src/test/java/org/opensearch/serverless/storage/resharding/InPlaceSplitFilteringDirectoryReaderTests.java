@@ -177,7 +177,10 @@ public class InPlaceSplitFilteringDirectoryReaderTests extends OpenSearchTestCas
                     // Regression test: IndexShard#wrapSearcher requires the wrapped reader's cache
                     // helper to equal the original's. A prior bug returned a fresh/independent cache
                     // helper (or null) here instead of delegating, which broke that contract.
-                    assertNotNull("the reader cache helper must not be null when the wrapped reader has one", wrapped.getReaderCacheHelper());
+                    assertNotNull(
+                        "the reader cache helper must not be null when the wrapped reader has one",
+                        wrapped.getReaderCacheHelper()
+                    );
                     assertSame(
                         "getReaderCacheHelper() must delegate to the wrapped (unfiltered) reader's cache helper, not "
                             + "construct its own",

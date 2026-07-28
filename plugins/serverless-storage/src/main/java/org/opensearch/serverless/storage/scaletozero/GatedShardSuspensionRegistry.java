@@ -10,11 +10,9 @@ package org.opensearch.serverless.storage.scaletozero;
 
 import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 
-import java.util.Collections;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
-import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -56,9 +54,19 @@ import java.util.concurrent.atomic.AtomicLong;
  * asleep is an outage. The next scale-to-zero tick observes it idle and suspends it again, so the error
  * is self-correcting and costs one tick of an idle shard being resident.
  *
- * <p>Access-ordered, so a sweep over cold indices cannot evict the suspensions that are being actively
- * maintained. The same argument as H11, and it applies more strongly here, because the population being
- * swept is the sleeping majority.
+ * <p><b>Recency is stamped on write, not reordered on read, and that is a correction to H12.</b> H12 made
+ * this an access-ordered {@code LinkedHashMap} so a sweep could not evict the actively maintained
+ * suspensions, and access ordering means a read mutates the recency list, so every lookup had to take the
+ * same monitor. This map is read from {@code AbsentIndexRoutingSuppliers.supply} on every computed routing
+ * resolution, so that was one global lock on the path of every search and every write. P1 measured the
+ * result: 57.8M reads per second on one thread, falling to 7.9M on sixteen, against 1,084M for a concurrent
+ * map. Throughput going backwards with concurrency is a lock convoy.
+ *
+ * <p>Read ordering was never needed for H12's argument. This map holds only indices that <em>are</em>
+ * suspended, so reading an unsuspended one is a miss that inserts nothing: a sweep of reads cannot evict
+ * anything. Only {@link #suspend} and {@link #reactivate} mutate it, and the coordinator re-suspends
+ * already-suspended shards on every tick, so an actively maintained suspension keeps its stamp fresh
+ * without any read needing to touch the structure.
  *
  * <p>Node-local by design. Every node computes the same placement from the same inputs, and suspension is
  * one of those inputs, so it has to reach every node. What makes that safe rather than divergent is that a
@@ -77,25 +85,21 @@ public final class GatedShardSuspensionRegistry {
      */
     public static final int DEFAULT_CAPACITY = 50_000;
 
-    private final Map<String, Set<Integer>> suspendedByIndexUuid;
+    /** A suspended shard set and when it was last written, so eviction can pick the stalest. */
+    private record Stamped(Set<Integer> shards, long stamp) {
+    }
 
+    private final ConcurrentHashMap<String, Stamped> suspendedByIndexUuid = new ConcurrentHashMap<>();
     private final AtomicLong evictions = new AtomicLong();
+    private final AtomicLong clock = new AtomicLong();
+    private final int capacity;
 
     public GatedShardSuspensionRegistry() {
         this(DEFAULT_CAPACITY);
     }
 
     public GatedShardSuspensionRegistry(int capacity) {
-        this.suspendedByIndexUuid = Collections.synchronizedMap(new LinkedHashMap<>(16, 0.75f, true) {
-            @Override
-            protected boolean removeEldestEntry(Map.Entry<String, Set<Integer>> eldest) {
-                if (size() > capacity) {
-                    evictions.incrementAndGet();
-                    return true;
-                }
-                return false;
-            }
-        });
+        this.capacity = capacity;
     }
 
     /** Installs this registry as the source placement consults. */
@@ -115,9 +119,15 @@ public final class GatedShardSuspensionRegistry {
         suspendedByIndexUuid.clear();
     }
 
-    /** The shards of this index that are asleep. */
+    /**
+     * The shards of this index that are asleep.
+     *
+     * <p>A plain concurrent get that touches no shared mutable state, which is the point: this runs on
+     * every routing resolution, and the previous access-ordered structure made it take a monitor.
+     */
     public Set<Integer> suspendedShards(String indexUuid) {
-        return suspendedByIndexUuid.getOrDefault(indexUuid, Set.of());
+        Stamped stamped = suspendedByIndexUuid.get(indexUuid);
+        return stamped == null ? Set.of() : stamped.shards();
     }
 
     /** Whether this shard is asleep. */
@@ -135,17 +145,21 @@ public final class GatedShardSuspensionRegistry {
     public boolean suspend(String indexUuid, int shardId) {
         boolean[] added = new boolean[1];
         suspendedByIndexUuid.compute(indexUuid, (uuid, current) -> {
-            if (current != null && current.contains(shardId)) {
-                return current;
+            // Restamped even when the shard is already suspended, because the coordinator calls this on
+            // every tick for already-suspended shards. That repeat is what keeps an actively maintained
+            // suspension fresh now that recency is not refreshed by reads.
+            if (current != null && current.shards().contains(shardId)) {
+                return new Stamped(current.shards(), clock.incrementAndGet());
             }
             added[0] = true;
             if (current == null) {
-                return Set.of(shardId);
+                return new Stamped(Set.of(shardId), clock.incrementAndGet());
             }
-            Set<Integer> next = new HashSet<>(current);
+            Set<Integer> next = new HashSet<>(current.shards());
             next.add(shardId);
-            return Set.copyOf(next);
+            return new Stamped(Set.copyOf(next), clock.incrementAndGet());
         });
+        evictIfOverCapacity();
         return added[0];
     }
 
@@ -153,15 +167,15 @@ public final class GatedShardSuspensionRegistry {
     public boolean reactivate(String indexUuid, int shardId) {
         boolean[] removed = new boolean[1];
         suspendedByIndexUuid.compute(indexUuid, (uuid, current) -> {
-            if (current == null || current.contains(shardId) == false) {
+            if (current == null || current.shards().contains(shardId) == false) {
                 return current;
             }
             removed[0] = true;
-            Set<Integer> next = new HashSet<>(current);
+            Set<Integer> next = new HashSet<>(current.shards());
             next.remove(shardId);
             // Removed rather than left empty, so the map is bounded by shards actually asleep. An entry
             // per index that has ever slept is the residency ceiling in another data structure.
-            return next.isEmpty() ? null : Set.copyOf(next);
+            return next.isEmpty() ? null : new Stamped(Set.copyOf(next), clock.incrementAndGet());
         });
         return removed[0];
     }
@@ -181,4 +195,32 @@ public final class GatedShardSuspensionRegistry {
     public long evictionCount() {
         return evictions.get();
     }
+
+    /**
+     * Drops the stalest entries once the map is over capacity.
+     *
+     * <p>A batch rather than one at a time, because finding the stalest costs a scan and doing that on
+     * every write past the bound would cost more than the lock this change removes. Amortised, the scan
+     * runs once per ten percent of capacity written.
+     */
+    private void evictIfOverCapacity() {
+        if (suspendedByIndexUuid.size() <= capacity) {
+            return;
+        }
+        int toEvict = Math.max(1, capacity / 10);
+        long[] stamps = suspendedByIndexUuid.values().stream().mapToLong(Stamped::stamp).sorted().toArray();
+        if (stamps.length == 0) {
+            return;
+        }
+        // A threshold rather than a sorted eviction list, so this is one pass over the entries.
+        long threshold = stamps[Math.min(toEvict, stamps.length - 1)];
+        suspendedByIndexUuid.entrySet().removeIf(entry -> {
+            if (entry.getValue().stamp() < threshold) {
+                evictions.incrementAndGet();
+                return true;
+            }
+            return false;
+        });
+    }
+
 }

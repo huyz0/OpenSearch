@@ -344,7 +344,9 @@ public class WalGcSchedulerTaskTests extends OpenSearchTestCase {
                 task.sweepForTesting();
                 assertFalse(
                     "the elected cluster-manager must still perform the sweep as normal",
-                    walBlobContainer.listBlobsByPrefix(WalChunkNaming.LOG_BLOB_PREFIX).keySet().contains(WalChunkNaming.blobName("epoch-0", seq0))
+                    walBlobContainer.listBlobsByPrefix(WalChunkNaming.LOG_BLOB_PREFIX)
+                        .keySet()
+                        .contains(WalChunkNaming.blobName("epoch-0", seq0))
                 );
             } finally {
                 task.close();

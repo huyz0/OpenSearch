@@ -92,9 +92,7 @@ public class NodeSelfWarmupSchedulerTaskTests extends OpenSearchTestCase {
     }
 
     private static DiscoveryNode node(String name, boolean reader) {
-        Map<String, String> attributes = reader
-            ? Map.of(ReaderShardPlacementAllocationDecider.READER_NODE_ATTRIBUTE, "true")
-            : Map.of();
+        Map<String, String> attributes = reader ? Map.of(ReaderShardPlacementAllocationDecider.READER_NODE_ATTRIBUTE, "true") : Map.of();
         return new DiscoveryNode(
             name,
             name,

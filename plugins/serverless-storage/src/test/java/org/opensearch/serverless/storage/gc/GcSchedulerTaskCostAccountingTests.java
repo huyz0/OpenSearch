@@ -97,7 +97,13 @@ public class GcSchedulerTaskCostAccountingTests extends OpenSearchTestCase {
         DurablePinRegistry pinRegistry = new BlobContainerDurablePinRegistry(countingContainer);
 
         long retentionWindowMillis = TimeValue.timeValueMinutes(1).millis();
-        GcSchedulerConfig config = new GcSchedulerConfig(TimeValue.timeValueMinutes(5), retentionWindowMillis, manifestStore, bundleStore, pinRegistry);
+        GcSchedulerConfig config = new GcSchedulerConfig(
+            TimeValue.timeValueMinutes(5),
+            retentionWindowMillis,
+            manifestStore,
+            bundleStore,
+            pinRegistry
+        );
         ThreadPool threadPool = new TestThreadPool(getTestName());
         try {
             // Bundles now get their own sustained-observation safety window on top of the manifest
@@ -107,14 +113,7 @@ public class GcSchedulerTaskCostAccountingTests extends OpenSearchTestCase {
             // elapses, deletes the bundles (one more batched request). The combined two-tick cost is
             // still flat regardless of deletableGenerationCount -- that's what this test proves.
             long[] clockMillis = { now };
-            GcSchedulerTask task = new GcSchedulerTask(
-                threadPool,
-                config.interval(),
-                INDEX_UUID,
-                SHARD_ID,
-                config,
-                () -> clockMillis[0]
-            );
+            GcSchedulerTask task = new GcSchedulerTask(threadPool, config.interval(), INDEX_UUID, SHARD_ID, config, () -> clockMillis[0]);
             try {
                 task.sweepForTesting();
                 clockMillis[0] = now + retentionWindowMillis + 1;

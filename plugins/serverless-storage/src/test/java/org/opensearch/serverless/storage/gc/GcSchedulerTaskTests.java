@@ -516,7 +516,8 @@ public class GcSchedulerTaskTests extends OpenSearchTestCase {
         long[] clockMillis = { now };
         GcSchedulerTask task = new GcSchedulerTask(threadPool, config.interval(), INDEX_UUID, SHARD_ID, config, () -> clockMillis[0]);
         try {
-            task.sweepForTesting(); // tick 1: gen 1 deleted (unpinned, superseded, past retention); its bundle observed as a fresh orphan candidate.
+            task.sweepForTesting(); // tick 1: gen 1 deleted (unpinned, superseded, past retention); its bundle observed as a fresh orphan
+                                    // candidate.
 
             // A new manifest re-references the same bundle by name (e.g. a compaction rebase or clone
             // reusing gen 1's segment files) -- like the sibling test above, but this one is itself

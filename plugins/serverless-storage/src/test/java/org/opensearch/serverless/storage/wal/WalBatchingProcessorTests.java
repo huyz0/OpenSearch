@@ -115,7 +115,10 @@ public class WalBatchingProcessorTests extends OpenSearchTestCase {
 
         // Priming op: its drain fires, drains exactly this one record, and blocks inside write() --
         // holding the promise semaphore so no other drain can start until we release it.
-        CompletableFuture<Void> priming = put(processor, new WalRecord("idx", 0, 1, 0, "prime".getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        CompletableFuture<Void> priming = put(
+            processor,
+            new WalRecord("idx", 0, 1, 0, "prime".getBytes(java.nio.charset.StandardCharsets.UTF_8))
+        );
         assertTrue("the priming write must reach write() before the burst is enqueued", firstWriteStarted.await(10, TimeUnit.SECONDS));
 
         // The burst: fires while the priming drain is blocked, so every one of these enqueues behind
@@ -136,13 +139,16 @@ public class WalBatchingProcessorTests extends OpenSearchTestCase {
                 executor.submit(() -> {
                     try {
                         startLine.await();
-                        processor.put(new WalRecord("idx", 0, 1, seqNo, ("v" + seqNo).getBytes(java.nio.charset.StandardCharsets.UTF_8)), exception -> {
-                            if (exception != null) {
-                                future.completeExceptionally(exception);
-                            } else {
-                                future.complete(null);
+                        processor.put(
+                            new WalRecord("idx", 0, 1, seqNo, ("v" + seqNo).getBytes(java.nio.charset.StandardCharsets.UTF_8)),
+                            exception -> {
+                                if (exception != null) {
+                                    future.completeExceptionally(exception);
+                                } else {
+                                    future.complete(null);
+                                }
                             }
-                        });
+                        );
                         allEnqueued.countDown();
                     } catch (Exception e) {
                         future.completeExceptionally(e);
@@ -323,7 +329,10 @@ public class WalBatchingProcessorTests extends OpenSearchTestCase {
         put(processor, new WalRecord("idx", 0, 1, -1, "prime".getBytes(java.nio.charset.StandardCharsets.UTF_8))).get(10, TimeUnit.SECONDS);
         assertEquals(1, logChunkCount());
 
-        CompletableFuture<Void> future = put(processor, new WalRecord("idx", 0, 1, 0, "x".getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        CompletableFuture<Void> future = put(
+            processor,
+            new WalRecord("idx", 0, 1, 0, "x".getBytes(java.nio.charset.StandardCharsets.UTF_8))
+        );
         assertEquals("must not have drained yet -- interval hasn't elapsed and threshold wasn't crossed", 1, logChunkCount());
         future.get(10, TimeUnit.SECONDS);
         assertEquals("the interval drain must still land eventually", 2, logChunkCount());
@@ -374,11 +383,7 @@ public class WalBatchingProcessorTests extends OpenSearchTestCase {
         }
 
         assertBusy(
-            () -> assertEquals(
-                "an encryption failure must still release the batch's bytes from the backlog",
-                0L,
-                processor.backlogBytes()
-            )
+            () -> assertEquals("an encryption failure must still release the batch's bytes from the backlog", 0L, processor.backlogBytes())
         );
     }
 

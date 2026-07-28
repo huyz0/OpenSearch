@@ -225,8 +225,7 @@ public class ShardClonerTests extends OpenSearchTestCase {
         );
 
         assertTrue(
-            "the pin added just before the failing read must still be released, not left as "
-                + "unreachable garbage",
+            "the pin added just before the failing read must still be released, not left as " + "unreachable garbage",
             sourcePinRegistry.getPins(SOURCE_INDEX_UUID, SHARD_ID).isEmpty()
         );
         assertTrue(targetLineageStore.readLineage().isEmpty());
@@ -408,7 +407,9 @@ public class ShardClonerTests extends OpenSearchTestCase {
             sourceContainer,
             SOURCE_INDEX_UUID,
             SHARD_ID,
-            (indexUuid, shardId) -> { throw new AssertionError("resolver must not be invoked when there is no lineage"); }
+            (indexUuid, shardId) -> {
+                throw new AssertionError("resolver must not be invoked when there is no lineage");
+            }
         );
         assertEquals(java.util.List.of(sourceContainer), chain);
     }

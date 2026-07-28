@@ -373,7 +373,10 @@ public class WalChunkServiceTests extends OpenSearchTestCase {
         BlobContainer blobContainer = newBlobContainer();
         CountDownLatch writeStarted = new CountDownLatch(1);
         CountDownLatch releaseWrite = new CountDownLatch(1);
-        WalChunkService service = new WalChunkService(new BlockingOnWriteBlobContainer(blobContainer, writeStarted, releaseWrite), "epoch-0");
+        WalChunkService service = new WalChunkService(
+            new BlockingOnWriteBlobContainer(blobContainer, writeStarted, releaseWrite),
+            "epoch-0"
+        );
         service.append(new WalRecord("idx", 0, 1, 0, "a".getBytes("UTF-8")));
 
         ExecutorService executor = Executors.newFixedThreadPool(2);
@@ -414,7 +417,8 @@ public class WalChunkServiceTests extends OpenSearchTestCase {
     }
 
     /** Blocks the first {@code writeBlob} call until released, letting a test observe/act while a write is genuinely in flight. */
-    private static final class BlockingOnWriteBlobContainer extends org.opensearch.serverless.storage.security.RegisterDelegatingBlobContainer {
+    private static final class BlockingOnWriteBlobContainer extends
+        org.opensearch.serverless.storage.security.RegisterDelegatingBlobContainer {
 
         private final CountDownLatch writeStarted;
         private final CountDownLatch releaseWrite;

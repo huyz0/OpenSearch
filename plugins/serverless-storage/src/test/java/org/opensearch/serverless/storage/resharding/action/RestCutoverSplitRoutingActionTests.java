@@ -14,7 +14,6 @@ import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.test.rest.FakeRestRequest;
 import org.opensearch.transport.client.node.NodeClient;
 
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 
