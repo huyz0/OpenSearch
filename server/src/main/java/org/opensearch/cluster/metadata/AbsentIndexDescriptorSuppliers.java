@@ -108,6 +108,20 @@ public final class AbsentIndexDescriptorSuppliers {
      * page and returns a page, which is what the descriptor index can actually do cheaply: S24 measured
      * paging by sorted name with {@code search_after} at roughly 33 ms per thousand names.
      */
+    /**
+     * One entry of a page: the two fields pagination orders and displays, and nothing else.
+     *
+     * <p>This is deliberately not an {@link IndexDescriptor}. T5 measured that building the full fourteen
+     * field record for every hit is roughly a quarter to a third of what a page costs, and
+     * {@code IndexPaginationStrategy} reads exactly {@code name} and {@code creationDate} from it. The
+     * alternative of returning {@code IndexDescriptor} with the other twelve fields left at their defaults
+     * would have been cheaper to write and is precisely the failure this area keeps producing: a value that
+     * reads fine and answers wrong, where a later caller asking for a shard count gets a confident zero.
+     * A narrow type cannot be misread that way.
+     */
+    public record PagedIndex(String name, long creationDate) {
+    }
+
     @FunctionalInterface
     public interface DescriptorPager {
         /**
@@ -118,7 +132,7 @@ public final class AbsentIndexDescriptorSuppliers {
          * @param ascending whether the order is ascending
          * @param size how many to return, which bounds the work
          */
-        List<IndexDescriptor> page(String afterName, long afterCreationDate, boolean ascending, int size);
+        List<PagedIndex> page(String afterName, long afterCreationDate, boolean ascending, int size);
     }
 
     private static final AtomicReference<DescriptorPager> PAGER = new AtomicReference<>();
@@ -141,13 +155,13 @@ public final class AbsentIndexDescriptorSuppliers {
      * area exists to be suspicious of, so callers that need to distinguish the two should ask {@link
      * #isPagerRegistered()} rather than inferring it from an empty result.
      */
-    public static List<IndexDescriptor> page(String afterName, long afterCreationDate, boolean ascending, int size) {
+    public static List<PagedIndex> page(String afterName, long afterCreationDate, boolean ascending, int size) {
         DescriptorPager pager = PAGER.get();
         if (pager == null || size <= 0) {
             return List.of();
         }
         try {
-            List<IndexDescriptor> page = pager.page(afterName, afterCreationDate, ascending, size);
+            List<PagedIndex> page = pager.page(afterName, afterCreationDate, ascending, size);
             return page == null ? List.of() : page;
         } catch (Exception e) {
             return List.of();

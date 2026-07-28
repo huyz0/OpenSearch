@@ -12,7 +12,6 @@ import org.opensearch.Version;
 import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
-import org.opensearch.cluster.metadata.IndexDescriptor;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.common.settings.Settings;
@@ -158,23 +157,12 @@ public class GatedIndexPaginationGapTests extends OpenSearchTestCase {
             .build();
     }
 
-    private static IndexDescriptor descriptor(String name, long creationDate) {
-        return new IndexDescriptor(
-            name,
-            name + "-uuid",
-            1,
-            0,
-            true,
-            IndexDescriptor.State.OPEN,
-            List.of(),
-            Version.CURRENT.id,
-            false,
-            false,
-            false,
-            false,
-            0L,
-            creationDate
-        );
+    /**
+     * T6 narrowed the pager to the two fields pagination reads, so this no longer builds a fourteen field
+     * descriptor whose other twelve values were never looked at.
+     */
+    private static AbsentIndexDescriptorSuppliers.PagedIndex descriptor(String name, long creationDate) {
+        return new AbsentIndexDescriptorSuppliers.PagedIndex(name, creationDate);
     }
 
     private static IndexMetadata indexMetadata(String name) {

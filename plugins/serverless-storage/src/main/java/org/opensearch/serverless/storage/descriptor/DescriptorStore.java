@@ -13,6 +13,7 @@ import org.apache.logging.log4j.Logger;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.action.index.IndexRequest;
 import org.opensearch.action.search.SearchResponse;
+import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.IndexDescriptor;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.Settings;
@@ -465,6 +466,51 @@ public final class DescriptorStore {
         } catch (Exception e) {
             // Same reasoning as get: no descriptor index means no descriptors, not a failed request.
             logger.debug("descriptor prefix search for [{}] failed", prefix, e);
+            return List.of();
+        }
+    }
+
+    /**
+     * One page of names and creation dates, without reading or decoding the rest of the descriptor.
+     *
+     * <p>Pagination reads exactly these two fields, and T5 measured that building the full record for every
+     * hit is roughly a quarter to a third of what a page costs. Both fields are already indexed, so they
+     * come back as doc values and {@code _source} is never fetched or parsed.
+     *
+     * <p>It sits beside {@link #findByPrefix} rather than replacing it because callers that need a whole
+     * descriptor still exist. That is a second read path, which is the thing C3 warned about, so the two are
+     * kept adjacent and share the paging and failure behaviour rather than being open-coded at the seam that
+     * wanted the cheap one.
+     *
+     * <p>Refresh-bound for the same reason {@link #findByPrefix} is: it is a search.
+     *
+     * @param afterName the last name of the previous page, or null for the first page
+     */
+    public List<AbsentIndexDescriptorSuppliers.PagedIndex> findNamesByPrefix(String prefix, String afterName, int size) {
+        try {
+            var request = client.prepareSearch(DESCRIPTOR_INDEX)
+                .setQuery(QueryBuilders.prefixQuery("name", prefix))
+                .addSort("name", SortOrder.ASC)
+                .setFetchSource(false)
+                .addDocValueField("name")
+                .addDocValueField("creationDate")
+                .setSize(size);
+            if (Strings.isNullOrEmpty(afterName) == false) {
+                request.searchAfter(new Object[] { afterName });
+            }
+            SearchResponse response = request.get();
+            List<AbsentIndexDescriptorSuppliers.PagedIndex> page = new ArrayList<>();
+            for (SearchHit hit : response.getHits().getHits()) {
+                page.add(
+                    new AbsentIndexDescriptorSuppliers.PagedIndex(
+                        hit.field("name").getValue(),
+                        ((Number) hit.field("creationDate").getValue()).longValue()
+                    )
+                );
+            }
+            return page;
+        } catch (Exception e) {
+            logger.debug("descriptor name search for [{}] failed", prefix, e);
             return List.of();
         }
     }

@@ -11,7 +11,6 @@ package org.opensearch.action.pagination;
 import org.opensearch.OpenSearchParseException;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
-import org.opensearch.cluster.metadata.IndexDescriptor;
 import org.opensearch.cluster.metadata.IndexMetadata;
 
 import java.util.ArrayList;
@@ -107,7 +106,7 @@ public class IndexPaginationStrategy implements PaginationStrategy<String> {
             return clusterStateNames;
         }
         boolean ascending = PageParams.PARAM_ASC_SORT_VALUE.equals(pageParams.getSort());
-        List<IndexDescriptor> gatedPage = AbsentIndexDescriptorSuppliers.page(
+        List<AbsentIndexDescriptorSuppliers.PagedIndex> gatedPage = AbsentIndexDescriptorSuppliers.page(
             lastIndexName,
             lastIndexCreationTime,
             ascending,
@@ -123,8 +122,8 @@ public class IndexPaginationStrategy implements PaginationStrategy<String> {
         for (IndexMetadata metadata : clusterStatePage) {
             merged.add(new Sortable(metadata.getIndex().getName(), metadata.getCreationDate()));
         }
-        for (IndexDescriptor descriptor : gatedPage) {
-            merged.add(new Sortable(descriptor.name(), descriptor.creationDate()));
+        for (AbsentIndexDescriptorSuppliers.PagedIndex gated : gatedPage) {
+            merged.add(new Sortable(gated.name(), gated.creationDate()));
         }
         merged.sort(ascending ? SORTABLE_ASC : SORTABLE_DESC);
 

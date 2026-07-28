@@ -178,11 +178,17 @@ public final class DescriptorGate {
      */
     private static AbsentIndexDescriptorSuppliers.DescriptorPager pagerFor(DescriptorStore store) {
         return (afterName, afterCreationDate, ascending, size) -> {
-            List<IndexDescriptor> page = store.findByPrefix("", afterName, size);
+            // Names and creation dates only. T5 measured that decoding the full descriptor for every hit is
+            // a quarter to a third of what a page costs, and pagination reads exactly these two fields.
+            List<org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.PagedIndex> page = store.findNamesByPrefix(
+                "",
+                afterName,
+                size
+            );
             if (ascending) {
                 return page;
             }
-            List<IndexDescriptor> reversed = new java.util.ArrayList<>(page);
+            List<org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.PagedIndex> reversed = new java.util.ArrayList<>(page);
             java.util.Collections.reverse(reversed);
             return reversed;
         };
