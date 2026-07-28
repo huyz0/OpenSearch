@@ -12,6 +12,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.IndexDescriptor;
+import org.opensearch.cluster.metadata.IndexDescriptorPublisher;
 
 import java.util.List;
 
@@ -81,6 +82,17 @@ public final class DescriptorGate {
         STORE.set(store);
         AbsentIndexDescriptorSuppliers.register(DescriptorGate::supplyExceptForTheStoreItself);
         AbsentIndexDescriptorSuppliers.registerPager(pagerFor(store));
+        // The write path. H2b dual-writes the descriptor at creation and H4 records deletions as
+        // tombstones, and neither has ever had a publisher registered, so no index creation outside a test
+        // has written a descriptor. Both go through put rather than create: publish records an index that
+        // already exists, and a tombstone deliberately overwrites the live descriptor rather than racing
+        // it. The put-if-absent path is create(), which is the uniqueness gate for gated creation (H3) and
+        // a different question from recording.
+        //
+        // Asynchronous because this hook runs on the cluster state thread: Metadata calls it while building
+        // a cluster state, so a blocking write deadlocks against the index operation it issues. Registering
+        // the blocking put hung the node instead of failing, which is how the constraint was found.
+        IndexDescriptorPublisher.register(store::putAsync);
         logger.info("descriptor resolution installed against [{}]", DescriptorStore.DESCRIPTOR_INDEX);
     }
 
@@ -89,6 +101,7 @@ public final class DescriptorGate {
         // Cleared in the reverse order, so the supplier is gone before the store it reads.
         AbsentIndexDescriptorSuppliers.register(null);
         AbsentIndexDescriptorSuppliers.registerPager(null);
+        IndexDescriptorPublisher.register(null);
         STORE.set(null);
     }
 

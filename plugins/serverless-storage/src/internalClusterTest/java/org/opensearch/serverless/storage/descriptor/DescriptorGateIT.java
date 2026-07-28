@@ -108,6 +108,68 @@ public class DescriptorGateIT extends OpenSearchIntegTestCase {
         assertFalse(AbsentIndexDescriptorSuppliers.isPagerRegistered());
     }
 
+    /**
+     * W4. Creating an index through the real API leaves a descriptor behind.
+     *
+     * <p>H2b built the dual write and H4 built tombstones, and nothing has ever registered a publisher, so
+     * until now no index creation outside a test wrote a descriptor. This is the first time the write path
+     * runs end to end.
+     */
+    public void testCreatingAnIndexRecordsADescriptor() throws Exception {
+        DescriptorStore store = new DescriptorStore(client(), 1);
+        DescriptorGate.install(store, true);
+
+        createIndex("recorded-index");
+
+        // assertBusy rather than a bare read: the publish hook runs on the cluster state thread, so the
+        // write is asynchronous by necessity (see DescriptorStore.putAsync) and a bare read would race it.
+        assertBusy(() -> {
+            IndexDescriptor recorded = store.get("recorded-index");
+            assertNotNull(
+                "creating an index must record a descriptor, or the descriptor index is a write-only "
+                    + "fixture that resolution can never find anything in",
+                recorded
+            );
+            assertEquals("recorded-index", recorded.name());
+            assertTrue("and it must be recorded as existing rather than tombstoned", recorded.exists());
+        });
+    }
+
+    /**
+     * Deletion records rather than removes, because absence cannot be told apart from not having looked.
+     * H4b is why: a node partitioned during a delete would otherwise adopt its dangling shard data on
+     * rejoin.
+     */
+    public void testDeletingAnIndexLeavesATombstoneRatherThanAnAbsence() throws Exception {
+        DescriptorStore store = new DescriptorStore(client(), 1);
+        DescriptorGate.install(store, true);
+        createIndex("doomed-index");
+        assertNotNull("the premise: it was recorded", store.get("doomed-index"));
+
+        assertTrue(client().admin().indices().prepareDelete("doomed-index").get().isAcknowledged());
+
+        assertBusy(() -> {
+            IndexDescriptor tombstone = store.get("doomed-index");
+            assertNotNull("a deleted index must leave a tombstone, not an absence", tombstone);
+            assertFalse("and the tombstone must not read as existing", tombstone.exists());
+            assertEquals(
+                "the uuid must survive the tombstone, since it identifies the dangling data to reclaim",
+                IndexDescriptor.State.DELETED,
+                tombstone.state()
+            );
+        });
+    }
+
+    /** Without the gate, the same creation records nothing, which is what production did until now. */
+    public void testWithoutTheGateCreationRecordsNothing() {
+        DescriptorStore store = new DescriptorStore(client(), 1);
+        // Deliberately not installed.
+
+        createIndex("unrecorded-index");
+
+        assertNull("no publisher means no descriptor, silently", store.get("unrecorded-index"));
+    }
+
     private static IndexDescriptor descriptor(String name) {
         return new IndexDescriptor(
             name,

@@ -114,10 +114,49 @@ public final class DescriptorStore {
         }
     }
 
-    /** Overwrites a descriptor, for a mapping generation bump or a tombstone. */
+    /** Overwrites a descriptor, for a mapping generation bump or a tombstone. Blocks until written. */
     public void put(IndexDescriptor descriptor) {
         ensureIndexExists();
         client.index(new IndexRequest(DESCRIPTOR_INDEX).id(descriptor.name()).source(DescriptorCodec.toSource(descriptor))).actionGet();
+    }
+
+    /**
+     * Records a descriptor without waiting for it to be written.
+     *
+     * <p><b>This exists because the publish hook runs on the cluster state thread.</b>
+     * {@code Metadata} calls {@code IndexDescriptorPublisher.publish} while a cluster state is being built,
+     * so a blocking write here deadlocks: the cluster state update waits on an index operation that itself
+     * needs a cluster state to route. Registering the blocking {@link #put} as the publisher hung the node
+     * rather than failing, which is how it was found.
+     *
+     * <p>The cost of not waiting is that a descriptor write can be lost to a crash between the cluster
+     * state commit and the index operation landing. For creation that is tolerable, since the index is in
+     * cluster state and the descriptor is redundant there. <b>For a tombstone it is not</b>, because H4b
+     * established that a node adopting dangling shard data must be able to read the tombstone, and a lost
+     * tombstone is exactly the case that protects against. That gap is real and is tracked rather than
+     * papered over here.
+     *
+     * <p>Failures are logged rather than thrown for the same reason they are swallowed on the read path:
+     * this runs inside cluster state construction, and an exception raised there fails an unrelated
+     * cluster state update.
+     */
+    public void putAsync(IndexDescriptor descriptor) {
+        try {
+            client.index(
+                new IndexRequest(DESCRIPTOR_INDEX).id(descriptor.name()).source(DescriptorCodec.toSource(descriptor)),
+                new org.opensearch.core.action.ActionListener<>() {
+                    @Override
+                    public void onResponse(org.opensearch.action.index.IndexResponse response) {}
+
+                    @Override
+                    public void onFailure(Exception e) {
+                        logger.warn("failed to record descriptor for [{}]", descriptor.name(), e);
+                    }
+                }
+            );
+        } catch (Exception e) {
+            logger.warn("failed to submit descriptor write for [{}]", descriptor.name(), e);
+        }
     }
 
     /**
