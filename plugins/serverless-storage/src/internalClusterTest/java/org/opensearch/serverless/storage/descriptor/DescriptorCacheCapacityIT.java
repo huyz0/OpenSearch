@@ -167,6 +167,77 @@ public class DescriptorCacheCapacityIT extends OpenSearchIntegTestCase {
         assertTrue("and it must have actually evicted something", store.evictionCount() > 0);
     }
 
+    /**
+     * T4b. The byte budget has to bind before the entry count does, for descriptors big enough to matter.
+     *
+     * <p>T4b measured a twenty alias descriptor at 5.8 times a typical one and a two hundred alias
+     * descriptor at 51.6 times, which is why the bound is bytes. An entry count would let this population
+     * occupy fifty times what the same count of ordinary descriptors would, and the count would report the
+     * cache as being comfortably within its limit the whole time.
+     *
+     * <p>The capacity here is deliberately far above the number of names resolved, so if the byte budget
+     * did nothing the cache would simply grow and this would fail.
+     */
+    public void testTheByteBudgetBindsBeforeTheEntryCount() {
+        long budget = 64 * 1024;
+        DescriptorStore store = new DescriptorStore(client(), 1, now::get, DescriptorStore.COLLAPSE_WAIT_MILLIS, 100_000, budget);
+
+        int names = 200;
+        for (int i = 0; i < names; i++) {
+            store.create(heavilyAliasedDescriptor(name(i)));
+        }
+        for (int i = 0; i < names; i++) {
+            assertNotNull(store.get(name(i)));
+        }
+
+        logger.warn(
+            String.format(
+                Locale.ROOT,
+                "%nT4b byte budget: %d heavily aliased names resolved, %d cached, %,d bytes held against a "
+                    + "%,d byte budget and a 100,000 entry capacity%n",
+                names,
+                store.cachedCount(),
+                store.cachedBytes(),
+                budget
+            )
+        );
+
+        assertTrue(
+            "the byte budget must bind. Held " + store.cachedBytes() + " bytes against a budget of " + budget,
+            store.cachedBytes() <= budget
+        );
+        assertTrue(
+            "and it must be the thing that bound, not the entry count, which was never approached: "
+                + store.cachedCount()
+                + " entries against a capacity of 100,000",
+            store.cachedCount() < names
+        );
+    }
+
+    /** Twenty plain aliases, the case T4b measured at 5.8 times a typical descriptor. */
+    private static IndexDescriptor heavilyAliasedDescriptor(String name) {
+        List<String> aliases = new java.util.ArrayList<>();
+        for (int i = 0; i < 20; i++) {
+            aliases.add(String.format(Locale.ROOT, "%s-alias-%04d-padding-to-a-realistic-length", name, i));
+        }
+        return new IndexDescriptor(
+            name,
+            name + "-uuid",
+            1,
+            0,
+            true,
+            IndexDescriptor.State.OPEN,
+            aliases,
+            Version.CURRENT.id,
+            false,
+            false,
+            false,
+            false,
+            0L,
+            1_700_000_000_000L
+        );
+    }
+
     private static void resolveAll(DescriptorStore store, int from, int to) {
         for (int i = from; i < to; i++) {
             assertNotNull(store.get(name(i)));

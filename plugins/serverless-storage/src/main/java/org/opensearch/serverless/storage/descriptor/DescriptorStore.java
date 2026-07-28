@@ -80,8 +80,35 @@ public final class DescriptorStore {
      */
     static final long CACHE_TTL_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(1);
 
-    /** How many descriptors one node keeps in memory, bounding this the way H11 and H12 bound theirs. */
+    /**
+     * How many descriptors one node keeps in memory.
+     *
+     * <p>Retained as a secondary guard rather than as the bound. T4b measured that a descriptor with twenty
+     * plain aliases is 5.8 times a typical one and two hundred aliases is 51.6 times, so an entry count
+     * admits a fiftyfold range of memory and cannot be the thing defending the residency ceiling.
+     */
     static final int CACHE_CAPACITY = 50_000;
+
+    /**
+     * How much memory those descriptors may occupy, which is the bound that actually holds.
+     *
+     * <p>T4b is the reason this exists and the reason it is bytes. The rule was stated before the numbers:
+     * a byte budget earns its cost if a plausible heavy descriptor is more than about five times a typical
+     * one. Measured at 5.8x for twenty aliases and 51.6x for two hundred, so it does.
+     *
+     * <p>Thirty-two megabytes is roughly what fifty thousand typical descriptors occupy, so a cluster of
+     * ordinary indices sees the same behaviour it saw before, while a cluster of heavily aliased ones is
+     * held to a memory figure rather than to an entry count that means nothing about memory.
+     */
+    static final long CACHE_BYTES = 32L * 1024 * 1024;
+
+    /**
+     * Charged per entry on top of the descriptor itself, for the map node holding it.
+     *
+     * <p>Without it a population of very small descriptors would be bounded by a number that ignores the
+     * structure doing the holding, which is the same class of error as bounding by entry count.
+     */
+    private static final long ENTRY_OVERHEAD_BYTES = 64;
 
     /**
      * How long a caller waits for another caller's in-flight read before going to the index itself.
@@ -102,7 +129,7 @@ public final class DescriptorStore {
      * every admission and making no progress. A monotonic sequence is unique by construction, which is what
      * {@code GatedShardSuspensionRegistry} stamps for the same reason.
      */
-    private record CachedDescriptor(IndexDescriptor descriptor, long readAtNanos, long admittedAt) {
+    private record CachedDescriptor(IndexDescriptor descriptor, long readAtNanos, long admittedAt, long bytes) {
     }
 
     private final java.util.concurrent.ConcurrentHashMap<String, CachedDescriptor> cache = new java.util.concurrent.ConcurrentHashMap<>();
@@ -118,9 +145,11 @@ public final class DescriptorStore {
     private final java.util.function.LongSupplier clock;
     private final long collapseWaitMillis;
     private final int cacheCapacity;
+    private final long cacheBytes;
     private final java.util.concurrent.atomic.AtomicLong reads = new java.util.concurrent.atomic.AtomicLong();
     private final java.util.concurrent.atomic.AtomicLong evictions = new java.util.concurrent.atomic.AtomicLong();
     private final java.util.concurrent.atomic.AtomicLong admissions = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong cachedBytes = new java.util.concurrent.atomic.AtomicLong();
 
     private final Client client;
     private final int shardCount;
@@ -132,7 +161,7 @@ public final class DescriptorStore {
 
     /** Test seam for the clock, so the cache window can be exercised without sleeping. */
     DescriptorStore(Client client, int shardCount, java.util.function.LongSupplier clock) {
-        this(client, shardCount, clock, COLLAPSE_WAIT_MILLIS, CACHE_CAPACITY);
+        this(client, shardCount, clock, COLLAPSE_WAIT_MILLIS, CACHE_CAPACITY, CACHE_BYTES);
     }
 
     /**
@@ -142,7 +171,7 @@ public final class DescriptorStore {
      * fallback is how this area produced mechanisms that were correct and never reached.
      */
     DescriptorStore(Client client, int shardCount, java.util.function.LongSupplier clock, long collapseWaitMillis) {
-        this(client, shardCount, clock, collapseWaitMillis, CACHE_CAPACITY);
+        this(client, shardCount, clock, collapseWaitMillis, CACHE_CAPACITY, CACHE_BYTES);
     }
 
     /**
@@ -150,11 +179,24 @@ public final class DescriptorStore {
      * fifty thousand descriptors to reach it.
      */
     DescriptorStore(Client client, int shardCount, java.util.function.LongSupplier clock, long collapseWaitMillis, int cacheCapacity) {
+        this(client, shardCount, clock, collapseWaitMillis, cacheCapacity, CACHE_BYTES);
+    }
+
+    /** Test seam for the byte budget, so the bound T4b established can be reached without 32 MB of names. */
+    DescriptorStore(
+        Client client,
+        int shardCount,
+        java.util.function.LongSupplier clock,
+        long collapseWaitMillis,
+        int cacheCapacity,
+        long cacheBytes
+    ) {
         this.client = client;
         this.shardCount = shardCount;
         this.clock = clock;
         this.collapseWaitMillis = collapseWaitMillis;
         this.cacheCapacity = cacheCapacity;
+        this.cacheBytes = cacheBytes;
     }
 
     /**
@@ -182,6 +224,11 @@ public final class DescriptorStore {
         return cache.size();
     }
 
+    /** How much memory the cached descriptors occupy, which is the bound T4b established has to hold. */
+    long cachedBytes() {
+        return cachedBytes.get();
+    }
+
     /**
      * Caches a descriptor, evicting the stalest entries if that puts the cache over its bound.
      *
@@ -197,8 +244,25 @@ public final class DescriptorStore {
      * The same reasoning applies here for the same reason: this is read on every resolution.
      */
     private void admit(String name, IndexDescriptor descriptor, long now) {
-        cache.put(name, new CachedDescriptor(descriptor, now, admissions.incrementAndGet()));
+        long bytes = retainedSizeOf(name, descriptor);
+        CachedDescriptor replaced = cache.put(name, new CachedDescriptor(descriptor, now, admissions.incrementAndGet(), bytes));
+        // Net, so refreshing an entry does not double count it. A refresh is the common case once the
+        // window starts expiring, so getting this wrong would drift the total upward until the cache
+        // evicted itself to nothing.
+        cachedBytes.addAndGet(bytes - (replaced == null ? 0 : replaced.bytes()));
         evictIfOverCapacity();
+    }
+
+    /**
+     * What one cached descriptor costs.
+     *
+     * <p>The alias list is the only unbounded part, which is what T4b measured, so it is the only part
+     * walked rather than assumed.
+     */
+    private static long retainedSizeOf(String name, IndexDescriptor descriptor) {
+        long bytes = ENTRY_OVERHEAD_BYTES + org.apache.lucene.util.RamUsageEstimator.shallowSizeOfInstance(IndexDescriptor.class)
+            + org.apache.lucene.util.RamUsageEstimator.sizeOf(name) + org.apache.lucene.util.RamUsageEstimator.sizeOf(descriptor.uuid());
+        return bytes + org.apache.lucene.util.RamUsageEstimator.sizeOfCollection(descriptor.aliases());
     }
 
     /**
@@ -209,27 +273,46 @@ public final class DescriptorStore {
      * running on every admission once the cache is full.
      */
     private void evictIfOverCapacity() {
-        if (cache.size() <= cacheCapacity) {
+        if (cache.size() <= cacheCapacity && cachedBytes.get() <= cacheBytes) {
             return;
         }
-        int toEvict = Math.max(1, cacheCapacity / 10);
+        // Repeated because one pass drops a tenth of the entries, which is a tenth of the count but an
+        // unknown share of the bytes. A single pass would leave a cache of large descriptors over budget.
+        // Bounded so a concurrent writer refilling as fast as this drains cannot spin here forever.
+        for (int pass = 0; pass < 10 && (cache.size() > cacheCapacity || cachedBytes.get() > cacheBytes); pass++) {
+            if (evictStalestTenth() == false) {
+                return;
+            }
+        }
+    }
+
+    /** Drops the stalest tenth, reporting whether there was anything to drop. */
+    private boolean evictStalestTenth() {
+        int toEvict = Math.max(1, cache.size() / 10);
         long[] stamps = cache.values().stream().mapToLong(CachedDescriptor::admittedAt).sorted().toArray();
         if (stamps.length == 0) {
-            return;
+            return false;
         }
         long threshold = stamps[Math.min(toEvict, stamps.length - 1)];
+        boolean[] dropped = new boolean[1];
         cache.entrySet().removeIf(entry -> {
             if (entry.getValue().admittedAt() < threshold) {
+                cachedBytes.addAndGet(-entry.getValue().bytes());
                 evictions.incrementAndGet();
+                dropped[0] = true;
                 return true;
             }
             return false;
         });
+        return dropped[0];
     }
 
     /** Drops every cached descriptor, which a write must do so it does not serve its own stale value. */
     public void invalidate(String name) {
-        cache.remove(name);
+        CachedDescriptor removed = cache.remove(name);
+        if (removed != null) {
+            cachedBytes.addAndGet(-removed.bytes());
+        }
     }
 
     /**
