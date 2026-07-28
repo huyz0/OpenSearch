@@ -230,6 +230,30 @@ an outage, and the next tick re-suspends it.
 sweep across Area H's own classes found no third instance, but the pattern is structural rather than
 accidental.
 
+## Four times a green suite measured nothing, and what stops the fifth
+
+The fourth was found while deleting the code it was supposed to cover, which is the only reason it was
+found at all.
+
+H9c reported adding five tests to `IndexDescriptorTests` and reported nine passing. The nine were the
+tests already in the file. The insertion used `str.replace` against an anchor comment that does not exist
+in that file, so it silently changed nothing, and the script printed its own success message regardless.
+The suite was green because it ran tests that had nothing to do with the change.
+
+**The existing guard does not catch this.** Checking a result file's age and re-running catches stale
+results from a build that did not run. It cannot catch a run that really happened against code that was
+never edited.
+
+**The guard that does:** after any scripted edit, assert the edit is present in the file rather than
+trusting the script's own output. `grep -c` for a new symbol, or `git diff --stat` showing the file
+changed. A script that reports success it did not verify is worse than one that throws, because the
+report is what gets believed.
+
+Two things limit the damage here and neither is a defence. The load-bearing half of H9c, the placement
+filter in `SuspendedComputedShardTests`, was real and mutation tested, so the mechanism that matters was
+genuinely covered. And the untested descriptor field has since been deleted outright (H15), so nothing
+now depends on tests that never existed.
+
 ## Three times a green suite measured nothing, and what stops the fourth
 
 This is the failure mode of this area, and it has now happened three times.

@@ -37,12 +37,16 @@ import java.util.concurrent.atomic.AtomicLong;
  * reasoning was inverted by the very property that makes the feature worth having.
  *
  * <p>So it is a fixed-capacity cache holding the active working set rather than the whole sleeping
- * population. It is intended to sit over a durable record on {@link
- * org.opensearch.cluster.metadata.IndexDescriptor}, which carries a suspended-shard set for exactly this
- * purpose. <b>Nothing writes that record yet</b> (H13), so today this state is node-local and volatile: a
- * full-cluster restart wakes every sleeping shard, and they sleep again on the next tick that finds them
- * idle. Stated rather than implied, because the eviction argument below reads as stronger than it is if
- * the durable half is assumed to exist. An index with nothing asleep is still removed rather than left holding an empty
+ * population.
+ *
+ * <p><b>Deliberately volatile, which H15 settled by measurement rather than by preference.</b> A durable
+ * record on the descriptor was designed and then removed. The question was whether a restart would
+ * materialize every sleeping shard before the first tick could suspend them, which at a hundred million
+ * indices decides the whole design. H15 measured that computed placement opens no engine before a request
+ * addresses the shard, so a restart rebuilds a large routing view and nothing else: the shards stay cold
+ * until something asks for them, and the first idle tick puts them formally back to sleep. A suspension is
+ * therefore a derived decision that scale-to-zero recomputes, not a fact only this map holds, and
+ * persisting it would have been dead weight in a wire format. An index with nothing asleep is still removed rather than left holding an empty
  * set, which keeps the common case out of the cache entirely.
  *
  * <p><b>Why eviction is safe here, which is not the argument H11 could make.</b> Evicting a mapping costs

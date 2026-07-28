@@ -377,8 +377,21 @@ Nobody has measured that, and the two answers point at opposite implementations,
 recorded here rather than half built. The probe is small: bring up a cluster with a gated index, resolve
 its placement, and count engines opened.
 
-**Until then both comments say so.** `GatedShardSuspensionRegistry` and `IndexDescriptor` each state that
-the state is node-local and volatile today, rather than describing the durable half as though it exists.
+**Answered by H15, and the answer removed code rather than adding it.** Computed placement opens no engine
+before a request addresses the shard, measured by resolving a gated index's placement on a live node and
+finding no `IndexService` for it. So a restart rebuilds a large routing view and nothing else: the shards
+stay cold until something asks for them, and the first idle tick puts them formally back to sleep. The
+restart transient that would have made durability mandatory does not exist.
+
+So suspension is a derived decision that scale-to-zero recomputes, not a fact only the registry holds, and
+the descriptor's suspended-shard field was deleted rather than wired. A serialized wire field that nothing
+writes is the correct-and-unreachable mechanism this area has now shipped twice and been caught by twice
+(H7a, H8a), and keeping one on the grounds that it might be wanted later is how the third happens.
+
+**Worth stating plainly about the order of work.** H9c built the durable field and H15 then established it
+was unnecessary. Building it was not wasted, since it is what made the design concrete enough to ask the
+right question, but the honest summary is that the state was designed before the measurement that would
+have said whether to design it. The measurement was cheap and could have come first.
 
 ## H.11 Phasing, each phase falsifiable
 
