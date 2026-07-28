@@ -1757,3 +1757,54 @@ Four points across one decade, projected across two more. The assumption that th
 what a run at scale would test and this does not. What it does have, which no earlier extrapolation here
 did, is a validation point outside its own range.
 
+## P1 to P8: the hot-path review, and the one mistake it kept finding
+
+A pass over every per-request path the wiring added, benchmarking first and fixing second. Five
+improvements, two correctness gaps, and one mistake made three times.
+
+### Measured and fixed
+
+| finding | before | after |
+|---|---|---|
+| P1, P2: suspension lookup, 16 threads | 9.1M reads/sec | 1,037M reads/sec |
+| P3: store reads for a ten-new-field document | 10 | 1 |
+| P5: placement plus filter, 100 shards, one asleep | 8,728 ns | 84.1 ns |
+| P8: reads for fifty resolutions of one name | 50 | 1 |
+
+P1's structure did not merely fail to scale, it ran backwards: 57.4M reads per second on one thread down to
+9.1M on sixteen, a lock convoy on a path every request takes. H12 had chosen access ordering to protect the
+active set from a sweep, and that argument never needed read ordering, because the map holds only suspended
+indices and reading an unsuspended one inserts nothing.
+
+### The mistake, three times
+
+Every one of these was a cache that existed and was consulted too late to prevent anything.
+
+1. **P3.** The mapping guard sat after the store read it existed to avoid, so ten new fields cost ten reads.
+2. **P5, first attempt.** Keyed a memo by identity against a caller-supplied function that allocates per
+   call, so it missed every time and cost *more* than no memo: 159,499 ns against 8,728 ns. Caught only
+   because the benchmark ran after the change as well as before.
+3. **P7.** Checked its synthesis cache after the descriptor read that populates it, which is what led to P8
+   finding the descriptor read had no cache at all despite the seam documenting that it should.
+
+The generalisable form: a guard that needs the expensive value in order to decide cannot be placed after
+the expensive call. Where the check genuinely requires the result, the answer is a time window rather than
+a value comparison, which is what P3 and P8 both ended up using.
+
+### Correctness found while measuring
+
+**P6, P7.** A gated index had no routing at all. Resolution converts a name to metadata before calling
+placement, gating means there is no metadata, and ownership answered false for null. Nameable since W3,
+gated since W12, served by nothing, and nothing thrown. Closed by passing the name so the descriptor can
+supply what placement needs. I had scoped this as requiring a widened seam across 72 registration sites; it
+required neither, which is worth remembering the next time a fix is deferred on estimated blast radius.
+
+### Not changed, deliberately
+
+`MappingRefreshOnDemand` has the same access-ordered structure and is not constructed in production, so
+tuning it would be tuning dead code. Its ordering is also genuinely load-bearing in a way the suspension
+registry's was not: reads there populate the map, so a sweep really can evict the working set.
+
+The per-field cost in `DocumentParser` is one reference comparison against a local, short-circuiting before
+any volatile read. Measured by inspection rather than benchmark, and recorded as such.
+
