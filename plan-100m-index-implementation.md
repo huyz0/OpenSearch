@@ -863,3 +863,50 @@ decade rather than assumed, and the one that appeared to grow has been explained
 What would change the answer is a hundred million indices on real hardware. That is the whole of the
 remaining gap, and it is a smaller and better characterised gap than at any previous review.
 
+## Fifth review: the goal answered by extrapolation from a measured curve
+
+Scope was set by the user: plan for a hundred million, measure locally at populations that fit, and
+project. That is what the previous reviews should have done instead of treating the endpoint as something
+to brute-force.
+
+### The answer
+
+**The design carries to a hundred million on the evidence available, with two conditions attached.**
+
+| ceiling | evidence |
+|---|---|
+| placement | cleared by Area C |
+| residency | gated indices leave zero cluster state entries (S22); H11 and H12 closed two leaks that had rebuilt it on the data nodes |
+| creation throughput | flat at ~26,500/sec across 100K to 1M (S30), ~20,600/sec end to end (S26); 100M is roughly 70 minutes of writing |
+| lookup latency | 0.35 to 0.48 ms projected at 100M (S30), against 0.34 ms measured at 1M |
+
+The lookup projection is the one that matters and it is the one with a check outside its own range. S30's
+curve predicts 0.403 ms at ten million; S29 measured 0.3199 ms there on a separate run. The projection
+overshoots where it can be tested, so the upper figure is a bound rather than an estimate.
+
+### The two conditions, both discovered rather than designed
+
+1. **Merge policy** bounds lookup latency (S29, S30). Segments left unbounded reproduce the 1.88x per
+   decade curve S28 first saw. Held at one per shard, the same decade costs 1.05x.
+2. **Refresh interval** bounds wildcard staleness (H18). Exact names are realtime because a get by id reads
+   the translog; wildcards are searches and see refreshed segments only.
+
+Both are deployment parameters that can be got wrong in a way that looks like the architecture failing.
+They belong in the contract, not in a tuning guide.
+
+### What remains genuinely open
+
+**The serverless-only precondition**, which is a product decision about what the system promises rather
+than a question the code can answer.
+
+Everything else that was open at the fourth review is closed. The mechanisms exist, are tested and are
+mutation tested. Every enumeration found on a request path is converted or pinned with a named fix. Both
+cost curves have been measured across a decade and one of them validated a decade beyond that.
+
+### The caveat that stays attached
+
+Four points across one decade, projected across two more, is arithmetic on a measured slope. A run at a
+hundred million would test whether the slope holds, and nothing here substitutes for it. What this has
+that no earlier extrapolation in this project had is a validation point outside the measured range, and a
+slope that flattens rather than steepens as population grows.
+
