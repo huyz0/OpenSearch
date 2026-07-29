@@ -354,6 +354,12 @@ public final class DescriptorStore {
             IndexDescriptor descriptor = readFromIndex(name, now);
             mine.complete(descriptor);
             return descriptor;
+        } catch (RuntimeException e) {
+            // Waiters must inherit the failure rather than the null it would otherwise become, or
+            // collapsing would convert one node's unavailability back into "absent" for every caller
+            // behind it, which is the whole point of DescriptorUnavailableException.
+            mine.completeExceptionally(e);
+            throw e;
         } finally {
             // Completing an already-completed future is a no-op, so this only fires if readFromIndex threw
             // an Error. Without it a waiter would block until its own timeout for no reason.
@@ -392,7 +398,12 @@ public final class DescriptorStore {
             // collapseWaitMillis ago would stamp the entry as already expired against a one second window,
             // so the cache would be populated with something nothing can ever read.
             return readFromIndex(name, clock.getAsLong());
-        } catch (Exception e) {
+        } catch (java.util.concurrent.ExecutionException e) {
+            // The reader failed. Unavailability propagates, since a waiter is no better placed to claim
+            // the index is absent than the reader was.
+            if (e.getCause() instanceof org.opensearch.cluster.metadata.DescriptorUnavailableException unavailable) {
+                throw unavailable;
+            }
             logger.debug("in-flight descriptor read for [{}] failed", name, e);
             return null;
         }
@@ -410,11 +421,20 @@ public final class DescriptorStore {
             IndexDescriptor descriptor = DescriptorCodec.fromSource(response.getSourceAsMap());
             admit(name, descriptor, now);
             return descriptor;
-        } catch (Exception e) {
-            // A missing index is a missing descriptor, not a failure: before the first gated creation the
-            // descriptor index does not exist, and every resolution would otherwise throw.
-            logger.debug("descriptor lookup for [{}] failed", name, e);
+        } catch (org.opensearch.index.IndexNotFoundException e) {
+            // The descriptor index itself does not exist, which means no gated index has ever been created.
+            // Absent is the true answer here, and this is the case the original blanket catch was written
+            // for: before the first gated creation every resolution would otherwise throw.
+            logger.debug("descriptor index absent while resolving [{}]", name, e);
             return null;
+        } catch (Exception e) {
+            // Anything else means the descriptor index exists and could not be read: a cluster block, no
+            // shard available, a timeout. Returning null here would report every gated index in the
+            // cluster as non-existent, and a client acting on that could create an index that already
+            // exists. "I cannot tell" and "it is not there" have opposite safe responses, so they get
+            // different answers.
+            logger.warn("could not read the descriptor for [{}]; reporting unavailable rather than absent", name, e);
+            throw new org.opensearch.cluster.metadata.DescriptorUnavailableException(name, e);
         }
     }
 

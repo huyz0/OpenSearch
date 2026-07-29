@@ -68,6 +68,13 @@ public final class AbsentIndexDescriptorSuppliers {
         }
         try {
             return supplier.apply(indexName);
+        } catch (DescriptorUnavailableException e) {
+            // The one failure that must not become "no answer". Everything else here is a supplier bug,
+            // and Area C's reasoning holds for a bug: resolution is already a degradation path and turning
+            // a plugin defect into a request failure makes the absence worse. It does not hold when the
+            // store could not be read, because then "no answer" is indistinguishable from "no such index"
+            // and the caller's safe response to those two is opposite.
+            throw e;
         } catch (Exception e) {
             return null;
         }
