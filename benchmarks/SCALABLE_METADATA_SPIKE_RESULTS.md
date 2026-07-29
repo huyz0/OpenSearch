@@ -1967,3 +1967,72 @@ document writes rather than index creation, and it was right to. But it then fix
 whatever the test happened to use and the resulting number was quoted as a property of the system for the
 rest of the project. A measurement is of a system under conditions, and the conditions are part of the
 result. S26 got the operation wrong; S31 got the operation right and the conditions unstated.
+
+## S35 (T15): every creation figure in this document was measured on an instrumented JVM
+
+The question was where creation time goes, so `GatedCreationProfileIT` runs three thousand gated creations
+at a hundred in flight, long enough for Java Flight Recorder to collect a real profile. The first thing the
+profile said was about the measurement rather than the system.
+
+Of 1,045 execution samples: **18.7 percent touch the Java security manager, 8.6 percent touch the jacoco
+coverage agent**. The hottest single leaf frame in the entire recording is `ArraysSupport.mismatch` at 11
+percent, which is file permission path comparison. Neither agent exists in production.
+
+| configuration | creations/sec | |
+|---|---|---|
+| jacoco + security manager | 536 | what S26, S31 and S34 were all measured under |
+| security manager off | 690 | 1.29x |
+| both off | **859** | **1.60x** |
+
+So the creation numbers in this document understate production by roughly **1.6x**. A hundred million
+indices is about **1.35 days** at 859 per second, against the 4.9 days S31 established and the 2.1 days S34
+corrected it to. That is the third value for the same quantity, and the first one measured on a JVM
+resembling the one that will run it.
+
+### Where the time goes, once the agents are subtracted
+
+The busiest thread by a wide margin is `clusterManagerService#updateTask` at 27.2 percent of all samples,
+and there is exactly one of it. Within that thread:
+
+| | share of that thread |
+|---|---|
+| jacoco / security manager | 14.8% |
+| index metadata and settings construction | 13.4% |
+| `withTempIndexService` | 4.6% |
+| mapping parse | 1.4% |
+| `aggregateIndexSettings` | 1.4% |
+
+`withTempIndexService` was the hypothesis this profile was built to test, because
+`applyCreateIndexWithTemporaryService` constructs a real `IndexService` per creation and its own comment
+says so. At 4.6 percent it is real and it is not the cost. That is the second hypothesis about this path to
+die on contact with a profiler after S32, both times because reading the code makes the expensive-looking
+thing look expensive.
+
+### An open contradiction
+
+S32 removed the cluster state queue entirely and throughput did not move, which says the queue is not the
+limiter. This profile says the single cluster manager task thread is the busiest thing in the system by a
+factor of two over anything else.
+
+Both can be true if S32's null result was taken at five requests in flight, below the knee S34 later found
+near fifty. Until that is retested at saturation, "the queue is not the bottleneck" rests on a measurement
+made where nothing was contended. **This is the next experiment**, and it is also the one that decides
+whether batching creations into fewer cluster state tasks is worth building.
+
+### On batching, before anyone builds it
+
+Batching the descriptor write is not worth doing and this can be settled from existing numbers rather than
+new ones. S26 measured a descriptor document write at 20,577 per second, about 0.049 ms. A gated creation
+at 859 per second is 1.16 ms. The storage write is roughly 4 percent of creation, so a perfect batcher
+removes at most 4 percent.
+
+Batching at the cluster state task level is a different proposition and is currently unevaluated, pending
+the S32 retest above.
+
+### Why this is worth writing down
+
+Three measurements of gated creation throughput, three different answers, and each was a correction of the
+last: S26 measured the wrong operation, S31 measured the right operation under unstated conditions, S34
+found the conditions were the ceiling. This one found that all three ran under two agents that do not ship.
+The pattern is not carelessness about arithmetic; it is that a number, once written down, stops carrying the
+conditions that produced it.
