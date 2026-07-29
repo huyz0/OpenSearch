@@ -85,10 +85,43 @@ import java.util.concurrent.atomic.AtomicInteger;
  *
  * <p><b>An open contradiction worth stating rather than smoothing over.</b> S32 removed the cluster state
  * queue entirely and throughput did not move, which says the queue is not the limiter. This profile says
- * the single cluster manager task thread is the busiest thing in the system by a factor of two. Those can
- * be reconciled if S32's null result came from measuring at five in flight, below the knee S34 later found
- * near fifty. If so it should be retested at saturation, and until someone does, "the queue is not the
- * bottleneck" rests on a measurement taken where nothing was contended.
+ * the single cluster manager task thread is the busiest thing in the system by a factor of two.
+ *
+ * <p><b>Resolved by re-profiling with both agents off</b>, which is the only profile worth optimising
+ * against. 523 samples, zero infrastructure contamination, and {@code jdk.ThreadCPULoad} answers the
+ * question directly: the cluster manager task thread runs at <b>3.76 percent of total CPU on a twenty core
+ * machine, where one fully busy thread reads 5.0 percent</b>. So it is about 75 percent busy. It is the
+ * leading constraint by a factor of two over anything else, and it is not saturated.
+ *
+ * <p>That reconciles S32 without needing the concurrency explanation: removing work from a thread with
+ * headroom gives sub-linear gains, so S32's null result is what a 75 percent busy serialisation point
+ * predicts. The clean concurrency sweep agrees, saturating near 850 per second between fifty and a hundred
+ * in flight and declining slightly at two hundred.
+ *
+ * <p><b>Where the cluster manager thread's time goes, cleanly measured:</b>
+ *
+ * <pre>
+ *   settings subsystem                      ~20%   Setting.get, getRaw, exists, AbstractScopedSettings
+ *   temporary IndexService and analysis     ~15-20%  createIndexService, newIndexService, AnalysisRegistry
+ *   descriptor write submission             ~10%   TransportBulkAction, IngestService.resolvePipelines
+ * </pre>
+ *
+ * <p>Note the first entry, because the earlier contaminated profile hid it and the second entry is the one
+ * everybody guesses. Validating index settings against the scoped settings registry costs more than
+ * building the throwaway {@code IndexService} that the code makes so visible.
+ *
+ * <p><b>Why nothing here was optimised.</b> Each of the three has a problem that measurement will not
+ * solve. Skipping the temporary {@code IndexService} for a gated index is defensible, since its mappings go
+ * to the mapping store rather than cluster state and T7 already refuses to gate an index with alias
+ * filters, but it moves mapping validation from creation time to first use, which is a semantic trade
+ * rather than an optimisation. Caching built analyzers is core OpenSearch behaviour affecting every index
+ * creation, not just gated ones. Moving the descriptor write submission off this thread is safe and worth
+ * perhaps five percent, and needs a {@code ThreadPool} plumbed through {@code DescriptorGate.install} to
+ * get it.
+ *
+ * <p>At 850 per second a hundred million indices is 1.35 days. The honest position is that the remaining
+ * wins are a semantic decision rather than an engineering one, and that decision belongs to whoever owns
+ * the mapping validation contract.
  */
 public class GatedCreationProfileIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
 

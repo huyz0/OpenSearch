@@ -2036,3 +2036,60 @@ last: S26 measured the wrong operation, S31 measured the right operation under u
 found the conditions were the ceiling. This one found that all three ran under two agents that do not ship.
 The pattern is not carelessness about arithmetic; it is that a number, once written down, stops carrying the
 conditions that produced it.
+
+## S36 (T16): the clean profile, and why the remaining wins are a semantic decision
+
+S35 found the profile was 27 percent test infrastructure. Re-profiled with the security manager and the
+jacoco agent both off, which is the only profile worth optimising against: 523 samples, **zero**
+contamination.
+
+### Is the cluster manager thread actually the bottleneck
+
+`jdk.ThreadCPULoad` answers it without inference. The cluster manager task thread runs at **3.76 percent of
+total CPU on a twenty core machine**, where one fully busy thread reads 5.0 percent. So it is about **75
+percent busy**: the leading constraint by a factor of two over anything else, and not saturated.
+
+That resolves the S32 contradiction without needing the concurrency explanation S35 proposed. Removing work
+from a thread that has headroom gives sub-linear gains, so S32's null result is exactly what a 75 percent
+busy serialisation point predicts. The clean concurrency sweep agrees:
+
+| in flight | 1 | 5 | 20 | 50 | 100 | 200 |
+|---|---|---|---|---|---|---|
+| creations/sec | 243 | 617 | 475 | 805 | **872** | 833 |
+
+Saturating near 850 per second between fifty and a hundred, declining slightly beyond.
+
+### Where the time goes
+
+| | share of the cluster manager thread |
+|---|---|
+| settings subsystem | ~20% |
+| temporary IndexService and analysis | ~15-20% |
+| descriptor write submission | ~10% |
+
+The first entry is the surprise and the contaminated profile hid it: validating index settings against the
+scoped settings registry costs more than building the throwaway `IndexService` that the code makes so
+visible. `withTempIndexService` was the hypothesis two profiles were built to test and it is second.
+
+### Why nothing was optimised here
+
+Each remaining target has a problem measurement will not solve.
+
+- **Skip the temporary IndexService for gated indices.** Defensible: a gated index's mappings go to the
+  mapping store rather than cluster state, and T7 already refuses to gate an index carrying alias filters.
+  But it moves mapping validation from creation time to first use. That is a semantic trade, not an
+  optimisation, and it belongs to whoever owns the mapping validation contract.
+- **Cache built analyzers.** Core OpenSearch behaviour affecting every index creation, not just gated ones.
+- **Move the descriptor write submission off the cluster manager thread.** Safe, worth perhaps five percent,
+  and needs a `ThreadPool` plumbed through `DescriptorGate.install` to get it.
+
+### Where creation actually stands
+
+**~850 per second, so a hundred million indices in about 1.35 days.** Down from 4.9 days (S31), via 2.1
+(S34), via 1.35 (S35). The three corrections were: wrong operation, unstated conditions, instrumented JVM.
+
+### On batching, settled
+
+Batching descriptor writes buys at most 4 percent and is not worth building. Batching creations into fewer
+cluster state tasks was the open question, and the 75 percent figure closes it: there is roughly a third
+more headroom on that thread, not a multiple.
