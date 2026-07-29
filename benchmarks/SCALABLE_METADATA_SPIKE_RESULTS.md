@@ -2093,3 +2093,61 @@ Each remaining target has a problem measurement will not solve.
 Batching descriptor writes buys at most 4 percent and is not worth building. Batching creations into fewer
 cluster state tasks was the open question, and the 75 percent figure closes it: there is roughly a third
 more headroom on that thread, not a multiple.
+
+## S37 (T17): a gated creation acknowledges before its descriptor lands
+
+Found while looking for the last few percent of creation throughput, by reading the path the profiler
+pointed at. `MetadataCreateIndexService.clusterStateCreateIndex` says of the gated branch:
+
+> The descriptor write is the creation, and it is the thing that must succeed.
+>
+> Failure semantics invert from H2b's here. During dual write a lost descriptor cost a comparison; now it
+> costs the index.
+
+It then calls `IndexDescriptorPublisher.publish`, which reports whether a publisher was **invoked**, not
+whether the write **landed**. The publisher routes a live descriptor to `DescriptorStore.putAsync`, which
+submits and returns, logging failure at warn.
+
+Probed rather than argued, by closing the descriptor index so the write cannot land:
+
+```
+T17: gated creation of [doomed-idx] returned acknowledged=true
+     while the descriptor index was closed
+```
+
+The client is told the index was created. There is no cluster state entry, because that is what gating
+means, and no descriptor, because the write failed. **The index exists nowhere and the client believes it
+exists.**
+
+### Why it is this way
+
+W4 produced it. The publish hook runs on the cluster state thread while a state is being built, and a
+blocking descriptor write there deadlocked the node rather than failing. `putAsync` was the answer to that
+deadlock, and it silently traded away the durability the gated branch later came to depend on. Both
+decisions were locally correct; the second one changed what the first one meant.
+
+### The fix, which is not in this commit
+
+The descriptor write has to move off the cluster state task and onto the request path, which is what H3
+describes: `create()` with `op_type=create` is the uniqueness gate and the creation, so it belongs where it
+can block and report failure. Two consequences fall out of that, and both are improvements:
+
+- the acknowledgement becomes truthful
+- `op_type=create` actually gates uniqueness, which the current path does not use at all, since `publish`
+  routes to a plain put
+
+That is a change to how index creation is sequenced. It needs its own design rather than being appended to
+a performance pass, so the test is committed under `AwaitsFix` and the defect stays reproducible.
+
+### Status
+
+**This is a blocker for enabling gated creation**, ahead of any remaining throughput work. Creation is at
+roughly 850 per second and the last available optimisations are worth a few percent each; correctness of the
+acknowledgement is worth more than all of them.
+
+### Why this is worth writing down
+
+The performance investigation found it. Three profiles looking for milliseconds walked past this line, and
+it only surfaced when the question became "what does this code actually do" rather than "how long does it
+take". Optimisation work reads code adversarially and at a level of detail that review does not, which is
+worth remembering the next time a performance pass is deprioritised.
