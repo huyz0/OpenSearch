@@ -141,16 +141,95 @@ public class GatedCreationThroughputIT extends org.opensearch.serverless.storage
         assertTrue("every arm must be non-zero, or this measured nothing", ordinary > 0 && gated > 0 && ordinaryAgain > 0);
     }
 
+    /**
+     * T14. Whether gated creation scales with concurrency, which decides whether 235 per second is a real
+     * ceiling or an artefact of how P9 drove it.
+     *
+     * <p>P9 measured 235 per second with five requests in flight and the plan has quoted it ever since,
+     * including as the reason a hundred million indices takes 4.9 days. That figure is only a ceiling if
+     * creation is serialised somewhere.
+     *
+     * <p>Two measurements say it may not be. P10 removed the cluster state queue entirely and throughput did
+     * not move, and T13 found a cluster state publication costs 14 to 27 ms while a gated creation costs
+     * 4.3 ms, so gating is skipping the round trip rather than queueing behind it. What remains is
+     * per-request pipeline work, and per-request work should scale with concurrent requests until something
+     * shared saturates.
+     *
+     * <p>So this sweeps concurrency at a fixed batch. Flat means 235 is a real serialisation point and the
+     * 4.9 day figure stands. Rising means the ceiling was the harness, and the number the plan quotes is
+     * measuring how hard P9 pushed rather than what the system does.
+     *
+     * <p><b>Measured, two runs:</b>
+     *
+     * <pre>
+     *   in flight    run A    run B
+     *           1      189      145 per second
+     *           5      222      317 per second
+     *          20      443      386 per second
+     *          50      499      492 per second
+     *         100        -      520 per second
+     *         200        -      566 per second
+     * </pre>
+     *
+     * <p><b>It rises, so 235 was not a ceiling.</b> The five in flight row reproduces P9, which is what
+     * makes the rest credible: the harness is the same, only the pressure changed. Throughput saturates
+     * around 500 to 570 per second, with four times the concurrency from fifty to two hundred buying 1.15x,
+     * so that is a real asymptote rather than a point on a line.
+     *
+     * <p>Individual figures are soft, since run to run they move by a third at the same concurrency. The
+     * asymptote and the shape are what survive repetition.
+     *
+     * <p><b>What this changes.</b> A hundred million indices is about 2.1 days at 550 per second rather than
+     * 4.9 days at 235, so the plan's figure overstates the cost by roughly 2.3x. That is worth correcting
+     * and it is not a reprieve: two days is still a bulk migration, and whether the asymptote rises with
+     * cluster size is a separate question this single cluster cannot answer.
+     */
+    public void testGatedCreationAgainstConcurrency() throws Exception {
+        DescriptorGate.install(
+            new DescriptorStore(client(), 1),
+            new IndexBackedMappingStore(client()),
+            new IndexBackedMappingStatsAggregator(client()),
+            new StoreBackedFieldRefresher(),
+            true
+        );
+
+        int[] concurrencies = { 1, 5, 20, 50, 100, 200 };
+        int batch = 100;
+        StringBuilder table = new StringBuilder("\nT14 gated creation against concurrency, " + batch + " indices per arm\n");
+        table.append(String.format(Locale.ROOT, "  %12s %18s %14s%n", "in flight", "creations/sec", "vs 1"));
+
+        // Warmed with the same work, since an under-warmed first arm is how S30 inverted a whole curve.
+        createPerSecond("warm", true, 20, 5);
+
+        double atOne = 0;
+        for (int concurrency : concurrencies) {
+            double rate = createPerSecond("conc-" + concurrency, true, batch, concurrency);
+            if (concurrency == concurrencies[0]) {
+                atOne = rate;
+            }
+            table.append(String.format(Locale.ROOT, "  %12d %18.0f %13.2fx%n", concurrency, rate, rate / atOne));
+        }
+
+        table.append("\n  P9 measured 235/sec at five in flight and the plan quotes it as the ceiling.\n");
+        logger.warn(table.toString());
+
+        assertTrue("the measurement must be non-zero, or this measured nothing", atOne > 0);
+    }
+
     private double createPerSecond(String prefix, boolean serverless) throws Exception {
-        CountDownLatch done = new CountDownLatch(BATCH);
+        return createPerSecond(prefix, serverless, BATCH, IN_FLIGHT);
+    }
+
+    private double createPerSecond(String prefix, boolean serverless, int batch, int concurrency) throws Exception {
+        CountDownLatch done = new CountDownLatch(batch);
         AtomicInteger failures = new AtomicInteger();
         // Capture the first failure rather than only counting. Counting told me 300 creations failed and
         // nothing about why, which cost a whole run.
         java.util.concurrent.atomic.AtomicReference<Exception> firstFailure = new java.util.concurrent.atomic.AtomicReference<>();
-        Semaphore inFlight = new Semaphore(IN_FLIGHT);
+        Semaphore inFlight = new Semaphore(concurrency);
 
         long startedAt = System.nanoTime();
-        for (int i = 0; i < BATCH; i++) {
+        for (int i = 0; i < batch; i++) {
             inFlight.acquire();
             Settings.Builder settings = Settings.builder()
                 .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
@@ -188,6 +267,6 @@ public class GatedCreationThroughputIT extends org.opensearch.serverless.storage
                 firstFailure.get()
             );
         }
-        return BATCH / seconds;
+        return batch / seconds;
     }
 }

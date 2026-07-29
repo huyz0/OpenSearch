@@ -1924,3 +1924,46 @@ different reasons agreeing is worth more than either on its own.
 An unmeasured number quoted three times starts to read like a finding. Nothing about it changed between the
 first assertion and the third except repetition, and the measurement it was standing in for took under an
 hour once someone wrote it instead of citing it.
+
+## S34 (T14): 235 per second was the harness, not the system
+
+S31 measured gated creation at 235 per second and this plan has quoted it ever since, including as the
+reason a hundred million indices takes 4.9 days. That figure was taken with five requests in flight, and a
+number measured under fixed pressure is a ceiling only if something serialises.
+
+Two measurements already suggested nothing did. S32 removed the cluster state queue entirely and throughput
+did not move. S33 found a publication costs 14 to 27 ms while a gated creation costs 4.3 ms, so gating skips
+the round trip rather than queueing behind it. What remains is per-request pipeline work, which should scale
+with concurrent requests until something shared saturates.
+
+| in flight | run A | run B |
+|---|---|---|
+| 1 | 189/sec | 145/sec |
+| 5 | 222/sec | 317/sec |
+| 20 | 443/sec | 386/sec |
+| 50 | 499/sec | 492/sec |
+| 100 | — | 520/sec |
+| 200 | — | 566/sec |
+
+The five in flight row reproduces S31, which is what makes the rest credible: same harness, only the
+pressure changed. Throughput saturates around 500 to 570 per second, and four times the concurrency from
+fifty to two hundred buys 1.15x, so that is a genuine asymptote rather than a point on a line.
+
+Individual figures move by a third between runs at the same concurrency. The asymptote survives repetition;
+the individual numbers do not.
+
+### What it changes
+
+A hundred million indices is roughly **2.1 days at 550 per second**, not 4.9 days at 235. The plan overstates
+creation cost by about 2.3x and should be corrected.
+
+It is not a reprieve. Two days is still a bulk migration rather than an operation, and whether the asymptote
+rises with cluster size is a separate question one cluster cannot answer.
+
+### Why this is worth writing down
+
+S31 was itself a correction. It replaced S26's 20,577 per second after finding S26 measured descriptor
+document writes rather than index creation, and it was right to. But it then fixed the concurrency at
+whatever the test happened to use and the resulting number was quoted as a property of the system for the
+rest of the project. A measurement is of a system under conditions, and the conditions are part of the
+result. S26 got the operation wrong; S31 got the operation right and the conditions unstated.
