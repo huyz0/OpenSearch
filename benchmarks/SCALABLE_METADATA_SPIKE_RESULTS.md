@@ -1881,3 +1881,46 @@ hot path, a hypothesis about where time goes is worth exactly as much as the mea
 
 Profiling the creation pipeline is the next step, and it is a different task from this one.
 
+
+## S33 (T13): publication cost does not grow with node count, over the range that can be measured
+
+Three separate answers in this project's design discussions rested on the claim that once index metadata
+leaves cluster state, the remaining O(N) publication becomes the ceiling at thousands of nodes. The claim
+was labelled unmeasured each time and reasoned from anyway, including in a recommendation to move node
+membership to etcd. `ClusterStatePublicationCostIT` measures it.
+
+A persistent cluster settings update is close to the smallest real cluster state change available: a few
+bytes of diff, no reroute, no index metadata. Median of nine, three runs of the whole test.
+
+| data nodes | run A | run B | run C |
+|---|---|---|---|
+| 1 | 13.69 ms | 16.99 ms | 26.60 ms |
+| 2 | 13.41 ms | 14.42 ms | 26.53 ms |
+| 4 | 14.69 ms | 15.47 ms | 24.22 ms |
+| 6 | 15.71 ms | 16.45 ms | 23.00 ms |
+| **ratio at 6** | **1.15x** | **0.97x** | **0.86x** |
+
+The slope reverses direction between runs. Variance at a fixed node count spans 13.7 to 26.6 ms, wider than
+anything six times the nodes does. Node join measured 180, 105, 104, 96, 106 and 79 ms against one through
+six existing nodes, with the first carrying JVM warmup, so it shows no growth either.
+
+### What this does and does not settle
+
+The claim is not supported. It is also not refuted, and keeping those apart is the point. Every node here is
+in one JVM over loopback, and the two effects that would make the claim true are exactly the ones a local run
+cannot produce: real network fan-out, and a tail set by the slowest of a thousand nodes rather than the
+slowest of six. So this is a floor, and the honest state of the claim is unproven.
+
+### The constant is the real result
+
+A cluster state change costs roughly 14 to 27 ms whatever the node count. That is a per-change floor paid by
+anything touching cluster state, and it cross-checks S31 from the opposite direction: gated creation at 235
+per second is 4.3 ms per index, less than a single publication costs. Gating therefore demonstrably skips
+the round trip rather than making it cheaper, which S31 alone could not show. Two measurements taken for
+different reasons agreeing is worth more than either on its own.
+
+### Why this is worth writing down
+
+An unmeasured number quoted three times starts to read like a finding. Nothing about it changed between the
+first assertion and the third except repetition, and the measurement it was standing in for took under an
+hour once someone wrote it instead of citing it.
