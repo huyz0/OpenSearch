@@ -45,6 +45,7 @@ public class DescriptorOnlyCreationScalingTests extends OpenSearchTestCase {
     public void clearRegistrations() {
         DescriptorOnlyCreation.register(null);
         IndexDescriptorPublisher.register(null);
+        IndexDescriptorPublisher.registerCreator(null);
     }
 
     public void testCreationCostAgainstPopulation() {
@@ -58,10 +59,18 @@ public class DescriptorOnlyCreationScalingTests extends OpenSearchTestCase {
 
             DescriptorOnlyCreation.register(null);
             IndexDescriptorPublisher.register(null);
+            IndexDescriptorPublisher.registerCreator(null);
             double throughClusterState = time(base, "cs-" + population);
 
             AtomicInteger published = new AtomicInteger();
             IndexDescriptorPublisher.register(descriptor -> published.incrementAndGet());
+            // T18 split recording from creating, and a gated index now goes through the creator only. The
+            // publisher still records ordinary indices from Metadata.Builder, so counting there would count
+            // zero for a gated population. The count moves to where the writes actually happen.
+            IndexDescriptorPublisher.registerCreator(descriptor -> {
+                published.incrementAndGet();
+                return java.util.concurrent.CompletableFuture.completedFuture(Boolean.TRUE);
+            });
             DescriptorOnlyCreation.register(indexMetadata -> true);
             double throughDescriptor = time(base, "desc-" + population);
 
@@ -87,6 +96,10 @@ public class DescriptorOnlyCreationScalingTests extends OpenSearchTestCase {
      */
     public void testDescriptorOnlyCreationIsFlatAgainstPopulation() {
         IndexDescriptorPublisher.register(descriptor -> {});
+        // T18 split recording from creating: a gated index is created by the creator, and its
+        // future is what the acknowledgement waits on. Registering only a publisher would leave
+        // createGated returning null, which creation now treats as "no record anywhere".
+        IndexDescriptorPublisher.registerCreator(descriptor -> java.util.concurrent.CompletableFuture.completedFuture(Boolean.TRUE));
         DescriptorOnlyCreation.register(indexMetadata -> true);
 
         double atThousand = time(stateWith(1_000), "flat-small");
@@ -122,6 +135,7 @@ public class DescriptorOnlyCreationScalingTests extends OpenSearchTestCase {
     public void testCreationRefusesWhenNothingWouldRecordTheIndex() {
         DescriptorOnlyCreation.register(indexMetadata -> true);
         IndexDescriptorPublisher.register(null);
+        IndexDescriptorPublisher.registerCreator(null);
 
         IllegalStateException failure = expectThrows(
             IllegalStateException.class,
@@ -147,7 +161,8 @@ public class DescriptorOnlyCreationScalingTests extends OpenSearchTestCase {
             Set.of(),
             index("ordinary"),
             (state, reason) -> state,
-            null
+            null,
+            write -> {}
         );
 
         assertTrue("an ungated index must still get its cluster state entry", created.metadata().hasIndex("ordinary"));
@@ -165,7 +180,8 @@ public class DescriptorOnlyCreationScalingTests extends OpenSearchTestCase {
                 Set.of(),
                 created,
                 (state, reason) -> state,
-                null
+                null,
+                write -> {}
             );
             best = Math.min(best, System.nanoTime() - startedAt);
             assertNotNull("creation must return a state, or the timing is of nothing", result);

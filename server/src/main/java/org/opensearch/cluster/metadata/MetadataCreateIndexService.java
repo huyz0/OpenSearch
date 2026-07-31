@@ -441,6 +441,75 @@ public class MetadataCreateIndexService {
             }
             super.onFailure(source, e);
         }
+
+        /**
+         * Answers the client, and for a gated index answers it only once the descriptor write has landed.
+         *
+         * <p>T18. For an ordinary index the cluster state update is the creation, so acknowledging it is
+         * the truth and this defers to the parent unchanged. For a gated index the update deliberately
+         * changes nothing and therefore always succeeds, so acknowledging it says only that nothing
+         * happened. The descriptor write is the creation, and its outcome is what the client is owed.
+         *
+         * <p>The cluster state thread has already returned by the time this runs, which is what keeps W4's
+         * deadlock closed: nothing waits on the thread that would have to route the write.
+         *
+         * <p>A completed-false future means a competing creation won the name, which is H3's uniqueness
+         * gate reporting rather than an error, so the client gets the same
+         * {@link ResourceAlreadyExistsException} an ordinary duplicate would produce.
+         */
+        @Override
+        public void onAllNodesAcked(@Nullable Exception e) {
+            java.util.concurrent.CompletableFuture<Boolean> write = request.descriptorWrite();
+            if (write == null) {
+                super.onAllNodesAcked(e);
+                return;
+            }
+            write.whenComplete((created, failure) -> {
+                if (failure != null) {
+                    onFailure("create-index [" + request.index() + "] descriptor write", unwrap(failure));
+                } else if (Boolean.TRUE.equals(created) == false) {
+                    onFailure(
+                        "create-index [" + request.index() + "] descriptor write",
+                        new ResourceAlreadyExistsException(request.index())
+                    );
+                } else {
+                    super.onAllNodesAcked(e);
+                }
+            });
+        }
+
+        /**
+         * The same deferral for the timeout path, since a gated creation that times out its acknowledgement
+         * has still not been told whether its descriptor landed.
+         */
+        @Override
+        public void onAckTimeout() {
+            java.util.concurrent.CompletableFuture<Boolean> write = request.descriptorWrite();
+            if (write == null) {
+                super.onAckTimeout();
+                return;
+            }
+            write.whenComplete((created, failure) -> {
+                if (failure != null) {
+                    onFailure("create-index [" + request.index() + "] descriptor write", unwrap(failure));
+                } else if (Boolean.TRUE.equals(created) == false) {
+                    onFailure(
+                        "create-index [" + request.index() + "] descriptor write",
+                        new ResourceAlreadyExistsException(request.index())
+                    );
+                } else {
+                    super.onAckTimeout();
+                }
+            });
+        }
+
+        /** Unwraps the CompletionException the future stage adds, so the client sees the real cause. */
+        private Exception unwrap(Throwable failure) {
+            Throwable cause = failure instanceof java.util.concurrent.CompletionException && failure.getCause() != null
+                ? failure.getCause()
+                : failure;
+            return cause instanceof Exception exception ? exception : new OpenSearchException(cause);
+        }
     }
 
     /**
@@ -636,7 +705,14 @@ public class MetadataCreateIndexService {
             );
 
             indexService.getIndexEventListener().beforeIndexAddedToCluster(indexMetadata.getIndex(), indexMetadata.getSettings());
-            return clusterStateCreateIndex(currentState, request.blocks(), indexMetadata, allocationService::reroute, metadataTransformer);
+            return clusterStateCreateIndex(
+                currentState,
+                request.blocks(),
+                indexMetadata,
+                allocationService::reroute,
+                metadataTransformer,
+                request::descriptorWrite
+            );
         });
     }
 
@@ -1635,12 +1711,39 @@ public class MetadataCreateIndexService {
      * Creates the index into the cluster state applying the provided blocks. The final cluster state will contain an updated routing
      * table based on the live nodes.
      */
+    /**
+     * Creates an ordinary index, one whose creation is the cluster state update itself.
+     *
+     * <p>Deliberately refuses a gated index rather than dropping its descriptor write on the floor. A gated
+     * creation's write is the creation, so somebody has to await it, and a sink that silently discarded it
+     * would reinstate exactly the defect T17 and T23 measured: an acknowledgement that means nothing and a
+     * name with no uniqueness. Callers that can create a gated index must use the six argument form and
+     * carry the future to whoever answers the client.
+     */
     static ClusterState clusterStateCreateIndex(
         ClusterState currentState,
         Set<ClusterBlock> clusterBlocks,
         IndexMetadata indexMetadata,
         BiFunction<ClusterState, String, ClusterState> rerouteRoutingTable,
         BiConsumer<Metadata.Builder, IndexMetadata> metadataTransformer
+    ) {
+        return clusterStateCreateIndex(currentState, clusterBlocks, indexMetadata, rerouteRoutingTable, metadataTransformer, write -> {
+            throw new IllegalStateException(
+                "index ["
+                    + indexMetadata.getIndex().getName()
+                    + "] is gated, so its descriptor write is its creation and must be awaited. Use the "
+                    + "clusterStateCreateIndex overload that accepts a descriptor write sink."
+            );
+        });
+    }
+
+    static ClusterState clusterStateCreateIndex(
+        ClusterState currentState,
+        Set<ClusterBlock> clusterBlocks,
+        IndexMetadata indexMetadata,
+        BiFunction<ClusterState, String, ClusterState> rerouteRoutingTable,
+        BiConsumer<Metadata.Builder, IndexMetadata> metadataTransformer,
+        java.util.function.Consumer<java.util.concurrent.CompletableFuture<Boolean>> descriptorWrite
     ) {
         // Area H's third phase. When the gate is open for this index, creation records a descriptor and
         // writes nothing to cluster state: no metadata entry, no routing entry, no publication, and none
@@ -1651,14 +1754,25 @@ public class MetadataCreateIndexService {
         // comparison; now it costs the index, so publish is required to report that someone was
         // listening rather than being allowed to no-op.
         if (DescriptorOnlyCreation.skipsClusterState(indexMetadata)) {
-            if (IndexDescriptorPublisher.publish(indexMetadata) == false) {
+            // T18. The descriptor write is the creation, so it goes through createGated rather than
+            // publish: op_type=create makes it atomic against a competing creation (T23 measured eight
+            // concurrent creations of one name all acknowledged without it), and the future carries the
+            // outcome so the acknowledgement can wait for it (T17 measured an acknowledged creation whose
+            // write could not possibly have landed).
+            //
+            // The cluster state thread does not wait here. It hands the future to the task, which defers
+            // its response until the write completes, which is what keeps W4's deadlock closed: the thread
+            // that would have to supply a cluster state for this write to route is this one.
+            java.util.concurrent.CompletableFuture<Boolean> write = IndexDescriptorPublisher.createGated(indexMetadata);
+            if (write == null) {
                 throw new IllegalStateException(
                     "index ["
                         + indexMetadata.getIndex().getName()
-                        + "] is configured to skip its cluster state entry, but no descriptor publisher is "
+                        + "] is configured to skip its cluster state entry, but no descriptor creator is "
                         + "installed, so creating it would leave no record of it anywhere"
                 );
             }
+            descriptorWrite.accept(write);
             return currentState;
         }
 

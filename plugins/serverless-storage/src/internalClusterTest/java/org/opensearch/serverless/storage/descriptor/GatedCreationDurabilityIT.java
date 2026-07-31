@@ -8,7 +8,6 @@
 
 package org.opensearch.serverless.storage.descriptor;
 
-import org.apache.lucene.tests.util.LuceneTestCase.AwaitsFix;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.Settings;
@@ -126,7 +125,6 @@ public class GatedCreationDurabilityIT extends org.opensearch.serverless.storage
      * stays honest about it. Weakening it to assert the broken behaviour would have made this area's
      * signature failure into a specification.
      */
-    @AwaitsFix(bugUrl = "gated creation acknowledges before the descriptor write lands; needs the write moved to the request path")
     public void testAcknowledgementWhenTheDescriptorWriteCannotLand() throws Exception {
         DescriptorStore store = install();
 

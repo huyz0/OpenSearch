@@ -122,6 +122,12 @@ public final class DescriptorGate {
                 store.putTombstoneAsync(descriptor);
             }
         });
+        // T18. The creator is a separate registration from the publisher because the two have opposite
+        // failure semantics, and T17 and T23 are what happened while one stood in for the other. The
+        // publisher records an index that already exists in cluster state, so a lost write costs a
+        // comparison. The creator writes the only record a gated index will ever have, so it uses
+        // op_type=create for atomicity against a competing creation and reports its outcome to the client.
+        IndexDescriptorPublisher.registerCreator(store::createAsync);
         // Mappings, which H4c required to leave cluster state and which have had no backing store since
         // H6a proved the swap converges. Blocking is safe here, unlike the publish hook above: a mapping
         // update runs on a transport thread handling a put-mapping or a dynamic field inference, not on
@@ -186,6 +192,7 @@ public final class DescriptorGate {
         AbsentIndexDescriptorSuppliers.register(null);
         AbsentIndexDescriptorSuppliers.registerPager(null);
         IndexDescriptorPublisher.register(null);
+        IndexDescriptorPublisher.registerCreator(null);
         MappingGenerationStore.register(null);
         GatedMappingStatsAggregator.register(null);
         DescriptorOnlyCreation.register(null);

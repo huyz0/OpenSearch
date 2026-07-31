@@ -50,6 +50,49 @@ public final class IndexDescriptorPublisher {
         PUBLISHER.set(publisher);
     }
 
+    /**
+     * Creates a gated index's descriptor, which for a gated index <em>is</em> the creation.
+     *
+     * <p>Separate from {@link #register}'s publisher because the two have opposite failure semantics and
+     * T17 and T23 are what happens when one stands in for the other. A publisher records an index that
+     * already exists in cluster state, so losing the write costs a comparison and fire and forget is
+     * right. A creator is the only record the index will ever have, so it must be atomic against a
+     * competing creation and its outcome must reach the client.
+     *
+     * <p>Returns a future rather than a boolean so the caller can defer the acknowledgement without
+     * blocking. W4 established that blocking on the cluster state thread deadlocks, and the thread does
+     * not need to wait; the acknowledgement does.
+     */
+    private static final AtomicReference<
+        java.util.function.Function<IndexDescriptor, java.util.concurrent.CompletableFuture<Boolean>>> CREATOR = new AtomicReference<>();
+
+    /** Installs the creator. Registering null clears it. */
+    public static void registerCreator(
+        java.util.function.Function<IndexDescriptor, java.util.concurrent.CompletableFuture<Boolean>> creator
+    ) {
+        CREATOR.set(creator);
+    }
+
+    /**
+     * Writes the descriptor that constitutes a gated index's creation, or null when nothing is installed.
+     *
+     * <p>The future completes {@code true} when this call created the name, {@code false} when a competing
+     * creation won, and exceptionally when the write could not be made. Null means no creator is
+     * registered, which the caller must treat as a failure rather than as success: an index with no record
+     * anywhere is the outcome this whole path exists to prevent.
+     */
+    public static java.util.concurrent.CompletableFuture<Boolean> createGated(IndexMetadata indexMetadata) {
+        java.util.function.Function<IndexDescriptor, java.util.concurrent.CompletableFuture<Boolean>> creator = CREATOR.get();
+        if (creator == null || indexMetadata == null) {
+            return null;
+        }
+        try {
+            return creator.apply(IndexDescriptor.from(indexMetadata));
+        } catch (Exception e) {
+            return java.util.concurrent.CompletableFuture.failedFuture(e);
+        }
+    }
+
     public static boolean isRegistered() {
         return PUBLISHER.get() != null;
     }

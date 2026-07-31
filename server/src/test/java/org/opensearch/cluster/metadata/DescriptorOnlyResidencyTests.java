@@ -42,12 +42,20 @@ public class DescriptorOnlyResidencyTests extends OpenSearchTestCase {
     public void clearRegistrations() {
         DescriptorOnlyCreation.register(null);
         IndexDescriptorPublisher.register(null);
+        IndexDescriptorPublisher.registerCreator(null);
     }
 
     /** The load-bearing one: gated indices must leave no cluster state entry at all. */
     public void testGatedIndicesAddNothingToClusterState() {
         AtomicInteger published = new AtomicInteger();
         IndexDescriptorPublisher.register(descriptor -> published.incrementAndGet());
+        // T18 split recording from creating, and a gated index now goes through the creator only. The
+        // publisher still records ordinary indices from Metadata.Builder, so counting there would count
+        // zero for a gated population. The count moves to where the writes actually happen.
+        IndexDescriptorPublisher.registerCreator(descriptor -> {
+            published.incrementAndGet();
+            return java.util.concurrent.CompletableFuture.completedFuture(Boolean.TRUE);
+        });
         DescriptorOnlyCreation.register(indexMetadata -> true);
 
         ClusterState state = ClusterState.builder(ClusterName.DEFAULT).build();
@@ -57,7 +65,8 @@ public class DescriptorOnlyResidencyTests extends OpenSearchTestCase {
                 Set.of(),
                 index("gated-" + i),
                 (current, reason) -> current,
-                null
+                null,
+                write -> {}
             );
         }
 
@@ -79,7 +88,8 @@ public class DescriptorOnlyResidencyTests extends OpenSearchTestCase {
                 Set.of(),
                 index("ordinary-" + i),
                 (current, reason) -> current,
-                null
+                null,
+                write -> {}
             );
         }
 
@@ -92,6 +102,10 @@ public class DescriptorOnlyResidencyTests extends OpenSearchTestCase {
      */
     public void testGatedAndUngatedCoexist() {
         IndexDescriptorPublisher.register(descriptor -> {});
+        // T18 split recording from creating: a gated index is created by the creator, and its
+        // future is what the acknowledgement waits on. Registering only a publisher would leave
+        // createGated returning null, which creation now treats as "no record anywhere".
+        IndexDescriptorPublisher.registerCreator(descriptor -> java.util.concurrent.CompletableFuture.completedFuture(Boolean.TRUE));
         DescriptorOnlyCreation.register(indexMetadata -> indexMetadata.getIndex().getName().startsWith("serverless-"));
 
         ClusterState state = ClusterState.builder(ClusterName.DEFAULT).build();
@@ -101,14 +115,16 @@ public class DescriptorOnlyResidencyTests extends OpenSearchTestCase {
                 Set.of(),
                 index("serverless-" + i),
                 (current, reason) -> current,
-                null
+                null,
+                write -> {}
             );
             state = MetadataCreateIndexService.clusterStateCreateIndex(
                 state,
                 Set.of(),
                 index("ordinary-" + i),
                 (current, reason) -> current,
-                null
+                null,
+                write -> {}
             );
         }
 

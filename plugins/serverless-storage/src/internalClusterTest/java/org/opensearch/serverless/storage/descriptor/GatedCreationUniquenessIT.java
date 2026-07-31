@@ -8,7 +8,6 @@
 
 package org.opensearch.serverless.storage.descriptor;
 
-import org.apache.lucene.tests.util.LuceneTestCase.AwaitsFix;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.action.admin.indices.create.CreateIndexResponse;
 import org.opensearch.cluster.metadata.IndexMetadata;
@@ -111,7 +110,6 @@ public class GatedCreationUniquenessIT extends org.opensearch.serverless.storage
      * {@code DescriptorStore.create}, which is {@code op_type=create} and therefore atomic, and make the
      * acknowledgement wait for its result instead of for a cluster state update that does nothing.
      */
-    @AwaitsFix(bugUrl = "gated creation uses a plain put, so op_type=create never gates uniqueness; see T18 design")
     public void testAGatedIndexNameCanOnlyBeCreatedOnce() throws Exception {
         DescriptorGate.install(
             new DescriptorStore(client(), 1),

@@ -219,4 +219,26 @@ public class CreateIndexClusterStateUpdateRequest extends ClusterStateUpdateRequ
             + waitForActiveShards
             + '}';
     }
+
+    /**
+     * The descriptor write that constitutes a gated index's creation, once issued.
+     *
+     * <p>Carried on the request because {@code clusterStateCreateIndex} is where the gated decision is made
+     * and {@code CreateIndexTask} is where the acknowledgement is sent, and the request is the only object
+     * both already hold. Null for an ordinary index, whose creation is the cluster state update itself.
+     *
+     * <p>Set once from the cluster state task thread and read from the acknowledgement path, so it is
+     * volatile for that handoff rather than for concurrent writers.
+     */
+    private volatile java.util.concurrent.CompletableFuture<Boolean> descriptorWrite;
+
+    /** Records the descriptor write, called by the gated branch of index creation. */
+    public void descriptorWrite(java.util.concurrent.CompletableFuture<Boolean> write) {
+        this.descriptorWrite = write;
+    }
+
+    /** The descriptor write for this creation, or null when this index is not gated. */
+    public java.util.concurrent.CompletableFuture<Boolean> descriptorWrite() {
+        return descriptorWrite;
+    }
 }

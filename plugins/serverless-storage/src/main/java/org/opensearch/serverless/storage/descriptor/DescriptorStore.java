@@ -155,6 +155,10 @@ public final class DescriptorStore {
     private final int shardCount;
     private final AtomicBoolean indexKnownToExist = new AtomicBoolean();
 
+    /** One-shot latch for the asynchronous bootstrap, cleared on failure so a transient outage can retry. */
+    private final java.util.concurrent.atomic.AtomicReference<java.util.concurrent.CompletableFuture<Void>> bootstrap =
+        new java.util.concurrent.atomic.AtomicReference<>();
+
     public DescriptorStore(Client client, int shardCount) {
         this(client, shardCount, System::nanoTime);
     }
@@ -458,6 +462,108 @@ public final class DescriptorStore {
         }
     }
 
+    /**
+     * The descriptor index, created once per node, without blocking the caller.
+     *
+     * <p>{@link #ensureIndexExists} cannot be used from the creation path: it blocks, and W4 established
+     * that blocking on the cluster state thread deadlocks, since the index operation it issues needs a
+     * cluster state to route and the thread that would supply one is the blocked one.
+     *
+     * <p><b>This also closes a gap T18 found.</b> Only {@code create} and {@code put} called
+     * {@code ensureIndexExists}, and neither has a production caller: the wired path is {@code putAsync},
+     * which does not. So in production the descriptor index was auto-created by its first write, without
+     * any of W8's contract settings. That silently dropped the merge policy S29 and S30 measured as the
+     * difference between 1.05x and 1.88x lookup growth per decade, and the refresh interval H18 made the
+     * wildcard staleness bound. The settings were correct, explicit, and never applied.
+     *
+     * <p>A failed bootstrap clears the latch rather than caching the failure, so a transient outage during
+     * the first gated creation in a cluster does not permanently poison every later one.
+     */
+    private java.util.concurrent.CompletableFuture<Void> ensureIndexExistsAsync() {
+        java.util.concurrent.CompletableFuture<Void> existing = bootstrap.get();
+        if (existing != null) {
+            return existing;
+        }
+        java.util.concurrent.CompletableFuture<Void> mine = new java.util.concurrent.CompletableFuture<>();
+        if (bootstrap.compareAndSet(null, mine) == false) {
+            return bootstrap.get();
+        }
+        try {
+            client.admin().indices().create(descriptorIndexRequest(), new org.opensearch.core.action.ActionListener<>() {
+                @Override
+                public void onResponse(org.opensearch.action.admin.indices.create.CreateIndexResponse response) {
+                    indexKnownToExist.set(true);
+                    mine.complete(null);
+                }
+
+                @Override
+                public void onFailure(Exception e) {
+                    if (e instanceof org.opensearch.ResourceAlreadyExistsException
+                        || e.getCause() instanceof org.opensearch.ResourceAlreadyExistsException) {
+                        // The normal case on every node but the first, and on every node after the first
+                        // gated creation. Concurrent bootstrap is expected rather than an error.
+                        indexKnownToExist.set(true);
+                        mine.complete(null);
+                        return;
+                    }
+                    bootstrap.set(null);
+                    mine.completeExceptionally(e);
+                }
+            });
+        } catch (Exception e) {
+            bootstrap.set(null);
+            mine.completeExceptionally(e);
+        }
+        return mine;
+    }
+
+    /**
+     * Records a descriptor for an index that does not yet exist, without blocking, reporting whether this
+     * call created it.
+     *
+     * <p>This is H3's uniqueness gate on the path H3 designed it for. {@code op_type=create} makes the
+     * store rather than the cluster manager decide that a name is taken, so a version conflict completes
+     * {@code false} and is a lost race rather than a failure.
+     *
+     * <p>T23 is why this exists. The creation path routed through {@code publish} to a plain put, so eight
+     * concurrent creations of one gated name were all acknowledged: the gate was implemented, tested, and
+     * never called. T17 is the other half, since a plain put was also fire and forget, so an acknowledged
+     * creation did not mean the descriptor had landed.
+     *
+     * <p>Non-blocking throughout, so the cluster state thread can issue this and return. The waiting is
+     * done by the acknowledgement, which is a different thread and is the one that should wait.
+     */
+    public java.util.concurrent.CompletableFuture<Boolean> createAsync(IndexDescriptor descriptor) {
+        return ensureIndexExistsAsync().thenCompose(ignored -> {
+            java.util.concurrent.CompletableFuture<Boolean> created = new java.util.concurrent.CompletableFuture<>();
+            try {
+                client.index(
+                    new IndexRequest(DESCRIPTOR_INDEX).id(descriptor.name()).source(DescriptorCodec.toSource(descriptor)).create(true),
+                    new org.opensearch.core.action.ActionListener<>() {
+                        @Override
+                        public void onResponse(org.opensearch.action.index.IndexResponse response) {
+                            invalidate(descriptor.name());
+                            created.complete(true);
+                        }
+
+                        @Override
+                        public void onFailure(Exception e) {
+                            if (e instanceof VersionConflictEngineException || e.getCause() instanceof VersionConflictEngineException) {
+                                // Someone else created this name first. That is the mechanism working.
+                                created.complete(false);
+                                return;
+                            }
+                            created.completeExceptionally(e);
+                        }
+                    }
+                );
+            } catch (Exception e) {
+                created.completeExceptionally(e);
+            }
+            return created;
+        });
+    }
+
     /** Overwrites a descriptor, for a mapping generation bump or a tombstone. Blocks until written. */
     public void put(IndexDescriptor descriptor) {
         ensureIndexExists();
@@ -651,27 +757,34 @@ public final class DescriptorStore {
      *       between the descriptor index being a ceiling and not being one.</li>
      * </ul>
      */
+    /**
+     * The descriptor index as it must be created, wherever it is created from.
+     *
+     * <p>Shared by the blocking and asynchronous bootstraps so the two cannot drift. T18 found the
+     * settings below had never actually been applied in production, because the only callers of the
+     * blocking path have no production caller, so drift here would be invisible in exactly the way that
+     * was.
+     */
+    private CreateIndexRequest descriptorIndexRequest() {
+        return new CreateIndexRequest(DESCRIPTOR_INDEX).settings(
+            Settings.builder()
+                .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, shardCount)
+                .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 1)
+                // H18: this is the wildcard staleness bound, stated rather than defaulted.
+                .put("index.refresh_interval", "1s")
+                // S29 and S30: this is the lookup latency bound.
+                .put("index.merge.policy.segments_per_tier", 4)
+                .put("index.merge.policy.max_merge_at_once", 4)
+                .build()
+        ).mapping(DescriptorCodec.MAPPING);
+    }
+
     private void ensureIndexExists() {
         if (indexKnownToExist.get()) {
             return;
         }
         try {
-            client.admin()
-                .indices()
-                .create(
-                    new CreateIndexRequest(DESCRIPTOR_INDEX).settings(
-                        Settings.builder()
-                            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, shardCount)
-                            .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 1)
-                            // H18: this is the wildcard staleness bound, stated rather than defaulted.
-                            .put("index.refresh_interval", "1s")
-                            // S29 and S30: this is the lookup latency bound.
-                            .put("index.merge.policy.segments_per_tier", 4)
-                            .put("index.merge.policy.max_merge_at_once", 4)
-                            .build()
-                    ).mapping(DescriptorCodec.MAPPING)
-                )
-                .actionGet();
+            client.admin().indices().create(descriptorIndexRequest()).actionGet();
             indexKnownToExist.set(true);
         } catch (Exception e) {
             if (e instanceof org.opensearch.ResourceAlreadyExistsException

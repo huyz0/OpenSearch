@@ -47,6 +47,7 @@ public class GatedIndexMappingUpdateTests extends OpenSearchTestCase {
     public void clearRegistrations() {
         DescriptorOnlyCreation.register(null);
         IndexDescriptorPublisher.register(null);
+        IndexDescriptorPublisher.registerCreator(null);
         MappingGenerationStore.register(null);
     }
 
@@ -56,6 +57,10 @@ public class GatedIndexMappingUpdateTests extends OpenSearchTestCase {
      */
     public void testAGatedIndexCannotBeResolvedForAMappingUpdate() {
         IndexDescriptorPublisher.register(descriptor -> {});
+        // T18 split recording from creating: a gated index is created by the creator, and its
+        // future is what the acknowledgement waits on. Registering only a publisher would leave
+        // createGated returning null, which creation now treats as "no record anywhere".
+        IndexDescriptorPublisher.registerCreator(descriptor -> java.util.concurrent.CompletableFuture.completedFuture(Boolean.TRUE));
         DescriptorOnlyCreation.register(indexMetadata -> true);
 
         ClusterState state = MetadataCreateIndexService.clusterStateCreateIndex(
@@ -63,7 +68,8 @@ public class GatedIndexMappingUpdateTests extends OpenSearchTestCase {
             Set.of(),
             index("gated-idx"),
             (current, reason) -> current,
-            null
+            null,
+            write -> {}
         );
 
         assertFalse("the premise: a gated index has no metadata entry", state.metadata().hasIndex("gated-idx"));
@@ -82,7 +88,8 @@ public class GatedIndexMappingUpdateTests extends OpenSearchTestCase {
             Set.of(),
             index("ordinary-idx"),
             (current, reason) -> current,
-            null
+            null,
+            write -> {}
         );
 
         IndexMetadata resolved = state.getMetadata().getIndexSafe(state.metadata().index("ordinary-idx").getIndex());
