@@ -2426,3 +2426,103 @@ resolves to nothing.
 Supporting aliases properly needs alias names to become a second key space in the descriptor store, with
 their own uniqueness against index names and their own write path for add, remove and repoint. That is a
 feature, not a repair, and nothing here forecloses it.
+
+## Re-scoping the target from a hundred million to ten million
+
+A hundred million was never runnable on the machine this work is done on, and every 100M figure in this
+document is an extrapolation. Ten million is the target now. This records what that changes, and the short
+answer is that it changes the arithmetic and none of the decisions.
+
+### What is already measured at exactly ten million
+
+| quantity | at 10M | where |
+|---|---|---|
+| descriptor point lookup | 0.32 ms at controlled segment counts | S29 |
+| descriptor point lookup, uncontrolled segments | 0.71 ms | S28 |
+| descriptor document write rate | 23,843/s | S28 |
+| descriptor index size | about 1.8 GiB | S9, re-based |
+
+S28 and S29 populated ten million real descriptors. That is a real run, not a projection, and it is the
+dimension the whole design rests on.
+
+### What ten million costs that a hundred million did not
+
+Real gated index creation through the API is about 850 per second (S31, corrected by S35 for an
+instrumented JVM). So the populations differ by more than a factor of ten in wall-clock patience:
+
+| population | creation time at 850/s |
+|---|---|
+| 10,000,000 | about 3.3 hours |
+| 100,000,000 | about 1.35 days |
+
+Three hours is a run that can actually be done here, which is the point of the re-scope.
+
+### Which decisions would reverse at ten million, and none do
+
+- **Gating itself.** Without it, index metadata is roughly 70 GB per node at 100M, so about **7 GB per node
+  at 10M**. Still far past what a cluster manager can hold, so the residency problem is not solved by
+  shrinking the target. Everything from H2 onward stands.
+- **The wildcard cap (T28).** It bounds fan-out, which is set by how many shards one request wakes, not by
+  the population. Unchanged at any target.
+- **The descriptor index sort (T28).** Extrapolating S41's 49.7 ms at 800k, an unsorted capped prefix query
+  costs roughly 600 ms at 10M against a flat few milliseconds sorted. Still decisive.
+- **Refusing aliases (T29), the byte-budgeted cache (T4b), tombstones, uniqueness (T18).** All correctness
+  or memory decisions with no population term.
+
+### What is still not measured at ten million
+
+- **End to end.** No search or bulk request has been measured against a gated index at any population. This
+  is the largest remaining gap and it is not a scale problem, so it does not need ten million to start.
+- **Real gated creation at 10M**, as opposed to document writes at 10M. About 3.3 hours.
+- **Wildcard expansion at 10M.** S41 measured to 800k, where the terminated arm was flat. Flat is a claim
+  that should be checked once at the target rather than extrapolated, which is the mistake S28 caught S27
+  making about lookup.
+
+## S45 (T30): the gated path works end to end, and does not honour a shard count
+
+Every measurement before this was a component. Creation, resolution, placement, wake, listing, wildcards and
+mappings each had numbers, and no request had ever been indexed into a gated index or searched out of one.
+That gap was the one thing that could have invalidated the rest, since every component can be right while
+the composition serves nothing.
+
+Twenty gated tenants created through the real API, fifty documents each:
+
+| stage | cost |
+|---|---|
+| create | 32.0 ms/index |
+| write | 343.6 ms/tenant, 50 documents |
+| search | 6.9 ms/tenant |
+| **documents found** | **1,000 of 1,000** |
+
+**The composition works.** Documents written to a gated index are findable in it, and one wildcard search
+reaches every tenant in the population: 20 of 20 documents in 141 ms across the whole set.
+
+The per-stage numbers are a floor rather than a benchmark. One node, one local disk, an empty cluster, and
+a test JVM carrying jacoco. They are recorded to show the path composes and to give the shape of where time
+goes, not to be quoted as production latency.
+
+### The defect it found
+
+The wildcard search reported touching **100 shards for 20 indices**, each of which had asked for one. Chased
+with a control, and the control is what made it a finding rather than a puzzle:
+
+| | asked | descriptor recorded | search touched |
+|---|---|---|---|
+| gated index | 1 | 3, then 5, then 10 across runs | same as the descriptor |
+| ordinary index, same cluster, same request | 1 | n/a | 1, with `number_of_shards=1` in its settings |
+
+**A gated index does not get the number of shards its request asked for**, and what it gets varies run to
+run, which is the signature of the test framework's randomised index template being applied where the
+request's explicit setting should have won. An ordinary index created moments later in the same cluster with
+the same explicit setting gets exactly what it asked for.
+
+This is not cosmetic. Every residency figure in this work is per shard: T20 measured 118 KB and 3.06 file
+descriptors per awake shard, and T28's expansion cap of a hundred was chosen from how many shards one
+request wakes. If a tenant asking for one shard gets ten, each of those figures is out by that factor per
+tenant, and the descriptor faithfully records the wrong number, so the error is durable rather than
+transient.
+
+Committed under `AwaitsFix` with the control alongside it, so the next session starts from a reproducer
+rather than from this paragraph. The cause was not located: the plugin's index setting provider only injects
+a shard count for data-stream backing indices with no explicit value, so something else on the gated
+creation path is losing the request's settings.
