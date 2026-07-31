@@ -428,7 +428,7 @@ public class GatedEndToEndIT extends org.opensearch.serverless.storage.Serverles
      * If the index is present in cluster state, it was never gated and there is no defect in the gated path
      * to find.
      */
-    @AwaitsFix(bugUrl = "T34: gated indices have no write path. Auto-creation restores the cluster state entry on first write, and suppressing it makes the write fail in Metadata.getIndexSafe")
+    @AwaitsFix(bugUrl = "T35: the gated write path is unbuilt. Six call sites fixed, routing table shard resolution is next; see S51")
     public void testWhetherTheDisagreeingIndexIsEvenGated() throws Exception {
         DescriptorStore store = new DescriptorStore(client(), 1);
         DescriptorGate.install(

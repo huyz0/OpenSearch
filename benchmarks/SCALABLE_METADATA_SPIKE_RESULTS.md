@@ -2819,3 +2819,46 @@ whatever else calls `getIndexSafe` need to obtain an `IndexMetadata` for a gated
 which `IndexDescriptor.toIndexMetadata` already synthesises for placement. That is a real piece of work and
 it is now the top of the list, ahead of both the cluster manager thread and the ten million run, because
 both of those describe a system whose indices do not stay gated once used.
+
+## S51 (T35): what the gated write path actually requires, mapped by building it
+
+T35 attempted the write path and did not finish it. What it produced is the inventory, which is worth more
+than the partial code and is why the code was reverted rather than left in the tree.
+
+**Method: fix one call site, run, read the next stack.** Each failure names the next assumption that a
+written index lives in cluster state. In order:
+
+| # | site | what it needs | fix |
+|---|---|---|---|
+| 1 | `AutoCreateIndex.shouldAutoCreate` via `hasIndexAbstraction` | existence | route through `AbsentIndexDescriptorSuppliers.exists` |
+| 2 | `TransportBulkAction.addFailureIfIndexIsUnavailable` | `getState()` | descriptor carries state |
+| 3 | `TransportBulkAction.doRun`, index/create branch | `mapping()`, `getCreationVersion()` | synthesised metadata; mapping is legitimately absent (H4c) |
+| 4 | `TransportBulkAction.doRun`, append-only branch | `isAppendOnlyIndex()` | synthesised metadata |
+| 5 | `TransportBulkAction.addFailureIfAppendOnlyIndexAndOpsDeleteOrUpdate` | `isAppendOnlyIndex()` | synthesised metadata |
+| 6 | `TransportBulkAction.doRun`, data stream guard | `IndexAbstraction` | absent means no parent data stream, and T29 refuses to gate anything that could be one |
+| 7 | `OperationRouting.indexMetadata` | shard count to hash against | synthesised metadata |
+| 8 | `RoutingTable.shardRoutingTable` via `OperationRouting.shards` | the shard's routing entry | **not reached**; the existing `AbsentIndexRoutingSuppliers` fallback beside it did not answer |
+
+Sites 1 through 7 were written and each moved the failure to the next one. Site 8 is where it stopped, and
+it is the interesting one: the fallback for it already exists, added by P6 and P7, and its own comment says
+it is there so "a computed index answers searches and fails writes and gets" cannot happen. It did not
+answer here, so either the computed placement disagrees with the descriptor's shard count or the supplier
+declines for a reason not yet established. That is the next question, and it should be asked with a probe
+rather than by reading.
+
+### Why it was reverted rather than committed part-done
+
+Site 1 is the crutch. Removing it stops auto-creation from un-gating the index, and until site 8 works,
+writes fail instead. Committing sites 2 through 7 without site 1 leaves code that cannot execute, because
+auto-creation still fills in the metadata they exist to synthesise, which is a seventh instance of the
+"correct and unreachable" pattern this area keeps producing. Committing all of them breaks writes. Neither
+is a good state to leave a shared tree in, so the branch keeps working behaviour and this document keeps the
+map.
+
+### The shape of the finding
+
+**Seven call sites on one request path each independently assume an index is in cluster state**, and that is
+after P6, P7 and H8a had already done this for placement and resolution. The descriptor design removes a
+per-index entry that a great deal of code treats as unconditional, and the write path was simply never
+walked. The count is the useful part of this spike: it says the remaining work is mechanical but not small,
+and that it needs an end-to-end test to drive it rather than reasoning about which callers matter.
