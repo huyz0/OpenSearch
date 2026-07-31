@@ -70,8 +70,38 @@ Four consequences, stated rather than discovered later:
   a search, and searches are refresh-bound. An index created moments ago may not appear in a wildcard yet.
   It does appear immediately by exact name, which is a realtime GET.
 
-`N` should default to 1,000. S24 measured about 33 ms per thousand names returned, so a thousand is a cost
-a request can carry, and a request touching a thousand indices is already large.
+### The cap
+
+**`N` defaults to 100, and is a cluster setting rather than a constant.**
+
+Refusal beats truncation and that is the part worth being firm about. Answering with the first `N` names
+would be the same class of defect as the four already found here: a plausible result that is silently
+incomplete, where a tenant searching `tenant-*` gets a thousand of their five thousand indices and has no
+way to tell.
+
+Two measurements bound the value, and only one of them is about resolution:
+
+- S24 measured about 33 ms per thousand names returned, so a hundred is about 3 ms. Negligible.
+- T20 and T21 measured 118 KB and 3.06 file descriptors per awake shard, and 41.5 ms to wake one. With
+  index per tenant most tenant indices are asleep, so **an expansion decides how many sleeping shards one
+  request wakes**. A hundred is roughly 12 MB and 300 file descriptors. A thousand is 118 MB and 3,000. A
+  hundred thousand is a node.
+
+That second point is the reason the cap exists. Resolving names is the cheap part of a wildcard against a
+scale-to-zero fleet, and the number that matters is how much of the fleet a single request pulls into
+memory.
+
+100 rather than 1,000 because the failure is asymmetric. A cap set too low refuses a request that would have
+worked, which the caller sees immediately and an operator can raise in one setting change. A cap set too
+high wakes a large part of the fleet on one request, which shows up as memory and file descriptor pressure
+on whichever node coordinated it, and does not point back at the wildcard that caused it. Start where the
+blast radius is small.
+
+Neither number is a measured optimum, and the fan-out figure is the weaker of the two: 118 KB is per shard
+at rest, and a hundred simultaneous wakes is not a hundred times one wake. Worth re-measuring against a real
+wake storm before the default is defended rather than merely chosen.
+
+`N = 0` is the "no wildcards at all" position, reachable by configuration rather than by a different design.
 
 ### Why not simply refuse all wildcards
 
