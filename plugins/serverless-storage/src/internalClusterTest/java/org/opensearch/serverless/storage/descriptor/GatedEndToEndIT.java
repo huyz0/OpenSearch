@@ -113,6 +113,14 @@ public class GatedEndToEndIT extends org.opensearch.serverless.storage.Serverles
                 org.opensearch.serverless.storage.ServerlessStoragePlugin.SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey(),
                 basePath().toString()
             )
+            // T36. Without this a gated index has no routing table at all, because computed placement is
+            // off by default and is what supplies one. Every earlier run of this class lacked it, which is
+            // why the writes here were only ever served by indices auto-creation had put back into cluster
+            // state: nothing gated could have served them.
+            .put(
+                org.opensearch.serverless.storage.ServerlessStoragePlugin.COMPUTED_PLACEMENT_ENABLED_SETTING.getKey(),
+                true
+            )
             .build();
     }
 
@@ -428,7 +436,7 @@ public class GatedEndToEndIT extends org.opensearch.serverless.storage.Serverles
      * If the index is present in cluster state, it was never gated and there is no defect in the gated path
      * to find.
      */
-    @AwaitsFix(bugUrl = "T35: the gated write path is unbuilt. Six call sites fixed, routing table shard resolution is next; see S51")
+    @AwaitsFix(bugUrl = "T35/T36: the gated write path needs ten metadata call sites and then an assigned primary shard; see S52")
     public void testWhetherTheDisagreeingIndexIsEvenGated() throws Exception {
         DescriptorStore store = new DescriptorStore(client(), 1);
         DescriptorGate.install(

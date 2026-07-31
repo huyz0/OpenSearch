@@ -2862,3 +2862,62 @@ after P6, P7 and H8a had already done this for placement and resolution. The des
 per-index entry that a great deal of code treats as unconditional, and the write path was simply never
 walked. The count is the useful part of this spike: it says the remaining work is mechanical but not small,
 and that it needs an end-to-end test to drive it rather than reasoning about which callers matter.
+
+## S52 (T36 and T35 continued): the map, extended, and the wall behind it
+
+S51 stopped at site 8 and called it unexplained. It is explained, and it was not a defect.
+
+**T36: the routing fallback declined because computed placement was never on.**
+`COMPUTED_PLACEMENT_ENABLED_SETTING` (`serverless_storage.computed_placement.enabled`) defaults to false,
+and no test in this class ever set it. Without it nothing supplies a routing table for a gated index, so
+`AbsentIndexRoutingSuppliers.supply` correctly returned null. The seam was right; the harness was
+incomplete.
+
+That also settles how every earlier run of this class passed: with placement off, **nothing gated could
+have served a request at all**, so the thousand documents S45 reported were necessarily served by the
+ordinary indices auto-creation had put back into cluster state.
+
+### The full site list, with placement enabled
+
+Ten call sites on the write path assume an index is in cluster state:
+
+| # | site | needs |
+|---|---|---|
+| 1 | `AutoCreateIndex.shouldAutoCreate` via `hasIndexAbstraction` | existence |
+| 2 | `TransportBulkAction.addFailureIfIndexIsUnavailable` | `getState()` |
+| 3 | `TransportBulkAction.doRun`, index/create branch | `mapping()`, `getCreationVersion()` |
+| 4 | `TransportBulkAction.doRun`, append-only branch | `isAppendOnlyIndex()` |
+| 5 | `TransportBulkAction.addFailureIfAppendOnlyIndexAndOpsDeleteOrUpdate` | `isAppendOnlyIndex()` |
+| 6 | `TransportBulkAction.doRun`, data stream guard | `IndexAbstraction` |
+| 7 | `OperationRouting.indexMetadata` | shard count to hash against |
+| 8 | `OperationRouting.shards` routing table | computed placement, once enabled |
+| 9 | `TransportBulkAction.executeBulk`, adaptive shard selection | `isAppendOnlyIndex()` |
+| 10 | `TransportReplicationAction.ReroutePhase.doRun` | `IndexMetadata` for the shard |
+
+All ten were written, and each moved the failure to the next. **Past all ten, the write reaches:**
+
+```
+UnavailableShardsException: [e2e-tenant-000][0] primary shard isn't assigned to a known node
+```
+
+### The wall, and why this stopped here
+
+That is a different subsystem. Metadata resolution is now complete enough for the write to be routed, and
+the shard it routes to does not exist on any node: computed placement produces a routing table, but nothing
+has materialised the shard. That is the scale-to-zero and wake machinery, which T21 measured at 41.5 ms for
+a shard that had been created and suspended, not one that has never existed.
+
+So the gated write path is three problems, not one:
+
+1. **Metadata residency assumptions**, ten call sites, all now known and all mechanically fixable.
+2. **Placement**, which exists and is off by default, and which no test had enabled.
+3. **Shard materialisation on first write**, which is unexplored. A gated index has never had a shard
+   allocated, and the wake path assumes a shard that exists and is asleep.
+
+Reverted again, for the reason S51 gives: with site 1 the writes fail, without it the other nine are
+unreachable. The value here is the map, and the map now reaches the wall rather than stopping at a puzzle.
+
+**What it means for the projections.** Nothing in this document has ever measured a gated index serving a
+write, and now the reason is precise rather than suspected. The residency figures describe a population that
+is created, resolvable, listable, wildcard-matchable and searchable-by-name, and that has never taken a
+document. Whether the design holds under writes is still open, and item 3 is the part nobody has looked at.
