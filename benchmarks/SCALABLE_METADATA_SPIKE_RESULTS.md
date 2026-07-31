@@ -2609,3 +2609,59 @@ Median 360, against the 536 S35 recorded under the same instrumented conditions.
 runs is 34 percent, so this suggests T18's acknowledgement now waiting on a descriptor write cost something
 without establishing how much. Worth an A/B against the pre-T18 commit before being quoted, and **not** on
 one run per arm, which is the mistake S43c already records.
+
+## S47 (T33): what Elasticsearch does about this, and why it does not transfer
+
+Two efforts in Elasticsearch are the obvious places to look, and neither addresses the constraint measured
+in S46. Recording that is the point: the temptation was to import a known optimisation, and the reason not
+to is specific.
+
+**Batched master task queues** (elastic/elasticsearch#92021, closing #81626 "Pending task batching can be a
+bottleneck"). Replaces one `PriorityBlockingQueue<Runnable>` with per-priority queues, per-executor typed
+queues created by the client, and avoids enqueueing on the thread pool unless work exists. Their
+`MasterService` documentation now forbids unbatched tasks in new production code, calling them a source of
+performance and stability bugs.
+
+**It optimises publication, and T32 measured our gated creation at zero publications per index.** The
+bottleneck their work removes is one we already have at zero. Creations here already run through a batching
+executor, and batching cannot collapse what does not exist.
+
+**Stateless Elasticsearch** (Elastic Cloud Serverless, GA on AWS December 2024, ACM SoCC 2025). Offloads
+index data, translog and cluster state to an object store, collapsing four data tiers into two.
+
+**It changes where cluster state is persisted, not how large it is.** A hundred million indices is still a
+hundred million metadata entries held by the elected master, wherever the bytes are durably stored. This
+work removes the per-index entry instead, which is the more aggressive move and the one the population size
+requires. The same limit applies to OpenSearch RFC #17957, which proposes externalising cluster state to
+etcd.
+
+So on this specific constraint there is nothing to copy. That is worth stating plainly rather than leaving
+the impression the research was skipped.
+
+### What gating already bought, and what is left
+
+`GatedCreationThroughputIT`, both arms in one cluster, twenty indices each:
+
+| arm | creations/sec |
+|---|---|
+| ordinary | 10 |
+| gated | **213** |
+| ordinary again, warmup control | 19 |
+
+**Gated creation is about 21x ordinary.** So skipping publication and the `Metadata` rebuild is where the
+large factor already came from, and it has been collected. What remains at a few hundred per second is the
+per-index creation pipeline, which S46 measured as 43.5 percent of OpenSearch CPU on the single
+`clusterManagerService#updateTask` thread.
+
+### The ranked options, with what is already known about each
+
+| option | share of the thread | status |
+|---|---|---|
+| run gated creation off the cluster manager thread entirely | ~43.5% becomes parallel | the only option with a multiple in it; H3 designed it, T18 deferred it because throughput was not then the question |
+| skip `withTempIndexService` for gated indices | 15-20% | a semantic trade, moving mapping validation to first use |
+| move the descriptor write submission off the thread | ~10%, S36 estimated ~5% net | safe, needs a `ThreadPool` through `DescriptorGate.install` |
+| cache settings validation | ~20% of the profile | **dead**: measured at 0.14 percent benefit |
+
+The ceiling for the first option is set by what the descriptor write itself sustains, which S28 measured at
+23,843 documents per second against a few hundred creations per second now. That is the gap worth an
+architectural change, and it is the same gap H3 named before any of this was built.
