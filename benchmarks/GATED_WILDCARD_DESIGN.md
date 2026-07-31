@@ -224,3 +224,52 @@ repointed on a gated index at all, because every alias operation is a cluster st
 index does not have. An index declaring any alias therefore keeps its cluster state entry. That costs the
 alias-carrying part of the population its gating, and makes the constraint visible at creation rather than
 as an alias that answers nothing. Details in S44.
+
+---
+
+# T39: opening a gated index's shard on demand
+
+S54 established the wall: a gated index's shard is never built, because
+`IndicesClusterStateService` constructs shards when an index appears in an applied cluster state and a gated
+index never appears in one. This is what T39 has to solve, and it is the last thing standing between the
+design and a gated index that can take a write.
+
+## What the two halves cost
+
+**The `IndexService` half is cheap.** `IndicesService.createIndex(indexMetadata, listeners,
+writeDanglingIndices)` is public and takes metadata we can synthesise: `IndexDescriptor.toIndexMetadata`
+already produces one, and it is what computed placement has used since P6. It rejects
+`INDEX_UUID_NA_VALUE`, and a descriptor carries the real uuid, so that check passes.
+
+**The shard half is not.** `IndicesService.createShard` takes fifteen collaborators: the segment replication
+checkpoint publisher, peer recovery target service, recovery listener, repositories service, shard failure
+and global checkpoint consumers, retention lease syncer, target and source nodes, remote store stats tracker
+factory, discovery nodes, merged segment warmer factory and publisher, among others. Every one of them is
+held by `IndicesClusterStateService`, which is the class cluster state application drives.
+
+## The shape this should take
+
+**Give `IndicesClusterStateService` a second trigger rather than building a parallel path.** It already owns
+every collaborator, the recovery wiring and the failure handling, and duplicating that for gated indices
+would mean maintaining two shard lifecycles that must agree. The trigger it needs is not a cluster state
+diff but a request: *a shard arrived for an index that computed placement says belongs on this node, and no
+`IndexService` exists for it*.
+
+That is the same shape as scale-to-zero wake, which is the strongest reason to believe this is tractable.
+T21 measured wake at 41.5 ms, and wake already reopens a shard on demand outside the ordinary allocation
+path. The difference is that wake resumes a shard that was built and suspended, so its data and its
+`ShardHead` exist; a never-built shard has neither, and has to start from an empty store rather than recover
+one. `ComputedRoutingTable` already states `ExistingStoreRecoverySource` deliberately, and its own comment
+warns that inferring the recovery source picks "empty store" whenever `inSyncAllocationIds` is absent, which
+under computed placement is always. So the recovery source for a first write is exactly the case that
+comment is about, and it has to be chosen rather than inferred.
+
+## Why this was not started
+
+Three attempts today built past what could be verified and were reverted. This one is a change to a core
+shard lifecycle class with fifteen collaborators and a recovery-source decision that the existing code
+explicitly warns is easy to get silently wrong. It needs a session that can carry the whole loop: build,
+drive it with `GatedEndToEndIT`, and run the wider suites before it lands.
+
+The eleven residency sites from S52 and S53 land **with** this, not before it. Site 1 removes auto-creation,
+and until a shard can be opened, removing the crutch turns a silent design failure into a loud one.
