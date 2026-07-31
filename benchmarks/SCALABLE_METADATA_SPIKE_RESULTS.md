@@ -2526,3 +2526,86 @@ Committed under `AwaitsFix` with the control alongside it, so the next session s
 rather than from this paragraph. The cause was not located: the plugin's index setting provider only injects
 a shard count for data-stream backing indices with no explicit value, so something else on the gated
 creation path is losing the request's settings.
+
+## S46 (T32): batching has nothing left to amortise, and creation is CPU-bound
+
+### Batching, answered directly rather than from headroom
+
+S36 closed the batching question with an inference: the cluster manager thread is about 75 percent busy, so
+there is a third more headroom rather than a multiple. That is an argument about CPU, and batching is not
+about CPU. A batching executor collapses N cluster state tasks into one *publication*, which is why S15
+measured it worth one to two orders of magnitude for wake and sleep. So the question is how many
+publications a creation costs, and the cluster state version answers it exactly:
+
+| creation | cluster state versions advanced, per index |
+|---|---|
+| ordinary | 2.16 |
+| gated | **0.00** |
+
+**A gated creation costs zero publications, so batching has nothing to collapse.** Creations already run
+through a batching executor, so the mechanism is present and idle. This is structural rather than a matter
+of degree, and it does not change with population, node count or in-flight depth.
+
+The other two candidates were already dead: P10 removed the cluster state queue entirely and moved 235 to
+245 per second, which is noise, and S36 measured batching descriptor writes at four percent.
+
+### Where the CPU and I/O actually go
+
+Profiled with Java Flight Recorder at `settings=profile`, jacoco disabled and the security manager off,
+since S35 established that both contaminate this measurement. Sixty-one seconds, 2,160 execution samples.
+
+**There is essentially no I/O.** Over the whole recording: **zero** socket read or write events, 39 file
+reads and 5 file writes. These events fire only above a 10 to 20 ms threshold, so the honest statement is
+that no individual I/O operation was slow, not that no I/O happened. Off-CPU time supports the same reading:
+the largest parked threads are transport workers at 47.8 and 42.3 seconds out of 61, which is idle waiting
+for work rather than blocking, and the cluster manager thread does not appear in the parked list at all.
+
+**The CPU, counting only OpenSearch threads (533 samples):**
+
+| thread role | share of OpenSearch CPU |
+|---|---|
+| `clusterManagerService#updateTask` | 43.5% |
+| `write` pool | 27.6% |
+| `transport_worker` | 16.9% |
+| other OpenSearch | 10.7% |
+| Lucene merge | 1.3% |
+
+The cluster manager thread is the single largest consumer, which agrees with S36 and with the 75 percent
+busy figure. The write pool at 27.6 percent is the descriptor write, and it is larger than any previous
+profile suggested, which is consistent with T18 having put a real indexing request on the acknowledgement
+path.
+
+### A flag raised and withdrawn
+
+A first, contaminated recording showed the descriptor index's Lucene merge thread at about 95 percent of one
+core, and it was flagged as a possible tension with W8's merge policy: `segments_per_tier=4` was chosen by
+S29 and S30 to bound lookup latency, and a policy that costs a core during creation would mean two spikes
+each optimised a metric without seeing the other's cost.
+
+**It is not a tension.** That figure came from a single one-second `ThreadCPULoad` window, so it was a peak.
+Across the clean recording merge accounts for 1.3 percent of OpenSearch CPU, 7 samples out of 533. Merging
+is bursty and brief, and the merge policy costs creation nothing worth naming.
+
+### What the profile does not support
+
+Frame-level attribution. The JSON export associates method names with the wrong types, producing impossible
+frames such as `java.lang.String.executeAndMaintainThreadName`, and the JDK's own pretty printer crashes on
+the same recording with a `StringIndexOutOfBoundsException`. Thread-level attribution and the duration
+events are sound; method percentages from this recording are not, and none are quoted above.
+
+The other limitation is sample budget: 74.4 percent of all samples are test harness threads, so the
+OpenSearch numbers are ratios within 533 samples. They are strong enough to separate CPU from I/O and to
+rank thread roles, and too thin to rank methods.
+
+### Throughput, re-measured after T18
+
+| run | creations/sec |
+|---|---|
+| 1 | 323 |
+| 2 | 432 |
+| 3 | 360 |
+
+Median 360, against the 536 S35 recorded under the same instrumented conditions. The spread across three
+runs is 34 percent, so this suggests T18's acknowledgement now waiting on a descriptor write cost something
+without establishing how much. Worth an A/B against the pre-T18 commit before being quoted, and **not** on
+one run per arm, which is the mistake S43c already records.
