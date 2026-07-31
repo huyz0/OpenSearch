@@ -2203,3 +2203,101 @@ So the 0.05 percent framing was the wrong denominator, not a pessimistic estimat
 Measured at four thousand tenants with capacities from 0.5 to 25 percent. Extending to a hundred million
 with a fifty thousand entry cache is an order of magnitude below the smallest capacity measured here, so the
 shape transfers and the number should be re-measured before being quoted.
+
+## S40 (T25): a wildcard cannot see a gated index, and mostly does not say so
+
+`WildcardExpressionResolver.matches` reads `metadata.getIndicesLookup()` in all three of its branches:
+match-all takes the whole lookup, a suffix wildcard takes a `subMap` of it, any other pattern filters it.
+A gated index is absent from that map by construction, and `AbsentIndexDescriptorSuppliers` has no pattern
+seam, only exact-name `supply`, `exists` and a bounded `page`.
+
+Measured against five gated tenants, resolved against an empty cluster state so the descriptor store is the
+only possible source of an answer:
+
+| expression | options | result |
+|---|---|---|
+| `tenant-*` | default (`allowNoIndices=true`) | 0 names, no error |
+| `*` | default | 0 names, no error |
+| `tenant-*` | `allowNoIndices=false` | `IndexNotFoundException` |
+| `tenant-000` (exact) | any | resolves, control |
+
+The severity is in the second column rather than the first. Under the options nearly every client uses, a
+tenant running `tenant-*` is told there are no matching indices rather than that the question cannot be
+answered, which is the same shape of failure as H19's plausible wrong cluster stats and T23's eight
+acknowledged creations of one name.
+
+## S41 (T26): a capped prefix wildcard is bounded only with an index sort and no hit tracking
+
+The repair everyone reaches for is a prefix seam over `findNamesByPrefix` with a cap on how many names a
+pattern may expand to, enforced by asking for `cap + 1` and refusing when that many come back. That is only
+bounded if a query with `size = cap + 1` costs the same whether the prefix matches a thousand names or a
+hundred million, which Lucene does not give for free: ranking by name over a prefix query normally visits
+every match.
+
+Single shard, one segment, `size=101`, median of nine rounds, arrival order shuffled:
+
+| population | plain | index-sorted | index-sorted, `track_total_hits=false` | narrow prefix (control) |
+|---|---|---|---|---|
+| 50,000 | 17.97 ms | 9.52 ms | 6.34 ms | 7.96 ms |
+| 200,000 | 29.48 ms | 11.20 ms | 3.28 ms | 3.12 ms |
+| 800,000 | **49.72 ms** | 11.57 ms | **4.15 ms** | 3.56 ms |
+
+**Both settings are required and neither is sufficient.** Index sorting alone still grows, because an exact
+hit total cannot be produced without visiting every match. Dropping hit tracking alone leaves the collector
+ranking in an order the segments are not stored in. With both, a prefix matching the entire population costs
+what a prefix matching ten names costs.
+
+The plain column is the cost of the design without this: 16x the population for 2.8x the time, which
+extrapolates to roughly six seconds at a hundred million. The terminated column shows no trend at all.
+
+A first run at 5k, 20k and 80k reported every arm flat and would have been quoted as "the cap is free".
+Every arm sat within a millisecond or two of the transport round trip, so a linear scan of eighty thousand
+documents was hidden inside the floor. The populations here are chosen so a scan cannot hide.
+
+### S41b: what the index sort costs the write path
+
+Creation throughput is a headline number at roughly 850 per second, so a flat wildcard bought by halving
+creation would be a bad trade made quietly.
+
+| arm | rate |
+|---|---|
+| plain | 15,795 docs/s |
+| index-sorted | 16,841 docs/s |
+
+**0.94x, which is to say no penalty.** The first run of this wrote names in ascending order and reported the
+same answer, and that run should not have been quoted: feeding a sorted index already-sorted input is the
+one case where sorting at flush is free. The numbers above shuffle arrival order, which is what descriptor
+writes actually do, since tenants are created in an order unrelated to their names.
+
+## S42 (T27): gated listing returns one page and reports it as the whole population
+
+H16 made pagination able to see gated indices by merging one pager page into the cluster state page, and the
+asymmetry it rests on is sound. What was never driven is the loop: every test of the merge asked for one
+page. Twelve gated indices, pages of four, creation dates deliberately inverse to name order:
+
+| walk | pages | distinct names | order returned |
+|---|---|---|---|
+| ascending | 1 | **4 of 12** | `paged-003, 002, 001, 000` |
+| descending | 1 | **4 of 12** | `paged-000, 001, 002, 003` |
+| ordinary indices, same walk (control) | 3 | 12 of 12 | correct |
+
+Three defects, each sufficient on its own:
+
+1. **The next-page token is computed from the cluster state page alone.** With every index gated that count
+   is zero, zero is not greater than the page size, and the token is null. A null token is how this API says
+   "that was everything", so an operator listing a hundred million indices is shown ten and told there are
+   no more.
+2. **The pager and the merge disagree about order.** `mergeGatedIndices` orders by `(creationDate, name)`
+   and states that both sides arrive already in page order. `DescriptorGate.pagerFor` orders by `name` alone
+   and resumes with `search_after(afterName)`, discarding the `afterCreationDate` it is handed. The page is
+   therefore selected by name and then ordered by date, which is visible above as four names chosen
+   alphabetically and returned in reverse.
+3. **Descending fetches the ascending first page and reverses it**, which reverses the first page rather
+   than producing the last one. Both walks return the same four names.
+
+Creation dates run opposite to name order on purpose. With both orders agreeing, a pager sorting by name and
+a merge sorting by date produce identical pages and defect 2 is invisible, which is presumably how it
+survived H16 and T5.
+
+Defect 1 is what hides the other two, since a walk that stops after one page never reaches a second page to
+be wrong about.
