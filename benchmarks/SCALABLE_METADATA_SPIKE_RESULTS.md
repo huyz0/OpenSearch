@@ -2151,3 +2151,55 @@ The performance investigation found it. Three profiles looking for milliseconds 
 it only surfaced when the question became "what does this code actually do" rather than "how long does it
 take". Optimisation work reads code adversarially and at a level of detail that review does not, which is
 worth remembering the next time a performance pass is deprioritised.
+
+## S38 (T21): a sleeping tenant's first request costs about 41 ms
+
+T20 established that an empty awake shard costs 118 KB and three file descriptors, so an index per tenant
+only works if most tenants are asleep. Scale to zero moves that cost rather than removing it: a sleeping
+tenant is free until it is not, and then somebody waits. That wait is a per-tenant service level, paid on
+every visit by a tenant who queries once an hour.
+
+`ServerlessStorageShardSuspensionIT` already proved the mechanism works. It never timed it, because proving
+a mechanism and sizing it are different jobs.
+
+| round | wake latency |
+|---|---|
+| 0 | 52.3 ms (carries warmup) |
+| 1 | 41.5 ms |
+| 2 | 36.0 ms |
+| 3 | 43.5 ms |
+| 4 | 40.9 ms |
+
+**Median 41.5 ms** excluding the first. One nearly empty shard, local recovery, idle cluster, so a floor: a
+real tenant's shard recovers more data, and on a busy cluster it queues behind other reroutes.
+
+41 ms of coordination overhead is small enough that the wake path is not the obstacle. What a real tenant
+pays on top is recovery of their actual data, which is a function of their index size rather than of this
+mechanism.
+
+## S39 (T22): the read path assumed uniform access, and tenant traffic is not uniform
+
+Earlier reasoning about the read path at many coordinators concluded the descriptor cache would be nearly
+useless: fifty thousand entries against a hundred million indices is 0.05 percent, so effectively every read
+pays the miss. That rested on an assumption never stated as one, that tenants are accessed uniformly.
+
+| capacity | uniform | zipf 0.8 | zipf 1.0 | zipf 1.2 |
+|---|---|---|---|---|
+| 20 (0.5%) | 0.5% | 6.7% | 20.2% | 40.9% |
+| 100 (2.5%) | 2.4% | 18.5% | 39.7% | 62.8% |
+| 200 (5.0%) | 4.8% | 26.2% | 49.2% | 71.1% |
+| 500 (12.5%) | 11.9% | 40.1% | 62.0% | 80.7% |
+| 1000 (25%) | 23.5% | 53.7% | 72.9% | 86.8% |
+
+The uniform column tracks capacity exactly, which is the arithmetic the earlier reasoning did and is correct
+for uniform access. At Zipf 1.0, the distribution multi-tenant traffic usually resembles, the same 0.5
+percent capacity returns 20 percent rather than 0.5, and 5 percent returns 49 percent.
+
+**The property that matters at scale is that Zipf hit rate follows the absolute cache size, not the
+fraction.** A cache holding fifty thousand tenants earns whatever share of traffic the top fifty thousand
+tenants generate, and that share barely moves whether the population is four thousand or a hundred million.
+So the 0.05 percent framing was the wrong denominator, not a pessimistic estimate.
+
+Measured at four thousand tenants with capacities from 0.5 to 25 percent. Extending to a hundred million
+with a fifty thousand entry cache is an order of magnitude below the smallest capacity measured here, so the
+shape transfers and the number should be re-measured before being quoted.
