@@ -2921,3 +2921,52 @@ unreachable. The value here is the map, and the map now reaches the wall rather 
 write, and now the reason is precise rather than suspected. The residency figures describe a population that
 is created, resolvable, listable, wildcard-matchable and searchable-by-name, and that has never taken a
 document. Whether the design holds under writes is still open, and item 3 is the part nobody has looked at.
+
+## S53 (T37): the third problem is the first problem, and placement works
+
+S52 called the write failure past all ten metadata sites a third subsystem: "placement produces a routing
+table, nothing materialises the shard", and said it was unexplored. **That reading was wrong**, in the same
+way T36's was, and for the same reason: a failure was attributed to the nearest unexamined thing rather than
+probed.
+
+Asked directly, computed placement assigns a gated index's primary perfectly well:
+
+```
+descriptor=true routingTable=true shard0=true
+primary=[placement-probe][0], node[l4enaaN2SDW4YnL7IuYBfA], [P], s[STARTED]
+assigned=true nodeKnown=true dataNodes=3
+```
+
+The shard is STARTED, on a node the cluster knows. `ComputedRoutingTable.primary` walks a shard to STARTED
+whenever it has a node id, and `eligibleNodes` falls back to every data node, so nothing was ever missing.
+There is no materialisation gap and no third subsystem.
+
+**Where `UnavailableShardsException` actually came from.**
+`TransportReplicationAction.ReroutePhase` already consults the routing seam, at
+`AbsentIndexRoutingSuppliers.resolveShard(state, request.shardId())`. That resolves placement from an
+`IndexMetadata` it looks up in cluster state, which for a gated index is null, so it computes nothing and
+returns null, and a null primary is reported as an unassigned one. The three-argument overload beside it,
+`supply(state, indexName, indexMetadata)`, already synthesises the metadata from the descriptor for exactly
+this case. It is the wrong overload, not a missing mechanism.
+
+### So there is one problem, not three
+
+| was | is |
+|---|---|
+| 1. metadata residency assumptions, ten sites | the whole of it |
+| 2. placement off by default | one setting in the test harness, `serverless_storage.computed_placement.enabled` |
+| 3. shard materialisation, unexplored | an eleventh instance of problem 1, in `resolveShard`'s choice of overload |
+
+Every one of the eleven is the same shape: code that reads cluster state for something a gated index keeps
+in its descriptor, where the seam to ask instead already exists. None of them needs a new mechanism.
+
+### The pattern, stated because it has now cost four wrong diagnoses in one session
+
+The shard count was blamed on a random template, then withdrawn as unexplained, then found to be
+un-gating. Site 8 was blamed on the routing seam and was a setting. The wall behind site 10 was blamed on a
+missing subsystem and was an overload choice. In all four the failure was attributed to the nearest thing
+not yet examined, and in all four the answer came from asking the system a direct question instead.
+
+**The generalisation worth keeping: in this codebase an unexplained failure on the gated path is a
+residency assumption until proven otherwise, because that is what gating changed.** Nothing else has been
+true yet.

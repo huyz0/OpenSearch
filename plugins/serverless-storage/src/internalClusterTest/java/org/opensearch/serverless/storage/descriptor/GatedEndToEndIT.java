@@ -117,10 +117,7 @@ public class GatedEndToEndIT extends org.opensearch.serverless.storage.Serverles
             // off by default and is what supplies one. Every earlier run of this class lacked it, which is
             // why the writes here were only ever served by indices auto-creation had put back into cluster
             // state: nothing gated could have served them.
-            .put(
-                org.opensearch.serverless.storage.ServerlessStoragePlugin.COMPUTED_PLACEMENT_ENABLED_SETTING.getKey(),
-                true
-            )
+            .put(org.opensearch.serverless.storage.ServerlessStoragePlugin.COMPUTED_PLACEMENT_ENABLED_SETTING.getKey(), true)
             .build();
     }
 
@@ -493,6 +490,70 @@ public class GatedEndToEndIT extends org.opensearch.serverless.storage.Serverles
                 + "hundred million cluster state entries, which is the entire cost this design removes",
             afterWrite
         );
+    }
+
+    /**
+     * T37. Whether computed placement actually assigns a gated index's primary, and to a live node.
+     *
+     * <p>Past all ten metadata call sites the write failed with "primary shard isn't assigned to a known
+     * node", which was read as the shard never having been materialised. That reading may be wrong in the
+     * same way T36's was: {@code ComputedRoutingTable.primary} walks a shard to STARTED whenever it has a
+     * node id, and {@code eligibleNodes} falls back to every data node, so a cluster with data nodes should
+     * produce an assigned primary.
+     *
+     * <p>So this asks the routing table directly rather than inferring from the write's failure: is there a
+     * primary, is it assigned, and is the node it names one the cluster knows.
+     */
+    public void testWhetherComputedPlacementAssignsAGatedPrimary() throws Exception {
+        DescriptorStore store = new DescriptorStore(client(), 1);
+        DescriptorGate.install(
+            store,
+            new IndexBackedMappingStore(client()),
+            new IndexBackedMappingStatsAggregator(client()),
+            new StoreBackedFieldRefresher(),
+            true
+        );
+
+        String name = "placement-probe";
+        assertTrue(
+            client().admin()
+                .indices()
+                .create(
+                    new CreateIndexRequest(name).settings(
+                        Settings.builder()
+                            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+                            .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+                            .put("index.serverless_storage.enabled", true)
+                            .build()
+                    )
+                )
+                .actionGet()
+                .isAcknowledged()
+        );
+
+        var state = client().admin().cluster().prepareState().get().getState();
+        var descriptor = store.get(name);
+        var synthesised = descriptor == null ? null : descriptor.toIndexMetadata();
+        var table = synthesised == null ? null : org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers.supply(state, synthesised);
+        var shard = table == null ? null : table.shard(0);
+        var primary = shard == null ? null : shard.primaryShard();
+
+        logger.warn(
+            "T37: descriptor={} routingTable={} shard0={} primary={} assigned={} node={} nodeKnown={} dataNodes={}",
+            descriptor != null,
+            table != null,
+            shard != null,
+            primary,
+            primary != null && primary.assignedToNode(),
+            primary == null ? "n/a" : primary.currentNodeId(),
+            primary != null && primary.currentNodeId() != null && state.nodes().get(primary.currentNodeId()) != null,
+            state.nodes().getDataNodes().size()
+        );
+
+        assertNotNull("computed placement must produce a routing table for a gated index", table);
+        assertNotNull("and a primary for shard 0", primary);
+        assertTrue("assigned to a node", primary.assignedToNode());
+        assertNotNull("and that node must be one the cluster knows", state.nodes().get(primary.currentNodeId()));
     }
 
     private static String tenant(int i) {
