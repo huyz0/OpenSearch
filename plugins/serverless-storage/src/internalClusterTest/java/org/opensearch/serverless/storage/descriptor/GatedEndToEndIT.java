@@ -39,6 +39,22 @@ import java.util.Locale;
  * <p>The assertions are about documents rather than about latency, because a wrong answer here is not slow,
  * it is empty. That is this area's signature failure and searching a population that returns zero hits looks
  * exactly like a population with no matches.
+ *
+ * <p><b>An unexplained discrepancy lives here, and it was first reported as something it is not.</b> A probe
+ * asking for one shard measured three, then five, then ten across runs, and was written up as "a gated index
+ * does not get the shard count it asked for". That claim was wrong: asking for one, two, four and seven
+ * shards records exactly those, in three isolated runs and again after writing a document, which was the
+ * leading hypothesis for what corrupted it.
+ *
+ * <p>What remains is narrower and still real. Running the whole class in one cluster, the multi-value probe
+ * recorded every count correctly while {@code shardcount-probe} recorded nine and the wildcard search touched
+ * eight shards per tenant. Different indices in one cluster disagreeing rules out a per-suite random
+ * template, and writing a document does not cause it. It is order-dependent and unexplained.
+ *
+ * <p>It matters because every residency figure here is per shard (T20: 118 KB and 3.06 file descriptors) and
+ * T28's expansion cap was chosen from how many shards one request wakes. But the first diagnosis varied only
+ * the observation while holding the request fixed, which cannot separate "the setting is ignored" from
+ * "something else is counted", and it should not have been reported as a cause.
  */
 public class GatedEndToEndIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
 
@@ -238,7 +254,8 @@ public class GatedEndToEndIT extends org.opensearch.serverless.storage.Serverles
      * say, what the descriptor recorded, and what a search reports touching. Disagreement between them is
      * the finding.
      */
-    @AwaitsFix(bugUrl = "a gated index does not get the number_of_shards its request asked for; measured 3, 5 and 10 across runs against an ordinary control of 1")
+    @AwaitsFix(bugUrl = "order-dependent: a gated index's recorded shard count sometimes disagrees with its request. "
+        + "Reproduces only when the whole class runs; asking for 1/2/4/7 in isolation is honoured every time")
     public void testHowManyShardsAGatedIndexActuallyGets() throws Exception {
         DescriptorStore store = new DescriptorStore(client(), 1);
         DescriptorGate.install(
@@ -316,6 +333,63 @@ public class GatedEndToEndIT extends org.opensearch.serverless.storage.Serverles
             ordinaryShards,
             searchedShards
         );
+    }
+
+    /**
+     * Whether the requested shard count is dropped, or only the value 1 is.
+     *
+     * <p>The first probe asked for one shard and measured three, then five, then ten across runs. Values
+     * varying run to run with an unchanging request is the signature of a random default winning, and this
+     * cluster's test framework does install a random index template. But it could equally be a floor being
+     * applied to the value one specifically, which would be a deliberate policy rather than a lost setting,
+     * and the two need different fixes.
+     *
+     * <p>So this asks for several distinct counts. If each comes back as asked, the request is honoured and
+     * only 1 is special. If they come back unrelated to the request, the setting is being discarded.
+     */
+    public void testWhetherTheRequestedShardCountSurvivesAtAll() throws Exception {
+        DescriptorStore store = new DescriptorStore(client(), 1);
+        DescriptorGate.install(
+            store,
+            new IndexBackedMappingStore(client()),
+            new IndexBackedMappingStatsAggregator(client()),
+            new StoreBackedFieldRefresher(),
+            true
+        );
+
+        StringBuilder report = new StringBuilder("\nT31 requested vs recorded shard count\n");
+        for (int asked : new int[] { 1, 2, 4, 7 }) {
+            String name = "shards-asked-" + asked;
+            assertTrue(
+                client().admin()
+                    .indices()
+                    .create(
+                        new CreateIndexRequest(name).settings(
+                            Settings.builder()
+                                .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, asked)
+                                .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+                                .put("index.serverless_storage.enabled", true)
+                                .build()
+                        )
+                    )
+                    .actionGet()
+                    .isAcknowledged()
+            );
+            org.opensearch.cluster.metadata.IndexDescriptor d = store.get(name);
+            int atCreation = d == null ? -1 : d.shardCount();
+
+            // The suspected trigger. The probes that disagreed with their request all wrote a document
+            // before reading the descriptor, and the ones that agreed read it immediately. A write can
+            // republish the descriptor through the H2b dual-write hook, so if the count changes here the
+            // durable record is being overwritten after creation rather than the request being ignored.
+            client().prepareIndex(name).setId("0").setSource("k", "v").get();
+            client().admin().indices().prepareRefresh(name).get();
+            org.opensearch.cluster.metadata.IndexDescriptor after = store.get(name);
+            int afterWrite = after == null ? -1 : after.shardCount();
+
+            report.append(String.format(Locale.ROOT, "  asked %d  at creation %d  after a write %d%n", asked, atCreation, afterWrite));
+        }
+        logger.warn(report.toString());
     }
 
     private static String tenant(int i) {

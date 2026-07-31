@@ -2511,10 +2511,10 @@ with a control, and the control is what made it a finding rather than a puzzle:
 | gated index | 1 | 3, then 5, then 10 across runs | same as the descriptor |
 | ordinary index, same cluster, same request | 1 | n/a | 1, with `number_of_shards=1` in its settings |
 
-**A gated index does not get the number of shards its request asked for**, and what it gets varies run to
-run, which is the signature of the test framework's randomised index template being applied where the
-request's explicit setting should have won. An ordinary index created moments later in the same cluster with
-the same explicit setting gets exactly what it asked for.
+**That conclusion was wrong, and S48 withdraws it.** Asking for one, two, four and seven shards records
+exactly those, in three isolated runs and again after writing a document. The probe above varied only the
+observation while holding the request fixed at one, which cannot separate "the setting is ignored" from
+"something else is being counted". What survives is narrower and unexplained: see S48.
 
 This is not cosmetic. Every residency figure in this work is per shard: T20 measured 118 KB and 3.06 file
 descriptors per awake shard, and T28's expansion cap of a hundred was chosen from how many shards one
@@ -2665,3 +2665,51 @@ per-index creation pipeline, which S46 measured as 43.5 percent of OpenSearch CP
 The ceiling for the first option is set by what the descriptor write itself sustains, which S28 measured at
 23,843 documents per second against a few hundred creations per second now. That is the gap worth an
 architectural change, and it is the same gap H3 named before any of this was built.
+
+## S48 (T31): the shard count claim, withdrawn
+
+S45 reported that a gated index does not get the shard count its request asked for, and named a cause: the
+test framework's randomised index template winning over the explicit setting. **Both the claim and the cause
+were wrong.**
+
+Asked for four distinct counts instead of one:
+
+| asked | recorded at creation | recorded after writing a document |
+|---|---|---|
+| 1 | 1 | 1 |
+| 2 | 2 | 2 |
+| 4 | 4 | 4 |
+| 7 | 7 | 7 |
+
+Every value honoured, in three isolated runs, and unchanged after a write, which was the leading hypothesis
+for what might corrupt it afterwards.
+
+**The original probe could not have distinguished the two possibilities.** It held the request fixed at one
+shard and watched the observation move (three, then five, then ten), which is consistent with the setting
+being ignored and equally consistent with something other than the index's shard count being read. Varying
+the request is what separates them, and that was not done before the finding was written up and committed.
+
+### What does survive, and is still unexplained
+
+Running the whole class in one cluster, in a single run:
+
+| index | asked | recorded |
+|---|---|---|
+| `shards-asked-1/2/4/7` | 1, 2, 4, 7 | 1, 2, 4, 7 |
+| `shardcount-probe` | 1 | **9** |
+| `e2e-tenant-*`, via wildcard search | 1 | **8 per tenant** |
+
+Different indices in the same cluster disagreeing rules out a per-suite random template, which would give one
+value to all of them. Writing a document does not cause it. It is order-dependent, it reproduces only when
+the class runs as a whole, and no mechanism has been found.
+
+It still matters, because every residency figure here is per shard (T20: 118 KB and 3.06 file descriptors)
+and T28's expansion cap was chosen from how many shards one request wakes. But it is now an open question
+with an honest description rather than a diagnosis, and the reproducer stays under `AwaitsFix` with the
+multi-value control beside it so the next attempt starts from both halves.
+
+**The method lesson, which is the third instance today.** The index sort was nearly reverted on a
+single-run A/B that a per-operation measurement then contradicted. The T22 timeout was blamed on that same
+sort and turned out to be suite contention. This one held the input fixed and varied only the reading. All
+three would have been caught by the same discipline: change the thing you are attributing the effect to, and
+more than once.
