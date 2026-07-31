@@ -115,13 +115,20 @@ realtime GET on this path, so a blocking remote read during resolution is not ne
 than a GET and the resolution path should be checked for callers that cannot block. The one constraint
 already known is W4's: nothing on the cluster state thread may block on a descriptor read.
 
-**4. The three listing defects.** The pager sorts by `(creationDate, name)` and resumes from both, matching
+**4. The listing defects. Done.** The pager sorts by `(creationDate, name)` and resumes from both, matching
 the strategy rather than approximating it; descending issues a descending search rather than reversing an
-ascending page; and the next-page token accounts for the gated side instead of being derived from a cluster
-state page that is empty.
+ascending page; the next-page token accounts for the gated side instead of being derived from a cluster
+state page that is empty; and tombstones are excluded, since H4 records a deletion as a document and nothing
+was filtering it out. The same walk now returns 12 of 12 over 3 pages in both directions.
 
-These are independent of the contract above and are unambiguous bugs, so they do not need the contract
+These were independent of the contract above and were unambiguous bugs, so they did not need the contract
 settled first.
+
+`findByPrefix`, the full-descriptor sibling of the pager's read, still has no state filter and so would list
+tombstones too. It has no production caller today, which is the only reason it was left alone: changing an
+unused method's behaviour without a test that fails first is how this area accumulated six mechanisms that
+were correct and unreachable. The prefix seam in step 2 will read through something of that shape and must
+carry the filter.
 
 ## What this does not solve
 

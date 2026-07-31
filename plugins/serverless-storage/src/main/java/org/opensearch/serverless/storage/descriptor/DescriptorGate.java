@@ -19,8 +19,6 @@ import org.opensearch.cluster.metadata.MappingGenerationStore;
 import org.opensearch.index.mapper.UnknownFieldRefresh;
 import org.opensearch.serverless.storage.placement.ComputedPlacementGate;
 
-import java.util.List;
-
 /**
  * Installs the descriptor read path, which was built and never connected.
  *
@@ -207,26 +205,15 @@ public final class DescriptorGate {
      * that pagination sorted the whole population to make one page, so a pager that fetched everything and
      * then trimmed would satisfy the type and reintroduce the cost. This asks the index for exactly the page.
      *
-     * <p>Descending order is served by fetching ascending and reversing the page. That is correct only
-     * because a page is bounded, and it is the honest trade: the alternative is a second sort direction in
-     * the store for a case that pagination rarely uses. Recorded rather than hidden, since a caller paging
-     * descending through a large population would page through it in ascending chunks.
+     * <p>It is a method reference rather than a lambda because every argument now goes through unchanged.
+     * The lambda that used to be here dropped {@code afterCreationDate} and served descending by reversing
+     * an ascending page, and T27 measured what that cost: a descending walk returned the same names as an
+     * ascending one, and pages were selected in name order while the caller merged them in creation-date
+     * order. A pager that quietly reinterprets its arguments is worse than one that cannot express them.
      */
     private static AbsentIndexDescriptorSuppliers.DescriptorPager pagerFor(DescriptorStore store) {
-        return (afterName, afterCreationDate, ascending, size) -> {
-            // Names and creation dates only. T5 measured that decoding the full descriptor for every hit is
-            // a quarter to a third of what a page costs, and pagination reads exactly these two fields.
-            List<org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.PagedIndex> page = store.findNamesByPrefix(
-                "",
-                afterName,
-                size
-            );
-            if (ascending) {
-                return page;
-            }
-            List<org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.PagedIndex> reversed = new java.util.ArrayList<>(page);
-            java.util.Collections.reverse(reversed);
-            return reversed;
-        };
+        // Names and creation dates only. T5 measured that decoding the full descriptor for every hit is a
+        // quarter to a third of what a page costs, and pagination reads exactly these two fields.
+        return store::findNamesForPage;
     }
 }

@@ -64,18 +64,15 @@ public class IndexPaginationStrategy implements PaginationStrategy<String> {
         List<String> clusterStateNames = metadataSublist.stream()
             .map(metadata -> metadata.getIndex().getName())
             .collect(Collectors.toList());
-        this.requestedIndices = mergeGatedIndices(
+        MergedPage merged = mergeGatedIndices(
             clusterStateNames,
             metadataSublist,
             pageParams,
             Objects.isNull(requestedToken) ? null : requestedToken.lastIndexName,
             Objects.isNull(requestedToken) ? 0L : requestedToken.lastIndexCreationTime
         );
-        this.pageToken = getResponseToken(
-            pageParams.getSize(),
-            sortedIndices.size(),
-            metadataSublist.isEmpty() ? null : metadataSublist.get(metadataSublist.size() - 1)
-        );
+        this.requestedIndices = merged.names;
+        this.pageToken = getResponseToken(pageParams.getSize(), sortedIndices.size(), merged);
     }
 
     /**
@@ -95,7 +92,7 @@ public class IndexPaginationStrategy implements PaginationStrategy<String> {
      * <p>With no pager installed this returns the cluster state page unchanged, so a cluster that has never
      * gated an index behaves exactly as before.
      */
-    private static List<String> mergeGatedIndices(
+    private static MergedPage mergeGatedIndices(
         List<String> clusterStateNames,
         List<IndexMetadata> clusterStatePage,
         PageParams pageParams,
@@ -103,18 +100,23 @@ public class IndexPaginationStrategy implements PaginationStrategy<String> {
         long lastIndexCreationTime
     ) {
         if (AbsentIndexDescriptorSuppliers.isPagerRegistered() == false) {
-            return clusterStateNames;
+            return MergedPage.fromClusterStateOnly(clusterStateNames, clusterStatePage);
         }
+        int size = pageParams.getSize();
         boolean ascending = PageParams.PARAM_ASC_SORT_VALUE.equals(pageParams.getSort());
+        // One more than the page, so a gated side with more to give can be told from one that is exhausted.
+        // Without that distinction the walk cannot know whether to offer a next page, and T27 measured the
+        // consequence: a population of a hundred million listed as ten.
         List<AbsentIndexDescriptorSuppliers.PagedIndex> gatedPage = AbsentIndexDescriptorSuppliers.page(
             lastIndexName,
             lastIndexCreationTime,
             ascending,
-            pageParams.getSize()
+            size + 1
         );
         if (gatedPage.isEmpty()) {
-            return clusterStateNames;
+            return MergedPage.fromClusterStateOnly(clusterStateNames, clusterStatePage);
         }
+        boolean moreGated = gatedPage.size() > size;
 
         // Both sides are already in page order, so this is a merge of two sorted runs rather than a sort of
         // their union. Sorting the union would reintroduce the cost this exists to avoid.
@@ -122,19 +124,56 @@ public class IndexPaginationStrategy implements PaginationStrategy<String> {
         for (IndexMetadata metadata : clusterStatePage) {
             merged.add(new Sortable(metadata.getIndex().getName(), metadata.getCreationDate()));
         }
-        for (AbsentIndexDescriptorSuppliers.PagedIndex gated : gatedPage) {
-            merged.add(new Sortable(gated.name(), gated.creationDate()));
+        for (int i = 0; i < Math.min(gatedPage.size(), size); i++) {
+            merged.add(new Sortable(gatedPage.get(i).name(), gatedPage.get(i).creationDate()));
         }
         merged.sort(ascending ? SORTABLE_ASC : SORTABLE_DESC);
 
-        List<String> page = new ArrayList<>(pageParams.getSize());
+        List<String> page = new ArrayList<>(size);
+        Sortable last = null;
         for (Sortable each : merged) {
-            if (page.size() >= pageParams.getSize()) {
+            if (page.size() >= size) {
                 break;
             }
             page.add(each.name);
+            last = each;
         }
-        return page;
+        // Entries pushed out of this page by the other side are not lost: the next token is the last entry
+        // actually returned, and both sides resume from it, so whichever side was truncated is re-read.
+        return new MergedPage(page, last, moreGated || merged.size() > size);
+    }
+
+    /**
+     * One page and what the walk needs to continue from it.
+     *
+     * <p>The last entry has to come from the <em>merged</em> page rather than from the cluster state page,
+     * which is what makes this a type rather than a return value. T27 found the token being built from the
+     * cluster state side alone: with every index gated that side is empty, so the token was null, and a null
+     * token is how this API says there is nothing more.
+     */
+    private static final class MergedPage {
+        private final List<String> names;
+        private final Sortable last;
+        private final boolean moreBeyondThisPage;
+
+        private MergedPage(List<String> names, Sortable last, boolean moreBeyondThisPage) {
+            this.names = names;
+            this.last = last;
+            this.moreBeyondThisPage = moreBeyondThisPage;
+        }
+
+        /**
+         * The page a cluster with no gated indices produces, which must behave exactly as it did before any
+         * of this existed.
+         */
+        private static MergedPage fromClusterStateOnly(List<String> names, List<IndexMetadata> clusterStatePage) {
+            IndexMetadata lastMetadata = clusterStatePage.isEmpty() ? null : clusterStatePage.get(clusterStatePage.size() - 1);
+            return new MergedPage(
+                names,
+                lastMetadata == null ? null : new Sortable(lastMetadata.getIndex().getName(), lastMetadata.getCreationDate()),
+                false
+            );
+        }
     }
 
     /** One entry's position in page order, which is all the merge needs from either side. */
@@ -204,12 +243,24 @@ public class IndexPaginationStrategy implements PaginationStrategy<String> {
         return sortedIndices.subList(0, Math.min(pageSize, sortedIndices.size()));
     }
 
-    private PageToken getResponseToken(final int pageSize, final int totalIndices, IndexMetadata lastIndex) {
-        if (totalIndices <= pageSize) {
+    /**
+     * The token for the next page, or a null token when this was the last.
+     *
+     * <p>Two sides can each have more to give, and either is enough to justify another page. The cluster
+     * state side says so by having more eligible indices than fit; the gated side says so through the extra
+     * entry {@code mergeGatedIndices} asks for. Asking only the first is what T27 measured, and with a fully
+     * gated population it is always the wrong question, because that side is empty.
+     *
+     * <p>With no pager installed the gated term is false and the last entry is the cluster state page's
+     * last, so this is exactly the previous behaviour rather than an equivalent of it.
+     */
+    private PageToken getResponseToken(final int pageSize, final int totalIndices, MergedPage merged) {
+        boolean more = merged.moreBeyondThisPage || totalIndices > pageSize;
+        if (more == false || merged.last == null) {
             return new PageToken(null, DEFAULT_INDICES_PAGINATED_ENTITY);
         }
         return new PageToken(
-            new IndexStrategyToken(lastIndex.getCreationDate(), lastIndex.getIndex().getName()).generateEncryptedToken(),
+            new IndexStrategyToken(merged.last.creationDate, merged.last.name).generateEncryptedToken(),
             DEFAULT_INDICES_PAGINATED_ENTITY
         );
     }

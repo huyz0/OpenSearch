@@ -8,7 +8,6 @@
 
 package org.opensearch.serverless.storage.descriptor;
 
-import org.apache.lucene.tests.util.LuceneTestCase.AwaitsFix;
 import org.opensearch.Version;
 import org.opensearch.action.pagination.IndexPaginationStrategy;
 import org.opensearch.action.pagination.PageParams;
@@ -32,27 +31,30 @@ import java.util.Set;
  * bounded by the page size, so a hundred million appears in neither term. What was never driven is the
  * <em>loop</em>. Every test of the merge asked for one page.
  *
- * <p>Three things in the code disagree with each other, and a single page cannot reveal any of them:
+ * <p>It found four defects, and drove the fix for all of them. Measured before the fix, twelve gated
+ * indices in pages of four returned one page of four names in both directions, and a tombstoned index was
+ * listed as an index:
  *
  * <ol>
+ *   <li>{@code getResponseToken} was computed from the cluster state page alone. With every index gated
+ *       that count is zero, zero is not greater than the page size, and the token was therefore null. A
+ *       null token is how this API says "that was everything", so a hundred million indices listed as ten.</li>
  *   <li>{@code mergeGatedIndices} orders by {@code (creationDate, name)} and states that both sides arrive
- *       already in page order. {@code DescriptorGate.pagerFor} orders by {@code name} alone and resumes with
- *       {@code search_after(afterName)}, discarding the {@code afterCreationDate} it is handed.</li>
- *   <li>Descending is served by fetching ascending and reversing, which reverses the <em>first</em> page
- *       rather than producing the last one.</li>
- *   <li>{@code getResponseToken} is computed from the cluster state page alone. With every index gated,
- *       that count is zero, zero is not greater than the page size, and the token is therefore null.</li>
+ *       already in page order. {@code DescriptorGate.pagerFor} ordered by {@code name} alone and resumed
+ *       with {@code search_after(afterName)}, discarding the {@code afterCreationDate} it was handed, so a
+ *       page was selected in one order and returned in another.</li>
+ *   <li>Descending was served by fetching ascending and reversing, which reverses the <em>first</em> page
+ *       rather than producing the last one, so both walks returned the same names.</li>
+ *   <li>Neither prefix search filtered on state, so a deleted index was still listed as an index.</li>
  * </ol>
  *
- * <p>Item three is the one that makes the others hard to see, because a listing that stops after one page
- * never reaches a second page to be wrong about. It is also the worst of the three on its own terms: a null
- * token is how this API says "that was everything", so an operator listing a hundred million indices is
- * shown ten of them and told there are no more.
+ * <p>Defect one is the one that hid the others, because a listing that stops after one page never reaches a
+ * second page to be wrong about.
  *
- * <p>Creation dates run <b>opposite</b> to name order on purpose. With both orders agreeing, a pager sorting
- * by name and a merge sorting by creation date produce identical pages and the disagreement stays invisible,
- * which is presumably how it survived. The controls pin that down: the same walk over ordinary indices, with
- * the same inverted dates, must enumerate all of them exactly once.
+ * <p>Creation dates run <b>opposite</b> to name order on purpose, and that is what makes this test able to
+ * fail. With both orders agreeing, a pager sorting by name and a merge sorting by creation date produce
+ * identical pages and defect two is invisible, which is presumably how it survived H16 and T5. The control
+ * pins the harness down: the same walk over ordinary indices must enumerate all of them exactly once.
  */
 public class GatedPaginationIT extends OpenSearchIntegTestCase {
 
@@ -66,7 +68,6 @@ public class GatedPaginationIT extends OpenSearchIntegTestCase {
     }
 
     /** The question, ascending. Walk the pages to exhaustion and see how much of the population appears. */
-    @AwaitsFix(bugUrl = "the next-page token is derived from the cluster state page alone, so a gated walk stops after one page; see GATED_WILDCARD_DESIGN.md")
     public void testWalkingEveryPageOfAGatedPopulation() {
         installWithGatedPopulation();
 
@@ -88,8 +89,7 @@ public class GatedPaginationIT extends OpenSearchIntegTestCase {
         );
     }
 
-    /** The same walk descending, where the pager reverses a page it fetched ascending. */
-    @AwaitsFix(bugUrl = "the pager reverses an ascending first page instead of searching descending; see GATED_WILDCARD_DESIGN.md")
+    /** The same walk descending, which before the fix reversed a page it had fetched ascending. */
     public void testWalkingEveryPageDescending() {
         installWithGatedPopulation();
 
@@ -97,6 +97,43 @@ public class GatedPaginationIT extends OpenSearchIntegTestCase {
         logger.warn("T27: descending walk yielded {} distinct names over {} pages {}", walk.seen.size(), walk.pages, walk.seen);
 
         assertEquals("descending must enumerate the same population as ascending", POPULATION, walk.seen.size());
+    }
+
+    /**
+     * The adjacent question, asked because neither prefix search filters on state.
+     *
+     * <p>H4 records a deletion as a tombstone rather than an absence, so a deleted gated index remains a
+     * document in the descriptor index carrying {@code state=DELETED}. Listing reads those documents and
+     * nothing in the query excludes them, which would mean a deleted index is still listed as an index.
+     *
+     * <p>Kept to a single page on purpose. The walk defects above would otherwise decide the outcome, and
+     * this is a different question: not whether paging reaches an index, but whether an index that no longer
+     * exists is offered at all.
+     */
+    public void testADeletedIndexIsNotListed() {
+        DescriptorStore store = new DescriptorStore(client(), 1);
+        store.create(descriptor("listed-alive", 1_700_000_001_000L));
+        store.create(tombstone("listed-deleted", 1_700_000_002_000L));
+        client().admin().indices().prepareRefresh(DescriptorStore.DESCRIPTOR_INDEX).get();
+        DescriptorGate.install(
+            store,
+            new IndexBackedMappingStore(client()),
+            new IndexBackedMappingStatsAggregator(client()),
+            new StoreBackedFieldRefresher(),
+            true
+        );
+
+        ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
+        List<String> page = new IndexPaginationStrategy(new PageParams(null, PageParams.PARAM_ASC_SORT_VALUE, 10), empty)
+            .getRequestedEntities();
+        logger.warn("T27: a page over one live and one tombstoned descriptor listed {}", page);
+
+        assertTrue("the premise: a live gated index is listed", page.contains("listed-alive"));
+        assertFalse(
+            "a deleted index must not be listed, and H4 keeps its descriptor as a tombstone rather than "
+                + "removing it, so listing has to exclude it by state rather than by absence",
+            page.contains("listed-deleted")
+        );
     }
 
     /**
@@ -185,7 +222,7 @@ public class GatedPaginationIT extends OpenSearchIntegTestCase {
         assertEquals(
             "the premise: the pager must be able to produce a first page at all",
             PAGE_SIZE,
-            store.findNamesByPrefix("", null, PAGE_SIZE).size()
+            store.findNamesForPage(null, 0L, true, PAGE_SIZE).size()
         );
     }
 
@@ -196,6 +233,26 @@ public class GatedPaginationIT extends OpenSearchIntegTestCase {
 
     private static String name(int i) {
         return String.format(Locale.ROOT, "paged-%03d", i);
+    }
+
+    /** A deleted index as H4 records it: still a document, distinguished only by its state. */
+    private static IndexDescriptor tombstone(String name, long creationDate) {
+        return new IndexDescriptor(
+            name,
+            name + "-uuid",
+            1,
+            0,
+            true,
+            IndexDescriptor.State.DELETED,
+            List.of(),
+            Version.CURRENT.id,
+            false,
+            false,
+            false,
+            false,
+            0L,
+            creationDate
+        );
     }
 
     private static IndexDescriptor descriptor(String name, long creationDate) {

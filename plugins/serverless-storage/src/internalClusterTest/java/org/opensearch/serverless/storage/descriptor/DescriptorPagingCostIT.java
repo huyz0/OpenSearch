@@ -139,10 +139,14 @@ public class DescriptorPagingCostIT extends OpenSearchIntegTestCase {
     /**
      * T6. The cheap path and the full path must agree, name for name and date for date.
      *
-     * <p>{@code findNamesByPrefix} is a second way to read the same documents, and a second read path that
+     * <p>{@code findNamesForPage} is a second way to read the same documents, and a second read path that
      * can drift from the first is exactly what C3 established the store exists to prevent. The saving is
      * only worth having if the two cannot disagree, so this pins them together rather than trusting that
      * doc values and {@code _source} say the same thing.
+     *
+     * <p>Creation dates ascend with the name here, so the two paths order identically despite sorting on
+     * different keys since T27, and a positional comparison is still meaningful. That is a property of this
+     * fixture rather than of the store: the two orders are the same only because this data makes them so.
      */
     public void testTheNameOnlyPathAgreesWithTheFullPath() {
         DescriptorStore store = new DescriptorStore(client(), 1);
@@ -152,7 +156,7 @@ public class DescriptorPagingCostIT extends OpenSearchIntegTestCase {
         client().admin().indices().prepareRefresh(DescriptorStore.DESCRIPTOR_INDEX).get();
 
         List<IndexDescriptor> full = store.findByPrefix("agreed-idx-", null, 50);
-        var namesOnly = store.findNamesByPrefix("agreed-idx-", null, 50);
+        var namesOnly = store.findNamesForPage(null, 0L, true, 50);
 
         assertEquals("both paths must return the same page size", full.size(), namesOnly.size());
         assertEquals("and a full page, or this compared almost nothing", 50, full.size());

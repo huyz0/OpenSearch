@@ -86,10 +86,12 @@ public class GatedIndexPaginationGapTests extends OpenSearchTestCase {
         new IndexPaginationStrategy(new PageParams(null, PageParams.PARAM_ASC_SORT_VALUE, 7), twoOrdinaryIndices());
 
         assertEquals(
-            "the pager must be asked for the page size and nothing more. Asking it for the population is "
-                + "the fix H16 warned against: it would make gated indices visible while making the cost "
-                + "problem worse",
-            7,
+            "the pager must be asked for one more than the page and nothing beyond that. Asking it for the "
+                + "population is the fix H16 warned against: it would make gated indices visible while "
+                + "making the cost problem worse. The extra entry is how the walk learns whether a next page "
+                + "exists, which T27 found it had no way to know: the token was built from the cluster "
+                + "state side alone, so a fully gated population listed one page and stopped",
+            8,
             requestedSize.get()
         );
     }

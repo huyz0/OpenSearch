@@ -713,19 +713,49 @@ public final class DescriptorStore {
      *
      * <p>Refresh-bound for the same reason {@link #findByPrefix} is: it is a search.
      *
+     * <p><b>Ordered by {@code (creationDate, name)} because that is the order pagination pages in.</b> T27
+     * found this sorted by name alone while {@code IndexPaginationStrategy} merged the result by creation
+     * date, so a page was selected in one order and returned in another, and the {@code afterCreationDate}
+     * the seam passes was accepted and discarded. Sorting here by anything other than the caller's order is
+     * not a near miss, it silently drops indices from the walk.
+     *
+     * <p><b>Both directions are real searches.</b> Descending used to be served by fetching ascending and
+     * reversing the page, which reverses the <em>first</em> page rather than producing the last one, so a
+     * descending walk returned the same names as an ascending one.
+     *
+     * <p><b>Tombstones are excluded.</b> H4 records a deletion as a document rather than removing one, so
+     * without this filter a deleted index is still listed as an index. That is a state question rather than
+     * a paging one, which is why it belongs in the query rather than in the caller: every future reader of
+     * this page would otherwise have to remember it, and T27 measured that the first one did not.
+     *
      * @param afterName the last name of the previous page, or null for the first page
+     * @param afterCreationDate the last creation date of the previous page, ignored when afterName is null
      */
-    public List<AbsentIndexDescriptorSuppliers.PagedIndex> findNamesByPrefix(String prefix, String afterName, int size) {
+    public List<AbsentIndexDescriptorSuppliers.PagedIndex> findNamesForPage(
+        String afterName,
+        long afterCreationDate,
+        boolean ascending,
+        int size
+    ) {
         try {
+            SortOrder order = ascending ? SortOrder.ASC : SortOrder.DESC;
             var request = client.prepareSearch(DESCRIPTOR_INDEX)
-                .setQuery(QueryBuilders.prefixQuery("name", prefix))
-                .addSort("name", SortOrder.ASC)
+                .setQuery(
+                    QueryBuilders.boolQuery()
+                        .mustNot(QueryBuilders.termQuery("state", org.opensearch.cluster.metadata.IndexDescriptor.State.DELETED.name()))
+                )
+                .addSort("creationDate", order)
+                .addSort("name", order)
                 .setFetchSource(false)
                 .addDocValueField("name")
                 .addDocValueField("creationDate")
+                // An exact hit total would make the collector visit every descriptor in the population to
+                // produce one page, which S41 measured as the difference between a flat cost and a linear
+                // one. Nothing here reports a total.
+                .setTrackTotalHits(false)
                 .setSize(size);
             if (Strings.isNullOrEmpty(afterName) == false) {
-                request.searchAfter(new Object[] { afterName });
+                request.searchAfter(new Object[] { afterCreationDate, afterName });
             }
             SearchResponse response = request.get();
             List<AbsentIndexDescriptorSuppliers.PagedIndex> page = new ArrayList<>();
@@ -739,7 +769,7 @@ public final class DescriptorStore {
             }
             return page;
         } catch (Exception e) {
-            logger.debug("descriptor name search for [{}] failed", prefix, e);
+            logger.debug("descriptor page search after [{}] failed", afterName, e);
             return List.of();
         }
     }
