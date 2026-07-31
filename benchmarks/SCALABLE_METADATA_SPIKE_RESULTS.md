@@ -2666,7 +2666,7 @@ The ceiling for the first option is set by what the descriptor write itself sust
 23,843 documents per second against a few hundred creations per second now. That is the gap worth an
 architectural change, and it is the same gap H3 named before any of this was built.
 
-## S48 (T31): the shard count claim, withdrawn
+## S48 (T31): the shard count claim, withdrawn, then superseded by S49
 
 S45 reported that a gated index does not get the shard count its request asked for, and named a cause: the
 test framework's randomised index template winning over the explicit setting. **Both the claim and the cause
@@ -2713,3 +2713,57 @@ single-run A/B that a per-operation measurement then contradicted. The T22 timeo
 sort and turned out to be suite contention. This one held the input fixed and varied only the reading. All
 three would have been caught by the same discipline: change the thing you are attributing the effect to, and
 more than once.
+
+## S49 (T31, third attempt): gating does not survive the first write
+
+S45 said a gated index does not get the shard count it asked for, and named a cause. S48 withdrew that as
+unexplained. Both were wrong, and the thing underneath is the most serious finding in this work.
+
+Varying the requested count and re-reading the descriptor after writing one document:
+
+| asked | recorded at creation | recorded after a write |
+|---|---|---|
+| 1 | 1 | **9** |
+| 2 | 2 | **9** |
+| 4 | 4 | **9** |
+| 7 | 7 | **9** |
+
+Four indices collapsing to a single value is a cluster default rather than a per-index setting, which is
+what pointed at the mechanism. Asked directly:
+
+```
+gatedness-probe
+  at creation:   in cluster state = false   descriptor shards = 1
+  after a write: in cluster state = TRUE    descriptor shards = 1
+```
+
+**A write puts the gated index back into cluster state.** `IndexDescriptorPublisher.publish` fires only from
+`Metadata.Builder.put`, so a descriptor rewritten during a write is the signature of the index entering
+metadata and being rebuilt there from defaults. The shard count was the visible symptom and is the smaller
+half of the problem.
+
+### Why this outranks everything else currently open
+
+The entire design is that a gated index has no cluster state entry. If writing to one restores the entry,
+then gating holds only until first use, and a population of a hundred million *written* indices is a
+hundred million entries, which is precisely the cost H2 onward exists to remove. Every residency number in
+this document describes a population that has been created and not yet used.
+
+It also explains an oddity nobody chased: the T30 wildcard search reporting 100, 160 and 180 shards for
+twenty tenants across runs. Those tenants had been written to, so they were back in cluster state with
+default shard counts.
+
+### What is not yet known
+
+Which write-path component does it. Auto-creation on the write is the obvious suspect, since the index is
+absent from metadata and an indexing request that cannot find one there creates it, but that is a reading of
+the code and this area has punished three such readings today alone. The next step is to find the caller,
+not to assume it.
+
+### The method note, since this is the third diagnosis of one symptom
+
+Attempt one held the request fixed and varied only the observation, and produced a confident wrong cause.
+Attempt two varied the request, found it honoured, and concluded there was no defect, which was right about
+the shard count and wrong about there being nothing there. Attempt three asked what the system's own
+invariant was, rather than what the number was, and the invariant is what broke. **Measuring the quantity
+you noticed is weaker than measuring the property the design guarantees.**

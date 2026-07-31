@@ -40,21 +40,29 @@ import java.util.Locale;
  * it is empty. That is this area's signature failure and searching a population that returns zero hits looks
  * exactly like a population with no matches.
  *
- * <p><b>An unexplained discrepancy lives here, and it was first reported as something it is not.</b> A probe
- * asking for one shard measured three, then five, then ten across runs, and was written up as "a gated index
- * does not get the shard count it asked for". That claim was wrong: asking for one, two, four and seven
- * shards records exactly those, in three isolated runs and again after writing a document, which was the
- * leading hypothesis for what corrupted it.
+ * <p><b>Chasing a shard count here found something much larger, after two wrong diagnoses.</b> A probe
+ * asking for one shard measured three, five and ten across runs, and was written up as "a gated index does
+ * not get the shard count it asked for". Wrong: asking for one, two, four and seven records exactly those.
+ * It was then withdrawn as unexplained. Also wrong.
  *
- * <p>What remains is narrower and still real. Running the whole class in one cluster, the multi-value probe
- * recorded every count correctly while {@code shardcount-probe} recorded nine and the wildcard search touched
- * eight shards per tenant. Different indices in one cluster disagreeing rules out a per-suite random
- * template, and writing a document does not cause it. It is order-dependent and unexplained.
+ * <p>Varying the request and then re-reading after a write shows what is happening:
  *
- * <p>It matters because every residency figure here is per shard (T20: 118 KB and 3.06 file descriptors) and
- * T28's expansion cap was chosen from how many shards one request wakes. But the first diagnosis varied only
- * the observation while holding the request fixed, which cannot separate "the setting is ignored" from
- * "something else is counted", and it should not have been reported as a cause.
+ * <pre>
+ *   asked 1  at creation 1  after a write 9
+ *   asked 2  at creation 2  after a write 9
+ *   asked 4  at creation 4  after a write 9
+ *   asked 7  at creation 7  after a write 9
+ * </pre>
+ *
+ * <p>Four indices collapsing to one value is a cluster default, not a per-index setting, and the mechanism
+ * is in {@code testWhetherTheDisagreeingIndexIsEvenGated}: at creation the index is absent from cluster
+ * state, and <b>after a write it is present</b>. {@code IndexDescriptorPublisher.publish} fires only from
+ * {@code Metadata.Builder.put}, so a descriptor rewritten during a write means the index entered cluster
+ * state and was rebuilt there from defaults.
+ *
+ * <p><b>So gating does not survive the first write.</b> The shard count was a symptom of that, and the
+ * symptom is the smaller half: an index that re-enters cluster state when written to costs exactly what
+ * this whole design exists to avoid, and a hundred million written indices is a hundred million entries.
  */
 public class GatedEndToEndIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
 
@@ -390,6 +398,82 @@ public class GatedEndToEndIT extends org.opensearch.serverless.storage.Serverles
             report.append(String.format(Locale.ROOT, "  asked %d  at creation %d  after a write %d%n", asked, atCreation, afterWrite));
         }
         logger.warn(report.toString());
+    }
+
+    /**
+     * Whether the indices whose shard count disagrees are gated at all.
+     *
+     * <p>The whole T31 puzzle rests on one observation, and it is weaker than it looked. For a gated index
+     * the search's shard count is <em>derived from</em> the descriptor through computed placement, so the
+     * descriptor and the search agreeing is not two witnesses, it is one. The single fact is that the
+     * descriptor records a count the request did not ask for.
+     *
+     * <p>There is a way for that to happen with nothing broken in the creation path: if the index is not
+     * gated, it lives in cluster state like any other, the random index template the test framework installs
+     * can give it a shard count, and its descriptor is written by the publisher from that metadata rather
+     * than by the creator from the request.
+     *
+     * <p>So this asks the question directly, for an index created exactly as the failing probe creates one.
+     * If the index is present in cluster state, it was never gated and there is no defect in the gated path
+     * to find.
+     */
+    @AwaitsFix(bugUrl = "writing a document to a gated index puts it back into cluster state, so gating does not survive the first write")
+    public void testWhetherTheDisagreeingIndexIsEvenGated() throws Exception {
+        DescriptorStore store = new DescriptorStore(client(), 1);
+        DescriptorGate.install(
+            store,
+            new IndexBackedMappingStore(client()),
+            new IndexBackedMappingStatsAggregator(client()),
+            new StoreBackedFieldRefresher(),
+            true
+        );
+
+        String name = "gatedness-probe";
+        assertTrue(
+            client().admin()
+                .indices()
+                .create(
+                    new CreateIndexRequest(name).settings(
+                        Settings.builder()
+                            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+                            .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+                            .put("index.serverless_storage.enabled", true)
+                            .build()
+                    )
+                )
+                .actionGet()
+                .isAcknowledged()
+        );
+
+        var metadata = client().admin().cluster().prepareState().get().getState().metadata().index(name);
+        org.opensearch.cluster.metadata.IndexDescriptor descriptor = store.get(name);
+
+        // Then the same two questions after a write, because the write is what corrupts the count.
+        // IndexDescriptorPublisher.publish fires only from Metadata.Builder.put, so a descriptor rewritten
+        // during a write means the index entered cluster state, which for a gated index it must never do.
+        client().prepareIndex(name).setId("0").setSource("k", "v").get();
+        client().admin().indices().prepareRefresh(name).get();
+        var afterWrite = client().admin().cluster().prepareState().get().getState().metadata().index(name);
+        org.opensearch.cluster.metadata.IndexDescriptor descriptorAfter = store.get(name);
+
+        logger.warn(
+            "T31: [{}] at creation: in cluster state={} descriptor shards={} | after a write: in cluster "
+                + "state={} (shards {}) descriptor shards={}",
+            name,
+            metadata != null,
+            descriptor == null ? "null" : descriptor.shardCount(),
+            afterWrite != null,
+            afterWrite == null ? "n/a" : afterWrite.getNumberOfShards(),
+            descriptorAfter == null ? "null" : descriptorAfter.shardCount()
+        );
+
+        assertNull("the premise: a gated index is absent from cluster state when created", metadata);
+        assertNull(
+            "a gated index must still be absent from cluster state after it is written to. If a write puts "
+                + "it back, gating survives only until first use, and a hundred million written indices is a "
+                + "hundred million cluster state entries, which is the entire cost this design removes",
+            afterWrite
+        );
     }
 
     private static String tenant(int i) {
