@@ -2494,8 +2494,10 @@ Twenty gated tenants created through the real API, fifty documents each:
 | search | 6.9 ms/tenant |
 | **documents found** | **1,000 of 1,000** |
 
-**The composition works.** Documents written to a gated index are findable in it, and one wildcard search
-reaches every tenant in the population: 20 of 20 documents in 141 ms across the whole set.
+**The composition works, for indices that start gated and do not stay gated.** S50 corrects this: the
+tenants were auto-created into cluster state by their first write, so the documents below were served by
+ordinary indices. The path is real and the result is real; what it does not demonstrate is a *gated* index
+serving a write.
 
 The per-stage numbers are a floor rather than a benchmark. One node, one local disk, an empty cluster, and
 a test JVM carrying jacoco. They are recorded to show the path composes and to give the shape of where time
@@ -2767,3 +2769,53 @@ Attempt two varied the request, found it honoured, and concluded there was no de
 the shard count and wrong about there being nothing there. Attempt three asked what the system's own
 invariant was, rather than what the number was, and the invariant is what broke. **Measuring the quantity
 you noticed is weaker than measuring the property the design guarantees.**
+
+## S50 (T34): there is no gated write path, and auto-creation was hiding it
+
+S49 found that a write puts a gated index back into cluster state. T34 asked which component does it, and
+the answer runs deeper than the component.
+
+**The mechanism.** `AutoCreateIndex.shouldAutoCreate` asks
+`IndexNameExpressionResolver.hasIndexAbstraction`, which reads `state.metadata().getIndicesLookup()` and
+never consults the descriptor seam. H8a taught `aliasOrIndexExists` to consult it and did not teach this
+sibling. So a write to a gated index is told no such index exists, and auto-creates one.
+
+**The fix that was not one.** Routing that check through `AbsentIndexDescriptorSuppliers.exists`, exactly as
+its sibling does, is a three-line change and it is correct. Applied, writes stop being auto-created and
+start failing instead:
+
+```
+IndexNotFoundException: no such index [e2e-tenant-000]
+  at Metadata.getIndexSafe(Metadata.java:837)
+  at TransportBulkAction$BulkOperation.addFailureIfIndexIsUnavailable(TransportBulkAction.java:968)
+```
+
+`TransportBulkAction` needs the index's `IndexMetadata` from cluster state to route a document. A gated
+index has none. **There is no gated write path at all**, and auto-creation was supplying one by silently
+un-gating the index on its first write.
+
+The change was reverted. It converts a silent design failure into a hard failure without providing the
+missing path, which is worse for anyone using this today, and the real work is the path itself.
+
+### What this corrects
+
+S45 reported the end-to-end composition working: a thousand documents written and found across twenty
+tenants. Those documents are real and were served correctly. They were served by **ordinary indices**,
+because each tenant was auto-created into cluster state by its own first write. So the demonstrated result
+is that an index which starts gated and is then un-gated by writing to it works end to end, which is not the
+claim that was made.
+
+Read and search by exact name over a genuinely gated index are still demonstrated, by W9, DescriptorGateIT
+and the T25 and T28 wildcard work, none of which write documents.
+
+### What it costs, and what it needs
+
+Every residency figure in this document describes a population that has been created and not written to. A
+tenant that receives one document today rejoins cluster state at full cost, so the hundred-million and
+ten-million projections describe an idle fleet rather than a working one.
+
+The missing piece is the write equivalent of what P6 and P7 built for placement: `TransportBulkAction` and
+whatever else calls `getIndexSafe` need to obtain an `IndexMetadata` for a gated index from its descriptor,
+which `IndexDescriptor.toIndexMetadata` already synthesises for placement. That is a real piece of work and
+it is now the top of the list, ahead of both the cluster manager thread and the ten million run, because
+both of those describe a system whose indices do not stay gated once used.

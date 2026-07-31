@@ -60,9 +60,20 @@ import java.util.Locale;
  * {@code Metadata.Builder.put}, so a descriptor rewritten during a write means the index entered cluster
  * state and was rebuilt there from defaults.
  *
- * <p><b>So gating does not survive the first write.</b> The shard count was a symptom of that, and the
- * symptom is the smaller half: an index that re-enters cluster state when written to costs exactly what
- * this whole design exists to avoid, and a hundred million written indices is a hundred million entries.
+ * <p><b>So gating does not survive the first write</b>, and T34 then found why, which is worse again.
+ * {@code AutoCreateIndex.shouldAutoCreate} asks {@code IndexNameExpressionResolver.hasIndexAbstraction},
+ * which reads cluster state alone and never consults the descriptor seam. A write to a gated index is
+ * therefore told the index does not exist, and auto-creates it.
+ *
+ * <p><b>Teaching that check about descriptors does not fix it, it exposes the real gap.</b> With
+ * auto-creation suppressed the write fails in {@code Metadata.getIndexSafe}: {@code TransportBulkAction}
+ * needs the index's {@code IndexMetadata} from cluster state to route a document, and a gated index has
+ * none. There is no gated write path. Auto-creation was supplying one by quietly un-gating the index.
+ *
+ * <p>Which means the headline of this class needs reading carefully. The thousand documents it finds are
+ * real, and they were served by ordinary indices: the tenants were auto-created into cluster state by their
+ * first write and behaved normally thereafter. <b>The end-to-end path has been demonstrated for indices that
+ * start gated and do not stay gated</b>, which is a weaker result than the one first reported here.
  */
 public class GatedEndToEndIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
 
@@ -417,7 +428,7 @@ public class GatedEndToEndIT extends org.opensearch.serverless.storage.Serverles
      * If the index is present in cluster state, it was never gated and there is no defect in the gated path
      * to find.
      */
-    @AwaitsFix(bugUrl = "writing a document to a gated index puts it back into cluster state, so gating does not survive the first write")
+    @AwaitsFix(bugUrl = "T34: gated indices have no write path. Auto-creation restores the cluster state entry on first write, and suppressing it makes the write fail in Metadata.getIndexSafe")
     public void testWhetherTheDisagreeingIndexIsEvenGated() throws Exception {
         DescriptorStore store = new DescriptorStore(client(), 1);
         DescriptorGate.install(
