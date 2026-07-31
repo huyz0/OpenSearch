@@ -2970,3 +2970,53 @@ not yet examined, and in all four the answer came from asking the system a direc
 **The generalisation worth keeping: in this codebase an unexplained failure on the gated path is a
 residency assumption until proven otherwise, because that is what gating changed.** Nothing else has been
 true yet.
+
+## S54 (T38): the eleven sites are real, and behind them the shard is genuinely never built
+
+T38 applied all eleven residency fixes together with computed placement enabled. Every one was needed and
+every one worked: the write proceeds through coordination, hashes to a shard, routes to a node, and arrives.
+Then, on the data node:
+
+```
+IndexNotFoundException
+  at IndicesService.indexServiceSafe(IndicesService.java:1029)
+  at TransportReplicationAction.getIndexShard(TransportReplicationAction.java:947)
+  at TransportReplicationAction$AsyncPrimaryAction.doRun
+```
+
+**The node has no `IndexService` for the index.** `IndicesClusterStateService` constructs one when an index
+appears in an applied cluster state, and a gated index never appears in one, so no node ever builds the
+shard. T37 measured that computed placement marks the primary STARTED on a chosen node; nothing told that
+node to open it.
+
+### S53 was half wrong, and this is the correction
+
+S53 said the third problem was an eleventh instance of the first, because `UnavailableShardsException` came
+from a metadata lookup rather than from a missing shard. That was true of *that* exception and false as a
+conclusion: fixing the metadata lookups moves the failure one layer further, to the place where the shard
+would have to exist. **The materialisation gap is real.** It was simply hidden behind eleven residency
+assumptions, each of which failed earlier than it.
+
+So the accounting, finally:
+
+| | |
+|---|---|
+| residency assumptions | eleven sites, all identified, all fixable with existing seams |
+| placement | works, off by default, one setting |
+| **shard materialisation** | **real, unimplemented, and the actual wall** |
+
+### What materialisation would have to do
+
+`IndicesClusterStateService` is driven by cluster state diffs, which is exactly the mechanism gating removes,
+so a gated index cannot be served by it as written. Something has to construct an `IndexService` and open a
+shard on demand, from a descriptor, when a request arrives for a shard the computed placement says belongs
+here. That is close to what scale-to-zero wake does, and T21's 41.5 ms measured it for a shard that had been
+built and suspended, so the machinery may be reusable for a shard that has never been built at all. Whether
+it is, is the open question.
+
+Reverted for the third time, for the reason S51 gave and which still holds: site 1 removes auto-creation, and
+until a shard can be opened the writes it was masking fail instead.
+
+**What this settles about the whole design.** A gated index today can be created, resolved, listed,
+wildcard-matched, and searched by name. It cannot take a write, and the reason is now known precisely and is
+not a small one: the component that builds shards is driven by the cluster state this design removes.
