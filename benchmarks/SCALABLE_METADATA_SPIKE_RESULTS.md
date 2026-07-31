@@ -2204,6 +2204,11 @@ Measured at four thousand tenants with capacities from 0.5 to 25 percent. Extend
 with a fifty thousand entry cache is an order of magnitude below the smallest capacity measured here, so the
 shape transfers and the number should be re-measured before being quoted.
 
+Re-measured during T28 at ten thousand accesses per arm rather than forty thousand, because eight hundred
+thousand reads made this benchmark expensive enough to exceed the suite budget it shares. Every cell agreed
+with the table above to within about a percentage point, which is what a ratio estimated from ten thousand
+samples over four thousand tenants should do.
+
 ## S40 (T25): a wildcard cannot see a gated index, and mostly does not say so
 
 `WildcardExpressionResolver.matches` reads `metadata.getIndicesLookup()` in all three of its branches:
@@ -2301,3 +2306,74 @@ survived H16 and T5.
 
 Defect 1 is what hides the other two, since a walk that stops after one page never reaches a second page to
 be wrong about.
+
+## S43 (T28): the wildcard contract, built
+
+S40 measured that a wildcard matches no gated index and mostly says nothing about it. S41 measured that a
+capped prefix expansion is bounded only with an index sort and no hit tracking. This is what shipped, and
+two parts of it disagree with the design that preceded it.
+
+| pattern | over gated indices |
+|---|---|
+| `tenant-42-*`, at or under the cap | expands |
+| `tenant-*`, over the cap | refused, naming the cap and the setting that controls it |
+| `*-logs`, `a*b`, `tenant-?` | refused, naming the trailing-wildcard rule |
+| `*`, `_all` | cluster state only, does not expand |
+| exact name | resolves, unchanged |
+
+### What the build changed about the design
+
+**Match-all had to be exempted, and it took two attempts to learn why.** The design treated `*` as a prefix
+with an empty prefix, so it would work on a small cluster and be refused on a large one. Measured, capping
+`_all` made cluster health fail once the population passed the cap, and then hung the test cluster until the
+suite timed out at twenty minutes, because the framework's own consistency checks ask the same question. The
+second attempt exempted only empty expression lists, on the theory that an explicit `*` is a user
+enumerating while an empty list is an API default. Measured, cluster health and index stats arrive with an
+explicit `_all` anyway. The resolver sees an expression, not a caller.
+
+So match-all keeps its cluster state meaning. The cost is stated rather than hidden: on a cluster small
+enough that `*` would have worked, `*` silently omits gated indices. That is S40's defect narrowed to one
+pattern and made deliberate, and it is the price of not letting a wildcard cap decide whether cluster health
+answers.
+
+**The resolver needed two call sites, not four.** The plan was to teach each of `matches()`'s three branches
+about gated indices separately. The gated side has no `IndexAbstraction`, no aliases and no data streams to
+reconcile, so it is a second source of names folded in beside `expand()` rather than a fourth branch. One
+call covers every pattern and the prefix-or-refuse decision lives in one method. The second site is
+`resolveEmptyOrTrivialWildcard`, which `_all` reaches without passing through the loop at all.
+
+### S43b: two costs that were not there before, and one that was
+
+A wildcard matching nothing now issues **0 descriptor point reads**, where before it issued one. Every
+expression passes through `aliasOrIndexExists`, which consults the store on a miss, and an index name cannot
+contain a star, so that read could only ever miss. Harmless from H8a until T28 made wildcards a normal path.
+Counted rather than reasoned about.
+
+A wildcard matching five gated tenants issues five reads, and those are the feature: each resolved name
+needs a descriptor to carry its uuid or the request cannot reach the shard. The first version of that test
+asserted zero against a matching prefix and failed, which is the test being wrong rather than the code.
+
+`ExceptionSerializationTests` had been failing since T12, which introduced `DescriptorUnavailableException`
+without registering it. An unregistered exception loses its type crossing the wire, which defeats the entire
+purpose of a type that exists so a caller can tell "unknown" from "absent": the distinction held on one node
+and was erased between two. Found only by running the full server suite rather than the descriptor subset.
+
+### S43c: what the index sort costs the store's own workload
+
+S41b measured index sorting as free on the write path and that number was quoted to justify making it a
+contract. It was measured with bulk requests and no reads, which is not how the descriptor store behaves.
+Re-measured under the shape that matters:
+
+| operation | plain | sorted | ratio |
+|---|---|---|---|
+| 2,000 single-document writes | 505/s | 581/s | 0.87x |
+| 5,000 realtime GETs by id | 1,099/s | 1,155/s | 0.95x |
+
+No penalty on either, and faster on both.
+
+Worth recording how close this came to the wrong conclusion. The T22 skew benchmark started exceeding its
+suite timeout, an A/B removing the index sort appeared to fix it, and the sort was very nearly reverted on
+that basis. The table above contradicted it, and re-running the benchmark in isolation with the sort in
+place passed in nine minutes. The benchmark was simply expensive enough that a loaded suite tipped it over,
+and it now runs a quarter of the accesses. **One run per arm is not an A/B**, which is the same lesson S26,
+S31 and S35 each taught about a different quantity.

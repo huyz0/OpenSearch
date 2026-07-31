@@ -14,6 +14,7 @@ import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.action.index.IndexRequest;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
+import org.opensearch.cluster.metadata.DescriptorUnavailableException;
 import org.opensearch.cluster.metadata.IndexDescriptor;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.Settings;
@@ -740,10 +741,7 @@ public final class DescriptorStore {
         try {
             SortOrder order = ascending ? SortOrder.ASC : SortOrder.DESC;
             var request = client.prepareSearch(DESCRIPTOR_INDEX)
-                .setQuery(
-                    QueryBuilders.boolQuery()
-                        .mustNot(QueryBuilders.termQuery("state", org.opensearch.cluster.metadata.IndexDescriptor.State.DELETED.name()))
-                )
+                .setQuery(QueryBuilders.boolQuery().mustNot(QueryBuilders.termQuery("state", IndexDescriptor.State.DELETED.name())))
                 .addSort("creationDate", order)
                 .addSort("name", order)
                 .setFetchSource(false)
@@ -771,6 +769,72 @@ public final class DescriptorStore {
         } catch (Exception e) {
             logger.debug("descriptor page search after [{}] failed", afterName, e);
             return List.of();
+        }
+    }
+
+    /**
+     * The gated indices whose name starts with {@code prefix}, or the fact that more than {@code limit} do.
+     *
+     * <p>This is T28's wildcard expansion, and the {@code limit + 1} it asks for is the whole mechanism.
+     * Asking for one more than the cap is how an over-cap pattern is detected without paying for it: the
+     * query stops as soon as it has that many, so refusing costs a page rather than a scan. That only holds
+     * because {@code descriptorIndexRequest} sorts the index by name and this asks for no hit total, and
+     * S41 measured that both are required and neither is sufficient.
+     *
+     * <p><b>Failure propagates rather than answering empty</b>, unlike every other read here. The others
+     * degrade one request; this one decides which indices a request touches, so a swallowed failure turns
+     * "the catalogue was unreadable" into "there are no such indices" and the caller acts on the second.
+     * T12 created {@link DescriptorUnavailableException} for exactly this distinction and T25 measured what
+     * the confident empty answer looks like from a tenant's side.
+     *
+     * <p>Open and hidden come back with the name because {@code IndicesOptions} filters on them per request
+     * while this result is shared. Fetching them costs two doc values inside a page that is already capped.
+     *
+     * <p>Refresh-bound, per H18, because it is a search. An index created moments ago may not match a
+     * wildcard yet, though it resolves immediately by exact name.
+     */
+    public AbsentIndexDescriptorSuppliers.PrefixExpansion expandPrefix(String prefix, int limit) {
+        try {
+            var request = client.prepareSearch(DESCRIPTOR_INDEX)
+                .setQuery(
+                    QueryBuilders.boolQuery()
+                        .filter(QueryBuilders.prefixQuery("name", prefix))
+                        .mustNot(QueryBuilders.termQuery("state", IndexDescriptor.State.DELETED.name()))
+                )
+                .addSort("name", SortOrder.ASC)
+                .setFetchSource(false)
+                .addDocValueField("name")
+                .addDocValueField("state")
+                .addDocValueField("hidden")
+                .setTrackTotalHits(false)
+                .setSize(limit + 1);
+            SearchResponse response = request.get();
+            SearchHit[] hits = response.getHits().getHits();
+            if (hits.length > limit) {
+                return AbsentIndexDescriptorSuppliers.PrefixExpansion.tooMany(limit);
+            }
+            List<AbsentIndexDescriptorSuppliers.PrefixMatch> matches = new ArrayList<>(hits.length);
+            for (SearchHit hit : hits) {
+                // Read into Object rather than inlining. SearchHitField#getValue is generic, so an inlined
+                // String.valueOf(...) infers char[] and binds the wrong overload, which compiles and then
+                // throws ClassCastException on the first hit.
+                Object state = hit.field("state").getValue();
+                Object hidden = hit.field("hidden").getValue();
+                matches.add(
+                    new AbsentIndexDescriptorSuppliers.PrefixMatch(
+                        hit.field("name").getValue(),
+                        IndexDescriptor.State.OPEN.name().equals(state),
+                        Boolean.TRUE.equals(hidden)
+                    )
+                );
+            }
+            return AbsentIndexDescriptorSuppliers.PrefixExpansion.of(matches);
+        } catch (org.opensearch.index.IndexNotFoundException e) {
+            // No descriptor index means no gated indices, which is a real and complete answer rather than
+            // an unreadable one. Every cluster is in this state until its first gated index exists.
+            return AbsentIndexDescriptorSuppliers.PrefixExpansion.of(List.of());
+        } catch (Exception e) {
+            throw new DescriptorUnavailableException(prefix + "*", e);
         }
     }
 
@@ -805,6 +869,18 @@ public final class DescriptorStore {
                 // S29 and S30: this is the lookup latency bound.
                 .put("index.merge.policy.segments_per_tier", 4)
                 .put("index.merge.policy.max_merge_at_once", 4)
+                // T28's wildcard bound, and the one setting here that cannot be changed later: index
+                // sorting is fixed at creation. S41 measured why it is a contract rather than tuning. A
+                // prefix query asking for one page costs 49.7 ms at 800k without it and stays at the 4 ms
+                // transport floor with it, because segments stored in name order let the collector stop as
+                // soon as it has a page instead of ranking every match. Extrapolated, that is the
+                // difference between about six seconds at a hundred million and a flat cost.
+                //
+                // S41b measured what it costs the write path with arrival order shuffled, which is how
+                // descriptors actually arrive: 0.94x, meaning no penalty. That measurement used bulk
+                // requests and no reads, which is not this store's workload, so T28b re-measured it under
+                // the shape that matters here: 0.87x on single-document writes and 0.95x on realtime GETs
+                // by id. No penalty on either, and faster on both.
                 .build()
         ).mapping(DescriptorCodec.MAPPING);
     }

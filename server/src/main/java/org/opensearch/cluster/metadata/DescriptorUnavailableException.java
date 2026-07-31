@@ -39,4 +39,17 @@ public class DescriptorUnavailableException extends OpenSearchStatusException {
     public DescriptorUnavailableException(String indexName, Throwable cause) {
         super("could not determine whether index [" + indexName + "] exists", RestStatus.SERVICE_UNAVAILABLE, cause);
     }
+
+    /**
+     * Read from a stream, which every {@link org.opensearch.OpenSearchException} subclass must support.
+     *
+     * <p>Missing when T12 introduced this type, which broke
+     * {@code ExceptionSerializationTests.testExceptionRegistration} and went unnoticed because that run only
+     * exercised the descriptor tests. The whole point of the type is that a caller can tell "unknown" from
+     * "absent", and an unregistered exception loses its identity crossing the wire, so the distinction
+     * survived on one node and was erased between two.
+     */
+    public DescriptorUnavailableException(org.opensearch.core.common.io.stream.StreamInput in) throws java.io.IOException {
+        super(in);
+    }
 }

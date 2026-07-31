@@ -53,7 +53,49 @@ public final class DescriptorGate {
     private static final java.util.concurrent.atomic.AtomicReference<DescriptorStore> STORE =
         new java.util.concurrent.atomic.AtomicReference<>();
 
+    /**
+     * How many gated indices one wildcard may expand to before the request is refused.
+     *
+     * <p>The number is a judgment call and the two measurements bounding it point at different things.
+     * Resolution is the cheap side: S24 measured about 33 ms per thousand names, so a hundred is roughly
+     * three milliseconds and nothing cares. The expensive side is fan-out. T20 and T21 measured 118 KB and
+     * 3.06 file descriptors per awake shard and 41.5 ms to wake one, and with index per tenant most tenant
+     * indices are asleep, so an expansion decides how many sleeping shards a single request wakes. A hundred
+     * is about 12 MB and 300 descriptors; a thousand is 118 MB and 3,000.
+     *
+     * <p>A hundred rather than a thousand because the failure is asymmetric. Too low refuses a request that
+     * would have worked, which the caller sees at once and an operator raises in one setting change. Too
+     * high wakes a large part of the fleet, which surfaces as memory and descriptor pressure on whichever
+     * node coordinated it and does not point back at the wildcard that caused it.
+     *
+     * <p>The fan-out figure is the weaker of the two inputs: 118 KB is per shard at rest, and a hundred
+     * simultaneous wakes is not a hundred times one wake. Worth re-measuring against a real wake storm
+     * before this default is defended rather than merely chosen.
+     */
+    public static final int DEFAULT_WILDCARD_EXPANSION_LIMIT = 100;
+
+    /**
+     * The live limit, held here rather than captured at install so the setting can be changed at runtime.
+     *
+     * <p>Capturing it would make a dynamic setting silently static, which is the shape of defect this area
+     * has shipped repeatedly: a mechanism that exists, is configured, and is not consulted.
+     */
+    private static final java.util.concurrent.atomic.AtomicInteger WILDCARD_EXPANSION_LIMIT = new java.util.concurrent.atomic.AtomicInteger(
+        DEFAULT_WILDCARD_EXPANSION_LIMIT
+    );
+
     private DescriptorGate() {}
+
+    /** Applies a new expansion limit, which the plugin wires to its cluster setting. */
+    public static void setWildcardExpansionLimit(int limit) {
+        WILDCARD_EXPANSION_LIMIT.set(limit);
+        logger.info("wildcard expansion over gated indices limited to [{}] indices", limit);
+    }
+
+    /** The limit in force, which tests assert rather than assume. */
+    public static int wildcardExpansionLimit() {
+        return WILDCARD_EXPANSION_LIMIT.get();
+    }
 
     /**
      * Resolves a name through the store, except the store's own index.
@@ -101,6 +143,13 @@ public final class DescriptorGate {
         STORE.set(store);
         AbsentIndexDescriptorSuppliers.register(DescriptorGate::supplyExceptForTheStoreItself);
         AbsentIndexDescriptorSuppliers.registerPager(pagerFor(store));
+        // T28. Wildcards, which until now matched no gated index at all: every branch of the resolver's
+        // matching reads cluster state, and a gated index is absent from it by construction, so T25
+        // measured tenant-* over five gated tenants returning nothing and returning it without an error.
+        //
+        // The limit is read per call rather than captured, so changing the setting takes effect on the next
+        // wildcard instead of on the next node restart.
+        AbsentIndexDescriptorSuppliers.registerExpander(prefix -> store.expandPrefix(prefix, WILDCARD_EXPANSION_LIMIT.get()));
         // The write path. H2b dual-writes the descriptor at creation and H4 records deletions as
         // tombstones, and neither has ever had a publisher registered, so no index creation outside a test
         // has written a descriptor. Both go through put rather than create: publish records an index that
@@ -189,6 +238,10 @@ public final class DescriptorGate {
         // Cleared in the reverse order, so the supplier is gone before the store it reads.
         AbsentIndexDescriptorSuppliers.register(null);
         AbsentIndexDescriptorSuppliers.registerPager(null);
+        AbsentIndexDescriptorSuppliers.registerExpander(null);
+        // Reset rather than leave, since the registries are static and a limit set by one test would
+        // otherwise decide the behaviour of every suite that ran after it in the same JVM.
+        WILDCARD_EXPANSION_LIMIT.set(DEFAULT_WILDCARD_EXPANSION_LIMIT);
         IndexDescriptorPublisher.register(null);
         IndexDescriptorPublisher.registerCreator(null);
         MappingGenerationStore.register(null);

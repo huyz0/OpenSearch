@@ -1085,6 +1085,26 @@ public class IndexNameExpressionResolver {
 
             if (isEmptyOrTrivialWildcard(expressions)) {
                 List<String> resolvedExpressions = resolveEmptyOrTrivialWildcard(options, metadata);
+                // T28. Match-all deliberately does not expand over indices held outside cluster state, and
+                // this is the one place the wildcard contract gives something up rather than bounding it.
+                //
+                // Two attempts came before this. Expanding _all under the same cap as any other prefix made
+                // cluster health fail once the population passed the cap, and the test cluster then hung
+                // until the suite timed out at twenty minutes, because the framework's own consistency
+                // checks ask the same question. A query limit had become an outage. Restricting that to
+                // explicitly written patterns did not help either: health and node stats reach here with an
+                // explicit _all, so the resolver cannot tell a caller enumerating the cluster from the
+                // cluster asking about itself, and plumbing that distinction through every transport action
+                // buys a semantic nobody asked for.
+                //
+                // So _all and * mean what they have always meant, which is everything in cluster state, and
+                // a gated index is reached by prefix or by name. That is consistent rather than
+                // population-dependent, it cannot fail, and it is the same answer H19 and H20 reached for
+                // cluster-wide questions: at this size they are served by aggregates, not by enumeration.
+                //
+                // The cost is real and worth naming: on a small cluster, * silently omits gated indices.
+                // Recorded in GATED_WILDCARD_DESIGN.md and pinned by a test rather than left to be
+                // rediscovered.
                 if (context.includeDataStreams()) {
                     final IndexMetadata.State excludeState = excludeState(options);
                     final Map<String, IndexAbstraction> dataStreamsAbstractions = metadata.getIndicesLookup()
@@ -1177,12 +1197,18 @@ public class IndexNameExpressionResolver {
                 final IndexMetadata.State excludeState = excludeState(options);
                 final Map<String, IndexAbstraction> matches = matches(context, metadata, expression);
                 Set<String> expand = expand(context, excludeState, matches, expression, options.expandWildcardsHidden());
+                // T28. Indices held outside cluster state match no pattern above, because every branch of
+                // matches() reads getIndicesLookup() and a gated index is absent from it by construction.
+                // T25 measured the consequence: a tenant searching tenant-* was told there are no matching
+                // indices when there were five, and was told it without an error.
+                Set<String> gated = expandGated(expression, options, excludeState);
+                expand.addAll(gated);
                 if (add) {
                     result.addAll(expand);
                 } else {
                     result.removeAll(expand);
                 }
-                if (options.allowNoIndices() == false && matches.isEmpty()) {
+                if (options.allowNoIndices() == false && matches.isEmpty() && gated.isEmpty()) {
                     context.addResolutionError(indexNotFoundException(expression));
                 }
                 if (Regex.isSimpleMatchPattern(expression)) {
@@ -1205,6 +1231,14 @@ public class IndexNameExpressionResolver {
         private static boolean aliasOrIndexExists(Context context, IndicesOptions options, Metadata metadata, String expression) {
             IndexAbstraction indexAbstraction = metadata.getIndicesLookup().get(expression);
             if (indexAbstraction == null) {
+                // A pattern is not a name, so asking the store whether an index is literally called
+                // "tenant-*" is a remote read that can only miss. Every expression reaches here, including
+                // wildcards, so without this each wildcard request paid one pointless descriptor GET before
+                // reaching the expansion that does the real work. Harmless when H8a added this seam and no
+                // wildcard consulted it; a per-request cost once T28 made wildcards a normal path.
+                if (Regex.isSimpleMatchPattern(expression)) {
+                    return false;
+                }
                 // Area H: an index whose metadata is not in cluster state answers from the descriptor
                 // instead. The order matters and is asserted: a name present in the lookup never reaches
                 // the seam, so no cluster that has not opted in pays a lookup it did not pay before.
@@ -1333,6 +1367,65 @@ public class IndexNameExpressionResolver {
 
         private static boolean implicitHiddenMatch(String itemName, String expression) {
             return itemName.startsWith(".") && expression.startsWith(".") && Regex.isSimpleMatchPattern(expression);
+        }
+
+        /**
+         * The gated indices a pattern matches, or an error saying why it cannot be answered.
+         *
+         * <p>Empty when nothing is installed, so a cluster that has never gated an index resolves exactly as
+         * it always has and pays nothing for this.
+         *
+         * <p><b>Only a trailing star is answerable.</b> That is not a limitation chosen for convenience: it
+         * is the same shape the sorted structure underneath can serve, and it is why {@code matches()} above
+         * already has a dedicated {@code suffixWildcard} branch. A leading or embedded star has no range to
+         * scan, so refusing it is the honest answer rather than a slow one. S13 reached this conclusion
+         * about the in-memory name index and it holds identically here.
+         *
+         * <p>State and hidden filtering happen here rather than in the store, because both are decisions
+         * {@code IndicesOptions} makes per request while the expansion is cached and shared. Closed and
+         * hidden gated indices are therefore fetched and then discarded, which costs a field each within a
+         * page that is already capped.
+         */
+        private static Set<String> expandGated(String expression, IndicesOptions options, IndexMetadata.State excludeState) {
+            if (AbsentIndexDescriptorSuppliers.isExpanderRegistered() == false) {
+                return Set.of();
+            }
+            if (isTrailingWildcard(expression) == false) {
+                throw UnsupportedWildcardException.notAPrefix(expression);
+            }
+            String prefix = expression.substring(0, expression.length() - 1);
+            AbsentIndexDescriptorSuppliers.PrefixExpansion expansion = AbsentIndexDescriptorSuppliers.expandPrefix(prefix);
+            if (expansion == null) {
+                return Set.of();
+            }
+            if (expansion.exceeded()) {
+                throw UnsupportedWildcardException.tooManyMatches(expression, expansion.limit());
+            }
+            Set<String> names = new HashSet<>();
+            for (AbsentIndexDescriptorSuppliers.PrefixMatch match : expansion.matches()) {
+                if (excludeState != null) {
+                    boolean excluded = excludeState == IndexMetadata.State.CLOSE ? match.open() == false : match.open();
+                    if (excluded) {
+                        continue;
+                    }
+                }
+                if (match.hidden() && options.expandWildcardsHidden() == false && implicitHiddenMatch(match.name(), expression) == false) {
+                    continue;
+                }
+                names.add(match.name());
+            }
+            return names;
+        }
+
+        /**
+         * Whether a pattern is a prefix followed by exactly one star and nothing else.
+         *
+         * <p>{@code ?} disqualifies too. It is a single-character wildcard, so {@code tenant-?} is not a
+         * prefix even though it has no star, and treating it as the literal prefix {@code tenant-?} would
+         * match nothing while looking like it worked.
+         */
+        private static boolean isTrailingWildcard(String expression) {
+            return expression.indexOf('*') == expression.length() - 1 && expression.indexOf('?') < 0;
         }
 
         private boolean isEmptyOrTrivialWildcard(List<String> expressions) {

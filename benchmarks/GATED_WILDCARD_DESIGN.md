@@ -62,10 +62,9 @@ Four consequences, stated rather than discovered later:
 - `*-logs` and `a*b` are refused. No storage arrangement in this design answers them. Supporting them means
   a second global structure keyed on reversed names, which doubles the write and adds a consistency
   question between the two, for a pattern that is rare.
-- `*` and `_all` are not special-cased. They are a prefix pattern with an empty prefix, so they work on a
-  cluster with few gated indices and are refused on one with a hundred million. That is the honest answer,
-  and it falls out of the rule rather than being bolted on. Listing a large population is what the
-  paginated API is for.
+- `*` and `_all` keep their existing meaning, which is everything in cluster state, and do not expand over
+  gated indices at all. **This is the one place the contract gives something up rather than bounding it,
+  and it was not the original plan.** See below.
 - Staleness is API-visible, at the `index.refresh_interval` H18 pinned at one second. A prefix expansion is
   a search, and searches are refresh-bound. An index created moments ago may not appear in a wildcard yet.
   It does appear immediately by exact name, which is a realtime GET.
@@ -103,6 +102,34 @@ wake storm before the default is defended rather than merely chosen.
 
 `N = 0` is the "no wildcards at all" position, reachable by configuration rather than by a different design.
 
+### Why match-all is exempt, which cost two attempts to learn
+
+The plan treated `*` as a prefix pattern with an empty prefix, so it would work on a small cluster and be
+refused on a large one, and called that the honest answer falling out of the rule. Built and measured, it
+was not honest, it was an outage.
+
+**First attempt: cap `_all` like any other prefix.** With the population over the cap, cluster health
+failed, and then the test cluster hung until the suite timed out at twenty minutes, because the test
+framework's own consistency checks ask the same question. Health, node stats and a good deal of internal
+housekeeping resolve match-all, so capping it means the cluster stops being able to describe itself the
+moment it grows past the limit. A query limit had become an availability limit.
+
+**Second attempt: expand only patterns the caller actually wrote**, on the theory that an empty index list
+is an API default meaning "this cluster" while an explicit `*` is a user enumerating. Measured, health and
+index stats arrive with an explicit `_all` anyway. The resolver sees an expression, not a caller, and
+threading that distinction through every transport action buys a semantic nobody asked for.
+
+**So match-all is exempt.** A gated index is reached by prefix or by name. This is consistent rather than
+population-dependent, and it cannot fail.
+
+The cost is real and worth stating plainly: on a cluster small enough that `*` would have worked, `*`
+silently omits gated indices. That is the same shape as the defect T25 measured, narrowed to one pattern and
+made deliberate. It is pinned by a test that asserts the omission rather than left to be rediscovered, and
+it is the honest price of not letting a wildcard cap decide whether cluster health answers.
+
+It also lands in the same place H19 and H20 reached independently: cluster-wide questions over a population
+this size are served by aggregates, not by enumerating indices.
+
 ### Why not simply refuse all wildcards
 
 That was offered as an acceptable compromise and it is close to the right answer, but it gives up the one
@@ -115,6 +142,9 @@ Refusing all wildcards remains the correct fallback if the prefix seam turns out
 estimates. It is `N = 0` in the rule above, not a different design.
 
 ## Implementation
+
+Built, in T28. What follows is what went in rather than what was planned, and the two differ in one place,
+noted under step 3.
 
 **1. The descriptor index gains an index sort.** `index.sort.field: name`, `index.sort.order: asc` in
 `descriptorIndexRequest`, beside the merge policy and for the same kind of reason: it is a contract, not
@@ -134,11 +164,32 @@ truncating, because a truncated expansion is a silently wrong answer of exactly 
 about. The seam returns the reason for a refusal rather than a boolean, following `DescriptorRepresentable`,
 so the error can say which rule the pattern broke.
 
-**3. The resolver consults it.** `WildcardExpressionResolver.matches` already branches three ways, and the
-`suffixWildcard` branch is exactly the answerable one. That is not a coincidence: both this and the
-descriptor index are sorted-prefix structures. The other two branches refuse when the seam is registered,
-instead of quietly returning the ordinary indices only. `resolveEmptyOrTrivialWildcard` is a fourth path and
-needs the same treatment.
+**3. The resolver consults it.** Two call sites rather than the four the plan expected, and the difference
+is worth recording because the plan was reasoning about the wrong layer.
+
+`matches()` branches three ways over cluster state, and the plan proposed teaching each branch about gated
+indices separately. That was unnecessary. The gated side has no `IndexAbstraction` to produce and no
+aliases or data streams to reconcile, so it does not belong inside `matches()` at all: it is a second source
+of names folded in beside `expand()`. One call in `innerResolve` covers every pattern, and the
+prefix-or-refuse decision lives in one method instead of being spread across three branches that would each
+have to agree.
+
+The second call site is `resolveEmptyOrTrivialWildcard`, which `_all` and a bare `*` reach without passing
+through `innerResolve` at all. That one is genuinely separate, and missing it would have left match-all
+silently blind to gated indices while every other pattern worked, which is the kind of gap that shows up
+only under the one API nobody tested.
+
+State and hidden filtering happens at the resolver rather than in the store, because `IndicesOptions`
+decides both per request while the expansion is shared. Closed and hidden gated indices are fetched and then
+discarded, which costs two doc values inside a page that is already capped.
+
+Wiring this up also exposed a wasted read that had been there since H8a. `innerResolve` asks
+`aliasOrIndexExists` about every expression before deciding whether it is a pattern, and that seam consults
+the descriptor store on a miss. An index name cannot contain a star, so for a wildcard that read can only
+miss: every wildcard request spent one remote GET asking whether an index is literally named `tenant-*`.
+Harmless while no wildcard reached the seam, and a per-request cost the moment wildcards became a normal
+path. Guarded, and counted in a test rather than assumed, because a cost that only appears under the feature
+that made it reachable is exactly the kind that goes unnoticed.
 
 Wildcard resolution then issues a search where it previously read a map. Point lookups already issue a
 realtime GET on this path, so a blocking remote read during resolution is not new, but a search is slower

@@ -1259,5 +1259,21 @@ public final class OpenSearchServerException {
                 V_3_8_0
             )
         );
+        registerExceptionHandle(
+            new OpenSearchExceptionHandle(
+                org.opensearch.cluster.metadata.DescriptorUnavailableException.class,
+                org.opensearch.cluster.metadata.DescriptorUnavailableException::new,
+                180,
+                V_3_8_0
+            )
+        );
+        registerExceptionHandle(
+            new OpenSearchExceptionHandle(
+                org.opensearch.cluster.metadata.UnsupportedWildcardException.class,
+                org.opensearch.cluster.metadata.UnsupportedWildcardException::new,
+                181,
+                V_3_8_0
+            )
+        );
     }
 }

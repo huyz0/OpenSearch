@@ -267,6 +267,29 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * How many gated indices one wildcard may expand to before the request is refused.
+     *
+     * <p>T28's cap, and it exists to bound fan-out rather than resolution. Resolving names is cheap: S24
+     * measured about 33 ms per thousand. What an expansion actually decides is how many <em>sleeping</em>
+     * shards one request wakes, since with index per tenant most tenant indices are asleep, and T20 and T21
+     * measured 118 KB and 3.06 file descriptors per awake shard.
+     *
+     * <p>Dynamic, because the right value depends on how tenants are grouped and an operator who guesses
+     * wrong should not need a restart to correct it. Zero refuses every wildcard over gated indices, which
+     * is the narrowest form of the contract rather than a separate design.
+     *
+     * <p>See {@link org.opensearch.serverless.storage.descriptor.DescriptorGate#DEFAULT_WILDCARD_EXPANSION_LIMIT}
+     * for why the default is a hundred.
+     */
+    public static final Setting<Integer> SERVERLESS_STORAGE_WILDCARD_MAX_EXPANDED_INDICES_SETTING = Setting.intSetting(
+        "serverless_storage.wildcard.max_expanded_indices",
+        org.opensearch.serverless.storage.descriptor.DescriptorGate.DEFAULT_WILDCARD_EXPANSION_LIMIT,
+        0,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
      * The fraction of the lazy-directory block cache's byte capacity above which
      * {@link ReaderShardAdmissionController} refuses to open another reader shard on this node,
      * even if {@link #SERVERLESS_STORAGE_MAX_CONCURRENT_READER_SHARDS_SETTING}'s count cap still
@@ -1268,6 +1291,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_BUNDLE_CACHE_SIZE_SETTING,
             SERVERLESS_STORAGE_PITR_WINDOW_SETTING,
             SERVERLESS_STORAGE_MAX_CONCURRENT_READER_SHARDS_SETTING,
+            SERVERLESS_STORAGE_WILDCARD_MAX_EXPANDED_INDICES_SETTING,
             SERVERLESS_STORAGE_MAX_FILE_CACHE_USAGE_RATIO_SETTING,
             SERVERLESS_STORAGE_MAX_CONCURRENT_REWRITES_SETTING,
             SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING,
@@ -1661,6 +1685,17 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         // locally.
         org.opensearch.serverless.storage.descriptor.DescriptorStore descriptorStore =
             new org.opensearch.serverless.storage.descriptor.DescriptorStore(client, DESCRIPTOR_INDEX_SHARDS);
+        // T28's wildcard cap, applied before the gate is installed so no expansion can run against the
+        // default when the operator configured something else, and kept current afterwards. Registering the
+        // update consumer is what makes the setting dynamic rather than merely declared as such.
+        org.opensearch.serverless.storage.descriptor.DescriptorGate.setWildcardExpansionLimit(
+            SERVERLESS_STORAGE_WILDCARD_MAX_EXPANDED_INDICES_SETTING.get(environment.settings())
+        );
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(
+                SERVERLESS_STORAGE_WILDCARD_MAX_EXPANDED_INDICES_SETTING,
+                org.opensearch.serverless.storage.descriptor.DescriptorGate::setWildcardExpansionLimit
+            );
         org.opensearch.serverless.storage.descriptor.DescriptorGate.install(
             descriptorStore,
             new org.opensearch.serverless.storage.descriptor.IndexBackedMappingStore(client),

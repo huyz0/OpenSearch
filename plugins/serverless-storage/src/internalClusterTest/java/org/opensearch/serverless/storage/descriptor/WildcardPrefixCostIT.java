@@ -179,6 +179,80 @@ public class WildcardPrefixCostIT extends OpenSearchIntegTestCase {
         assertTrue("a rate of zero would mean nothing was written", sorted > 0 && plain > 0);
     }
 
+    /**
+     * What index sorting costs the descriptor store's actual workload, rather than a bulk load.
+     *
+     * <p>S41b measured index sorting as free on the write path and that measurement was quoted to justify
+     * making it a contract. It was measured under conditions the descriptor store does not share: bulk
+     * requests of two thousand documents, and no reads. The store writes descriptors one at a time and reads
+     * them back with realtime GETs, and applying the sort to it made the T22 skew benchmark go from passing
+     * inside a seven minute suite to exceeding a twenty minute timeout on its own.
+     *
+     * <p>So this measures the two phases separately under the shape that regressed: single-document writes,
+     * then realtime GETs by id. Separately because the remedy differs. If writes are the cost, the sort is
+     * paying for wildcards with creation throughput, which is a headline number. If GETs are the cost, it is
+     * paying with the read path, which every request touches.
+     *
+     * <p>The generalisation is the lesson rather than the number: a benchmark answers the question it was
+     * run under, and this is the third time this session that quoting one past its conditions produced a
+     * wrong conclusion.
+     */
+    public void testWhatIndexSortingCostsSingleWritesAndRealtimeGets() throws Exception {
+        int documents = 2_000;
+        int gets = 5_000;
+
+        for (String index : List.of(PLAIN, SORTED)) {
+            if (indexExists(index)) {
+                assertAcked(client().admin().indices().prepareDelete(index));
+            }
+        }
+        createBoth();
+
+        // Alternated, so whichever arm runs first does not always pay for what it warms.
+        long plainWrites = timeSingleWrites(PLAIN, documents);
+        long sortedWrites = timeSingleWrites(SORTED, documents);
+        client().admin().indices().prepareRefresh(PLAIN, SORTED).get();
+        long sortedGets = timeGets(SORTED, documents, gets);
+        long plainGets = timeGets(PLAIN, documents, gets);
+
+        logger.warn(
+            String.format(
+                Locale.ROOT,
+                "%nT28b index sorting on the descriptor store's own workload%n"
+                    + "  %,d single-document writes   plain %8.0f/s   sorted %8.0f/s   ratio %5.2fx%n"
+                    + "  %,d realtime GETs by id      plain %8.0f/s   sorted %8.0f/s   ratio %5.2fx%n",
+                documents,
+                documents / (plainWrites / 1e9),
+                documents / (sortedWrites / 1e9),
+                (double) sortedWrites / plainWrites,
+                gets,
+                gets / (plainGets / 1e9),
+                gets / (sortedGets / 1e9),
+                (double) sortedGets / plainGets
+            )
+        );
+
+        assertTrue("a zero duration would mean nothing ran", plainWrites > 0 && sortedGets > 0);
+    }
+
+    /** One document per request, which is how descriptors are actually written. */
+    private long timeSingleWrites(String index, int documents) {
+        long start = System.nanoTime();
+        for (int i = 0; i < documents; i++) {
+            client().prepareIndex(index).setId(name(i)).setSource("name", name(i)).get();
+        }
+        return System.nanoTime() - start;
+    }
+
+    /** Realtime GET by id, which is how descriptors are actually read. */
+    private long timeGets(String index, int documents, int gets) {
+        long start = System.nanoTime();
+        for (int i = 0; i < gets; i++) {
+            assertTrue(client().prepareGet(index, name(i % documents)).get().isExists());
+        }
+        return System.nanoTime() - start;
+    }
+
     /** Rebuilds both indices at the given population, so each row is measured against a fresh index. */
     private void build(int population) throws Exception {
         for (String index : List.of(PLAIN, SORTED)) {

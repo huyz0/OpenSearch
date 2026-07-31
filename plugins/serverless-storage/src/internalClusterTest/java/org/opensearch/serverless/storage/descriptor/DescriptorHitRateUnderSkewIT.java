@@ -43,7 +43,21 @@ public class DescriptorHitRateUnderSkewIT extends OpenSearchIntegTestCase {
     /** Enough tenants that a capacity of a few percent is meaningful, few enough to populate quickly. */
     private static final int TENANTS = 4_000;
 
-    private static final int ACCESSES = 40_000;
+    /**
+     * Accesses per arm, reduced from forty thousand.
+     *
+     * <p>Twenty arms at forty thousand is eight hundred thousand reads through the transport client, which
+     * took this benchmark seven to nine minutes on its own and eventually exceeded the twenty minute suite
+     * budget it shares with every other descriptor test. The timeout was first blamed on an unrelated change
+     * to the descriptor index settings, which an A/B appeared to confirm and a per-operation measurement
+     * then contradicted. It was neither: the benchmark is simply expensive enough that a loaded suite tips
+     * it over.
+     *
+     * <p>A hit rate is a ratio, and ten thousand samples over four thousand tenants estimates one to well
+     * within the precision anything here is quoted at. Spending four times as long to add a decimal place
+     * nobody uses is what made this fragile.
+     */
+    private static final int ACCESSES = 10_000;
 
     /** Capacity as a count, against 4,000 tenants: 0.5%, 2.5%, 5%, 12.5%, 25%. */
     private static final int[] CAPACITIES = { 20, 100, 200, 500, 1_000 };

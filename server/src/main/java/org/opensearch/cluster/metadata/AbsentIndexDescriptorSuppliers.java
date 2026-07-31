@@ -181,4 +181,95 @@ public final class AbsentIndexDescriptorSuppliers {
         }
         return indexNames.stream().map(AbsentIndexDescriptorSuppliers::supply).filter(java.util.Objects::nonNull).toList();
     }
+
+    /**
+     * One gated index that matched a prefix, carrying only what wildcard expansion filters on.
+     *
+     * <p>Three fields rather than an {@link IndexDescriptor} for the reason {@link PagedIndex} gives, and
+     * three rather than one because expansion is not just a name lookup. {@code IndicesOptions} decides
+     * whether closed indices and hidden indices are in the answer, so an expander returning bare names
+     * forces the caller either to ignore those options or to fetch each descriptor to honour them. The first
+     * is wrong and the second reintroduces the cost the cap exists to avoid.
+     */
+    public record PrefixMatch(String name, boolean open, boolean hidden) {
+    }
+
+    /**
+     * The result of expanding one prefix: the matches, or the fact that there are too many.
+     *
+     * <p>The two are a single type because they are one answer with two shapes, and collapsing them into an
+     * empty list or a truncated one is precisely the failure this area keeps shipping. A wildcard that
+     * matched five thousand tenants and returned the first hundred reads as a complete answer, and a tenant
+     * has no way to tell it was not.
+     *
+     * @param matches the matching gated indices, empty when the limit was exceeded
+     * @param exceeded whether more than {@code limit} indices matched, so no answer is being given
+     * @param limit the cap that was applied, carried so an error can name it
+     */
+    public record PrefixExpansion(List<PrefixMatch> matches, boolean exceeded, int limit) {
+
+        public static PrefixExpansion of(List<PrefixMatch> matches) {
+            return new PrefixExpansion(matches, false, -1);
+        }
+
+        public static PrefixExpansion tooMany(int limit) {
+            return new PrefixExpansion(List.of(), true, limit);
+        }
+    }
+
+    /**
+     * Expands a prefix over gated indices.
+     *
+     * <p>Prefix rather than pattern, and that is the contract rather than an implementation detail. The
+     * descriptor index is sorted by name, so a prefix is a range scan and anything else is a scan of the
+     * whole population. An expander is never asked to answer {@code *-logs}, because at a hundred million
+     * indices there is no answer to give.
+     *
+     * <p>The cap lives in the implementation rather than here, so the policy stays with the component that
+     * knows the cluster's settings and core carries no constant it cannot justify.
+     */
+    @FunctionalInterface
+    public interface DescriptorPrefixExpander {
+        /**
+         * The gated indices whose name starts with {@code prefix}, or the fact that too many do.
+         *
+         * @param prefix the pattern with its trailing star removed, which may be empty for match-all
+         */
+        PrefixExpansion expand(String prefix);
+    }
+
+    private static final AtomicReference<DescriptorPrefixExpander> EXPANDER = new AtomicReference<>();
+
+    /** Installs the expander. Registering null clears it, which is how a test restores the default. */
+    public static void registerExpander(DescriptorPrefixExpander expander) {
+        EXPANDER.set(expander);
+    }
+
+    /**
+     * Whether wildcards are answered over gated indices at all.
+     *
+     * <p>Callers must ask this rather than infer it from an empty expansion, because the two mean opposite
+     * things: nothing installed is an ordinary cluster where wildcards behave as they always have, and an
+     * empty expansion is a gated cluster where the pattern genuinely matched nothing.
+     */
+    public static boolean isExpanderRegistered() {
+        return EXPANDER.get() != null;
+    }
+
+    /**
+     * Expands {@code prefix}, or returns null when nothing is installed.
+     *
+     * <p><b>A failing expander propagates rather than answering empty</b>, which is the opposite of how
+     * {@link #supply} and {@link #page} treat failure and is deliberate. Those two degrade a request; this
+     * one decides which indices a request touches, so a swallowed failure turns "I could not read the
+     * catalogue" into "there are no such indices" and the caller acts on the second. That distinction is
+     * what {@link DescriptorUnavailableException} was created for.
+     */
+    public static PrefixExpansion expandPrefix(String prefix) {
+        DescriptorPrefixExpander expander = EXPANDER.get();
+        if (expander == null || prefix == null) {
+            return null;
+        }
+        return expander.expand(prefix);
+    }
 }
