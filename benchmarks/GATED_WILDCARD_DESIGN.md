@@ -218,6 +218,9 @@ many indices are there" still has no bounded answer, and the cap makes that expl
 H20's mapping stats aggregate is the pattern that works: ask a question whose cost is set by something other
 than the number of indices. Nothing here does that for counting.
 
-Aliases are also unmodelled. An alias is a name pointing at a set of indices, and the descriptor carries an
-alias list, but no spike has measured what resolving an alias over a gated population costs or whether the
-same prefix rule can be stated for it.
+Aliases, which T29 then measured and settled. An alias on a gated index resolved to nothing, silently under
+the options most clients use, and the repair is not to resolve it: an alias cannot be added, removed or
+repointed on a gated index at all, because every alias operation is a cluster state update over metadata the
+index does not have. An index declaring any alias therefore keeps its cluster state entry. That costs the
+alias-carrying part of the population its gating, and makes the constraint visible at creation rather than
+as an alias that answers nothing. Details in S44.

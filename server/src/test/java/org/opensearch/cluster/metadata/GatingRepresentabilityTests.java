@@ -81,8 +81,17 @@ public class GatingRepresentabilityTests extends OpenSearchTestCase {
     }
 
     /**
-     * The control, and the reason this is a list rather than a rule: the plain case is genuinely fine, so
-     * refusing to gate every index with an alias would be the wrong fix.
+     * A plain alias survives the conversion intact, which is still true and no longer the whole story.
+     *
+     * <p>This was written as the reason T7 is a list rather than a blanket rule: the plain case loses
+     * nothing, so refusing every aliased index looked like the wrong fix. T29 refused them anyway, on a
+     * ground this test cannot see. Representability is about what a descriptor can carry, and the alias name
+     * is carried; the problem is that nothing can change it afterwards, because every alias operation is a
+     * cluster state update over metadata a gated index does not have.
+     *
+     * <p>Kept as it is, because the distinction is worth preserving. If alias names ever become a second key
+     * space in the descriptor store with their own write path, this is the assertion that says the data was
+     * never the obstacle.
      */
     public void testAPlainAliasIsFullyRepresented() {
         IndexMetadata metadata = serverlessIndex().putAlias(AliasMetadata.builder("plain").build()).build();
@@ -99,19 +108,50 @@ public class GatingRepresentabilityTests extends OpenSearchTestCase {
     public void testEveryLossIsAStatedReasonNotToGate() throws Exception {
         assertNull(
             "the plain case must stay gatable, or this would gate nothing",
-            DescriptorRepresentable.whyNotRepresentable(serverlessIndex().putAlias(AliasMetadata.builder("plain").build()).build())
+            DescriptorRepresentable.whyNotRepresentable(serverlessIndex().build())
         );
 
+        // T29 widened four alias rules into one, so every alias is now refused and each of these reports
+        // the same reason. They are kept as separate cases rather than collapsed into one because they are
+        // the four ways an alias can carry meaning a descriptor drops, and a future change that re-admits
+        // plain aliases has to decide about each of them again rather than about "aliases" in general.
+        assertReason("alias", serverlessIndex().putAlias(AliasMetadata.builder("plain").build()).build());
         assertReason(
-            "filter",
+            "alias",
             serverlessIndex().putAlias(
                 AliasMetadata.builder("filtered").filter(new CompressedXContent("{\"term\":{\"tenant\":\"acme\"}}")).build()
             ).build()
         );
-        assertReason("routing", serverlessIndex().putAlias(AliasMetadata.builder("routed").indexRouting("k").build()).build());
-        assertReason("routing", serverlessIndex().putAlias(AliasMetadata.builder("routed").searchRouting("k").build()).build());
-        assertReason("write index", serverlessIndex().putAlias(AliasMetadata.builder("w").writeIndex(true).build()).build());
-        assertReason("hidden", serverlessIndex().putAlias(AliasMetadata.builder("h").isHidden(true).build()).build());
+        assertReason("alias", serverlessIndex().putAlias(AliasMetadata.builder("routed").indexRouting("k").build()).build());
+        assertReason("alias", serverlessIndex().putAlias(AliasMetadata.builder("routed").searchRouting("k").build()).build());
+        assertReason("alias", serverlessIndex().putAlias(AliasMetadata.builder("w").writeIndex(true).build()).build());
+        assertReason("alias", serverlessIndex().putAlias(AliasMetadata.builder("h").isHidden(true).build()).build());
+    }
+
+    /**
+     * Why a plain alias is refused, which is not the reason the other four are.
+     *
+     * <p>The other four are refused because a descriptor drops something: a filter, routing, a write index
+     * flag, a hidden flag. A plain alias loses nothing on the way into a descriptor, since the name is
+     * carried. It is refused because nothing can ever change it afterwards.
+     *
+     * <p>Every alias operation is a cluster state update that rewrites the index's {@code IndexMetadata},
+     * and a gated index has none, so T29 measured an alias add against one timing out with
+     * {@code ClusterManagerNotDiscoveredException} rather than failing cleanly. An alias that can be set at
+     * creation and never repointed is the opposite of what an alias is for.
+     */
+    public void testAPlainAliasIsRefusedForMutabilityRatherThanForLoss() throws Exception {
+        IndexMetadata plainAlias = serverlessIndex().putAlias(AliasMetadata.builder("stable-name").build()).build();
+
+        assertTrue(
+            "the name itself survives into a descriptor, so this is not a loss of information",
+            IndexDescriptor.from(plainAlias).aliases().contains("stable-name")
+        );
+        assertNotNull("and it is refused anyway", DescriptorRepresentable.whyNotRepresentable(plainAlias));
+        assertTrue(
+            "the reason must be about the alias never changing rather than about a dropped field",
+            DescriptorRepresentable.whyNotRepresentable(plainAlias).contains("changed")
+        );
     }
 
     /** An index with no metadata at all is not representable either, rather than being quietly accepted. */

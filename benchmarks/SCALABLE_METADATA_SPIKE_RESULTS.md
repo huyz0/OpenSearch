@@ -2377,3 +2377,52 @@ that basis. The table above contradicted it, and re-running the benchmark in iso
 place passed in nine minutes. The benchmark was simply expensive enough that a loaded suite tipped it over,
 and it now runs a quarter of the accesses. **One run per arm is not an A/B**, which is the same lesson S26,
 S31 and S35 each taught about a different quantity.
+
+## S44 (T29): an alias on a gated index was silently dead, and the fix is not to resolve it
+
+T7 closed the list of reasons an index keeps its cluster state entry and let a *plain* alias through, because
+`IndexDescriptor` has a field for the name. The field is written, serialized, sized and round-tripped, and
+`IndexDescriptor`'s own javadoc says aliases are carried "because resolution needs them to answer without
+materializing". Nothing read it. Seventh mechanism in this area found correct and unreachable.
+
+| query against a gated index with alias `tenant-alias` | result |
+|---|---|
+| the alias name, lenient options | **0 names, no error** |
+| the alias name, strict options | `IndexNotFoundException` |
+| `tenant-*`, the alias namespace | 0 names |
+| the descriptor carries the alias (premise) | yes |
+| the same alias on an ordinary index (control) | resolves |
+
+### The question that changed the answer
+
+The obvious repair is to resolve aliases by searching the `aliases` field, which T28's machinery already
+makes easy. Before building it, one more thing was measured: whether an alias can be **changed** on a gated
+index.
+
+It cannot. Every alias operation is a cluster state update that looks the index up in `Metadata` and rewrites
+its `IndexMetadata`, and a gated index is not in `Metadata`. Adding an alias to one does not fail cleanly, it
+times out with `ClusterManagerNotDiscoveredException`.
+
+So resolution would have served an alias that could be set once at creation and never added, removed or
+repointed, with a refresh-bound visibility window on top. That is a partial feature inviting exactly the
+usage it cannot support, and an alias is the worst place for that: a client is given an alias precisely so
+the index behind it can change.
+
+**So `DescriptorRepresentable` refuses to gate any index that declares an alias**, widening T7's four alias
+rules into one. An aliased index keeps its cluster state entry and behaves exactly as it always has.
+
+The four narrower rules were about a descriptor *dropping* something: a filter, routing, a write index flag,
+a hidden flag. The new rule is about something different, and the distinction is worth keeping: a plain alias
+loses nothing on the way into a descriptor. It is refused because nothing can ever change it.
+
+### What this costs
+
+An index with an alias is not gated, so it counts against the cluster state budget the whole design exists to
+protect. If tenant indices routinely carry aliases, gating does not apply to them and the population that can
+reach a hundred million is only the alias-free part. That is a product constraint rather than a defect, and
+it is now visible at creation in a log line naming aliases as the reason, rather than as an alias that
+resolves to nothing.
+
+Supporting aliases properly needs alias names to become a second key space in the descriptor store, with
+their own uniqueness against index names and their own write path for add, remove and repoint. That is a
+feature, not a repair, and nothing here forecloses it.

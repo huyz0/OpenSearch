@@ -46,22 +46,31 @@ public final class DescriptorRepresentable {
         if (indexMetadata == null) {
             return "there is no metadata to represent";
         }
-        for (AliasMetadata alias : indexMetadata.getAliases().values()) {
-            // A descriptor carries alias names and nothing else, so each of these would be dropped in
-            // silence. The filter is the one that matters most: it restricts which documents a query
-            // through the alias may see, and losing it widens a restricted view rather than breaking it.
-            if (alias.filter() != null) {
-                return "alias [" + alias.alias() + "] has a filter, which a descriptor cannot carry";
-            }
-            if (alias.indexRouting() != null || alias.searchRouting() != null) {
-                return "alias [" + alias.alias() + "] has routing, which a descriptor cannot carry";
-            }
-            if (alias.writeIndex() != null) {
-                return "alias [" + alias.alias() + "] declares a write index, which a descriptor cannot carry";
-            }
-            if (alias.isHidden() != null) {
-                return "alias [" + alias.alias() + "] declares hidden, which a descriptor cannot carry";
-            }
+        // T29 widened this from four alias properties to every alias, and the reason is not that a
+        // descriptor cannot carry the name. It carries it already. The reason is that nothing can ever
+        // change it.
+        //
+        // Every alias operation is a cluster state update that looks the index up in Metadata and rewrites
+        // its IndexMetadata. A gated index is not in Metadata, so there is nothing to rewrite: adding an
+        // alias to one does not fail cleanly, it times out with ClusterManagerNotDiscoveredException.
+        // An alias could therefore only ever be set at creation and never added, removed or repointed,
+        // which is the opposite of what an alias is for. A client is given an alias precisely so the index
+        // behind it can change.
+        //
+        // T29 also measured that resolution never reads the field: naming the alias of a gated index
+        // resolved to nothing, silently under the options most clients use. Building that resolution was
+        // the alternative to this rule and was rejected, because it would have served a set-once alias
+        // with a refresh-bound visibility window, which is a partial feature that invites exactly the
+        // usage it cannot support.
+        //
+        // The four narrower rules this replaces (filter, routing, write index, hidden) are now subsumed.
+        // They are worth remembering rather than deleting from history: the filter one mattered most,
+        // because losing an alias filter widens a restricted view rather than breaking it, which is a
+        // security-shaped failure rather than an availability-shaped one.
+        if (indexMetadata.getAliases().isEmpty() == false) {
+            return "index declares aliases "
+                + indexMetadata.getAliases().keySet()
+                + ", and an alias on an index held outside cluster state could never be changed afterwards";
         }
         if (indexMetadata.getCustomData().isEmpty() == false) {
             return "index carries custom metadata " + indexMetadata.getCustomData().keySet() + ", which a descriptor cannot carry";
