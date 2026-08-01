@@ -70,6 +70,58 @@ public interface DescriptorBackend {
     /** {@link #create} without blocking the caller. */
     CompletableFuture<Boolean> createAsync(IndexDescriptor descriptor);
 
+    /**
+     * {@link #create}, but able to tell "someone else took this name" from "my own earlier attempt took
+     * it and I never heard back".
+     *
+     * <h4>Why this is needed at all</h4>
+     *
+     * Under a cluster state update an ambiguous timeout was resolvable: the caller read the next published
+     * state and saw whether its index was there. Creation through a conditional write has no such vantage
+     * point. The first attempt may have reached the store and had its acknowledgement lost, so the retry
+     * gets a conflict, and a conflict is indistinguishable from another client having won the name.
+     *
+     * <p>Reporting that as a collision fails a creation that actually succeeded. Reporting it as success
+     * without checking would hand the name to a client that never got it. So the retry has to be able to
+     * recognise its own work, which means carrying something stable across attempts.
+     *
+     * <p>The descriptor's uuid already is that thing, provided the caller reuses it on retry rather than
+     * minting a new one. That is the contract: <b>a retry must resend the same descriptor</b>. A caller
+     * that generates a fresh uuid each attempt is asking a question this cannot answer, and will be told
+     * the name is taken.
+     *
+     * @return {@link CreateOutcome#CREATED} if this call took the name, {@link CreateOutcome#ALREADY_MINE}
+     *         if it was already held by a descriptor with this uuid, {@link CreateOutcome#TAKEN} if
+     *         somebody else holds it.
+     */
+    default CreateOutcome createIdempotently(IndexDescriptor descriptor) {
+        if (create(descriptor)) {
+            return CreateOutcome.CREATED;
+        }
+        IndexDescriptor existing = get(descriptor.name());
+        if (existing == null) {
+            // Created and then deleted between the two calls, or a store that lost the write. Either way
+            // this caller does not hold the name and saying so is the only honest answer.
+            return CreateOutcome.TAKEN;
+        }
+        return descriptor.uuid().equals(existing.uuid()) ? CreateOutcome.ALREADY_MINE : CreateOutcome.TAKEN;
+    }
+
+    /** What {@link #createIdempotently} found. */
+    enum CreateOutcome {
+        /** This call took the name. */
+        CREATED,
+        /** The name was already held by this same descriptor, so an earlier attempt by this caller won. */
+        ALREADY_MINE,
+        /** Somebody else holds the name. */
+        TAKEN;
+
+        /** Whether the caller ends up owning the name, which is what most callers actually want to know. */
+        public boolean owned() {
+            return this != TAKEN;
+        }
+    }
+
     /** Writes a descriptor whether or not the name is taken. */
     void put(IndexDescriptor descriptor);
 

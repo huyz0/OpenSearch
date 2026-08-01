@@ -165,6 +165,31 @@ public class BlobDescriptorBackendTests extends OpenSearchTestCase {
         assertTrue(descriptors.listBlobs().keySet().containsAll(Set.of("logs-alpha", "logs-beta", "metrics-gamma")));
     }
 
+    /**
+     * The case that has no answer without an idempotency token: a creation whose acknowledgement was lost.
+     *
+     * <p>Resending the same descriptor is what makes the retry recognisable. Reporting it as a collision
+     * would fail a creation that actually succeeded.
+     */
+    public void testRetryingTheSameCreationRecognisesItsOwnWork() throws Exception {
+        BlobDescriptorBackend backend = backendOver(createTempDir());
+        IndexDescriptor mine = descriptor("tenant-a");
+
+        assertEquals(DescriptorBackend.CreateOutcome.CREATED, backend.createIdempotently(mine));
+        assertEquals(DescriptorBackend.CreateOutcome.ALREADY_MINE, backend.createIdempotently(mine));
+        assertTrue(backend.createIdempotently(mine).owned());
+    }
+
+    /** And a genuinely different creator is still told the name is taken. */
+    public void testADifferentCreatorIsToldTheNameIsTaken() throws Exception {
+        BlobDescriptorBackend backend = backendOver(createTempDir());
+        assertEquals(DescriptorBackend.CreateOutcome.CREATED, backend.createIdempotently(descriptor("tenant-a")));
+
+        DescriptorBackend.CreateOutcome outcome = backend.createIdempotently(descriptor("tenant-a"));
+        assertEquals(DescriptorBackend.CreateOutcome.TAKEN, outcome);
+        assertFalse(outcome.owned());
+    }
+
     public void testTombstonesRefuseRatherThanLandingUnderTheDescriptorPrefix() throws Exception {
         BlobDescriptorBackend backend = backendOver(createTempDir());
         expectThrows(UnsupportedOperationException.class, () -> backend.putTombstoneAsync(descriptor("tenant-a")));
