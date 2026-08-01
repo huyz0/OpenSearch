@@ -41,11 +41,13 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.ClusterStateApplier;
 import org.opensearch.cluster.action.index.NodeMappingRefreshAction;
 import org.opensearch.cluster.action.shard.ShardStateAction;
+import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.ComputedShardRouting;
+import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.RecoverySource;
 import org.opensearch.cluster.routing.RecoverySource.Type;
@@ -53,6 +55,7 @@ import org.opensearch.cluster.routing.RoutingNode;
 import org.opensearch.cluster.routing.RoutingNodes;
 import org.opensearch.cluster.routing.RoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
+import org.opensearch.cluster.routing.UnassignedInfo;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.Nullable;
 import org.opensearch.common.annotation.PublicApi;
@@ -68,6 +71,7 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.env.ShardLockObtainFailedException;
 import org.opensearch.gateway.GatewayService;
 import org.opensearch.index.IndexComponent;
+import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.index.IndexService;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.MergedSegmentWarmerFactory;
@@ -269,12 +273,14 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
         // Doesn't make sense to manage shards on non-master and non-data nodes
         if (DiscoveryNode.isDataNode(settings) || DiscoveryNode.isClusterManagerNode(settings)) {
             clusterService.addHighPriorityApplier(this);
+            indicesService.setOnDemandShardOpener(this::openComputedShardsOnDemand);
         }
     }
 
     @Override
     protected void doStop() {
         if (DiscoveryNode.isDataNode(settings) || DiscoveryNode.isClusterManagerNode(settings)) {
+            indicesService.setOnDemandShardOpener(null);
             clusterService.removeApplier(this);
         }
     }
@@ -444,6 +450,21 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
 
         for (AllocatedIndex<? extends Shard> indexService : indicesService) {
             final Index index = indexService.index();
+            if (heldOnDemand(index)) {
+                // Not in cluster state and not supposed to be. Every test below reads absence from
+                // metadata or from the routing node as "the cluster manager took this away", and for an
+                // index the cluster manager never knew about, absence is its ordinary condition.
+                continue;
+            }
+            if (openedOnDemand.remove(index)) {
+                // Was held on demand and is not any more, which heldOnDemand has just decided. Removed
+                // here rather than fallen through to the checks below, because the assertion in them
+                // states that an index absent from cluster state must have been deleted or the cluster
+                // must be new. Neither is true of this one: it was never in cluster state to be deleted.
+                logger.debug("{} releasing index opened on demand, nothing supplies its descriptor now", index);
+                indicesService.removeIndex(index, NO_LONGER_ASSIGNED, "removing index (no descriptor supplier)");
+                continue;
+            }
             final IndexMetadata indexMetadata = state.metadata().index(index);
             final IndexMetadata existingMetadata = indexService.getIndexSettings().getIndexMetadata();
 
@@ -508,6 +529,12 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
         // remove shards based on routing nodes (no deletion of data)
         RoutingNode localRoutingNode = RoutingNodes.localRoutingNode(state, localNodeId);
         for (AllocatedIndex<? extends Shard> indexService : indicesService) {
+            if (heldOnDemand(indexService.index())) {
+                // A shard opened from a descriptor is in no routing node, so the loop below would read it
+                // as unallocated and remove it on the first cluster state applied after the write that
+                // opened it. Nothing published it, so nothing can un-publish it.
+                continue;
+            }
             for (Shard shard : indexService) {
                 ShardRouting currentRoutingEntry = shard.routingEntry();
                 ShardId shardId = currentRoutingEntry.shardId();
@@ -540,6 +567,225 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
                 }
             }
         }
+    }
+
+    /**
+     * Indices this node built from a descriptor rather than from an applied cluster state.
+     *
+     * <p>Node-local and deliberately not a static registry, which is what every other seam in this area
+     * is. A registry keyed on nothing would be shared by every node in a test JVM, and the question this
+     * set answers -- "did <em>I</em> open this" -- is one only a node can answer about itself.
+     */
+    private final Set<Index> openedOnDemand = ConcurrentCollections.newConcurrentSet();
+
+    /**
+     * Whether this index is one this node opened from a descriptor and should still be holding.
+     *
+     * <p>The second half is what stops the guards below from being permanent. An on-demand index is here
+     * because a descriptor vouched for it, so with no descriptor supplier installed nothing vouches for it
+     * any more and cluster state's answer -- that it does not exist -- is the only one left. Without this
+     * the index and its shard lock outlive the mechanism that created them, which a test notices as a shard
+     * still locked long after everything that could unlock it is gone.
+     *
+     * <p>Deliberately a registry check rather than a descriptor read. This runs on the cluster state
+     * applier thread, where W4 established that a blocking descriptor lookup deadlocks, and it runs once
+     * per open index per applied state.
+     *
+     * <p><b>What this does not cover, stated rather than implied:</b> deleting a live gated index does not
+     * close the shard on the node holding it. Deletion tombstones the descriptor and changes no cluster
+     * state, so no node is told, and this check cannot see it without the read it must not make. The shard
+     * stays open until the node stops. That is a real gap and it is T39's, listed in the spike results
+     * rather than left to be discovered.
+     */
+    private boolean heldOnDemand(Index index) {
+        return openedOnDemand.contains(index) && AbsentIndexDescriptorSuppliers.isRegistered();
+    }
+
+    /**
+     * The second trigger: open a gated index's shards here because a request arrived for one, not because
+     * a cluster state said to.
+     *
+     * <p>This is T39, and S54 is why it exists. Everything above this method is driven by a cluster state
+     * diff, and a gated index never appears in one, so no node ever built its shard: a write that survived
+     * all eleven residency sites arrived at a data node and died in {@code indexServiceSafe}. Placement had
+     * already chosen this node and marked the primary STARTED (T37); nothing had told the node.
+     *
+     * <p><b>Why here rather than in a parallel path.</b> {@code IndicesService.createShard} takes fifteen
+     * collaborators -- the checkpoint publisher, the peer recovery target service, the recovery listener,
+     * the repositories service, the shard failure and global checkpoint consumers, the retention lease
+     * syncer, the stats tracker factory, the discovery nodes, the warmer factory -- and this class holds
+     * every one of them, along with the recovery wiring and the failure handling. A second lifecycle that
+     * had to agree with this one would be a worse problem than the one being solved.
+     *
+     * <p>The descriptor read happens outside the lock and the shard construction inside it. That split is
+     * not tidiness: {@link #applyClusterState} is synchronized on this instance, so holding the lock across
+     * a remote descriptor GET would stall cluster state application behind a request, which is the shape
+     * W4 measured deadlocking.
+     *
+     * <p>Does nothing at all unless a descriptor supplier is installed, so an ordinary cluster reaches the
+     * {@code IndexNotFoundException} it always reached, one map lookup later.
+     */
+    public void openComputedShardsOnDemand(Index index) {
+        ClusterState state = clusterService.state();
+        if (state.metadata().index(index) != null) {
+            // Published, so the ordinary path owns it and is either mid-flight or has already failed it.
+            return;
+        }
+        IndexMetadata indexMetadata = AbsentIndexDescriptorSuppliers.metadataOrDescriptor(state.metadata(), index);
+        if (indexMetadata == null) {
+            return;
+        }
+        IndexRoutingTable computed = AbsentIndexRoutingSuppliers.supply(state, indexMetadata);
+        if (computed == null) {
+            // No placement means no opinion about where this index lives, which is what an unconfigured
+            // cluster answers. Opening a shard here on a guess is how an index ends up served from two
+            // nodes that each think they hold the primary.
+            return;
+        }
+        String localNodeId = state.nodes().getLocalNodeId();
+        List<ShardRouting> mine = new ArrayList<>();
+        for (IndexShardRoutingTable shardTable : computed) {
+            for (ShardRouting candidate : shardTable) {
+                if (localNodeId.equals(candidate.currentNodeId())) {
+                    mine.add(candidate);
+                }
+            }
+        }
+        if (mine.isEmpty()) {
+            return;
+        }
+
+        List<ShardId> opening = new ArrayList<>();
+        synchronized (this) {
+            AllocatedIndex<? extends Shard> indexService = indicesService.indexService(index);
+            if (indexService == null) {
+                try {
+                    // writeDanglingIndices is false, and that is a correctness argument rather than a
+                    // saving. Writing this index's metadata to disk makes it a dangling index, and a
+                    // dangling index is imported into cluster state on the next restart, which would
+                    // un-gate it exactly the way auto-creation used to.
+                    indexService = indicesService.createIndex(indexMetadata, builtInIndexListener, false);
+                    openedOnDemand.add(index);
+                } catch (Exception e) {
+                    logger.warn(() -> new ParameterizedMessage("[{}] failed to open gated index on demand", index), e);
+                    return;
+                }
+            }
+            for (ShardRouting placed : mine) {
+                if (indexService.getShardOrNull(placed.id()) != null) {
+                    continue;
+                }
+                if (failedShardsCache.containsKey(placed.shardId())) {
+                    continue;
+                }
+                createShard(state.nodes(), state.routingTable(), openable(placed, indexMetadata), state);
+                opening.add(placed.shardId());
+            }
+        }
+        awaitStarted(index, opening);
+    }
+
+    /**
+     * Waits for shards this call just opened to finish recovering, outside the lock.
+     *
+     * <p>Without this the opener returns a shard that exists and is INITIALIZING, the write fails with
+     * "shard is not in primary mode", and the coordinator retries. That retry is the expensive part and it
+     * is expensive for a reason particular to this design: {@code ReroutePhase} retries by waiting for the
+     * <em>next cluster state change</em>, and a gated index produces none, so the retry sits until the
+     * request times out and then succeeds on the timeout path. Measured at 57 seconds per tenant against a
+     * one minute default, which reads as a hang rather than as a retry.
+     *
+     * <p>So the wait happens here, where it can end the moment the shard is ready. T21 measured a wake at
+     * 41.5 ms and this is the same order: it is a bounded pause on a first write, not a poll loop with a
+     * long tail.
+     *
+     * <p>Outside the synchronized block deliberately. {@code handleRecoveryFailure} is synchronized on this
+     * instance, so waiting while holding the lock would stop the very recovery being waited on from ever
+     * reporting failure -- a deadlock that only appears when recovery fails, which is the case least
+     * likely to be exercised.
+     *
+     * <p>Gives up quietly at the deadline rather than throwing. The caller's next step re-reads the shard
+     * and reports the absence, and a slow recovery should look to the client like the retry it already
+     * knows how to handle.
+     */
+    private void awaitStarted(Index index, List<ShardId> opening) {
+        if (opening.isEmpty()) {
+            return;
+        }
+        long deadline = System.nanoTime() + ON_DEMAND_RECOVERY_WAIT.nanos();
+        for (ShardId shardId : opening) {
+            while (System.nanoTime() < deadline) {
+                AllocatedIndex<? extends Shard> indexService = indicesService.indexService(index);
+                Shard shard = indexService == null ? null : indexService.getShardOrNull(shardId.id());
+                if (shard == null) {
+                    // Failed and was removed while recovering. Nothing to wait for, and the caller's
+                    // lookup will report it.
+                    break;
+                }
+                if (shard.state() == IndexShardState.STARTED) {
+                    break;
+                }
+                try {
+                    Thread.sleep(5);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }
+    }
+
+    /**
+     * How long a first request waits for the shard it triggered.
+     *
+     * <p>Shorter than the request timeouts above it, so that a shard which cannot be opened surfaces as
+     * this node declining rather than as the client's own deadline expiring. Ten seconds against a
+     * measured 41.5 ms is two orders of margin, which is the right shape for a bound that should never be
+     * reached.
+     */
+    private static final TimeValue ON_DEMAND_RECOVERY_WAIT = TimeValue.timeValueSeconds(10);
+
+    /**
+     * The same computed shard, as the entry a data node can act on: INITIALIZING, and carrying a recovery
+     * source chosen here rather than inherited.
+     *
+     * <p><b>The recovery source is the one thing on this path that fails silently.</b>
+     * {@code ComputedRoutingTable} states {@code ExistingStoreRecoverySource} for every computed shard, and
+     * it is right to: for a shard that has data, inferring the source picks "empty store" whenever
+     * {@code inSyncAllocationIds} is absent, which under computed placement is always, and the index comes
+     * back blank while looking healthy. That is the A5 trap, and its own comment says so.
+     *
+     * <p>A shard that has never been built is the case that comment does not cover. It has no store to
+     * recover, so {@code ExistingStoreRecoverySource} fails it outright with "shard allocated for local
+     * recovery, should exist, but doesn't". So the source is decided here from the one fact that
+     * distinguishes the two and that no shared function can know: whether this node already holds data for
+     * this shard. {@link #withNodeLocalRecoverySource} makes the same call in the opposite direction for
+     * shards that come from placement, from the same fact, for the same reason.
+     *
+     * <p>What this does <em>not</em> make safe is placement moving a shard to a node that has no copy of
+     * its data, which would read as "never built" here and recover empty. That is C13's hazard and
+     * {@code ComputedPlacementMembership} is what holds it off, by keeping the node list stable while a
+     * node is merely restarting. It is a real limit rather than a solved problem, and it is written down in
+     * the spike results rather than only here.
+     */
+    private ShardRouting openable(ShardRouting placed, IndexMetadata indexMetadata) {
+        String customDataPath = IndexMetadata.INDEX_DATA_PATH_SETTING.get(indexMetadata.getSettings());
+        boolean hasData = indicesService.hasExistingShardData(placed.shardId(), customDataPath);
+        RecoverySource recoverySource = hasData
+            ? RecoverySource.ExistingStoreRecoverySource.INSTANCE
+            : RecoverySource.EmptyStoreRecoverySource.INSTANCE;
+        logger.debug("{} opening gated shard on demand, recovering from {} store", placed.shardId(), hasData ? "the existing" : "an empty");
+        // Rebuilt rather than mutated, because the entry placement produced is STARTED and createShard
+        // takes only an initializing one. The allocation id is carried across unchanged: it is what the
+        // coordinator put in the request and what AsyncPrimaryAction checks the shard against, so minting
+        // a fresh one here would fail every write with "expected allocation id [x] but found [y]".
+        return ShardRouting.newUnassigned(
+            placed.shardId(),
+            placed.primary(),
+            placed.isSearchOnly(),
+            recoverySource,
+            new UnassignedInfo(UnassignedInfo.Reason.CLUSTER_RECOVERED, "opened on demand from descriptor")
+        ).initialize(placed.currentNodeId(), placed.allocationId().getId(), ShardRouting.UNAVAILABLE_EXPECTED_SHARD_SIZE);
     }
 
     private void createIndices(final ClusterState state) {
@@ -611,6 +857,13 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
         final ClusterState state = event.state();
         for (AllocatedIndex<? extends Shard> indexService : indicesService) {
             final Index index = indexService.index();
+            if (heldOnDemand(index)) {
+                // The assertion below is the point of this guard: an on-demand index is absent from
+                // metadata by design, and asserting it was removed by deleteIndices would fire on the
+                // first metadata change after a gated write. Its settings come from the descriptor and
+                // change when the descriptor does, not when cluster state does.
+                continue;
+            }
             final IndexMetadata currentIndexMetadata = indexService.getIndexSettings().getIndexMetadata();
             final IndexMetadata newIndexMetadata = state.metadata().index(index);
             assert newIndexMetadata != null : "index " + index + " should have been removed by deleteIndices";
@@ -715,7 +968,12 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
         }
 
         try {
-            final long primaryTerm = state.metadata().index(shardRouting.index()).primaryTerm(shardRouting.id());
+            final IndexMetadata indexMetadata = AbsentIndexDescriptorSuppliers.metadataOrDescriptor(state.metadata(), shardRouting.index());
+            if (indexMetadata == null) {
+                failAndRemoveShard(shardRouting, true, "failed to create shard", new IndexNotFoundException(shardRouting.index()), state);
+                return;
+            }
+            final long primaryTerm = indexMetadata.primaryTerm(shardRouting.id());
             logger.debug("{} creating shard with primary term [{}]", shardRouting.shardId(), primaryTerm);
             indicesService.createShard(
                 shardRouting,
@@ -994,10 +1252,12 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
         if (shard == null) {
             return false;
         }
-        IndexMetadata indexMetadata = state.metadata().index(shardRouting.index());
+        IndexMetadata indexMetadata = AbsentIndexDescriptorSuppliers.metadataOrDescriptor(state.metadata(), shardRouting.index());
         if (indexMetadata == null) {
             // The index was deleted while this shard was recovering. There is nothing to start and the
-            // deletion path will remove the shard.
+            // deletion path will remove the shard. For a gated index the descriptor answers this rather
+            // than cluster state, and a tombstoned descriptor gives the same null, which is the same
+            // answer for the same reason.
             return false;
         }
         ShardRouting started = shardRouting.moveToStarted();
@@ -1204,6 +1464,19 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
      * @opensearch.internal
      */
     public interface AllocatedIndices<T extends Shard, U extends AllocatedIndex<T>> extends Iterable<U> {
+
+        /**
+         * Installs the on-demand opener, which is asked for an index that is not here before the absence
+         * is reported as an error.
+         *
+         * <p>An instance method rather than one of this area's static registries, and that is the whole
+         * reason it is on this interface. The opener belongs to one node's shard lifecycle, and a static
+         * registry in a test JVM would hand every node the last one to start.
+         *
+         * <p>A no-op by default, so an implementation that holds no shards on demand -- which includes
+         * every test double -- needs to know nothing about this.
+         */
+        default void setOnDemandShardOpener(java.util.function.Consumer<Index> opener) {}
 
         /**
          * Creates a new {@link IndexService} for the given metadata.

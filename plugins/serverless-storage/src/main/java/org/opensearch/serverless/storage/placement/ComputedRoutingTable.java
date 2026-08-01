@@ -13,6 +13,7 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.routing.ComputedPlacementMembership;
 import org.opensearch.cluster.routing.ComputedPlacementMembershipService;
+import org.opensearch.cluster.routing.ComputedShardRouting;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.RecoverySource;
@@ -164,11 +165,26 @@ public final class ComputedRoutingTable {
     /**
      * Walks a shard to STARTED on its computed node.
      *
-     * <p>The allocation id is left to be generated rather than derived from the node, so a shard that
-     * moves because the node list changed gets a fresh id. Reusing one would make two placements of the
-     * same shard indistinguishable in any log that records allocation ids.
+     * <p><b>The allocation id is derived, not generated, and that was a defect until T39 drove a write
+     * through here.</b> This method used to pass null and let {@link ShardRouting#initialize} mint a fresh
+     * id. That is invisible while every node answers its own reads: a coordinator resolves placement, gets
+     * an id, and never compares it with anyone.
+     *
+     * <p>A write compares them. The coordinator puts the id it computed into the request, and
+     * {@code TransportReplicationAction.AsyncPrimaryAction} checks it against the id the shard on the data
+     * node actually has. Two nodes minting independently random ids for the same computed shard disagree
+     * every time, and the write fails with "expected allocation id [x] but found [y]" -- a hard failure
+     * whose message points at a stale routing table rather than at a random number.
+     *
+     * <p>{@link ComputedShardRouting#allocationId} is the derivation, and it already existed for the data
+     * node's half of this. Its javadoc gives the second reason: an entry rebuilt on every applied cluster
+     * state carrying a new id makes {@code IndexShard.updateShardState} reject the update and
+     * {@code removeShards} tear the shard down, so a computed shard would be destroyed and rebuilt
+     * continuously. The same reasoning that lets placement be computed rather than agreed applies to
+     * identity.
      */
     private static ShardRouting started(ShardRouting routing, String nodeId) {
-        return routing.initialize(nodeId, null, ShardRouting.UNAVAILABLE_EXPECTED_SHARD_SIZE).moveToStarted();
+        String allocationId = ComputedShardRouting.allocationId(routing.shardId().getIndex().getUUID(), routing.id(), nodeId);
+        return routing.initialize(nodeId, allocationId, ShardRouting.UNAVAILABLE_EXPECTED_SHARD_SIZE).moveToStarted();
     }
 }

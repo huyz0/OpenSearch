@@ -608,7 +608,12 @@ public class IndexNameExpressionResolver {
     public boolean hasIndexAbstraction(String indexAbstraction, ClusterState state) {
         Context context = new Context(state, IndicesOptions.lenientExpandOpen(), false, false, true, isSystemIndexAccessAllowed());
         String resolvedAliasOrIndex = dateMathExpressionResolver.resolveExpression(indexAbstraction, context);
-        return state.metadata().getIndicesLookup().containsKey(resolvedAliasOrIndex);
+        // Site 1 of eleven, and the one that was hiding the other ten. H8a taught aliasOrIndexExists to
+        // consult the descriptor seam and did not teach this sibling, so AutoCreateIndex.shouldAutoCreate
+        // was told a gated index does not exist and auto-created an ordinary one over the top of it. S49
+        // and S50 measured the consequence: gating did not survive a first write, and every end-to-end
+        // result claimed before then was served by indices that were no longer gated.
+        return AbsentIndexDescriptorSuppliers.exists(state.metadata(), resolvedAliasOrIndex);
     }
 
     /**
@@ -675,6 +680,17 @@ public class IndexNameExpressionResolver {
 
         final IndexMetadata indexMetadata = state.metadata().getIndices().get(index);
         if (indexMetadata == null) {
+            // Site 14, found by T39 on the search half of the end-to-end path rather than by S52 on the
+            // write half, and only reachable once an index stays gated through a write.
+            //
+            // Answered here rather than through the descriptor seam, because the descriptor cannot make
+            // this answer wrong: T29 established that an index declaring any alias keeps its cluster state
+            // entry, since every alias operation is a cluster state update over metadata a gated index does
+            // not have. So a gated index has no aliases, and "no filtering required" is the complete
+            // answer rather than a degraded one.
+            if (AbsentIndexDescriptorSuppliers.isRegistered()) {
+                return null;
+            }
             // Shouldn't happen
             throw new IndexNotFoundException(index);
         }

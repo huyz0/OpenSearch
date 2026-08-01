@@ -60,6 +60,7 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.ClusterStateObserver;
 import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.block.ClusterBlockLevel;
+import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.DataStream;
 import org.opensearch.cluster.metadata.IndexAbstraction;
 import org.opensearch.cluster.metadata.IndexMetadata;
@@ -640,8 +641,13 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
                     // The ConcreteIndices#resolveIfAbsent(...) method validates via IndexNameExpressionResolver whether
                     // an operation is allowed in index into a data stream, but this isn't done when resolve call is cached, so
                     // the validation needs to be performed here too.
+                    // Site 6. A gated index has no abstraction in the lookup, and absent means it has no
+                    // parent data stream rather than that it is unroutable: T29 established that an index
+                    // which could be part of a data stream keeps its cluster state entry, because every
+                    // data stream operation is a cluster state update over metadata a gated index does not
+                    // have. So absence here is an answer, and it is "no".
                     IndexAbstraction indexAbstraction = clusterState.getMetadata().getIndicesLookup().get(concreteIndex.getName());
-                    if (indexAbstraction.getParentDataStream() != null &&
+                    if (indexAbstraction != null && indexAbstraction.getParentDataStream() != null &&
                     // avoid valid cases when directly indexing into a backing index
                     // (for example when directly indexing into .ds-logs-foobar-000001)
                         concreteIndex.getName().equals(docWriteRequest.index()) == false
@@ -655,7 +661,14 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
                             prohibitAppendWritesInBackingIndices(docWriteRequest, metadata);
                             prohibitCustomRoutingOnDataStream(docWriteRequest, metadata);
                             IndexRequest indexRequest = (IndexRequest) docWriteRequest;
-                            final IndexMetadata indexMetadata = metadata.index(concreteIndex);
+                            // Site 3. The mapping is legitimately absent for a gated index rather than
+                            // merely unavailable: H4c moved mappings off cluster state entirely, and a null
+                            // mapping here is what process() already expects from an index that has not been
+                            // mapped yet. The creation version is what the descriptor records at creation.
+                            final IndexMetadata indexMetadata = AbsentIndexDescriptorSuppliers.metadataOrDescriptor(
+                                metadata,
+                                concreteIndex
+                            );
                             MappingMetadata mappingMd = indexMetadata.mapping();
                             Version indexCreated = indexMetadata.getCreationVersion();
                             indexRequest.resolveRouting(metadata);
@@ -679,7 +692,13 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
                             throw new AssertionError("request type not supported: [" + docWriteRequest.opType() + "]");
                     }
 
-                    IndexMetadata indexMetaData = clusterState.metadata().index(concreteIndex.getName());
+                    // Site 4. Append-only is a setting a gated index does not carry, so the descriptor's
+                    // synthesised metadata answers false, which is the same answer an ordinary index
+                    // without the setting gives.
+                    IndexMetadata indexMetaData = AbsentIndexDescriptorSuppliers.metadataOrDescriptor(
+                        clusterState.metadata(),
+                        concreteIndex.getName()
+                    );
                     ShardId shardId = null;
                     if (indexMetaData.isAppendOnlyIndex() && indexMetaData.bulkAdaptiveShardSelectionEnabled()) {
                         shardId = index2ShardId.computeIfAbsent(
@@ -744,8 +763,14 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
                 final IndexShardRoutingTable shardRoutingTable = routingTable.shardRoutingTableOrNull(shardId);
                 final ShardRouting primary = shardRoutingTable == null ? null : shardRoutingTable.primaryShard();
                 String targetNodeId = primary != null ? primary.currentNodeId() : null;
-                IndexMetadata indexMetaData = clusterState.metadata().index(shardId.getIndexName());
-                boolean bulkAdaptiveShardSelectionEnabled = indexMetaData.isAppendOnlyIndex()
+                // Site 9. The same append-only question as site 4, asked again per shard request rather
+                // than per document, and it throws on a null the same way.
+                IndexMetadata indexMetaData = AbsentIndexDescriptorSuppliers.metadataOrDescriptor(
+                    clusterState.metadata(),
+                    shardId.getIndexName()
+                );
+                boolean bulkAdaptiveShardSelectionEnabled = indexMetaData != null
+                    && indexMetaData.isAppendOnlyIndex()
                     && indexMetaData.bulkAdaptiveShardSelectionEnabled();
 
                 // Add the shard level accounting for coordinating and supply the listener
@@ -899,8 +924,9 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
             Metadata metadata
         ) {
             Index concreteIndex = concreteIndices.resolveIfAbsent(request);
-            final IndexMetadata indexMetadata = metadata.index(concreteIndex);
-            if (indexMetadata.isAppendOnlyIndex()) {
+            // Site 5. Same question as sites 4 and 9, third call site.
+            final IndexMetadata indexMetadata = AbsentIndexDescriptorSuppliers.metadataOrDescriptor(metadata, concreteIndex);
+            if (indexMetadata != null && indexMetadata.isAppendOnlyIndex()) {
                 if ((request.opType() == DocWriteRequest.OpType.UPDATE || request.opType() == DocWriteRequest.OpType.DELETE)) {
                     ValidationException exception = new ValidationException();
                     exception.addValidationError(
@@ -965,7 +991,14 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
                     return true;
                 }
             }
-            IndexMetadata indexMetadata = metadata.getIndexSafe(concreteIndex);
+            // Site 2, and the first one a write hits once auto-creation stops covering for it: getIndexSafe
+            // throws IndexNotFoundException for an index that exists and is simply not in cluster state.
+            // The descriptor carries the state, which is what this check wanted.
+            IndexMetadata indexMetadata = AbsentIndexDescriptorSuppliers.metadataOrDescriptor(metadata, concreteIndex);
+            if (indexMetadata == null) {
+                addFailure(request, idx, new IndexNotFoundException(concreteIndex));
+                return true;
+            }
             if (indexMetadata.getState() == IndexMetadata.State.CLOSE) {
                 addFailure(request, idx, new IndexClosedException(concreteIndex));
                 return true;

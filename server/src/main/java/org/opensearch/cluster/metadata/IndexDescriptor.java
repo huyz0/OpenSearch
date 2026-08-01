@@ -302,7 +302,8 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
      * the descriptor exists is that full {@code IndexMetadata} is what could not be afforded per index.
      */
     public IndexMetadata toIndexMetadata() {
-        return IndexMetadata.builder(name)
+        int shards = Math.max(1, shardCount);
+        IndexMetadata.Builder builder = IndexMetadata.builder(name)
             .settings(
                 org.opensearch.common.settings.Settings.builder()
                     .put(IndexMetadata.SETTING_VERSION_CREATED, org.opensearch.Version.fromId((int) createdVersion))
@@ -310,10 +311,30 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
                     .put("index.serverless_storage.enabled", serverless)
                     .build()
             )
-            .numberOfShards(Math.max(1, shardCount))
-            .numberOfReplicas(0)
-            .build();
+            .numberOfShards(shards)
+            .numberOfReplicas(0);
+        for (int shard = 0; shard < shards; shard++) {
+            builder.primaryTerm(shard, FIRST_PRIMARY_TERM);
+        }
+        return builder.build();
     }
+
+    /**
+     * The primary term every shard of a gated index is opened at.
+     *
+     * <p>Stated rather than left at the default, and the default is the reason. {@code IndexMetadata}
+     * initialises absent terms to {@link org.opensearch.index.seqno.SequenceNumbers#UNASSIGNED_PRIMARY_TERM},
+     * which is zero and means "no primary has been assigned"; a shard opened at that term is a shard that
+     * announces it has no primary, which is not what a computed primary is.
+     *
+     * <p>Constant because nothing advances it. A published index's term is bumped by the cluster manager
+     * each time a new primary is promoted, and a gated index has no cluster manager step to bump it in. That
+     * is a real limitation rather than a solved problem: it means two nodes cannot be told apart by term if
+     * placement ever moves a primary between them, and it is recorded in the spike results rather than
+     * hidden here. What it does buy is agreement, since every node derives the same term from the same
+     * descriptor, which is what the coordinator's term check against the data node's shard requires.
+     */
+    public static final long FIRST_PRIMARY_TERM = 1L;
 
     /** The same descriptor at a new mapping generation, which is what a mapping update records. */
     public IndexDescriptor withMappingGeneration(long generation) {

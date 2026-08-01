@@ -34,6 +34,7 @@ package org.opensearch.cluster.routing;
 
 import org.apache.lucene.util.CollectionUtil;
 import org.opensearch.cluster.ClusterState;
+import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.VirtualShardRoutingHelper;
 import org.opensearch.cluster.metadata.WeightedRoutingMetadata;
@@ -521,8 +522,16 @@ public class OperationRouting {
         return indexRouting;
     }
 
+    /**
+     * Site 7, and it is the one every other routing decision here is built on.
+     *
+     * <p>Routing a document means hashing its id against a shard count, and the shard count is the first
+     * thing a gated index cannot supply from cluster state. Repaired here rather than at each of the four
+     * callers below, because they all reach the same question through this method and site 8 -- the routing
+     * table itself -- already has its supplier fallback and simply never ran, since this threw first.
+     */
     protected IndexMetadata indexMetadata(ClusterState clusterState, String index) {
-        IndexMetadata indexMetadata = clusterState.metadata().index(index);
+        IndexMetadata indexMetadata = AbsentIndexDescriptorSuppliers.metadataOrDescriptor(clusterState.metadata(), index);
         if (indexMetadata == null) {
             throw new IndexNotFoundException(index);
         }

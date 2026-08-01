@@ -264,12 +264,24 @@ warns that inferring the recovery source picks "empty store" whenever `inSyncAll
 under computed placement is always. So the recovery source for a first write is exactly the case that
 comment is about, and it has to be chosen rather than inferred.
 
-## Why this was not started
+## Why this was not started, and how it went
 
-Three attempts today built past what could be verified and were reverted. This one is a change to a core
-shard lifecycle class with fifteen collaborators and a recovery-source decision that the existing code
-explicitly warns is easy to get silently wrong. It needs a session that can carry the whole loop: build,
-drive it with `GatedEndToEndIT`, and run the wider suites before it lands.
+Three attempts built past what could be verified and were reverted. This one is a change to a core shard
+lifecycle class with fifteen collaborators and a recovery-source decision that the existing code explicitly
+warns is easy to get silently wrong. It needs a session that can carry the whole loop: build, drive it with
+`GatedEndToEndIT`, and run the wider suites before it lands.
 
 The eleven residency sites from S52 and S53 land **with** this, not before it. Site 1 removes auto-creation,
 and until a shard can be opened, removing the crutch turns a silent design failure into a loud one.
+
+**Built and landed. S55 has the result.** The shape above survived contact: the trigger is a second entry
+point on `IndicesClusterStateService`, the recovery source is chosen from whether the node already holds the
+data rather than inferred, and the eleven sites landed with it. A thousand documents written to twenty
+tenants and found again, with those tenants still absent from cluster state at the end.
+
+Three things this note did not predict. The eleven sites were fifteen, and two of the extra four were not
+metadata lookups at all: one was a wait for a cluster state change that a gated index never causes, and one
+was a refresh that touched no shards and reported success. `ComputedRoutingTable` was minting random
+allocation ids, which nothing could notice until a write made two nodes compare theirs. And the first
+working build wrote at 57 seconds per tenant, because a retry that waits for cluster state is not a retry
+here but a full-timeout stall.

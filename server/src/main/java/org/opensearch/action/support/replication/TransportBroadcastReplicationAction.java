@@ -176,8 +176,15 @@ public abstract class TransportBroadcastReplicationAction<
             // computed index has shards and simply does not publish them. Looking up directly found
             // nothing, so a refresh or a flush reported success having touched nothing at all, and every
             // read afterwards saw a stale searcher. Silent, and indistinguishable from a broken write.
+            //
+            // The metadata half of that guard then reintroduced the same defect for a gated index, which
+            // has no metadata entry at all, and T39 measured it: a refresh over twenty gated tenants
+            // touched nothing, reported success, and the search that followed found 450 documents of a
+            // thousand that had genuinely been written. It is dropped because it is redundant rather than
+            // because it is inconvenient -- resolve already answers null for an index that is in neither
+            // table, which is the case the metadata check was standing in for.
             IndexRoutingTable indexRouting = AbsentIndexRoutingSuppliers.resolve(clusterState, index);
-            if (clusterState.metadata().hasIndex(index) && indexRouting != null) {
+            if (indexRouting != null) {
                 for (IndexShardRoutingTable shardRouting : indexRouting.getShards().values()) {
                     shardIds.add(shardRouting.shardId());
                 }

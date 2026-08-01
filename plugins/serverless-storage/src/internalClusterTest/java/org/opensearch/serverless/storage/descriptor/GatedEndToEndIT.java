@@ -11,6 +11,7 @@ package org.opensearch.serverless.storage.descriptor;
 import org.apache.lucene.tests.util.LuceneTestCase.AwaitsFix;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.action.bulk.BulkRequestBuilder;
+import org.opensearch.action.bulk.BulkResponse;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.Settings;
@@ -74,6 +75,14 @@ import java.util.Locale;
  * real, and they were served by ordinary indices: the tenants were auto-created into cluster state by their
  * first write and behaved normally thereafter. <b>The end-to-end path has been demonstrated for indices that
  * start gated and do not stay gated</b>, which is a weaker result than the one first reported here.
+ *
+ * <p><b>T39 closed that gap, and the paragraph above is kept rather than deleted because it is what makes
+ * the current result mean anything.</b> A gated index's shard is now opened on demand from its descriptor
+ * when a request arrives for it, the write path no longer reads cluster state for what the descriptor
+ * holds, and the tenants below stay absent from cluster state through their writes. That absence is
+ * asserted here, before and after the write, by {@link #assertEveryTenantIsGated}: without it a pass here
+ * says nothing that S45's pass did not also say. S55 has the numbers and the four call sites T39 found
+ * behind the eleven that S52 and S53 had mapped.
  */
 public class GatedEndToEndIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
 
@@ -159,15 +168,24 @@ public class GatedEndToEndIT extends org.opensearch.serverless.storage.Serverles
         }
         long createNanos = System.nanoTime() - createStart;
 
+        assertEveryTenantIsGated(created, "at creation");
+
         long writeStart = System.nanoTime();
         for (String name : created) {
             BulkRequestBuilder bulk = client().prepareBulk();
             for (int d = 0; d < DOCS_PER_TENANT; d++) {
                 bulk.add(client().prepareIndex(name).setId(String.valueOf(d)).setSource("tenant", name, "seq", d));
             }
-            assertFalse("writing to a gated index must not fail", bulk.get().hasFailures());
+            BulkResponse response = bulk.get();
+            assertFalse("writing to a gated index must not fail: " + response.buildFailureMessage(), response.hasFailures());
         }
         long writeNanos = System.nanoTime() - writeStart;
+
+        // The premise, checked after the write rather than only before it, because a write is exactly what
+        // used to break it. S49 found that the first write auto-created an ordinary index over the top of
+        // the gated one, and S50 found why; every headline this class reported before then was served by
+        // indices that were no longer gated. A pass here means nothing without this.
+        assertEveryTenantIsGated(created, "after a write");
 
         client().admin().indices().prepareRefresh(created.toArray(new String[0])).get();
 
@@ -554,6 +572,32 @@ public class GatedEndToEndIT extends org.opensearch.serverless.storage.Serverles
         assertNotNull("and a primary for shard 0", primary);
         assertTrue("assigned to a node", primary.assignedToNode());
         assertNotNull("and that node must be one the cluster knows", state.nodes().get(primary.currentNodeId()));
+    }
+
+    /**
+     * That every named index is absent from cluster state, which is what "gated" means.
+     *
+     * <p>Named separately from the assertion it guards because the failure it catches is not a failure:
+     * the write succeeds and the search finds every document, and the whole result is about ordinary
+     * indices. There is a {@code testWhetherTheDisagreeingIndexIsEvenGated} beside this that established
+     * the check.
+     */
+    private void assertEveryTenantIsGated(List<String> names, String when) {
+        var metadata = client().admin().cluster().prepareState().get().getState().metadata();
+        List<String> published = new ArrayList<>();
+        for (String name : names) {
+            if (metadata.index(name) != null) {
+                published.add(name);
+            }
+        }
+        assertTrue(
+            "the premise, "
+                + when
+                + ": a gated index must have no cluster state entry. These do, so whatever this test goes on to "
+                + "measure is about ordinary indices: "
+                + published,
+            published.isEmpty()
+        );
     }
 
     private static String tenant(int i) {

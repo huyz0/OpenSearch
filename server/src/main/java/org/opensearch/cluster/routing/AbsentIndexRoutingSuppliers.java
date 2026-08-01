@@ -205,34 +205,15 @@ public final class AbsentIndexRoutingSuppliers {
     }
 
     /**
-     * The metadata synthesised from a gated index's descriptor, cached so it is stable.
+     * The metadata synthesised from a gated index's descriptor.
      *
-     * <p>Stability is the point, not just the saving. P5's memo keys on metadata identity, so synthesising
-     * a fresh instance per resolution would make that memo miss every time, which P5 measured as an 18x
-     * regression rather than a slow path. Keyed by descriptor identity so a descriptor change invalidates
-     * it.
+     * <p>Delegated rather than kept here, because the write path synthesises the same metadata for the same
+     * index on the same request and the memo below keys on identity. Two caches would hand the two paths
+     * two equal instances that are not the same object, and this memo would then miss on every write.
      */
     private static IndexMetadata synthesisedMetadata(String indexName) {
-        org.opensearch.cluster.metadata.IndexDescriptor descriptor = org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.supply(
-            indexName
-        );
-        if (descriptor == null || descriptor.exists() == false) {
-            return null;
-        }
-        SynthesisedMetadata cached = SYNTHESISED.get(indexName);
-        if (cached != null && cached.descriptor == descriptor) {
-            return cached.metadata;
-        }
-        IndexMetadata metadata = descriptor.toIndexMetadata();
-        SYNTHESISED.put(indexName, new SynthesisedMetadata(descriptor, metadata));
-        return metadata;
+        return org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.synthesisedMetadata(indexName);
     }
-
-    private record SynthesisedMetadata(org.opensearch.cluster.metadata.IndexDescriptor descriptor, IndexMetadata metadata) {
-    }
-
-    private static final java.util.concurrent.ConcurrentHashMap<String, SynthesisedMetadata> SYNTHESISED =
-        new java.util.concurrent.ConcurrentHashMap<>();
 
     public static IndexRoutingTable supply(ClusterState state, IndexMetadata indexMetadata) {
         BiFunction<ClusterState, IndexMetadata, IndexRoutingTable> supplier = SUPPLIER.get();
@@ -297,7 +278,7 @@ public final class AbsentIndexRoutingSuppliers {
     /** Drops every memoised placement, which a test must do because this registry is static. */
     public static void clearMemos() {
         MEMOS.clear();
-        SYNTHESISED.clear();
+        org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.clearSynthesised();
     }
 
     /**
@@ -311,7 +292,7 @@ public final class AbsentIndexRoutingSuppliers {
         SUSPENDED_SHARDS.set(suspendedShards);
         // Any change to either input invalidates every memoised placement.
         MEMOS.clear();
-        SYNTHESISED.clear();
+        org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.clearSynthesised();
     }
 
     /** The shards of this index that are asleep, empty when nothing is registered or the source fails. */

@@ -272,4 +272,89 @@ public final class AbsentIndexDescriptorSuppliers {
         }
         return expander.expand(prefix);
     }
+
+    /**
+     * The {@link IndexMetadata} synthesised from a gated index's descriptor, or null if there is none.
+     *
+     * <p><b>Cached, and the cache is for stability rather than for speed.</b> {@code
+     * AbsentIndexRoutingSuppliers} memoises placement on metadata <em>identity</em>, so a fresh instance per
+     * call makes that memo miss every time, which P5 measured as an 18x regression rather than a slow path.
+     * Keyed on descriptor identity, so a descriptor that changes invalidates it.
+     *
+     * <p>One cache rather than one per caller, which is the reason this lives here and not beside each
+     * user. The routing seam and the write path both synthesise metadata for the same index on the same
+     * request, and two caches would hand them two instances that compare equal and are not the same object.
+     * The routing memo would then miss on every write, and worse, {@code IndexShard} identity checks
+     * comparing metadata across the two paths would disagree about an index nothing had changed.
+     */
+    public static IndexMetadata synthesisedMetadata(String indexName) {
+        IndexDescriptor descriptor = supply(indexName);
+        if (descriptor == null || descriptor.exists() == false) {
+            return null;
+        }
+        SynthesisedMetadata cached = SYNTHESISED.get(indexName);
+        if (cached != null && cached.descriptor == descriptor) {
+            return cached.metadata;
+        }
+        IndexMetadata metadata = descriptor.toIndexMetadata();
+        SYNTHESISED.put(indexName, new SynthesisedMetadata(descriptor, metadata));
+        return metadata;
+    }
+
+    private record SynthesisedMetadata(IndexDescriptor descriptor, IndexMetadata metadata) {
+    }
+
+    private static final java.util.concurrent.ConcurrentHashMap<String, SynthesisedMetadata> SYNTHESISED =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Drops every synthesised instance, which a test must do because this registry is static. */
+    public static void clearSynthesised() {
+        SYNTHESISED.clear();
+    }
+
+    /**
+     * The metadata for an index, from cluster state when it is there and from the descriptor when it is
+     * not.
+     *
+     * <p>This is the write path's whole repair, and S51 to S54 found the sites for it one stack trace at a
+     * time: eleven places on the path from a bulk request to a shard read cluster state for something a
+     * gated index keeps in its descriptor. Each of them wants an {@link IndexMetadata} and each of them
+     * gets a null or a throw instead.
+     *
+     * <p><b>Deliberately not folded into {@link Metadata#getIndexSafe}.</b> That is the obvious place and it
+     * is the wrong one: W4 established that widening a hot core accessor to do a remote lookup deadlocks,
+     * because the accessor is called from the cluster state applier thread and the lookup needs that thread
+     * to make progress. A separate helper means every caller of it is one somebody chose, and the cluster
+     * state thread is not among them.
+     *
+     * <p>Returns null rather than throwing, matching {@link Metadata#index(Index)}, because the callers
+     * disagree about what absence means: a bulk request fails the one document, resolution reports no such
+     * index, and routing reports no shard available.
+     */
+    public static IndexMetadata metadataOrDescriptor(Metadata metadata, String indexName) {
+        IndexMetadata published = metadata.index(indexName);
+        if (published != null || isRegistered() == false) {
+            return published;
+        }
+        return synthesisedMetadata(indexName);
+    }
+
+    /**
+     * The same, for a caller that already holds a concrete {@link org.opensearch.core.index.Index}.
+     *
+     * <p>The uuid is checked rather than ignored. A caller with an {@code Index} has already resolved a
+     * name to a uuid, and answering with a descriptor for a different uuid would serve a request against a
+     * deleted index's successor, which is the one thing the durable tombstone exists to prevent.
+     */
+    public static IndexMetadata metadataOrDescriptor(Metadata metadata, org.opensearch.core.index.Index index) {
+        IndexMetadata published = metadata.index(index);
+        if (published != null || isRegistered() == false) {
+            return published;
+        }
+        IndexMetadata synthesised = synthesisedMetadata(index.getName());
+        if (synthesised == null || synthesised.getIndexUUID().equals(index.getUUID()) == false) {
+            return null;
+        }
+        return synthesised;
+    }
 }

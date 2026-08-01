@@ -442,6 +442,16 @@ public class IndicesService extends AbstractLifecycleComponent
     private final Supplier<TieredStoragePrefetchSettings> tieredStoragePrefetchSettingsSupplier;
     private final Client client;
     private volatile Map<String, IndexService> indices = emptyMap();
+
+    /**
+     * Asked to build an index that is not here, before its absence is reported as an error.
+     *
+     * <p>Installed by {@code IndicesClusterStateService}, which owns the shard lifecycle and every
+     * collaborator opening a shard needs. Null until then, and null on a node that holds no shards, so
+     * {@link #indexServiceSafe} behaves exactly as it always has.
+     */
+    private volatile Consumer<Index> onDemandShardOpener;
+
     private final Map<Index, List<PendingDelete>> pendingDeletes = new HashMap<>();
     private final AtomicInteger numUncompletedDeletes = new AtomicInteger();
     private final OldShardsStats oldShardsStats = new OldShardsStats();
@@ -1023,8 +1033,24 @@ public class IndicesService extends AbstractLifecycleComponent
     /**
      * Returns an IndexService for the specified index if exists otherwise a {@link IndexNotFoundException} is thrown.
      */
+    @Override
+    public void setOnDemandShardOpener(Consumer<Index> opener) {
+        this.onDemandShardOpener = opener;
+    }
+
     public IndexService indexServiceSafe(Index index) {
         IndexService indexService = indices.get(index.getUUID());
+        if (indexService == null) {
+            // T39's trigger. An index whose metadata never appears in cluster state is never built by
+            // cluster state application, so the first request for one of its shards is the only thing that
+            // can ask for it. Reached only on the way to throwing, so an ordinary cluster pays one null
+            // check on a path that was already about to fail.
+            Consumer<Index> opener = onDemandShardOpener;
+            if (opener != null) {
+                opener.accept(index);
+                indexService = indices.get(index.getUUID());
+            }
+        }
         if (indexService == null) {
             throw new IndexNotFoundException(index);
         }

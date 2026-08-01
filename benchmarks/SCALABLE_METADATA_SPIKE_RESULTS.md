@@ -3020,3 +3020,137 @@ until a shard can be opened the writes it was masking fail instead.
 **What this settles about the whole design.** A gated index today can be created, resolved, listed,
 wildcard-matched, and searched by name. It cannot take a write, and the reason is now known precisely and is
 not a small one: the component that builds shards is driven by the cluster state this design removes.
+
+## S55 (T39): a gated index takes a write, and the eleven sites were fifteen
+
+T39 built the on-demand shard trigger and landed the residency sites with it. `GatedEndToEndIT`
+`testAGatedIndexCanBeWrittenToAndSearched` passes, over twenty tenants that are still absent from cluster
+state when it finishes:
+
+```
+  create       48.0 ms/index
+  write        81.3 ms/tenant (50 docs)
+  search        8.5 ms/tenant
+  hits     1,000 of 1,000 expected
+```
+
+Those are single-run figures from the test in isolation and they move a lot under suite contention: the same
+test in a later whole-class run measured 241.6, 765.6 and 78.0, an order of magnitude on each stage with the
+same thousand documents found. Treat them as "the path works and costs tens to hundreds of milliseconds per
+tenant", not as a benchmark. What is not variance is the hit count, which is exact.
+
+The premise is asserted rather than assumed, twice: every tenant is checked absent from cluster state at
+creation and again after its write. That check is the whole reason this result is not S45's. Four earlier
+runs of this class reported documents written and found, and every one of them was serving ordinary indices
+that auto-creation had put back into cluster state.
+
+### The trigger
+
+`IndicesClusterStateService` now has a second entry point, `openComputedShardsOnDemand(Index)`, alongside
+`applyClusterState`. `IndicesService.indexServiceSafe` calls it on a miss, before reporting the absence,
+and it does nothing at all unless a descriptor supplier is installed. It reads the descriptor, computes the
+placement, keeps the shards this node is assigned, and builds them through the same `createIndex` and
+`createShard` the cluster state path uses, holding this class's lock for the construction and not for the
+descriptor read.
+
+Three guards keep what it built alive. `removeIndices`, `removeShards` and `updateIndices` each read an
+index's absence from cluster state as the cluster manager having taken it away, and for an index the
+cluster manager never knew about, absence is its ordinary condition. Without them the shard was destroyed
+by the first cluster state applied after the write that opened it.
+
+**The recovery source is chosen from whether this node already holds the shard's data**, which is the one
+fact that separates the two cases and the one no shared function can know. `ComputedRoutingTable` states
+`ExistingStoreRecoverySource` for every computed shard and is right to, because inferring it picks "empty
+store" whenever `inSyncAllocationIds` is absent, which under computed placement is always. A shard that has
+never been built is the case that reasoning does not cover: it has no store, and existing-store recovery
+fails it outright. `withNodeLocalRecoverySource` already made the same call in the opposite direction, from
+the same fact.
+
+### The eleven were fifteen, and one was not a residency assumption
+
+S52 and S53 mapped eleven sites by walking the write path until it stopped. Each of those was real. Four
+more were behind them, and they were behind them because nothing had ever run this far:
+
+| # | site | what it needed |
+|---|---|---|
+| 12 | `TransportReplicationAction.AsyncPrimaryAction.runWithPrimaryShardReference` | `getIndexSafe` on the data node, once the primary permit is held |
+| 13 | `TransportShardBulkAction`, the dynamic mapping wait | a mapping update that does not arrive by cluster state |
+| 14 | `IndexNameExpressionResolver.indexAliases` | alias filters on the search half |
+| 15 | `TransportBroadcastReplicationAction.shards` | a refresh that touched no shards and said so to nobody |
+
+Site 11 needed nothing. The handoff says `resolveShard` uses the wrong `supply` overload; it already uses
+the three-argument one, so S53's diagnosis had been landed in core before T39 started.
+
+Sites 12 and 14 are ordinary instances of the pattern. The other two are not.
+
+**Site 13 is a wait, not a lookup.** A primary that meets a new field merges it with
+`MAPPING_UPDATE_PREFLIGHT`, which deliberately does not commit, sends the update to the cluster manager,
+and then waits for the next cluster state change to bring the committed mapping back. For a gated index
+`MetadataMappingService` already handles the update correctly, by compare-and-swap against
+`MappingGenerationStore` with no cluster state change at all, and that is exactly what makes the wait
+unsatisfiable. Every document failed with "timed out while waiting for a dynamic mapping update" for a
+mapping that had already been recorded. The repair is to commit the merge locally and not wait.
+
+**Site 15 is the failure this area keeps producing, in the line written to prevent it.**
+`TransportBroadcastReplicationAction.shards` guards its routing lookup with
+`clusterState.metadata().hasIndex(index) && indexRouting != null`, and the comment above it explains that
+looking routing up directly made "a refresh or a flush report success having touched nothing at all, and
+every read afterwards saw a stale searcher. Silent, and indistinguishable from a broken write." The
+metadata half of that same guard does precisely this to a gated index. Measured: a refresh over twenty
+gated tenants touched nothing, reported success, and the search that followed found **450 documents of a
+thousand that had genuinely been written**. The condition was redundant, because `resolve` already answers
+null for an index in neither table.
+
+### A defect that only a write could expose
+
+`ComputedRoutingTable.started` passed a null allocation id and let `ShardRouting.initialize` mint a random
+one. That is invisible while every node answers its own reads, because no two nodes ever compare. A write
+compares them: the coordinator puts the id it computed into the request and
+`AsyncPrimaryAction` checks it against the id the shard on the data node actually has. Two nodes minting
+independently random ids for the same computed shard disagree every time.
+
+`ComputedShardRouting.allocationId` is the derivation and already existed, for the data node's half of the
+same question, with a javadoc giving a second reason: an entry rebuilt on every applied cluster state
+carrying a new id makes `updateShardState` reject it and `removeShards` tear the shard down. The two halves
+of one mechanism had been written eight months apart and only one of them used it.
+
+### Waiting for the shard, and why the first version looked like a hang
+
+The first working build wrote at **57 seconds per tenant** and found all thousand documents. That is not a
+slow write, it is a timeout: the opener returned a shard that existed and was still INITIALIZING, the
+write failed with "shard is not in primary mode", and `ReroutePhase` retried by waiting for the next
+cluster state change. A gated index produces none, so the retry sat until the request's own one minute
+deadline and then succeeded on the timeout path.
+
+The opener now waits for the shards it just opened, outside the lock, bounded at ten seconds against a
+measured recovery of tens of milliseconds. Same test, **81.3 ms per tenant**, a factor of 700. The shape is
+worth keeping: on this path a retry that waits for cluster state is a full-timeout stall rather than a
+retry, so anything that expects to be retried has to be given something else to wait on.
+
+### What is still open
+
+Stated here rather than left to be found.
+
+- **Deleting a live gated index does not close its shard.** Deletion tombstones the descriptor and changes
+  no cluster state, so the node holding the shard is never told, and it cannot find out without a
+  descriptor read on the cluster state applier thread, which W4 established deadlocks. The shard stays
+  open until the node stops or the descriptor supplier is uninstalled. Nothing serves stale data, because
+  resolution answers from the tombstone, but the shard and its file handles are held.
+- **The primary term is the constant 1**, set on the descriptor's synthesised metadata so that every node
+  derives the same one, which the coordinator's term check against the data node's shard requires. Nothing
+  advances it, because there is no cluster manager step to advance it in. Two placements of the same shard
+  cannot be told apart by term.
+- **Placement moving a primary to a node with no copy of its data still recovers empty**, because that node
+  reads as "never built" by the same node-local test T39 relies on. `ComputedPlacementMembership` is what
+  holds this off, by keeping the node list stable while a node is merely restarting. It is the C13 hazard
+  and it is unchanged by this work.
+- The mapping wiring carries top-level properties only, which `MetadataMappingService.recordGatedMapping`
+  already stated. An index using object or nested fields must not be gated until that parses them.
+
+### What this settles
+
+A gated index can now be created, resolved, listed, paginated, wildcard-matched, deleted, suspended, woken,
+**written to**, and searched. The residency figures in this document still describe a population that has
+been created and not written to, and are now the floor rather than the whole story: a tenant that takes a
+document gets an open shard on one node, at T20's 118 KB and 3.06 file descriptors, and no cluster state
+entry anywhere. That was the claim the design rested on and it had never been demonstrated before.
