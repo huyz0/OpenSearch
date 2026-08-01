@@ -460,12 +460,12 @@ results do it.
 
 ## 12. Where this stands, and what is next
 
-Seventeen tasks landed. Working tree clean, everything below verified by a test that was checked against a
+Eighteen tasks landed. Working tree clean, everything below verified by a test that was checked against a
 deliberately broken build before being believed.
 
 **Done.** T1 (caller enumeration), T2 (register semantics), T3 (store audit), T4 (S3 conditional create),
 T5 (create-only contract tests), T21 (Fs register lock), T22 (`createRegisterIfAbsent`), T6 (backend
-interfaces), T7 (cache extraction), T8 (blob backend), T9 (idempotent creation), T10 (tombstones), T11 (cache instrumentation), T12 (change log), T16 (membership epochs), T17 (decommission), T18 (derived warmth).
+interfaces), T7 (cache extraction), T8 (blob backend), T9 (idempotent creation), T10 (tombstones), T11 (cache instrumentation), T12 (change log), T16 (membership epochs), T15 (descriptor enumeration), T17 (decommission), T18 (derived warmth).
 
 Two commits are formatting-only sweeps, separated out rather than buried. **The branch base does not pass
 `spotlessCheck`** in either `:server` or `:plugins:serverless-storage`, so a precommit build fails there
@@ -475,7 +475,7 @@ for reasons unrelated to any change. Worth fixing at the base rather than paying
 
 | | task | note |
 |---|---|---|
-| T13, T14, T15 | name index fed from the change log, checkpointed, rebuildable from LIST | T3: this gates removing the system index, not adding the blob backend |
+| T13, T14 | name index fed from the change log, checkpointed to the store | T15 landed the enumeration they rebuild from; these are the wiring |
 | T19, T20 | point lookup and cache hit rate benchmarks | the numbers the whole approach rests on, and neither is measured |
 
 **Still blocked on T39** in the sibling worktree: C2 (`routingNumShards` on the descriptor) and C5
@@ -935,6 +935,29 @@ for a quiet one.
 
 Ten is stated rather than tuned, and should be re-derived against a real restart profile before anyone
 relies on the exact value.
+
+### T15: the path that makes I2 true rather than claimed
+
+`DescriptorEnumerator` reads the full live name set from the object store alone. Invariant I2 says every
+local structure is reconstructible; for the name index that was a claim until something could actually do
+it. Without this path the name index is not a discardable cache, it is a second source of truth that has to
+be protected, which is a different and much worse system.
+
+**Not a query path, and it must not become one.** S13 measured an in-memory prefix match at 3.2 ms for
+sixty-five thousand hits. A LIST pages a thousand keys behind a serial continuation token, so millions of
+names is seconds to minutes. Rebuild and reconcile with it; answer nothing.
+
+Parallelism comes from splitting the prefix space, not from paging one prefix, which the continuation token
+makes impossible. One listing per starting character runs independently. Two details that would otherwise
+be quiet defects: results are unioned through a sorted set rather than concatenated, so a future alphabet
+change cannot silently duplicate a name into a rebuild; and names outside the split alphabet are swept
+afterwards rather than assumed absent, because a rebuild that drops indices looks exactly like success.
+
+This only works because T8 kept keys prefix-preserving and T10 moved tombstones out from under the
+descriptor prefix. Hashed keys would leave no way to enumerate a range or to split the work, and tombstones
+left in place would need a read per key to find out which names are live.
+
+Six tests, including one asserting the parallel and serial passes agree.
 
 ### T7 verification, including the part that looked like a regression
 

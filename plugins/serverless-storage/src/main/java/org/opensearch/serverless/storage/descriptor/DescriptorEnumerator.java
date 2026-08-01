@@ -1,0 +1,133 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
+
+package org.opensearch.serverless.storage.descriptor;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.opensearch.common.blobstore.BlobContainer;
+import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.BlobStore;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import java.util.TreeSet;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+
+/**
+ * Every live index name, read from the object store and nothing else.
+ *
+ * <h2>What this is for, which is not serving queries</h2>
+ *
+ * Invariant I2 says every local structure is reconstructible from the object store. For the name index
+ * that is a claim, and this is what makes it true. Without a path from the store back to the full set of
+ * names, the name index is not a cache that can be discarded, it is a second source of truth that has to
+ * be protected, which is a different and much worse system.
+ *
+ * <p>It is not a query path and must not become one. S13 measured an in-memory prefix match at 3.2 ms for
+ * sixty-five thousand hits; a LIST pages a thousand keys at a time behind a serial continuation token, so
+ * a population in the millions is seconds to minutes. Use it to rebuild, to reconcile when drift is
+ * suspected, and to answer nothing.
+ *
+ * <h2>Why the keys had to be prefix-preserving</h2>
+ *
+ * This only works because {@link BlobDescriptorBackend} stores descriptors under their own names rather
+ * than under a hash. Hashing would spread writes, which the store already does adaptively on its own, and
+ * would cost exactly this: with hashed keys there is no way to enumerate a name range, and no way to
+ * split the work either.
+ *
+ * <p>Deleted names are absent for free, because T10 moved tombstones out from under the descriptor prefix.
+ * A layout that left them in place would need a read per key to find out which names are live, turning a
+ * listing into a full fetch of the population.
+ */
+public final class DescriptorEnumerator {
+
+    private static final Logger logger = LogManager.getLogger(DescriptorEnumerator.class);
+
+    /**
+     * The alphabet a prefix is split over.
+     *
+     * <p>Index names are lowercase and may not begin with most punctuation, so this covers what a first
+     * character can be. A name whose first character falls outside it is still found, by the sweep that
+     * follows the split shards: correctness does not depend on the alphabet being complete, only
+     * parallelism does.
+     */
+    private static final String SPLIT_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz";
+
+    private final BlobStore blobStore;
+    private final BlobPath basePath;
+
+    public DescriptorEnumerator(BlobStore blobStore, BlobPath basePath) {
+        this.blobStore = blobStore;
+        this.basePath = basePath;
+    }
+
+    /** Every live name, in one serial pass. Fine for a small population and for tests. */
+    public List<String> allNames() throws IOException {
+        return new ArrayList<>(new TreeSet<>(descriptors().listBlobs().keySet()));
+    }
+
+    /**
+     * Every live name, with the listing split across {@code executor} by first character.
+     *
+     * <p>A single prefix cannot be paged in parallel, because the continuation token is serial by
+     * construction. What can be parallelised is the prefix space: one listing per starting character runs
+     * independently, and at a hundred million names that is the difference between a recovery option and a
+     * theoretical one.
+     *
+     * <p>The results are unioned through a sorted set rather than concatenated. Prefix ranges are disjoint
+     * in principle, and relying on that would make a future alphabet change silently duplicate names, which
+     * a rebuild would turn into a corrupted index rather than an error.
+     */
+    public List<String> allNamesInParallel(ExecutorService executor) throws IOException {
+        BlobContainer descriptors = descriptors();
+        List<Callable<Collection<String>>> shards = new ArrayList<>();
+        for (char first : SPLIT_ALPHABET.toCharArray()) {
+            String prefix = String.valueOf(first);
+            shards.add(() -> descriptors.listBlobsByPrefix(prefix).keySet());
+        }
+
+        TreeSet<String> names = new TreeSet<>();
+        try {
+            for (Future<Collection<String>> future : executor.invokeAll(shards)) {
+                names.addAll(future.get());
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("interrupted while enumerating descriptors", e);
+        } catch (java.util.concurrent.ExecutionException e) {
+            throw new IOException("could not enumerate descriptors", e.getCause());
+        }
+
+        // The split covers what a name can start with, and a name that starts with something else is a
+        // name this would otherwise lose. A rebuild that quietly drops indices is the failure this whole
+        // area is most careful about, so the remainder is swept rather than assumed empty.
+        int found = names.size();
+        for (String name : descriptors.listBlobs().keySet()) {
+            if (SPLIT_ALPHABET.indexOf(name.charAt(0)) < 0) {
+                names.add(name);
+            }
+        }
+        if (names.size() != found) {
+            logger.info("{} descriptor names fell outside the split alphabet and were swept", names.size() - found);
+        }
+        return new ArrayList<>(names);
+    }
+
+    private BlobContainer descriptors() {
+        return blobStore.blobContainer(basePath.add(trimmed(BlobDescriptorBackend.DESCRIPTOR_PREFIX)));
+    }
+
+    private static String trimmed(String prefix) {
+        return prefix.endsWith("/") ? prefix.substring(0, prefix.length() - 1) : prefix;
+    }
+}
