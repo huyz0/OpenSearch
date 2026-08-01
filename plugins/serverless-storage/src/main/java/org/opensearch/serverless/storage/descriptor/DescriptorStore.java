@@ -326,6 +326,7 @@ public final class DescriptorStore implements DescriptorBackend, DescriptorPrefi
                         // The normal case on every node but the first, and on every node after the first
                         // gated creation. Concurrent bootstrap is expected rather than an error.
                         indexKnownToExist.set(true);
+                        repairMapping();
                         mine.complete(null);
                         return;
                     }
@@ -415,22 +416,39 @@ public final class DescriptorStore implements DescriptorBackend, DescriptorPrefi
      * cluster state update.
      */
     public void putAsync(IndexDescriptor descriptor) {
-        try {
-            client.index(
-                new IndexRequest(DESCRIPTOR_INDEX).id(descriptor.name()).source(DescriptorCodec.toSource(descriptor)),
-                new org.opensearch.core.action.ActionListener<>() {
-                    @Override
-                    public void onResponse(org.opensearch.action.index.IndexResponse response) {}
+        // Bootstrapped first, for the same reason createAsync is. A bare index request against a missing
+        // descriptor index does not fail, it is auto-created -- with dynamic mappings, because auto-creation
+        // knows nothing about DescriptorCodec.MAPPING. The name field then is not a keyword, so every prefix
+        // query fails with "No mapping found for [name] in order to sort on" while point reads by id keep
+        // working. That is the worst shape a failure can take here: creation, exact-name resolution and
+        // writes all succeed, only wildcards break, and they break for the life of the process.
+        //
+        // This was reachable in production, not only in tests. Whichever write path touched the store first
+        // after the index was absent decided its mapping, and putAsync is a first-touch path: it is what the
+        // publisher calls, so an ordinary index entering cluster state before any gated index existed was
+        // enough to create the store wrong.
+        ensureIndexExistsAsync().whenComplete((ignored, bootstrapFailure) -> {
+            if (bootstrapFailure != null) {
+                logger.warn("could not bootstrap the descriptor index before recording [{}]", descriptor.name(), bootstrapFailure);
+                return;
+            }
+            try {
+                client.index(
+                    new IndexRequest(DESCRIPTOR_INDEX).id(descriptor.name()).source(DescriptorCodec.toSource(descriptor)),
+                    new org.opensearch.core.action.ActionListener<>() {
+                        @Override
+                        public void onResponse(org.opensearch.action.index.IndexResponse response) {}
 
-                    @Override
-                    public void onFailure(Exception e) {
-                        logger.warn("failed to record descriptor for [{}]", descriptor.name(), e);
+                        @Override
+                        public void onFailure(Exception e) {
+                            logger.warn("failed to record descriptor for [{}]", descriptor.name(), e);
+                        }
                     }
-                }
-            );
-        } catch (Exception e) {
-            logger.warn("failed to submit descriptor write for [{}]", descriptor.name(), e);
-        }
+                );
+            } catch (Exception e) {
+                logger.warn("failed to submit descriptor write for [{}]", descriptor.name(), e);
+            }
+        });
     }
 
     /**
@@ -462,7 +480,14 @@ public final class DescriptorStore implements DescriptorBackend, DescriptorPrefi
     }
 
     private void submitTombstone(IndexDescriptor tombstone, int attempt) {
+        // Same bootstrap as putAsync, and for the same reason: a tombstone is also a first-touch path, since
+        // deleting an index is a perfectly ordinary first thing for a cluster to do to the descriptor store.
+        ensureIndexExistsAsync().whenComplete((ignored, bootstrapFailure) -> submitTombstoneNow(tombstone, attempt));
+    }
+
+    private void submitTombstoneNow(IndexDescriptor tombstone, int attempt) {
         try {
+            logger.debug("recording tombstone for [{}], attempt [{}]", tombstone.name(), attempt);
             client.index(
                 new IndexRequest(DESCRIPTOR_INDEX).id(tombstone.name()).source(DescriptorCodec.toSource(tombstone)),
                 new org.opensearch.core.action.ActionListener<>() {
@@ -654,8 +679,16 @@ public final class DescriptorStore implements DescriptorBackend, DescriptorPrefi
         } catch (org.opensearch.index.IndexNotFoundException e) {
             // No descriptor index means no gated indices, which is a real and complete answer rather than
             // an unreadable one. Every cluster is in this state until its first gated index exists.
+            forgetIndex();
             return AbsentIndexDescriptorSuppliers.PrefixExpansion.of(List.of());
         } catch (Exception e) {
+            // A search that fails for any other reason may be a search against an index that exists without
+            // its mapping. Forgetting is not enough on its own: nothing else would run until the next write,
+            // and a cluster whose wildcards are broken may not take another write for a long time, so the
+            // repair has to be kicked from here. The bootstrap finds the index present and re-applies the
+            // mapping, and the caller's retry then succeeds.
+            forgetIndex();
+            ensureIndexExistsAsync();
             throw new DescriptorUnavailableException(prefix + "*", e);
         }
     }
@@ -719,10 +752,49 @@ public final class DescriptorStore implements DescriptorBackend, DescriptorPrefi
                 || e.getCause() instanceof org.opensearch.ResourceAlreadyExistsException) {
                 // The normal case on every node but the first. Concurrent creation is expected, not an error.
                 indexKnownToExist.set(true);
+                repairMapping();
                 return;
             }
             throw e instanceof RuntimeException runtime ? runtime : new RuntimeException(e);
         }
+    }
+
+    /**
+     * Re-applies the mapping to an index that already exists.
+     *
+     * <p>Guards against the descriptor index existing <em>without</em> its mapping, which is not
+     * hypothetical: a descriptor write to a missing index is auto-created by the bulk path, and auto-creation
+     * knows nothing about {@link DescriptorCodec#MAPPING}. The index comes back with dynamic mappings, the
+     * {@code name} field is not a keyword, and every prefix query then fails with "No mapping found for
+     * [name] in order to sort on" while point reads by id keep working.
+     *
+     * <p>That combination is the bad part. Creation, resolution by exact name and writes all still succeed,
+     * so the cluster looks healthy; only wildcards fail, and they fail for as long as the process lives
+     * because {@link #indexKnownToExist} is a latch that is never re-examined once set.
+     *
+     * <p>Idempotent, best effort, and off the critical path: a put-mapping that adds nothing is cheap, and
+     * one that cannot be applied must not fail the write that noticed. Found from two ITs that could resolve
+     * a gated index by name and could not match it with a wildcard.
+     */
+    private void repairMapping() {
+        try {
+            client.admin().indices().preparePutMapping(DESCRIPTOR_INDEX).setSource(DescriptorCodec.MAPPING).execute();
+        } catch (Exception e) {
+            logger.debug("could not re-apply the descriptor mapping", e);
+        }
+    }
+
+    /**
+     * Forgets that the descriptor index exists, so the next write bootstraps it again.
+     *
+     * <p>Called when an operation observes the index missing or unusable. Without it the two latches --
+     * {@link #indexKnownToExist} and {@link #bootstrap} -- are one-way: once set, an index that is later
+     * deleted is never recreated properly, and every subsequent write relies on auto-creation, which is
+     * what produces the mapping-less index {@link #repairMapping} then has to fix.
+     */
+    void forgetIndex() {
+        indexKnownToExist.set(false);
+        bootstrap.set(null);
     }
 
     /** Whether the descriptor index has been created, which tests assert rather than infer. */

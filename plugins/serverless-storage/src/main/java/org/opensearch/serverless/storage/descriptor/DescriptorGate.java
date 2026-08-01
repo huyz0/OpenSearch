@@ -208,6 +208,29 @@ public final class DescriptorGate {
         // Tombstones take the retrying path: they are the one descriptor write that is not safe to lose,
         // since for a gated index there is no cluster state entry and no graveyard entry behind them.
         IndexDescriptorPublisher.register(descriptor -> {
+            if (recordsItself(descriptor)) {
+                if (descriptor.exists() == false) {
+                    // The store's own index has just been deleted, and the store is the last thing to find
+                    // out. Both bootstrap latches are one-way, so without this the next write skips creation,
+                    // is auto-created instead, and comes back with dynamic mappings: name becomes a text
+                    // field, and every prefix query then fails with "Text fields are not optimised for
+                    // operations that require per-document field data". That state is unrecoverable rather
+                    // than merely broken -- a put-mapping cannot change a field's type, so repairing it needs
+                    // the index dropped and rebuilt.
+                    //
+                    // Told through the publisher because it already observes every index leaving cluster
+                    // state, including this one. The alternative was giving the store a ClusterService to
+                    // consult on each write, which is a dependency and a per-write check for a fact that
+                    // arrives here as an event.
+                    forgetStoreIndex(store);
+                    forgetStoreIndex(prefixBackend);
+                }
+                return;
+            }
+            // Which name is being written and whether it is a tombstone. Descriptor writes are asynchronous,
+            // so they are hard to attribute after the fact: a write that lands after a test has finished
+            // shows up only as the descriptor index reappearing, with nothing saying what wrote to it.
+            logger.debug("publishing descriptor for [{}], exists [{}]", descriptor.name(), descriptor.exists());
             if (descriptor.exists()) {
                 store.putAsync(descriptor);
             } else {
@@ -236,7 +259,43 @@ public final class DescriptorGate {
         // publisher records an index that already exists in cluster state, so a lost write costs a
         // comparison. The creator writes the only record a gated index will ever have, so it uses
         // op_type=create for atomicity against a competing creation and reports its outcome to the client.
-        IndexDescriptorPublisher.registerCreator(store::createAsync);
+        //
+        // Dual-writes for the same reason the publisher does, and this half was missed. Gated creation is
+        // the one write that never goes through the publisher, so with only the point half written a gated
+        // index created on the blob backend was resolvable by exact name and invisible to every wildcard --
+        // permanently, since nothing else ever writes that descriptor again. The prefix write uses put
+        // rather than create: the uniqueness gate is the point half's create above, and a second create here
+        // would race against it and report a spurious conflict.
+        //
+        // After the point write rather than beside it, because a name that is not uniquely ours must not
+        // appear in the prefix half at all.
+        IndexDescriptorPublisher.registerCreator(descriptor -> {
+            java.util.concurrent.CompletableFuture<Boolean> created = store.createAsync(descriptor);
+            if (prefixBackend instanceof DescriptorBackend == false || prefixBackend == store) {
+                return created;
+            }
+            DescriptorBackend prefixWrites = (DescriptorBackend) prefixBackend;
+            // Chained into the future the caller waits on, not fired and forgotten, and that ordering is
+            // load-bearing. Creation is acknowledged when this future completes, so a fire-and-forget prefix
+            // write can still be in flight when the client issues the delete that follows. The tombstone then
+            // lands first and the creation write overwrites it, leaving a deleted index recorded as OPEN in
+            // the half that answers wildcards -- a resurrection produced by nothing but write ordering.
+            // Observed as exactly that: a tombstoned name reading back OPEN.
+            return created.thenCompose(won -> {
+                if (Boolean.TRUE.equals(won) == false) {
+                    return java.util.concurrent.CompletableFuture.completedFuture(won);
+                }
+                // Failure here does not fail the creation. The point half is the record of the index; the
+                // prefix half is an index over it, and a name missing from it costs a wildcard match rather
+                // than the index.
+                return prefixWrites.createAsync(descriptor).handle((ok, failure) -> {
+                    if (failure != null) {
+                        logger.warn("could not record [{}] in the prefix half; wildcards will not match it", descriptor.name(), failure);
+                    }
+                    return won;
+                });
+            });
+        });
         // Mappings, which H4c required to leave cluster state and which have had no backing store since
         // H6a proved the swap converges. Blocking is safe here, unlike the publish hook above: a mapping
         // update runs on a transport thread handling a put-mapping or a dynamic field inference, not on
@@ -270,6 +329,44 @@ public final class DescriptorGate {
 
         DescriptorOnlyCreation.register(DescriptorGate::gatable);
         logger.info("descriptor resolution installed against [{}]", DescriptorStore.DESCRIPTOR_INDEX);
+    }
+
+    /**
+     * Whether this descriptor is about the store that would hold it.
+     *
+     * <p>The publisher fires for every index that enters or leaves cluster state, and the descriptor system
+     * index is one of those, so without this the store records its own lifecycle into itself. That is
+     * circular on its face, and it has a concrete consequence: deleting the descriptor index issues a write
+     * to the descriptor index, and auto-creation puts it straight back. The index cannot be dropped, and a
+     * delete reports success while leaving a live index behind.
+     *
+     * <p>Found from a shard lock left held at test teardown. The wipe deleted the store, the in-flight write
+     * about that deletion failed with "no such index", auto-creation recreated it under a new uuid, and the
+     * recreated shards were open and locked when the assertion ran. The lock was three steps downstream of
+     * the actual fault, which is why this is worth a name rather than a condition.
+     *
+     * <p>Deliberately narrow. Other system indices still get descriptors, because the dual write H2b
+     * introduced is what lets the two representations be compared during migration, and only this one index
+     * is its own subject.
+     */
+    private static boolean recordsItself(org.opensearch.cluster.metadata.IndexDescriptor descriptor) {
+        return DescriptorStore.DESCRIPTOR_INDEX.equals(descriptor.name());
+    }
+
+    /**
+     * Makes a backend re-bootstrap its index, for whichever half is backed by one.
+     *
+     * <p>Reaches through {@link CompositeDescriptorBackend} because either half may be the system index and
+     * only that half has anything to forget. A blob-backed half has no index to bootstrap and is skipped.
+     */
+    private static void forgetStoreIndex(Object backend) {
+        if (backend instanceof CompositeDescriptorBackend composite) {
+            forgetStoreIndex(composite.prefixBackend());
+            return;
+        }
+        if (backend instanceof DescriptorStore indexBacked) {
+            indexBacked.forgetIndex();
+        }
     }
 
     /**

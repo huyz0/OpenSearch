@@ -62,11 +62,24 @@ import java.util.concurrent.TimeUnit;
     + "weaker than it reads: hasIndex(name) false does not by itself establish the index was gated.")
 public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
 
-    private volatile java.nio.file.Path sharedBasePath;
+    /**
+     * Where the object store lives, shared by every test in the class.
+     *
+     * <p><b>Static, and that is the whole point.</b> JUnit builds a fresh instance per test method while the
+     * cluster is built once for the suite, so an instance field gives each method its own path and only the
+     * first one matches the path the nodes were actually configured with in {@link #nodeSettings}. Every
+     * later method then reads an empty directory -- one it creates itself, since {@code FsBlobStore} is
+     * constructed writable -- and concludes the descriptor never reached the object store.
+     *
+     * <p>This is why the class passed when a single method was run and failed when the class was run: "run
+     * it in isolation" was not narrowing the problem, it was selecting the one case that works. Three of the
+     * four methods had never been able to pass.
+     */
+    private static volatile java.nio.file.Path sharedBasePath;
 
     private java.nio.file.Path basePath() {
         if (sharedBasePath == null) {
-            synchronized (this) {
+            synchronized (BlobBackedDescriptorIT.class) {
                 if (sharedBasePath == null) {
                     sharedBasePath = randomRepoPath();
                 }
@@ -152,7 +165,74 @@ public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.Se
             .allNames();
     }
 
+    /**
+     * Names this test created, so teardown can delete them by name.
+     *
+     * <p>Needed because {@code TestCluster.wipeIndices("_all")} cannot reach a gated index. T28 decided
+     * deliberately that {@code _all} and {@code *} expand over cluster state only, and a gated index is not
+     * in cluster state, so the framework's own cleanup silently skips it. The shard therefore stays open and
+     * still holds its lock when {@code assertAfterTest} runs, which is the "still locked after 5 sec"
+     * failure this class was muted for. The lock was the symptom; the wipe never naming the index is the
+     * cause.
+     */
+    private final java.util.List<String> created = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+
+    @org.junit.After
+    public void deleteGatedIndicesByName() throws Exception {
+        for (String name : created) {
+            try {
+                client().admin().indices().prepareDelete(name).get();
+            } catch (Exception e) {
+                // Already deleted by the test itself is the ordinary case and not a failure.
+                logger.debug("could not delete [{}] during teardown", name, e);
+            }
+        }
+        quiesceDescriptorWrites();
+        created.clear();
+    }
+
+    /**
+     * Waits until every tombstone this test caused has actually landed in the prefix half.
+     *
+     * <p>Tombstone writes are asynchronous and retried up to five times, so they outlive the test method.
+     * The framework then wipes every index, and a retry firing after the wipe recreates the descriptor
+     * system index behind it under a fresh uuid. Those shards are open and holding their locks when
+     * {@code assertAfterTest} runs, so the failure reads as a shard lock leak and is really a retry landing
+     * late. Observed directly: attempt 1, then the wipe's "deleting index", then attempt 2, then "creating
+     * index, cause [auto(bulk api)]", all within 270 ms.
+     *
+     * <p><b>Asserts the tombstone is present, not that the name is absent</b>, and the difference is the
+     * whole point. The first version of this waited for a wildcard to stop matching, which an empty index
+     * satisfies just as well as a tombstoned one: "not written yet" and "deleted" are the same observation
+     * from the outside, so it returned immediately with every retry still pending. Presence is the only form
+     * of this check that proves no attempt is outstanding, because the retry stops on the first success.
+     */
+    private void quiesceDescriptorWrites() throws Exception {
+        assertBusy(() -> {
+            for (String name : created) {
+                org.opensearch.action.get.GetResponse response;
+                try {
+                    response = client().prepareGet(DescriptorStore.DESCRIPTOR_INDEX, name).get();
+                } catch (Exception e) {
+                    // The store may not exist yet, or may be mid-recreation after a previous test's wipe.
+                    // Both mean "not landed", and both have to keep the wait going rather than end it: an
+                    // exception escaping here would abort the retry loop and leave the write in flight,
+                    // which is the state this method exists to rule out.
+                    fail("[" + name + "] descriptor store not readable yet: " + e);
+                    return;
+                }
+                assertTrue("[" + name + "] has no descriptor document yet, so a write is still in flight", response.isExists());
+                assertEquals(
+                    "[" + name + "] is recorded but not yet tombstoned, so the tombstone write is still in flight",
+                    org.opensearch.cluster.metadata.IndexDescriptor.State.DELETED.name(),
+                    response.getSourceAsMap().get("state")
+                );
+            }
+        }, 30, TimeUnit.SECONDS);
+    }
+
     private void createGated(String name) {
+        created.add(name);
         assertTrue(
             client().admin()
                 .indices()
@@ -236,8 +316,14 @@ public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.Se
         awaitDescriptor("logs-two");
         awaitDescriptor("metrics-one");
 
-        SearchResponse search = client().prepareSearch("logs-*").setQuery(QueryBuilders.matchAllQuery()).setSize(0).get();
-        assertEquals("a wildcard must reach both gated tenants and neither more nor fewer", 2, search.getTotalShards());
+        // Retried rather than read once, because a wildcard is refresh-bound by design. H18 made the
+        // descriptor index's refresh_interval an explicit 1s so that staleness is a stated bound instead of
+        // an accident, and awaitDescriptor above waits on the object store, which is the point half. A
+        // single read here asserts that the prefix half has already refreshed, which nothing promises.
+        assertBusy(() -> {
+            SearchResponse search = client().prepareSearch("logs-*").setQuery(QueryBuilders.matchAllQuery()).setSize(0).get();
+            assertEquals("a wildcard must reach both gated tenants and neither more nor fewer", 2, search.getTotalShards());
+        }, 30, TimeUnit.SECONDS);
     }
 
     /** Deletion has to remove the name from the object store's live prefix, not merely from a request's view. */
