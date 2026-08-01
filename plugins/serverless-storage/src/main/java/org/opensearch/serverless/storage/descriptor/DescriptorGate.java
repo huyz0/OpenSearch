@@ -54,7 +54,7 @@ public final class DescriptorGate {
 
     private static final Logger logger = LogManager.getLogger(DescriptorGate.class);
 
-    private static final java.util.concurrent.atomic.AtomicReference<DescriptorStore> STORE =
+    private static final java.util.concurrent.atomic.AtomicReference<DescriptorBackend> STORE =
         new java.util.concurrent.atomic.AtomicReference<>();
 
     /**
@@ -123,7 +123,7 @@ public final class DescriptorGate {
         if (DescriptorStore.DESCRIPTOR_INDEX.equals(name)) {
             return null;
         }
-        DescriptorStore store = STORE.get();
+        DescriptorBackend store = STORE.get();
         return store == null ? null : store.get(name);
     }
 
@@ -132,8 +132,26 @@ public final class DescriptorGate {
      *
      * @param enabled whether gated indices are in use at all, so an ordinary cluster is untouched
      */
+    /**
+     * The unswitched form: one store answers both point reads and prefix searches.
+     *
+     * <p>Which is what every deployment did before the backend became selectable, and what most callers
+     * mean. Kept as an overload rather than making them pass the same object twice, since a caller that
+     * has to repeat itself eventually passes two different things by accident.
+     */
     public static void install(
         DescriptorStore store,
+        MappingGenerationStore.Store mappingStore,
+        GatedMappingStatsAggregator.Aggregator statsAggregator,
+        UnknownFieldRefresh.Refresher fieldRefresher,
+        boolean enabled
+    ) {
+        install(store, store, mappingStore, statsAggregator, fieldRefresher, enabled);
+    }
+
+    public static void install(
+        DescriptorBackend store,
+        DescriptorPrefixBackend prefixBackend,
         MappingGenerationStore.Store mappingStore,
         GatedMappingStatsAggregator.Aggregator statsAggregator,
         UnknownFieldRefresh.Refresher fieldRefresher,
@@ -146,14 +164,14 @@ public final class DescriptorGate {
         // registered supplier backed by a null store.
         STORE.set(store);
         AbsentIndexDescriptorSuppliers.register(DescriptorGate::supplyExceptForTheStoreItself);
-        AbsentIndexDescriptorSuppliers.registerPager(pagerFor(store));
+        AbsentIndexDescriptorSuppliers.registerPager(pagerFor(prefixBackend));
         // T28. Wildcards, which until now matched no gated index at all: every branch of the resolver's
         // matching reads cluster state, and a gated index is absent from it by construction, so T25
         // measured tenant-* over five gated tenants returning nothing and returning it without an error.
         //
         // The limit is read per call rather than captured, so changing the setting takes effect on the next
         // wildcard instead of on the next node restart.
-        AbsentIndexDescriptorSuppliers.registerExpander(prefix -> store.expandPrefix(prefix, WILDCARD_EXPANSION_LIMIT.get()));
+        AbsentIndexDescriptorSuppliers.registerExpander(prefix -> prefixBackend.expandPrefix(prefix, WILDCARD_EXPANSION_LIMIT.get()));
         // C1's prefetcher, which had no registrar and so did nothing at all. The seam and its hook in
         // TransportBulkAction landed together; without this line the hook found nothing installed and
         // returned immediately on every request, which is the "correct and unreachable" shape this area
@@ -194,6 +212,22 @@ public final class DescriptorGate {
                 store.putAsync(descriptor);
             } else {
                 store.putTombstoneAsync(descriptor);
+            }
+            // The prefix half is a separate store until the name index serves prefix resolution, and a
+            // point write to the object store leaves it not knowing the name exists. Dual-writing keeps
+            // wildcards answering while point reads move; without it, switching the backend would silently
+            // stop every wildcard from matching anything created afterwards, which is the failure T25
+            // already measured once from the other direction.
+            //
+            // Skipped when the two are the same object, which is the unswitched configuration, so an
+            // ordinary deployment does exactly one write as before.
+            if (prefixBackend instanceof DescriptorBackend && prefixBackend != store) {
+                DescriptorBackend prefixWrites = (DescriptorBackend) prefixBackend;
+                if (descriptor.exists()) {
+                    prefixWrites.putAsync(descriptor);
+                } else {
+                    prefixWrites.putTombstoneAsync(descriptor);
+                }
             }
             recordChange(descriptor);
         });
@@ -347,7 +381,7 @@ public final class DescriptorGate {
      * ascending one, and pages were selected in name order while the caller merged them in creation-date
      * order. A pager that quietly reinterprets its arguments is worse than one that cannot express them.
      */
-    private static AbsentIndexDescriptorSuppliers.DescriptorPager pagerFor(DescriptorStore store) {
+    private static AbsentIndexDescriptorSuppliers.DescriptorPager pagerFor(DescriptorPrefixBackend store) {
         // Names and creation dates only. T5 measured that decoding the full descriptor for every hit is a
         // quarter to a third of what a page costs, and pagination reads exactly these two fields.
         return store::findNamesForPage;

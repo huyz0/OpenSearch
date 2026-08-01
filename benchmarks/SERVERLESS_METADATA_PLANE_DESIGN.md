@@ -1266,6 +1266,55 @@ registration fails two of its three tests.
 Four of the six are still unreachable. The difference from before is that they are now written down as such
 in a table rather than discoverable only by counting, and the two that were most load-bearing are fixed.
 
+### I1-I4: integration, and the defect it immediately found
+
+The batch was: composite backend, selectable by setting, wired by the plugin, proved by an end-to-end test.
+The first three landed. The fourth is muted with its finding recorded, which is the outcome this area's
+rules prescribe when something cannot be driven to green in one sitting.
+
+**I1, the composite.** `CompositeDescriptorBackend` takes point operations from one backend and prefix
+searches from another, because T3 established a bucket cannot serve the latter. This is what
+"make the backend selectable" actually requires; a straight swap would silently stop every wildcard
+matching anything created afterwards.
+
+**I2, the gate widened** to the two SPIs, with an overload preserving the one-store form so no existing
+caller churns. The publisher dual-writes when the two halves differ, which is what keeps wildcards
+answering while point reads move, and makes the switch reversible because the system index still holds
+everything.
+
+**I3, `serverless_storage.descriptor.backend`,** defaulting to `index`. Choosing `blob` and failing to
+resolve a container throws rather than falling back, because quietly serving descriptors from the index
+after the operator asked for the object store is a durability guarantee nobody would notice was missing.
+
+**I4b: the plugin has never installed the descriptor plane in a real node.** `createComponents` decided
+whether to install `DescriptorGate` from `SERVERLESS_STORAGE_ENABLED_SETTING.get(environment.settings())`.
+That setting is `IndexScope`, and OpenSearch **rejects index-scoped settings in node settings outright**,
+so the expression could never be true. The same condition also gated the shard suspension registry.
+
+Nothing caught it because every gated integration test calls `DescriptorGate.install` by hand inside the
+test method, so the plugin's own wiring was never the thing under test. A whole subsystem was correct,
+tested, and unreachable in production. That is the same shape as the six components the caller count found,
+at a much larger scale, and it was found only by writing a test that refused to install anything itself.
+
+Fixed with a node-scoped `serverless_storage.enabled`. Existing tests are unaffected, and the reason is
+worth stating: they never set it, and the old expression was always false, so their behaviour is identical.
+
+**I4 itself is muted, one layer deeper.** With the gate installing, gated creation reaches the blob backend
+and stops there. `BlobDescriptorBackend.createAsync` completes synchronously inside an already-completed
+future, and `DescriptorGate.registerCreator` runs on the cluster state thread, which the gate's own comment
+says must not block: *"registering the blocking put hung the node instead of failing, which is how the
+constraint was found."*
+
+The backend states that limitation in its own javadoc, written when nothing called it. This is the first
+caller that actually needs it lifted, and lifting it means threading an executor into the backend. All four
+test failures are downstream of the one cause: the descriptor never lands, so the wildcard finds nothing,
+the delete finds no index, and the write leaves a shard locked.
+
+**What the exercise demonstrated.** Twenty-two tasks of component work produced zero integration bugs
+because there was no integration. One integration test produced two on its first run, one of them a
+subsystem that could never have worked in production. Section 12's remaining items should be read with that
+in mind: the unwired components are not nearly done.
+
 ### T7 verification, including the part that looked like a regression
 
 247 descriptor and gated tests pass.
