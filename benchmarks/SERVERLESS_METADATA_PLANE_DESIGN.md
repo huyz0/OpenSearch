@@ -221,6 +221,74 @@ resolution to complete.
 That enumeration is a prerequisite for C1, not a follow-up to it. An unenumerated caller is a deadlock
 waiting for a cache miss, and cache misses are rare enough that it will not show up in testing.
 
+### 5.1 The enumeration, done
+
+Two seams reach the descriptor store, one directly and one through a synthesised metadata step:
+
+- `AbsentIndexDescriptorSuppliers.supply`, `exists`, `expandPrefix`, `page`, `supplyAll`.
+- `AbsentIndexRoutingSuppliers.resolve` and `resolveShard`, which call
+  `supply(state, indexName, indexMetadata)` with null metadata for a gated index, which calls
+  `synthesisedMetadata`, which calls the descriptor seam.
+
+Two helpers that look like they reach it do not, and the distinction is worth stating because it is not
+obvious from the call site. `allShards(ClusterState)` enumerates `state.metadata()` and calls
+`supply(state, indexMetadata)` with metadata already in hand, so a gated index is never enumerated and no
+lookup happens. `supply(ClusterState, IndexMetadata)` likewise. Only the name-keyed entry points hit the
+store.
+
+The classification. Thread context was verified from the enclosing type rather than assumed.
+
+**Group A: cannot block. Six sites.**
+
+| site | thread | path to the store |
+|---|---|---|
+| `DanglingIndicesState:195` | cluster applier, the class is a `ClusterStateListener` | direct `supply` |
+| `IndicesClusterStateService:874` | cluster applier | `resolveShard` |
+| `IndicesClusterStateService:896` | cluster applier | `resolveShard` |
+| `RoutingNodes:382` | whichever thread first calls `ClusterState.getRoutingNodes()`, which includes the applier and, via `AllocationService:724`, the cluster manager | `localShards` |
+| `ClusterStateHealth:103,187,264` | cluster manager, constructed from `AllocationService` | `resolve` per index |
+| `ActiveShardCount:179` | dual: `ReplicationOperation` on a write thread, `ActiveShardsObserver` on the applier | `resolve` |
+
+`RestoreService:981` looks like it belongs here, being inside a `ClusterStateUpdateTask.execute` on the
+cluster manager thread, but it calls the no-argument `allShards(ClusterState)` and so never reaches the
+store.
+
+**Group B: has a request entry point, prefetchable.** `OperationRouting:346,541`,
+`TransportReplicationAction:1052`, `TransportBroadcastReplicationAction:179`, `TransportUpdateAction:222`,
+`IndexNameExpressionResolver:367,1245,1397`, `TransportAnalyzeAction:150`,
+`TransportGetFieldMappingsIndexAction:121`.
+
+**Group C: management or generic pool, blocking is acceptable.** The stats, cat, segments, recovery,
+force-merge, upgrade, clear-cache and ingestion-state actions, plus `IndexPaginationStrategy:110` and
+`ShardPaginationStrategy:123`. All reach the store through `allShards(state, concreteIndices)`, which calls
+`resolve` once per named index. Blocking is fine here, but M named indices is still M round trips, so these
+want the same batching C1 provides even though they do not need it for safety.
+
+### 5.2 What Group A means for the design
+
+Six sites is few enough to fix individually and too many to keep correct by discipline. Every future core
+change that reads metadata on the applier or cluster manager thread re-opens the hole, and the failure only
+appears on a cache miss, which is exactly the case testing does not produce.
+
+So the mechanism should make it impossible rather than forbidden. **The descriptor seam should refuse to
+perform I/O when called on a thread where blocking is unsafe**, returning null the way it already does for
+an unregistered supplier or a throwing one. A warm descriptor still answers from cache, because that costs
+no I/O. A cold one degrades to the same absence the seam already models, and every caller already handles
+absence because that is the contract.
+
+This is preferable to the enumeration alone for the reason T38 gave for landing site 1 with T39 rather than
+before it: it turns a silent design failure into a loud one. An applier thread that quietly blocks for 80 ms
+under load is invisible until it deadlocks. An applier thread that gets null and reports no shard available
+is a bug report.
+
+It also means C1's prefetch does not have to be exhaustive to be safe. Missing a Group B site costs a slow
+request, not a stalled cluster.
+
+Open question, not resolved here: whether the six Group A sites can tolerate absence semantically, or
+whether some of them need the descriptor badly enough that returning null is itself a correctness bug.
+`IndicesClusterStateService:874,896` is the one to check first, since T39 is building shard materialisation
+on top of exactly that call.
+
 ### Warmth, while we are here
 
 The related question of "which node has shard X warm" should not become stored per-shard state, because
@@ -370,8 +438,8 @@ It is a design and a reading of the existing code, not a measurement. Nothing he
 
 The load-bearing unmeasured claims, in the order they would hurt:
 
-- That the request-scoped prefetch actually covers the callers that matter. The enumeration has not been
-  done, and an unenumerated caller is a deadlock.
+- That the six Group A sites in section 5.1 can tolerate a null descriptor. The enumeration is done and
+  the thread contexts are verified, but whether absence is semantically acceptable at each site is not.
 - That the descriptor cache hit rate is high enough to hide an object store round trip under a real tenant
   access distribution.
 - That the concurrently-active fraction is low enough for the fleet arithmetic in section 8 to be
