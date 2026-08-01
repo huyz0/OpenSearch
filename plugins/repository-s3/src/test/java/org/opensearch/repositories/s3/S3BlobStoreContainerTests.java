@@ -64,6 +64,7 @@ import software.amazon.awssdk.services.s3.model.ObjectIdentifier;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.s3.model.PutObjectResponse;
 import software.amazon.awssdk.services.s3.model.S3Error;
+import software.amazon.awssdk.services.s3.model.S3Exception;
 import software.amazon.awssdk.services.s3.model.S3Object;
 import software.amazon.awssdk.services.s3.model.ServerSideEncryption;
 import software.amazon.awssdk.services.s3.model.StorageClass;
@@ -88,6 +89,7 @@ import org.opensearch.test.OpenSearchTestCase;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.FileAlreadyExistsException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -702,6 +704,71 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
         } else {
             assertEquals(ServerSideEncryption.AES256, request.serverSideEncryption());
         }
+    }
+
+    /**
+     * The precondition that makes {@code failIfAlreadyExists} mean anything on S3.
+     *
+     * <p>Before this was wired up the flag was accepted and dropped, so a create-only write silently
+     * became an overwrite. That is not detectable from the outside, which is why this asserts on the
+     * request the SDK is handed rather than on an outcome: an assertion about behaviour would pass
+     * against a container that ignores the flag as long as the key happened to be free.
+     */
+    public void testSingleUploadSetsIfNoneMatchOnlyWhenFailIfAlreadyExists() throws IOException {
+        for (boolean failIfAlreadyExists : new boolean[] { true, false }) {
+            final S3BlobStore blobStore = mock(S3BlobStore.class);
+            when(blobStore.bucket()).thenReturn("bucket");
+            when(blobStore.bufferSizeInBytes()).thenReturn(ByteSizeUnit.MB.toBytes(1));
+            when(blobStore.getStatsMetricPublisher()).thenReturn(new StatsMetricPublisher());
+            when(blobStore.serverSideEncryptionType()).thenReturn(ServerSideEncryption.AES256.toString());
+
+            final S3Client client = mock(S3Client.class);
+            when(blobStore.clientReference()).thenReturn(new AmazonS3Reference(client));
+            final ArgumentCaptor<PutObjectRequest> captor = ArgumentCaptor.forClass(PutObjectRequest.class);
+            when(client.putObject(captor.capture(), any(RequestBody.class))).thenReturn(PutObjectResponse.builder().build());
+
+            final S3BlobContainer blobContainer = new S3BlobContainer(BlobPath.cleanPath(), blobStore);
+            blobContainer.executeSingleUpload(blobStore, "blob", new ByteArrayInputStream(new byte[8]), 8, null, null, failIfAlreadyExists);
+
+            if (failIfAlreadyExists) {
+                assertEquals("create-only write must carry the precondition", "*", captor.getValue().ifNoneMatch());
+            } else {
+                assertNull("an overwriting write must not carry it", captor.getValue().ifNoneMatch());
+            }
+        }
+    }
+
+    /**
+     * 412 is S3 saying the key was already there, and callers must see the same exception
+     * {@code FsBlobContainer} throws so one catch covers both.
+     */
+    public void testSingleUploadTranslatesPreconditionFailedToFileAlreadyExists() {
+        final S3BlobStore blobStore = mock(S3BlobStore.class);
+        when(blobStore.bucket()).thenReturn("bucket");
+        when(blobStore.bufferSizeInBytes()).thenReturn(ByteSizeUnit.MB.toBytes(1));
+        when(blobStore.getStatsMetricPublisher()).thenReturn(new StatsMetricPublisher());
+        when(blobStore.serverSideEncryptionType()).thenReturn(ServerSideEncryption.AES256.toString());
+
+        final S3Client client = mock(S3Client.class);
+        when(blobStore.clientReference()).thenReturn(new AmazonS3Reference(client));
+        when(client.putObject(any(PutObjectRequest.class), any(RequestBody.class))).thenThrow(
+            S3Exception.builder().statusCode(412).message("At least one of the pre-conditions you specified did not hold").build()
+        );
+
+        final S3BlobContainer blobContainer = new S3BlobContainer(BlobPath.cleanPath(), blobStore);
+
+        expectThrows(
+            FileAlreadyExistsException.class,
+            () -> blobContainer.executeSingleUpload(blobStore, "blob", new ByteArrayInputStream(new byte[8]), 8, null, null, true)
+        );
+
+        // And a 412 with the flag off is not a precondition failure at all, so it stays a plain IOException
+        // rather than being reported as a name collision that never happened.
+        final IOException wrapped = expectThrows(
+            IOException.class,
+            () -> blobContainer.executeSingleUpload(blobStore, "blob", new ByteArrayInputStream(new byte[8]), 8, null, null, false)
+        );
+        assertFalse(wrapped instanceof FileAlreadyExistsException);
     }
 
     public void testExecuteMultipartUploadBlobSizeTooLarge() {

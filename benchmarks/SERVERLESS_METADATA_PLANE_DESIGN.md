@@ -616,3 +616,24 @@ testConcurrentPutIfAbsentAcrossSeparateContainersHasExactlyOneWinner FAILED
 Two winners on one put-if-absent, which is the lost update. With the fix restored, 8 tests, 0 failures.
 A concurrency test that has never been shown to fail is a test that asserts nothing, and this area has
 shipped one of those before.
+
+### T5: the create-only contract, asserted on both sides
+
+Three tests, and each was run against a deliberately broken build before being believed.
+
+**S3, on the request rather than the outcome.** `testSingleUploadSetsIfNoneMatchOnlyWhenFailIfAlreadyExists`
+captures the `PutObjectRequest` and asserts `ifNoneMatch` is `"*"` with the flag set and null without it.
+Asserting on an outcome would have been the weaker test: a container that ignores the flag still succeeds
+whenever the key happens to be free, which is every time in a unit test. Deleting the `ifNoneMatch` line
+gives `expected:<*> but was:<null>`.
+
+**S3, on the error translation.** `testSingleUploadTranslatesPreconditionFailedToFileAlreadyExists` asserts
+a 412 becomes `FileAlreadyExistsException` with the flag set, and stays a plain `IOException` without it,
+so a 412 arriving for some other reason is not reported as a name collision that never happened.
+
+**Fs, on the contract itself.** `testWriteBlobHonoursFailIfAlreadyExists` had no equivalent anywhere, which
+is how the S3 divergence survived: the behaviour was only ever exercised where it already worked. It also
+asserts the original survives the rejected write rather than being half-replaced, and that the flag being
+off still overwrites, since the flag is a choice between two behaviours rather than a safety toggle.
+
+`repository-s3` 51 tests, `FsBlobContainerTests` and `FsBlobContainerRegisterTests` green.
