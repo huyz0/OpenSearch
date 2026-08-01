@@ -53,6 +53,28 @@ public class ComputedPlacementMembershipService implements ClusterStateListener 
      */
     private final Runnable onPlacementRegistered = this::publishIfElected;
 
+    /**
+     * How many consecutive elected-cluster-manager observations a member may be missing before it is
+     * treated as gone.
+     *
+     * <p>Not a tuned number so much as a stated one. Every cluster state change this node applies is an
+     * observation, so this is "absent across a sustained run of cluster activity" rather than a duration.
+     * Too low resurrects the C13 failure, where a restarting node's shards move to nodes holding none of
+     * its data and recover empty while looking healthy. Too high leaves rendezvous weight on nodes that
+     * are never coming back, which under scale-to-zero is permanent rather than transient. Ten is chosen
+     * to be clearly on the safe side of that first failure, and should be re-derived against a real
+     * restart profile before anyone relies on the exact value.
+     */
+    static final long ABSENT_OBSERVATIONS_BEFORE_DECOMMISSION = 10;
+
+    /**
+     * Consecutive absences per member, held only on the elected cluster manager.
+     *
+     * <p>Deliberately not persisted. See {@link #decommissionable}: losing this delays a decommission and
+     * can never cause one, which is the direction that fails safely.
+     */
+    private final java.util.Map<String, Long> absentObservations = new java.util.concurrent.ConcurrentHashMap<>();
+
     public ComputedPlacementMembershipService(ClusterService clusterService) {
         this.clusterService = clusterService;
         // Publish as soon as placement is enabled rather than waiting for the next unrelated cluster
@@ -76,7 +98,7 @@ public class ComputedPlacementMembershipService implements ClusterStateListener 
         }
         List<String> dataNodes = dataNodeIds(state);
         if (dataNodes.isEmpty() == false && get(state).withNodes(dataNodes) != get(state)) {
-            submitUpdate(dataNodes);
+            submitUpdate(dataNodes, List.of());
         }
     }
 
@@ -100,18 +122,50 @@ public class ComputedPlacementMembershipService implements ClusterStateListener 
         if (dataNodes.isEmpty()) {
             return;
         }
-        if (get(event.state()).withNodes(dataNodes) == get(event.state())) {
-            return; // already a superset, and withNodes returning the same instance is how we know
+        List<String> decommission = decommissionable(get(event.state()), dataNodes);
+        if (get(event.state()).withNodes(dataNodes) == get(event.state()) && decommission.isEmpty()) {
+            return; // already a superset with nothing to drop, and withNodes returning the same instance is how we know
         }
-        submitUpdate(dataNodes);
+        submitUpdate(dataNodes, decommission);
     }
 
-    private void submitUpdate(List<String> dataNodes) {
+    /**
+     * Members that have been absent long enough to be treated as gone rather than restarting.
+     *
+     * <p>Counted in consecutive observations rather than elapsed time. A wall clock says how long a node
+     * has been away and not whether anyone was watching, so a cluster manager that was itself restarting
+     * would see a long absence for a node that never left. Consecutive observations by an elected cluster
+     * manager are absences somebody actually saw.
+     *
+     * <p><b>The counter is in memory, and losing it is the safe direction.</b> A cluster manager election
+     * resets every count, which delays a decommission and never causes one. That asymmetry is deliberate:
+     * decommissioning a node that was merely restarting moves its shards to nodes holding none of its data,
+     * and those recover empty while looking healthy, which is what C13 hit and it is silent. Waiting longer
+     * costs requests that fail and retry, which is loud and self-correcting.
+     */
+    private List<String> decommissionable(ComputedPlacementMembership membership, List<String> presentDataNodes) {
+        for (String present : presentDataNodes) {
+            absentObservations.remove(present);
+        }
+        List<String> gone = new ArrayList<>();
+        for (String member : membership.nodeIds()) {
+            if (presentDataNodes.contains(member)) {
+                continue;
+            }
+            long absences = absentObservations.merge(member, 1L, Long::sum);
+            if (absences >= ABSENT_OBSERVATIONS_BEFORE_DECOMMISSION) {
+                gone.add(member);
+            }
+        }
+        return gone;
+    }
+
+    private void submitUpdate(List<String> dataNodes, List<String> decommission) {
         clusterService.submitStateUpdateTask("computed-placement-membership", new ClusterStateUpdateTask() {
             @Override
             public ClusterState execute(ClusterState currentState) {
                 ComputedPlacementMembership current = get(currentState);
-                ComputedPlacementMembership updated = current.withNodes(dataNodes);
+                ComputedPlacementMembership updated = current.withNodes(dataNodes).withoutNodes(decommission);
                 if (updated == current) {
                     return currentState;
                 }

@@ -460,12 +460,12 @@ results do it.
 
 ## 12. Where this stands, and what is next
 
-Sixteen tasks landed. Working tree clean, everything below verified by a test that was checked against a
+Seventeen tasks landed. Working tree clean, everything below verified by a test that was checked against a
 deliberately broken build before being believed.
 
 **Done.** T1 (caller enumeration), T2 (register semantics), T3 (store audit), T4 (S3 conditional create),
 T5 (create-only contract tests), T21 (Fs register lock), T22 (`createRegisterIfAbsent`), T6 (backend
-interfaces), T7 (cache extraction), T8 (blob backend), T9 (idempotent creation), T10 (tombstones), T11 (cache instrumentation), T12 (change log), T16 (membership epochs), T18 (derived warmth).
+interfaces), T7 (cache extraction), T8 (blob backend), T9 (idempotent creation), T10 (tombstones), T11 (cache instrumentation), T12 (change log), T16 (membership epochs), T17 (decommission), T18 (derived warmth).
 
 Two commits are formatting-only sweeps, separated out rather than buried. **The branch base does not pass
 `spotlessCheck`** in either `:server` or `:plugins:serverless-storage`, so a precommit build fails there
@@ -476,7 +476,6 @@ for reasons unrelated to any change. Worth fixing at the base rather than paying
 | | task | note |
 |---|---|---|
 | T13, T14, T15 | name index fed from the change log, checkpointed, rebuildable from LIST | T3: this gates removing the system index, not adding the blob backend |
-| T17 | decommission after K absent epochs | the policy that decides when to call `withoutNodes` |
 | T19, T20 | point lookup and cache hit rate benchmarks | the numbers the whole approach rests on, and neither is measured |
 
 **Still blocked on T39** in the sibling worktree: C2 (`routingNumShards` on the descriptor) and C5
@@ -917,6 +916,25 @@ needed a freshness check that this does not.
 Six tests, one of which re-derives S12's structural claim independently: a single node joining leaves no
 shard without a warm candidate, checked across two thousand shards, because one new node can displace at
 most one of K.
+
+### T17: decommission counted in observations, not elapsed time
+
+A member absent from `DiscoveryNodes` across ten consecutive elected-cluster-manager observations is
+removed with `withoutNodes`.
+
+**Observations rather than a duration**, because a wall clock says how long a node has been away and not
+whether anyone was watching. A cluster manager that was itself restarting would see a long absence for a
+node that never left. Consecutive observations are absences somebody actually saw.
+
+**The counter is in memory and losing it is the safe direction.** A cluster manager election resets every
+count, which delays a decommission and can never cause one. That asymmetry is the whole design:
+decommissioning a node that was merely restarting moves its shards to nodes holding none of its data and
+they recover empty while looking healthy, which is C13 and it is silent. Waiting too long costs requests
+that fail and retry, which is loud and self-correcting. Persisting the counter would trade a loud failure
+for a quiet one.
+
+Ten is stated rather than tuned, and should be re-derived against a real restart profile before anyone
+relies on the exact value.
 
 ### T7 verification, including the part that looked like a regression
 
