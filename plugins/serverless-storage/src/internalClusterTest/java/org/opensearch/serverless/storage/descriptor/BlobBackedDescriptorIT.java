@@ -47,19 +47,19 @@ import java.util.concurrent.TimeUnit;
  * {@link #testTheDescriptorReallyLivesInTheObjectStore} goes further and reads the descriptor out of the
  * store directly.
  */
-@org.apache.lucene.tests.util.LuceneTestCase.AwaitsFix(bugUrl = "I4. The answer is neither candidate: the blob-backed descriptor write WORKS. Run "
-    + "testAGatedIndexCanBeCreatedResolvedAndSearchedOnTheBlobBackend alone and awaitDescriptor "
-    + "passes; the failure moves to 'Shard [tenant-alpha][0] is still locked after 5 sec waiting', "
-    + "which is a teardown assertion, not a descriptor one. "
-    + "Ruled out along the way, each by direct evidence rather than by reasoning: a path mismatch "
-    + "(after a create the base path holds descriptors-root/descriptors, exactly where "
-    + "DescriptorEnumerator looks); a dead write path (it writes in isolation); and a race (a 30s "
-    + "wait does not help when the whole class runs). "
-    + "What is left is two lifecycle problems, both outside the descriptor store. First, a gated "
-    + "shard's lock is not released at teardown, so the cluster does not come down cleanly. Second, "
-    + "the four tests share one cluster and one base path, and three of them fail only when run "
-    + "together, so state from an earlier test is interfering. Fix the lock leak first: it is the "
-    + "one that is a product defect rather than a fixture one, and it plausibly causes the second.")
+@org.apache.lucene.tests.util.LuceneTestCase.AwaitsFix(bugUrl = "I4. Debug run narrows it further and the answer is suspect 2, with one caveat. In the "
+    + "captured output for a single-test run, 'opening gated shard on demand' appears ZERO times "
+    + "while ordinary creation lines for the same index do appear: MergeSchedulerConfig initialising "
+    + "tenant-alpha, and PluginsService onIndexModule for tenant-alpha/8Ryh7kEDTvarIUIOXB0myA. So the "
+    + "shard holding the lock is built by the ordinary index path, not by T39's on-demand path, and "
+    + "the recovery-source theory (suspect 1) is not what is happening. "
+    + "The caveat, stated because it changes what this proves: it was not confirmed that "
+    + "-Dtests.loggers.levels actually took effect, so 'zero lines' could mean the path did not run "
+    + "or that DEBUG was never enabled. Confirm by asserting on a line the same logger emits at INFO "
+    + "before concluding. "
+    + "If it holds, the question becomes why an index that assertGated says is absent from cluster "
+    + "state is nonetheless going through ordinary creation, which would mean the premise guard is "
+    + "weaker than it reads: hasIndex(name) false does not by itself establish the index was gated.")
 public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
 
     private volatile java.nio.file.Path sharedBasePath;
