@@ -1361,3 +1361,100 @@ with `ClusterService is null`. Those were checked against the base by stashing t
 19 failures there too. Pre-existing and unrelated, but assumed-unrelated would not have been good enough,
 because "an unexplained failure is a residency assumption until proven otherwise" applies to unexplained
 passes on unrelated suites as well.
+
+### I4 resolved: five faults behind one shard lock
+
+The class is unmuted and all four tests pass. Getting there meant peeling off five separate faults, four of
+them defects in production code rather than in the fixture. Each was verified by breaking it again and
+watching the suite fail, because on this branch a fix nobody has seen fail is a guess.
+
+**The lock was never the bug.** "Shard [tenant-alpha][0] is still locked after 5 sec" is what the framework
+reports when any index is still open at teardown, and every one of the five faults ended there. Three
+sessions were spent theorising about recovery sources and shard lifecycles on the strength of that message.
+
+1. **A gated index could be created and never deleted.** `MetadataDeleteIndexService` called
+   `Metadata.getIndexSafe` on a name the resolver had just resolved to a concrete `Index` carrying the
+   descriptor's uuid, and threw "no such index". Creation had grown a branch for gating and deletion never
+   had. The first fix put the branch inside the cluster state update task and it did nothing at all, because
+   `AbsentIndexDescriptorSuppliers` refuses to answer on that thread -- C1's own guard, working correctly,
+   against code asking in the one place forbidden to ask.
+
+2. **The descriptor store recorded a descriptor for its own system index.** Deleting the store issued a
+   write to the store, which auto-created it again.
+
+3. **A descriptor write to a missing store auto-created it with dynamic mappings.** `putAsync` and
+   `submitTombstone` went straight to an `IndexRequest` with no bootstrap, so whichever path touched the
+   store first decided its mapping. `name` became a text field, every prefix query then failed, and point
+   reads kept working -- a cluster that looks healthy with wildcards permanently broken. Unrecoverable once
+   reached, since a put-mapping cannot change a field's type.
+
+4. **Gated creation never reached the prefix half.** It is the one write that does not go through the
+   publisher, so an index created on the blob backend was resolvable by name and invisible to every
+   wildcard, forever. The fix had to be chained into the future creation waits on, not fired and forgotten:
+   fire-and-forget let the creation write land after a tombstone and resurrect a deleted name as `OPEN`.
+
+5. **A gated delete does not close the index's shards** (D2). Nothing tells the holding node, because a
+   gated delete produces no cluster state change by design. Closed for now by a sweep on each node, with the
+   interval as a setting and a stated default of a minute. The push version belongs on the change feed and
+   is not built. The sweep closes rather than deletes, which is what makes an ambiguous answer safe: a
+   descriptor that will not resolve may mean deleted or may mean briefly unreadable, and closing a shard
+   that turns out to be live costs one cold start because T39 reopens it on demand.
+
+**The fixture was wrong in a way that made every diagnosis worse.** `sharedBasePath` was an instance field
+while the cluster is per-suite, so only the first test's base path matched the one the nodes were configured
+with. Three of the four tests had never been able to pass. Running a single test "to narrow the problem" was
+not narrowing anything -- it was selecting the one case that works, and it made a fixture bug look like a
+race.
+
+**Two pieces of instrumentation were themselves wrong**, which is worth more than the fixes.
+`-Dtests.loggers.levels` does not take effect in this harness at all. An earlier session read "zero lines"
+from a DEBUG probe and drew a conclusion about which code path ran; it was measuring nothing. Confirmed by
+asserting on a DEBUG line the same class emits on the ordinary path and finding that absent too. And the
+first teardown quiesce waited for a wildcard to *stop* matching, which an empty store satisfies exactly as
+well as a tombstoned one, so it returned immediately with every retry still pending. Both have the same
+shape as the bugs they were hunting: an observation that cannot distinguish "nothing there" from "not
+looked yet".
+
+**What I4 cost, against what it bought.** Four production defects, three of which would have been invisible
+in any component test because each needs two subsystems and a real cluster to appear, and none of which any
+amount of reading found across three sessions. That is the same lesson as the wiring pass, arriving again:
+components that pass in isolation say nothing about whether the system works.
+
+### The regression the targeted test could never have caught
+
+I4's own class was green through every step of this, including the step that broke five other suites. Worth
+writing down, because the reason is general.
+
+The D2 sweep's first version held `synchronized (this)` across `indicesService.removeIndex`. That monitor is
+the one `applyClusterState` takes, closing a shard is slow, and the sweep runs on GENERIC, so a sweep stalled
+cluster state application on its node until it finished. It surfaced as an unrelated index delete returning
+"not acked" -- in `ServerlessStorageWriterFailoverIT`, `ShardResidencyCostIT`, `WildcardPrefixCostIT` and two
+others, none of which this work touched, and all of which passed in isolation.
+
+`BlobBackedDescriptorIT` could not have found it: the class sets the sweep interval explicitly, so it never
+depended on the default and never generated the contention. A green targeted test said nothing at all about
+the change's effect on the system.
+
+**What the numbers say, and why the wall clock mattered more than the failures.**
+
+| | baseline | broken sweep | sweep off | sweep on, lock fixed |
+|---|---|---|---|---|
+| passing | 70 | 141 | 165 | 165 |
+| failing | 23 | 20 | 14 | 14 |
+| skipped | 118 | 2 | 2 | 2 |
+| class-level aborts | 8 | 0 | 0 | 0 |
+| wall clock | -- | 12m37s | 6m35s | 6m41s |
+
+The suite taking twice as long is what identified this as contention rather than a flaky handful. Failure
+counts alone would have supported "these five are load-sensitive, they pass in isolation, move on" -- which
+is the conclusion this branch has reached before about `ComputedPlacementCostTests` and would have been wrong
+here.
+
+**Comparing against the base was not optional.** The first reading of the diff looked like twelve new
+failures. Eight of the baseline's sixteen were `classMethod` aborts -- whole classes failing in teardown on
+the shard lock -- which skipped 118 tests. Fixing the lock let those classes run, so tests that had never
+executed appeared as new failures. Six of them genuinely fail and are now visible rather than hidden; that is
+the honest description, and it is neither a regression nor a win.
+
+Net: 70 passing to 165, no regressions, six real defects in the gated creation paths that were previously
+masked. Those six are the next thing to look at.

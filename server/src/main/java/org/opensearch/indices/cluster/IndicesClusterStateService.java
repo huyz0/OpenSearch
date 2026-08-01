@@ -61,6 +61,7 @@ import org.opensearch.common.Nullable;
 import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.lifecycle.AbstractLifecycleComponent;
+import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.AbstractRunnable;
@@ -100,6 +101,7 @@ import org.opensearch.indices.replication.common.ReplicationState;
 import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.search.SearchService;
 import org.opensearch.snapshots.SnapshotShardsService;
+import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
@@ -268,20 +270,111 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
         this.referencedSegmentsPublisher = referencedSegmentsPublisher;
     }
 
+    /**
+     * How often a node checks whether the gated indices it opened on demand still exist.
+     *
+     * <p>Zero disables the sweep, which is what an ordinary cluster wants: with no descriptor supplier
+     * installed nothing is ever opened on demand, so the sweep would have nothing to walk.
+     */
+    public static final Setting<TimeValue> GATED_SHARD_SWEEP_INTERVAL_SETTING = Setting.timeSetting(
+        "indices.gated.deleted_shard_sweep_interval",
+        TimeValue.timeValueSeconds(60),
+        TimeValue.ZERO,
+        Setting.Property.NodeScope
+    );
+
+    private volatile Scheduler.Cancellable gatedSweep;
+
     @Override
     protected void doStart() {
         // Doesn't make sense to manage shards on non-master and non-data nodes
         if (DiscoveryNode.isDataNode(settings) || DiscoveryNode.isClusterManagerNode(settings)) {
             clusterService.addHighPriorityApplier(this);
             indicesService.setOnDemandShardOpener(this::openComputedShardsOnDemand);
+            TimeValue interval = GATED_SHARD_SWEEP_INTERVAL_SETTING.get(settings);
+            if (interval.millis() > 0) {
+                gatedSweep = threadPool.scheduleWithFixedDelay(this::sweepDeletedGatedIndices, interval, ThreadPool.Names.GENERIC);
+            }
         }
     }
 
     @Override
     protected void doStop() {
         if (DiscoveryNode.isDataNode(settings) || DiscoveryNode.isClusterManagerNode(settings)) {
+            if (gatedSweep != null) {
+                gatedSweep.cancel();
+                gatedSweep = null;
+            }
             indicesService.setOnDemandShardOpener(null);
             clusterService.removeApplier(this);
+        }
+    }
+
+    /**
+     * Closes indices this node opened on demand whose descriptor is no longer there.
+     *
+     * <p><b>Why a sweep rather than an event.</b> Every other index closure on this node is driven by a
+     * cluster state diff, and a gated index never appears in one -- that is the point of gating. So a gated
+     * delete tells nobody: the cluster manager tombstones the descriptor and returns, and the node holding
+     * the shard has no way to hear about it. Left alone the shard stays open forever, holding its
+     * {@code NodeEnvironment} lock, its memory and its files, and still able to serve reads for an index the
+     * cluster says is gone. That is how this was found -- as a lock still held at test teardown, three
+     * layers downstream of the delete that should have released it.
+     *
+     * <p>The push version belongs on the change feed, which would let a node learn about a deletion the same
+     * way it learns about any other descriptor change. That is not built, and a sweep is the honest stand-in
+     * rather than a design: it trades latency, bounded by the interval, for needing nothing that does not
+     * already exist.
+     *
+     * <p><b>Closes rather than deletes, and that is what makes an ambiguous answer safe.</b> A descriptor
+     * that will not resolve may mean deleted or may mean the store is briefly unreadable, and no caller can
+     * tell the two apart -- the same ambiguity that stops {@code DanglingIndicesState} inferring deletion
+     * from absence. Deleting on that basis would discard live data. Closing does not: {@code
+     * NO_LONGER_ASSIGNED} leaves the contents on disk, and T39's on-demand opener rebuilds the shard on the
+     * next request that needs it. So the worst case of guessing wrong is one cold start, not data loss.
+     */
+    private void sweepDeletedGatedIndices() {
+        if (openedOnDemand.isEmpty() || AbsentIndexDescriptorSuppliers.isRegistered() == false) {
+            return;
+        }
+        // Runs on GENERIC, which is what lets it resolve a descriptor at all: the read is remote, and
+        // AbsentIndexDescriptorSuppliers refuses to answer on a cluster state thread because W4 measured that
+        // deadlocking. That is also why this cannot simply be folded into applyClusterState.
+        ClusterState state = clusterService.state();
+        for (Index index : List.copyOf(openedOnDemand)) {
+            if (state.metadata().index(index) != null) {
+                // Published after all, so the ordinary path owns its lifecycle now.
+                continue;
+            }
+            IndexMetadata descriptorMetadata;
+            try {
+                descriptorMetadata = AbsentIndexDescriptorSuppliers.metadataOrDescriptor(state.metadata(), index);
+            } catch (Exception e) {
+                logger.debug(() -> new ParameterizedMessage("[{}] could not be checked for deletion", index), e);
+                continue;
+            }
+            if (descriptorMetadata != null) {
+                continue;
+            }
+            // Claimed with an atomic remove, closed without holding this instance's monitor. The first
+            // version wrapped both in synchronized(this) and it cost five previously-passing suites: that
+            // monitor is the one applyClusterState takes, closing a shard is slow, and this runs on GENERIC,
+            // so a sweep would stall cluster state application on its node until it finished. The symptom
+            // was an unrelated index delete returning "not acked", nowhere near this code, only under
+            // whole-suite load, and passing in isolation. It also doubled the suite's wall clock, 6m35s to
+            // 12m37s, which is the part that says this was contention rather than bad luck.
+            //
+            // Giving up atomicity between the claim and the close is safe for the same reason closing is:
+            // if an on-demand open races in and rebuilds the shard, that costs a cold start, not an index.
+            if (openedOnDemand.remove(index) == false) {
+                continue;
+            }
+            logger.debug("{} closing gated index opened on demand, its descriptor is gone", index);
+            try {
+                indicesService.removeIndex(index, NO_LONGER_ASSIGNED, "gated index no longer has a descriptor");
+            } catch (Exception e) {
+                logger.warn(() -> new ParameterizedMessage("[{}] could not be closed after its descriptor went away", index), e);
+            }
         }
     }
 

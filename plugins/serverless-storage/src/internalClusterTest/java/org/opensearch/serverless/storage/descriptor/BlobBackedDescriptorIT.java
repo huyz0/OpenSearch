@@ -47,19 +47,6 @@ import java.util.concurrent.TimeUnit;
  * {@link #testTheDescriptorReallyLivesInTheObjectStore} goes further and reads the descriptor out of the
  * store directly.
  */
-@org.apache.lucene.tests.util.LuceneTestCase.AwaitsFix(bugUrl = "I4. Debug run narrows it further and the answer is suspect 2, with one caveat. In the "
-    + "captured output for a single-test run, 'opening gated shard on demand' appears ZERO times "
-    + "while ordinary creation lines for the same index do appear: MergeSchedulerConfig initialising "
-    + "tenant-alpha, and PluginsService onIndexModule for tenant-alpha/8Ryh7kEDTvarIUIOXB0myA. So the "
-    + "shard holding the lock is built by the ordinary index path, not by T39's on-demand path, and "
-    + "the recovery-source theory (suspect 1) is not what is happening. "
-    + "The caveat, stated because it changes what this proves: it was not confirmed that "
-    + "-Dtests.loggers.levels actually took effect, so 'zero lines' could mean the path did not run "
-    + "or that DEBUG was never enabled. Confirm by asserting on a line the same logger emits at INFO "
-    + "before concluding. "
-    + "If it holds, the question becomes why an index that assertGated says is absent from cluster "
-    + "state is nonetheless going through ordinary creation, which would mean the premise guard is "
-    + "weaker than it reads: hasIndex(name) false does not by itself establish the index was gated.")
 public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
 
     /**
@@ -119,6 +106,13 @@ public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.Se
             // Without this a gated index has no routing table at all, since computed placement supplies
             // one and is off by default. T36 found every earlier run of the sibling class lacked it.
             .put(ServerlessStoragePlugin.COMPUTED_PLACEMENT_ENABLED_SETTING.getKey(), true)
+            // A gated delete tells no node anything, so the shard it opened on demand is reclaimed by a
+            // sweep. The production default is a minute; a second here so a test does not spend one waiting
+            // for a reclamation whose latency is not what it is testing.
+            .put(
+                org.opensearch.indices.cluster.IndicesClusterStateService.GATED_SHARD_SWEEP_INTERVAL_SETTING.getKey(),
+                "1s"
+            )
             .build();
     }
 
@@ -188,7 +182,34 @@ public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.Se
             }
         }
         quiesceDescriptorWrites();
+        awaitGatedShardsClosed();
         created.clear();
+    }
+
+    /**
+     * Waits until no node still holds an index service for a deleted gated index.
+     *
+     * <p>Asserted rather than left to the framework's five second lock wait, because the two failures read
+     * identically and mean opposite things: a shard that has not been reclaimed yet and one that never will
+     * be both surface as "still locked". This names which one it is, and it is the only assertion in the
+     * class that covers the deletion path reaching the node that holds the data.
+     */
+    private void awaitGatedShardsClosed() throws Exception {
+        assertBusy(() -> {
+            for (org.opensearch.indices.IndicesService indices : internalCluster().getInstances(
+                org.opensearch.indices.IndicesService.class
+            )) {
+                for (String name : created) {
+                    for (org.opensearch.index.IndexService indexService : indices) {
+                        assertNotEquals(
+                            "[" + name + "] is deleted and a node still holds its index service, so its shards leak",
+                            name,
+                            indexService.index().getName()
+                        );
+                    }
+                }
+            }
+        }, 30, TimeUnit.SECONDS);
     }
 
     /**
