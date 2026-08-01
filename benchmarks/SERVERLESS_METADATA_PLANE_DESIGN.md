@@ -706,7 +706,44 @@ change. T3 established the one second window is wrong by two orders of magnitude
 and the fix is a long window with explicit invalidation from the change log rather than a larger number
 chosen by feel.
 
-**Verification, including the part that looked like a regression.** 247 descriptor and gated tests pass.
+### T8: the blob backend, and a third Fs/S3 divergence
+
+`BlobDescriptorBackend` implements the eight point operations over a `BlobContainer`, reusing
+`IndexDescriptor`'s existing `Writeable` form so there is one serialisation rather than two that drift.
+
+Keys are `descriptors/<name>`, flat and prefix-preserving. Not hashed, and the reason is not the obvious
+one: S3 already partitions adaptively on observed key distribution, so diverse tenant names spread without
+help, and the real hazard is monotonically increasing names landing in one partition. Hashing would buy
+little and cost the only path from the object store back to the name index, which is what makes that tier
+provably a cache rather than a second source of truth.
+
+`create` is one `createRegisterIfAbsent`. `available()` is unconditionally true, because there is nothing
+to bootstrap. `putTombstoneAsync` throws rather than writing under the descriptor prefix, since a tombstone
+there makes every LIST return dead names and forces a read per key to filter them; that belongs under its
+own uuid-keyed prefix and is its own task. Refusing loudly beats a version that would only be caught when a
+rebuild resurrected deleted indices.
+
+**A third way Fs and S3 disagreed.** `FsBlobContainer.compareAndSwapRegister` called
+`Files.createDirectories(path)`, the container root, rather than the register key's parent. A blob name
+carrying a path segment, which is how any store namespaces its keys, resolves below the container, so the
+open threw `NoSuchFileException`. S3 has no equivalent failure because its keys are flat strings. Fixed to
+create `registerPath.getParent()`.
+
+That is the third instance of the same shape in this branch, after the ignored `failIfAlreadyExists` flag
+and the per-instance register lock. The pattern is worth naming: **`FsBlobContainer` is the only
+implementation every test runs against, so anywhere it is more permissive than S3 the divergence is
+invisible, and anywhere it is less permissive it fails only when someone finally exercises the path.**
+
+**The test framework caught a bad test.** `testKeysArePrefixPreserving` first asserted an exact blob count
+and failed at 4 rather than 3, because Lucene's `ExtrasFS` deliberately drops an `extra0` file into test
+directories to catch code assuming a directory holds only what it wrote. The assertion was doing exactly
+that. Rewritten to assert which names a prefix selects, which is the property a rebuild actually needs.
+
+8 backend tests pass, and the server-side `FsBlobContainer` suites still pass with the directory fix.
+
+### T7 verification, including the part that looked like a regression
+
+247 descriptor and gated tests pass.
 The full plugin suite reports 1,242 tests with 19 failures, all in `ServerlessStoragePluginTests` and all
 with `ClusterService is null`. Those were checked against the base by stashing the change and re-running:
 19 failures there too. Pre-existing and unrelated, but assumed-unrelated would not have been good enough,

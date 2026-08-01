@@ -329,7 +329,12 @@ public class FsBlobContainer extends AbstractBlobContainer {
     public BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
         throws IOException {
         Path registerPath = path.resolve(blobName);
-        Files.createDirectories(path);
+        // The register's own parent, not the container root. A blob name carrying a path segment, which is
+        // how a store namespaces its keys, resolves below the container, and creating only the root left
+        // the open() below throwing NoSuchFileException. S3 has no equivalent failure because its keys are
+        // flat strings, so this was a third way for the two implementations to disagree about a call that
+        // works against one of them.
+        Files.createDirectories(registerPath.getParent());
 
         ReentrantLock lock = registerLockFor(registerPath);
         lock.lock();
