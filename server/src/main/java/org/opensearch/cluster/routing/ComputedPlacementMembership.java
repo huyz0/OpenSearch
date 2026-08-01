@@ -63,39 +63,80 @@ public final class ComputedPlacementMembership extends AbstractNamedDiffable<Cus
     public static final String TYPE = "computed_placement_membership";
 
     /** No members and version zero: what an unconfigured cluster has, and what placement declines on. */
-    public static final ComputedPlacementMembership EMPTY = new ComputedPlacementMembership(List.of(), 0L);
+    public static final ComputedPlacementMembership EMPTY = new ComputedPlacementMembership(List.of(), List.of(), 0L);
 
     private final List<String> nodeIds;
+
+    /**
+     * The membership one version ago, retained so warmth can be computed instead of stored.
+     *
+     * <p>This is the whole reason an epoch is more than a version number. "Which node holds shard X warm"
+     * is O(shards) if it is written down, which is the global structure this design exists to delete. It is
+     * O(nodes) if it is derived: rendezvous-hash the shard against the previous member list and the answer
+     * is where it used to live, available to any coordinator in the nanoseconds a lookup costs.
+     *
+     * <p>One generation, not N. Two is enough to answer "where was this before the change that just
+     * happened", and each extra one is more cluster state for a question nobody asks. A shard that has
+     * missed two membership changes has no warm holder worth chasing.
+     */
+    private final List<String> previousNodeIds;
+
     private final long version;
 
-    private ComputedPlacementMembership(List<String> sortedNodeIds, long version) {
+    private ComputedPlacementMembership(List<String> sortedNodeIds, List<String> previousNodeIds, long version) {
         this.nodeIds = sortedNodeIds;
+        this.previousNodeIds = previousNodeIds;
         this.version = version;
     }
 
     /** Builds a membership from any collection of node ids, sorting and deduplicating them. */
     public static ComputedPlacementMembership of(Iterable<String> nodeIds, long version) {
+        return of(nodeIds, List.of(), version);
+    }
+
+    /** Builds a membership that also remembers the list it replaced. */
+    public static ComputedPlacementMembership of(Iterable<String> nodeIds, Iterable<String> previousNodeIds, long version) {
+        return new ComputedPlacementMembership(sortedCopyOf(nodeIds), sortedCopyOf(previousNodeIds), version);
+    }
+
+    private static List<String> sortedCopyOf(Iterable<String> nodeIds) {
         TreeSet<String> sorted = new TreeSet<>();
         for (String nodeId : nodeIds) {
             sorted.add(Objects.requireNonNull(nodeId, "node id must not be null"));
         }
-        return new ComputedPlacementMembership(List.copyOf(sorted), version);
+        return List.copyOf(sorted);
     }
 
     public ComputedPlacementMembership(StreamInput in) throws IOException {
         this.nodeIds = List.copyOf(in.readStringList());
         this.version = in.readVLong();
+        this.previousNodeIds = List.copyOf(in.readStringList());
     }
 
     @Override
     public void writeTo(StreamOutput out) throws IOException {
         out.writeStringCollection(nodeIds);
         out.writeVLong(version);
+        // After the version rather than beside the node ids, so the two lists cannot be transposed by a
+        // reader that gets the order wrong: a membership silently swapped with its own predecessor would
+        // place every shard one epoch in the past and look entirely healthy.
+        out.writeStringCollection(previousNodeIds);
     }
 
     /** The members, sorted, as placement expects them. */
     public List<String> nodeIds() {
         return Collections.unmodifiableList(nodeIds);
+    }
+
+    /**
+     * The members as of one version ago, or empty if this is the first.
+     *
+     * <p>Where a shard was warm before the most recent membership change. Empty is a real answer meaning
+     * "there is no previous epoch", not a missing one, so a caller finding it should fall back to the
+     * current membership rather than treat every shard as cold.
+     */
+    public List<String> previousNodeIds() {
+        return Collections.unmodifiableList(previousNodeIds);
     }
 
     /** Bumped whenever the membership changes, so a stale view is recognisable as stale. */
@@ -131,7 +172,35 @@ public final class ComputedPlacementMembership extends AbstractNamedDiffable<Cus
         if (changed == false) {
             return this;
         }
-        return of(merged, version + 1);
+        return of(merged, nodeIds, version + 1);
+    }
+
+    /**
+     * The membership with these nodes removed, or {@code this} when none of them are members.
+     *
+     * <p>Removal exists now, and the asymmetry that kept it out is still right for the case it was written
+     * for. A node absent because it is restarting must keep its membership, because moving its shards to
+     * nodes holding none of its data makes them recover empty while looking healthy, which is what C13 hit
+     * and it is silent.
+     *
+     * <p>What changed is that "absent" stopped being one condition. Under autoscaling with scale-to-zero,
+     * nodes genuinely leave, and a member list that only grows accumulates ids that will never come back.
+     * A growing share of rendezvous weight then lands on nodes that do not exist, and those requests fail
+     * and retry forever. So removal is expressible here and the decision about when to use it stays with
+     * the caller, which is the only place that can tell a restart from a departure.
+     */
+    public ComputedPlacementMembership withoutNodes(Iterable<String> departedNodeIds) {
+        List<String> remaining = new ArrayList<>(nodeIds);
+        boolean changed = false;
+        for (String nodeId : departedNodeIds) {
+            if (remaining.remove(nodeId)) {
+                changed = true;
+            }
+        }
+        if (changed == false) {
+            return this;
+        }
+        return of(remaining, nodeIds, version + 1);
     }
 
     @Override
@@ -177,12 +246,15 @@ public final class ComputedPlacementMembership extends AbstractNamedDiffable<Cus
             return false;
         }
         ComputedPlacementMembership other = (ComputedPlacementMembership) o;
-        return version == other.version && nodeIds.equals(other.nodeIds);
+        // previousNodeIds participates, because two memberships that differ only in what they replaced
+        // are genuinely different: warmth is derived from it, so treating them as equal would let a
+        // cluster state update carrying a corrected predecessor be dropped as a no-op.
+        return version == other.version && nodeIds.equals(other.nodeIds) && previousNodeIds.equals(other.previousNodeIds);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(nodeIds, version);
+        return Objects.hash(nodeIds, previousNodeIds, version);
     }
 
     @Override

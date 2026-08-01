@@ -460,12 +460,12 @@ results do it.
 
 ## 12. Where this stands, and what is next
 
-Fourteen tasks landed. Working tree clean, everything below verified by a test that was checked against a
+Fifteen tasks landed. Working tree clean, everything below verified by a test that was checked against a
 deliberately broken build before being believed.
 
 **Done.** T1 (caller enumeration), T2 (register semantics), T3 (store audit), T4 (S3 conditional create),
 T5 (create-only contract tests), T21 (Fs register lock), T22 (`createRegisterIfAbsent`), T6 (backend
-interfaces), T7 (cache extraction), T8 (blob backend), T9 (idempotent creation), T10 (tombstones), T11 (cache instrumentation), T12 (change log).
+interfaces), T7 (cache extraction), T8 (blob backend), T9 (idempotent creation), T10 (tombstones), T11 (cache instrumentation), T12 (change log), T16 (membership epochs).
 
 Two commits are formatting-only sweeps, separated out rather than buried. **The branch base does not pass
 `spotlessCheck`** in either `:server` or `:plugins:serverless-storage`, so a precommit build fails there
@@ -476,7 +476,7 @@ for reasons unrelated to any change. Worth fixing at the base rather than paying
 | | task | note |
 |---|---|---|
 | T13, T14, T15 | name index fed from the change log, checkpointed, rebuildable from LIST | T3: this gates removing the system index, not adding the blob backend |
-| T16, T17, T18 | membership epochs, decommission, warmth from epoch N-1 | independent of the descriptor work |
+| T17, T18 | decommission after K absent epochs, warmth from epoch N-1 | T16 landed the epoch; these are the policy and the consumer |
 | T19, T20 | point lookup and cache hit rate benchmarks | the numbers the whole approach rests on, and neither is measured |
 
 **Still blocked on T39** in the sibling worktree: C2 (`routingNumShards` on the descriptor) and C5
@@ -863,6 +863,38 @@ already succeeded. But a log that silently appends nothing reads exactly like a 
 four tests came back empty and the cause had already been logged and discarded. Added
 `failedAppendCount()`, and every test that appends now asserts it is zero. Swallowing a failure is a
 decision; making it unobservable is a defect.
+
+### T16: an epoch is a version number plus the list it replaced
+
+`ComputedPlacementMembership` already had a version. What it lacked was the previous member list and any
+way to shrink.
+
+**Retaining the predecessor is what makes warmth computable rather than stored.** "Which node holds shard X
+warm" is O(shards) if it is written down, which is the global structure this design exists to delete, and
+O(nodes) if it is derived: rendezvous the shard against the previous list and the answer is where it used
+to live. One generation, not N. Two epochs answer "where was this before the change that just happened",
+and a shard that has missed two membership changes has no warm holder worth chasing.
+
+**`withoutNodes` exists now, and the asymmetry it was omitted for is still right.** A node absent because
+it is restarting must keep its membership, because moving its shards to nodes holding none of its data
+makes them recover empty while looking healthy. What changed is that "absent" stopped being one condition:
+under autoscaling with scale-to-zero, nodes genuinely leave, and a list that only grows accumulates ids
+that never come back until a growing share of rendezvous weight lands on nodes that do not exist. So
+removal is expressible and the decision stays with the caller, which is the only place that can tell a
+restart from a departure. `withNodes` still cannot shrink.
+
+The existing `testMembershipNeverShrinks` javadoc said that if a removal API were ever added, that test
+should force the question of what happens to the data first. It did. The test was renamed and its
+reasoning updated rather than deleted, because the property it guards is still true and still the reason
+`withNodes` is separate.
+
+Two things that would have been quiet defects: the predecessor is serialised **after** the version rather
+than beside the node ids, so a reader with the order wrong cannot silently transpose a membership with its
+own predecessor and place every shard one epoch in the past while looking healthy. And it participates in
+`equals` and `hashCode`, or a cluster state update carrying a corrected predecessor would be dropped as a
+no-op.
+
+17 membership tests, 0 failures.
 
 ### T7 verification, including the part that looked like a regression
 
