@@ -16,6 +16,7 @@ import org.opensearch.cluster.ClusterStateListener;
 import org.opensearch.cluster.metadata.AliasMetadata;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.serverless.storage.descriptor.DescriptorChange;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -153,6 +154,76 @@ public class NameIndexService implements ClusterStateListener {
      * carried so a caller can tell a recreated index from its predecessor, and a 128-bit digest of the
      * real UUID preserves that distinction.
      */
+    /**
+     * Applies a batch of descriptor changes, which is the feed a gated index actually appears in.
+     *
+     * <p>The cluster state feed above cannot see one. A gated index has no metadata entry by construction,
+     * so this service has been blind to precisely the indices it exists to resolve. That is the same shape
+     * as the cache-affinity record that reads from {@code IndexMetadata} for indices that have none.
+     *
+     * <h4>Why order within a batch does not matter</h4>
+     *
+     * The change log has no total order, and cannot have one without serialising every descriptor write in
+     * the cluster behind a single key. So this is written to be order-insensitive and idempotent rather
+     * than to consume a sequence: a delete applies when the name currently maps to the uuid being deleted,
+     * and a create or update sets the name to its uuid outright.
+     *
+     * <p>The uuid check on delete is what makes replay safe. A stale delete for an index that has since
+     * been recreated would otherwise remove the live one, and the recreate is precisely the case where two
+     * entries for one name arrive with no defined order between them.
+     *
+     * @return how many changes actually altered the index, so a caller can tell a quiet feed from a
+     *         no-op one.
+     */
+    public int apply(List<DescriptorChange> changes) {
+        if (enabled == false) {
+            return 0;
+        }
+        // Two passes, because one is not order-independent and a test proved it. Applying in arrival
+        // order, a delete that arrives before its own create resurrects the index: the delete finds
+        // nothing to remove and the create then puts it back. Since the log has no order, that is not an
+        // edge case, it is a coin flip.
+        //
+        // Collecting the dead incarnations first makes the outcome a function of the batch's contents
+        // rather than its sequence. A tombstone is terminal for the uuid it names, which is exactly what
+        // T10 made it in the descriptor store, so this is the same rule read from the log.
+        java.util.Set<String> deadIncarnations = new java.util.HashSet<>();
+        for (DescriptorChange change : changes) {
+            if (change.live() == false) {
+                deadIncarnations.add(change.name() + "\u0000" + change.uuid());
+            }
+        }
+
+        int applied = 0;
+        for (DescriptorChange change : changes) {
+            byte[] uuid = uuidBytes(change.uuid());
+            IndexNameEntry existing = nameIndex.lookup(change.name());
+            boolean dead = deadIncarnations.contains(change.name() + "\u0000" + change.uuid());
+
+            if (dead) {
+                // Only remove the incarnation this refers to. Deleting by name alone would let a replayed
+                // delete take out an index recreated after it, and a recreate is precisely the case where
+                // two entries for one name arrive with no order between them.
+                if (existing != null && java.util.Arrays.equals(existing.getUuid(), uuid)) {
+                    nameIndex.delete(change.name());
+                    applied++;
+                }
+                continue;
+            }
+            if (existing == null || java.util.Arrays.equals(existing.getUuid(), uuid) == false) {
+                if (existing != null) {
+                    nameIndex.delete(change.name());
+                }
+                nameIndex.create(change.name(), uuid, IndexNameEntry.STATUS_OPEN);
+                applied++;
+            }
+        }
+        if (applied > 0) {
+            nameIndex.maybeRebuild();
+        }
+        return applied;
+    }
+
     private static byte[] uuidBytes(String uuid) {
         byte[] source = uuid.getBytes(StandardCharsets.UTF_8);
         byte[] out = new byte[CompactNameIndex.UUID_LENGTH];

@@ -460,12 +460,12 @@ results do it.
 
 ## 12. Where this stands, and what is next
 
-Twenty tasks landed. Working tree clean, everything below verified by a test that was checked against a
+Twenty-one tasks landed. Working tree clean, everything below verified by a test that was checked against a
 deliberately broken build before being believed.
 
 **Done.** T1 (caller enumeration), T2 (register semantics), T3 (store audit), T4 (S3 conditional create),
 T5 (create-only contract tests), T21 (Fs register lock), T22 (`createRegisterIfAbsent`), T6 (backend
-interfaces), T7 (cache extraction), T8 (blob backend), T9 (idempotent creation), T10 (tombstones), T11 (cache instrumentation), T12 (change log), T16 (membership epochs), T15 (descriptor enumeration), T17 (decommission), T18 (derived warmth), T14 (checkpoint store), T20 (cache hit rate).
+interfaces), T7 (cache extraction), T8 (blob backend), T9 (idempotent creation), T10 (tombstones), T11 (cache instrumentation), T12 (change log), T16 (membership epochs), T15 (descriptor enumeration), T17 (decommission), T18 (derived warmth), T13 (name index feed), T14 (checkpoint store), T20 (cache hit rate).
 
 Two commits are formatting-only sweeps, separated out rather than buried. **The branch base does not pass
 `spotlessCheck`** in either `:server` or `:plugins:serverless-storage`, so a precommit build fails there
@@ -475,7 +475,6 @@ for reasons unrelated to any change. Worth fixing at the base rather than paying
 
 | | task | note |
 |---|---|---|
-| T13 | `NameIndexService` fed from the change log rather than cluster state | the last piece of wiring; T12, T14 and T15 are its inputs |
 | T19 | point lookup latency, system index against blob | needs a real object store; measuring it against `FsBlobContainer` would report local disk speed as an object store result |
 
 **Still blocked on T39** in the sibling worktree: C2 (`routingNumShards` on the descriptor) and C5
@@ -1035,6 +1034,29 @@ unreadable newest checkpoint falls back to a rebuild rather than to an older che
 structure with a newer feed position skips everything between them.
 
 Five tests.
+
+### T13: the feed a gated index appears in, and a test that caught my own claim
+
+`NameIndexService.apply(List<DescriptorChange>)` consumes the change log. The cluster state feed it had
+cannot see a gated index at all, since one has no metadata entry by construction, so the service was blind
+to precisely the indices it exists to resolve. That is the same shape as the cache-affinity record reading
+`IndexMetadata` for indices that have none.
+
+**The first version claimed to be order-insensitive and was not.** Applying in arrival order, a delete that
+arrives before its own create resurrects the index: the delete finds nothing to remove and the create then
+puts it back. With no order in the log that is a coin flip rather than an edge case. The test asserting
+order-independence failed, which is what the assertion was for.
+
+Fixed with two passes. The first collects every incarnation the batch deletes, the second applies creates
+only for incarnations that survive it, so the outcome is a function of the batch's contents rather than its
+sequence. A tombstone is terminal for the uuid it names, which is what T10 made it in the descriptor store,
+so this is that rule read back from the log.
+
+The uuid on a change is what keeps replay safe. A stale delete applied by name alone would remove an index
+recreated after it, and delete-then-recreate is exactly the case that produces two entries for one name
+with no order between them. That is a silent data-visibility loss, and it has its own test.
+
+Six tests, plus a full pass over the descriptor, name index and placement suites: 384 tests, 0 failures.
 
 ### T7 verification, including the part that looked like a regression
 
