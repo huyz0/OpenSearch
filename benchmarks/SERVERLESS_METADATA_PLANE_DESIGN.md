@@ -425,10 +425,13 @@ these files appear in T39's working set.
 epochs. C2 once `IndexDescriptor` is free. P3 and P4 last, because they are optimisations of a path that
 has to work before it can be made cheap.
 
-**One check before P1 is worth building.** The register API may cap value size. A descriptor is small, but
-if the cap bites, split the uniqueness token from the descriptor body and keep the token name-only. The
-uniqueness key must never include the uuid: two clients creating the same name with different uuids would
-write different keys and both conditional PUTs would succeed.
+**Two blob-layer defects found before P1, both filed.** T2 checked whether the register API caps value size
+(it does not, so a descriptor fits) and found two things worth fixing first: `FsBlobContainer`'s CAS does
+not arbitrate across container instances, which silently disarms the test arm, and the create path does a
+GET that the conditional PUT makes redundant. Section 11 has both.
+
+**The uniqueness key must never include the uuid.** Two clients creating the same name with different uuids
+would write different keys and both conditional PUTs would succeed. Name-only, always.
 
 ---
 
@@ -448,3 +451,46 @@ The load-bearing unmeasured claims, in the order they would hurt:
 
 Corrections go in this file with the reason they were wrong, kept rather than deleted, the way the spike
 results do it.
+
+---
+
+## 11. Implementation findings
+
+Recorded as the tasks land. T1's result is structural enough that it lives in section 5.1 instead.
+
+### T2: the register primitive, and two things it does that the design assumed away
+
+**There is no value-size cap, so a descriptor fits.** The wire format is an 8-byte generation followed by
+arbitrary bytes, in both `S3BlobContainer` and `FsBlobContainer`. `BlobRegister`'s javadoc calls a register
+"a small blob" but nothing enforces it. S8 measured the serialised descriptor at well under a kilobyte, so
+the uniqueness token does not need splitting from the descriptor body after all. That removes the caveat
+section 9 attached to P1.
+
+**The generation lives in the body, not in the ETag,** which is why `readRegister` reads the whole object
+and why a CAS cannot be a single conditional PUT.
+
+**A CAS is two round trips, and a creation does not need to be.** `S3BlobContainer.compareAndSwapRegister`
+does a GET, compares generations as a fast-fail, then does the conditional PUT. Three round trips on
+conflict, because the 412 handler re-reads to report the conflicting generation.
+
+For creation specifically, `expectedGeneration` is `ABSENT_GENERATION` and the GET exists only to discover
+that `currentETag == null`, which selects `ifNoneMatch("*")`. But `ifNoneMatch("*")` is create-if-absent
+already, evaluated atomically by S3, and the method's own javadoc says the conditional PUT is the
+authoritative check and the read is "purely as a fast-fail." So the GET on the create path is provably
+redundant.
+
+Skipping it halves the latency and the request cost of every index creation. At the scale this design
+targets, index creation is the throughput story, so this is worth a dedicated `createRegisterIfAbsent`
+rather than a comment. Filed as its own task.
+
+**`FsBlobContainer`'s CAS does not arbitrate across container instances, which breaks the test arm.**
+`registerLocksByBlobName` is a `private final` instance field holding a `ReentrantLock` per blob name. Two
+`FsBlobContainer` objects over the same directory therefore share no lock. Both read the same generation,
+both pass the equality check, both write, and the second silently wins.
+
+Internal cluster tests run several nodes in one JVM with their own container instances, so a test asserting
+"exactly one of N concurrent creators wins the name" would be measuring nothing. That is precisely what
+task 5 exists to verify, and precisely the "fails by succeeding" shape this area keeps producing.
+
+The channel is already open under `FileChannel.open`, so `FileChannel.lock()` on it would arbitrate across
+instances and across processes. Filed as its own task, and it blocks task 5.
