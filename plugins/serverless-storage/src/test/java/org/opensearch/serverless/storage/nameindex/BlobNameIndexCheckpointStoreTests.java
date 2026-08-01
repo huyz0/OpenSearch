@@ -19,7 +19,7 @@ import java.util.Optional;
 public class BlobNameIndexCheckpointStoreTests extends OpenSearchTestCase {
 
     private BlobNameIndexCheckpointStore storeOver(Path directory) throws Exception {
-        return new BlobNameIndexCheckpointStore(new FsBlobStore(1024, directory, false), BlobPath.cleanPath());
+        return new BlobNameIndexCheckpointStore(new FsBlobStore(1024, directory, false)::blobContainer, BlobPath.cleanPath());
     }
 
     private static byte[] uuid(int seed) {

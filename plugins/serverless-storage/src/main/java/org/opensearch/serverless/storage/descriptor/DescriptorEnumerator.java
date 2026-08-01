@@ -12,7 +12,6 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
-import org.opensearch.common.blobstore.BlobStore;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -22,6 +21,7 @@ import java.util.TreeSet;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
+import java.util.function.Function;
 
 /**
  * Every live index name, read from the object store and nothing else.
@@ -63,11 +63,11 @@ public final class DescriptorEnumerator {
      */
     private static final String SPLIT_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz";
 
-    private final BlobStore blobStore;
+    private final Function<BlobPath, BlobContainer> containers;
     private final BlobPath basePath;
 
-    public DescriptorEnumerator(BlobStore blobStore, BlobPath basePath) {
-        this.blobStore = blobStore;
+    public DescriptorEnumerator(Function<BlobPath, BlobContainer> containers, BlobPath basePath) {
+        this.containers = containers;
         this.basePath = basePath;
     }
 
@@ -124,7 +124,7 @@ public final class DescriptorEnumerator {
     }
 
     private BlobContainer descriptors() {
-        return blobStore.blobContainer(basePath.add(trimmed(BlobDescriptorBackend.DESCRIPTOR_PREFIX)));
+        return containers.apply(basePath.add(trimmed(BlobDescriptorBackend.DESCRIPTOR_PREFIX)));
     }
 
     private static String trimmed(String prefix) {

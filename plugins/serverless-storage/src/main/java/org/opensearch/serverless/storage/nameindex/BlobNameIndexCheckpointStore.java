@@ -12,7 +12,6 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
-import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.common.io.stream.StreamInput;
@@ -20,6 +19,7 @@ import org.opensearch.core.common.io.stream.StreamInput;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.Optional;
+import java.util.function.Function;
 
 /**
  * Where a {@link CompactNameIndex} is parked so a restarting tier does not have to reconstruct itself.
@@ -50,11 +50,11 @@ public final class BlobNameIndexCheckpointStore {
     /** Where checkpoints live, beside the descriptors they were derived from. */
     public static final String CHECKPOINT_PREFIX = "nameindex";
 
-    private final BlobStore blobStore;
+    private final Function<BlobPath, BlobContainer> containers;
     private final BlobPath basePath;
 
-    public BlobNameIndexCheckpointStore(BlobStore blobStore, BlobPath basePath) {
-        this.blobStore = blobStore;
+    public BlobNameIndexCheckpointStore(Function<BlobPath, BlobContainer> containers, BlobPath basePath) {
+        this.containers = containers;
         this.basePath = basePath;
     }
 
@@ -111,7 +111,7 @@ public final class BlobNameIndexCheckpointStore {
     }
 
     private BlobContainer checkpoints() {
-        return blobStore.blobContainer(basePath.add(CHECKPOINT_PREFIX));
+        return containers.apply(basePath.add(CHECKPOINT_PREFIX));
     }
 
     /** Zero-padded so lexicographic order is generation order, the same reason the change log pads buckets. */

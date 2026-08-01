@@ -30,7 +30,7 @@ public class BlobDescriptorChangeLogTests extends OpenSearchTestCase {
     }
 
     private BlobDescriptorChangeLog logOver(Path directory) throws Exception {
-        return new BlobDescriptorChangeLog(storeOver(directory), BlobPath.cleanPath());
+        return new BlobDescriptorChangeLog(storeOver(directory)::blobContainer, BlobPath.cleanPath());
     }
 
     private static DescriptorChange change(String name, DescriptorChange.Kind kind) {
@@ -96,7 +96,11 @@ public class BlobDescriptorChangeLogTests extends OpenSearchTestCase {
     /** Buckets order chronologically, and a reader resuming from one skips only what precedes it. */
     public void testResumingFromABucketSkipsOnlyEarlierBuckets() throws Exception {
         AtomicLong clock = new AtomicLong(0);
-        BlobDescriptorChangeLog log = new BlobDescriptorChangeLog(storeOver(createTempDir()), BlobPath.cleanPath(), clock::get);
+        BlobDescriptorChangeLog log = new BlobDescriptorChangeLog(
+            storeOver(createTempDir())::blobContainer,
+            BlobPath.cleanPath(),
+            clock::get
+        );
 
         log.append(change("early", DescriptorChange.Kind.CREATED));
         String secondBucket = BlobDescriptorChangeLog.bucketOf(BlobDescriptorChangeLog.BUCKET_MILLIS);

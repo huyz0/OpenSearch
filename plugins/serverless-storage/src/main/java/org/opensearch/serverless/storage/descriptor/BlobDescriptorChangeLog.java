@@ -13,7 +13,6 @@ import org.apache.logging.log4j.Logger;
 import org.opensearch.common.UUIDs;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
-import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.common.io.stream.StreamInput;
@@ -25,6 +24,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
 import java.util.function.LongSupplier;
 
 /**
@@ -85,7 +85,7 @@ public final class BlobDescriptorChangeLog {
      */
     static final long BUCKET_MILLIS = TimeUnit.MINUTES.toMillis(1);
 
-    private final BlobStore blobStore;
+    private final Function<BlobPath, BlobContainer> containers;
     private final BlobPath basePath;
     private final LongSupplier clock;
 
@@ -98,13 +98,13 @@ public final class BlobDescriptorChangeLog {
      * bitten this branch three times in the other direction, and building a fourth instance of it into a
      * new component would have been careless.
      */
-    public BlobDescriptorChangeLog(BlobStore blobStore, BlobPath basePath) {
-        this(blobStore, basePath, System::currentTimeMillis);
+    public BlobDescriptorChangeLog(Function<BlobPath, BlobContainer> containers, BlobPath basePath) {
+        this(containers, basePath, System::currentTimeMillis);
     }
 
     /** Test seam for the clock, so bucketing can be exercised without waiting a minute. */
-    BlobDescriptorChangeLog(BlobStore blobStore, BlobPath basePath, LongSupplier clock) {
-        this.blobStore = blobStore;
+    BlobDescriptorChangeLog(Function<BlobPath, BlobContainer> containers, BlobPath basePath, LongSupplier clock) {
+        this.containers = containers;
         this.basePath = basePath;
         this.clock = clock;
     }
@@ -153,7 +153,7 @@ public final class BlobDescriptorChangeLog {
         List<DescriptorChange> changes = new ArrayList<>();
         try {
             // Sorted, because children() gives no order and the buckets are the only ordering there is.
-            Map<String, BlobContainer> buckets = new TreeMap<>(blobStore.blobContainer(changelogPath()).children());
+            Map<String, BlobContainer> buckets = new TreeMap<>(containers.apply(changelogPath()).children());
             for (Map.Entry<String, BlobContainer> bucket : buckets.entrySet()) {
                 if (fromBucket != null && bucket.getKey().compareTo(fromBucket) < 0) {
                     continue;
@@ -196,7 +196,7 @@ public final class BlobDescriptorChangeLog {
     }
 
     private BlobContainer bucketContainer(String bucket) {
-        return blobStore.blobContainer(changelogPath().add(bucket));
+        return containers.apply(changelogPath().add(bucket));
     }
 
     private static BytesReference encode(DescriptorChange change) throws IOException {

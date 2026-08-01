@@ -13,11 +13,15 @@ import org.apache.logging.log4j.Logger;
 import org.opensearch.action.admin.cluster.stats.GatedMappingStatsAggregator;
 import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.DescriptorOnlyCreation;
+import org.opensearch.cluster.metadata.DescriptorPrefetch;
 import org.opensearch.cluster.metadata.IndexDescriptor;
 import org.opensearch.cluster.metadata.IndexDescriptorPublisher;
 import org.opensearch.cluster.metadata.MappingGenerationStore;
 import org.opensearch.index.mapper.UnknownFieldRefresh;
+import org.opensearch.serverless.storage.nameindex.NameIndexService;
 import org.opensearch.serverless.storage.placement.ComputedPlacementGate;
+
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Installs the descriptor read path, which was built and never connected.
@@ -150,6 +154,29 @@ public final class DescriptorGate {
         // The limit is read per call rather than captured, so changing the setting takes effect on the next
         // wildcard instead of on the next node restart.
         AbsentIndexDescriptorSuppliers.registerExpander(prefix -> store.expandPrefix(prefix, WILDCARD_EXPANSION_LIMIT.get()));
+        // C1's prefetcher, which had no registrar and so did nothing at all. The seam and its hook in
+        // TransportBulkAction landed together; without this line the hook found nothing installed and
+        // returned immediately on every request, which is the "correct and unreachable" shape this area
+        // has produced repeatedly and which is invisible because a no-op prefetch looks exactly like a
+        // successful one.
+        //
+        // Warming is a plain get per name, which is what puts the descriptor in the cache the eleven
+        // synchronous sites read from. Doing it here rather than at those sites is the whole point: this
+        // runs once per request with the full name set, so a bulk touching M tenants resolves M
+        // descriptors together instead of one at a time from inside the document loop.
+        DescriptorPrefetch.register((indexNames, listener) -> {
+            for (String indexName : indexNames) {
+                try {
+                    store.get(indexName);
+                } catch (RuntimeException e) {
+                    // One name failing must not abandon the rest, and must not fail the request either.
+                    // Whatever did not warm is resolved inline later, slowly, which is the contract
+                    // DescriptorPrefetch states and the reason this is allowed to be best effort.
+                    logger.debug("could not prefetch the descriptor for [{}]", indexName, e);
+                }
+            }
+            listener.onResponse(null);
+        });
         // The write path. H2b dual-writes the descriptor at creation and H4 records deletions as
         // tombstones, and neither has ever had a publisher registered, so no index creation outside a test
         // has written a descriptor. Both go through put rather than create: publish records an index that
@@ -168,6 +195,7 @@ public final class DescriptorGate {
             } else {
                 store.putTombstoneAsync(descriptor);
             }
+            recordChange(descriptor);
         });
         // T18. The creator is a separate registration from the publisher because the two have opposite
         // failure semantics, and T17 and T23 are what happened while one stood in for the other. The
@@ -234,11 +262,66 @@ public final class DescriptorGate {
     }
 
     /** Clears both registrations, which a node shutting down must do. */
+    /**
+     * The change feed, which had nowhere to be called from until the publisher above called it.
+     *
+     * <p>Both halves were built and neither was reachable: {@code BlobDescriptorChangeLog} had no
+     * appender and {@code NameIndexService.apply} had no caller. A feed nothing writes and an index
+     * nothing feeds look exactly like a quiet cluster, which is why this needed wiring rather than more
+     * building.
+     *
+     * <p>Optional on purpose. A deployment with no object store configured still publishes descriptors,
+     * and a null feed simply means nothing is recorded, which is what the setter's absence already meant.
+     */
+    private static final AtomicReference<BlobDescriptorChangeLog> CHANGE_LOG = new AtomicReference<>();
+    private static final AtomicReference<NameIndexService> NAME_INDEX = new AtomicReference<>();
+
+    /** Installs the change feed. Passing nulls clears it, matching every other registration here. */
+    public static void setChangeFeed(BlobDescriptorChangeLog changeLog, NameIndexService nameIndexService) {
+        CHANGE_LOG.set(changeLog);
+        NAME_INDEX.set(nameIndexService);
+    }
+
+    /**
+     * Records one descriptor write to the log and applies it to this node's name index.
+     *
+     * <p>The local apply is immediate rather than tailed, because this node already knows what it just
+     * wrote and waiting to read it back would make its own index the last to know. The log is what carries
+     * the same change to every other node, and the tailer that consumes it on those nodes is the piece
+     * still missing: today a remote node learns of the change only through a rebuild. That is a real gap
+     * and it is stated rather than papered over, because a feed that is half-wired reads as a working one.
+     *
+     * <p>Never throws. A descriptor write that succeeded must not be undone by a derived feed failing,
+     * which is the same reasoning {@code append} already applies inside itself.
+     */
+    private static void recordChange(IndexDescriptor descriptor) {
+        DescriptorChange change = new DescriptorChange(
+            descriptor.name(),
+            descriptor.uuid(),
+            descriptor.exists() ? DescriptorChange.Kind.UPDATED : DescriptorChange.Kind.DELETED,
+            System.currentTimeMillis()
+        );
+        try {
+            BlobDescriptorChangeLog changeLog = CHANGE_LOG.get();
+            if (changeLog != null) {
+                changeLog.append(change);
+            }
+            NameIndexService nameIndexService = NAME_INDEX.get();
+            if (nameIndexService != null) {
+                nameIndexService.apply(java.util.List.of(change));
+            }
+        } catch (RuntimeException e) {
+            logger.warn("could not record the descriptor change for [{}]; the feed will need a rebuild", descriptor.name(), e);
+        }
+    }
+
     public static void uninstall() {
         // Cleared in the reverse order, so the supplier is gone before the store it reads.
         AbsentIndexDescriptorSuppliers.register(null);
         AbsentIndexDescriptorSuppliers.registerPager(null);
         AbsentIndexDescriptorSuppliers.registerExpander(null);
+        DescriptorPrefetch.register(null);
+        setChangeFeed(null, null);
         // Reset rather than leave, since the registries are static and a limit set by one test would
         // otherwise decide the behaviour of every suite that ran after it in the same JVM.
         WILDCARD_EXPANSION_LIMIT.set(DEFAULT_WILDCARD_EXPANSION_LIMIT);

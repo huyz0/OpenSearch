@@ -47,7 +47,7 @@ public class DescriptorEnumeratorTests extends OpenSearchTestCase {
     private void setUpOver(Path directory) throws Exception {
         store = new FsBlobStore(1024, directory, false);
         backend = new BlobDescriptorBackend(new FsBlobContainer(store, BlobPath.cleanPath(), store.path()));
-        enumerator = new DescriptorEnumerator(store, BlobPath.cleanPath());
+        enumerator = new DescriptorEnumerator(store::blobContainer, BlobPath.cleanPath());
     }
 
     private static IndexDescriptor descriptor(String name) {
