@@ -660,3 +660,27 @@ both tests fail. 53 tests, 0 failures with it restored.
 Worth being precise about the failure mode: the mutated build fails with an NPE from the unstubbed
 `getObject` rather than from `verify(never())`. The signal is still "a GET happened", which is what is
 under test, but the assertion is not what reports it.
+
+### T6: two interfaces, because there are two sets of possible implementations
+
+`DescriptorBackend` holds the eight point operations. `DescriptorPrefixBackend` holds the three prefix
+searches. Splitting them is the substance of this task rather than a stylistic choice.
+
+Put together, a blob implementation has to throw from three of eleven methods, and the compiler cannot tell
+anyone that. Split, "the object store cannot resolve `logs-*`" is a type-level fact, and the ordering
+constraint T3 found is expressed in the type system rather than in a comment: the blob backend can be
+added while the system index still answers prefix queries, and the system index cannot be removed until
+something else does.
+
+Caching, TTL, eviction and in-flight collapsing stay above the interface in `DescriptorStore`. A backend
+does I/O only. That matters more under an object store than under a system index, because collapsing turns
+M concurrent readers of one cold descriptor into a single round trip, and a per-backend copy of that is two
+chances to get it subtly different.
+
+One rename: `indexExists()` becomes `available()` at the interface, because the mechanisms do not resemble
+each other. The system index must exist, be allocated, and carry W8's settings. A blob backend has nothing
+to bootstrap at all.
+
+**The SPI was checked by making `DescriptorStore` implement both interfaces**, which compiles with no
+signature changes anywhere. An interface extracted from one implementation is a guess until the
+implementation is made to satisfy it. 234 plugin tests, 0 failures.

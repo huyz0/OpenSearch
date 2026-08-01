@@ -51,7 +51,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * {@code ResourceAlreadyExistsException} being treated as success, because two nodes creating the
  * descriptor index concurrently is the normal case rather than an error.
  */
-public final class DescriptorStore {
+public final class DescriptorStore implements DescriptorBackend, DescriptorPrefixBackend {
 
     private static final Logger logger = LogManager.getLogger(DescriptorStore.class);
 
@@ -906,6 +906,19 @@ public final class DescriptorStore {
     /** Whether the descriptor index has been created, which tests assert rather than infer. */
     public boolean indexExists() {
         return client.admin().indices().prepareExists(DESCRIPTOR_INDEX).get().isExists();
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>For this backend readiness is the descriptor index existing, so this is {@link #indexExists}
+     * under the name the interface uses. The two are kept separate rather than renamed because tests
+     * assert on the mechanism deliberately, and a backend with no index to create still has to answer
+     * the question.
+     */
+    @Override
+    public boolean available() {
+        return indexExists();
     }
 
     /** The mapping and the document shape, kept beside each other so they cannot drift. */
