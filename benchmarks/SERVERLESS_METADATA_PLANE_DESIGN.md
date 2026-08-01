@@ -1318,6 +1318,25 @@ bytes are on disk at a different path; or gated creation never reaches
 `IndexDescriptorPublisher.registerCreator` on this path and something still pointed at the system index is
 writing the descriptor. Listing the base path on disk after one create separates them in a single step.
 
+**The disk listing settled it, and the answer was neither candidate.** After a create the base path holds
+`descriptors-root/descriptors`, which is exactly where `DescriptorEnumerator` looks, so it was never a path
+mismatch. Running one test alone then makes `awaitDescriptor` pass outright: **the blob-backed descriptor
+write works.** The failure in isolation moves to `Shard [tenant-alpha][0] is still locked after 5 sec
+waiting`, which is a teardown assertion rather than a descriptor one.
+
+Three explanations eliminated by direct evidence rather than by argument: path mismatch (the listing), a
+dead write path (it writes in isolation), and a race (a thirty second wait does not help when the class runs
+together).
+
+What is actually left is two lifecycle problems, both outside the descriptor store. A gated shard's lock is
+not released at teardown, so the cluster does not come down cleanly. And the four tests share one cluster
+and one base path, with three failing only when run together, so earlier state interferes. The lock leak is
+the one that is a product defect rather than a fixture one, and it plausibly causes the other.
+
+**A defect in my own fixture turned up on the way**, worth recording because the guard that should have
+caught it did not. A blanket rename had put the node-scoped enable flag into `createGated` where the
+index-scoped one belongs, so the indices were not marked gated at all, and `assertGated` still passed.
+
 **I4 itself is muted, one layer deeper.** With the gate installing, gated creation reaches the blob backend
 and stops there. `BlobDescriptorBackend.createAsync` completes synchronously inside an already-completed
 future, and `DescriptorGate.registerCreator` runs on the cluster state thread, which the gate's own comment

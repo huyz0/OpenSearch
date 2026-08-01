@@ -47,15 +47,19 @@ import java.util.concurrent.TimeUnit;
  * {@link #testTheDescriptorReallyLivesInTheObjectStore} goes further and reads the descriptor out of the
  * store directly.
  */
-@org.apache.lucene.tests.util.LuceneTestCase.AwaitsFix(bugUrl = "I4, second attempt. Making createAsync genuinely asynchronous was necessary and is not "
-    + "sufficient: the descriptor still never appears under the blob prefix, and awaitDescriptor waits "
-    + "30s before failing, so this is not a race. Gated creation does happen -- the premise guard "
-    + "passes, the index is absent from cluster state -- so the write is going somewhere other than "
-    + "where DescriptorEnumerator looks. Two candidates, neither eliminated: (1) resolveContainer "
-    + "scopes under a prefix this test does not replicate, so the bytes are on disk at a different "
-    + "path; (2) gated creation does not reach IndexDescriptorPublisher.registerCreator at all on this "
-    + "path, and the descriptor is being written by something still pointed at the system index. "
-    + "Distinguish them by listing the base path on disk after a create before debugging either.")
+@org.apache.lucene.tests.util.LuceneTestCase.AwaitsFix(bugUrl = "I4. The answer is neither candidate: the blob-backed descriptor write WORKS. Run "
+    + "testAGatedIndexCanBeCreatedResolvedAndSearchedOnTheBlobBackend alone and awaitDescriptor "
+    + "passes; the failure moves to 'Shard [tenant-alpha][0] is still locked after 5 sec waiting', "
+    + "which is a teardown assertion, not a descriptor one. "
+    + "Ruled out along the way, each by direct evidence rather than by reasoning: a path mismatch "
+    + "(after a create the base path holds descriptors-root/descriptors, exactly where "
+    + "DescriptorEnumerator looks); a dead write path (it writes in isolation); and a race (a 30s "
+    + "wait does not help when the whole class runs). "
+    + "What is left is two lifecycle problems, both outside the descriptor store. First, a gated "
+    + "shard's lock is not released at teardown, so the cluster does not come down cleanly. Second, "
+    + "the four tests share one cluster and one base path, and three of them fail only when run "
+    + "together, so state from an earlier test is interfering. Fix the lock leak first: it is the "
+    + "one that is a product defect rather than a fixture one, and it plausibly causes the second.")
 public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
 
     private volatile java.nio.file.Path sharedBasePath;
@@ -114,7 +118,32 @@ public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.Se
      * has never promised.
      */
     private void awaitDescriptor(String name) throws Exception {
-        assertBusy(() -> assertTrue("[" + name + "] never reached the object store", storeNames().contains(name)), 30, TimeUnit.SECONDS);
+        assertBusy(
+            () -> assertTrue(
+                "[" + name + "] never reached the object store; base path holds " + diskListing(),
+                storeNames().contains(name)
+            ),
+            30,
+            TimeUnit.SECONDS
+        );
+    }
+
+    /**
+     * Everything under the base path, so a failure names where the bytes went instead of only where they
+     * were not. Two candidate causes were indistinguishable without it: a container resolved under a
+     * prefix this test does not replicate, or a descriptor never written to the object store at all.
+     */
+    private String diskListing() {
+        try (java.util.stream.Stream<java.nio.file.Path> walk = java.nio.file.Files.walk(basePath(), 4)) {
+            return walk.map(basePath()::relativize)
+                .map(java.nio.file.Path::toString)
+                .filter(x -> x.isEmpty() == false)
+                .sorted()
+                .toList()
+                .toString();
+        } catch (Exception e) {
+            return "<unreadable: " + e + ">";
+        }
     }
 
     private java.util.List<String> storeNames() throws java.io.IOException {
@@ -130,7 +159,11 @@ public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.Se
                 .create(
                     new CreateIndexRequest(name).settings(
                         Settings.builder()
-                            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_NODE_ENABLED_SETTING.getKey(), true)
+                            // Index-scoped: this is what marks one index gated. The node-scoped twin in
+                            // nodeSettings decides whether the machinery exists at all. A blanket rename
+                            // put the node one here and the index was then never gated, which is the kind
+                            // of thing a premise guard is supposed to catch and this one did not.
+                            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey(), true)
                             .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
                             .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
                     )
