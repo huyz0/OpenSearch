@@ -460,12 +460,12 @@ results do it.
 
 ## 12. Where this stands, and what is next
 
-Fifteen tasks landed. Working tree clean, everything below verified by a test that was checked against a
+Sixteen tasks landed. Working tree clean, everything below verified by a test that was checked against a
 deliberately broken build before being believed.
 
 **Done.** T1 (caller enumeration), T2 (register semantics), T3 (store audit), T4 (S3 conditional create),
 T5 (create-only contract tests), T21 (Fs register lock), T22 (`createRegisterIfAbsent`), T6 (backend
-interfaces), T7 (cache extraction), T8 (blob backend), T9 (idempotent creation), T10 (tombstones), T11 (cache instrumentation), T12 (change log), T16 (membership epochs).
+interfaces), T7 (cache extraction), T8 (blob backend), T9 (idempotent creation), T10 (tombstones), T11 (cache instrumentation), T12 (change log), T16 (membership epochs), T18 (derived warmth).
 
 Two commits are formatting-only sweeps, separated out rather than buried. **The branch base does not pass
 `spotlessCheck`** in either `:server` or `:plugins:serverless-storage`, so a precommit build fails there
@@ -476,7 +476,7 @@ for reasons unrelated to any change. Worth fixing at the base rather than paying
 | | task | note |
 |---|---|---|
 | T13, T14, T15 | name index fed from the change log, checkpointed, rebuildable from LIST | T3: this gates removing the system index, not adding the blob backend |
-| T17, T18 | decommission after K absent epochs, warmth from epoch N-1 | T16 landed the epoch; these are the policy and the consumer |
+| T17 | decommission after K absent epochs | the policy that decides when to call `withoutNodes` |
 | T19, T20 | point lookup and cache hit rate benchmarks | the numbers the whole approach rests on, and neither is measured |
 
 **Still blocked on T39** in the sibling worktree: C2 (`routingNumShards` on the descriptor) and C5
@@ -895,6 +895,28 @@ own predecessor and place every shard one epoch in the past while looking health
 no-op.
 
 17 membership tests, 0 failures.
+
+### T18: warmth is a function of the previous epoch
+
+`WarmCandidates.forShard` rendezvous-hashes a shard against the epoch before the current one. Wherever a
+shard used to be placed is where its cache is, because deterministic placement is what put it there.
+
+That replaces `ReaderCacheAffinityMetadata`, which had two problems rather than one. It is O(shards) of
+recorded state, the global structure this design exists to delete, and both of its consumers read it from
+`IndexMetadata` in cluster state, which a serverless index has no entry in, so it is unreachable for
+exactly the indices it was built for. The derived version is O(nodes) for the whole cluster and any
+coordinator can evaluate it in the time a rendezvous lookup costs.
+
+`preferWarm` orders rather than filters, and that is the design decision worth stating. A warm-only list
+empties out precisely when the fleet has just doubled, which S12 measured as 12.4% of shards having no
+warm candidate at all, and that is the moment a router most needs somewhere to send a request. Departed
+nodes are dropped, because their cache is unreachable and offering one sends traffic somewhere that cannot
+answer, which is the failure a stale stored affinity record produces and the reason the stored version
+needed a freshness check that this does not.
+
+Six tests, one of which re-derives S12's structural claim independently: a single node joining leaves no
+shard without a warm candidate, checked across two thousand shards, because one new node can displace at
+most one of K.
 
 ### T7 verification, including the part that looked like a regression
 
