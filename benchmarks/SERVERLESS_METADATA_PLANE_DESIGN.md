@@ -460,12 +460,12 @@ results do it.
 
 ## 12. Where this stands, and what is next
 
-Thirteen tasks landed. Working tree clean, everything below verified by a test that was checked against a
+Fourteen tasks landed. Working tree clean, everything below verified by a test that was checked against a
 deliberately broken build before being believed.
 
 **Done.** T1 (caller enumeration), T2 (register semantics), T3 (store audit), T4 (S3 conditional create),
 T5 (create-only contract tests), T21 (Fs register lock), T22 (`createRegisterIfAbsent`), T6 (backend
-interfaces), T7 (cache extraction), T8 (blob backend), T9 (idempotent creation), T10 (tombstones), T11 (cache instrumentation).
+interfaces), T7 (cache extraction), T8 (blob backend), T9 (idempotent creation), T10 (tombstones), T11 (cache instrumentation), T12 (change log).
 
 Two commits are formatting-only sweeps, separated out rather than buried. **The branch base does not pass
 `spotlessCheck`** in either `:server` or `:plugins:serverless-storage`, so a precommit build fails there
@@ -475,7 +475,6 @@ for reasons unrelated to any change. Worth fixing at the base rather than paying
 
 | | task | note |
 |---|---|---|
-| T12 | descriptor change log | T3 moved this ahead of switching the blob backend on, because the cache TTL needs invalidation rather than a shorter window |
 | T13, T14, T15 | name index fed from the change log, checkpointed, rebuildable from LIST | T3: this gates removing the system index, not adding the blob backend |
 | T16, T17, T18 | membership epochs, decommission, warmth from epoch N-1 | independent of the descriptor work |
 | T19, T20 | point lookup and cache hit rate benchmarks | the numbers the whole approach rests on, and neither is measured |
@@ -838,6 +837,32 @@ an object store, and it is invisible without the counter.
 
 Six tests, including the two cases where a low hit rate is correct rather than a fault: an expired entry
 and an absent name, since a miss is never cached. A reader of the metric needs to know both.
+
+### T12: the change log, and a swallow that hid its own failure
+
+One object per entry under `changelog/<bucket>/<random>`. A single object appended under compare-and-swap
+is the obvious design and would serialise every descriptor write in the cluster behind one key at roughly
+one write per round trip, which is worse than the cluster manager this design removes from the creation
+path. So appends are independent and nothing coordinates.
+
+The cost is stated rather than discovered: **there is no total order.** Two entries in one bucket have no
+defined order, node clocks disagree, and a slow appender can land behind a later one. Nothing may use a log
+position as a version cursor. Both real consumers are fine with that, because the cache only drops an entry
+and the name index applies name, uuid and liveness, which is last-writer-wins on a key rather than a
+sequence. Buckets are zero-padded so lexicographic order is chronological, which is load-bearing: an
+unpadded bucket 9 sorts after bucket 10 and a reader resuming from it skips the gap silently.
+
+**A fourth Fs/S3 divergence, caught before it shipped rather than after.** The first version put the bucket
+inside the blob name as `changelog/<bucket>/<uuid>`. That works on S3, where keys are flat strings, and
+fails on a filesystem repository, where nothing creates the intermediate directory. Rewritten to nest
+through `BlobPath` and take a `BlobStore`, which every implementation honours.
+
+**And the reason it took a debugging cycle is worth more than the bug.** `append` swallows failures
+deliberately, because the log is derived and losing an entry must not fail the descriptor write that
+already succeeded. But a log that silently appends nothing reads exactly like a log with nothing to say:
+four tests came back empty and the cause had already been logged and discarded. Added
+`failedAppendCount()`, and every test that appends now asserts it is zero. Swallowing a failure is a
+decision; making it unobservable is a defect.
 
 ### T7 verification, including the part that looked like a regression
 
