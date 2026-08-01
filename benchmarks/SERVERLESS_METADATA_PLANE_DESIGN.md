@@ -458,6 +458,47 @@ results do it.
 
 ---
 
+## 12. Where this stands, and what is next
+
+Eleven tasks landed. Working tree clean, everything below verified by a test that was checked against a
+deliberately broken build before being believed.
+
+**Done.** T1 (caller enumeration), T2 (register semantics), T3 (store audit), T4 (S3 conditional create),
+T5 (create-only contract tests), T21 (Fs register lock), T22 (`createRegisterIfAbsent`), T6 (backend
+interfaces), T7 (cache extraction), T8 (blob backend), T9 (idempotent creation).
+
+Two commits are formatting-only sweeps, separated out rather than buried. **The branch base does not pass
+`spotlessCheck`** in either `:server` or `:plugins:serverless-storage`, so a precommit build fails there
+for reasons unrelated to any change. Worth fixing at the base rather than paying it per commit.
+
+**Not started, in the order they unblock each other:**
+
+| | task | note |
+|---|---|---|
+| T10 | tombstones under their own prefix | `putTombstoneAsync` currently throws; the blob backend is incomplete until this lands |
+| T12 | descriptor change log | T3 moved this ahead of switching the blob backend on, because the cache TTL needs invalidation rather than a shorter window |
+| T11 | cache hit/miss instrumentation | `DescriptorCache` counts reads and evictions but has no explicit hit counter |
+| T13, T14, T15 | name index fed from the change log, checkpointed, rebuildable from LIST | T3: this gates removing the system index, not adding the blob backend |
+| T16, T17, T18 | membership epochs, decommission, warmth from epoch N-1 | independent of the descriptor work |
+| T19, T20 | point lookup and cache hit rate benchmarks | the numbers the whole approach rests on, and neither is measured |
+
+**Still blocked on T39** in the sibling worktree: C2 (`routingNumShards` on the descriptor) and C5
+(on-demand shard materialisation) both touch files that session is editing.
+
+**The largest unmeasured risk is unchanged.** Nothing here has been run against a real object store. Every
+latency claim in this document is arithmetic, and T19 and T20 are the tasks that would make them evidence.
+A blob backend that works against `FsBlobContainer` and has never seen a network is exactly the shape this
+area calls "correct and unreachable".
+
+**One pattern worth carrying forward.** Three separate defects on this branch were the same shape:
+`FsBlobContainer` and `S3BlobContainer` disagreeing about a call, with every test running against the
+former. The ignored `failIfAlreadyExists` flag, the per-instance register lock, and the container-root
+`createDirectories`. Any new `BlobContainer` behaviour should be assumed to have this problem until a test
+shows otherwise, and the S3 side needs an assertion on the request rather than on the outcome, because an
+outcome assertion passes against a container that silently does nothing.
+
+---
+
 ## 11. Implementation findings
 
 Recorded as the tasks land. T1's result is structural enough that it lives in section 5.1 instead.
@@ -740,6 +781,21 @@ directories to catch code assuming a directory holds only what it wrote. The ass
 that. Rewritten to assert which names a prefix selects, which is the property a rebuild actually needs.
 
 8 backend tests pass, and the server-side `FsBlobContainer` suites still pass with the directory fix.
+
+### T9: a conflict cannot say whose creation it was
+
+`createIdempotently` returns `CREATED`, `ALREADY_MINE` or `TAKEN`. The middle case is the one that did not
+exist before: a first attempt reached the store, its acknowledgement was lost, and the retry got a
+conflict. Reporting that as a collision fails a creation that actually succeeded; reporting it as success
+without checking hands the name to a client that never got it.
+
+Resolved by reading the winner and comparing uuids, which works because the uuid is already a stable token
+per creation attempt. The contract that makes it work is stated rather than assumed: **a retry must resend
+the same descriptor.** A caller minting a fresh uuid each attempt is asking a question this cannot answer,
+and is told the name is taken.
+
+An absent descriptor after a lost create is `TAKEN`, not `CREATED`. Either it was created and deleted
+between the two calls or the store lost the write, and in neither case does this caller hold the name.
 
 ### T7 verification, including the part that looked like a regression
 
