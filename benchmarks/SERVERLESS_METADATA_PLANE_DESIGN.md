@@ -460,12 +460,12 @@ results do it.
 
 ## 12. Where this stands, and what is next
 
-Nineteen tasks landed. Working tree clean, everything below verified by a test that was checked against a
+Twenty tasks landed. Working tree clean, everything below verified by a test that was checked against a
 deliberately broken build before being believed.
 
 **Done.** T1 (caller enumeration), T2 (register semantics), T3 (store audit), T4 (S3 conditional create),
 T5 (create-only contract tests), T21 (Fs register lock), T22 (`createRegisterIfAbsent`), T6 (backend
-interfaces), T7 (cache extraction), T8 (blob backend), T9 (idempotent creation), T10 (tombstones), T11 (cache instrumentation), T12 (change log), T16 (membership epochs), T15 (descriptor enumeration), T17 (decommission), T18 (derived warmth), T20 (cache hit rate).
+interfaces), T7 (cache extraction), T8 (blob backend), T9 (idempotent creation), T10 (tombstones), T11 (cache instrumentation), T12 (change log), T16 (membership epochs), T15 (descriptor enumeration), T17 (decommission), T18 (derived warmth), T14 (checkpoint store), T20 (cache hit rate).
 
 Two commits are formatting-only sweeps, separated out rather than buried. **The branch base does not pass
 `spotlessCheck`** in either `:server` or `:plugins:serverless-storage`, so a precommit build fails there
@@ -475,7 +475,7 @@ for reasons unrelated to any change. Worth fixing at the base rather than paying
 
 | | task | note |
 |---|---|---|
-| T13, T14 | name index fed from the change log, checkpointed to the store | T15 landed the enumeration they rebuild from; these are the wiring |
+| T13 | `NameIndexService` fed from the change log rather than cluster state | the last piece of wiring; T12, T14 and T15 are its inputs |
 | T19 | point lookup latency, system index against blob | needs a real object store; measuring it against `FsBlobContainer` would report local disk speed as an object store result |
 
 **Still blocked on T39** in the sibling worktree: C2 (`routingNumShards` on the descriptor) and C5
@@ -1012,6 +1012,29 @@ the bar to make the rule pass would have been the wrong repair.
 
 A third arm pins the tail: a tenant outside the working set reaches the backend on at least 40 of 50
 lookups, so no per-tenant latency claim can be made from a fleet-wide hit rate.
+
+### T14: the checkpoint stays an optimisation because something else can rebuild it
+
+`BlobNameIndexCheckpointStore` parks a `CompactNameIndex` in the object store so a restarting tier loads
+packed entries instead of replaying the population, which is the trade A16 already settled.
+
+What makes it safe to call that an optimisation is T15. Without a path from the object store back to the
+full name set, a checkpoint stops being a cache of a derivable thing and becomes the only copy, which would
+give the name index its own durability problem. A lost or unreadable checkpoint is a slow start, never a
+loss, and the class is written so that reads back that way.
+
+Each checkpoint is its own object and the newest generation wins, rather than one key overwritten in place.
+Overwriting leaves a window where a reader sees a half-written structure, and a half-understood name index
+is a cluster that cannot find its own indices, which `NameIndexCheckpoint`'s version guard already refuses.
+Generations are zero-padded for the same reason the change log pads buckets: names sort lexicographically
+in a listing, so generation 9 must not read as newer than 10.
+
+Writing twice at one generation fails rather than picking a survivor, because two writers at one generation
+have disagreed about how far the feed has been consumed and keeping one silently would hide that. An
+unreadable newest checkpoint falls back to a rebuild rather than to an older checkpoint, since an older
+structure with a newer feed position skips everything between them.
+
+Five tests.
 
 ### T7 verification, including the part that looked like a regression
 
