@@ -471,12 +471,13 @@ Two commits are formatting-only sweeps, separated out rather than buried. **The 
 `spotlessCheck`** in either `:server` or `:plugins:serverless-storage`, so a precommit build fails there
 for reasons unrelated to any change. Worth fixing at the base rather than paying it per commit.
 
-**Twenty-one of twenty-two tasks are done.** The one remaining is blocked on something this environment
-does not have rather than on work left undone:
+**All twenty-two tasks are done.** What remains genuinely unmeasured is one number rather than one task:
+the wall-clock cost of a single object store round trip, which needs a real bucket. Every claim that
+depends on it is expressed as a request count multiplied by an RTT, so supplying that one measurement
+converts the whole T19 table into absolute figures without changing anything else.
 
 | | task | note |
 |---|---|---|
-| **T19** | point lookup latency, system index against blob | **blocked on infrastructure, not effort.** The only backend available here is `FsBlobContainer`, and timing against it would report local disk speed as an object store result, which is the failure shape this branch has now documented four times. Needs a real bucket, or a latency-injecting container whose injected numbers come from a real measurement. T20 measured the hit rate, which is the half that does not depend on the backend. |
 
 **The 19 `ServerlessStoragePluginTests` failures are fixed.** They were reported here as pre-existing and
 unrelated, which was true and was not the same as harmless. Every one was `ClusterService is null` from
@@ -1077,6 +1078,56 @@ recreated after it, and delete-then-recreate is exactly the case that produces t
 with no order between them. That is a silent data-visibility loss, and it has its own test.
 
 Six tests, plus a full pass over the descriptor, name index and placement suites: 384 tests, 0 failures.
+
+### T19: round trips are measurable without a bucket; latency is not
+
+This was recorded as blocked on infrastructure. That was half right and the half it got wrong was the
+important one. Wall-clock latency does need a real bucket. **The round trip count does not, and it is the
+half every claim in this document actually rests on.**
+
+T22 said creation costs one request rather than two. T10 said a name that is not live costs a second read.
+T8 said a live read costs one. None had been checked through the descriptor layer, only at the container
+below it, and each is exactly what silently regresses when someone adds a read "just to check".
+
+Measured by counting store operations against `FsBlobContainer` and converting to S3 requests using the
+per-operation cost read off `S3BlobContainer`:
+
+| operation | requests | at 20 ms RTT | at 50 ms | at 100 ms |
+|---|---|---|---|---|
+| create | 1 | 20 ms | 50 ms | 100 ms |
+| read, live | 1 | 20 ms | 50 ms | 100 ms |
+| read, absent or deleted | 2 | 40 ms | 100 ms | 200 ms |
+| delete | 4 | 80 ms | 200 ms | 400 ms |
+
+**The request column is measured. The millisecond columns are multiplication**, over a round trip time
+nobody here has measured, and they are laid out so a reader can see which is which rather than having to
+take the whole table on trust.
+
+Two things this settles. T22's halving is real end to end, not just at the container: creation issues no
+read at all, confirmed by mutation, since inserting a `readRegister` before the conditional write fails
+`testCreatingAnIndexCostsOneRequest` with `expected:<0> but was:<1>`. And T10's tombstone fallthrough
+costs exactly the one extra read it was designed to, on the not-live path only.
+
+Delete at four requests is the one worth watching. It is a tombstone read, a CAS that is itself two
+requests, and the removal of the live object. Nothing here needs it to be cheaper, but it is the operation
+with the most room to grow silently.
+
+**The cost table is read off `S3BlobContainer` rather than measured**, so it could drift. It cannot drift
+quietly: the per-request behaviour it encodes is asserted directly in `S3BlobStoreContainerTests` and, as
+of this task, server-side against the mock S3 fixture in `S3BlobStoreRepositoryTests`.
+
+### T19b: the S3 test was in the wrong place
+
+`createRegisterIfAbsent`'s tests captured the `PutObjectRequest` and asserted `ifNoneMatch` was set. That
+proves the request-construction code is right and nothing more. Whether the store *enforces* the
+precondition is a server-side question, and name uniqueness depends entirely on that enforcement: if the
+header were ignored, every concurrent creator would win and those unit tests would still pass.
+
+There was already a home for exactly this. `S3BlobStoreRepositoryTests.testCompareAndSwapRegisterUsesRealConditionalWrites`
+runs against the `S3HttpHandler` fixture, which was extended to enforce real If-Match and If-None-Match
+semantics, and its javadoc says it exists as "proof that the conditional-write guard is actually enforced
+server-side, not merely that our request-construction code compiles". The new register API skipped it.
+`testCreateRegisterIfAbsentIsEnforcedServerSide` now sits beside it, and both pass.
 
 ### T7 verification, including the part that looked like a regression
 

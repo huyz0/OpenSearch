@@ -243,6 +243,44 @@ public class S3BlobStoreRepositoryTests extends OpenSearchMockAPIBasedRepository
     }
 
     /**
+     * The same proof for {@link S3BlobContainer#createRegisterIfAbsent}, which is the call index creation
+     * actually makes.
+     *
+     * <p>It belongs here rather than only in the unit tests for the reason the test below already gives.
+     * The unit test captures the {@code PutObjectRequest} and asserts {@code ifNoneMatch} is set, which
+     * proves the request-construction code is right and nothing else. Whether the store enforces the
+     * precondition is a server-side question, and creation depends on that enforcement for name
+     * uniqueness: if the header were ignored, every concurrent creator would win and the unit test would
+     * still pass.
+     */
+    public void testCreateRegisterIfAbsentIsEnforcedServerSide() throws Exception {
+        final String repository = createRepository(randomName());
+        final BlobContainer container = getBlobContainer(repository);
+        final String registerName = "create-if-absent-register";
+        try {
+            BlobRegisterCasResult winner = container.createRegisterIfAbsent(
+                registerName,
+                new BytesArray("winner".getBytes(StandardCharsets.UTF_8))
+            );
+            assertTrue(winner.applied());
+            assertEquals(1L, winner.currentGeneration());
+
+            BlobRegisterCasResult loser = container.createRegisterIfAbsent(
+                registerName,
+                new BytesArray("loser".getBytes(StandardCharsets.UTF_8))
+            );
+            assertFalse("a name can only be taken once, and the store is what enforces that", loser.applied());
+
+            // The winner's value survives. Without server-side enforcement the loser would have
+            // overwritten it and this is the assertion that would notice.
+            assertEquals("winner", container.readRegister(registerName).get().value().utf8ToString());
+            assertEquals(1L, container.readRegister(registerName).get().generation());
+        } finally {
+            container.deleteBlobsIgnoringIfNotExists(Collections.singletonList(registerName));
+        }
+    }
+
+    /**
      * Exercises {@link S3BlobContainer#compareAndSwapRegister}/{@code readRegister} against the
      * real {@link fixture.s3.S3HttpHandler} fixture (extended to enforce real S3 If-Match/
      * If-None-Match semantics for exactly this purpose): proof that the conditional-write guard is
