@@ -1754,7 +1754,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             try {
                 descriptorBackend = new org.opensearch.serverless.storage.descriptor.CompositeDescriptorBackend(
                     new org.opensearch.serverless.storage.descriptor.BlobDescriptorBackend(
-                        resolveContainer(
+                        resolveContainerForDescriptors(
                             BlobPath.cleanPath().add("descriptors-root"),
                             "["
                                 + DESCRIPTOR_BACKEND_SETTING.getKey()
@@ -1763,7 +1763,11 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                                 + "] or ["
                                 + SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey()
                                 + "]"
-                        )
+                        ),
+                        // GENERIC, because the descriptor hooks are registered on the cluster state thread
+                        // and must not do I/O there. Which pool is the caller's decision precisely because
+                        // getting it wrong hangs a node rather than slowing one down.
+                        threadPool.executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC)
                     ),
                     descriptorStore
                 );
@@ -2146,6 +2150,11 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      * verification via {@code ServerlessStorageRepositoryBackedContainerIT}), extending it to the
      * WAL containers below is exactly that follow-up: the same one seam, no new resolution logic.
      */
+    /** {@link #resolveContainer} under a name that says why the descriptor plane needs its own. */
+    private BlobContainer resolveContainerForDescriptors(BlobPath relativePath, String missingContainerErrorMessage) throws IOException {
+        return resolveContainer(relativePath, missingContainerErrorMessage);
+    }
+
     private BlobContainer resolveContainer(BlobPath relativePath, String missingContainerErrorMessage) throws IOException {
         return new RequestCountingBlobContainer(resolveContainerUncounted(relativePath, missingContainerErrorMessage), requestCounter);
     }

@@ -23,6 +23,7 @@ import java.io.IOException;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 
 /**
  * A {@link DescriptorBackend} over object storage, replacing the system index for the eight point
@@ -83,9 +84,35 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
     public static final String TOMBSTONE_PREFIX = "tombstones/";
 
     private final BlobContainer blobContainer;
+    private final Executor executor;
 
+    /**
+     * Same-thread form, for a caller that is already somewhere blocking is allowed.
+     *
+     * <p>Named for what it does rather than offered as a default, because the whole point of the other
+     * constructor is that the difference matters. Tests use this; the plugin does not.
+     */
     public BlobDescriptorBackend(BlobContainer blobContainer) {
+        this(blobContainer, Runnable::run);
+    }
+
+    /**
+     * The form with somewhere to run, which the {@code *Async} methods below actually need.
+     *
+     * <p>They used to complete synchronously inside an already-completed future, and this class said so in
+     * its own javadoc: an honest synchronous method beats a fake asynchronous one. That was fine while
+     * nothing called them. The first real caller is {@code DescriptorGate}, which registers them as hooks
+     * that run <b>on the cluster state thread</b>, and that thread must not block on I/O. The gate's own
+     * comment records what happens otherwise: "registering the blocking put hung the node instead of
+     * failing, which is how the constraint was found."
+     *
+     * <p>So the executor is a constructor argument rather than something the backend reaches for, because
+     * which pool this runs on is the caller's decision and getting it wrong hangs a node rather than
+     * slowing one down.
+     */
+    public BlobDescriptorBackend(BlobContainer blobContainer, Executor executor) {
         this.blobContainer = blobContainer;
+        this.executor = executor;
     }
 
     /**
@@ -137,13 +164,16 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
         }
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Genuinely off the calling thread, which the cluster state thread requires. The future carries the
+     * outcome so a caller that wants to know whether it took the name still can, and a caller that does
+     * not simply ignores it.
+     */
     @Override
     public CompletableFuture<Boolean> createAsync(IndexDescriptor descriptor) {
-        // Deliberately not a fake async wrapper around the blocking call. A CompletableFuture that has
-        // already blocked its caller is worse than an honest synchronous method, because it reads as
-        // non-blocking at every call site. Threading this properly needs an executor the backend does not
-        // own yet, so the contract is stated here rather than pretended.
-        return CompletableFuture.completedFuture(create(descriptor));
+        return CompletableFuture.supplyAsync(() -> create(descriptor), executor);
     }
 
     /**
@@ -176,9 +206,25 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
         }
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Off-thread for the same reason as {@link #createAsync}, and additionally because {@link #put}
+     * reads before it writes: two round trips on the cluster state thread rather than one.
+     *
+     * <p>A failure is logged rather than propagated. There is nobody to propagate it to, since the caller
+     * is a cluster state hook that has already returned, and the descriptor write being lost is what the
+     * publisher's own retry contract covers.
+     */
     @Override
     public void putAsync(IndexDescriptor descriptor) {
-        put(descriptor);
+        executor.execute(() -> {
+            try {
+                put(descriptor);
+            } catch (RuntimeException e) {
+                logger.warn("could not write the descriptor for [{}]", descriptor.name(), e);
+            }
+        });
     }
 
     /**
@@ -195,6 +241,19 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
      */
     @Override
     public void putTombstoneAsync(IndexDescriptor tombstone) {
+        executor.execute(() -> {
+            try {
+                writeTombstone(tombstone);
+            } catch (RuntimeException e) {
+                // Louder than the others. A lost tombstone is the one descriptor write that cannot be
+                // reconstructed: for a gated index there is no cluster state entry and no graveyard entry
+                // behind it, so the name silently stays live.
+                logger.error("could not write the tombstone for [{}]; the index may resurrect", tombstone.name(), e);
+            }
+        });
+    }
+
+    private void writeTombstone(IndexDescriptor tombstone) {
         String name = tombstone.name();
         try {
             String tombstoneKey = tombstoneKeyFor(name);

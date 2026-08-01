@@ -1299,6 +1299,25 @@ at a much larger scale, and it was found only by writing a test that refused to 
 Fixed with a node-scoped `serverless_storage.enabled`. Existing tests are unaffected, and the reason is
 worth stating: they never set it, and the old expression was always false, so their behaviour is identical.
 
+**The async fix landed and was not enough.** `createAsync`, `putAsync` and `putTombstoneAsync` now run on
+a supplied `Executor` rather than completing synchronously inside an already-completed future, and the
+plugin passes `GENERIC`. The executor is a constructor argument rather than something the backend reaches
+for, because which pool this runs on is the caller's decision and getting it wrong hangs a node instead of
+slowing one down. A same-thread constructor stays for callers already off a restricted thread, named for
+what it does rather than offered as a default.
+
+That was necessary and is not sufficient. The descriptor still never appears under the blob prefix, and the
+test now waits thirty seconds before failing, so **it is not a race**. S37 already recorded that gated
+creation acknowledges before its descriptor lands, which is why the wait was added; the wait expiring rules
+that explanation out.
+
+What is established: gated creation does happen, because the premise guard passes and the index is absent
+from cluster state. So the write is going somewhere other than where `DescriptorEnumerator` looks. Two
+candidates, neither eliminated: `resolveContainer` scopes under a prefix the test does not replicate, so the
+bytes are on disk at a different path; or gated creation never reaches
+`IndexDescriptorPublisher.registerCreator` on this path and something still pointed at the system index is
+writing the descriptor. Listing the base path on disk after one create separates them in a single step.
+
 **I4 itself is muted, one layer deeper.** With the gate installing, gated creation reaches the blob backend
 and stops there. `BlobDescriptorBackend.createAsync` completes synchronously inside an already-completed
 future, and `DescriptorGate.registerCreator` runs on the cluster state thread, which the gate's own comment

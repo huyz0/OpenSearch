@@ -20,6 +20,7 @@ import org.opensearch.serverless.storage.ServerlessStoragePlugin;
 
 import java.util.Collection;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 /**
  * A gated index created, written, searched and deleted with the object store answering descriptor point
@@ -46,15 +47,15 @@ import java.util.List;
  * {@link #testTheDescriptorReallyLivesInTheObjectStore} goes further and reads the descriptor out of the
  * store directly.
  */
-@org.apache.lucene.tests.util.LuceneTestCase.AwaitsFix(bugUrl = "I4. Integration got as far as gated creation reaching the blob backend and no further. "
-    + "BlobDescriptorBackend.createAsync completes synchronously inside an already-completed future, "
-    + "and DescriptorGate.registerCreator is called on the cluster state thread, which the gate's own "
-    + "comment says must not block: 'registering the blocking put hung the node instead of failing, "
-    + "which is how the constraint was found'. The blob backend states that limitation in its own "
-    + "javadoc and this is the first caller to actually need it lifted. Fixing it means threading an "
-    + "executor into the backend, which is its own task. The four failures below are all downstream of "
-    + "it: the descriptor never lands in the store, so the wildcard finds nothing, the delete finds no "
-    + "index, and the write leaves a shard locked.")
+@org.apache.lucene.tests.util.LuceneTestCase.AwaitsFix(bugUrl = "I4, second attempt. Making createAsync genuinely asynchronous was necessary and is not "
+    + "sufficient: the descriptor still never appears under the blob prefix, and awaitDescriptor waits "
+    + "30s before failing, so this is not a race. Gated creation does happen -- the premise guard "
+    + "passes, the index is absent from cluster state -- so the write is going somewhere other than "
+    + "where DescriptorEnumerator looks. Two candidates, neither eliminated: (1) resolveContainer "
+    + "scopes under a prefix this test does not replicate, so the bytes are on disk at a different "
+    + "path; (2) gated creation does not reach IndexDescriptorPublisher.registerCreator at all on this "
+    + "path, and the descriptor is being written by something still pointed at the system index. "
+    + "Distinguish them by listing the base path on disk after a create before debugging either.")
 public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
 
     private volatile java.nio.file.Path sharedBasePath;
@@ -104,6 +105,24 @@ public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.Se
             .build();
     }
 
+    /**
+     * Waits for a name to appear in the object store.
+     *
+     * <p>Not a flake guard. S37 recorded that a gated creation acknowledges before its descriptor lands,
+     * and making the write genuinely asynchronous widened that window rather than closing it. So "created"
+     * and "durable" are two events here, and a test that conflates them is asserting something the system
+     * has never promised.
+     */
+    private void awaitDescriptor(String name) throws Exception {
+        assertBusy(() -> assertTrue("[" + name + "] never reached the object store", storeNames().contains(name)), 30, TimeUnit.SECONDS);
+    }
+
+    private java.util.List<String> storeNames() throws java.io.IOException {
+        org.opensearch.common.blobstore.fs.FsBlobStore store = new org.opensearch.common.blobstore.fs.FsBlobStore(1024, basePath(), false);
+        return new DescriptorEnumerator(store::blobContainer, org.opensearch.common.blobstore.BlobPath.cleanPath().add("descriptors-root"))
+            .allNames();
+    }
+
     private void createGated(String name) {
         assertTrue(
             client().admin()
@@ -132,9 +151,10 @@ public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.Se
         );
     }
 
-    public void testAGatedIndexCanBeCreatedResolvedAndSearchedOnTheBlobBackend() {
+    public void testAGatedIndexCanBeCreatedResolvedAndSearchedOnTheBlobBackend() throws Exception {
         createGated("tenant-alpha");
         assertGated("tenant-alpha");
+        awaitDescriptor("tenant-alpha");
 
         BulkRequestBuilder bulk = client().prepareBulk();
         for (int i = 0; i < 25; i++) {
@@ -174,11 +194,14 @@ public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.Se
      * composite rather than a swap. T3 established a bucket cannot serve a prefix search; if the switch
      * had simply replaced the store, this would return nothing and would do so without an error.
      */
-    public void testWildcardsStillResolveWithPointReadsOnTheObjectStore() {
+    public void testWildcardsStillResolveWithPointReadsOnTheObjectStore() throws Exception {
         createGated("logs-one");
         createGated("logs-two");
         createGated("metrics-one");
         assertGated("logs-one");
+        awaitDescriptor("logs-one");
+        awaitDescriptor("logs-two");
+        awaitDescriptor("metrics-one");
 
         SearchResponse search = client().prepareSearch("logs-*").setQuery(QueryBuilders.matchAllQuery()).setSize(0).get();
         assertEquals("a wildcard must reach both gated tenants and neither more nor fewer", 2, search.getTotalShards());
