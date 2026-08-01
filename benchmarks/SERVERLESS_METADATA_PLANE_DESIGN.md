@@ -1224,6 +1224,48 @@ cluster.**
 Nine tests. Removing the guard fails two of them; the mutation returns a descriptor on the applier thread,
 which is the stall.
 
+### The wiring pass, and the count that prompted it
+
+With every T-task and every C-change landed, I counted production callers of what had been built. Six
+components had none:
+
+`BlobDescriptorBackend`, `BlobDescriptorChangeLog`, `BlobNameIndexCheckpointStore`,
+`DescriptorEnumerator`, `WarmCandidates`, and `DescriptorPrefetch`'s registrar.
+
+**C1 was the sharpest case: it did nothing.** The seam landed in core and the hook landed in
+`TransportBulkAction`, both correct, and nothing registered a prefetcher. The hook found nothing installed
+and returned immediately on every request in every cluster. Nothing failed and nothing logged, because a
+no-op prefetch is indistinguishable from a fast one. This is the failure this area's own record names
+seven times over, and I had added six more instances of it in one branch.
+
+**What the pass fixed.** `DescriptorGate` now registers a prefetcher that warms each name through the
+store's cache, so C1 is real. The change log and the name index feed both hang off
+`IndexDescriptorPublisher`, which is where every descriptor write already flows, so T12 and T13 stop being
+capabilities nobody invokes.
+
+Three of the components also asked for a `BlobStore` while the plugin resolves everything through
+`resolveContainer` returning a `BlobContainer`. That mismatch is the same mistake wearing a different hat,
+and they now take a `Function<BlobPath, BlobContainer>` which the plugin's own seam satisfies directly.
+
+**`DescriptorGateReachabilityTests` makes the count a build step** rather than something found by grepping.
+It asserts install registers every seam it owns and uninstall clears every one. Suppressing the prefetch
+registration fails two of its three tests.
+
+**What is still unwired, stated rather than left to be discovered again.**
+
+| component | state |
+|---|---|
+| `BlobDescriptorChangeLog` | wired; appended on every descriptor write |
+| `NameIndexService.apply` | wired, locally. **The cross-node tailer does not exist**: a remote node learns of a change only through a rebuild |
+| `BlobDescriptorBackend` | **not selectable.** `ServerlessStoragePlugin` still builds the system-index `DescriptorStore`, and T3 is why: three of eleven operations are prefix searches a blob store cannot serve, so swapping needs a composite backend or the name index serving them first |
+| `BlobNameIndexCheckpointStore` | **no caller.** Needs a scheduled writer and a load on startup |
+| `DescriptorEnumerator` | referenced only for its prefix constant. **No rebuild path invokes it** |
+| `WarmCandidates` | **no caller.** Needs a hook on the search routing path |
+| P3, P4 | not started. Section 7's request-rate economics depend on both |
+
+Four of the six are still unreachable. The difference from before is that they are now written down as such
+in a table rather than discoverable only by counting, and the two that were most load-bearing are fixed.
+
 ### T7 verification, including the part that looked like a regression
 
 247 descriptor and gated tests pass.
