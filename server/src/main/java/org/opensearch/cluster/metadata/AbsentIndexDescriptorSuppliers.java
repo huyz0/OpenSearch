@@ -8,6 +8,9 @@
 
 package org.opensearch.cluster.metadata;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
@@ -37,7 +40,52 @@ import java.util.function.Function;
  */
 public final class AbsentIndexDescriptorSuppliers {
 
+    private static final Logger logger = LogManager.getLogger(AbsentIndexDescriptorSuppliers.class);
+
     private static final AtomicReference<Function<String, IndexDescriptor>> SUPPLIER = new AtomicReference<>();
+
+    /**
+     * Threads on which a supplier must not be asked to do I/O.
+     *
+     * <p>W4 established the deadlock: a remote lookup made from the cluster state applier thread needs
+     * that thread to make progress before it can complete, so it waits on itself. The cluster manager's
+     * update thread is the same shape and is additionally the one serialised thread this whole design
+     * exists to keep out of the request path.
+     *
+     * <p>T1 enumerated six call sites that reach a supplier from one of these: {@code DanglingIndicesState},
+     * {@code IndicesClusterStateService} twice, {@code RoutingNodes} through
+     * {@code ClusterState.getRoutingNodes}, {@code ClusterStateHealth} by way of {@code AllocationService},
+     * and {@code ActiveShardCount}. Six is few enough to fix one at a time and too many to keep correct by
+     * discipline, because every future core change that reads metadata on one of these threads reopens the
+     * hole and the failure only appears on a cache miss, which is the case testing does not produce.
+     *
+     * <p>So this makes it impossible rather than forbidden. A warm descriptor still answers, because that
+     * costs no I/O and never reaches a supplier that would block. A cold one degrades to the same absence
+     * the seam already models everywhere. That turns a silent stall into a reported absence, which is the
+     * same trade T38 made when it landed the auto-creation removal alongside the shard path rather than
+     * before it.
+     */
+    private static final String[] THREADS_WHERE_BLOCKING_IS_UNSAFE = {
+        "clusterApplierService#updateTask",
+        "clusterManagerService#updateTask",
+        "masterService#updateTask" };
+
+    /**
+     * Whether the calling thread is one a supplier must not block.
+     *
+     * <p>Matched on thread name, which is how {@code ClusterService} already asserts the same property. It
+     * is a weaker check than holding a reference to the executor, and it is the one available to a static
+     * seam that has no services injected into it.
+     */
+    static boolean blockingIsUnsafeHere() {
+        String threadName = Thread.currentThread().getName();
+        for (String unsafe : THREADS_WHERE_BLOCKING_IS_UNSAFE) {
+            if (threadName.contains(unsafe)) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     private AbsentIndexDescriptorSuppliers() {}
 
@@ -64,6 +112,13 @@ public final class AbsentIndexDescriptorSuppliers {
     public static IndexDescriptor supply(String indexName) {
         Function<String, IndexDescriptor> supplier = SUPPLIER.get();
         if (supplier == null || indexName == null) {
+            return null;
+        }
+        if (blockingIsUnsafeHere()) {
+            // Reported as absent rather than fetched. See blockingIsUnsafeHere: a supplier backed by a
+            // remote store would block a thread that has to make progress for the fetch to complete, and
+            // every caller here already handles absence because that is the seam's contract.
+            logger.debug("refusing to resolve the descriptor for [{}] on {}", indexName, Thread.currentThread().getName());
             return null;
         }
         try {

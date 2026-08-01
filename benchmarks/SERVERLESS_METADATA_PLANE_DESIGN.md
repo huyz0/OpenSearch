@@ -103,11 +103,14 @@ being built elsewhere.
 
 | | change | location | shape | risk |
 |---|---|---|---|---|
-| **C1** | descriptor prefetch seam | core, new class plus a hook at ~4 transport action entry points | new seam, inert when unregistered | medium |
-| **C2** | routing geometry on the descriptor | core, `IndexDescriptor` | two fields, carried into `toIndexMetadata` | low |
-| **C3** | membership epochs and decommission | core, `ComputedPlacementMembership` and its service | versioned node list, retained history | medium |
-| **C4** | conditional create on S3 | `plugins/repository-s3`, `S3BlobContainer` | wire `failIfAlreadyExists` to `ifNoneMatch("*")` | low |
-| **C5** | on-demand shard materialisation | core, `IndicesClusterStateService` | second trigger, not a parallel path | high |
+| **C1** | descriptor prefetch seam, plus the unsafe-thread guard | core, new class plus a hook in `TransportBulkAction` | **done** |
+| **C2** | routing geometry on the descriptor | core, `IndexDescriptor` | **done** |
+| **C3** | membership epochs and decommission | core, `ComputedPlacementMembership` and its service | **done**, T16 and T17 |
+| **C4** | conditional create on S3 | `plugins/repository-s3`, `S3BlobContainer` | **done**, T4 |
+| **C5** | on-demand shard materialisation | core, `IndicesClusterStateService` | **done**, this is what T39 built |
+
+All five have landed. Section 11 records what each one turned out to involve, including the two places C2
+corrected this section's own description of the problem.
 
 Everything else is plugin-side:
 
@@ -141,8 +144,9 @@ Index-per-tenant makes the second case scheduled rather than hypothetical, becau
 shard-count threshold by definition. Carry both fields now, while it is a field addition rather than a
 migration of live tenants.
 
-`IndexDescriptor.java` is in T39's working set, so this waits for T39 to resolve rather than rebasing a
-field addition through an active edit.
+**Done.** Section 11's C2 entry records two corrections to the paragraph above: the divergence runs the
+other way, and the setting alone does nothing because `IndexMetadata` holds the routing shard count as a
+field.
 
 ### C3, and the conflict with autoscaling
 
@@ -1167,6 +1171,58 @@ waved through, because "unrelated" is what four wrong diagnoses in this area loo
 **What this does not clear.** C2 and C5 were blocked on T39 and are now unblocked, but neither is done.
 C2 still needs `routingNumShards` and `routingPartitionSize` on the descriptor, and `IndexDescriptor.java`
 is now free to take them.
+
+### C1 and C2: the last two core changes
+
+With T39 landed, all five core changes in section 4 are done. C3 was T16 and T17, C4 was T4, and C5 is
+what T39 built. These are the remaining two.
+
+**C2 carries the routing geometry, and I had the direction backwards.** `toIndexMetadata` set
+`numberOfShards` and nothing else, so a synthesised index routed against its shard count and was never
+partitioned. Both failures are silent: `index.routing_partition_size` was accepted at creation and ignored,
+and a split index routed against the wrong divisor.
+
+The correction the tests forced is worth recording, because section 4 states it wrongly.
+`number_of_routing_shards` is the **pre-split** shard space, so it is at or above the shard count and a
+whole multiple of it. Splitting grows the shard count toward it and leaves it alone, which is exactly what
+keeps a document routing to the same place across a split. Section 4 says "after a reshard,
+`routingNumShards` diverges from `numberOfShards`", which is true, but my first fixtures had it diverging
+downward and `IndexMetadata`'s own assert rejected them.
+
+A second correction from the same tests: `IndexMetadata` keeps the routing shard count as a **field** and
+derives `routingFactor` from it. The builder does not read it back out of the settings, so putting the
+setting does nothing at all. It has to go through `setRoutingNumShards`, which is what real creation does.
+My first test built its fixture via the setting and got the shard count back, which is precisely the
+mistake the descriptor was making.
+
+Unset is stored as 0 rather than a copy of the shard count, so a descriptor written before these fields
+reads as "never split, not partitioned" rather than as a coincidence. The 14-argument constructor stays as
+a delegate meaning exactly that, so no caller churns, and the map codec reads both with `getOrDefault`
+because descriptors written before them are still in the index.
+
+**C1 is two halves, and the second is the one that makes the first safe to skip.**
+
+`DescriptorPrefetch` resolves the descriptors a request needs at its entry point, batched, before the
+synchronous path runs. Hooked into `TransportBulkAction.doExecute`, which is the last point that knows the
+whole request: by `doRun` the work is per document, and a lookup issued from inside that loop is one round
+trip per distinct index, sequentially. T20 is what makes this load-bearing rather than a nicety, since
+roughly three lookups in ten still reach the store at a realistic cache bound.
+
+It is written to stay an optimisation. A prefetch that fails, or a prefetcher that throws, completes the
+listener normally so the request proceeds and resolves inline the way it always did. The alternative would
+let a speculative read break the thing it speeds up.
+
+The second half is the guard T1's section 5.2 asked for. `AbsentIndexDescriptorSuppliers.supply` now
+refuses to reach a supplier at all on `clusterApplierService#updateTask` or
+`clusterManagerService#updateTask`, returning the same absence every caller already handles. That matters
+because prefetch cannot cover the six Group A sites, which have no request entry point, and six is few
+enough to fix individually and too many to keep correct by discipline: every future core change that reads
+metadata on one of those threads reopens the hole, and the failure only shows on a cache miss, which
+testing does not produce. **Missing a prefetch site now costs a slow request rather than a stalled
+cluster.**
+
+Nine tests. Removing the guard fails two of them; the mutation returns a descriptor on the applier thread,
+which is the stall.
 
 ### T7 verification, including the part that looked like a regression
 

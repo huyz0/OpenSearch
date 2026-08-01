@@ -62,6 +62,7 @@ import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.block.ClusterBlockLevel;
 import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.DataStream;
+import org.opensearch.cluster.metadata.DescriptorPrefetch;
 import org.opensearch.cluster.metadata.IndexAbstraction;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
@@ -253,11 +254,46 @@ public class TransportBulkAction extends HandledTransportAction<BulkRequest, Bul
         final Releasable releasable = indexingPressureService.markCoordinatingOperationStarted(bulkRequest::ramBytesUsed, isOnlySystem);
         final ActionListener<BulkResponse> releasingListener = ActionListener.runBefore(listener, releasable::close);
         final String executorName = isOnlySystem ? Names.SYSTEM_WRITE : Names.WRITE;
-        try {
-            doInternalExecute(task, bulkRequest, executorName, releasingListener);
-        } catch (Exception e) {
-            releasingListener.onFailure(e);
+        // C1. Resolve the descriptors this request will need before entering the synchronous path that
+        // needs them. Inert unless a prefetcher is installed, in which case it completes on this thread
+        // and this is the same call it always was.
+        //
+        // Here rather than deeper in because this is the last point that knows the whole request: by
+        // doRun the work is per document, and a lookup issued from inside that loop is one round trip per
+        // distinct index, sequentially. Batched, it is one. That stopped being an optimisation when the
+        // hit rate was measured: at a cache bound of a tenth of the population under realistic skew,
+        // roughly three lookups in ten still reach the store.
+        DescriptorPrefetch.prefetch(distinctIndicesOf(bulkRequest), ActionListener.wrap(ignored -> {
+            try {
+                doInternalExecute(task, bulkRequest, executorName, releasingListener);
+            } catch (Exception e) {
+                releasingListener.onFailure(e);
+            }
+        },
+            // Unreachable by contract: prefetch always completes successfully, precisely so that a
+            // speculative read cannot fail a request. Wired anyway rather than left to throw, because
+            // "cannot happen" is how a listener ends up silently dropping a bulk request.
+            releasingListener::onFailure
+        ));
+    }
+
+    /**
+     * The distinct index names a bulk request names, or an empty set when nothing is installed to use them.
+     *
+     * <p>Distinct rather than one per document: a bulk of ten thousand documents across fifty tenants is
+     * fifty descriptors, and passing the raw list would make the batch as large as the request.
+     */
+    private static Set<String> distinctIndicesOf(BulkRequest bulkRequest) {
+        if (DescriptorPrefetch.isRegistered() == false) {
+            return Set.of();
         }
+        Set<String> names = new HashSet<>();
+        for (DocWriteRequest<?> request : bulkRequest.requests()) {
+            if (request.index() != null) {
+                names.add(request.index());
+            }
+        }
+        return names;
     }
 
     protected void doInternalExecute(Task task, BulkRequest bulkRequest, String executorName, ActionListener<BulkResponse> listener) {
