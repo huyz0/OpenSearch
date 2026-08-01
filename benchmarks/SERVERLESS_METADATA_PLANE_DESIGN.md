@@ -552,3 +552,41 @@ waiter blocks before reading directly, and it was chosen against a sub-milliseco
 reader could not take its waiters down with it. Against a 50 ms read the ratio inverts: the fallback
 essentially never fires, so the blast-radius protection it was built for is no longer there. Whether that
 matters depends on what a hung object store read looks like, which is not known yet.
+
+### T4: the dropped flag was already a live bug, not just a trap
+
+Section 6 listed C4 as a behaviour change to argue upstream on its own merits. It is stronger than that.
+**Six callers already pass `failIfAlreadyExists = true` and have been getting nothing on S3**, all of them
+writing state that must not be overwritten:
+
+`BlobContainerManifestStore`, `BlobContainerBundleStore`, `BlobContainerCloneLineageStore`,
+`BlobContainerShardPartitionStore`, `BlobContainerInPlaceSplitRangeStore`, and the pinned-timestamp
+service.
+
+Every one is protected on a filesystem repository, because `FsBlobContainer` throws
+`FileAlreadyExistsException` for the same call, and unprotected on S3. So the divergence is invisible to
+any test that runs against `FsBlobContainer`, which is all of them. The manifest one is the sharpest: a
+commit manifest is a shard's durability record, and two writers racing on a generation silently lose one.
+
+Implemented as `ifNoneMatch("*")` on the single-upload `PutObject` and on the multipart
+`CompleteMultipartUpload`, translating 412 into `FileAlreadyExistsException` so callers need one catch
+rather than two. The multipart case puts the precondition on completion rather than creation, because
+completion is the request that publishes the key, and the existing abort-on-failure block discards the
+parts of a losing upload.
+
+**Who actually changes behaviour, checked rather than assumed.** The two `BlobStoreRepository`
+verification writes look like the risk and are not: both write under a container keyed by a freshly
+generated `UUIDs.randomBase64UUID()`, so the precondition can only fire on a UUID collision.
+
+`RemoteStorePinnedTimestampService.pinTimestamp` and `cloneTimestamp` do change: re-pinning the same
+timestamp for the same entity used to overwrite a zero-byte marker on S3 and now throws. That is not a
+regression introduced here, because those calls already throw on a filesystem repository today. The change
+makes S3 agree with the interface contract and with every other implementation of it. If idempotent
+re-pinning is intended, the fix belongs at those call sites, which should pass `false`, and it is an
+existing bug on filesystem repositories independent of this.
+
+**Requires an endpoint that implements conditional writes.** Older S3-compatible stores ignore the
+precondition header, and against those this silently reverts to last-writer-wins rather than failing. That
+is the same dependency section 4 already records for name uniqueness, now on a second path.
+
+Existing `repository-s3` unit tests: 75 run, 0 failures.

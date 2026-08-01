@@ -105,6 +105,7 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
+import java.nio.file.FileAlreadyExistsException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -194,7 +195,24 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
     }
 
     /**
-     * This implementation ignores the failIfAlreadyExists flag as the S3 API has no way to enforce this due to its weak consistency model.
+     * Honours {@code failIfAlreadyExists} by asking S3 to enforce it, throwing
+     * {@link FileAlreadyExistsException} when the key is already present, which is what
+     * {@code FsBlobContainer} does and therefore what every caller was already written against.
+     *
+     * <p>This used to be documented as unenforceable, "as the S3 API has no way to enforce this due to
+     * its weak consistency model". Both halves stopped being true: S3 became strongly consistent in
+     * December 2020 and gained conditional writes in August 2024. {@link #compareAndSwapRegister} in this
+     * same class has used {@code If-None-Match} since it was written.
+     *
+     * <p>The flag being silently dropped was not only a trap for future code. Six callers in
+     * {@code serverless-storage} already pass true for write-once state (commit manifests, bundles, clone
+     * lineage, resharding ranges), and every one of them was protected on a filesystem repository and
+     * unprotected on S3, so the divergence was invisible to tests. A losing manifest write is a lost
+     * commit.
+     *
+     * <p>Requires an endpoint that implements conditional writes. Older S3-compatible stores do not, and
+     * against those the precondition is ignored by the server and this reverts to the previous
+     * last-writer-wins behaviour rather than failing.
      */
     @Override
     public void writeBlob(String blobName, InputStream inputStream, long blobSize, boolean failIfAlreadyExists) throws IOException {
@@ -217,9 +235,9 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
         assert inputStream.markSupported() : "No mark support on inputStream breaks the S3 SDK's ability to retry requests";
         AccessController.doPrivilegedChecked(() -> {
             if (blobSize <= getLargeBlobThresholdInBytes()) {
-                executeSingleUpload(blobStore, buildKey(blobName), inputStream, blobSize, metadata, cryptoMetadata);
+                executeSingleUpload(blobStore, buildKey(blobName), inputStream, blobSize, metadata, cryptoMetadata, failIfAlreadyExists);
             } else {
-                executeMultipartUpload(blobStore, buildKey(blobName), inputStream, blobSize, metadata, cryptoMetadata);
+                executeMultipartUpload(blobStore, buildKey(blobName), inputStream, blobSize, metadata, cryptoMetadata, failIfAlreadyExists);
             }
         });
     }
@@ -292,7 +310,11 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
                         inputStream.getInputStream(),
                         uploadRequest.getContentLength(),
                         uploadRequest.getMetadata(),
-                        crypto
+                        crypto,
+                        // The async upload path carries no such flag, and its callers write
+                        // content-addressed segment data where a rewrite is the same bytes. Passing false
+                        // keeps this path exactly as it was rather than inventing a guarantee for it.
+                        false
                     );
                     completionListener.onResponse(null);
                 } catch (Exception ex) {
@@ -579,7 +601,8 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
         final InputStream input,
         final long blobSize,
         final Map<String, String> metadata,
-        @Nullable CryptoMetadata cryptoMetadata
+        @Nullable CryptoMetadata cryptoMetadata,
+        final boolean failIfAlreadyExists
     ) throws IOException {
 
         // Extra safety checks
@@ -603,6 +626,13 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
             putObjectRequestBuilder = putObjectRequestBuilder.metadata(metadata);
         }
 
+        if (failIfAlreadyExists) {
+            // The precondition is the enforcement, evaluated atomically by S3 against the live object.
+            // Reading first and then writing would leave a window a concurrent creator fits through,
+            // which is the race compareAndSwapRegister already documents avoiding the same way.
+            putObjectRequestBuilder.ifNoneMatch("*");
+        }
+
         configureEncryptionSettings(putObjectRequestBuilder, blobStore, cryptoMetadata);
 
         PutObjectRequest putObjectRequest = putObjectRequestBuilder.build();
@@ -616,6 +646,13 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
             AccessController.doPrivileged(
                 () -> clientReference.get().putObject(putObjectRequest, RequestBody.fromInputStream(requestInputStream, blobSize))
             );
+        } catch (final S3Exception e) {
+            // 412 is the precondition failing, which means the key was already there. Reported as the
+            // same exception FsBlobContainer throws so callers need one catch rather than two.
+            if (failIfAlreadyExists && e.statusCode() == 412) {
+                throw new FileAlreadyExistsException("Blob [" + blobName + "] already exists, cannot overwrite");
+            }
+            throw new IOException("Unable to upload object [" + blobName + "] using a single upload", e);
         } catch (final SdkException e) {
             throw new IOException("Unable to upload object [" + blobName + "] using a single upload", e);
         }
@@ -630,7 +667,8 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
         final InputStream input,
         final long blobSize,
         final Map<String, String> metadata,
-        @Nullable CryptoMetadata cryptoMetadata
+        @Nullable CryptoMetadata cryptoMetadata,
+        final boolean failIfAlreadyExists
     ) throws IOException {
 
         ensureMultiPartUploadSize(blobSize);
@@ -707,18 +745,30 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
                 );
             }
 
-            CompleteMultipartUploadRequest completeMultipartUploadRequest = CompleteMultipartUploadRequest.builder()
+            CompleteMultipartUploadRequest.Builder completeMultipartUploadRequestBuilder = CompleteMultipartUploadRequest.builder()
                 .bucket(bucketName)
                 .key(blobName)
                 .uploadId(uploadId.get())
                 .multipartUpload(CompletedMultipartUpload.builder().parts(parts).build())
                 .overrideConfiguration(o -> o.addMetricPublisher(blobStore.getStatsMetricPublisher().multipartUploadMetricCollector))
-                .expectedBucketOwner(blobStore.expectedBucketOwner())
-                .build();
+                .expectedBucketOwner(blobStore.expectedBucketOwner());
 
+            if (failIfAlreadyExists) {
+                // The precondition goes on the completion rather than on the creation, because that is the
+                // request that publishes the key. Parts uploaded against a losing upload are discarded by
+                // the abort in the finally block below.
+                completeMultipartUploadRequestBuilder.ifNoneMatch("*");
+            }
+
+            CompleteMultipartUploadRequest completeMultipartUploadRequest = completeMultipartUploadRequestBuilder.build();
             AccessController.doPrivileged(() -> clientReference.get().completeMultipartUpload(completeMultipartUploadRequest));
             success = true;
 
+        } catch (final S3Exception e) {
+            if (failIfAlreadyExists && e.statusCode() == 412) {
+                throw new FileAlreadyExistsException("Blob [" + blobName + "] already exists, cannot overwrite");
+            }
+            throw new IOException("Unable to upload object [" + blobName + "] using multipart upload", e);
         } catch (final SdkException e) {
             throw new IOException("Unable to upload object [" + blobName + "] using multipart upload", e);
         } finally {
