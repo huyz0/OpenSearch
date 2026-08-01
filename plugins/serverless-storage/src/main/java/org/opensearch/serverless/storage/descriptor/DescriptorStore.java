@@ -130,27 +130,11 @@ public final class DescriptorStore implements DescriptorBackend, DescriptorPrefi
      * every admission and making no progress. A monotonic sequence is unique by construction, which is what
      * {@code GatedShardSuspensionRegistry} stamps for the same reason.
      */
-    private record CachedDescriptor(IndexDescriptor descriptor, long readAtNanos, long admittedAt, long bytes) {
-    }
-
-    private final java.util.concurrent.ConcurrentHashMap<String, CachedDescriptor> cache = new java.util.concurrent.ConcurrentHashMap<>();
-
     /**
-     * The name currently being read, so concurrent misses on it wait rather than each issuing a read.
-     *
-     * <p>An entry lives only for the duration of one read, which is why this needs no capacity bound while
-     * {@link #cache} does.
+     * The read path, extracted in T7 so the blob backend reuses it rather than growing a second copy.
+     * Every property in it was paid for by a measurement; see {@link DescriptorCache}.
      */
-    private final java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.CompletableFuture<IndexDescriptor>> inFlight =
-        new java.util.concurrent.ConcurrentHashMap<>();
-    private final java.util.function.LongSupplier clock;
-    private final long collapseWaitMillis;
-    private final int cacheCapacity;
-    private final long cacheBytes;
-    private final java.util.concurrent.atomic.AtomicLong reads = new java.util.concurrent.atomic.AtomicLong();
-    private final java.util.concurrent.atomic.AtomicLong evictions = new java.util.concurrent.atomic.AtomicLong();
-    private final java.util.concurrent.atomic.AtomicLong admissions = new java.util.concurrent.atomic.AtomicLong();
-    private final java.util.concurrent.atomic.AtomicLong cachedBytes = new java.util.concurrent.atomic.AtomicLong();
+    private final DescriptorCache descriptorCache;
 
     private final Client client;
     private final int shardCount;
@@ -198,10 +182,7 @@ public final class DescriptorStore implements DescriptorBackend, DescriptorPrefi
     ) {
         this.client = client;
         this.shardCount = shardCount;
-        this.clock = clock;
-        this.collapseWaitMillis = collapseWaitMillis;
-        this.cacheCapacity = cacheCapacity;
-        this.cacheBytes = cacheBytes;
+        this.descriptorCache = new DescriptorCache(clock, CACHE_TTL_NANOS, collapseWaitMillis, cacheCapacity, cacheBytes);
     }
 
     /**
@@ -209,125 +190,32 @@ public final class DescriptorStore implements DescriptorBackend, DescriptorPrefi
      * waiter falls back rather than hanging behind it.
      */
     java.util.concurrent.CompletableFuture<IndexDescriptor> pretendReadIsInFlight(String name) {
-        java.util.concurrent.CompletableFuture<IndexDescriptor> never = new java.util.concurrent.CompletableFuture<>();
-        inFlight.put(name, never);
-        return never;
+        return descriptorCache.pretendReadIsInFlight(name);
     }
 
     /** How many times this store has actually gone to the index, which is what a test counts. */
     public long readCount() {
-        return reads.get();
+        return descriptorCache.readCount();
     }
 
     /** How many cached descriptors have been evicted, which distinguishes a small cache from a broken one. */
     public long evictionCount() {
-        return evictions.get();
+        return descriptorCache.evictionCount();
     }
 
     /** How many descriptors are cached, which is what the capacity bounds and what a test checks. */
     int cachedCount() {
-        return cache.size();
+        return descriptorCache.cachedCount();
     }
 
     /** How much memory the cached descriptors occupy, which is the bound T4b established has to hold. */
     long cachedBytes() {
-        return cachedBytes.get();
-    }
-
-    /**
-     * Caches a descriptor, evicting the stalest entries if that puts the cache over its bound.
-     *
-     * <p><b>The admission is unconditional, which T3 is the reason for.</b> This used to be gated on
-     * {@code cache.size() < cacheCapacity}, and since nothing ever removed an entry, that was not an
-     * eviction policy but a freeze. The first {@code cacheCapacity} names held every slot permanently, and
-     * because an expired entry was re-read and then not re-admitted, every entry went stale after one
-     * second and could never be refreshed. Past the bound the cache held its memory and served nothing:
-     * T3 measured twenty names costing twenty reads on every pass, forever.
-     *
-     * <p>Recency is stamped on write and never touched on read, which is the structure P2 established for
-     * the suspension registry after P1 measured a read-mutating LRU running backwards under contention.
-     * The same reasoning applies here for the same reason: this is read on every resolution.
-     */
-    private void admit(String name, IndexDescriptor descriptor, long now) {
-        long bytes = retainedSizeOf(name, descriptor);
-        if (bytes > cacheBytes) {
-            // An entry that alone exceeds the budget can never be evicted down to fit, so admitting it
-            // would leave the cache permanently over budget and run the eviction scan on every subsequent
-            // admission forever. That is the shape T4 caught once already, where eviction made no progress
-            // and kept re-sorting to discover it. Not caching this descriptor costs one read per
-            // resolution for one index; admitting it costs the read path a scan per admission for all of
-            // them.
-            logger.debug("descriptor for [{}] is {} bytes, above the whole cache budget of {}; not cached", name, bytes, cacheBytes);
-            return;
-        }
-        CachedDescriptor replaced = cache.put(name, new CachedDescriptor(descriptor, now, admissions.incrementAndGet(), bytes));
-        // Net, so refreshing an entry does not double count it. A refresh is the common case once the
-        // window starts expiring, so getting this wrong would drift the total upward until the cache
-        // evicted itself to nothing.
-        cachedBytes.addAndGet(bytes - (replaced == null ? 0 : replaced.bytes()));
-        evictIfOverCapacity();
-    }
-
-    /**
-     * What one cached descriptor costs.
-     *
-     * <p>The alias list is the only unbounded part, which is what T4b measured, so it is the only part
-     * walked rather than assumed.
-     */
-    private static long retainedSizeOf(String name, IndexDescriptor descriptor) {
-        long bytes = ENTRY_OVERHEAD_BYTES + org.apache.lucene.util.RamUsageEstimator.shallowSizeOfInstance(IndexDescriptor.class)
-            + org.apache.lucene.util.RamUsageEstimator.sizeOf(name) + org.apache.lucene.util.RamUsageEstimator.sizeOf(descriptor.uuid());
-        return bytes + org.apache.lucene.util.RamUsageEstimator.sizeOfCollection(descriptor.aliases());
-    }
-
-    /**
-     * Drops the stalest tenth when the cache is over its bound.
-     *
-     * <p>A threshold from one pass over the stamps rather than a sorted eviction list, matching
-     * {@code GatedShardSuspensionRegistry}. Evicting a tenth rather than a single entry keeps this from
-     * running on every admission once the cache is full.
-     */
-    private void evictIfOverCapacity() {
-        if (cache.size() <= cacheCapacity && cachedBytes.get() <= cacheBytes) {
-            return;
-        }
-        // Repeated because one pass drops a tenth of the entries, which is a tenth of the count but an
-        // unknown share of the bytes. A single pass would leave a cache of large descriptors over budget.
-        // Bounded so a concurrent writer refilling as fast as this drains cannot spin here forever.
-        for (int pass = 0; pass < 10 && (cache.size() > cacheCapacity || cachedBytes.get() > cacheBytes); pass++) {
-            if (evictStalestTenth() == false) {
-                return;
-            }
-        }
-    }
-
-    /** Drops the stalest tenth, reporting whether there was anything to drop. */
-    private boolean evictStalestTenth() {
-        int toEvict = Math.max(1, cache.size() / 10);
-        long[] stamps = cache.values().stream().mapToLong(CachedDescriptor::admittedAt).sorted().toArray();
-        if (stamps.length == 0) {
-            return false;
-        }
-        long threshold = stamps[Math.min(toEvict, stamps.length - 1)];
-        boolean[] dropped = new boolean[1];
-        cache.entrySet().removeIf(entry -> {
-            if (entry.getValue().admittedAt() < threshold) {
-                cachedBytes.addAndGet(-entry.getValue().bytes());
-                evictions.incrementAndGet();
-                dropped[0] = true;
-                return true;
-            }
-            return false;
-        });
-        return dropped[0];
+        return descriptorCache.cachedBytes();
     }
 
     /** Drops every cached descriptor, which a write must do so it does not serve its own stale value. */
     public void invalidate(String name) {
-        CachedDescriptor removed = cache.remove(name);
-        if (removed != null) {
-            cachedBytes.addAndGet(-removed.bytes());
-        }
+        descriptorCache.invalidate(name);
     }
 
     /**
@@ -337,95 +225,29 @@ public final class DescriptorStore implements DescriptorBackend, DescriptorPrefi
      * soon as its write is acknowledged. That is what lets a client create an index and immediately write
      * to it.
      */
+    @Override
     public IndexDescriptor get(String name) {
-        // The guard precedes the read, which P3 and P5 both had to learn the hard way: a cache consulted
-        // after the expensive call prevents nothing.
-        CachedDescriptor cached = cache.get(name);
-        long now = clock.getAsLong();
-        if (cached != null && now - cached.readAtNanos() < CACHE_TTL_NANOS) {
-            return cached.descriptor();
-        }
-
-        // The window above only helps a caller arriving after some other caller finished reading. Callers
-        // arriving together all see the same empty slot, and T1 measured that they all go to the index:
-        // sixty-four concurrent resolutions of one name issued sixty-four reads. So one of them reads and
-        // the rest wait on it.
-        java.util.concurrent.CompletableFuture<IndexDescriptor> mine = new java.util.concurrent.CompletableFuture<>();
-        java.util.concurrent.CompletableFuture<IndexDescriptor> reader = inFlight.putIfAbsent(name, mine);
-        if (reader != null) {
-            return awaitOrReadDirectly(reader, name);
-        }
-        try {
-            IndexDescriptor descriptor = readFromIndex(name, now);
-            mine.complete(descriptor);
-            return descriptor;
-        } catch (RuntimeException e) {
-            // Waiters must inherit the failure rather than the null it would otherwise become, or
-            // collapsing would convert one node's unavailability back into "absent" for every caller
-            // behind it, which is the whole point of DescriptorUnavailableException.
-            mine.completeExceptionally(e);
-            throw e;
-        } finally {
-            // Completing an already-completed future is a no-op, so this only fires if readFromIndex threw
-            // an Error. Without it a waiter would block until its own timeout for no reason.
-            mine.complete(null);
-            inFlight.remove(name, mine);
-        }
+        return descriptorCache.get(name, this::readFromIndex);
     }
 
     /**
-     * Waits for the caller that is already reading this name, and reads directly if that takes too long.
+     * One read of one descriptor from the index, with no caching of its own.
      *
-     * <p>The fallback is the point. Collapsing turns N independent reads into one read with N-1 threads
-     * depending on it, which is a new way to fail: before, a caller that hung hung alone. A bounded wait
-     * keeps the failure blast radius what it was, at the cost of occasionally issuing the read this exists
-     * to avoid.
+     * <p>T7 moved the freshness window, the eviction and the in-flight collapsing into
+     * {@link DescriptorCache}, so what is left here is the part that is specific to reading from an
+     * OpenSearch index and nothing else. A backend that forgets to count a read or to admit a hit is now
+     * not expressible, because neither is its job.
      */
-    private IndexDescriptor awaitOrReadDirectly(java.util.concurrent.CompletableFuture<IndexDescriptor> reader, String name) {
+    private IndexDescriptor readFromIndex(String name) {
         try {
-            IndexDescriptor shared = reader.get(collapseWaitMillis, java.util.concurrent.TimeUnit.MILLISECONDS);
-            if (shared != null) {
-                return shared;
-            }
-            // A miss is never shared, for the same reason P8 never caches one. H18 makes an exact-name get
-            // realtime, so an index is nameable the instant its creation is acknowledged, and the read we
-            // waited on may have started before that creation landed. Handing its null to a caller that
-            // arrived afterwards makes a freshly created index unnameable for the length of one read.
-            // Collapsing hits is where the load saving is anyway: T1's fan-out is many callers resolving an
-            // index that exists.
-            return readFromIndex(name, clock.getAsLong());
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return null;
-        } catch (java.util.concurrent.TimeoutException e) {
-            logger.debug("waited [{}] ms on an in-flight descriptor read for [{}]; reading directly", collapseWaitMillis, name);
-            // The clock is read again rather than reused from before the wait. A timestamp taken up to
-            // collapseWaitMillis ago would stamp the entry as already expired against a one second window,
-            // so the cache would be populated with something nothing can ever read.
-            return readFromIndex(name, clock.getAsLong());
-        } catch (java.util.concurrent.ExecutionException e) {
-            // The reader failed. Unavailability propagates, since a waiter is no better placed to claim
-            // the index is absent than the reader was.
-            if (e.getCause() instanceof org.opensearch.cluster.metadata.DescriptorUnavailableException unavailable) {
-                throw unavailable;
-            }
-            logger.debug("in-flight descriptor read for [{}] failed", name, e);
-            return null;
-        }
-    }
-
-    private IndexDescriptor readFromIndex(String name, long now) {
-        try {
-            reads.incrementAndGet();
             var response = client.prepareGet(DESCRIPTOR_INDEX, name).get();
             if (response.isExists() == false) {
-                // A miss is deliberately not cached. An index created a moment ago must be nameable
-                // immediately (H18), and caching absence would delay that by the window.
+                // A miss is deliberately not cached, which DescriptorCache enforces by never admitting
+                // null. An index created a moment ago must be nameable immediately (H18), and caching
+                // absence would delay that by the window.
                 return null;
             }
-            IndexDescriptor descriptor = DescriptorCodec.fromSource(response.getSourceAsMap());
-            admit(name, descriptor, now);
-            return descriptor;
+            return DescriptorCodec.fromSource(response.getSourceAsMap());
         } catch (org.opensearch.index.IndexNotFoundException e) {
             // The descriptor index itself does not exist, which means no gated index has ever been created.
             // Absent is the true answer here, and this is the case the original blanket catch was written

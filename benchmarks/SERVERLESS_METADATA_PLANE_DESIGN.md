@@ -684,3 +684,31 @@ to bootstrap at all.
 **The SPI was checked by making `DescriptorStore` implement both interfaces**, which compiles with no
 signature changes anywhere. An interface extracted from one implementation is a guess until the
 implementation is made to satisfy it. 234 plugin tests, 0 failures.
+
+### T7: the cache moved out, and the loader can no longer forget
+
+`DescriptorCache` now owns the freshness window, the byte and entry bounds, eviction, and in-flight request
+collapsing. `DescriptorStore.get` is `descriptorCache.get(name, this::readFromIndex)`, and `readFromIndex`
+is reduced to one read with no caching of its own.
+
+The shape matters as much as the move. The loader is handed a name and returns a descriptor or null;
+counting the read and admitting the hit belong to the cache. A backend that forgets to do either is now not
+expressible, which is the sort of omission that shows up as a performance mystery rather than a failure.
+
+Everything carried over unchanged, comments included, because each of the following was paid for once:
+unconditional admission (T3 measured that gating it on capacity was a freeze, not an eviction policy),
+recency stamped on write and never on read (P1 measured a read-mutating LRU running backwards under
+contention), two clocks per entry, refusing to cache an entry larger than the whole budget, and never
+caching a miss.
+
+`DEFAULT_TTL_NANOS` is now a constructor parameter rather than a constant, which is the one deliberate
+change. T3 established the one second window is wrong by two orders of magnitude against an object store,
+and the fix is a long window with explicit invalidation from the change log rather than a larger number
+chosen by feel.
+
+**Verification, including the part that looked like a regression.** 247 descriptor and gated tests pass.
+The full plugin suite reports 1,242 tests with 19 failures, all in `ServerlessStoragePluginTests` and all
+with `ClusterService is null`. Those were checked against the base by stashing the change and re-running:
+19 failures there too. Pre-existing and unrelated, but assumed-unrelated would not have been good enough,
+because "an unexplained failure is a residency assumption until proven otherwise" applies to unexplained
+passes on unrelated suites as well.
