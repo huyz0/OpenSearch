@@ -20,6 +20,7 @@ import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.common.io.stream.StreamInput;
 
 import java.io.IOException;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
@@ -68,8 +69,18 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
 
     private static final Logger logger = LogManager.getLogger(BlobDescriptorBackend.class);
 
-    /** Where descriptors live under the container, kept off the root so tombstones can sit beside them. */
+    /** Where live descriptors live. A LIST here returns exactly the names that currently exist. */
     public static final String DESCRIPTOR_PREFIX = "descriptors/";
+
+    /**
+     * Where deleted ones go, keyed by name rather than by uuid.
+     *
+     * <p>Uuid-keying is the obvious choice and is wrong here. {@code State.DELETED} exists so that a node
+     * partitioned during a delete consults the descriptor, finds the tombstone, and deletes its local shard
+     * data instead of resurrecting the index. That lookup is by <em>name</em>, because the name is all the
+     * partitioned node has. A uuid-keyed tombstone is unfindable by the one reader it exists for.
+     */
+    public static final String TOMBSTONE_PREFIX = "tombstones/";
 
     private final BlobContainer blobContainer;
 
@@ -87,11 +98,22 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
     @Override
     public IndexDescriptor get(String name) {
         try {
-            Optional<BlobRegister> register = blobContainer.readRegister(keyFor(name));
-            if (register.isEmpty()) {
-                return null;
+            Optional<BlobRegister> live = blobContainer.readRegister(keyFor(name));
+            if (live.isPresent()) {
+                return decode(live.get().value());
             }
-            return decode(register.get().value());
+            // Then the tombstone, because "deleted" and "never existed" are different answers and only
+            // the first one stops a partitioned node resurrecting the index from its local shard data.
+            // This costs a second round trip, but only on a name that is not live, and creation does not
+            // come through here at all: it is one conditional write that never reads.
+            Optional<BlobRegister> tombstone = blobContainer.readRegister(tombstoneKeyFor(name));
+            return tombstone.map(register -> {
+                try {
+                    return decode(register.value());
+                } catch (IOException e) {
+                    throw new DescriptorUnavailableException(name, e);
+                }
+            }).orElse(null);
         } catch (IOException | RuntimeException e) {
             logger.warn("could not read the descriptor for [{}]; reporting unavailable rather than absent", name, e);
             throw new DescriptorUnavailableException(name, e);
@@ -159,14 +181,36 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
         put(descriptor);
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Two writes in an order that matters. The tombstone lands first, then the live descriptor is
+     * removed. A crash between them leaves an index that is tombstoned but still listed, which resolves as
+     * deleted and is repaired by repeating the delete. The other order leaves a name with no record at all,
+     * which is the resurrection case: free to recreate, with a partitioned node still holding shard data
+     * for the old uuid and no tombstone to tell it otherwise.
+     *
+     * <p>The tombstone is written with an unconditional CAS rather than create-if-absent, because deleting
+     * an already-deleted index has to be idempotent. Re-tombstoning is a no-op that has to succeed.
+     */
     @Override
     public void putTombstoneAsync(IndexDescriptor tombstone) {
-        // Not implemented here on purpose. A tombstone left under DESCRIPTOR_PREFIX makes every LIST
-        // return dead names and forces a read per key to filter them, which is the one thing the flat
-        // prefix-preserving layout exists to avoid. It belongs under its own uuid-keyed prefix with the
-        // descriptor object removed, which is its own task, and doing it wrong here would be invisible
-        // until a rebuild resurrected deleted indices.
-        throw new UnsupportedOperationException("tombstones need their own prefix; see the tombstone task before wiring this");
+        String name = tombstone.name();
+        try {
+            String tombstoneKey = tombstoneKeyFor(name);
+            long generation = blobContainer.readRegister(tombstoneKey).map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
+            BlobRegisterCasResult result = blobContainer.compareAndSwapRegister(tombstoneKey, generation, encode(tombstone));
+            if (result.applied() == false) {
+                // Another deleter of the same index got there first, and it wrote the same thing. Deletion
+                // is idempotent, so losing this race is success rather than something to retry.
+                logger.debug("tombstone for [{}] was written concurrently at generation {}", name, result.currentGeneration());
+            }
+            // Only now does the name stop being listed. Deleting a blob that is not there is not an error,
+            // so repeating a partially-applied delete converges.
+            blobContainer.deleteBlobsIgnoringIfNotExists(List.of(keyFor(name)));
+        } catch (IOException e) {
+            throw new DescriptorUnavailableException(name, e);
+        }
     }
 
     /**
@@ -183,6 +227,10 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
 
     private static String keyFor(String name) {
         return DESCRIPTOR_PREFIX + name;
+    }
+
+    private static String tombstoneKeyFor(String name) {
+        return TOMBSTONE_PREFIX + name;
     }
 
     /** The descriptor's existing wire format, so there is one serialisation rather than two that drift. */

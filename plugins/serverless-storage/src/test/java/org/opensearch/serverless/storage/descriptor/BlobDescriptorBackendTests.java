@@ -190,9 +190,75 @@ public class BlobDescriptorBackendTests extends OpenSearchTestCase {
         assertFalse(outcome.owned());
     }
 
-    public void testTombstonesRefuseRatherThanLandingUnderTheDescriptorPrefix() throws Exception {
+    /**
+     * A tombstone has to stay findable by name, which is the constraint that rules out the obvious
+     * uuid-keyed layout. {@code State.DELETED} exists so a node partitioned during a delete consults the
+     * descriptor and drops its shard data instead of resurrecting the index, and the name is all that node
+     * has to look it up by.
+     */
+    public void testADeletedNameResolvesToItsTombstoneRatherThanToNothing() throws Exception {
         BlobDescriptorBackend backend = backendOver(createTempDir());
-        expectThrows(UnsupportedOperationException.class, () -> backend.putTombstoneAsync(descriptor("tenant-a")));
+        IndexDescriptor live = descriptor("tenant-a");
+        assertTrue(backend.create(live));
+
+        backend.putTombstoneAsync(live.tombstoned());
+
+        IndexDescriptor read = backend.get("tenant-a");
+        assertNotNull("a deleted name must not read as never-existed", read);
+        assertFalse("and it must report itself as gone", read.exists());
+        assertEquals(live.uuid(), read.uuid());
+    }
+
+    /** A name that was never used stays genuinely absent, so the two cases remain distinguishable. */
+    public void testANameThatNeverExistedIsStillAbsentAfterTombstonesExist() throws Exception {
+        BlobDescriptorBackend backend = backendOver(createTempDir());
+        backend.create(descriptor("tenant-a"));
+        backend.putTombstoneAsync(backend.get("tenant-a").tombstoned());
+
+        assertNull(backend.get("tenant-b"));
+    }
+
+    /**
+     * The layout property the whole flat-key design rests on: a LIST over descriptors returns live names
+     * only, so a rebuild does not resurrect deleted indices and does not need a read per key to find out.
+     */
+    public void testDeletedNamesLeaveTheDescriptorPrefix() throws Exception {
+        Path directory = createTempDir();
+        BlobDescriptorBackend backend = backendOver(directory);
+        backend.create(descriptor("logs-alpha"));
+        backend.create(descriptor("logs-beta"));
+
+        backend.putTombstoneAsync(backend.get("logs-alpha").tombstoned());
+
+        BlobContainer root = containerOver(directory);
+        assertEquals(Set.of("logs-beta"), root.children().get("descriptors").listBlobsByPrefix("logs-").keySet());
+        assertEquals(Set.of("logs-alpha"), root.children().get("tombstones").listBlobsByPrefix("logs-").keySet());
+    }
+
+    /** Deleting twice has to converge rather than fail, including after a partially applied delete. */
+    public void testDeletingTwiceIsIdempotent() throws Exception {
+        BlobDescriptorBackend backend = backendOver(createTempDir());
+        backend.create(descriptor("tenant-a"));
+        IndexDescriptor tombstone = backend.get("tenant-a").tombstoned();
+
+        backend.putTombstoneAsync(tombstone);
+        backend.putTombstoneAsync(tombstone);
+
+        assertFalse(backend.get("tenant-a").exists());
+    }
+
+    /** A recreated name is live again, and the stale tombstone does not shadow it. */
+    public void testANameCanBeRecreatedAfterDeletion() throws Exception {
+        BlobDescriptorBackend backend = backendOver(createTempDir());
+        backend.create(descriptor("tenant-a"));
+        backend.putTombstoneAsync(backend.get("tenant-a").tombstoned());
+
+        IndexDescriptor recreated = descriptor("tenant-a");
+        assertTrue("the name is free once tombstoned", backend.create(recreated));
+
+        IndexDescriptor read = backend.get("tenant-a");
+        assertTrue(read.exists());
+        assertEquals(recreated.uuid(), read.uuid());
     }
 
     public void testThereIsNothingToBootstrap() throws Exception {

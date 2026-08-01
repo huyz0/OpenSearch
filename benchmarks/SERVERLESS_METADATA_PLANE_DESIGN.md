@@ -460,12 +460,12 @@ results do it.
 
 ## 12. Where this stands, and what is next
 
-Eleven tasks landed. Working tree clean, everything below verified by a test that was checked against a
+Twelve tasks landed. Working tree clean, everything below verified by a test that was checked against a
 deliberately broken build before being believed.
 
 **Done.** T1 (caller enumeration), T2 (register semantics), T3 (store audit), T4 (S3 conditional create),
 T5 (create-only contract tests), T21 (Fs register lock), T22 (`createRegisterIfAbsent`), T6 (backend
-interfaces), T7 (cache extraction), T8 (blob backend), T9 (idempotent creation).
+interfaces), T7 (cache extraction), T8 (blob backend), T9 (idempotent creation), T10 (tombstones).
 
 Two commits are formatting-only sweeps, separated out rather than buried. **The branch base does not pass
 `spotlessCheck`** in either `:server` or `:plugins:serverless-storage`, so a precommit build fails there
@@ -475,7 +475,6 @@ for reasons unrelated to any change. Worth fixing at the base rather than paying
 
 | | task | note |
 |---|---|---|
-| T10 | tombstones under their own prefix | `putTombstoneAsync` currently throws; the blob backend is incomplete until this lands |
 | T12 | descriptor change log | T3 moved this ahead of switching the blob backend on, because the cache TTL needs invalidation rather than a shorter window |
 | T11 | cache hit/miss instrumentation | `DescriptorCache` counts reads and evictions but has no explicit hit counter |
 | T13, T14, T15 | name index fed from the change log, checkpointed, rebuildable from LIST | T3: this gates removing the system index, not adding the blob backend |
@@ -796,6 +795,30 @@ and is told the name is taken.
 
 An absent descriptor after a lost create is `TAKEN`, not `CREATED`. Either it was created and deleted
 between the two calls or the store lost the write, and in neither case does this caller hold the name.
+
+### T10: the tombstone has to stay findable by name
+
+The obvious layout is uuid-keyed, and it is wrong. `State.DELETED` exists so a node partitioned during a
+delete consults the descriptor, finds the tombstone, and drops its local shard data instead of resurrecting
+the index. That node looks the descriptor up **by name**, because the name is all it has. A uuid-keyed
+tombstone is unfindable by the one reader it exists for.
+
+So tombstones go to `tombstones/<name>`, and `get` reads `descriptors/<name>` first and falls through to
+the tombstone. Live names still cost one round trip; only a name that is not live costs two, and creation
+never comes through here at all, since it is a conditional write that never reads.
+
+`putTombstoneAsync` writes the tombstone first and removes the live descriptor second, and the order is the
+correctness argument. A crash between them leaves an index tombstoned but still listed, which resolves as
+deleted and is repaired by repeating the delete. The other order leaves a name with no record at all: free
+to recreate, with a partitioned node still holding shard data for the old uuid and nothing to tell it
+otherwise. The tombstone write is an unconditional CAS rather than create-if-absent, because deleting an
+already-deleted index has to succeed.
+
+A LIST over `descriptors/` now returns live names only, which is what stops a rebuild resurrecting deleted
+indices without needing a read per key to find out.
+
+Six tests, and the mutation check is unambiguous: removing the descriptor delete fails four of them,
+including the two that check resolution rather than layout. 14 backend tests pass.
 
 ### T7 verification, including the part that looked like a regression
 
