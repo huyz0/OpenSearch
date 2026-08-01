@@ -12,6 +12,8 @@ import org.opensearch.cluster.routing.RecoverySource;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.ShardRoutingState;
 import org.opensearch.cluster.routing.TestShardRouting;
+import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.MockSecureSettings;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
@@ -30,6 +32,10 @@ import org.opensearch.test.OpenSearchTestCase;
 import java.nio.file.Path;
 import java.util.Base64;
 import java.util.Optional;
+import java.util.Set;
+
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 public class ServerlessStoragePluginTests extends OpenSearchTestCase {
 
@@ -42,9 +48,35 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
                 .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey(), basePath.toString())
                 .build();
             Environment environment = TestEnvironment.newEnvironment(nodeSettings);
-            plugin.createComponents(null, null, null, null, null, null, environment, null, null, null, null);
+            plugin.createComponents(null, clusterServiceFor(plugin), null, null, null, null, environment, null, null, null, null);
         }
         return plugin;
+    }
+
+    /**
+     * A cluster service that can answer for the plugin's own settings.
+     *
+     * <p>This used to be null, along with every other collaborator, and the tests passed because
+     * {@code createComponents} happened never to touch it. It does now: T28's wildcard cap registers a
+     * settings update consumer, so the dynamic half of that setting is wired through here. Nineteen tests
+     * then failed with a null cluster service, which reads like a regression and is not one. The fixture
+     * was asserting against a shape a real node never has.
+     *
+     * <p>Only the plugin's node-scoped settings are registered, which is what a real node's
+     * {@code ClusterSettings} would carry for it. {@code addSettingsUpdateConsumer} rejects a setting it
+     * does not know, so this fails loudly if the plugin ever registers a consumer for something it forgot
+     * to declare in {@code getSettings}, which is a real defect worth catching here rather than at
+     * startup.
+     */
+    private static ClusterService clusterServiceFor(ServerlessStoragePlugin plugin) {
+        Set<Setting<?>> nodeScoped = plugin.getSettings()
+            .stream()
+            .filter(Setting::hasNodeScope)
+            .collect(java.util.stream.Collectors.toSet());
+        ClusterSettings clusterSettings = new ClusterSettings(Settings.EMPTY, nodeScoped);
+        ClusterService clusterService = mock(ClusterService.class);
+        when(clusterService.getClusterSettings()).thenReturn(clusterSettings);
+        return clusterService;
     }
 
     private IndexSettings indexSettings(boolean enabled) {
@@ -126,7 +158,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
             .setSecureSettings(secureSettings)
             .build();
         Environment environment = TestEnvironment.newEnvironment(nodeSettings);
-        plugin.createComponents(null, null, null, null, null, null, environment, null, null, null, null);
+        plugin.createComponents(null, clusterServiceFor(plugin), null, null, null, null, environment, null, null, null, null);
 
         IndexSettings settings = indexSettings(true);
         ShardId shardId = new ShardId(settings.getIndex(), 0);
@@ -164,7 +196,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
             .setSecureSettings(secureSettings)
             .build();
         Environment environment = TestEnvironment.newEnvironment(nodeSettings);
-        plugin.createComponents(null, null, null, null, null, null, environment, null, null, null, null);
+        plugin.createComponents(null, clusterServiceFor(plugin), null, null, null, null, environment, null, null, null, null);
 
         IndexSettings settings = indexSettings(true);
         ShardId shardId = new ShardId(settings.getIndex(), 0);
@@ -189,7 +221,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
             .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING.getKey(), true)
             .build();
         Environment environment = TestEnvironment.newEnvironment(nodeSettings);
-        plugin.createComponents(null, null, null, null, null, null, environment, null, null, null, null);
+        plugin.createComponents(null, clusterServiceFor(plugin), null, null, null, null, environment, null, null, null, null);
 
         IndexSettings settings = indexSettings(true);
         ShardId shardId = new ShardId(settings.getIndex(), 0);
@@ -210,7 +242,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
             .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING.getKey(), true)
             .build();
         Environment environment = TestEnvironment.newEnvironment(nodeSettings);
-        plugin.createComponents(null, null, null, null, null, null, environment, null, null, null, null);
+        plugin.createComponents(null, clusterServiceFor(plugin), null, null, null, null, environment, null, null, null, null);
         // sharedWalChunkService is no longer built eagerly by createComponents -- it's resolved
         // lazily on first real writer-shard use (see resolveSharedWalChunkService()'s own javadoc),
         // so a writer EngineFactory must actually be requested first to trigger construction.
@@ -230,7 +262,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
             .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_WAL_PER_SHARD_BUDGET_SETTING.getKey(), "512kb")
             .build();
         Environment environment = TestEnvironment.newEnvironment(nodeSettings);
-        plugin.createComponents(null, null, null, null, null, null, environment, null, null, null, null);
+        plugin.createComponents(null, clusterServiceFor(plugin), null, null, null, null, environment, null, null, null, null);
         triggerSharedWalChunkServiceResolution(plugin);
 
         assertEquals(512L * 1024, plugin.sharedWalChunkService().perShardBudgetBytesForTesting());
@@ -263,7 +295,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
             .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_LAZY_DIRECTORY_CACHE_SIZE_SETTING.getKey(), "16mb")
             .build();
         Environment environment = TestEnvironment.newEnvironment(nodeSettings);
-        plugin.createComponents(null, null, null, null, null, null, environment, null, null, null, null);
+        plugin.createComponents(null, clusterServiceFor(plugin), null, null, null, null, environment, null, null, null, null);
 
         assertNotNull(
             "an explicit positive cache size must construct a real FileCache",
@@ -290,7 +322,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
             .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_MAX_CONCURRENT_READER_SHARDS_SETTING.getKey(), 5)
             .build();
         Environment environment = TestEnvironment.newEnvironment(nodeSettings);
-        plugin.createComponents(null, null, null, null, null, null, environment, null, null, null, null);
+        plugin.createComponents(null, clusterServiceFor(plugin), null, null, null, null, environment, null, null, null, null);
 
         assertNotNull(
             "an explicit positive max_concurrent_reader_shards must construct a real controller",
@@ -308,7 +340,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
             .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING.getKey(), true)
             .build();
         Environment environment = TestEnvironment.newEnvironment(nodeSettings);
-        plugin.createComponents(null, null, null, null, null, null, environment, null, null, null, null);
+        plugin.createComponents(null, clusterServiceFor(plugin), null, null, null, null, environment, null, null, null, null);
 
         assertNull(
             "the WAL GC scheduler must stay off by default (non-positive interval), matching every "
@@ -339,7 +371,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
         Environment environment = TestEnvironment.newEnvironment(nodeSettings);
         org.opensearch.threadpool.ThreadPool threadPool = new org.opensearch.threadpool.TestThreadPool(getTestName());
         try {
-            plugin.createComponents(null, null, threadPool, null, null, null, environment, null, null, null, null);
+            plugin.createComponents(null, clusterServiceFor(plugin), threadPool, null, null, null, environment, null, null, null, null);
 
             org.opensearch.serverless.storage.scaletozero.ScaleToZeroCandidatesSchedulerTask task = plugin
                 .scaleToZeroCandidatesSchedulerTaskForTesting();
@@ -363,7 +395,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
             .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey(), basePath.toString())
             .build();
         Environment environment = TestEnvironment.newEnvironment(nodeSettings);
-        plugin.createComponents(null, null, null, null, null, null, environment, null, null, null, null);
+        plugin.createComponents(null, clusterServiceFor(plugin), null, null, null, null, environment, null, null, null, null);
 
         assertNull(
             "the node self-warmup scheduler must stay off by default (non-positive interval), "
@@ -387,7 +419,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
         Environment environment = TestEnvironment.newEnvironment(nodeSettings);
         org.opensearch.threadpool.ThreadPool threadPool = new org.opensearch.threadpool.TestThreadPool(getTestName());
         try {
-            plugin.createComponents(null, null, threadPool, null, null, null, environment, null, null, null, null);
+            plugin.createComponents(null, clusterServiceFor(plugin), threadPool, null, null, null, environment, null, null, null, null);
 
             org.opensearch.serverless.storage.nodecapacity.NodeSelfWarmupSchedulerTask task = plugin
                 .nodeSelfWarmupSchedulerTaskForTesting();
@@ -437,7 +469,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
             .build();
         Environment environment = TestEnvironment.newEnvironment(buildEnvSettings(nodeSettings));
         ServerlessStoragePlugin plugin = new ServerlessStoragePlugin();
-        plugin.createComponents(null, null, null, null, null, null, environment, null, null, null, null);
+        plugin.createComponents(null, clusterServiceFor(plugin), null, null, null, null, environment, null, null, null, null);
 
         InMemoryPlaintextBundleCache sharedCache = plugin.sharedBundleCache();
         assertNotNull("createComponents must construct the shared cache", sharedCache);

@@ -478,10 +478,24 @@ does not have rather than on work left undone:
 |---|---|---|
 | **T19** | point lookup latency, system index against blob | **blocked on infrastructure, not effort.** The only backend available here is `FsBlobContainer`, and timing against it would report local disk speed as an object store result, which is the failure shape this branch has now documented four times. Needs a real bucket, or a latency-injecting container whose injected numbers come from a real measurement. T20 measured the hit rate, which is the half that does not depend on the backend. |
 
-**The full plugin suite has 19 pre-existing failures** in `ServerlessStoragePluginTests`, all
-`ClusterService is null`, verified against the base by stashing and re-running. `ComputedPlacementCostTests`
-also fails under heavy concurrent suite load and passes in isolation, which matches this branch's own
-recorded experience of blaming a timeout on the wrong cause when the real one was contention.
+**The 19 `ServerlessStoragePluginTests` failures are fixed.** They were reported here as pre-existing and
+unrelated, which was true and was not the same as harmless. Every one was `ClusterService is null` from
+`createComponents`, because the test passed null for every collaborator and the production code had since
+started registering a settings update consumer for T28's wildcard cap. The fixture was asserting against a
+shape a real node never has, and thirteen call sites now pass a cluster service carrying the plugin's own
+node-scoped settings.
+
+That also buys a check rather than just a pass: `addSettingsUpdateConsumer` rejects a setting it does not
+know, so the suite now fails loudly if the plugin ever registers a consumer for something it forgot to
+declare in `getSettings`. That is a real startup defect, caught in a unit test instead of on a node.
+
+Full plugin suite: **1,294 tests, 1 failure**, down from 19. The survivor is
+`WalBatchingLatencyBenchmarkTests`, which passes in isolation and fails only under whole-suite load, the
+same shape as `ComputedPlacementCostTests`. Both are latency benchmarks and both match this branch's own
+recorded experience of blaming a timeout on the wrong cause when contention was the real one.
+
+**`spotlessCheck` now passes** on `:server`, `:plugins:serverless-storage` and `:plugins:repository-s3`.
+The two formatting-only commits cleared it; a precommit build no longer fails for unrelated reasons.
 
 **Still blocked on T39** in the sibling worktree: C2 (`routingNumShards` on the descriptor) and C5
 (on-demand shard materialisation) both touch files that session is editing.
