@@ -127,6 +127,21 @@ public final class DescriptorCache {
     private final AtomicLong admissions = new AtomicLong();
     private final AtomicLong cachedBytes = new AtomicLong();
 
+    /**
+     * Lookups served without touching the backend, split by how.
+     *
+     * <p>{@code reads} alone cannot give a hit rate, because it counts backend trips rather than lookups,
+     * and it cannot distinguish the two ways a lookup avoids one. That distinction is the point: a fresh
+     * hit costs nothing, and a collapsed wait costs a full round trip that somebody else is paying. A
+     * cache reporting 99% "hits" where most of them are threads blocked behind one cold read is not a
+     * cache that is working, and against a system index the difference was half a millisecond so nobody
+     * had to care. Against an object store it is the difference between a served request and a stalled
+     * one.
+     */
+    private final AtomicLong freshHits = new AtomicLong();
+    private final AtomicLong collapsedWaits = new AtomicLong();
+    private final AtomicLong collapseFallbacks = new AtomicLong();
+
     public DescriptorCache() {
         this(System::nanoTime, DEFAULT_TTL_NANOS, DEFAULT_COLLAPSE_WAIT_MILLIS, DEFAULT_CAPACITY, DEFAULT_BYTES);
     }
@@ -153,6 +168,7 @@ public final class DescriptorCache {
         CachedDescriptor cached = cache.get(name);
         long now = clock.getAsLong();
         if (cached != null && now - cached.readAtNanos() < ttlNanos) {
+            freshHits.incrementAndGet();
             return cached.descriptor();
         }
 
@@ -199,6 +215,7 @@ public final class DescriptorCache {
         try {
             IndexDescriptor shared = reader.get(collapseWaitMillis, TimeUnit.MILLISECONDS);
             if (shared != null) {
+                collapsedWaits.incrementAndGet();
                 return shared;
             }
             return load(name, loader, clock.getAsLong());
@@ -206,6 +223,7 @@ public final class DescriptorCache {
             Thread.currentThread().interrupt();
             return null;
         } catch (TimeoutException e) {
+            collapseFallbacks.incrementAndGet();
             logger.debug("waited [{}] ms on an in-flight descriptor read for [{}]; reading directly", collapseWaitMillis, name);
             // The clock is read again rather than reused from before the wait. A timestamp taken up to
             // collapseWaitMillis ago would stamp the entry as already expired against the window, so the
@@ -332,6 +350,46 @@ public final class DescriptorCache {
     /** How many cached descriptors have been evicted, which distinguishes a small cache from a broken one. */
     public long evictionCount() {
         return evictions.get();
+    }
+
+    /** Lookups answered from memory with no wait and no backend trip. */
+    public long freshHitCount() {
+        return freshHits.get();
+    }
+
+    /**
+     * Lookups answered by waiting on somebody else's in-flight read.
+     *
+     * <p>Counted apart from {@link #freshHitCount} because it is not the same outcome. This is a saved
+     * round trip rather than an avoided one: the caller still waited for the network, it just did not add
+     * traffic. Folding the two together would report a cache as healthy while every request stalls.
+     */
+    public long collapsedWaitCount() {
+        return collapsedWaits.get();
+    }
+
+    /**
+     * Times a waiter gave up on the in-flight read and went to the backend itself.
+     *
+     * <p>The one number here that should stay near zero. It rising means the collapse wait is shorter than
+     * a real read takes, which turns collapsing into duplicated work: every waiter times out and then
+     * issues the read it was waiting to avoid. That is the specific way the 3-second default becomes wrong
+     * against an object store, and it is invisible without this counter.
+     */
+    public long collapseFallbackCount() {
+        return collapseFallbacks.get();
+    }
+
+    /**
+     * Lookups served without a backend trip, as a fraction of all lookups, or NaN before any lookup.
+     *
+     * <p>The number the blob-backed design rests on, and it is stated as a derived value rather than a
+     * stored one so it cannot drift from the counters it comes from.
+     */
+    public double hitRate() {
+        long hits = freshHits.get() + collapsedWaits.get();
+        long total = hits + reads.get();
+        return total == 0 ? Double.NaN : (double) hits / total;
     }
 
     /** How many descriptors are cached, which is what the capacity bounds and what a test checks. */

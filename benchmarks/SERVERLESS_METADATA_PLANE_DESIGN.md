@@ -115,12 +115,12 @@ Everything else is plugin-side:
 |---|---|---|
 | **P1** | blob-backed `DescriptorStore` | replace the system index client with a `BlobContainer` |
 | **P2** | name index fed from descriptor writes rather than cluster state | `nameindex`, plus an append-only change log |
+| **P3** | write lease scoped to `(node, epoch)` rather than per shard | `shardstate` |
+| **P4** | commit manifests batched per node | `manifest` |
 
 P2 gates the *removal* of the system index, not the addition of the blob backend: three of
 `DescriptorStore`'s eleven operations are prefix searches that a blob store cannot serve. T3 in section 11
 has the breakdown.
-| **P3** | write lease scoped to `(node, epoch)` rather than per shard | `shardstate` |
-| **P4** | commit manifests batched per node | `manifest` |
 
 ### C2, and why it is not optional
 
@@ -460,12 +460,12 @@ results do it.
 
 ## 12. Where this stands, and what is next
 
-Twelve tasks landed. Working tree clean, everything below verified by a test that was checked against a
+Thirteen tasks landed. Working tree clean, everything below verified by a test that was checked against a
 deliberately broken build before being believed.
 
 **Done.** T1 (caller enumeration), T2 (register semantics), T3 (store audit), T4 (S3 conditional create),
 T5 (create-only contract tests), T21 (Fs register lock), T22 (`createRegisterIfAbsent`), T6 (backend
-interfaces), T7 (cache extraction), T8 (blob backend), T9 (idempotent creation), T10 (tombstones).
+interfaces), T7 (cache extraction), T8 (blob backend), T9 (idempotent creation), T10 (tombstones), T11 (cache instrumentation).
 
 Two commits are formatting-only sweeps, separated out rather than buried. **The branch base does not pass
 `spotlessCheck`** in either `:server` or `:plugins:serverless-storage`, so a precommit build fails there
@@ -476,7 +476,6 @@ for reasons unrelated to any change. Worth fixing at the base rather than paying
 | | task | note |
 |---|---|---|
 | T12 | descriptor change log | T3 moved this ahead of switching the blob backend on, because the cache TTL needs invalidation rather than a shorter window |
-| T11 | cache hit/miss instrumentation | `DescriptorCache` counts reads and evictions but has no explicit hit counter |
 | T13, T14, T15 | name index fed from the change log, checkpointed, rebuildable from LIST | T3: this gates removing the system index, not adding the blob backend |
 | T16, T17, T18 | membership epochs, decommission, warmth from epoch N-1 | independent of the descriptor work |
 | T19, T20 | point lookup and cache hit rate benchmarks | the numbers the whole approach rests on, and neither is measured |
@@ -819,6 +818,26 @@ indices without needing a read per key to find out.
 
 Six tests, and the mutation check is unambiguous: removing the descriptor delete fails four of them,
 including the two that check resolution rather than layout. 14 backend tests pass.
+
+### T11: a hit rate that distinguishes the two ways a lookup avoids a read
+
+`readCount` and `evictionCount` existed; a hit rate did not, because `reads` counts backend trips rather
+than lookups. Added `freshHitCount`, `collapsedWaitCount`, `collapseFallbackCount` and a derived
+`hitRate()`.
+
+Splitting the first two is the substance. A fresh hit costs nothing. A collapsed wait costs a full round
+trip that another thread is paying for, so the caller still waited on the network, it just did not add
+traffic. Folded together they report a cache as healthy while every request stalls behind one cold read.
+Against a system index that difference was half a millisecond and nobody had to care. Against an object
+store it is the difference between a served request and a stalled one.
+
+`collapseFallbackCount` is the one that should stay near zero. It rising means the collapse wait is
+shorter than a real read takes, which converts collapsing into duplicated work: every waiter times out and
+then issues the read it was waiting to avoid. That is exactly how the 3-second default goes wrong against
+an object store, and it is invisible without the counter.
+
+Six tests, including the two cases where a low hit rate is correct rather than a fault: an expired entry
+and an absent name, since a miss is never cached. A reader of the metric needs to know both.
 
 ### T7 verification, including the part that looked like a regression
 
