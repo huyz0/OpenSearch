@@ -498,8 +498,9 @@ recorded experience of blaming a timeout on the wrong cause when contention was 
 **`spotlessCheck` now passes** on `:server`, `:plugins:serverless-storage` and `:plugins:repository-s3`.
 The two formatting-only commits cleared it; a precommit build no longer fails for unrelated reasons.
 
-**Still blocked on T39** in the sibling worktree: C2 (`routingNumShards` on the descriptor) and C5
-(on-demand shard materialisation) both touch files that session is editing.
+**T39 has landed and this branch is rebased onto it.** C2 (`routingNumShards` on the descriptor) and C5
+(on-demand shard materialisation) are no longer blocked. C5 is what T39 built; C2 is now free to be done,
+and section 4 explains why it is not optional once tenants start resharding.
 
 **The largest unmeasured risk is unchanged.** Nothing here has been run against a real object store. Every
 latency claim in this document is arithmetic, and T19 and T20 are the tasks that would make them evidence.
@@ -1128,6 +1129,44 @@ runs against the `S3HttpHandler` fixture, which was extended to enforce real If-
 semantics, and its javadoc says it exists as "proof that the conditional-write guard is actually enforced
 server-side, not merely that our request-construction code compiles". The new register API skipped it.
 `testCreateRegisterIfAbsentIsEnforcedServerSide` now sits beside it, and both pass.
+
+### Rebase onto T39: it lands, with no conflicts and nothing to repair
+
+T39 landed on `feature/pluggable-engine-per-shard-role` at `1b02991d93a`, "a gated index takes a write,
+and the eleven sites were fifteen". This branch was cut from its parent, so it rebased onto it.
+
+**Twenty-eight commits replayed, zero conflicts.** The two sides turn out to have touched disjoint file
+sets, which was checkable in advance and worth checking: T39 changed the descriptor seams, the residency
+sites and `IndicesClusterStateService`, while this branch changed the blob layer, membership and the
+descriptor store's backend. Even the two formatting sweeps missed T39's files.
+
+Textual cleanliness was never the real question, though. The risk was semantic, and specifically that T39
+might have widened `IndexDescriptor`, which several tests here construct directly. It did not, so every
+one still compiles.
+
+Verified after the rebase rather than assumed from a clean `git rebase`:
+
+| | |
+|---|---|
+| `:server`, `:plugins:serverless-storage`, `:plugins:repository-s3` main and test compilation | clean |
+| plugin unit suite | **1,299 tests, 0 failures** |
+| server tests over the touched areas (`FsBlobContainer`, `ComputedPlacementMembership`, `OperationRouting`, `AbsentIndex*`) | 74 tests, 0 failures |
+| `repository-s3` unit plus the mock-S3 register tests | 184 + 2, 0 failures |
+| `spotlessCheck` on all three projects | clean |
+
+**The one that mattered: `GatedEndToEndIT.testAGatedIndexCanBeWrittenToAndSearched` passes.** That is the
+test T39 exists to make pass, and this branch changes `FsBlobContainer`'s register locking, the membership
+custom's wire format and `NameIndexService`'s feed, any of which could have broken it. The two skips in
+that class are pre-existing `@AwaitsFix` annotations, not new.
+
+One failure appeared and was not a regression. `AwsS3ServiceImplTests.testIrsaCredentialsFromKeystore`
+fails with "Unable to load region from any of the providers in the chain", and passes with `AWS_REGION`
+set. It is an environment prerequisite that has nothing to do with either side, checked rather than
+waved through, because "unrelated" is what four wrong diagnoses in this area looked like.
+
+**What this does not clear.** C2 and C5 were blocked on T39 and are now unblocked, but neither is done.
+C2 still needs `routingNumShards` and `routingPartitionSize` on the descriptor, and `IndexDescriptor.java`
+is now free to take them.
 
 ### T7 verification, including the part that looked like a regression
 
