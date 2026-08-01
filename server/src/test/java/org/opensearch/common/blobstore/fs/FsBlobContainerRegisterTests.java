@@ -35,7 +35,12 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class FsBlobContainerRegisterTests extends OpenSearchTestCase {
 
     private BlobContainer newFsBlobContainer() throws Exception {
-        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        return newFsBlobContainer(createTempDir());
+    }
+
+    /** A container over a caller-supplied directory, so two of them can be pointed at the same one. */
+    private BlobContainer newFsBlobContainer(java.nio.file.Path directory) throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, directory, false);
         return new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
     }
 
@@ -139,6 +144,68 @@ public class FsBlobContainerRegisterTests extends OpenSearchTestCase {
 
         assertEquals("exactly one contender must win the put-if-absent race", 1, successCount.get());
         assertEquals(contenders - 1, results.stream().filter(r -> r.applied() == false).count());
+    }
+
+    /**
+     * The same race, but through <em>separate container instances</em> over one directory.
+     *
+     * <p>This is the shape that actually occurs, and the one the previous implementation did not
+     * arbitrate. Every test above holds a single container, so they exercised a per-instance lock and
+     * passed; an internal cluster test gives each node its own container over shared storage, and there
+     * both contenders read the same absent generation, both passed the equality check, both wrote, and
+     * the second silently won. A uniqueness test built on that would have asserted nothing.
+     *
+     * <p>Contenders are spread across the containers rather than one each, so the assertion covers both
+     * the within-container and across-container paths in one run.
+     */
+    public void testConcurrentPutIfAbsentAcrossSeparateContainersHasExactlyOneWinner() throws Exception {
+        java.nio.file.Path shared = createTempDir();
+        int containerCount = 4;
+        List<BlobContainer> containers = new java.util.ArrayList<>();
+        for (int i = 0; i < containerCount; i++) {
+            containers.add(newFsBlobContainer(shared));
+        }
+
+        int contenders = 20;
+        ExecutorService executor = Executors.newFixedThreadPool(contenders);
+        CountDownLatch startLine = new CountDownLatch(1);
+        AtomicInteger successCount = new AtomicInteger();
+
+        try {
+            List<Future<?>> futures = new java.util.ArrayList<>();
+            for (int i = 0; i < contenders; i++) {
+                final BlobContainer container = containers.get(i % containerCount);
+                final int contenderId = i;
+                futures.add(executor.submit(() -> {
+                    try {
+                        startLine.await();
+                        BlobRegisterCasResult result = container.compareAndSwapRegister(
+                            "head",
+                            BlobRegister.ABSENT_GENERATION,
+                            new BytesArray(new byte[] { (byte) contenderId })
+                        );
+                        if (result.applied()) {
+                            successCount.incrementAndGet();
+                        }
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                }));
+            }
+            startLine.countDown();
+            for (Future<?> future : futures) {
+                future.get(30, TimeUnit.SECONDS);
+            }
+        } finally {
+            executor.shutdown();
+        }
+
+        assertEquals("exactly one contender must win across separate containers", 1, successCount.get());
+
+        // And the winner is readable at generation 1 through a container that did not write it, so the
+        // single write is genuinely shared state rather than one instance's private view.
+        BlobRegister read = containers.get(containerCount - 1).readRegister("head").orElseThrow();
+        assertEquals(1L, read.generation());
     }
 
     // No lost updates under concurrent CAS-with-retry, mirroring how a real writer/compactor pair

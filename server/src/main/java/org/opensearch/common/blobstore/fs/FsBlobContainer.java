@@ -55,6 +55,7 @@ import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
 import java.nio.channels.SeekableByteChannel;
 import java.nio.file.DirectoryStream;
 import java.nio.file.FileAlreadyExistsException;
@@ -98,7 +99,15 @@ public class FsBlobContainer extends AbstractBlobContainer {
     // inter-process only, and a second overlapping lock() from a different FileChannel in the
     // *same* JVM throws OverlappingFileLockException rather than blocking, so real intra-process
     // mutual exclusion has to come from here, not from the filesystem.
-    private final ConcurrentHashMap<String, ReentrantLock> registerLocksByBlobName = new ConcurrentHashMap<>();
+    //
+    // Static, and keyed by the resolved register path rather than by blob name, because the unit of
+    // exclusion is the file and not the container that reached it. As a per-instance field keyed by
+    // name this arbitrated nothing between two containers over the same directory: both read the
+    // same generation, both passed the equality check, both wrote, and the second silently won.
+    // Internal cluster tests give every node its own container, so that is the normal case rather
+    // than an exotic one, and a test asserting one winner among concurrent CAS callers would have
+    // been asserting nothing.
+    private static final ConcurrentHashMap<String, ReentrantLock> REGISTER_LOCKS_BY_PATH = new ConcurrentHashMap<>();
 
     public FsBlobContainer(FsBlobStore blobStore, BlobPath blobPath, Path path) {
         super(blobPath);
@@ -302,10 +311,15 @@ public class FsBlobContainer extends AbstractBlobContainer {
         if (Files.exists(registerPath) == false) {
             return Optional.empty();
         }
-        ReentrantLock lock = registerLockFor(blobName);
+        ReentrantLock lock = registerLockFor(registerPath);
         lock.lock();
         try (FileChannel channel = FileChannel.open(registerPath, StandardOpenOption.READ)) {
-            return readRegisterUnderLock(channel);
+            // Shared, because the channel is read-only and an exclusive lock on it would throw. Enough
+            // to exclude a writer in another process, which is all this adds over the lock above.
+            try (FileLock fileLock = channel.lock(0L, Long.MAX_VALUE, true)) {
+                assert fileLock != null;
+                return readRegisterUnderLock(channel);
+            }
         } finally {
             lock.unlock();
         }
@@ -317,7 +331,7 @@ public class FsBlobContainer extends AbstractBlobContainer {
         Path registerPath = path.resolve(blobName);
         Files.createDirectories(path);
 
-        ReentrantLock lock = registerLockFor(blobName);
+        ReentrantLock lock = registerLockFor(registerPath);
         lock.lock();
         try (
             FileChannel channel = FileChannel.open(
@@ -327,22 +341,35 @@ public class FsBlobContainer extends AbstractBlobContainer {
                 StandardOpenOption.WRITE
             )
         ) {
-            Optional<BlobRegister> current = readRegisterUnderLock(channel);
-            long currentGeneration = current.map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
-            if (currentGeneration != expectedGeneration) {
-                return BlobRegisterCasResult.conflict(currentGeneration);
-            }
+            // Held across the read and the write, so the compare and the swap are one step. Taken only
+            // after the intra-process lock above, which is what keeps this from throwing
+            // OverlappingFileLockException when two containers in one JVM reach the same file.
+            try (FileLock fileLock = channel.lock()) {
+                assert fileLock != null;
+                Optional<BlobRegister> current = readRegisterUnderLock(channel);
+                long currentGeneration = current.map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
+                if (currentGeneration != expectedGeneration) {
+                    return BlobRegisterCasResult.conflict(currentGeneration);
+                }
 
-            long newGeneration = currentGeneration + 1;
-            writeRegisterUnderLock(channel, newGeneration, newValue);
-            return BlobRegisterCasResult.applied(newGeneration);
+                long newGeneration = currentGeneration + 1;
+                writeRegisterUnderLock(channel, newGeneration, newValue);
+                return BlobRegisterCasResult.applied(newGeneration);
+            }
         } finally {
             lock.unlock();
         }
     }
 
-    private ReentrantLock registerLockFor(String blobName) {
-        return registerLocksByBlobName.computeIfAbsent(blobName, name -> new ReentrantLock());
+    /**
+     * The intra-process lock for one register file.
+     *
+     * <p>Keyed by the absolute normalised path so two containers that reach the same file through
+     * different {@link BlobPath}s share a lock, and two containers over different directories with the
+     * same blob name do not.
+     */
+    private static ReentrantLock registerLockFor(Path registerPath) {
+        return REGISTER_LOCKS_BY_PATH.computeIfAbsent(registerPath.toAbsolutePath().normalize().toString(), ignored -> new ReentrantLock());
     }
 
     private Optional<BlobRegister> readRegisterUnderLock(FileChannel channel) throws IOException {

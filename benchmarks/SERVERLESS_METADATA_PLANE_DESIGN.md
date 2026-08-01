@@ -590,3 +590,29 @@ precondition header, and against those this silently reverts to last-writer-wins
 is the same dependency section 4 already records for name uniqueness, now on a second path.
 
 Existing `repository-s3` unit tests: 75 run, 0 failures.
+
+### T21: the Fs register lock, and a test that was checked against the bug
+
+`registerLocksByBlobName` was a per-instance field keyed by blob name. Made static and keyed by the
+resolved absolute path instead, because the unit of exclusion is the file rather than the container that
+reached it. A `FileChannel.lock()` now spans the read and the write as well, taken only after the
+in-process lock so it cannot throw `OverlappingFileLockException` when two containers in one JVM meet at
+the same file. Read takes it shared, since the channel is read-only and an exclusive lock on it would
+throw.
+
+`FsBlobContainerRegisterTests` already had `testConcurrentPutIfAbsentRaceHasExactlyOneWinner` and
+`testConcurrentWritersWithRetryNeverLoseAnUpdate`, and both passed against the broken code, because both
+hold a single container and so exercised the per-instance lock. The new test spreads twenty contenders
+across four containers over one directory, which is the shape an internal cluster test produces.
+
+**It was run against the unfixed source before being believed.** Reverting only `FsBlobContainer.java` and
+keeping the test gives:
+
+```
+testConcurrentPutIfAbsentAcrossSeparateContainersHasExactlyOneWinner FAILED
+  java.lang.AssertionError: exactly one contender must win across separate containers expected:<1> but was:<2>
+```
+
+Two winners on one put-if-absent, which is the lost update. With the fix restored, 8 tests, 0 failures.
+A concurrency test that has never been shown to fail is a test that asserts nothing, and this area has
+shipped one of those before.
