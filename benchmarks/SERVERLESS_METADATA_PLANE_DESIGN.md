@@ -115,6 +115,10 @@ Everything else is plugin-side:
 |---|---|---|
 | **P1** | blob-backed `DescriptorStore` | replace the system index client with a `BlobContainer` |
 | **P2** | name index fed from descriptor writes rather than cluster state | `nameindex`, plus an append-only change log |
+
+P2 gates the *removal* of the system index, not the addition of the blob backend: three of
+`DescriptorStore`'s eleven operations are prefix searches that a blob store cannot serve. T3 in section 11
+has the breakdown.
 | **P3** | write lease scoped to `(node, epoch)` rather than per shard | `shardstate` |
 | **P4** | commit manifests batched per node | `manifest` |
 
@@ -494,3 +498,57 @@ task 5 exists to verify, and precisely the "fails by succeeding" shape this area
 
 The channel is already open under `FileChannel.open`, so `FileChannel.lock()` on it would arbitrate across
 instances and across processes. Filed as its own task, and it blocks task 5.
+
+### T3: eight of eleven operations move, and the cache constants do not
+
+`DescriptorStore`'s public surface, and what a blob backend can serve:
+
+| operation | shape | blob-servable |
+|---|---|---|
+| `get(name)` | realtime point read | yes, a GET |
+| `create(descriptor)` | create-if-absent | yes, `ifNoneMatch("*")` |
+| `createAsync(descriptor)` | the same, async | yes |
+| `put` / `putAsync` | upsert | yes, PUT or CAS |
+| `putTombstoneAsync` | tombstone write, 5 attempts | yes, but see task 10 |
+| `invalidate(name)` | cache only, no I/O | n/a |
+| `indexExists()` | bootstrap probe | n/a, disappears |
+| `readCount` / `evictionCount` | stats | n/a |
+| `findByPrefix(prefix, after, size)` | prefix search | **no** |
+| `findNamesForPage(...)` | pagination | **no** |
+| `expandPrefix(prefix, limit)` | wildcard expansion | **no** |
+
+**P1 and P2 are not independent, and section 9 understated that.** The blob backend can be added
+alongside the system index, but the index cannot be removed until the name index serves those last three,
+which are exactly the operations S13 identified as the part that cannot be partitioned. The ordering is
+P2 gates the deletion, not the addition.
+
+**The create-only contract already exists and carries over unchanged.** `create` uses
+`IndexRequest.create(true)`, which T18 added for uniqueness. The semantics are identical to
+`ifNoneMatch("*")`; only the enforcement mechanism moves from document-id uniqueness to a conditional PUT.
+Nothing above the store has to change.
+
+**Bootstrap circularity disappears for free.** There is no index to create, so no `ensureIndexExists` race,
+no shard count fixed at creation, and no dependency on a cluster state entry to hold the metadata plane
+that exists to escape cluster state. That was one of the four problems section 2 charged against the system
+index, and the blob backend simply does not have it.
+
+**The cache is stronger than section 5 assumed.** It is bounded by both entry count and retained bytes, and
+it collapses concurrent reads of the same name through an in-flight future map, because T1 measured
+sixty-four concurrent resolutions of one name issuing sixty-four reads. Request collapsing is exactly the
+right thing to have in front of an object store: M concurrent readers of a cold descriptor cost one round
+trip, not M.
+
+**But `CACHE_TTL_NANOS` is one second, and that is tuned for a local index.** A descriptor accessed more
+often than once per second re-reads every second. At 0.5 ms that is free. At an object store round trip it
+is 20 to 100 ms, paid per active tenant per second per node, whatever the request rate above it.
+
+The fix is not a longer constant chosen by feel. It is a long TTL plus explicit invalidation, and the hook
+already exists as `invalidate(name)`. The change log in task 12 is what drives it. **That gives the change
+log a second reason to exist, independent of feeding the name index,** and it should be built before the
+blob backend is switched on rather than after.
+
+**`COLLAPSE_WAIT_MILLIS` is 3,000 and should be re-derived rather than inherited.** It bounds how long a
+waiter blocks before reading directly, and it was chosen against a sub-millisecond read so that a hung
+reader could not take its waiters down with it. Against a 50 ms read the ratio inverts: the fallback
+essentially never fires, so the blast-radius protection it was built for is no longer there. Whether that
+matters depends on what a hung object store read looks like, which is not known yet.
