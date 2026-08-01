@@ -471,11 +471,17 @@ Two commits are formatting-only sweeps, separated out rather than buried. **The 
 `spotlessCheck`** in either `:server` or `:plugins:serverless-storage`, so a precommit build fails there
 for reasons unrelated to any change. Worth fixing at the base rather than paying it per commit.
 
-**Not started, in the order they unblock each other:**
+**Twenty-one of twenty-two tasks are done.** The one remaining is blocked on something this environment
+does not have rather than on work left undone:
 
 | | task | note |
 |---|---|---|
-| T19 | point lookup latency, system index against blob | needs a real object store; measuring it against `FsBlobContainer` would report local disk speed as an object store result |
+| **T19** | point lookup latency, system index against blob | **blocked on infrastructure, not effort.** The only backend available here is `FsBlobContainer`, and timing against it would report local disk speed as an object store result, which is the failure shape this branch has now documented four times. Needs a real bucket, or a latency-injecting container whose injected numbers come from a real measurement. T20 measured the hit rate, which is the half that does not depend on the backend. |
+
+**The full plugin suite has 19 pre-existing failures** in `ServerlessStoragePluginTests`, all
+`ClusterService is null`, verified against the base by stashing and re-running. `ComputedPlacementCostTests`
+also fails under heavy concurrent suite load and passes in isolation, which matches this branch's own
+recorded experience of blaming a timeout on the wrong cause when the real one was contention.
 
 **Still blocked on T39** in the sibling worktree: C2 (`routingNumShards` on the descriptor) and C5
 (on-demand shard materialisation) both touch files that session is editing.

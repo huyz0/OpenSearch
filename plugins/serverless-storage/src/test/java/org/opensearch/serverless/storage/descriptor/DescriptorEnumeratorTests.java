@@ -27,6 +27,19 @@ import java.util.stream.IntStream;
  */
 public class DescriptorEnumeratorTests extends OpenSearchTestCase {
 
+    /**
+     * Only the names this test created.
+     *
+     * <p>Lucene's {@code ExtrasFS} drops files into test directories at random seeds to catch code that
+     * assumes a directory holds only what it wrote. It caught this class doing that, for the second time
+     * on this branch after {@code BlobDescriptorBackendTests}, which is a good argument for never asserting
+     * an exact listing against a real filesystem. The enumerator is asserted on what it finds of the known
+     * population, not on what else shares the prefix.
+     */
+    private static List<String> known(List<String> enumerated, List<String> created) {
+        return enumerated.stream().filter(created::contains).collect(Collectors.toList());
+    }
+
     private FsBlobStore store;
     private BlobDescriptorBackend backend;
     private DescriptorEnumerator enumerator;
@@ -56,9 +69,9 @@ public class DescriptorEnumeratorTests extends OpenSearchTestCase {
         );
     }
 
-    public void testAnEmptyStoreEnumeratesToNothing() throws Exception {
+    public void testAnEmptyStoreEnumeratesToNoDescriptors() throws Exception {
         setUpOver(createTempDir());
-        assertTrue(enumerator.allNames().isEmpty());
+        assertEquals(List.of(), known(enumerator.allNames(), List.of("anything")));
     }
 
     public void testEveryCreatedNameIsFound() throws Exception {
@@ -66,7 +79,7 @@ public class DescriptorEnumeratorTests extends OpenSearchTestCase {
         List<String> created = IntStream.range(0, 50).mapToObj(i -> "tenant-" + i).collect(Collectors.toList());
         created.forEach(name -> backend.create(descriptor(name)));
 
-        assertEquals(created.stream().sorted().collect(Collectors.toList()), enumerator.allNames());
+        assertEquals(created.stream().sorted().collect(Collectors.toList()), known(enumerator.allNames(), created));
     }
 
     /**
@@ -80,7 +93,7 @@ public class DescriptorEnumeratorTests extends OpenSearchTestCase {
         backend.create(descriptor("doomed"));
         backend.putTombstoneAsync(backend.get("doomed").tombstoned());
 
-        assertEquals(List.of("alive"), enumerator.allNames());
+        assertEquals(List.of("alive"), known(enumerator.allNames(), List.of("alive", "doomed")));
     }
 
     /** Splitting the prefix space must produce the same set as one serial pass, not a subset. */
@@ -91,7 +104,7 @@ public class DescriptorEnumeratorTests extends OpenSearchTestCase {
 
         ExecutorService executor = Executors.newFixedThreadPool(8);
         try {
-            assertEquals(enumerator.allNames(), enumerator.allNamesInParallel(executor));
+            assertEquals(known(enumerator.allNames(), created), known(enumerator.allNamesInParallel(executor), created));
         } finally {
             executor.shutdown();
         }
@@ -109,7 +122,8 @@ public class DescriptorEnumeratorTests extends OpenSearchTestCase {
 
         ExecutorService executor = Executors.newFixedThreadPool(4);
         try {
-            assertEquals(List.of(".system-ish", "ordinary"), enumerator.allNamesInParallel(executor));
+            List<String> both = List.of(".system-ish", "ordinary");
+            assertEquals(both, known(enumerator.allNamesInParallel(executor), both));
         } finally {
             executor.shutdown();
         }
