@@ -261,12 +261,7 @@ public class DeferredIndexMetadataTests extends OpenSearchTestCase {
             .putAlias(AliasMetadata.builder("shared").build())
             .build();
 
-        Metadata materialized = Metadata.builder()
-            .put(plain, false)
-            .put(hidden, false)
-            .put(system, false)
-            .put(aliased, false)
-            .build();
+        Metadata materialized = Metadata.builder().put(plain, false).put(hidden, false).put(system, false).put(aliased, false).build();
         Metadata deferred = Metadata.builder()
             .putStub(LazyIndexMetadata.of(plain, () -> plain))
             .putStub(LazyIndexMetadata.of(hidden, () -> hidden))

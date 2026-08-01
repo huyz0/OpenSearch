@@ -119,7 +119,10 @@ public class LookupGrowthCauseIT extends OpenSearchIntegTestCase {
         assertTrue("both lookup measurements must be non-zero, or this measured nothing", beforeMillis > 0 && afterMillis > 0);
         assertTrue(
             "the force merge must actually have collapsed segments, or the comparison is between two "
-                + "identical states and says nothing: " + segmentsBefore + " -> " + segmentsAfter,
+                + "identical states and says nothing: "
+                + segmentsBefore
+                + " -> "
+                + segmentsAfter,
             segmentsAfter < segmentsBefore
         );
     }

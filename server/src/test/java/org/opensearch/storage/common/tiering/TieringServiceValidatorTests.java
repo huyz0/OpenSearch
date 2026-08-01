@@ -21,7 +21,6 @@ import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodeRole;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.routing.IndexRoutingTable;
-import org.opensearch.storage.common.tiering.TieringRejectionException.RejectionReason;
 import org.opensearch.cluster.routing.RoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.ShardRoutingState;
@@ -37,6 +36,7 @@ import org.opensearch.index.IndexModule;
 import org.opensearch.index.store.remote.filecache.FileCacheSettings;
 import org.opensearch.indices.ShardLimitValidator;
 import org.opensearch.node.NodeResourceUsageStats;
+import org.opensearch.storage.common.tiering.TieringRejectionException.RejectionReason;
 import org.opensearch.test.OpenSearchTestCase;
 import org.junit.Before;
 

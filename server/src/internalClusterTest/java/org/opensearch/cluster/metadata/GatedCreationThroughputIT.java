@@ -61,9 +61,7 @@ public class GatedCreationThroughputIT extends OpenSearchIntegTestCase {
         createDescriptorIndex();
 
         StringBuilder table = new StringBuilder("\nH10 end-to-end gated creation, descriptor writes at op_type=create\n");
-        table.append(
-            String.format(Locale.ROOT, "  %9s %14s %16s %18s%n", "created", "elapsed (s)", "per index (ms)", "indices/sec")
-        );
+        table.append(String.format(Locale.ROOT, "  %9s %14s %16s %18s%n", "created", "elapsed (s)", "per index (ms)", "indices/sec"));
 
         int alreadyCreated = 0;
         double lastRate = 0;

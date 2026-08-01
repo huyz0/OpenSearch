@@ -474,7 +474,11 @@ public class TransportReplicationActionTests extends OpenSearchTestCase {
         PlainActionFuture<TestResponse> listener = new PlainActionFuture<>();
         TestAction.ReroutePhase reroutePhase = action.new ReroutePhase(task, request, listener);
         reroutePhase.run();
-        assertListenerThrows("a cold index must time out like an unassigned one, not fail immediately", listener, UnavailableShardsException.class);
+        assertListenerThrows(
+            "a cold index must time out like an unassigned one, not fail immediately",
+            listener,
+            UnavailableShardsException.class
+        );
         assertPhase(task, "failed");
         assertTrue(request.isRetrySet.get());
 

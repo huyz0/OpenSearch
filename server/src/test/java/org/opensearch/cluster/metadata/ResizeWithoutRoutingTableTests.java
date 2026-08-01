@@ -58,9 +58,7 @@ public class ResizeWithoutRoutingTableTests extends OpenSearchTestCase {
     private static ClusterState openStateWith(String indexName, int shards) {
         IndexMetadata indexMetadata = IndexMetadata.builder(indexName)
             .settings(
-                Settings.builder()
-                    .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
-                    .put(IndexMetadata.SETTING_BLOCKS_WRITE, true)
+                Settings.builder().put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT).put(IndexMetadata.SETTING_BLOCKS_WRITE, true)
             )
             .numberOfShards(shards)
             .numberOfReplicas(0)
@@ -69,11 +67,7 @@ public class ResizeWithoutRoutingTableTests extends OpenSearchTestCase {
         return ClusterState.builder(ClusterName.DEFAULT)
             .metadata(metadata)
             .routingTable(RoutingTable.builder().addAsNew(metadata.index(indexName)).build())
-            .blocks(
-                org.opensearch.cluster.block.ClusterBlocks.builder()
-                    .addIndexBlock(indexName, IndexMetadata.INDEX_WRITE_BLOCK)
-                    .build()
-            )
+            .blocks(org.opensearch.cluster.block.ClusterBlocks.builder().addIndexBlock(indexName, IndexMetadata.INDEX_WRITE_BLOCK).build())
             .build();
     }
 
