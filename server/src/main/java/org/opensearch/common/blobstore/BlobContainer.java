@@ -395,4 +395,30 @@ public interface BlobContainer {
         throws IOException {
         throw new UnsupportedOperationException(getClass() + " does not support compareAndSwapRegister");
     }
+
+    /**
+     * Writes a register only if it does not exist yet, in as few round trips as the backend allows.
+     *
+     * <p>Semantically identical to {@code compareAndSwapRegister(blobName, ABSENT_GENERATION, value)},
+     * which is exactly what this defaults to. It exists because that general form cannot be as cheap: a
+     * CAS against an arbitrary generation has to learn the current one, so an object-store implementation
+     * reads before it writes. Creation does not need to. "Must not exist" is expressible as a
+     * precondition on the write itself, so the read is redundant on the path that succeeds.
+     *
+     * <p>That halving matters because of what calls it. Index creation is one create-if-absent, and this
+     * design's whole claim about creation throughput is that it becomes an object-store write with no
+     * cluster-wide serialisation behind it. Two round trips instead of one is a factor of two on the one
+     * operation expected to run at a hundred million.
+     *
+     * <p>Implementations may leave the conflicting generation as
+     * {@link BlobRegister#ABSENT_GENERATION} rather than pay a read to discover it, so callers that need
+     * the current value on conflict should read it themselves. The applied case is authoritative either
+     * way.
+     *
+     * @return whether this caller created the register.
+     * @throws UnsupportedOperationException if this blob container does not implement register semantics.
+     */
+    default BlobRegisterCasResult createRegisterIfAbsent(String blobName, BytesReference value) throws IOException {
+        return compareAndSwapRegister(blobName, BlobRegister.ABSENT_GENERATION, value);
+    }
 }

@@ -77,12 +77,15 @@ import org.opensearch.action.LatchedActionListener;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.BlobRegister;
+import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.BlobStoreException;
 import org.opensearch.common.blobstore.DeleteResult;
 import org.opensearch.common.blobstore.stream.read.ReadContext;
 import org.opensearch.common.collect.Tuple;
 import org.opensearch.common.io.InputStreamContainer;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.unit.ByteSizeUnit;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -122,6 +125,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -769,6 +773,52 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
             () -> blobContainer.executeSingleUpload(blobStore, "blob", new ByteArrayInputStream(new byte[8]), 8, null, null, false)
         );
         assertFalse(wrapped instanceof FileAlreadyExistsException);
+    }
+
+    /**
+     * The saving is the point, so it is asserted directly: one PUT and no GET.
+     *
+     * <p>A test that only checked the return value would pass against the default implementation, which
+     * is correct and twice as expensive. Index creation is one of these calls, at the scale this design
+     * targets, so the round trip count is the behaviour under test rather than an implementation detail.
+     */
+    public void testCreateRegisterIfAbsentIssuesOnePutAndNoGet() throws IOException {
+        final S3BlobStore blobStore = mock(S3BlobStore.class);
+        when(blobStore.bucket()).thenReturn("bucket");
+        when(blobStore.getStatsMetricPublisher()).thenReturn(new StatsMetricPublisher());
+
+        final S3Client client = mock(S3Client.class);
+        when(blobStore.clientReference()).thenReturn(new AmazonS3Reference(client));
+        final ArgumentCaptor<PutObjectRequest> captor = ArgumentCaptor.forClass(PutObjectRequest.class);
+        when(client.putObject(captor.capture(), any(RequestBody.class))).thenReturn(PutObjectResponse.builder().build());
+
+        final S3BlobContainer blobContainer = new S3BlobContainer(BlobPath.cleanPath(), blobStore);
+        final BlobRegisterCasResult result = blobContainer.createRegisterIfAbsent("head", new BytesArray(new byte[] { 1, 2, 3 }));
+
+        assertTrue(result.applied());
+        assertEquals(BlobRegister.ABSENT_GENERATION + 1, result.currentGeneration());
+        assertEquals("*", captor.getValue().ifNoneMatch());
+        verify(client, times(1)).putObject(any(PutObjectRequest.class), any(RequestBody.class));
+        verify(client, never()).getObject(any(GetObjectRequest.class));
+    }
+
+    /** Losing the create race is a conflict, not an exception, and still costs one round trip. */
+    public void testCreateRegisterIfAbsentReportsConflictOnPreconditionFailure() throws IOException {
+        final S3BlobStore blobStore = mock(S3BlobStore.class);
+        when(blobStore.bucket()).thenReturn("bucket");
+        when(blobStore.getStatsMetricPublisher()).thenReturn(new StatsMetricPublisher());
+
+        final S3Client client = mock(S3Client.class);
+        when(blobStore.clientReference()).thenReturn(new AmazonS3Reference(client));
+        when(client.putObject(any(PutObjectRequest.class), any(RequestBody.class))).thenThrow(
+            S3Exception.builder().statusCode(412).message("precondition failed").build()
+        );
+
+        final S3BlobContainer blobContainer = new S3BlobContainer(BlobPath.cleanPath(), blobStore);
+        final BlobRegisterCasResult result = blobContainer.createRegisterIfAbsent("head", new BytesArray(new byte[] { 1 }));
+
+        assertFalse(result.applied());
+        verify(client, never()).getObject(any(GetObjectRequest.class));
     }
 
     public void testExecuteMultipartUploadBlobSizeTooLarge() {

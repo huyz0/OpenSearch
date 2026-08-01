@@ -1160,6 +1160,51 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
         }
     }
 
+    /**
+     * One conditional PUT, where {@link #compareAndSwapRegister} needs a GET first.
+     *
+     * <p>That GET is not wasted work in the general case: a CAS against an arbitrary generation has to
+     * learn the current one. It is wasted here. The only thing the read tells the create path is that
+     * {@code currentETag} is null, which selects {@code ifNoneMatch("*")}, and that header is itself the
+     * atomic "must not exist" check evaluated by S3 against the live object. The class comment on
+     * {@code compareAndSwapRegister} already says the conditional write is the authoritative guard and
+     * the read is "purely as a fast-fail", so dropping it costs no safety.
+     *
+     * <p>Conflict reports {@link BlobRegister#ABSENT_GENERATION} rather than reading to find the real
+     * generation, because a caller that lost a create race wants to know it lost, and paying a round trip
+     * to decorate that would reintroduce the cost this exists to remove. A caller that needs the winning
+     * value reads it itself, on a path that by definition is not the common one.
+     */
+    @Override
+    public BlobRegisterCasResult createRegisterIfAbsent(String blobName, BytesReference value) throws IOException {
+        String key = buildKey(blobName);
+        long newGeneration = BlobRegister.ABSENT_GENERATION + 1;
+        byte[] bytesToWrite = serializeRegister(newGeneration, value);
+
+        PutObjectRequest putObjectRequest = PutObjectRequest.builder()
+            .bucket(blobStore.bucket())
+            .key(key)
+            .contentLength((long) bytesToWrite.length)
+            .expectedBucketOwner(blobStore.expectedBucketOwner())
+            .ifNoneMatch("*")
+            .build();
+
+        try (AmazonS3Reference clientReference = blobStore.clientReference()) {
+            S3Client client = clientReference.get();
+            try {
+                AccessController.doPrivileged(() -> client.putObject(putObjectRequest, RequestBody.fromBytes(bytesToWrite)));
+                return BlobRegisterCasResult.applied(newGeneration);
+            } catch (S3Exception e) {
+                if (e.statusCode() == 412) {
+                    return BlobRegisterCasResult.conflict(BlobRegister.ABSENT_GENERATION);
+                }
+                throw e;
+            }
+        } catch (SdkException e) {
+            throw new IOException("Unable to create register [" + blobName + "]", e);
+        }
+    }
+
     private static BlobRegister deserializeRegister(byte[] bytes) {
         ByteBuffer buffer = ByteBuffer.wrap(bytes);
         long generation = buffer.getLong();

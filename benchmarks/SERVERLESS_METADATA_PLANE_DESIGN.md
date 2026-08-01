@@ -637,3 +637,26 @@ asserts the original survives the rejected write rather than being half-replaced
 off still overwrites, since the flag is a choice between two behaviours rather than a safety toggle.
 
 `repository-s3` 51 tests, `FsBlobContainerTests` and `FsBlobContainerRegisterTests` green.
+
+### T22: creation is one round trip, not two
+
+`createRegisterIfAbsent(blobName, value)` on `BlobContainer`, defaulting to
+`compareAndSwapRegister(blobName, ABSENT_GENERATION, value)` so every existing container keeps working,
+overridden in `S3BlobContainer` to issue the conditional PUT alone.
+
+The general CAS has to read first, because a CAS against an arbitrary generation must learn the current
+one. Creation does not: the only thing the read tells that path is that `currentETag` is null, which
+selects `ifNoneMatch("*")`, and that header is itself the atomic must-not-exist check. The existing
+javadoc already called the read "purely as a fast-fail", so removing it costs no safety.
+
+Conflict reports `ABSENT_GENERATION` rather than reading to discover the winner's generation. A caller
+that lost a create race wants to know it lost; paying a round trip to decorate that would put back the
+cost this removes. `BlobContainer`'s javadoc states the weaker conflict contract so no caller relies on it.
+
+Asserted on round trip count, not on the return value, because a test checking only the result passes
+against the default implementation, which is correct and twice as expensive. Removing the `@Override` makes
+both tests fail. 53 tests, 0 failures with it restored.
+
+Worth being precise about the failure mode: the mutated build fails with an NPE from the unstubbed
+`getObject` rather than from `verify(never())`. The signal is still "a GET happened", which is what is
+under test, but the assertion is not what reports it.
