@@ -96,14 +96,18 @@ public class ShardSplitCandidatesRequest extends BaseNodesRequest<ShardSplitCand
         ActionRequestValidationException validationException = null;
         if (writesPerMinuteThreshold < 0 && writesPerMinuteThreshold != USE_DEFAULT_WPM_THRESHOLD) {
             validationException = addValidationError(
-                "writesPerMinuteThreshold must be >= 0 (or " + USE_DEFAULT_WPM_THRESHOLD + " to use the configured default), got "
+                "writesPerMinuteThreshold must be >= 0 (or "
+                    + USE_DEFAULT_WPM_THRESHOLD
+                    + " to use the configured default), got "
                     + writesPerMinuteThreshold,
                 validationException
             );
         }
         if (sizeThresholdBytes < 0 && sizeThresholdBytes != USE_DEFAULT_SIZE_THRESHOLD_BYTES) {
             validationException = addValidationError(
-                "sizeThresholdBytes must be >= 0 (or " + USE_DEFAULT_SIZE_THRESHOLD_BYTES + " to use the configured default), got "
+                "sizeThresholdBytes must be >= 0 (or "
+                    + USE_DEFAULT_SIZE_THRESHOLD_BYTES
+                    + " to use the configured default), got "
                     + sizeThresholdBytes,
                 validationException
             );

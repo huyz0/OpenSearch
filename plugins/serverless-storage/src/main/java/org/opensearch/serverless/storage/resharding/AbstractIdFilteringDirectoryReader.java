@@ -53,8 +53,7 @@ abstract class AbstractIdFilteringDirectoryReader extends FilterDirectoryReader 
      * @param idRoutingPredicate given a document's {@code _id} and its stored {@code _routing}
      *        ({@code null} if none), returns {@code true} iff the document should remain visible.
      */
-    protected AbstractIdFilteringDirectoryReader(DirectoryReader in, BiPredicate<String, String> idRoutingPredicate)
-        throws IOException {
+    protected AbstractIdFilteringDirectoryReader(DirectoryReader in, BiPredicate<String, String> idRoutingPredicate) throws IOException {
         super(in, new IdFilteringSubReaderWrapper(idRoutingPredicate));
     }
 

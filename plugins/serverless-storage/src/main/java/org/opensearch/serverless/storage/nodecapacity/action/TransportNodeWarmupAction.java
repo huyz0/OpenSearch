@@ -89,7 +89,10 @@ public class TransportNodeWarmupAction extends TransportClusterManagerNodeAction
             listener.onFailure(new IllegalArgumentException("no such node: " + request.nodeId()));
             return;
         }
-        ActionListener<Void> ackListener = ActionListener.wrap(response -> listener.onResponse(new AcknowledgedResponse(true)), listener::onFailure);
+        ActionListener<Void> ackListener = ActionListener.wrap(
+            response -> listener.onResponse(new AcknowledgedResponse(true)),
+            listener::onFailure
+        );
         if (request.warming()) {
             warmupCoordinator.markWarming(node.getName(), ackListener);
         } else {

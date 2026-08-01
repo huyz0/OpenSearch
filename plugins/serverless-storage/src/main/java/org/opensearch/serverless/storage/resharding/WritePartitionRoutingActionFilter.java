@@ -285,7 +285,8 @@ public final class WritePartitionRoutingActionFilter implements ActionFilter {
     }
 
     /** The precomputed {@code partitionIndex -> target index name} table for one write-routing alias. */
-    private record PartitionTable(int numPartitions, String[] byPartitionIndex) {}
+    private record PartitionTable(int numPartitions, String[] byPartitionIndex) {
+    }
 
     /** Pairs a {@link Metadata} snapshot with the partition tables computed against it -- see {@link #tableCache}. */
     private static final class MetadataPartitionTableCache {

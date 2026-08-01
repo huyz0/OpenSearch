@@ -101,9 +101,7 @@ public class TransportDisableWritePartitionRoutingAction extends TransportCluste
         }
         if (missingUpFront.isEmpty() == false) {
             listener.onFailure(
-                new IllegalArgumentException(
-                    "target index(es) do not exist, refusing to report a false acknowledgement: " + missingUpFront
-                )
+                new IllegalArgumentException("target index(es) do not exist, refusing to report a false acknowledgement: " + missingUpFront)
             );
             return;
         }

@@ -83,7 +83,10 @@ public class ShardShrinkRequest extends ActionRequest {
                 // A duplicated (indexUuid, shardId) would be materialized and merged twice with no
                 // document-level dedup at the Lucene addIndexes layer -- every document in that
                 // source would end up duplicated in the target.
-                validationException = addValidationError("sources must not contain duplicate (indexUuid, shardId) entries", validationException);
+                validationException = addValidationError(
+                    "sources must not contain duplicate (indexUuid, shardId) entries",
+                    validationException
+                );
             }
         }
         if (targetIndexUuid == null || targetIndexUuid.isEmpty()) {

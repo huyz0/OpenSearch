@@ -250,14 +250,7 @@ public class ServerlessStorageMigrateShardActionIT extends ServerlessStorageInte
             .index(INDEX_NAME)
             .shard(SHARD_ID);
         String replicaNodeId = shardRoutingTable.replicaShards().get(0).currentNodeId();
-        String replicaNodeName = client().admin()
-            .cluster()
-            .prepareState()
-            .get()
-            .getState()
-            .nodes()
-            .get(replicaNodeId)
-            .getName();
+        String replicaNodeName = client().admin().cluster().prepareState().get().getState().nodes().get(replicaNodeId).getName();
 
         ExecutionException failure = expectThrows(
             ExecutionException.class,

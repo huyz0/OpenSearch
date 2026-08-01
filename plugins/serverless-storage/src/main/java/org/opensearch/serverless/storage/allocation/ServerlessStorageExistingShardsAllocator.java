@@ -257,7 +257,11 @@ public final class ServerlessStorageExistingShardsAllocator implements ExistingS
                 continue;
             }
             records.add(
-                new ReaderCacheAffinityRecorder.ShardStartRecord(indexMetadata.getIndexUUID(), shardRouting.id(), shardRouting.currentNodeId())
+                new ReaderCacheAffinityRecorder.ShardStartRecord(
+                    indexMetadata.getIndexUUID(),
+                    shardRouting.id(),
+                    shardRouting.currentNodeId()
+                )
             );
         }
         recorder.recordStarted(records);

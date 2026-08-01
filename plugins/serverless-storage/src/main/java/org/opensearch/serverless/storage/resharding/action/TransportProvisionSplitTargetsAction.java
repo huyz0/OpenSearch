@@ -159,7 +159,9 @@ public class TransportProvisionSplitTargetsAction extends HandledTransportAction
                 new DeleteIndexRequest(createdByThisCall.toArray(new String[0])).indicesOptions(IndicesOptions.LENIENT_EXPAND_OPEN),
                 ActionListener.wrap(deleteResponse -> listener.onFailure(failure), rollbackFailure -> {
                     logger.warn(
-                        "failed to roll back partially-provisioned split targets " + createdByThisCall + " after a "
+                        "failed to roll back partially-provisioned split targets "
+                            + createdByThisCall
+                            + " after a "
                             + "provisioning failure -- manual cleanup may be required",
                         rollbackFailure
                     );

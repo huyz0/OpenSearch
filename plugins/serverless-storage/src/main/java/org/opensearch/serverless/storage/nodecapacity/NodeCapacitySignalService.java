@@ -132,7 +132,8 @@ public final class NodeCapacitySignalService implements Closeable {
 
         for (IndexRoutingTable indexRoutingTable : state.routingTable()) {
             IndexMetadata indexMetadata = state.metadata().index(indexRoutingTable.getIndex());
-            if (indexMetadata == null || ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.get(indexMetadata.getSettings()) == false) {
+            if (indexMetadata == null
+                || ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.get(indexMetadata.getSettings()) == false) {
                 continue;
             }
             String indexUuid = indexMetadata.getIndexUUID();

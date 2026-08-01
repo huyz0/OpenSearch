@@ -171,7 +171,13 @@ public final class EncryptingBlobContainer extends RegisterDelegatingBlobContain
         boolean failIfAlreadyExists
     ) throws IOException {
         byte[] ciphertext = encryptBlocked(readAllAndClose(inputStream));
-        delegate.writeBlobAtomicWithMetadata(blobName, new ByteArrayInputStream(ciphertext), metadata, ciphertext.length, failIfAlreadyExists);
+        delegate.writeBlobAtomicWithMetadata(
+            blobName,
+            new ByteArrayInputStream(ciphertext),
+            metadata,
+            ciphertext.length,
+            failIfAlreadyExists
+        );
     }
 
     private static byte[] readAllAndClose(InputStream in) throws IOException {

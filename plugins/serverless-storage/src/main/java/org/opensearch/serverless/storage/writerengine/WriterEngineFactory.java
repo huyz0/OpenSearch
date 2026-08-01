@@ -844,7 +844,9 @@ public final class WriterEngineFactory implements EngineFactory {
                 new org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore(childContainer);
             org.opensearch.serverless.storage.shardstate.VersionedShardHead childHead = childShardStateStore.get(indexUuid, childShardId)
                 .orElseThrow(
-                    () -> new IOException("in-place merge: child shard " + indexUuid + "/" + childShardId + " has no published head to merge")
+                    () -> new IOException(
+                        "in-place merge: child shard " + indexUuid + "/" + childShardId + " has no published head to merge"
+                    )
                 );
             org.opensearch.serverless.storage.manifest.BlobContainerManifestStore childManifestStore =
                 new org.opensearch.serverless.storage.manifest.BlobContainerManifestStore(childContainer);

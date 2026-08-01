@@ -342,8 +342,7 @@ public final class ReaderEngineFactory implements EngineFactory {
             CommitManifest manifest;
             long primaryTerm;
             if (unwrapped instanceof org.opensearch.serverless.storage.readerengine.lazydirectory.LazyBundleDirectory) {
-                manifest = ((org.opensearch.serverless.storage.readerengine.lazydirectory.LazyBundleDirectory) unwrapped)
-                    .currentManifest();
+                manifest = ((org.opensearch.serverless.storage.readerengine.lazydirectory.LazyBundleDirectory) unwrapped).currentManifest();
                 primaryTerm = manifest.primaryTerm();
             } else {
                 Optional<VersionedShardHead> head = shardStateStore.get(indexUuid, shardId);

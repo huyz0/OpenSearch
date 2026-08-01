@@ -181,11 +181,7 @@ public final class CompactionSchedulerTask implements Closeable {
     void maybeCompactSafely() {
         if (admissionController != null && admissionController.tryAcquire() == false) {
             // See class javadoc: never worse than a no-op, re-evaluated on this shard's own next tick.
-            logger.debug(
-                "compaction tick skipped for shard [{}][{}]: node's compaction/rewrite admission cap reached",
-                indexUuid,
-                shardId
-            );
+            logger.debug("compaction tick skipped for shard [{}][{}]: node's compaction/rewrite admission cap reached", indexUuid, shardId);
             return;
         }
         try {

@@ -20,8 +20,8 @@ import org.apache.lucene.store.Directory;
 import org.opensearch.cluster.metadata.ShardRange;
 import org.opensearch.common.UUIDs;
 import org.opensearch.common.lucene.Lucene;
-import org.opensearch.index.engine.Engine;
 import org.opensearch.common.util.io.IOUtils;
+import org.opensearch.index.engine.Engine;
 import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.serverless.storage.format.BundleFileReader;
 import org.opensearch.serverless.storage.manifest.CommitManifest;
@@ -95,7 +95,8 @@ public final class InPlaceSiblingMerger {
          * @param readPath fetches {@code manifest}'s bundle files.
          * @param range the child's own hash range.
          */
-        public MergeChild {}
+        public MergeChild {
+        }
 
         /** The child's current published commit manifest. */
         @Override

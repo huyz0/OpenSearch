@@ -120,10 +120,7 @@ public class ServerlessStorageInPlaceMergeDocumentReachabilityIT extends Serverl
         // records the superseded copy as a per-child soft-delete against the shared base segment --
         // the divergent-liveDocs case the merge must reconcile.
         for (int i = 0; i < UPDATE_COUNT; i++) {
-            client().prepareIndex(INDEX_NAME)
-                .setId(String.valueOf(i))
-                .setSource("field", "updated-" + i, "padding", "x".repeat(256))
-                .get();
+            client().prepareIndex(INDEX_NAME).setId(String.valueOf(i)).setSource("field", "updated-" + i, "padding", "x".repeat(256)).get();
         }
         // Post-split deletes of pre-split documents, likewise routed to the owning child.
         for (int i = 10; i < 10 + DELETE_COUNT; i++) {

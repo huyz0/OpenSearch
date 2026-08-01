@@ -167,7 +167,8 @@ public class TransportShardShrinkAction extends HandledTransportAction<ShardShri
     }
 
     /** A pin placed on a source generation during a shrink, tracked so it can be released once the merge is done. */
-    private record PendingPin(DurablePinRegistry registry, String indexUuid, int shardId, PinRecord pinRecord) {}
+    private record PendingPin(DurablePinRegistry registry, String indexUuid, int shardId, PinRecord pinRecord) {
+    }
 
     private ShrinkSource resolveShrinkSource(ShardRef sourceRef, String targetIndexUuid, int targetShardId, List<PendingPin> pendingPins)
         throws IOException {

@@ -90,7 +90,10 @@ public class TransportNodeDrainAction extends TransportClusterManagerNodeAction<
             listener.onFailure(new IllegalArgumentException("no such node: " + request.nodeId()));
             return;
         }
-        ActionListener<Void> ackListener = ActionListener.wrap(response -> listener.onResponse(new AcknowledgedResponse(true)), listener::onFailure);
+        ActionListener<Void> ackListener = ActionListener.wrap(
+            response -> listener.onResponse(new AcknowledgedResponse(true)),
+            listener::onFailure
+        );
         if (request.drain()) {
             drainCoordinator.drain(node.getName(), ackListener);
         } else {

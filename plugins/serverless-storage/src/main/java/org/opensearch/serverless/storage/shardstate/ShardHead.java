@@ -55,13 +55,7 @@ public final class ShardHead implements Writeable {
      *                  far; must be &gt;= {@code primaryTerm} (a lease can be acquired under a term
      *                  ahead of the last real publication, but never behind it)
      */
-    public ShardHead(
-        long primaryTerm,
-        String leaseHolderNodeId,
-        long leaseExpiryMillis,
-        long latestManifestGeneration,
-        long leaseTerm
-    ) {
+    public ShardHead(long primaryTerm, String leaseHolderNodeId, long leaseExpiryMillis, long latestManifestGeneration, long leaseTerm) {
         if (primaryTerm < 1) {
             throw new IllegalArgumentException("primaryTerm must be >= 1, got " + primaryTerm);
         }

@@ -70,7 +70,8 @@ public final class ReaderCacheAffinityRecorder {
      * @param shardId the shard number that started.
      * @param nodeId the node id it started on.
      */
-    public record ShardStartRecord(String indexUuid, int shardId, String nodeId) {}
+    public record ShardStartRecord(String indexUuid, int shardId, String nodeId) {
+    }
 
     /**
      * Records that {@code indexUuid}'s reader shard {@code shardId} just started on {@code
