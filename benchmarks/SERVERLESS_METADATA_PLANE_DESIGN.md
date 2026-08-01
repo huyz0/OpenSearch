@@ -460,12 +460,12 @@ results do it.
 
 ## 12. Where this stands, and what is next
 
-Eighteen tasks landed. Working tree clean, everything below verified by a test that was checked against a
+Nineteen tasks landed. Working tree clean, everything below verified by a test that was checked against a
 deliberately broken build before being believed.
 
 **Done.** T1 (caller enumeration), T2 (register semantics), T3 (store audit), T4 (S3 conditional create),
 T5 (create-only contract tests), T21 (Fs register lock), T22 (`createRegisterIfAbsent`), T6 (backend
-interfaces), T7 (cache extraction), T8 (blob backend), T9 (idempotent creation), T10 (tombstones), T11 (cache instrumentation), T12 (change log), T16 (membership epochs), T15 (descriptor enumeration), T17 (decommission), T18 (derived warmth).
+interfaces), T7 (cache extraction), T8 (blob backend), T9 (idempotent creation), T10 (tombstones), T11 (cache instrumentation), T12 (change log), T16 (membership epochs), T15 (descriptor enumeration), T17 (decommission), T18 (derived warmth), T20 (cache hit rate).
 
 Two commits are formatting-only sweeps, separated out rather than buried. **The branch base does not pass
 `spotlessCheck`** in either `:server` or `:plugins:serverless-storage`, so a precommit build fails there
@@ -476,7 +476,7 @@ for reasons unrelated to any change. Worth fixing at the base rather than paying
 | | task | note |
 |---|---|---|
 | T13, T14 | name index fed from the change log, checkpointed to the store | T15 landed the enumeration they rebuild from; these are the wiring |
-| T19, T20 | point lookup and cache hit rate benchmarks | the numbers the whole approach rests on, and neither is measured |
+| T19 | point lookup latency, system index against blob | needs a real object store; measuring it against `FsBlobContainer` would report local disk speed as an object store result |
 
 **Still blocked on T39** in the sibling worktree: C2 (`routingNumShards` on the descriptor) and C5
 (on-demand shard materialisation) both touch files that session is editing.
@@ -958,6 +958,60 @@ descriptor prefix. Hashed keys would leave no way to enumerate a range or to spl
 left in place would need a read per key to find out which names are live.
 
 Six tests, including one asserting the parallel and serial passes agree.
+
+### T20: the decision rule was stated first, and it failed
+
+The rule, written before the numbers: the design claims the cache hides the backend round trip, which is
+credible only if a cache holding a small fraction of the population serves the large majority of lookups
+under skew. **If a bound of one tenth of the population cannot reach 90%, the prefetch in C1 is doing the
+real work and the cache is not.**
+
+100,000 tenants, Zipf s=1.0, 500,000 lookups, TTL long enough that this measures the capacity bound rather
+than the freshness window:
+
+| cache bound | share of population | hit rate | reachable ceiling | shortfall |
+|---|---|---|---|---|
+| 100 | 0.1% | 24.7% | 42.9% | 18.2% |
+| 1,000 | 1.0% | 46.0% | 61.9% | 15.9% |
+| **10,000** | **10.0%** | **69.3%** | **81.0%** | **11.7%** |
+| 50,000 | 50.0% | 85.6% | 94.3% | 8.7% |
+
+**69.3% at a tenth of the population. The rule was not met.** Roughly three lookups in ten reach the
+backend, so under an object store roughly three in ten pay a round trip.
+
+The ceiling column is what makes that number attributable. It is the share of lookups landing in the
+`capacity` hottest tenants, which is what a perfect eviction policy would achieve. Two separate things
+follow:
+
+- **The workload caps it at 81%**, not 90%. Zipf s=1.0 over 100k tenants simply does not concentrate
+  enough traffic in the top 10% for the design's assumption to hold at that bound. No cache policy fixes
+  this.
+- **The policy leaves 11.7% on the table.** Eviction drops the stalest tenth by *admission* order, because
+  recency is stamped on write and never touched on read, which P1 and P2 established after a read-mutating
+  LRU was measured running backwards under contention. So the cache is closer to FIFO than LRU. That gap
+  is real and the trade behind it was deliberate.
+
+The control arm confirms the fixture models what it claims: at the same bound, uniform access gives 9.2%
+against skew's 68.9%. Skew is worth a factor of seven, which is also why measuring this uniformly would
+have been useless.
+
+**What this changes.** C1's prefetch moves from optimisation to load-bearing. A bulk touching M distinct
+indices cannot rely on the cache for roughly three in ten of them, and those are sequential round trips
+without batching. It also raises the value of T12's change log, since a longer TTL with invalidation
+recovers hit rate that a short window throws away, and the window was not even the binding constraint in
+this run.
+
+**What it does not say.** No latency was measured, deliberately: timing this against a filesystem container
+would report local disk dressed as an object store result. The absolute cost of a miss is still unmeasured
+and still needs a real store. Real tenant traffic may also be more skewed than s=1.0, which would raise
+every row; the exponent is an assumption, not a measurement.
+
+The test now asserts a regression floor below the measured value rather than the rule it failed, and
+records the ceiling and shortfall so a future change that improves the policy is visible as such. Lowering
+the bar to make the rule pass would have been the wrong repair.
+
+A third arm pins the tail: a tenant outside the working set reaches the backend on at least 40 of 50
+lookups, so no per-tenant latency claim can be made from a fleet-wide hit rate.
 
 ### T7 verification, including the part that looked like a regression
 
