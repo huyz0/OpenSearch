@@ -63,6 +63,31 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
     private final String uuid;
     private final int shardCount;
     private final int searchOnlyReplicaCount;
+
+    /**
+     * The divisor a document's routing hash is taken against, or 0 meaning "the same as the shard count".
+     *
+     * <p>Separate from {@link #shardCount} because after a split or shrink they diverge, and routing must
+     * keep using the original. {@code IndexMetadata} has carried this since forever as
+     * {@code index.number_of_routing_shards}; a descriptor that omits it makes every resharded index route
+     * against the wrong divisor, which does not fail, it just puts documents on the wrong shard and returns
+     * partial results.
+     *
+     * <p>Zero rather than a copy of the shard count, so that "never resharded" stays distinguishable from
+     * "resharded and happens to match", and so a descriptor written before this field existed reads as the
+     * former rather than as a coincidence.
+     */
+    private final int routingNumShards;
+
+    /**
+     * How many shards one routing value may spread across, or 0 meaning the default of 1.
+     *
+     * <p>{@code index.routing_partition_size} is an ordinary index setting a user can set at creation. Left
+     * off the descriptor it defaults to 1, {@code isRoutingPartitionedIndex()} answers false, the partition
+     * offset is always zero, and every document for a routing value lands on one shard instead of the
+     * partition set. The setting is accepted and silently ignored, which is the worst of the three outcomes.
+     */
+    private final int routingPartitionSize;
     private final boolean serverless;
     private final State state;
     private final List<String> aliases;
@@ -95,6 +120,10 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
      */
     private final long creationDate;
 
+    /**
+     * A descriptor with default routing geometry, which is what an index that has never been resharded and
+     * sets no partition size has. Kept so the many callers that mean exactly that do not have to say so.
+     */
     public IndexDescriptor(
         String name,
         String uuid,
@@ -111,6 +140,46 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         long mappingGeneration,
         long creationDate
     ) {
+        this(
+            name,
+            uuid,
+            shardCount,
+            searchOnlyReplicaCount,
+            serverless,
+            state,
+            aliases,
+            createdVersion,
+            system,
+            hidden,
+            remoteSnapshot,
+            warm,
+            mappingGeneration,
+            creationDate,
+            0,
+            0
+        );
+    }
+
+    public IndexDescriptor(
+        String name,
+        String uuid,
+        int shardCount,
+        int searchOnlyReplicaCount,
+        boolean serverless,
+        State state,
+        List<String> aliases,
+        long createdVersion,
+        boolean system,
+        boolean hidden,
+        boolean remoteSnapshot,
+        boolean warm,
+        long mappingGeneration,
+        long creationDate,
+        int routingNumShards,
+        int routingPartitionSize
+    ) {
+        this.routingNumShards = routingNumShards;
+        this.routingPartitionSize = routingPartitionSize;
         this.name = Objects.requireNonNull(name, "descriptor needs a name");
         this.uuid = Objects.requireNonNull(uuid, "descriptor needs a uuid, since placement hashes it");
         this.shardCount = shardCount;
@@ -149,7 +218,11 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
             indexMetadata.isRemoteSnapshot(),
             indexMetadata.isWarmIndex(),
             0L,
-            indexMetadata.getCreationDate()
+            indexMetadata.getCreationDate(),
+            // Read off the metadata rather than inferred. getRoutingNumShards() resolves the setting's own
+            // default, so this stores the resolved value and effectiveRoutingNumShards agrees with it.
+            indexMetadata.getRoutingNumShards(),
+            indexMetadata.getRoutingPartitionSize()
         );
     }
 
@@ -168,6 +241,11 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         this.warm = in.readBoolean();
         this.mappingGeneration = in.readVLong();
         this.creationDate = in.readLong();
+        // Appended rather than placed beside shardCount, so a reader with the order wrong cannot silently
+        // read the shard count as the routing divisor. Those two are equal on most indices, which is
+        // exactly what would make such a transposition invisible until an index was resharded.
+        this.routingNumShards = in.readVInt();
+        this.routingPartitionSize = in.readVInt();
     }
 
     @Override
@@ -186,6 +264,8 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         out.writeBoolean(warm);
         out.writeVLong(mappingGeneration);
         out.writeLong(creationDate);
+        out.writeVInt(routingNumShards);
+        out.writeVInt(routingPartitionSize);
     }
 
     /** The index, which is what placement hashes and what every shard id is built from. */
@@ -203,6 +283,35 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
 
     public int shardCount() {
         return shardCount;
+    }
+
+    /** The stored value, 0 when unset. Most callers want {@link #effectiveRoutingNumShards}. */
+    public int routingNumShards() {
+        return routingNumShards;
+    }
+
+    /** The stored value, 0 when unset. Most callers want {@link #effectiveRoutingPartitionSize}. */
+    public int routingPartitionSize() {
+        return routingPartitionSize;
+    }
+
+    /**
+     * The divisor routing must actually use, resolving the unset sentinel the way IndexMetadata does.
+     *
+     * <p>Note the direction, which is easy to get backwards and was: this is the <em>pre-split</em> shard
+     * space, so it is greater than or equal to the shard count and a whole multiple of it. Splitting grows
+     * the shard count toward it and leaves this alone, which is what keeps documents routing to the same
+     * place across a split. {@code IndexMetadata} asserts the multiple, so a stored value that violates it
+     * fails loudly at construction rather than misrouting quietly.
+     */
+    public int effectiveRoutingNumShards() {
+        int shards = Math.max(1, shardCount);
+        return routingNumShards >= shards ? routingNumShards : shards;
+    }
+
+    /** The partition size routing must actually use, where 1 means not partitioned. */
+    public int effectiveRoutingPartitionSize() {
+        return routingPartitionSize > 0 ? routingPartitionSize : 1;
     }
 
     public int searchOnlyReplicaCount() {
@@ -309,10 +418,18 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
                     .put(IndexMetadata.SETTING_VERSION_CREATED, org.opensearch.Version.fromId((int) createdVersion))
                     .put(IndexMetadata.SETTING_INDEX_UUID, uuid)
                     .put("index.serverless_storage.enabled", serverless)
+                    // routing_partition_size is a plain setting and is read back from one. The routing
+                    // shard count is not: IndexMetadata holds it as a field and derives routingFactor from
+                    // it, so it has to go through the builder below or it is silently ignored.
+                    .put(IndexMetadata.SETTING_ROUTING_PARTITION_SIZE, effectiveRoutingPartitionSize())
                     .build()
             )
             .numberOfShards(shards)
             .numberOfReplicas(0);
+        // The divisor a document's routing hash is taken against. Left unset, IndexMetadata uses the shard
+        // count, which is right for an index that has never been resharded and wrong, silently, for one
+        // that has: routingFactor comes out as 1 and every document routes to the wrong shard.
+        builder.setRoutingNumShards(effectiveRoutingNumShards());
         for (int shard = 0; shard < shards; shard++) {
             builder.primaryTerm(shard, FIRST_PRIMARY_TERM);
         }

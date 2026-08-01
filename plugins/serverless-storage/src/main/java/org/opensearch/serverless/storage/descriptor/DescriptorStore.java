@@ -782,7 +782,9 @@ public final class DescriptorStore implements DescriptorBackend, DescriptorPrefi
                 Map.entry("remoteSnapshot", d.remoteSnapshot()),
                 Map.entry("warm", d.warm()),
                 Map.entry("mappingGeneration", d.mappingGeneration()),
-                Map.entry("creationDate", d.creationDate())
+                Map.entry("creationDate", d.creationDate()),
+                Map.entry("routingNumShards", d.routingNumShards()),
+                Map.entry("routingPartitionSize", d.routingPartitionSize())
             );
         }
 
@@ -802,7 +804,11 @@ public final class DescriptorStore implements DescriptorBackend, DescriptorPrefi
                 (Boolean) source.get("remoteSnapshot"),
                 (Boolean) source.get("warm"),
                 ((Number) source.get("mappingGeneration")).longValue(),
-                ((Number) source.get("creationDate")).longValue()
+                ((Number) source.get("creationDate")).longValue(),
+                // Tolerant, because descriptors written before these fields existed are still in the index
+                // and must keep reading as "never resharded, not partitioned" rather than failing.
+                ((Number) source.getOrDefault("routingNumShards", 0)).intValue(),
+                ((Number) source.getOrDefault("routingPartitionSize", 0)).intValue()
             );
         }
 
