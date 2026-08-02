@@ -1327,10 +1327,26 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         Setting.Property.NodeScope
     );
 
+    /**
+     * How often the elected cluster manager parks the name index so a restart does not rebuild it.
+     *
+     * <p>Ten minutes because the cost of being stale is bounded and small: a checkpoint older than the
+     * population only means the rebuild path covers the difference, and {@code DescriptorEnumerator} is that
+     * path. Checkpointing often enough to matter but rarely enough that the fold it triggers is not on any
+     * request's critical path.
+     */
+    public static final Setting<TimeValue> NAME_INDEX_CHECKPOINT_INTERVAL_SETTING = Setting.timeSetting(
+        "serverless_storage.name_index.checkpoint_interval",
+        TimeValue.timeValueMinutes(10),
+        TimeValue.timeValueSeconds(1),
+        Setting.Property.NodeScope
+    );
+
     @Override
     public List<Setting<?>> getSettings() {
         return List.of(
             NAME_INDEX_ENABLED_SETTING,
+            NAME_INDEX_CHECKPOINT_INTERVAL_SETTING,
             COMPUTED_PLACEMENT_ENABLED_SETTING,
             SERVERLESS_STORAGE_ENABLED_SETTING,
             SERVERLESS_STORAGE_BASE_PATH_SETTING,
@@ -1714,10 +1730,55 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         // answers, so running both is pure cost until the switchover. Registered as a cluster state
         // listener so a node's copy tracks index creates and deletes without anything else having to
         // remember to update it.
+        //
+        // G3. The checkpoint store had no caller, so every node rebuilt the whole name set on every start
+        // however large the population, which is what A16 chose checkpointing to avoid. It is resolved here
+        // and handed to the service, which loads the newest checkpoint in its constructor: a tier that
+        // filled in lazily would answer a wildcard arriving early with an empty result, and an empty result
+        // reads as a correct answer rather than an unfinished one.
+        //
+        // A store that cannot be resolved is not fatal. DescriptorEnumerator rebuilds the tier from the
+        // object store, which is what keeps a checkpoint an optimisation rather than a second source of
+        // truth, so failing here costs a slower start and nothing else.
+        org.opensearch.serverless.storage.nameindex.BlobNameIndexCheckpointStore nameIndexCheckpoints = null;
+        if (NAME_INDEX_ENABLED_SETTING.get(environment.settings())) {
+            try {
+                nameIndexCheckpoints = new org.opensearch.serverless.storage.nameindex.BlobNameIndexCheckpointStore(
+                    path -> {
+                        try {
+                            return resolveContainerForDescriptors(path, "no blob store for the name index checkpoint");
+                        } catch (IOException e) {
+                            throw new java.io.UncheckedIOException(e);
+                        }
+                    },
+                    BlobPath.cleanPath().add("descriptors-root")
+                );
+            } catch (Exception e) {
+                logger.warn("no name index checkpoint store; the tier will rebuild on every start", e);
+            }
+        }
         org.opensearch.serverless.storage.nameindex.NameIndexService nameIndexService =
-            new org.opensearch.serverless.storage.nameindex.NameIndexService(NAME_INDEX_ENABLED_SETTING.get(environment.settings()));
+            new org.opensearch.serverless.storage.nameindex.NameIndexService(
+                NAME_INDEX_ENABLED_SETTING.get(environment.settings()),
+                nameIndexCheckpoints
+            );
         if (nameIndexService.isEnabled()) {
             clusterService.addListener(nameIndexService);
+            // Written from the elected cluster manager only, and that is what makes a plain counter safe.
+            // Each checkpoint is its own object and readers take the highest generation, so two nodes
+            // counting independently could let a higher number carry fewer names. One writer at a time,
+            // resuming from the generation it loaded, stays monotonic across failover as well as restart.
+            if (nameIndexCheckpoints != null && org.opensearch.cluster.node.DiscoveryNode.isClusterManagerNode(environment.settings())) {
+                threadPool.scheduleWithFixedDelay(
+                    () -> {
+                        if (clusterService.state().nodes().isLocalNodeElectedClusterManager()) {
+                            nameIndexService.checkpoint();
+                        }
+                    },
+                    NAME_INDEX_CHECKPOINT_INTERVAL_SETTING.get(environment.settings()),
+                    ThreadPool.Names.GENERIC
+                );
+            }
         }
 
         // Computed placement. Installing the supplier is the whole of the wiring: a serverless index

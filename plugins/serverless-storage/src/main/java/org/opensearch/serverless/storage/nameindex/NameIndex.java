@@ -290,6 +290,24 @@ public final class NameIndex {
         return found;
     }
 
+    /**
+     * The packed form, with anything pending folded in, for writing a checkpoint.
+     *
+     * <p>Folds first because a checkpoint of the base alone would silently omit every name created since
+     * the last rebuild, and a name index missing recent indices answers a wildcard wrongly rather than
+     * slowly. Skips the fold when nothing is pending, so a quiet cluster checkpoints without rebuilding.
+     *
+     * <p>Names arriving during the fold stay in the overlay and are not in what this returns. That is
+     * correct rather than a gap: a checkpoint records a prefix of the history, and the generation written
+     * beside it says how much.
+     */
+    public CompactNameIndex packed() {
+        if (pendingSize() > 0) {
+            rebuild();
+        }
+        return state.base;
+    }
+
     /** Entries in the base, which is everything except changes since the last rebuild. */
     public int baseSize() {
         return state.base.size();

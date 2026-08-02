@@ -196,3 +196,65 @@ Stated so it is not mistaken for coverage.
   and one was found to have been quoted against the wrong JVM configuration for months.
 - Correctness under node failure, partition, or concurrent reshard. The tests build real clusters but do
   not fault-inject.
+
+---
+
+## 7. G4: the non-seam core audit, first pass
+
+Section 3 said 198 modified core files had never been checked against R2 and that this was the largest open
+question. This is the first pass over them. It does not clear them; it finds enough to say the answer is
+"no" and to say where.
+
+### Method
+
+Every modified core file whose diff never mentions a seam, bucketed by whether it alters existing lines,
+then scanned for removed public or protected members, then the largest read by hand. Deletions are the
+signal that matters: adding a method is an extension, removing one is a change to what core is.
+
+| | count |
+|---|---|
+| non-seam modified core files | 198 |
+| pure additions, no existing line altered | 73 |
+| alter existing lines | 125 |
+| **remove public or protected members** | **21 files, 34 members** |
+| core files deleted outright | 1 |
+
+### Three findings that answer the R2 question
+
+**`Plugin.nodeStats()` was removed, and it was an extension point.** Core also lost
+`plugins/PluginNodeStats.java` entirely, the only core file this branch deletes. In its place
+`NodeStats` gained a concrete `NativeAllocatorPoolStats` from `org.opensearch.plugin.stats`. So a generic
+mechanism by which any plugin could contribute node statistics was replaced by one implementation named
+directly in core. That is the exact inversion of the requirement: an extension point became a hardcoded
+dependency, and any other plugin relying on `nodeStats()` no longer compiles.
+
+**`ShardRouting` lost `recoveringChildShards` and `parentShardId`**, eleven references in `main`, none here,
+along with a constructor overload. Whatever the merits, a routing primitive changing shape is not a seam and
+cannot be inert when the plugin is absent, because there is no plugin involved.
+
+**Twenty-one files remove public or protected members**, thirty-four in total, including `IndexShard`,
+`KeywordFieldMapper`, `ClusterMetadataManifest`, `FsRepository` and `MultiBucketConsumerService`. These are
+not additive and were not written as seams.
+
+### What this means for the requirement
+
+R2 holds for the metadata plane and does not hold for the branch. The 54 seam-touching files follow the
+extension-point shape faithfully. The engine work alongside them changes core's shape directly, and in at
+least one case by deleting a plugin extension point.
+
+That is a statement about upstreamability rather than about correctness. Nothing above is a bug. It means
+the branch cannot be offered to `main` as "a few hooks plus a plugin" until the engine work is either
+separated from the metadata plane or reworked behind seams of its own.
+
+### What is still unchecked
+
+The 73 pure-addition files were not read. Adding a method to an existing class does not change default
+behaviour, but adding a call inside an existing method does, and the two are indistinguishable from the
+numbers alone.
+
+Of the 125 that alter existing lines, 104 remove nothing public and were not read either. `IndexShard` at
+403 added lines, `StoreRecovery` at 238 and `IndexingMemoryController` at 142 are the ones most likely to
+carry a behaviour change, and none has been walked through.
+
+The honest summary is that this pass proves R2 is violated without establishing how far. Closing it needs
+the file-by-file read, which is a larger exercise than the rest of this list combined.

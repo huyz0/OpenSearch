@@ -58,10 +58,74 @@ public class NameIndexService implements ClusterStateListener {
     private final NameIndex nameIndex;
     private final NameIndexResolver resolver;
 
+    /**
+     * Where checkpoints are read and written, or null when nothing durable backs this tier.
+     *
+     * <p>Nullable rather than optional-typed because the disabled case is the common one and the whole tier
+     * is a no-op then. A node with no checkpoint store still works; it just rebuilds from scratch.
+     */
+    private final BlobNameIndexCheckpointStore checkpoints;
+
+    /** How far the loaded checkpoint had consumed, so the next one written is strictly newer. */
+    private final java.util.concurrent.atomic.AtomicLong generation = new java.util.concurrent.atomic.AtomicLong();
+
     public NameIndexService(boolean enabled) {
+        this(enabled, null);
+    }
+
+    /**
+     * The tier with a durable checkpoint behind it.
+     *
+     * <p>{@link BlobNameIndexCheckpointStore} existed, was tested, and had no caller, so every node rebuilt
+     * the whole name set on every start no matter how large the population. A16 chose checkpointing over
+     * streaming persistence precisely to avoid that, and the choice was never connected.
+     *
+     * <p>Loading here rather than lazily because a name index that is empty until first use answers wrongly
+     * rather than slowly: a wildcard arriving before the rebuild finished would match nothing and look like
+     * a correct empty answer.
+     */
+    public NameIndexService(boolean enabled, BlobNameIndexCheckpointStore checkpoints) {
         this.enabled = enabled;
-        this.nameIndex = new NameIndex();
+        this.checkpoints = checkpoints;
+        CompactNameIndex loaded = null;
+        if (enabled && checkpoints != null) {
+            java.util.Optional<BlobNameIndexCheckpointStore.Loaded> latest = checkpoints.readLatest();
+            if (latest.isPresent()) {
+                loaded = latest.get().index();
+                generation.set(latest.get().generation());
+                logger.info("name index resumed from checkpoint at generation [{}] with [{}] names", generation.get(), loaded.size());
+            } else {
+                // Not a failure. A cluster with no checkpoint yet, or one whose checkpoint could not be
+                // read, rebuilds from the object store, which is what makes the checkpoint an optimisation
+                // rather than a second source of truth.
+                logger.info("no name index checkpoint to resume from; the tier will be rebuilt");
+            }
+        }
+        this.nameIndex = loaded == null ? new NameIndex() : new NameIndex(loaded);
         this.resolver = new NameIndexResolver(nameIndex);
+    }
+
+    /**
+     * Parks the current name set so the next start does not rebuild it.
+     *
+     * <p>Best effort and deliberately quiet about failure. A checkpoint that cannot be written costs a
+     * slower start later and nothing else, so it must never fail whatever asked for it.
+     *
+     * @return whether a checkpoint was actually written
+     */
+    public boolean checkpoint() {
+        if (enabled == false || checkpoints == null) {
+            return false;
+        }
+        try {
+            long next = generation.incrementAndGet();
+            checkpoints.write(nameIndex.packed(), next);
+            logger.debug("wrote name index checkpoint at generation [{}]", next);
+            return true;
+        } catch (Exception e) {
+            logger.warn("could not write the name index checkpoint; the next start will rebuild instead", e);
+            return false;
+        }
     }
 
     public boolean isEnabled() {
