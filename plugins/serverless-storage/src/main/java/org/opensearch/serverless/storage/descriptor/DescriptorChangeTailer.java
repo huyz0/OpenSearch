@@ -127,6 +127,21 @@ public final class DescriptorChangeTailer {
             }
         }
 
+        // A delete is the one change with a shard behind it. Nothing else tells a node that a gated index is
+        // gone, because a gated delete produces no cluster state diff, so without this the shard stays open
+        // until D2's sweep re-derives the same conclusion on its next tick. The sweep stays as the backstop:
+        // a push arrives once and can be missed, and re-deriving from scratch converges regardless.
+        //
+        // By uuid as well as name, because a name alone cannot tell a deleted index from a new one created
+        // with the same name moments later, and closing the wrong one would take down a live shard.
+        for (DescriptorChange change : changes) {
+            if (change.live() == false) {
+                org.opensearch.cluster.metadata.GatedIndexRelease.release(
+                    new org.opensearch.core.index.Index(change.name(), change.uuid())
+                );
+            }
+        }
+
         int applied = 0;
         if (nameIndexService != null) {
             try {

@@ -60,6 +60,7 @@ public class CoreIsInertWithoutAPluginTests extends OpenSearchTestCase {
         IndexDescriptorPublisher.register(null);
         IndexDescriptorPublisher.registerCreator(null);
         DurableTombstones.register(null);
+        GatedIndexRelease.register(null);
         MappingGenerationStore.register(null);
         UnknownFieldRefresh.register(null);
         GatedMappingStatsAggregator.register(null);
@@ -98,6 +99,7 @@ public class CoreIsInertWithoutAPluginTests extends OpenSearchTestCase {
         assertFalse("the descriptor prefetcher", DescriptorPrefetch.isRegistered());
         assertFalse("the descriptor publisher", IndexDescriptorPublisher.isRegistered());
         assertFalse("the durable tombstone writer", DurableTombstones.isRegistered());
+        assertFalse("the gated index releaser", GatedIndexRelease.isRegistered());
         assertFalse("the mapping generation store", MappingGenerationStore.isRegistered());
         assertFalse("the unknown field refresher", UnknownFieldRefresh.isRegistered());
         assertFalse("the gated mapping stats aggregator", GatedMappingStatsAggregator.isRegistered());

@@ -42,6 +42,7 @@ import org.opensearch.cluster.ClusterStateApplier;
 import org.opensearch.cluster.action.index.NodeMappingRefreshAction;
 import org.opensearch.cluster.action.shard.ShardStateAction;
 import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
+import org.opensearch.cluster.metadata.GatedIndexRelease;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodes;
@@ -291,6 +292,9 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
         if (DiscoveryNode.isDataNode(settings) || DiscoveryNode.isClusterManagerNode(settings)) {
             clusterService.addHighPriorityApplier(this);
             indicesService.setOnDemandShardOpener(this::openComputedShardsOnDemand);
+            // The push half of the same lifecycle. The sweep below re-derives which gated indices are gone
+            // on a timer; this lets whatever already knows say so at once. Both close a shard the same way.
+            GatedIndexRelease.register(index -> releaseGatedIndex(index, "gated index was deleted"));
             TimeValue interval = GATED_SHARD_SWEEP_INTERVAL_SETTING.get(settings);
             if (interval.millis() > 0) {
                 gatedSweep = threadPool.scheduleWithFixedDelay(this::sweepDeletedGatedIndices, interval, ThreadPool.Names.GENERIC);
@@ -305,6 +309,7 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
                 gatedSweep.cancel();
                 gatedSweep = null;
             }
+            GatedIndexRelease.register(null);
             indicesService.setOnDemandShardOpener(null);
             clusterService.removeApplier(this);
         }
@@ -366,15 +371,36 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
             //
             // Giving up atomicity between the claim and the close is safe for the same reason closing is:
             // if an on-demand open races in and rebuilds the shard, that costs a cold start, not an index.
-            if (openedOnDemand.remove(index) == false) {
-                continue;
-            }
-            logger.debug("{} closing gated index opened on demand, its descriptor is gone", index);
-            try {
-                indicesService.removeIndex(index, NO_LONGER_ASSIGNED, "gated index no longer has a descriptor");
-            } catch (Exception e) {
-                logger.warn(() -> new ParameterizedMessage("[{}] could not be closed after its descriptor went away", index), e);
-            }
+            releaseGatedIndex(index, "gated index no longer has a descriptor");
+        }
+    }
+
+    /**
+     * Closes a gated index this node opened on demand, if it still holds it.
+     *
+     * <p>Shared by the sweep and by the change feed, which is what keeps the two from drifting: the feed
+     * makes this fast in the common case and the sweep makes it certain in the uncommon one, and both have
+     * to close a shard the same way or a shard closed by one route would differ from the other.
+     *
+     * <p>Claimed with an atomic remove, closed without holding this instance's monitor. The first version of
+     * the sweep wrapped both in {@code synchronized(this)} and it cost five previously-passing suites: that
+     * monitor is the one {@link #applyClusterState} takes, closing a shard is slow, and this runs on GENERIC,
+     * so it would stall cluster state application on its node until it finished. The symptom was an
+     * unrelated index delete returning "not acked", nowhere near this code, only under whole-suite load, and
+     * passing in isolation. It also doubled the suite's wall clock.
+     *
+     * <p>Giving up atomicity between the claim and the close is safe for the same reason closing is: if an
+     * on-demand open races in and rebuilds the shard, that costs a cold start, not an index.
+     */
+    private void releaseGatedIndex(Index index, String reason) {
+        if (openedOnDemand.remove(index) == false) {
+            return;
+        }
+        logger.debug("{} closing gated index opened on demand: {}", index, reason);
+        try {
+            indicesService.removeIndex(index, NO_LONGER_ASSIGNED, reason);
+        } catch (Exception e) {
+            logger.warn(() -> new ParameterizedMessage("[{}] could not be closed after its descriptor went away", index), e);
         }
     }
 

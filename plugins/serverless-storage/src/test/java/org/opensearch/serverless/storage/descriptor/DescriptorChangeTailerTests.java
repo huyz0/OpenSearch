@@ -193,6 +193,45 @@ public class DescriptorChangeTailerTests extends OpenSearchTestCase {
         assertEquals(List.of("tenant-a"), invalidated);
     }
 
+    /**
+     * A delete releases the shard, which is the half that had no mechanism other than a timer.
+     *
+     * <p>A gated delete produces no cluster state diff, so before this the only thing that told a node to
+     * close the shard was D2's sweep re-deriving the answer on its next tick. The sweep stays as the
+     * backstop; this makes the common case immediate.
+     */
+    public void testADeleteReleasesTheGatedIndex() throws Exception {
+        Path shared = createTempDir();
+        List<org.opensearch.core.index.Index> released = new ArrayList<>();
+        org.opensearch.cluster.metadata.GatedIndexRelease.register(released::add);
+        try {
+            logOver(shared).append(created("tenant-live"));
+            logOver(shared).append(deleted("tenant-gone"));
+
+            new DescriptorChangeTailer(logOver(shared), backendOver(createTempDir()), null).tailOnce();
+
+            assertEquals("only the deleted name may be released", 1, released.size());
+            assertEquals("tenant-gone", released.get(0).getName());
+            assertEquals(
+                "released by uuid as well as name, or a name reused moments later would close a live shard",
+                "tenant-gone-uuid",
+                released.get(0).getUUID()
+            );
+        } finally {
+            org.opensearch.cluster.metadata.GatedIndexRelease.register(null);
+        }
+    }
+
+    /** With nothing registered, which is a stock node, tailing must not attempt to close anything. */
+    public void testNoReleaserMeansNoRelease() throws Exception {
+        Path shared = createTempDir();
+        logOver(shared).append(deleted("tenant-gone"));
+        org.opensearch.cluster.metadata.GatedIndexRelease.register(null);
+
+        // The assertion is that this does not throw: an unregistered seam is a no-op, not a failure.
+        new DescriptorChangeTailer(logOver(shared), backendOver(createTempDir()), null).tailOnce();
+    }
+
     /** A backend that records what it was asked to forget. */
     private static final class RecordingBackend implements DescriptorBackend {
         private final List<String> invalidated;
