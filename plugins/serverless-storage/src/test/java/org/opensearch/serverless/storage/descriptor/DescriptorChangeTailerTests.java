@@ -154,18 +154,51 @@ public class DescriptorChangeTailerTests extends OpenSearchTestCase {
     }
 
     /**
-     * The cursor advances, or every pass re-reads the whole log and the cost grows without bound.
+     * The cursor starts at the bucket the node started in, not at the beginning of the log.
      *
-     * <p>It advances to the bucket captured <em>before</em> the read rather than after. Taking it after
-     * would skip anything written to a rolling bucket between the listing and the capture.
+     * <p>It used to start at null, meaning the first pass read the entire history. That was right when the
+     * tailer fed a name index that had to be built from that history; it has not been right since the index
+     * was removed. A starting node has an empty descriptor cache and no shards opened on demand, so every
+     * historical entry it read was applied to nothing, and the log is never pruned, so the cost of reading
+     * it grows for the life of the cluster.
+     */
+    public void testAStartingNodeDoesNotReadTheWholeHistory() throws Exception {
+        Path shared = createTempDir();
+        org.opensearch.common.blobstore.BlobStore store = new FsBlobStore(1024, shared, false);
+
+        // A driven clock, because the boundary being tested is a bucket boundary and buckets are a minute
+        // wide. Writing the history an hour back is what puts it behind the cursor; entries in the bucket
+        // the node starts in are deliberately still read, since "just before start-up" and "just after"
+        // cannot be told apart inside one bucket and reading them is the safe direction.
+        final long[] now = { java.util.concurrent.TimeUnit.HOURS.toMillis(1000) };
+        BlobDescriptorChangeLog writerLog = new BlobDescriptorChangeLog(store::blobContainer, BlobPath.cleanPath(), () -> now[0]);
+        writerLog.append(created("tenant-ancient"));
+        writerLog.append(created("tenant-older-still"));
+
+        now[0] += java.util.concurrent.TimeUnit.HOURS.toMillis(1);
+        List<String> invalidated = new ArrayList<>();
+        DescriptorChangeTailer tailer = new DescriptorChangeTailer(
+            new BlobDescriptorChangeLog(store::blobContainer, BlobPath.cleanPath(), () -> now[0]),
+            new RecordingBackend(invalidated)
+        );
+
+        assertNotNull("a starting node names the bucket it started in rather than the start of time", tailer.resumeFrom());
+        assertEquals("history written before this node existed has nothing here to act on", 0, tailer.tailOnce());
+        assertEquals(List.of(), invalidated);
+    }
+
+    /**
+     * The cursor advances, and to the bucket captured <em>before</em> the read rather than after. Taking it
+     * after would skip anything written to a rolling bucket between the listing and the capture.
      */
     public void testTheCursorAdvances() throws Exception {
         Path shared = createTempDir();
         DescriptorChangeTailer tailer = new DescriptorChangeTailer(logOver(shared), backendOver(createTempDir()));
 
-        assertNull("the first pass reads everything, which is what a joining node needs", tailer.resumeFrom());
+        String atStart = tailer.resumeFrom();
+        assertNotNull(atStart);
         tailer.tailOnce();
-        assertNotNull("and then resumes from where it stopped", tailer.resumeFrom());
+        assertNotNull("and still names a bucket afterwards", tailer.resumeFrom());
     }
 
     /** An empty log is an ordinary state and must not look like a failure. */

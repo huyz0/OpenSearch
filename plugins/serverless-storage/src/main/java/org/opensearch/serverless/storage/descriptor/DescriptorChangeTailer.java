@@ -65,12 +65,19 @@ public final class DescriptorChangeTailer {
     private final DescriptorBackend backend;
 
     /**
-     * The bucket to resume from, null until the first pass.
+     * The bucket to resume from, set at construction to the bucket current at start-up.
      *
-     * <p>Starting from null means the first pass reads the whole log rather than only what arrives after
-     * start-up. That is deliberate for a node joining an existing cluster, which has missed everything.
+     * <p>This used to start at null, so the first pass read the whole log back to the beginning of time.
+     * That was right when the tailer fed a per-node name index, which had to be built from the history
+     * before it could answer anything. It has not been right since that index was removed, and it was
+     * unbounded: the log is never pruned, so a node joining a year-old cluster read a year of changes.
+     *
+     * <p>What the tailer does now is invalidate cache entries and release shards of deleted gated indices.
+     * A starting node has an empty descriptor cache and an empty {@code openedOnDemand} set, both being
+     * plain in-memory structures, so there is nothing for any of that history to act on. Every entry it
+     * used to read was applied to nothing.
      */
-    private final AtomicReference<String> resumeFrom = new AtomicReference<>();
+    private final AtomicReference<String> resumeFrom;
 
     /**
      * Keys already consumed inside {@link #resumeFrom}'s bucket, so a revisit does not redeliver them.
@@ -87,6 +94,10 @@ public final class DescriptorChangeTailer {
     public DescriptorChangeTailer(BlobDescriptorChangeLog changeLog, DescriptorBackend backend) {
         this.changeLog = changeLog;
         this.backend = backend;
+        // Captured now rather than on the first pass, so a change written between start-up and that pass is
+        // still seen: the cursor names the bucket it starts in and entries are filtered by key, not skipped
+        // wholesale.
+        this.resumeFrom = new AtomicReference<>(changeLog.currentBucket());
     }
 
     /**
