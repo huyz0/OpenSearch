@@ -492,3 +492,64 @@ Three distinct kinds of core change now have names, which is what H3 needs:
 
 The 62 non-trivial files in the "neither" bucket were not read individually. The four largest were, and one
 of the four was an R2 violation, which is not a reassuring hit rate for the other 58.
+
+---
+
+## 12. H3: separating the metadata plane from the engine work
+
+What an upstreamable metadata plane would consist of, and what stands in the way. This is a plan with file
+lists, not the split itself; the mechanical work is large and the decisions below should be settled first.
+
+### The metadata plane's actual core footprint
+
+**18 new files**, all seams or the primitives they need:
+
+`AbsentIndexDescriptorSuppliers`, `AbsentIndexRoutingSuppliers`, `DescriptorOnlyCreation`,
+`DescriptorPrefetch`, `DescriptorRepresentable`, `DescriptorUnavailableException`, `DurableTombstones`,
+`GatedIndexRelease`, `IndexDescriptor`, `IndexDescriptorPublisher`, `MappingGenerationStore`,
+`GatedMappingStatsAggregator`, `UnknownFieldRefresh`, `ComputedPlacementMembership`,
+`ComputedPlacementMembershipService`, `ComputedShardRouting`, `BlobRegister`, `BlobRegisterCasResult`.
+
+**47 modified files**, each consulting one of those seams. They cluster into four groups rather than being
+scattered: broadcast and stats actions that iterate indices (17), the metadata services for create, delete,
+mapping, settings and state (7), resolution and routing (6), and the rest one-offs.
+
+That is the whole of it. Roughly 65 core files, every one either a registry that is null by default or a
+call site that checks for null first, plus `BlobRegister` which is a new blob-store primitive with no
+serverless coupling at all and would stand on its own merits.
+
+### What blocks it, in order of difficulty
+
+**1. `Plugin.nodeStats()` and `PluginNodeStats` were deleted.** A two-line interface and one method, replaced
+by `NodeStats` naming a concrete `NativeAllocatorPoolStats`. Fixing it means restoring both and moving the
+concrete class behind the interface, which touches `NodeStats` serialisation and its BWC handling for
+V_3_7_0. Small in concept, fiddly in practice, and it is a regression against `main` regardless of this
+design: any other plugin that used `nodeStats()` no longer compiles.
+
+**2. `RestController` holds a serverless mode.** `rest.serverless_mode.enabled`, a `serverlessModeEnabled`
+field, `ServerlessScope` on `RestHandler`, and a 410 for handlers not marked `AVAILABLE`. The mechanism is
+reasonable; siting it in core is what breaks R2. It wants the same shape as everything else, a registry a
+plugin fills, and the conversion is contained because `ServerlessScope` already exists as the vocabulary.
+
+**3. Twenty-one files remove public or protected members**, 34 in total. Each needs deciding individually:
+some are dead code the branch was right to remove and should be proposed to `main` separately, others are
+API other consumers may hold.
+
+**4. The engine work is 73 files plus part of the 110 unclassified.** Not this design's to justify, and the
+reason the raw diff looks ten times larger than the metadata plane is.
+
+### The sequence that would work
+
+1. Restore `PluginNodeStats` and `Plugin.nodeStats()`, moving `NativeAllocatorPoolStats` behind it. Removes
+   the one outright regression against `main`.
+2. Convert `RestController`'s serverless mode into a seam. Removes the clearest R2 violation.
+3. Read the 58 unexamined non-trivial files. One in four of the four largest was a violation, so assume
+   more.
+4. Only then attempt the branch split, because until 3 is done nobody knows which side each file belongs on.
+
+### Why this is a plan and not a branch
+
+Splitting 1,071 commits across two intertwined bodies of work is not a mechanical `git` operation: the
+metadata plane was built on top of the engine work and uses its plugin, so a branch containing only the 65
+core files plus `serverless-storage` would not compile without deciding what to do with `DataFormatAwareEngine`
+and everything under it. That decision is architectural and belongs to whoever owns both, not to a script.
