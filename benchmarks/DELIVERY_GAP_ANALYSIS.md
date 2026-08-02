@@ -3,8 +3,15 @@
 A step back from task-level work to ask three questions. What was this supposed to do, what does it
 actually do now, and what stands between those two.
 
-Written against `feature/serverless` at `b98d6e9a050`, measured rather than recalled. Every count below
-comes from the diff, not from a document.
+Written against `feature/serverless`, measured rather than recalled. Every count below comes from the diff,
+not from a document.
+
+**Baseline, and a warning.** All current figures are measured against `b99229e3f36`, the merge base of this
+branch and `upstream/main`. Sections 3, 7, 11 and 12 were originally measured against the local `main` ref,
+which is six weeks stale, and so counted 332 upstream commits as this branch's work. Section 13 records the
+correction and what it changed. Sections marked superseded keep their original text because the reasoning is
+still worth reading; their numbers are not. If you add a measurement to this document, diff against the merge
+base, `git merge-base HEAD upstream/main`, and say so.
 
 ---
 
@@ -66,29 +73,58 @@ ordinary index.
 
 ## 3. The core footprint, measured
 
-`server/src/main/java` against `main`: **303 files, 17,959 insertions, 1,605 deletions.**
+**Baseline.** Every figure below is measured against `b99229e3f36` (Jul 6 2026), the merge base of this
+branch and `upstream/main`. That matters: the local `main` ref is stale, sitting at May 25, and **332 of
+the 1088 commits in `main..HEAD` are upstream commits, not this branch's work**. Earlier revisions of this
+document measured against `main` and so attributed roughly a third of upstream's changes to this branch.
+Section 3.1 records what that corrected. Measure against the merge base, never against `main`.
+
+`server/src/main/java` against the fork point: **143 files, 11,341 insertions, 449 deletions.**
 
 | | count |
 |---|---|
-| added (new seams and mechanisms) | 51 |
-| modified | 252 |
-| of the modified, files whose diff references a seam | **54** |
-| of the modified, files that do not | **198** |
+| added (new seams and mechanisms) | 37 |
+| modified | 106 |
+| of the modified, files whose diff references a seam | **49** |
+| of the modified, files that do not | **57** |
+| of all modified, files changing six lines or fewer | 17 |
+| core files deleted | **0** |
 
-That split is the whole R2 story and it is worth being blunt about.
+That split is the whole R2 story.
 
-The 54 are the metadata plane's real footprint. They follow one shape: a static registry holding a
+The 49 are the metadata plane's real footprint. They follow one shape: a static registry holding a
 nullable supplier, a call site that checks for null, and identical behaviour when nothing is registered.
 That is a defensible extension-point design and it scales to the ten seams listed in section 4.
 
-**The 198 are not that.** They belong to the pluggable engine work the branch was originally cut for, and
-they were never audited against R2. Some are certainly benign. Nobody has established which. The metadata
-plane design document says this explicitly and then sets it aside as "not this design's concern", which
-was reasonable for that document and is not reasonable for delivery.
+The 57 are not that. They belong to the pluggable engine work the branch was originally cut for. Section
+11 reports what reading them found; the short version is that the engine work is a genuine second change
+sharing a branch with the metadata plane, and section 12 is about separating them.
 
-`IndexShard` gains 403 lines, `Metadata` 332, `MetadataCreateIndexService` 261, `StoreRecovery` 238,
-`DataFormatAwareEngine` 862. Whether those are guarded by a plugin check or change the default path is
-unknown, and it is the single largest open question against R1 and R2.
+### 3.1 What the stale baseline had wrong
+
+The corrected numbers are roughly half the previously reported ones, and two claims did not survive at all.
+
+| claim | measured against stale `main` | measured against the fork point |
+|---|---|---|
+| core files changed | 303 | **143** |
+| insertions | 17,959 | **11,341** |
+| deletions | 1,605 | **449** |
+| non-seam modified files | 198 | **57** |
+| removed public/protected members | 34, across 21 files | **5, across 2 files** |
+| core files deleted | reported as a concern | **0** |
+
+The five genuine removals are `ShardRouting.splitting/isSplitTarget/getParentShardId/getRecoveringChildShards`
+and `OperationRouting.shardWithRecoveringChild`, all removed deliberately by CC1 and all verifiably dead on
+the baseline. Everything else counted as a "removal" was a modified signature whose name still exists in the
+same file. See section 13.
+
+One further correction, of a change this analysis itself prompted: an earlier pass concluded that the branch
+had deleted the `PluginNodeStats` extension point and restored it. That was wrong. Upstream removed it, in
+PR #21820, replacing an `@ExperimentalApi` SPI that had one consumer and an unreleased wire format with a
+typed `NodeStats` field and a narrower `ArrowAllocatorPlugin` SPI in `libs/arrow-spi`. The restoration
+reintroduced an interface upstream had deliberately retired, and added a `Plugin.nodeStats()` that nothing
+in the repository called, the same *correct and unreachable* failure section 4a describes, committed while
+fixing a different instance of it. Reverted.
 
 ---
 
@@ -200,6 +236,11 @@ Stated so it is not mistaken for coverage.
 ---
 
 ## 7. G4: the non-seam core audit, first pass
+
+> **Superseded in its conclusions by section 13.** This pass was run against the stale `main` baseline, so
+> its counts include upstream's changes as though they were this branch's, and its three headline findings
+> do not survive re-measurement against the fork point. The method below is sound and worth keeping; the
+> numbers and the verdict are not. Read section 13 for what is actually true.
 
 Section 3 said 198 modified core files had never been checked against R2 and that this was the largest open
 question. This is the first pass over them. It does not clear them; it finds enough to say the answer is
@@ -441,6 +482,10 @@ any S3-compatible endpoint including real S3 when someone has credentials.
 
 ## 11. H2: finishing the core audit, and a correction to section 3
 
+> **Counts superseded by section 13.** Like section 7, this pass measured against the stale `main`, so its
+> denominator of 196 includes upstream files this branch never touched; the true figure is 57. What it found
+> by *reading* files stands, since those findings are about content rather than which ref produced them.
+
 Section 3 said 198 modified core files "belong to the pluggable engine work". That was an assumption stated
 as fact. Measuring it changes the shape of the problem.
 
@@ -510,46 +555,114 @@ lists, not the split itself; the mechanical work is large and the decisions belo
 `GatedMappingStatsAggregator`, `UnknownFieldRefresh`, `ComputedPlacementMembership`,
 `ComputedPlacementMembershipService`, `ComputedShardRouting`, `BlobRegister`, `BlobRegisterCasResult`.
 
-**47 modified files**, each consulting one of those seams. They cluster into four groups rather than being
+**49 modified files**, each consulting one of those seams. They cluster into four groups rather than being
 scattered: broadcast and stats actions that iterate indices (17), the metadata services for create, delete,
 mapping, settings and state (7), resolution and routing (6), and the rest one-offs.
 
-That is the whole of it. Roughly 65 core files, every one either a registry that is null by default or a
+That is the whole of it. Roughly 67 core files, every one either a registry that is null by default or a
 call site that checks for null first, plus `BlobRegister` which is a new blob-store primitive with no
 serverless coupling at all and would stand on its own merits.
 
 ### What blocks it, in order of difficulty
 
-**1. `Plugin.nodeStats()` and `PluginNodeStats` were deleted.** A two-line interface and one method, replaced
-by `NodeStats` naming a concrete `NativeAllocatorPoolStats`. Fixing it means restoring both and moving the
-concrete class behind the interface, which touches `NodeStats` serialisation and its BWC handling for
-V_3_7_0. Small in concept, fiddly in practice, and it is a regression against `main` regardless of this
-design: any other plugin that used `nodeStats()` no longer compiles.
+> Item 1 as originally written, "`Plugin.nodeStats()` and `PluginNodeStats` were deleted, the one outright
+> regression against `main`", was false, and the attempt to act on it is described in section 3.1. Upstream
+> removed that SPI deliberately. There is no such regression. The list below is what remains.
 
-**2. `RestController` holds a serverless mode.** `rest.serverless_mode.enabled`, a `serverlessModeEnabled`
-field, `ServerlessScope` on `RestHandler`, and a 410 for handlers not marked `AVAILABLE`. The mechanism is
-reasonable; siting it in core is what breaks R2. It wants the same shape as everything else, a registry a
-plugin fills, and the conversion is contained because `ServerlessScope` already exists as the vocabulary.
+**1. `RestController` holds a serverless mode.** `rest.serverless_mode.enabled`, a `serverlessModeEnabled`
+field, `ServerlessScope` on `RestHandler` defaulting to `UNAVAILABLE`, and a 410 for handlers not marked
+`AVAILABLE`. Default-off, so R1 holds. Siting it in core is what strains R2, and the tell is that
+`RestController` had to give `/favicon.ico` an explicit `AVAILABLE` override to stop its own new setting
+from 410-ing a static asset. Upstream already ships `ActionPlugin.getRestHandlerWrapper(ThreadContext)`,
+which lets a plugin wrap every handler and refuse the ones it wants refused. So the question to settle is
+not how to build a seam but whether the existing extension point already suffices. Ten core handlers
+currently carry `serverlessScope()` overrides that would move to the plugin with it.
 
-**3. Twenty-one files remove public or protected members**, 34 in total. Each needs deciding individually:
-some are dead code the branch was right to remove and should be proposed to `main` separately, others are
-API other consumers may hold.
+**2. Five public members were removed from `ShardRouting` and `OperationRouting`**, all by CC1, all
+verifiably dead on the baseline. Not a blocker so much as something to disclose and offer upstream on its
+own merits. Section 13.
 
-**4. The engine work is 73 files plus part of the 110 unclassified.** Not this design's to justify, and the
-reason the raw diff looks ten times larger than the metadata plane is.
+**3. CC1 also changed core behaviour**, rejecting primary writes on the parent of an in-progress in-place
+split. It applies with no plugin installed, so it is a real R1 deviation, and it fixes a genuine upstream
+data-loss window. It is separable and should be proposed to `main` as its own bug fix.
+
+**4. The engine work is the 57 non-seam modified files plus most of the 37 new ones.** Not this design's to
+justify, and the reason the raw diff looks several times larger than the metadata plane is.
 
 ### The sequence that would work
 
-1. Restore `PluginNodeStats` and `Plugin.nodeStats()`, moving `NativeAllocatorPoolStats` behind it. Removes
-   the one outright regression against `main`.
-2. Convert `RestController`'s serverless mode into a seam. Removes the clearest R2 violation.
-3. Read the 58 unexamined non-trivial files. One in four of the four largest was a violation, so assume
-   more.
+1. Settle whether `RestController`'s serverless mode can move onto the existing `getRestHandlerWrapper`
+   extension point. Removes the clearest R2 strain and needs no new seam if it can.
+2. Offer CC1's write-rejection fix to `main` separately, with its dead-scaffolding removal attached.
+3. Read the remaining unexamined non-trivial files, against the fork point this time.
 4. Only then attempt the branch split, because until 3 is done nobody knows which side each file belongs on.
 
 ### Why this is a plan and not a branch
 
-Splitting 1,071 commits across two intertwined bodies of work is not a mechanical `git` operation: the
-metadata plane was built on top of the engine work and uses its plugin, so a branch containing only the 65
+Splitting 756 branch commits across two intertwined bodies of work is not a mechanical `git` operation: the
+metadata plane was built on top of the engine work and uses its plugin, so a branch containing only the 67
 core files plus `serverless-storage` would not compile without deciding what to do with `DataFormatAwareEngine`
 and everything under it. That decision is architectural and belongs to whoever owns both, not to a script.
+
+---
+
+## 13. H4: the baseline was wrong, and what changed when it was fixed
+
+Every measurement in sections 3, 7, 11 and 12 was taken against the local `main` ref. That ref is stale. It
+sits at `fae98a3a5f3` (May 25 2026) while the branch forked from `upstream/main` at `b99229e3f36`
+(Jul 6 2026), so **332 of the 1088 commits in `main..HEAD` belong to upstream**, and every `git diff main`
+in this document counted six weeks of other people's work as this branch's.
+
+### How it surfaced
+
+Not by re-reading the numbers. Section 12 listed "restore `Plugin.nodeStats()`" as step one, the single
+outright regression against `main`. Acting on it meant restoring the interface, and restoring it meant
+asking who had deleted it. That turned out to be upstream, in PR #21820, deliberately, with a commit
+message explaining that the SPI was `@ExperimentalApi`, had one consumer, had an unreleased wire format,
+and was being replaced by a typed field plus a narrower `ArrowAllocatorPlugin` SPI in `libs/arrow-spi`.
+
+The restoration had already been committed by then. It reintroduced an interface upstream had retired and
+added a `Plugin.nodeStats()` with no caller anywhere in the repository: the *correct and unreachable*
+pattern section 4a is about, produced while trying to fix a different instance of it. Reverted in full;
+`Plugin.java` is now byte-identical to the fork point.
+
+The general lesson is narrow and worth stating plainly: a diff is only as trustworthy as the ref on the
+left of it, and nothing about `git diff main` announces that `main` is six weeks behind.
+
+### What re-measurement changed
+
+See the table in section 3.1. The two claims that did not survive:
+
+**"Twenty-one files remove 34 public or protected members."** Actually two files remove five, and the other
+29 counted "removals" were modified signatures, a `-` line and a `+` line for the same member, counted as a
+deletion by a grep that only looked at the `-` side. The five real ones are
+`ShardRouting.splitting/isSplitTarget/getParentShardId/getRecoveringChildShards` and
+`OperationRouting.shardWithRecoveringChild`.
+
+**"One core file deleted outright."** Zero. That file was `PluginNodeStats`, deleted by upstream.
+
+### The five removals, checked rather than assumed
+
+CC1 removed them along with `ShardRoutingState.SPLITTING`, justifying it as dead scaffolding upstream left
+behind for a dual-write path the in-place-split feature never wired up. That justification is load-bearing,
+so it was verified rather than taken on trust. On the fork point:
+
+- the five accessors have **zero callers** outside the two files declaring them, in `server/src/main/java`,
+  `plugins/`, `modules/` and `libs/`;
+- `SPLITTING` appears **only inside `ShardRouting.java` and its own enum declaration**. Nothing ever puts a
+  shard into that state.
+
+The second point also disposes of the backwards-compatibility worry that removing a wire enum value would
+normally raise. `ShardRoutingState.fromValue(5)` now throws, but no node ever produced byte 5, because no
+code path ever constructed a `SPLITTING` routing. The removal is wire-safe.
+
+What remains is a public API removal from a routing primitive. It is defensible, it should be disclosed, and
+it belongs upstream as its own change rather than buried in a serverless branch.
+
+### The behaviour change that comes with it
+
+CC1's actual fix, `IndexShard.ensureNotInProgressSplitParent`, which rejects primary writes on a split
+parent, is core behaviour that applies with no plugin installed. That is a genuine R1 deviation, the only one this
+document has found that is not default-off. It is also a real bug fix: without it, documents acknowledged by
+the parent after a child cloned its manifest but before the split committed became permanently unreachable.
+Both things are true, and the resolution is the same either way, which is to offer it to `main` on its own.

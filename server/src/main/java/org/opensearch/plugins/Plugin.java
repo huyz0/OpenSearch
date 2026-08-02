@@ -42,7 +42,6 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.inject.Module;
 import org.opensearch.common.lifecycle.LifecycleComponent;
-import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.SettingUpgrader;
 import org.opensearch.common.settings.Settings;
@@ -249,27 +248,6 @@ public abstract class Plugin implements Closeable {
      * Returns a list of additional {@link Setting} definitions for this plugin.
      */
     public List<Setting<?>> getSettings() {
-        return Collections.emptyList();
-    }
-
-    /**
-     * Returns plugin-contributed node statistics that surface under {@code _nodes/stats}.
-     * Each entry renders at top-level under {@code nodes.<id>.<getWriteableName()>}.
-     *
-     * <p>Plugins that override this method must also register the concrete
-     * {@link PluginNodeStats} subclass via {@link #getNamedWriteables()} so the
-     * coordinator can deserialize per-node payloads received over transport.
-     *
-     * <p>Restored after this branch deleted it. Removing an extension point is a regression against main
-     * independent of any design here: a plugin that overrode it stopped compiling, and core gained a
-     * concrete stats class in its place, which is the inverse of what an extension point is for.
-     *
-     * <p>Default: empty.
-     *
-     * @opensearch.experimental
-     */
-    @ExperimentalApi
-    public List<PluginNodeStats> nodeStats() {
         return Collections.emptyList();
     }
 
