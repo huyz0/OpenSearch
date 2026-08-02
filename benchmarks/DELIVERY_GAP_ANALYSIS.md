@@ -821,3 +821,45 @@ alternative engine can subclass rather than reimplement. Widening `private` to `
 maintenance commitment rather than a behaviour change, and it is worth being explicit that this is the
 mechanism, because "no behaviour changed" and "core's API surface did not grow" are different claims and
 only the first is true.
+
+---
+
+## 16. H9: CC1 extracted as a standalone patch
+
+Sections 12 and 13 concluded that CC1 should be offered to `main` on its own, for two reasons that point
+the same way: it fixes a real upstream data-loss window, and it is the only R1 deviation in the branch
+that is not default-off. Leaving it buried in a serverless branch means the bug stays unfixed upstream
+for as long as the branch takes.
+
+The patch is `benchmarks/cc1-in-place-split-write-rejection.patch`.
+
+### What it took to separate
+
+CC1 as committed does not apply to the fork point. It touches
+`MetadataInPlaceMergeShardServiceTests`, which is part of the in-place merge feature this branch adds
+and upstream does not have, and one hunk of `SplitShardsMetadataTests` covering a merge case that
+likewise does not exist there.
+
+Both are additions this branch made, not part of the fix, so the extracted patch drops them. One hunk in
+`SplitShardsMetadata` then needed applying by hand, because the surrounding code has moved on this branch
+since. Nothing else required judgement: the guard, its test, and the dead-scaffolding removal all apply
+unchanged.
+
+### Verified, not assumed
+
+Against a worktree checked out at the fork point and nothing else:
+
+- applies cleanly to a pristine checkout;
+- `:server:compileJava`, `:server:compileTestJava` and `:test:framework:compileJava` all pass, which
+  matters because the patch removes public members and changes a method signature, so a missed caller
+  would show up here;
+- `IndexShardTests`, `SplitShardsMetadataTests`, `OperationRoutingTests` and `ShardRoutingTests` pass;
+- removing the guard fails `testRejectsPrimaryWriteWhileInPlaceSplitInProgress`, so the test is
+  load-bearing there and not only on this branch.
+
+### What it does not resolve
+
+Applying it upstream would still leave this branch carrying the same change, so the eventual merge has to
+account for it. And it removes public members from `ShardRouting`, which is a compatibility decision for
+whoever reviews it rather than something this branch can settle. The dead-code evidence is in section 13
+and reproducible with a single `git grep` against the fork point.
