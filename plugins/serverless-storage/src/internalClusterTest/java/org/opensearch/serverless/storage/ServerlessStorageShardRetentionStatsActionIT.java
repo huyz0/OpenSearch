@@ -20,6 +20,7 @@ import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.serverless.storage.format.BlobContainerBundleStore;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
@@ -72,7 +73,16 @@ public class ServerlessStorageShardRetentionStatsActionIT extends ServerlessStor
         Settings nodeSettings = Settings.builder()
             .putList("path.repo", basePath.toString())
             .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey(), basePath.toString())
-            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING.getKey(), org.opensearch.common.unit.TimeValue.ZERO)
+            // Legal and deliberately not the default. This used to set zero, and fd4ebdb13ee gave the
+            // setting a minimum of twice the PITR reconcile interval, so the node stopped starting at all:
+            // "failed to parse value [0ms] for setting [serverless_storage.gc.retention_window], must be
+            // >= [600000ms]". Fifteen minutes clears that minimum and is still not the thirty-minute
+            // default, so the assertion below proves the stats action reports the window it was configured
+            // with rather than one it never read.
+            .put(
+                ServerlessStoragePlugin.SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING.getKey(),
+                TimeValue.timeValueMinutes(15)
+            )
             .build();
 
         internalCluster().startClusterManagerOnlyNode(nodeSettings);
@@ -127,21 +137,58 @@ public class ServerlessStorageShardRetentionStatsActionIT extends ServerlessStor
             }
         }
 
-        // Zero retention window (the node setting above): the older, non-latest generation is
-        // immediately eligible for deletion once unpinned.
+        // Age the older generation past the retention window, rather than configuring the window away.
+        //
+        // The stats action computes its cutoff as now minus the window, so a manifest published moments ago
+        // is inside every legal window and can never be deletable. Setting the window to zero used to make
+        // that true trivially, and the setting now forbids zero for a real reason: a window shorter than one
+        // PITR reconcile cycle would let GC delete a manifest before the reconciler could pin it. Backdating
+        // the manifest tests the same property -- old, unpinned, not the latest generation, therefore
+        // collectable -- against a configuration production would actually accept.
+        //
+        // Every other field is carried across, so this stays the manifest the publisher produced and the
+        // bundle it references is still the real one. Deleted first because a manifest is immutable:
+        // writeManifest goes through writeBlobAtomic with fail-if-exists, and rewriting in place threw
+        // FileAlreadyExistsException. deleteManifests removes only the manifest blob and leaves the bundle,
+        // which is exactly what is wanted here.
+        CommitManifest agedFirstManifest = new CommitManifest(
+            firstManifest.indexUuid(),
+            firstManifest.shardId(),
+            firstManifest.primaryTerm(),
+            firstManifest.generation(),
+            firstManifest.segmentsFileName(),
+            firstManifest.files(),
+            firstManifest.maxSeqNo(),
+            firstManifest.localCheckpoint(),
+            firstManifest.walPosition(),
+            firstManifest.mappingVersion(),
+            firstManifest.pruningStats(),
+            System.currentTimeMillis() - TimeValue.timeValueHours(1).millis(),
+            firstManifest.quiescent(),
+            firstManifest.totalDocCount(),
+            firstManifest.deletedDocCount()
+        );
+        manifestStore.deleteManifests(java.util.List.of(firstManifest));
+        manifestStore.writeManifest(agedFirstManifest);
+
+        // The older, non-latest generation is now outside the window and unpinned, so it is deletable.
         ShardRetentionStatsResponse beforePin = client().execute(
             ShardRetentionStatsAction.INSTANCE,
             new ShardRetentionStatsRequest(INDEX_UUID, SHARD_ID)
         ).get();
         assertEquals("both published generations must be counted", 2, beforePin.manifestCount());
         assertEquals(
-            "the older, non-latest generation must be deletable with no pin and a zero retention window",
+            "the older, non-latest generation must be deletable once it is unpinned and past the window",
             1,
             beforePin.deletableManifestCount()
         );
         assertEquals("no pins have been added yet", 0, beforePin.durablePinCount());
         assertEquals(0, beforePin.pitrPinCount());
-        assertEquals(0L, beforePin.gcRetentionWindowMillis());
+        assertEquals(
+            "the stats must report the configured window, not the default",
+            TimeValue.timeValueMinutes(15).millis(),
+            beforePin.gcRetentionWindowMillis()
+        );
 
         // Directly seed a PITR pin on the older generation, the same way PitrRetentionReconciler
         // would once its own (much longer, 5-minute) schedule got around to it -- this test isn't
