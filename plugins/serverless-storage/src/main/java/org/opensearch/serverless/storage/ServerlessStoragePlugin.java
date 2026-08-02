@@ -1335,6 +1335,24 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      * path. Checkpointing often enough to matter but rarely enough that the fold it triggers is not on any
      * request's critical path.
      */
+    /**
+     * How often a node reads the descriptor change log to learn what other nodes wrote.
+     *
+     * <p>This is the staleness bound for cross-node visibility of a gated index, and it replaces relying on
+     * the descriptor cache's freshness window, which bounded nothing about the name index at all.
+     *
+     * <p>Five seconds because the cost of a pass is one listing over recent buckets and the cost of being
+     * late is a wildcard on one node missing an index another node just created. Shorter would spend
+     * requests on an idle cluster; much longer and a create-then-search across two nodes starts to look
+     * broken rather than eventually consistent.
+     */
+    public static final Setting<TimeValue> DESCRIPTOR_CHANGE_TAIL_INTERVAL_SETTING = Setting.timeSetting(
+        "serverless_storage.descriptor.change_tail_interval",
+        TimeValue.timeValueSeconds(5),
+        TimeValue.timeValueMillis(100),
+        Setting.Property.NodeScope
+    );
+
     public static final Setting<TimeValue> NAME_INDEX_CHECKPOINT_INTERVAL_SETTING = Setting.timeSetting(
         "serverless_storage.name_index.checkpoint_interval",
         TimeValue.timeValueMinutes(10),
@@ -1347,6 +1365,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         return List.of(
             NAME_INDEX_ENABLED_SETTING,
             NAME_INDEX_CHECKPOINT_INTERVAL_SETTING,
+            DESCRIPTOR_CHANGE_TAIL_INTERVAL_SETTING,
             COMPUTED_PLACEMENT_ENABLED_SETTING,
             SERVERLESS_STORAGE_ENABLED_SETTING,
             SERVERLESS_STORAGE_BASE_PATH_SETTING,
@@ -1847,6 +1866,48 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new org.opensearch.serverless.storage.descriptor.StoreBackedFieldRefresher(),
             SERVERLESS_STORAGE_NODE_ENABLED_SETTING.get(environment.settings())
         );
+
+        // G2. The change feed, both ends of it.
+        //
+        // Neither end had a production caller. DescriptorGate.setChangeFeed was referenced only by its own
+        // uninstall, so no node ever appended a change and no node ever read one. That left a gated index
+        // created on one node invisible to every other node's name index until a rebuild, and a descriptor
+        // changed elsewhere visible here only once the cache's freshness window expired.
+        //
+        // The appender is registered before the tailer starts, so the tailer never reads a log nothing
+        // writes, which is the configuration that looks exactly like a quiet cluster.
+        if (SERVERLESS_STORAGE_NODE_ENABLED_SETTING.get(environment.settings())) {
+            try {
+                org.opensearch.serverless.storage.descriptor.BlobDescriptorChangeLog changeLog =
+                    new org.opensearch.serverless.storage.descriptor.BlobDescriptorChangeLog(path -> {
+                        try {
+                            return resolveContainerForDescriptors(path, "no blob store for the descriptor change log");
+                        } catch (IOException e) {
+                            throw new java.io.UncheckedIOException(e);
+                        }
+                    }, BlobPath.cleanPath().add("descriptors-root"));
+                org.opensearch.serverless.storage.descriptor.DescriptorGate.setChangeFeed(changeLog, nameIndexService);
+
+                org.opensearch.serverless.storage.descriptor.DescriptorChangeTailer tailer =
+                    new org.opensearch.serverless.storage.descriptor.DescriptorChangeTailer(
+                        changeLog,
+                        descriptorBackend,
+                        nameIndexService
+                    );
+                // On GENERIC because a pass is object-store I/O. Every node tails, including the cluster
+                // manager: a gated index has no cluster state entry, so there is no node that learns about
+                // one by any other route.
+                threadPool.scheduleWithFixedDelay(
+                    tailer::tailOnce,
+                    DESCRIPTOR_CHANGE_TAIL_INTERVAL_SETTING.get(environment.settings()),
+                    ThreadPool.Names.GENERIC
+                );
+            } catch (Exception e) {
+                // A cluster with no object store configured still publishes descriptors and still resolves
+                // them; it simply has no cross-node feed, which is the state it was in before this existed.
+                logger.warn("no descriptor change feed; other nodes will learn of changes only by rebuild", e);
+            }
+        }
 
         return java.util.List.of(this, nameIndexService, descriptorStore);
     }

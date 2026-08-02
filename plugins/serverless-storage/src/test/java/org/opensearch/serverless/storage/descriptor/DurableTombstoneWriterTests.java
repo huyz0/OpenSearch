@@ -81,6 +81,9 @@ public class DurableTombstoneWriterTests extends OpenSearchTestCase {
         }
 
         @Override
+        public void invalidate(String name) {}
+
+        @Override
         public IndexDescriptor get(String name) {
             return null;
         }

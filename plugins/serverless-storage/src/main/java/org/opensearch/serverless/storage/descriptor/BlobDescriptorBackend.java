@@ -368,6 +368,17 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
         }
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Safe for a name never cached, which is the common case for a tailer: it sees every change in the
+     * cluster and most concern names this node has never read.
+     */
+    @Override
+    public void invalidate(String name) {
+        descriptorCache.invalidate(name);
+    }
+
     private static String keyFor(String name) {
         return DESCRIPTOR_PREFIX + name;
     }

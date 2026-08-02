@@ -178,4 +178,18 @@ public interface DescriptorBackend {
      * producing -- and a prefetch that does nothing is indistinguishable from a fast one.
      */
     void warmAsync(java.util.Collection<String> names, org.opensearch.core.action.ActionListener<Void> listener);
+
+    /**
+     * Drops any cached answer for this name, so the next read goes to the store.
+     *
+     * <p>The write paths invalidate their own name already. This is for a change made <em>elsewhere</em>:
+     * a descriptor written on another node is invisible here until the freshness window expires, so a node
+     * tailing the change log needs a way to say "whatever you think you know about this name, forget it".
+     * Without it the only bound on staleness is the cache TTL, which is a second of a deleted index still
+     * resolving as live.
+     *
+     * <p>Must be safe for a name that was never cached, since a tailer sees every change in the cluster and
+     * most of them concern names this node has never read.
+     */
+    void invalidate(String name);
 }

@@ -96,6 +96,12 @@ public final class CompositeDescriptorBackend implements DescriptorBackend, Desc
         points.putTombstoneAsync(tombstone, whenDurable);
     }
 
+    /** Only the point half caches, so only it has anything to forget. */
+    @Override
+    public void invalidate(String name) {
+        points.invalidate(name);
+    }
+
     /**
      * Warms the point half only, since that is the half {@link #get} reads.
      *
