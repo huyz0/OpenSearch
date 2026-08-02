@@ -14,7 +14,6 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.settings.Settings;
-import org.opensearch.serverless.storage.nameindex.NameIndexService;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.nio.file.Path;
@@ -71,37 +70,6 @@ public class DescriptorChangeTailerTests extends OpenSearchTestCase {
         return new DescriptorChange(name, name + "-uuid", DescriptorChange.Kind.DELETED, System.currentTimeMillis());
     }
 
-    public void testANameCreatedElsewhereBecomesResolvableHere() throws Exception {
-        Path shared = createTempDir();
-        BlobDescriptorChangeLog writerLog = logOver(shared);
-
-        // The other node's write.
-        writerLog.append(created("tenant-remote"));
-
-        NameIndexService localNameIndex = new NameIndexService(true);
-        DescriptorChangeTailer tailer = new DescriptorChangeTailer(logOver(shared), backendOver(createTempDir()), localNameIndex);
-
-        assertFalse("nothing has been tailed yet", localNameIndex.getNameIndex().contains("tenant-remote"));
-        assertEquals(1, tailer.tailOnce());
-        assertTrue("an index created on another node must become resolvable here", localNameIndex.getNameIndex().contains("tenant-remote"));
-    }
-
-    /** A delete has to travel too, and it is the direction that matters more. */
-    public void testANameDeletedElsewhereStopsResolvingHere() throws Exception {
-        Path shared = createTempDir();
-        BlobDescriptorChangeLog writerLog = logOver(shared);
-        NameIndexService localNameIndex = new NameIndexService(true);
-        DescriptorChangeTailer tailer = new DescriptorChangeTailer(logOver(shared), backendOver(createTempDir()), localNameIndex);
-
-        writerLog.append(created("tenant-doomed"));
-        tailer.tailOnce();
-        assertTrue(localNameIndex.getNameIndex().contains("tenant-doomed"));
-
-        writerLog.append(deleted("tenant-doomed"));
-        tailer.tailOnce();
-        assertFalse("a deleted index must stop resolving rather than linger until a rebuild", localNameIndex.getNameIndex().contains("tenant-doomed"));
-    }
-
     /**
      * A cached descriptor for a name changed elsewhere must be dropped.
      *
@@ -123,7 +91,7 @@ public class DescriptorChangeTailerTests extends OpenSearchTestCase {
         BlobDescriptorChangeLog writerLog = logOver(sharedLog);
         writerLog.append(deleted("tenant-x"));
 
-        DescriptorChangeTailer tailer = new DescriptorChangeTailer(logOver(sharedLog), readerBackend, null);
+        DescriptorChangeTailer tailer = new DescriptorChangeTailer(logOver(sharedLog), readerBackend);
         tailer.tailOnce();
 
         IndexDescriptor after = readerBackend.get("tenant-x");
@@ -134,23 +102,38 @@ public class DescriptorChangeTailerTests extends OpenSearchTestCase {
         );
     }
 
-    /** Re-applying what has already been seen has to be harmless, which is what lets this be a poll. */
+    /**
+     * Re-applying what has already been seen has to be harmless, which is what lets this be a poll.
+     *
+     * <p>Harmless, not absent. The cursor advances to the bucket the read started in rather than past it, so
+     * everything written in the current bucket is delivered again on the next pass, and buckets are a minute
+     * wide against a five second interval. A change is therefore re-read and re-invalidated up to twelve
+     * times before its bucket rolls.
+     *
+     * <p>That is correct and it is not free: re-invalidating a name evicts it, so the next read of a
+     * recently-changed index goes back to the store. The assertion here is the correctness half, that no
+     * name outside the change set is ever touched and repetition converges rather than corrupts. The cost
+     * half is recorded as a finding rather than pinned as intended behaviour, because a cursor that
+     * remembered the entries it had consumed inside the bucket would not pay it.
+     */
     public void testTailingIsIdempotent() throws Exception {
         Path shared = createTempDir();
         BlobDescriptorChangeLog writerLog = logOver(shared);
         writerLog.append(created("tenant-a"));
         writerLog.append(created("tenant-b"));
 
-        NameIndexService localNameIndex = new NameIndexService(true);
-        DescriptorChangeTailer tailer = new DescriptorChangeTailer(logOver(shared), backendOver(createTempDir()), localNameIndex);
+        List<String> invalidated = new ArrayList<>();
+        DescriptorChangeTailer tailer = new DescriptorChangeTailer(logOver(shared), new RecordingBackend(invalidated));
 
         tailer.tailOnce();
         tailer.tailOnce();
         tailer.tailOnce();
 
-        assertTrue(localNameIndex.getNameIndex().contains("tenant-a"));
-        assertTrue(localNameIndex.getNameIndex().contains("tenant-b"));
-        assertEquals("two names, however many passes", 2, localNameIndex.getNameIndex().baseSize() + localNameIndex.getNameIndex().pendingSize());
+        assertEquals(
+            "three passes must converge on the same two names and touch nothing else",
+            java.util.Set.of("tenant-a", "tenant-b"),
+            new java.util.HashSet<>(invalidated)
+        );
     }
 
     /**
@@ -161,7 +144,7 @@ public class DescriptorChangeTailerTests extends OpenSearchTestCase {
      */
     public void testTheCursorAdvances() throws Exception {
         Path shared = createTempDir();
-        DescriptorChangeTailer tailer = new DescriptorChangeTailer(logOver(shared), backendOver(createTempDir()), null);
+        DescriptorChangeTailer tailer = new DescriptorChangeTailer(logOver(shared), backendOver(createTempDir()));
 
         assertNull("the first pass reads everything, which is what a joining node needs", tailer.resumeFrom());
         tailer.tailOnce();
@@ -170,24 +153,20 @@ public class DescriptorChangeTailerTests extends OpenSearchTestCase {
 
     /** An empty log is an ordinary state and must not look like a failure. */
     public void testAnEmptyLogAppliesNothing() throws Exception {
-        DescriptorChangeTailer tailer = new DescriptorChangeTailer(
-            logOver(createTempDir()),
-            backendOver(createTempDir()),
-            new NameIndexService(true)
-        );
+        DescriptorChangeTailer tailer = new DescriptorChangeTailer(logOver(createTempDir()), backendOver(createTempDir()));
         assertEquals(0, tailer.tailOnce());
         assertEquals(1, tailer.passCount());
     }
 
-    /** With no name index, invalidation still has to happen: the two consumers fail independently. */
-    public void testInvalidationHappensWithoutANameIndex() throws Exception {
+    /** Invalidation is the tailer's reason to exist, so it is asserted on its own rather than only in passing. */
+    public void testTailingInvalidatesEveryTouchedName() throws Exception {
         Path shared = createTempDir();
         logOver(shared).append(created("tenant-a"));
 
         List<String> invalidated = new ArrayList<>();
         DescriptorBackend recording = new RecordingBackend(invalidated);
 
-        DescriptorChangeTailer tailer = new DescriptorChangeTailer(logOver(shared), recording, null);
+        DescriptorChangeTailer tailer = new DescriptorChangeTailer(logOver(shared), recording);
         tailer.tailOnce();
 
         assertEquals(List.of("tenant-a"), invalidated);
@@ -208,7 +187,7 @@ public class DescriptorChangeTailerTests extends OpenSearchTestCase {
             logOver(shared).append(created("tenant-live"));
             logOver(shared).append(deleted("tenant-gone"));
 
-            new DescriptorChangeTailer(logOver(shared), backendOver(createTempDir()), null).tailOnce();
+            new DescriptorChangeTailer(logOver(shared), backendOver(createTempDir())).tailOnce();
 
             assertEquals("only the deleted name may be released", 1, released.size());
             assertEquals("tenant-gone", released.get(0).getName());
@@ -229,7 +208,7 @@ public class DescriptorChangeTailerTests extends OpenSearchTestCase {
         org.opensearch.cluster.metadata.GatedIndexRelease.register(null);
 
         // The assertion is that this does not throw: an unregistered seam is a no-op, not a failure.
-        new DescriptorChangeTailer(logOver(shared), backendOver(createTempDir()), null).tailOnce();
+        new DescriptorChangeTailer(logOver(shared), backendOver(createTempDir())).tailOnce();
     }
 
     /** A backend that records what it was asked to forget. */

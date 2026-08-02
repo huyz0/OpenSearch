@@ -19,7 +19,6 @@ import org.opensearch.cluster.metadata.IndexDescriptor;
 import org.opensearch.cluster.metadata.IndexDescriptorPublisher;
 import org.opensearch.cluster.metadata.MappingGenerationStore;
 import org.opensearch.index.mapper.UnknownFieldRefresh;
-import org.opensearch.serverless.storage.nameindex.NameIndexService;
 import org.opensearch.serverless.storage.placement.ComputedPlacementGate;
 
 import java.util.concurrent.atomic.AtomicReference;
@@ -425,33 +424,30 @@ public final class DescriptorGate {
 
     /** Clears both registrations, which a node shutting down must do. */
     /**
-     * The change feed, which had nowhere to be called from until the publisher above called it.
+     * The change log, which had nowhere to be called from until the publisher above called it.
      *
-     * <p>Both halves were built and neither was reachable: {@code BlobDescriptorChangeLog} had no
-     * appender and {@code NameIndexService.apply} had no caller. A feed nothing writes and an index
-     * nothing feeds look exactly like a quiet cluster, which is why this needed wiring rather than more
-     * building.
+     * <p>What the log carries is cache invalidation and shard release on other nodes, applied by
+     * {@code DescriptorChangeTailer}. It once also fed an in-memory name index on every node; that index
+     * was removed because no request path read it and wildcards are answered by a prefix search over the
+     * descriptor index instead, which is one sharded structure rather than a copy per node.
      *
      * <p>Optional on purpose. A deployment with no object store configured still publishes descriptors,
-     * and a null feed simply means nothing is recorded, which is what the setter's absence already meant.
+     * and a null log simply means nothing is recorded, which is what the setter's absence already meant.
      */
     private static final AtomicReference<BlobDescriptorChangeLog> CHANGE_LOG = new AtomicReference<>();
-    private static final AtomicReference<NameIndexService> NAME_INDEX = new AtomicReference<>();
 
-    /** Installs the change feed. Passing nulls clears it, matching every other registration here. */
-    public static void setChangeFeed(BlobDescriptorChangeLog changeLog, NameIndexService nameIndexService) {
+    /** Installs the change log. Passing null clears it, matching every other registration here. */
+    public static void setChangeFeed(BlobDescriptorChangeLog changeLog) {
         CHANGE_LOG.set(changeLog);
-        NAME_INDEX.set(nameIndexService);
     }
 
     /**
-     * Records one descriptor write to the log and applies it to this node's name index.
+     * Records one descriptor write to the log, so other nodes learn of it.
      *
-     * <p>The local apply is immediate rather than tailed, because this node already knows what it just
-     * wrote and waiting to read it back would make its own index the last to know. The log is what carries
-     * the same change to every other node, and the tailer that consumes it on those nodes is the piece
-     * still missing: today a remote node learns of the change only through a rebuild. That is a real gap
-     * and it is stated rather than papered over, because a feed that is half-wired reads as a working one.
+     * <p>Nothing is applied locally: this node wrote the descriptor, so its own cache is already correct,
+     * and the log exists to carry the change to nodes that were not party to the write. Those consume it
+     * through {@code DescriptorChangeTailer}, which invalidates their caches and releases shards of a
+     * deleted gated index.
      *
      * <p>Never throws. A descriptor write that succeeded must not be undone by a derived feed failing,
      * which is the same reasoning {@code append} already applies inside itself.
@@ -468,10 +464,6 @@ public final class DescriptorGate {
             if (changeLog != null) {
                 changeLog.append(change);
             }
-            NameIndexService nameIndexService = NAME_INDEX.get();
-            if (nameIndexService != null) {
-                nameIndexService.apply(java.util.List.of(change));
-            }
         } catch (RuntimeException e) {
             logger.warn("could not record the descriptor change for [{}]; the feed will need a rebuild", descriptor.name(), e);
         }
@@ -483,7 +475,7 @@ public final class DescriptorGate {
         AbsentIndexDescriptorSuppliers.registerPager(null);
         AbsentIndexDescriptorSuppliers.registerExpander(null);
         DescriptorPrefetch.register(null);
-        setChangeFeed(null, null);
+        setChangeFeed(null);
         // Reset rather than leave, since the registries are static and a limit set by one test would
         // otherwise decide the behaviour of every suite that ran after it in the same JVM.
         WILDCARD_EXPANSION_LIMIT.set(DEFAULT_WILDCARD_EXPANSION_LIMIT);

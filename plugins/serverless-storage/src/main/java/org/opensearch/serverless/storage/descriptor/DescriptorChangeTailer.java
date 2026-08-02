@@ -10,9 +10,7 @@ package org.opensearch.serverless.storage.descriptor;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.opensearch.serverless.storage.nameindex.NameIndexService;
 
-import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
@@ -53,9 +51,9 @@ import java.util.concurrent.atomic.AtomicReference;
  * <h2>What it is not</h2>
  *
  * Not a durability mechanism and not a source of truth. A change log entry that never lands, or a tailer
- * that never runs, costs freshness: the descriptor cache still expires on its own window and
- * {@code DescriptorEnumerator} can still rebuild the name index from the store. That is what makes it safe
- * for this to be best effort and to swallow its own failures.
+ * that never runs, costs freshness: the descriptor cache still expires on its own window, and D2's sweep
+ * still re-derives which gated indices are gone. That is what makes it safe for this to be best effort
+ * and to swallow its own failures.
  */
 public final class DescriptorChangeTailer {
 
@@ -63,7 +61,6 @@ public final class DescriptorChangeTailer {
 
     private final BlobDescriptorChangeLog changeLog;
     private final DescriptorBackend backend;
-    private final NameIndexService nameIndexService;
 
     /**
      * The bucket to resume from, null until the first pass.
@@ -76,10 +73,9 @@ public final class DescriptorChangeTailer {
     private final AtomicLong appliedCount = new AtomicLong();
     private final AtomicLong passCount = new AtomicLong();
 
-    public DescriptorChangeTailer(BlobDescriptorChangeLog changeLog, DescriptorBackend backend, NameIndexService nameIndexService) {
+    public DescriptorChangeTailer(BlobDescriptorChangeLog changeLog, DescriptorBackend backend) {
         this.changeLog = changeLog;
         this.backend = backend;
-        this.nameIndexService = nameIndexService;
     }
 
     /**
@@ -112,7 +108,7 @@ public final class DescriptorChangeTailer {
             return 0;
         }
 
-        // Invalidate before applying to the name index, and invalidate every name including deletes: a
+        // Invalidate every name including deletes: a
         // cached live descriptor for a name deleted elsewhere is the dangerous direction, because a write
         // routed on it lands against a shard the cluster no longer believes in.
         Set<String> touched = new LinkedHashSet<>();
@@ -142,14 +138,10 @@ public final class DescriptorChangeTailer {
             }
         }
 
-        int applied = 0;
-        if (nameIndexService != null) {
-            try {
-                applied = nameIndexService.apply(new ArrayList<>(changes));
-            } catch (RuntimeException e) {
-                logger.warn("could not apply [{}] descriptor changes to the name index", changes.size(), e);
-            }
-        }
+        // Counted as changes consumed rather than name-index entries written. This used to return what
+        // NameIndexService.apply reported, which meant a tailer that invalidated caches and released
+        // shards correctly still reported zero once the name index was gone.
+        int applied = changes.size();
 
         resumeFrom.set(nextResume);
         appliedCount.addAndGet(applied);

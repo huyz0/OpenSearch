@@ -1350,31 +1350,15 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         Setting.Property.NodeScope
     );
 
-    /** Whether the name index tier runs. Off until it replaces cluster-state resolution rather than duplicating it. */
-    public static final Setting<Boolean> NAME_INDEX_ENABLED_SETTING = Setting.boolSetting(
-        org.opensearch.serverless.storage.nameindex.NameIndexService.ENABLED_SETTING_KEY,
-        false,
-        Setting.Property.NodeScope
-    );
-
-    /**
-     * How often the elected cluster manager parks the name index so a restart does not rebuild it.
-     *
-     * <p>Ten minutes because the cost of being stale is bounded and small: a checkpoint older than the
-     * population only means the rebuild path covers the difference, and {@code DescriptorEnumerator} is that
-     * path. Checkpointing often enough to matter but rarely enough that the fold it triggers is not on any
-     * request's critical path.
-     */
     /**
      * How often a node reads the descriptor change log to learn what other nodes wrote.
      *
-     * <p>This is the staleness bound for cross-node visibility of a gated index, and it replaces relying on
-     * the descriptor cache's freshness window, which bounded nothing about the name index at all.
+     * <p>This is the staleness bound for cross-node visibility of a descriptor write: how long another
+     * node may keep serving a cached descriptor for an index that was changed or deleted elsewhere.
      *
      * <p>Five seconds because the cost of a pass is one listing over recent buckets and the cost of being
-     * late is a wildcard on one node missing an index another node just created. Shorter would spend
-     * requests on an idle cluster; much longer and a create-then-search across two nodes starts to look
-     * broken rather than eventually consistent.
+     * late is a node holding a stale descriptor. Shorter would spend requests on an idle cluster; much
+     * longer and a delete on one node takes visibly long to close the shard on another.
      */
     public static final Setting<TimeValue> DESCRIPTOR_CHANGE_TAIL_INTERVAL_SETTING = Setting.timeSetting(
         "serverless_storage.descriptor.change_tail_interval",
@@ -1383,18 +1367,9 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         Setting.Property.NodeScope
     );
 
-    public static final Setting<TimeValue> NAME_INDEX_CHECKPOINT_INTERVAL_SETTING = Setting.timeSetting(
-        "serverless_storage.name_index.checkpoint_interval",
-        TimeValue.timeValueMinutes(10),
-        TimeValue.timeValueSeconds(1),
-        Setting.Property.NodeScope
-    );
-
     @Override
     public List<Setting<?>> getSettings() {
         return List.of(
-            NAME_INDEX_ENABLED_SETTING,
-            NAME_INDEX_CHECKPOINT_INTERVAL_SETTING,
             DESCRIPTOR_CHANGE_TAIL_INTERVAL_SETTING,
             COMPUTED_PLACEMENT_ENABLED_SETTING,
             SERVERLESS_STORAGE_ENABLED_SETTING,
@@ -1790,47 +1765,6 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         // A store that cannot be resolved is not fatal. DescriptorEnumerator rebuilds the tier from the
         // object store, which is what keeps a checkpoint an optimisation rather than a second source of
         // truth, so failing here costs a slower start and nothing else.
-        org.opensearch.serverless.storage.nameindex.BlobNameIndexCheckpointStore nameIndexCheckpoints = null;
-        if (NAME_INDEX_ENABLED_SETTING.get(environment.settings())) {
-            try {
-                nameIndexCheckpoints = new org.opensearch.serverless.storage.nameindex.BlobNameIndexCheckpointStore(
-                    path -> {
-                        try {
-                            return resolveContainerForDescriptors(path, "no blob store for the name index checkpoint");
-                        } catch (IOException e) {
-                            throw new java.io.UncheckedIOException(e);
-                        }
-                    },
-                    BlobPath.cleanPath().add("descriptors-root")
-                );
-            } catch (Exception e) {
-                logger.warn("no name index checkpoint store; the tier will rebuild on every start", e);
-            }
-        }
-        org.opensearch.serverless.storage.nameindex.NameIndexService nameIndexService =
-            new org.opensearch.serverless.storage.nameindex.NameIndexService(
-                NAME_INDEX_ENABLED_SETTING.get(environment.settings()),
-                nameIndexCheckpoints
-            );
-        if (nameIndexService.isEnabled()) {
-            clusterService.addListener(nameIndexService);
-            // Written from the elected cluster manager only, and that is what makes a plain counter safe.
-            // Each checkpoint is its own object and readers take the highest generation, so two nodes
-            // counting independently could let a higher number carry fewer names. One writer at a time,
-            // resuming from the generation it loaded, stays monotonic across failover as well as restart.
-            if (nameIndexCheckpoints != null && org.opensearch.cluster.node.DiscoveryNode.isClusterManagerNode(environment.settings())) {
-                threadPool.scheduleWithFixedDelay(
-                    () -> {
-                        if (clusterService.state().nodes().isLocalNodeElectedClusterManager()) {
-                            nameIndexService.checkpoint();
-                        }
-                    },
-                    NAME_INDEX_CHECKPOINT_INTERVAL_SETTING.get(environment.settings()),
-                    ThreadPool.Names.GENERIC
-                );
-            }
-        }
-
         // Computed placement. Installing the supplier is the whole of the wiring: a serverless index
         // publishes no routing entry and each node fills the gap locally, so there is nothing to
         // subscribe to and nothing to keep in sync.
@@ -1917,14 +1851,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                             throw new java.io.UncheckedIOException(e);
                         }
                     }, BlobPath.cleanPath().add("descriptors-root"));
-                org.opensearch.serverless.storage.descriptor.DescriptorGate.setChangeFeed(changeLog, nameIndexService);
+                org.opensearch.serverless.storage.descriptor.DescriptorGate.setChangeFeed(changeLog);
 
                 org.opensearch.serverless.storage.descriptor.DescriptorChangeTailer tailer =
-                    new org.opensearch.serverless.storage.descriptor.DescriptorChangeTailer(
-                        changeLog,
-                        descriptorBackend,
-                        nameIndexService
-                    );
+                    new org.opensearch.serverless.storage.descriptor.DescriptorChangeTailer(changeLog, descriptorBackend);
                 // On GENERIC because a pass is object-store I/O. Every node tails, including the cluster
                 // manager: a gated index has no cluster state entry, so there is no node that learns about
                 // one by any other route.
@@ -1940,7 +1870,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             }
         }
 
-        return java.util.List.of(this, nameIndexService, descriptorStore);
+        return java.util.List.of(this, descriptorStore);
     }
 
     /**
@@ -2697,10 +2627,6 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         getActions() {
         return java.util.List.of(
             new ActionHandler<>(
-                org.opensearch.serverless.storage.nameindex.action.ResolveIndexNamesAction.INSTANCE,
-                org.opensearch.serverless.storage.nameindex.action.TransportResolveIndexNamesAction.class
-            ),
-            new ActionHandler<>(
                 org.opensearch.serverless.storage.clone.action.ShardCloneAction.INSTANCE,
                 org.opensearch.serverless.storage.clone.action.TransportShardCloneAction.class
             ),
@@ -2877,7 +2803,6 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         java.util.function.Supplier<org.opensearch.cluster.node.DiscoveryNodes> nodesInCluster
     ) {
         return java.util.List.of(
-            new org.opensearch.serverless.storage.nameindex.action.RestResolveIndexNamesAction(),
             new org.opensearch.serverless.storage.clone.action.RestShardCloneAction(),
             new org.opensearch.serverless.storage.compaction.action.RestCompactionTriggerAction(),
             new org.opensearch.serverless.storage.writerengine.action.RestShardIdleTimeAction(),

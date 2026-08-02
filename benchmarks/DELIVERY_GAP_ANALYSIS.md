@@ -921,3 +921,69 @@ is the one that would still hold against a real object store rather than against
 The populations are thousands, not millions. `-Dtests.descriptor.population` raises them and the assertions
 need no retuning, since they are equalities and zeroes rather than thresholds, but nothing runs at 100M and
 nothing here says the object store behind it would keep up. That is the request-budget question, still open.
+
+---
+
+## 18. S5: the name index is deleted, and the question it created goes with it
+
+The next planned step was to measure the name index's bytes per entry, because A11 claimed 4.2 GiB at 100M
+names (8.4 with the reversed twin for suffix queries) and the largest population any test had ever built was
+ten thousand. That is a ten-thousandfold extrapolation carrying a number that decides whether the design fits
+on a node.
+
+The measurement was never taken, because the prior question had not been asked: does this structure need to
+exist?
+
+### What was found
+
+- `NAME_INDEX_ENABLED_SETTING` defaults to **false**, and its own comment reads *"Off until it replaces
+  cluster-state resolution rather than duplicating it."*
+- Wildcard expansion goes to `prefixBackend.expandPrefix`, which is a **prefix search against the descriptor
+  index**, sorted by name, capped at `limit + 1`, no total hits. Not the name index.
+- The only production reader was `TransportResolveIndexNamesAction`, behind a bespoke `_resolve` endpoint
+  this branch invented.
+
+So it was fully built, checkpointed, change-fed, and read by nothing on any request path. The *correct and
+unreachable* pattern of section 4a, at the largest scale in the codebase.
+
+### Why deleting beats wiring it up
+
+Both options answer wildcards. They differ in where the cost lands.
+
+| | descriptor index (kept) | name index (deleted) |
+|---|---|---|
+| where it lives | one index, sharded | one copy per node |
+| cost at 100M | 20M docs per shard across 5 | 8.4 GiB on every node |
+| scales by | adding shards | nothing; every node pays the whole population |
+
+For a design whose premise is that per-index cost goes to zero, a per-node structure proportional to the
+total population is the opposite shape. The descriptor index is a sharded, horizontally scalable structure
+that Lucene is good at; the name index was an in-memory second copy of it.
+
+It is also the entire reason anyone would ask whether 100M metadata fits in a node. Without it, what a node
+holds is a bounded descriptor cache with a byte budget and real eviction, the membership epoch that computes
+placement, and the shards it currently hosts. Nothing proportional to the population.
+
+### The reasoning error, preserved and then removed
+
+`benchmarks/.../NameIndexSpike.java` stated the premise that produced this, and stated it as a dichotomy:
+
+> Answering `logs-*` requires knowing every index name, which is global by construction, so either one tier
+> holds all 100M names or every wildcard scatters to every partition.
+
+Neither branch is what happens. The names live in a sharded index, one wildcard is one search against it,
+and no node holds the population. The spike measured which of two options was affordable without checking
+whether a third already existed in the same codebase. Deleted with the thing it justified.
+
+### What went
+
+4,656 lines of production and test code, the `_resolve` endpoint and its action, the checkpoint store, two
+settings, the change-tailer and gate coupling, and the spike. `DescriptorChangeTailer` keeps its real job:
+invalidating caches and releasing shards of a deleted gated index on nodes that were not party to the write.
+
+### What this does not settle
+
+Wildcards now always reach the descriptor index, so it is on the critical path for every pattern query. That
+makes the request-budget question sharper rather than softer. If measurement later shows wildcards are a
+bottleneck, the answer is a bounded cache of hot prefixes, which is a much smaller thing than a resident copy
+of every name, and it would be built against evidence rather than ahead of it.
