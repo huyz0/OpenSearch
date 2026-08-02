@@ -391,3 +391,48 @@ contaminating its own baseline. Both pass in isolation, in 2m55s.
 baseline arm was run. The disjointness answers the attribution question without one; it does not tell anyone
 how many of these suites are chronically flaky on this hardware, which is a separate and useful thing to
 know.
+
+---
+
+## 10. H1: the uniqueness primitive, checked against an independent implementation
+
+Section 4c said no number here had an object store behind it. G6 answered the latency half by simulation.
+This answers the half simulation cannot reach: whether a real store enforces the preconditions the design's
+uniqueness depends on.
+
+### Why the existing coverage was not enough
+
+`S3BlobStoreRepositoryTests.testCreateRegisterIfAbsentIsEnforcedServerSide` already proves server-side
+enforcement, and its javadoc is right about why that matters: a unit test asserting `ifNoneMatch` is set
+"proves the request-construction code is right and nothing else... if the header were ignored, every
+concurrent creator would win and the unit test would still pass".
+
+But it proves it against `fixture.s3.S3HttpHandler`, which this project extended to enforce those headers. A
+fixture enforces what its author believed the semantics to be, so passing against it shows the code agrees
+with our reading of S3, not with S3. A wrong reading makes both sides wrong together and every test green.
+
+### What was run
+
+MinIO in Docker, an independent implementation of the same API, exercised through the AWS SDK on the two
+behaviours `createRegisterIfAbsent` and `compareAndSwapRegister` are built on.
+
+| | result |
+|---|---|
+| `If-None-Match: *` against an existing key | refused, **412**, first writer's value survives |
+| `If-Match: <stale etag>` | refused, **412**, winner's value survives |
+| eight concurrent creators of one name | **exactly one winner, seven 412s** |
+
+412 specifically matters: that status is what the register code translates into a lost race rather than an
+error, so a store answering 409 or 200 would break the design quietly.
+
+The concurrent case is the one the design actually cares about, since a hundred million tenants provisioning
+at once is the workload and there is no lock anywhere in the path.
+
+### Limits, stated
+
+MinIO is closer to S3 than a fixture and is not S3. It runs on localhost, so this says nothing about
+round-trip cost and does not supersede G6's simulated latency. It covers the register preconditions only,
+not the rest of the descriptor path.
+
+The test skips unless `-Dtests.s3.endpoint` is set, so an ordinary build is untouched, and it runs against
+any S3-compatible endpoint including real S3 when someone has credentials.
