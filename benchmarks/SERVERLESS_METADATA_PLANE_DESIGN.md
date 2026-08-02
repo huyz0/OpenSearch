@@ -1511,3 +1511,50 @@ unrelated to any of this.
 throughput against ordinary creation, sustained creation profile, batching headroom -- was taken with a
 blocking get per index on the request path. Those numbers were measuring the prefetcher, not the design.
 They should be re-run before any of them is cited again.
+
+### The gated creation benchmarks, re-run
+
+The four creation benchmarks all failed until the prefetch fix, so every figure this branch has quoted for
+them predates the prefetcher entirely. These are the first valid numbers since.
+
+**T32, cluster state cost per creation.** The design's central claim, and the one result here that is a
+count rather than a rate, so it does not depend on the machine:
+
+| | versions advanced | per index |
+|---|---|---|
+| ordinary | 54 | 2.16 |
+| gated | **0** | **0.00** |
+
+Twenty-five gated creations advance the cluster state version zero times. That is what the whole design is
+for and it holds.
+
+**Throughput, five runs with the dual write on and four without**, peak across the concurrency ladder and
+the sustained 3,000-index run:
+
+| | peak/sec | sustained/sec |
+|---|---|---|
+| dual write on | 370 median (285-412) | 345 median (226-397) |
+| dual write off | 408 median (396-458) | 376 median (257-417) |
+
+**The first reading of this was wrong and the error is the point.** One run of each arm gave 285 against 418
+peak and 237 against 397 sustained, which is a 32 to 40 percent cost, and it would have gone into this
+document as the price of making wildcards work. Repeating the *same* configuration gave 397 and 345 -- most
+of the apparent gap was run-to-run variance in a single sample. With repeats the difference is around ten
+percent at the peak, in the expected direction, with overlapping ranges: real enough to believe in the sign,
+not resolvable to a number at this noise level. A single-run A/B on this harness cannot measure a ten
+percent effect, and treating one as if it could is how a number becomes a fact.
+
+**Concurrency still scales.** Throughput rises from about 90-130 per second at one in flight to 370-460
+around fifty to two hundred, roughly 3 to 4.4x, then flattens. That is the shape S34 found and the reason
+S31's "235 per second" was a property of five-in-flight rather than a ceiling.
+
+**What cannot be concluded.** These ran on a different machine from the spike results, under assertions,
+with computed placement and on-demand shard opening both on -- none of which was true for S35's ~850 per
+second. Today's 350-450 is not evidence of a regression against that figure, because the two are not
+comparable. Re-running the spike harness on this machine is the only way to make that comparison, and until
+someone does, ~850 per second and the 1.35 days it implies for a hundred million indices should not be
+quoted as this branch's number.
+
+**Gated against ordinary, same machine and same run**, which is the comparison that is valid: 2.7x to 10.6x,
+varying widely because the arm is only twenty indices. The direction is consistent across every run; the
+multiple is not a measurement worth quoting.
