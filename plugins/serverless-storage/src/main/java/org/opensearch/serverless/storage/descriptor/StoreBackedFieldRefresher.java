@@ -33,11 +33,28 @@ import java.util.Map;
  * <p><b>The cost this must not have.</b> H6c's claim was that pulling beats broadcasting, and a refresher
  * that read the store on every unknown field would refute it: a document with ten new fields would cost ten
  * reads, and a shard behind on a field it will never see would still pay. So a read is skipped when the
- * mapping this shard already holds is at or ahead of the store's generation, which is the same comparison
- * {@code MappingRefreshOnDemand} makes and the reason it counts fetches rather than trusting itself.
+ * mapping this shard already holds is at or ahead of the store's generation, and the tests count fetches
+ * rather than trusting that comparison.
  *
  * <p>Returning false is a complete answer, not a failure: it means the field is genuinely new, and the
  * caller then rejects or dynamically infers it exactly as it would have without any of this.
+ *
+ * <h2>The other half of this idea, and why its cache would not be shaped like this one's</h2>
+ *
+ * H6c's original design had a coordinator stamp each request with the generation it planned against, and a
+ * core class, {@code MappingRefreshOnDemand}, implemented it. W14 chose this trigger instead: a shard
+ * refreshes when it meets a field its mapping does not have. That other half was complete, tested, and
+ * called by nothing, so it was removed from core rather than left as one more mechanism a reader has to
+ * discover by search does not run.
+ *
+ * <p>One conclusion from it is worth keeping, because it applies to anyone changing the cache below. T9
+ * replaced an access-ordered {@code synchronizedMap} here with recency stamped on write, after P1 measured
+ * that structure going from 57.4M reads per second on one thread to 9.1M on sixteen. That suits this class,
+ * whose hot entries are written often. It would be the wrong move for a generation-stamped cache, where
+ * entries are read often and written only when a mapping generation advances: stamping on write lets a
+ * sweep over cold indices take the freshest stamps and evict the working set, which is precisely what
+ * access ordering was there to prevent. A read-cheap structure that still keeps recency, such as the SIEVE
+ * algorithm TiDB uses for the same read-hot write-rare shape, is the answer if that path is built again.
  */
 public final class StoreBackedFieldRefresher implements UnknownFieldRefresh.Refresher {
 

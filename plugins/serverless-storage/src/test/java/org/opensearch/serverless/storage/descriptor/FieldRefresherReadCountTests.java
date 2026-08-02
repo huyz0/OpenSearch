@@ -26,8 +26,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * the cache guard, so every unknown field went to the store even when this shard was already current. A
  * document with ten new fields cost ten reads, which is exactly the cost H6c argued that pulling avoids.
  *
- * <p>Counting is the only way to tell "did not need to read" from "read and got the same answer", which is
- * the same reason {@code MappingRefreshOnDemand} exposes a fetch count. These tests count.
+ * <p>Counting is the only way to tell "did not need to read" from "read and got the same answer". These
+ * tests count.
  */
 public class FieldRefresherReadCountTests extends OpenSearchTestCase {
 
