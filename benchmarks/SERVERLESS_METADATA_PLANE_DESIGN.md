@@ -1558,3 +1558,41 @@ quoted as this branch's number.
 **Gated against ordinary, same machine and same run**, which is the comparison that is valid: 2.7x to 10.6x,
 varying widely because the arm is only twenty indices. The direction is consistent across every run; the
 multiple is not a measurement worth quoting.
+
+### The spike harness, re-run here, and what it licenses saying
+
+`GatedCreationThroughputIT` and `GatedCreationProfileIT` *are* the S31/S34/S35 harness -- their output
+cites P9 and T14 directly. So the previous section had already re-run the spike; what differed was the JVM,
+and that turned out to be the whole of the discrepancy I was worried about.
+
+**The earlier comparison was against the wrong row.** Checking the forked JVM's arguments rather than
+assuming: those runs carried the jacoco agent and `-Dtests.security.manager=true`. That is exactly the
+configuration S35 labels "what S26, S31 and S34 were all measured under" and measured at 536 per second. So
+350-450 should have been read against **536**, not against 859.
+
+Three arms, three runs each, peak across the concurrency ladder:
+
+| configuration | this machine | ratio | S35 | S35 ratio |
+|---|---|---|---|---|
+| jacoco + security manager | 339, 400, 410 -> **400** | 1.00x | 536 | 1.00x |
+| security manager off | 426, 503, 482 -> **482** | **1.21x** | 690 | 1.29x |
+| both off | 525, 623, 851 -> **623** | **1.56x** | 859 | 1.60x |
+
+**S35's finding reproduces, and the ratio is the part that travels.** The agents cost 1.56x here against
+1.60x there. Two machines, two people, the same correction: the instrumentation penalty is a property of
+the measurement rather than of either host, which is what makes S35 worth having believed.
+
+**This machine's number, measured the way production would run:** about **620 per second at the peak of the
+concurrency ladder**, which is roughly **1.9 days** for a hundred million indices. The sustained
+three-thousand-index run gives 479 per second and **2.4 days**, and for a bulk migration that is the more
+honest of the two, since it is the rate actually held rather than the best rung on a ladder.
+
+**No regression is demonstrated against S35's 859**, and none is ruled out either. This host reaches 0.73x
+of that machine with the agents off, and nothing here separates "slower hardware" from "the branch got
+slower since the spike" -- WSL2, a different CPU, and everything T36 through D2 added all sit inside that
+gap. Answering it needs the spike commit run on this machine, which is a different exercise from this one.
+
+**The sustained arm is too noisy to compare across configurations.** Three runs with both agents off gave
+479, 621 and 274 per second. The peak arm is stable to about 10 percent and the sustained arm is not, so
+only the peak column above supports the ratios. Quoting a sustained figure from one run, which is what
+produced the dual-write error in the previous section, would have been the same mistake twice.
