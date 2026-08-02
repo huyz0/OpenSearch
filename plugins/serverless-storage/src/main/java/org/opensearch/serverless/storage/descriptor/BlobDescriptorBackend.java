@@ -87,6 +87,21 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
     private final Executor executor;
 
     /**
+     * The same read path {@code DescriptorStore} uses, which is the reuse T7 extracted it for.
+     *
+     * <p>T7 moved the freshness window, eviction and in-flight collapsing out of the store so "the blob
+     * backend reuses it rather than growing a second copy", and then the blob backend never took it. Every
+     * point read went to the object store, so switching the backend, which is the whole point of the design,
+     * turned each of the eleven synchronous resolution sites into a network round trip. On a filesystem that
+     * is invisible. At the 20 to 40 ms a real GET costs it is the difference between the design working and
+     * not, and a miss costs two round trips because absence is confirmed against the tombstone prefix.
+     *
+     * <p>Nothing about the cache is blob-specific, which is why it needed no changes: it caches hits, never
+     * misses, and bounds itself by bytes rather than entries.
+     */
+    private final DescriptorCache descriptorCache = new DescriptorCache();
+
+    /**
      * Same-thread form, for a caller that is already somewhere blocking is allowed.
      *
      * <p>Named for what it does rather than offered as a default, because the whole point of the other
@@ -124,6 +139,11 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
      */
     @Override
     public IndexDescriptor get(String name) {
+        return descriptorCache.get(name, this::readFromStore);
+    }
+
+    /** One read of one descriptor from the object store, with no caching of its own. */
+    private IndexDescriptor readFromStore(String name) {
         try {
             Optional<BlobRegister> live = blobContainer.readRegister(keyFor(name));
             if (live.isPresent()) {
@@ -201,6 +221,9 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
                     );
                 }
             }
+            // Invalidated after the write, never before. Dropping the entry first would leave a window
+            // where a concurrent read repopulates the cache from the old value and then outlives the write.
+            descriptorCache.invalidate(descriptor.name());
         } catch (IOException e) {
             throw new DescriptorUnavailableException(descriptor.name(), e);
         }
@@ -288,6 +311,10 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
             // Only now does the name stop being listed. Deleting a blob that is not there is not an error,
             // so repeating a partially-applied delete converges.
             blobContainer.deleteBlobsIgnoringIfNotExists(List.of(keyFor(name)));
+            // A cached live descriptor would otherwise outlive the delete for a whole freshness window, and
+            // a deleted index that still resolves is worse than a slow one: a write routed to it would be
+            // accepted against a shard the cluster no longer believes in.
+            descriptorCache.invalidate(name);
         } catch (IOException e) {
             throw new DescriptorUnavailableException(name, e);
         }

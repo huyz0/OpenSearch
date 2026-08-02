@@ -258,3 +258,54 @@ carry a behaviour change, and none has been walked through.
 
 The honest summary is that this pass proves R2 is violated without establishing how far. Closing it needs
 the file-by-file read, which is a larger exercise than the rest of this list combined.
+
+---
+
+## 8. G6: what a descriptor read costs when the store behaves like a store
+
+Section 4c said no number on this branch had an object store behind it, and that the design rests on a cache
+hiding latency whose size had never been measured. Measuring it found the cache was not there.
+
+### The finding
+
+`BlobDescriptorBackend` had no cache. T7 extracted `DescriptorCache` from the system-index store so "the
+blob backend reuses it rather than growing a second copy", and the blob backend never took it. So switching
+`descriptor_backend` to the object store, which is the entire point of the design, sent every point read to
+the store. Each of the eleven synchronous resolution sites became a network round trip.
+
+Invisible against `FsBlobContainer`, where a read is microseconds. That is why every earlier measurement
+missed it, and it is the same shape as the rest of this branch's defects: correct component, never
+integrated, and the gap only visible under a condition nothing reproduced.
+
+### Measured, `LatencyProfile.TYPICAL` (GET 20-40 ms, PUT 40-80, LIST 50-100)
+
+| | uncached, as it was | with the cache wired |
+|---|---|---|
+| one cold read | 31 ms | 39 ms |
+| twelve reads of one hot tenant | **362 ms** | **0 ms** |
+| four distinct tenants, second pass | 138 ms | 0 ms |
+| one miss | 63 ms | 48 ms |
+
+Twelve resolutions of a single hot tenant cost 362 ms uncached and nothing cached. A bulk request touching
+one tenant resolves that tenant at several of the eleven sites, so this is a per-request cost rather than a
+per-tenant one.
+
+The latency is simulated, and that is the honest limit: `LatencyProfile` is this branch's own approximation
+of S3, not S3. It gets the order of magnitude right, which is what the design question needed, and it needs
+no credentials. A run against a real bucket is still worth doing and is still not done.
+
+### Two costs that are correct and now have numbers
+
+**A miss costs two round trips**, about 48-63 ms, because absence is only absence once the tombstone prefix
+agrees. That is the right behaviour: "deleted" and "never existed" have opposite safe responses. It is the
+most expensive descriptor operation and nothing had costed it.
+
+**A miss is never cached**, so an index created moments after a failed lookup resolves immediately. Caching
+absence would make a just-created index unresolvable for a freshness window, which H18 refused.
+
+### What the cache needed to be safe here
+
+Writes invalidate. `put` invalidates after the write rather than before, since dropping the entry first
+leaves a window where a concurrent read repopulates from the old value and outlives the write. Deletion
+invalidates once the tombstone lands, because a deleted index that still resolves would accept a write
+against a shard the cluster no longer believes in.
