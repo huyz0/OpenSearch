@@ -436,3 +436,59 @@ not the rest of the descriptor path.
 
 The test skips unless `-Dtests.s3.endpoint` is set, so an ordinary build is untouched, and it runs against
 any S3-compatible endpoint including real S3 when someone has credentials.
+
+---
+
+## 11. H2: finishing the core audit, and a correction to section 3
+
+Section 3 said 198 modified core files "belong to the pluggable engine work". That was an assumption stated
+as fact. Measuring it changes the shape of the problem.
+
+### The actual composition
+
+Of 196 non-seam modified core files:
+
+| | count | +/- lines |
+|---|---|---|
+| mention engine, tiering, resharding or ingest concepts | **73** | the pluggable-engine work, as assumed |
+| touch metadata-plane primitives (register, descriptor) | **11** | this design's own footprint, missed by the seam grep |
+| remote cluster state / remote store | 2 | |
+| **none of the above** | **110** | +1,986 / -484, and never characterised by anyone |
+
+So "the 198 are engine work" was wrong twice over. Only 73 are. Eleven are the metadata plane's own, which
+the seam-name grep undercounted because `FsBlobContainer` and `BlobContainer` carry the register primitive
+without naming a seam class. And 110 files, about two thousand added lines, belong to neither and had never
+been looked at.
+
+Of those 110, 48 are trivial (ten or fewer added lines, three or fewer removed). The remaining 62 are where
+an unexamined behaviour change would live.
+
+### What reading the largest of them found
+
+**`RestController` carries a serverless mode in core.** It gains
+`rest.serverless_mode.enabled`, a `serverlessModeEnabled` field, a `ServerlessScope` on `RestHandler`, and
+a check that 410s any handler not marked `AVAILABLE` when the setting is on. That is core holding a
+serverless-specific policy decision directly rather than consulting a seam a plugin fills. It defaults off,
+so R1 holds; R2 does not, and this is the clearest instance found so far because the concept is named in
+core rather than injected into it.
+
+**`IndexingMemoryController`** adds a node setting for native off-heap indexing buffers. Additive, and
+engine work by nature even though it names no engine class, so the 73 undercounts.
+
+**`BalancedShardsAllocator`** and **`Security`** look like refactors: extracted validators, and threading
+`Settings` through policy reading. Neither is obviously behaviour-changing, and neither was written as a
+seam.
+
+### The honest state of R2 after this
+
+Three distinct kinds of core change now have names, which is what H3 needs:
+
+1. **Seam-shaped and inert by default.** The 54 plus the 11 register files. Defensible as-is.
+2. **Serverless policy named directly in core.** `RestController`, `Plugin.nodeStats()`s removal,
+   `PluginNodeStats`'s deletion. These contradict R2 and are individually small.
+3. **Engine work, unaudited.** 73 files, plus some of the 110. Large, and not this design's to justify.
+
+### Still not established
+
+The 62 non-trivial files in the "neither" bucket were not read individually. The four largest were, and one
+of the four was an R2 violation, which is not a reassuring hit rate for the other 58.
