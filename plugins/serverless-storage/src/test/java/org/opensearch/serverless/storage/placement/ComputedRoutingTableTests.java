@@ -261,6 +261,112 @@ public class ComputedRoutingTableTests extends OpenSearchTestCase {
             .build();
     }
 
+    // ---------------------------------------------------------------- warmth
+
+    /**
+     * Search replicas prefer a node that held the shard last epoch, so a read does not pay a cold fetch.
+     *
+     * <p>{@code WarmCandidates} computed this and nothing consulted it, so every placement decision was made
+     * as if the cluster had no history.
+     */
+    public void testSearchReplicasPreferNodesThatHeldTheShardLastEpoch() {
+        IndexMetadata metadata = index("idx", 24, 1);
+        List<String> before = nodes(4);
+        List<String> after = new ArrayList<>(before);
+        after.add("node-4");
+        after.add("node-5");
+
+        IndexRoutingTable warm = ComputedRoutingTable.build(metadata, after, ComputedPlacementMembership.of(after, before, 2L), 3);
+        IndexRoutingTable cold = ComputedRoutingTable.build(metadata, after, ComputedPlacementMembership.of(after, 2L), 3);
+
+        assertTrue(
+            "warmth must put more search replicas on nodes that already hold the data than ignoring history "
+                + "does, but placed " + searchReplicasOn(warm, metadata, before) + " against " + searchReplicasOn(cold, metadata, before),
+            searchReplicasOn(warm, metadata, before) > searchReplicasOn(cold, metadata, before)
+        );
+    }
+
+    /**
+     * The primary stays exactly where rendezvous put it, and this is the assertion that matters most.
+     *
+     * <p>The first version of this ordered every candidate by warmth and let the primary fall out of it.
+     * With three candidates drawn from a membership that mostly overlaps the previous one, nearly every
+     * shard had a warm candidate, so all 24 primaries stayed on the four old nodes and none moved to the two
+     * just added. Warmth had quietly become an anti-scaling rule: new capacity would take no primaries until
+     * enough epochs rolled to age the old membership out.
+     */
+    public void testWarmthNeverMovesAPrimary() {
+        IndexMetadata metadata = index("idx", 24, 1);
+        List<String> before = nodes(4);
+        List<String> after = new ArrayList<>(before);
+        after.add("node-4");
+        after.add("node-5");
+
+        IndexRoutingTable warm = ComputedRoutingTable.build(metadata, after, ComputedPlacementMembership.of(after, before, 2L), 3);
+        IndexRoutingTable plain = ComputedRoutingTable.build(metadata, after, 3);
+
+        int onANewNode = 0;
+        for (int shardId = 0; shardId < metadata.getNumberOfShards(); shardId++) {
+            String withWarmth = warm.shard(shardId).primaryShard().currentNodeId();
+            assertEquals(
+                "warmth must not change where a primary goes, only which replicas follow it",
+                plain.shard(shardId).primaryShard().currentNodeId(),
+                withWarmth
+            );
+            if (before.contains(withWarmth) == false) {
+                onANewNode++;
+            }
+        }
+        assertTrue("and the added nodes must actually receive primaries", onANewNode > 0);
+    }
+
+    /**
+     * Warmth reorders and never narrows, so a node the membership no longer contains cannot be chosen.
+     * Offering a departed node would send traffic somewhere that cannot answer, which is the failure a stale
+     * stored affinity record produces.
+     */
+    public void testAPrimaryIsNeverPlacedOnADepartedNode() {
+        IndexMetadata metadata = index("idx", 16, 0);
+        List<String> before = nodes(6);
+        List<String> after = List.of("node-0", "node-1", "node-2");
+
+        IndexRoutingTable table = ComputedRoutingTable.build(metadata, after, ComputedPlacementMembership.of(after, before, 3L), 3);
+
+        for (int shardId = 0; shardId < metadata.getNumberOfShards(); shardId++) {
+            assertTrue(
+                "a shard may only be placed on a current member",
+                after.contains(table.shard(shardId).primaryShard().currentNodeId())
+            );
+        }
+    }
+
+    /** Every coordinator must reach the same answer, or two nodes disagree about who owns a shard. */
+    public void testWarmthIsDeterministic() {
+        IndexMetadata metadata = index("idx", 20, 1);
+        List<String> after = nodes(5);
+        ComputedPlacementMembership membership = ComputedPlacementMembership.of(after, nodes(3), 4L);
+
+        IndexRoutingTable first = ComputedRoutingTable.build(metadata, after, membership, 3);
+        IndexRoutingTable second = ComputedRoutingTable.build(metadata, after, membership, 3);
+
+        for (int shardId = 0; shardId < metadata.getNumberOfShards(); shardId++) {
+            assertEquals(first.shard(shardId).primaryShard().currentNodeId(), second.shard(shardId).primaryShard().currentNodeId());
+        }
+    }
+
+    /** How many search replicas landed on a node from the given set. */
+    private static int searchReplicasOn(IndexRoutingTable table, IndexMetadata metadata, List<String> nodeIds) {
+        int count = 0;
+        for (int shardId = 0; shardId < metadata.getNumberOfShards(); shardId++) {
+            for (ShardRouting routing : table.shard(shardId)) {
+                if (routing.primary() == false && nodeIds.contains(routing.currentNodeId())) {
+                    count++;
+                }
+            }
+        }
+        return count;
+    }
+
     // ---------------------------------------------------------------- helpers
 
     private static IndexMetadata index(String name, int shards, int searchReplicas) {

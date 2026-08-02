@@ -106,13 +106,51 @@ public final class ComputedRoutingTable {
      * into a broken one.
      */
     public static IndexRoutingTable build(IndexMetadata indexMetadata, List<String> eligibleNodeIds, int candidateCount) {
+        return build(indexMetadata, eligibleNodeIds, null, candidateCount);
+    }
+
+    /**
+     * The same table, with search replicas placed on nodes likely to still hold the shard's blocks.
+     *
+     * <p>{@link WarmCandidates} computed that from the previous membership epoch and nothing consulted it,
+     * so every placement decision was made as if the cluster had no history.
+     *
+     * <p><b>The primary is deliberately not chosen this way, and a test is the reason.</b> The first version
+     * ordered all candidates by warmth and let the primary fall out of that. With three candidates drawn
+     * from a membership that mostly overlaps the previous one, at least one candidate is nearly always warm,
+     * so every primary stayed on an old node and none moved to the nodes just added. That is not stickiness,
+     * it is a cluster that cannot scale out: new capacity would take no primaries until enough epochs had
+     * rolled to age the old membership away.
+     *
+     * <p>So the primary keeps plain rendezvous placement, which is what balances it, and warmth decides only
+     * among the remaining candidates. That matches what {@code WarmCandidates} says it is for: "a hint for
+     * choosing among replicas and for deciding what to pre-warm. Never an authority."
+     *
+     * <p>Search replicas are where this pays. They serve reads, they recover from object storage rather than
+     * from a peer, and a read served by a node that already holds the blocks costs no cold fetch.
+     *
+     * <p>Falls back to plain placement when there is no membership or no previous epoch, which is a fresh
+     * cluster with nothing to be warm from.
+     */
+    public static IndexRoutingTable build(
+        IndexMetadata indexMetadata,
+        List<String> eligibleNodeIds,
+        ComputedPlacementMembership membership,
+        int candidateCount
+    ) {
         IndexRoutingTable.Builder builder = IndexRoutingTable.builder(indexMetadata.getIndex());
         String indexUuid = indexMetadata.getIndexUUID();
 
         for (int shardId = 0; shardId < indexMetadata.getNumberOfShards(); shardId++) {
             ShardId shard = new ShardId(indexMetadata.getIndex(), shardId);
             IndexShardRoutingTable.Builder shardBuilder = new IndexShardRoutingTable.Builder(shard);
-            List<String> candidates = RendezvousShardPlacement.candidates(eligibleNodeIds, indexUuid, shardId, candidateCount);
+            List<String> candidates = warmthOrderedAfterThePrimary(
+                RendezvousShardPlacement.candidates(eligibleNodeIds, indexUuid, shardId, candidateCount),
+                membership,
+                indexUuid,
+                shardId,
+                candidateCount
+            );
 
             shardBuilder.addShard(primary(shard, candidates.isEmpty() ? null : candidates.get(0)));
 
@@ -129,8 +167,52 @@ public final class ComputedRoutingTable {
         return builder.build();
     }
 
+    /**
+     * The placement candidates with the primary left exactly where rendezvous put it, and everything after
+     * it ordered so warm nodes come first.
+     *
+     * <p>Keeping element zero fixed is the whole point: that is the primary, and reordering it costs
+     * balance. The tail is search replicas, where a warm node saves a cold read and where nothing depends
+     * on the choice.
+     */
+    private static List<String> warmthOrderedAfterThePrimary(
+        List<String> placement,
+        ComputedPlacementMembership membership,
+        String indexUuid,
+        int shardId,
+        int candidateCount
+    ) {
+        if (membership == null || membership.isEmpty() || placement.size() <= 2) {
+            return placement;
+        }
+        List<String> warm = WarmCandidates.forShard(membership, indexUuid, shardId, candidateCount);
+        if (warm.isEmpty()) {
+            return placement;
+        }
+        List<String> ordered = new ArrayList<>(placement.size());
+        ordered.add(placement.get(0));
+        for (String nodeId : warm) {
+            // Only nodes rendezvous already chose, and never the primary again: this reorders the tail
+            // rather than changing who is eligible.
+            if (ordered.contains(nodeId) == false && placement.contains(nodeId)) {
+                ordered.add(nodeId);
+            }
+        }
+        for (String nodeId : placement) {
+            if (ordered.contains(nodeId) == false) {
+                ordered.add(nodeId);
+            }
+        }
+        return ordered;
+    }
+
     public static IndexRoutingTable build(IndexMetadata indexMetadata, ClusterState state) {
-        return build(indexMetadata, eligibleNodes(state), RendezvousShardPlacement.DEFAULT_CANDIDATE_COUNT);
+        return build(
+            indexMetadata,
+            eligibleNodes(state),
+            ComputedPlacementMembershipService.get(state),
+            RendezvousShardPlacement.DEFAULT_CANDIDATE_COUNT
+        );
     }
 
     /**
