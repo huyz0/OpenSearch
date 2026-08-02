@@ -1360,6 +1360,28 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      * late is a node holding a stale descriptor. Shorter would spend requests on an idle cluster; much
      * longer and a delete on one node takes visibly long to close the shard on another.
      */
+    /**
+     * How long a node may serve a cached descriptor before re-reading it from the object store.
+     *
+     * <p>This is the object-store request floor. A node serving T active tenants issues T reads per window
+     * whatever the request rate above it, so a one second window means T reads per second per node forever.
+     * The cache's own default was one second, chosen when descriptors lived in a local index where a read
+     * cost microseconds; against a 20 to 40 ms GET it is wrong by two orders of magnitude, which
+     * {@code DescriptorCache}'s javadoc says outright.
+     *
+     * <p>A minute is safe because this is not what makes a change visible. A descriptor written on another
+     * node is invalidated here by the change log tailer within
+     * {@link #DESCRIPTOR_CHANGE_TAIL_INTERVAL_SETTING}, so this window only bounds how long a <em>lost</em>
+     * change log entry can go unnoticed. Shortening it buys nothing that the tailer does not already
+     * provide, and costs a read per tenant per window.
+     */
+    public static final Setting<TimeValue> DESCRIPTOR_CACHE_FRESHNESS_SETTING = Setting.timeSetting(
+        "serverless_storage.descriptor.cache_freshness",
+        TimeValue.timeValueSeconds(60),
+        TimeValue.timeValueMillis(100),
+        Setting.Property.NodeScope
+    );
+
     public static final Setting<TimeValue> DESCRIPTOR_CHANGE_TAIL_INTERVAL_SETTING = Setting.timeSetting(
         "serverless_storage.descriptor.change_tail_interval",
         TimeValue.timeValueSeconds(5),
@@ -1371,6 +1393,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     public List<Setting<?>> getSettings() {
         return List.of(
             DESCRIPTOR_CHANGE_TAIL_INTERVAL_SETTING,
+            DESCRIPTOR_CACHE_FRESHNESS_SETTING,
             COMPUTED_PLACEMENT_ENABLED_SETTING,
             SERVERLESS_STORAGE_ENABLED_SETTING,
             SERVERLESS_STORAGE_BASE_PATH_SETTING,
@@ -1812,7 +1835,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                         // GENERIC, because the descriptor hooks are registered on the cluster state thread
                         // and must not do I/O there. Which pool is the caller's decision precisely because
                         // getting it wrong hangs a node rather than slowing one down.
-                        threadPool.executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC)
+                        threadPool.executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC),
+                        DESCRIPTOR_CACHE_FRESHNESS_SETTING.get(environment.settings()).nanos()
                     ),
                     descriptorStore
                 );

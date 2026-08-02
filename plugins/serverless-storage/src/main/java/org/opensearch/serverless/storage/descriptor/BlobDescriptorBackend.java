@@ -98,8 +98,19 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
      *
      * <p>Nothing about the cache is blob-specific, which is why it needed no changes: it caches hits, never
      * misses, and bounds itself by bytes rather than entries.
+     *
+     * <p><b>The window is the cost lever, and it was left at the local-index default.</b>
+     * {@link DescriptorCache}'s own javadoc says a one second window is "right for a local index, wrong by
+     * two orders of magnitude for an object store", and made the window a constructor parameter for that
+     * reason. This class then called the no-argument constructor and took the one second anyway, so a node
+     * serving T active tenants re-read all T of them every second whatever the request rate above it.
+     *
+     * <p>What makes a long window safe is that freshness does not depend on it. A descriptor changed on
+     * another node is invalidated here by {@code DescriptorChangeTailer} within its poll interval, so the
+     * window is a backstop for a change log entry that was lost, not the mechanism by which deletes become
+     * visible. A minute bounds that backstop while cutting steady-state reads by sixty.
      */
-    private final DescriptorCache descriptorCache = new DescriptorCache();
+    private final DescriptorCache descriptorCache;
 
     /**
      * Same-thread form, for a caller that is already somewhere blocking is allowed.
@@ -110,6 +121,16 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
     public BlobDescriptorBackend(BlobContainer blobContainer) {
         this(blobContainer, Runnable::run);
     }
+
+    /**
+     * The default freshness window, a minute rather than the cache's own one second.
+     *
+     * <p>One second was chosen against a sub-millisecond local read. Against a 20 to 40 ms GET it means a
+     * node re-reads every active tenant once a second forever, which is a floor on request rate that no
+     * amount of caching above it can lower. Sixty seconds cuts that by sixty and remains a backstop rather
+     * than the freshness mechanism, which is the change log tailer.
+     */
+    public static final long DEFAULT_CACHE_TTL_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(60);
 
     /**
      * The form with somewhere to run, which the {@code *Async} methods below actually need.
@@ -126,8 +147,20 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
      * slowing one down.
      */
     public BlobDescriptorBackend(BlobContainer blobContainer, Executor executor) {
+        this(blobContainer, executor, DEFAULT_CACHE_TTL_NANOS);
+    }
+
+    /** The form that names its own freshness window, which the plugin uses to make it a setting. */
+    public BlobDescriptorBackend(BlobContainer blobContainer, Executor executor, long cacheTtlNanos) {
         this.blobContainer = blobContainer;
         this.executor = executor;
+        this.descriptorCache = new DescriptorCache(
+            System::nanoTime,
+            cacheTtlNanos,
+            DescriptorCache.DEFAULT_COLLAPSE_WAIT_MILLIS,
+            DescriptorCache.DEFAULT_CAPACITY,
+            DescriptorCache.DEFAULT_BYTES
+        );
     }
 
     /**

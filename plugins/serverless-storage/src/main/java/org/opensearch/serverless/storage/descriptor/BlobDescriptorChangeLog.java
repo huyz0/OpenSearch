@@ -150,7 +150,35 @@ public final class BlobDescriptorChangeLog {
      * entry as meaningful is relying on something this cannot provide.
      */
     public List<DescriptorChange> since(String fromBucket) {
-        List<DescriptorChange> changes = new ArrayList<>();
+        List<LoggedChange> entries = entriesSince(fromBucket, java.util.Set.of());
+        List<DescriptorChange> changes = new ArrayList<>(entries.size());
+        for (LoggedChange entry : entries) {
+            changes.add(entry.change());
+        }
+        return changes;
+    }
+
+    /**
+     * One entry as it sits in the log, so a reader can remember what it has already consumed.
+     *
+     * <p>The key is needed because entry names are random. A reader resuming inside a bucket cannot say
+     * "everything after key K" the way it could with an ordered name, so it has to name the individual
+     * entries it has seen.
+     */
+    public record LoggedChange(String bucket, String key, DescriptorChange change) {}
+
+    /**
+     * Everything from {@code fromBucket} onward except the entries in {@code alreadyConsumed}.
+     *
+     * <p>{@code alreadyConsumed} holds keys within {@code fromBucket} only, which is the sole bucket a
+     * reader ever revisits: the cursor is set to the bucket the read started in rather than past it, so
+     * entries written to that bucket after the listing are not missed. Without the exclusion those entries
+     * are delivered again on every pass until the bucket rolls, which at a one minute bucket and a five
+     * second interval is up to twelve times, and each redelivery invalidates a cache entry that did not
+     * need invalidating.
+     */
+    public List<LoggedChange> entriesSince(String fromBucket, java.util.Set<String> alreadyConsumed) {
+        List<LoggedChange> changes = new ArrayList<>();
         try {
             // Sorted, because children() gives no order and the buckets are the only ordering there is.
             Map<String, BlobContainer> buckets = new TreeMap<>(containers.apply(changelogPath()).children());
@@ -158,9 +186,13 @@ public final class BlobDescriptorChangeLog {
                 if (fromBucket != null && bucket.getKey().compareTo(fromBucket) < 0) {
                     continue;
                 }
+                boolean revisiting = bucket.getKey().equals(fromBucket);
                 for (String entry : bucket.getValue().listBlobs().keySet()) {
+                    if (revisiting && alreadyConsumed.contains(entry)) {
+                        continue;
+                    }
                     try (InputStream stream = bucket.getValue().readBlob(entry); StreamInput in = StreamInput.wrap(stream.readAllBytes())) {
-                        changes.add(new DescriptorChange(in));
+                        changes.add(new LoggedChange(bucket.getKey(), entry, new DescriptorChange(in)));
                     } catch (IOException e) {
                         // One unreadable entry is not a reason to lose the rest of the catch-up. It is also
                         // expected transiently: an entry can be listed between its key appearing and its

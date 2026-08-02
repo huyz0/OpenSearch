@@ -11,6 +11,8 @@ package org.opensearch.serverless.storage.descriptor;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
@@ -70,6 +72,15 @@ public final class DescriptorChangeTailer {
      */
     private final AtomicReference<String> resumeFrom = new AtomicReference<>();
 
+    /**
+     * Keys already consumed inside {@link #resumeFrom}'s bucket, so a revisit does not redeliver them.
+     *
+     * <p>Bounded by one bucket's writes and cleared whenever the cursor moves to a new bucket, because a
+     * bucket the cursor has passed is never read again. Entry names are random, so there is no "everything
+     * after key K" to resume from and the individual keys have to be named.
+     */
+    private final AtomicReference<Set<String>> consumedInBucket = new AtomicReference<>(Set.of());
+
     private final AtomicLong appliedCount = new AtomicLong();
     private final AtomicLong passCount = new AtomicLong();
 
@@ -94,18 +105,23 @@ public final class DescriptorChangeTailer {
         // what was written to the old one after the listing.
         String nextResume = changeLog.currentBucket();
 
-        List<DescriptorChange> changes;
+        List<BlobDescriptorChangeLog.LoggedChange> entries;
         try {
-            changes = changeLog.since(from);
+            entries = changeLog.entriesSince(from, consumedInBucket.get());
         } catch (RuntimeException e) {
             // Left un-advanced on purpose, so the next pass retries the same range rather than stepping
             // over changes it never read.
             logger.warn("could not read the descriptor change log from bucket [{}]; will retry", from, e);
             return 0;
         }
-        if (changes.isEmpty()) {
-            resumeFrom.set(nextResume);
+        if (entries.isEmpty()) {
+            advanceTo(nextResume, entries);
             return 0;
+        }
+
+        List<DescriptorChange> changes = new ArrayList<>(entries.size());
+        for (BlobDescriptorChangeLog.LoggedChange entry : entries) {
+            changes.add(entry.change());
         }
 
         // Invalidate every name including deletes: a
@@ -143,10 +159,30 @@ public final class DescriptorChangeTailer {
         // shards correctly still reported zero once the name index was gone.
         int applied = changes.size();
 
-        resumeFrom.set(nextResume);
+        advanceTo(nextResume, entries);
         appliedCount.addAndGet(applied);
         logger.debug("tailed [{}] descriptor changes over [{}] names from bucket [{}]", changes.size(), touched.size(), from);
         return applied;
+    }
+
+    /**
+     * Moves the cursor, carrying forward the keys consumed inside the bucket that will be revisited.
+     *
+     * <p>Only that bucket's keys are kept. Anything older is behind the cursor and will never be listed
+     * again, so remembering it would grow without bound for no benefit.
+     */
+    private void advanceTo(String nextResume, List<BlobDescriptorChangeLog.LoggedChange> justRead) {
+        Set<String> carried = new HashSet<>();
+        if (nextResume != null && nextResume.equals(resumeFrom.get())) {
+            carried.addAll(consumedInBucket.get());
+        }
+        for (BlobDescriptorChangeLog.LoggedChange entry : justRead) {
+            if (entry.bucket().equals(nextResume)) {
+                carried.add(entry.key());
+            }
+        }
+        resumeFrom.set(nextResume);
+        consumedInBucket.set(Set.copyOf(carried));
     }
 
     /** How many changes this tailer has applied, which a test asserts rather than infers from timing. */

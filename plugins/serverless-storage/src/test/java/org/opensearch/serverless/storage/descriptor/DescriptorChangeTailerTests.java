@@ -103,20 +103,22 @@ public class DescriptorChangeTailerTests extends OpenSearchTestCase {
     }
 
     /**
-     * Re-applying what has already been seen has to be harmless, which is what lets this be a poll.
+     * A change already consumed is not delivered again, however many passes run.
      *
-     * <p>Harmless, not absent. The cursor advances to the bucket the read started in rather than past it, so
-     * everything written in the current bucket is delivered again on the next pass, and buckets are a minute
-     * wide against a five second interval. A change is therefore re-read and re-invalidated up to twelve
-     * times before its bucket rolls.
+     * <p>The cursor moves to the bucket the read started in rather than past it, so that entry written to
+     * that bucket a moment after the listing is not missed. That alone used to mean every entry in the
+     * bucket came back on every pass: buckets are a minute wide against a five second interval, so a change
+     * was redelivered up to twelve times before its bucket rolled.
      *
-     * <p>That is correct and it is not free: re-invalidating a name evicts it, so the next read of a
-     * recently-changed index goes back to the store. The assertion here is the correctness half, that no
-     * name outside the change set is ever touched and repetition converges rather than corrupts. The cost
-     * half is recorded as a finding rather than pinned as intended behaviour, because a cursor that
-     * remembered the entries it had consumed inside the bucket would not pay it.
+     * <p>Which would be merely wasteful if applying were free, and it is not. Applying a change invalidates
+     * the cached descriptor for that name, so redelivery evicted a live entry twelve times over and sent
+     * the next read of a recently-changed index back to the object store. The tailer was manufacturing the
+     * misses it exists to prevent.
+     *
+     * <p>So the assertion is exact rather than a set comparison: three passes over two changes must
+     * invalidate exactly twice.
      */
-    public void testTailingIsIdempotent() throws Exception {
+    public void testAConsumedChangeIsNotDeliveredAgain() throws Exception {
         Path shared = createTempDir();
         BlobDescriptorChangeLog writerLog = logOver(shared);
         writerLog.append(created("tenant-a"));
@@ -125,15 +127,30 @@ public class DescriptorChangeTailerTests extends OpenSearchTestCase {
         List<String> invalidated = new ArrayList<>();
         DescriptorChangeTailer tailer = new DescriptorChangeTailer(logOver(shared), new RecordingBackend(invalidated));
 
-        tailer.tailOnce();
-        tailer.tailOnce();
-        tailer.tailOnce();
+        assertEquals("the first pass consumes both", 2, tailer.tailOnce());
+        assertEquals("and the rest have nothing left to do", 0, tailer.tailOnce());
+        assertEquals(0, tailer.tailOnce());
 
-        assertEquals(
-            "three passes must converge on the same two names and touch nothing else",
-            java.util.Set.of("tenant-a", "tenant-b"),
-            new java.util.HashSet<>(invalidated)
-        );
+        assertEquals("two changes, two invalidations, three passes", 2, invalidated.size());
+        assertEquals(java.util.Set.of("tenant-a", "tenant-b"), new java.util.HashSet<>(invalidated));
+    }
+
+    /** A change appended after a pass still arrives, which is what the revisit exists to guarantee. */
+    public void testAChangeAppendedAfterAPassIsStillDelivered() throws Exception {
+        Path shared = createTempDir();
+        BlobDescriptorChangeLog writerLog = logOver(shared);
+        writerLog.append(created("tenant-early"));
+
+        List<String> invalidated = new ArrayList<>();
+        DescriptorChangeTailer tailer = new DescriptorChangeTailer(logOver(shared), new RecordingBackend(invalidated));
+        assertEquals(1, tailer.tailOnce());
+
+        // Same bucket, after the cursor already pointed at it. Skipping consumed keys must not turn into
+        // skipping the whole bucket, which is the way this fix could have broken the thing it optimises.
+        writerLog.append(created("tenant-late"));
+        assertEquals("an entry added to the revisited bucket must still arrive", 1, tailer.tailOnce());
+
+        assertEquals(List.of("tenant-early", "tenant-late"), invalidated);
     }
 
     /**
