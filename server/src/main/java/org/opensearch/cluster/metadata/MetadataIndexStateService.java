@@ -175,6 +175,24 @@ public class MetadataIndexStateService {
         if (concreteIndices == null || concreteIndices.length == 0) {
             throw new IllegalArgumentException("Index name is required");
         }
+        // Refused rather than failed later, for the same reason update-settings is. A gated index has no
+        // cluster state entry, so everything below -- the blocks, the routing table rewrite, the wait for
+        // shards to verify -- has nothing to operate on, and the request would surface as "no such index"
+        // from getIndexSafe. The descriptor can represent State.CLOSE, so this is a missing feature rather
+        // than an impossible one, and saying so is more useful than a misleading error.
+        //
+        // Resolved on this thread, which is the transport thread that received the request: the seam refuses
+        // to answer on the cluster state thread, so checking inside the update task would learn nothing.
+        final List<Index> gated = AbsentIndexDescriptorSuppliers.gatedAmong(clusterService.state().metadata(), request.indices());
+        if (gated.isEmpty() == false) {
+            listener.onFailure(
+                new UnsupportedOperationException(
+                    "cannot close serverless " + names(gated) + ": a serverless index has no cluster state entry, and closing one is not implemented"
+                )
+            );
+            return;
+        }
+
         List<String> writeIndices = new ArrayList<>();
         SortedMap<String, IndexAbstraction> lookup = clusterService.state().metadata().getIndicesLookup();
         for (Index index : concreteIndices) {
@@ -932,6 +950,17 @@ public class MetadataIndexStateService {
         final OpenIndexClusterStateUpdateRequest request,
         final ActionListener<OpenIndexClusterStateUpdateResponse> listener
     ) {
+        // Same refusal as closeIndices, and reachable by the same route: an operator opening a name that
+        // resolves through a descriptor rather than through cluster state.
+        final List<Index> gatedToOpen = AbsentIndexDescriptorSuppliers.gatedAmong(clusterService.state().metadata(), request.indices());
+        if (gatedToOpen.isEmpty() == false) {
+            listener.onFailure(
+                new UnsupportedOperationException(
+                    "cannot open serverless " + names(gatedToOpen) + ": a serverless index has no cluster state entry, and opening one is not implemented"
+                )
+            );
+            return;
+        }
         onlyOpenIndex(request, ActionListener.wrap(response -> {
             if (response.isAcknowledged()) {
                 String[] indexNames = Arrays.stream(request.indices()).map(Index::getName).toArray(String[]::new);
@@ -1161,5 +1190,13 @@ public class MetadataIndexStateService {
             clusterBlock.status(),
             clusterBlock.levels()
         );
+    }
+
+    /** Reads as "index x" or "indices [x, y]", so a single-name error does not say "indices". */
+    private static String names(List<Index> indices) {
+        if (indices.size() == 1) {
+            return "index " + indices.get(0).getName();
+        }
+        return "indices " + indices.stream().map(Index::getName).collect(java.util.stream.Collectors.toList());
     }
 }

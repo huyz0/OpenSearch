@@ -22,6 +22,8 @@ import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
+import static org.hamcrest.Matchers.containsString;
+
 /**
  * A gated index created, written, searched and deleted with the object store answering descriptor point
  * reads.
@@ -322,6 +324,44 @@ public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.Se
         org.opensearch.action.get.GetResponse response = client().prepareGet("tenant-getbyid", "doc-1").get();
         assertTrue("a document written to a gated index must be readable by id", response.isExists());
         assertEquals(7, response.getSourceAsMap().get("value"));
+    }
+
+    /**
+     * The three operations that a gated index cannot support must say so, rather than say "no such index".
+     *
+     * <p>G9's audit found all three reaching {@code Metadata.getIndexSafe} unguarded, which fails with
+     * "no such index" for an index that exists perfectly well and is simply not in cluster state. That
+     * message sends an operator looking for a deleted index rather than telling them the operation is
+     * unsupported, which is a worse failure than the unsupported operation itself.
+     *
+     * <p>Update-settings is the one that cannot be implemented rather than merely is not: a descriptor
+     * carries no arbitrary settings, so there is nowhere to put them. Open and close are missing features,
+     * since {@code IndexDescriptor.State} can represent CLOSE.
+     */
+    public void testOperationsAGatedIndexCannotSupportFailClearly() throws Exception {
+        createGated("tenant-unsupported");
+        assertGated("tenant-unsupported");
+        awaitDescriptor("tenant-unsupported");
+
+        Exception settings = expectThrows(
+            Exception.class,
+            () -> client().admin()
+                .indices()
+                .prepareUpdateSettings("tenant-unsupported")
+                .setSettings(Settings.builder().put("index.number_of_replicas", 1))
+                .get()
+        );
+        assertThat(
+            "an operator must be told the operation is unsupported, not that the index is missing",
+            settings.getMessage() + String.valueOf(settings.getCause()),
+            containsString("serverless")
+        );
+
+        Exception close = expectThrows(Exception.class, () -> client().admin().indices().prepareClose("tenant-unsupported").get());
+        assertThat(close.getMessage() + String.valueOf(close.getCause()), containsString("serverless"));
+
+        Exception open = expectThrows(Exception.class, () -> client().admin().indices().prepareOpen("tenant-unsupported").get());
+        assertThat(open.getMessage() + String.valueOf(open.getCause()), containsString("serverless"));
     }
 
     /**

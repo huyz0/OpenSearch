@@ -140,6 +140,26 @@ public class MetadataUpdateSettingsService {
             .normalizePrefix(IndexMetadata.INDEX_SETTING_PREFIX)
             .build();
 
+        // Refused here rather than failed later. A gated index keeps no settings in cluster state and the
+        // descriptor has nowhere to put arbitrary ones, so this operation is not expressible for it at all.
+        // Without this the request reaches Metadata.getIndexSafe inside the state update task and comes back
+        // "no such index", which sends an operator looking for a deleted index rather than telling them the
+        // operation is unsupported.
+        //
+        // Checked on this thread, which is the transport thread that received the request, because resolving
+        // a descriptor is a remote read and the seam refuses to answer on the cluster state thread.
+        final java.util.List<Index> gated = AbsentIndexDescriptorSuppliers.gatedAmong(clusterService.state().metadata(), request.indices());
+        if (gated.isEmpty() == false) {
+            listener.onFailure(
+                new UnsupportedOperationException(
+                    "cannot update settings on serverless "
+                        + (gated.size() == 1 ? "index " + gated.get(0).getName() : "indices " + gated)
+                        + ": a serverless index has no cluster state entry and its descriptor does not carry settings"
+                )
+            );
+            return;
+        }
+
         validateRefreshIntervalSettings(normalizedSettings, clusterService.getClusterSettings());
         validateTranslogDurabilitySettings(normalizedSettings, clusterService.getClusterSettings(), clusterService.getSettings());
         validateIndexTotalPrimaryShardsPerNodeSetting(normalizedSettings, clusterService);

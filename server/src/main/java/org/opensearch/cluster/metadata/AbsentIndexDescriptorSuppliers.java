@@ -412,4 +412,31 @@ public final class AbsentIndexDescriptorSuppliers {
         }
         return synthesised;
     }
+
+    /**
+     * The names among these that are gated, meaning cluster state has no entry and a descriptor does.
+     *
+     * <p>For the operations that cannot be expressed on a descriptor at all, so they can refuse clearly
+     * instead of failing on {@code Metadata.getIndexSafe} with "no such index". That message is actively
+     * misleading for a gated index: the index exists, it is simply not where the caller looked, and an
+     * operator reading it would go looking for a deleted index rather than an unsupported operation.
+     *
+     * <p><b>Must be called off the cluster state thread.</b> Resolving a descriptor is a remote read and
+     * {@link #supply} refuses to answer on that thread, so a caller that checks from inside a cluster state
+     * update task gets an empty answer and learns nothing. Every current caller resolves on the transport
+     * thread that received the request and passes the result in, which is what {@code MetadataDeleteIndexService}
+     * established.
+     */
+    public static java.util.List<org.opensearch.core.index.Index> gatedAmong(Metadata metadata, org.opensearch.core.index.Index[] indices) {
+        if (isRegistered() == false || indices == null) {
+            return java.util.List.of();
+        }
+        java.util.List<org.opensearch.core.index.Index> gated = new java.util.ArrayList<>();
+        for (org.opensearch.core.index.Index index : indices) {
+            if (metadata.index(index) == null && metadataOrDescriptor(metadata, index) != null) {
+                gated.add(index);
+            }
+        }
+        return gated;
+    }
 }
