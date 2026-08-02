@@ -40,7 +40,7 @@ import static org.mockito.Mockito.when;
 public class ServerlessStoragePluginTests extends OpenSearchTestCase {
 
     private ServerlessStoragePlugin newPlugin(Path basePath) {
-        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin();
+        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin(Settings.EMPTY);
         if (basePath != null) {
             Settings nodeSettings = Settings.builder()
                 .put("path.home", createTempDir().toString())
@@ -141,7 +141,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
     }
 
     public void testEncryptionKeyConfiguredDoesNotBreakEngineFactoryConstruction() throws Exception {
-        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin();
+        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin(Settings.EMPTY);
         Path basePath = createTempDir();
 
         MockSecureSettings secureSettings = new MockSecureSettings();
@@ -178,7 +178,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
      * combination or inspects anything beyond the factory's type.
      */
     public void testEncryptionAndWalMirroringTogetherWireTheEncryptionKeyProviderIntoTheWriterEngineFactory() throws Exception {
-        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin();
+        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin(Settings.EMPTY);
         Path basePath = createTempDir();
 
         MockSecureSettings secureSettings = new MockSecureSettings();
@@ -212,7 +212,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
     }
 
     public void testWalMirroringEnabledDoesNotBreakEngineFactoryConstruction() {
-        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin();
+        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin(Settings.EMPTY);
         Path basePath = createTempDir();
         Settings nodeSettings = Settings.builder()
             .put("path.home", createTempDir().toString())
@@ -233,7 +233,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
     }
 
     public void testWalPerShardBudgetSettingDefaultsToDisabled() {
-        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin();
+        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin(Settings.EMPTY);
         Path basePath = createTempDir();
         Settings nodeSettings = Settings.builder()
             .put("path.home", createTempDir().toString())
@@ -252,7 +252,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
     }
 
     public void testWalPerShardBudgetSettingIsThreadedIntoTheSharedWalChunkService() {
-        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin();
+        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin(Settings.EMPTY);
         Path basePath = createTempDir();
         Settings nodeSettings = Settings.builder()
             .put("path.home", createTempDir().toString())
@@ -286,7 +286,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
     }
 
     public void testLazyDirectoryCacheSizeSettingConstructsARealCache() {
-        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin();
+        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin(Settings.EMPTY);
         Path basePath = createTempDir();
         Settings nodeSettings = Settings.builder()
             .put("path.home", createTempDir().toString())
@@ -313,7 +313,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
     }
 
     public void testReaderShardAdmissionControllerSettingConstructsARealController() {
-        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin();
+        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin(Settings.EMPTY);
         Path basePath = createTempDir();
         Settings nodeSettings = Settings.builder()
             .put("path.home", createTempDir().toString())
@@ -331,7 +331,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
     }
 
     public void testWalGcSchedulerTaskIsNotConstructedByDefault() {
-        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin();
+        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin(Settings.EMPTY);
         Path basePath = createTempDir();
         Settings nodeSettings = Settings.builder()
             .put("path.home", createTempDir().toString())
@@ -357,7 +357,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
     // plugin shutdown. Exercises one of them concretely (via a real, non-test-only isCancelled()
     // check) rather than just confirming close() doesn't throw, which wouldn't have caught the bug.
     public void testCloseCancelsTheScaleToZeroCandidatesSchedulerTask() throws Exception {
-        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin();
+        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin(Settings.EMPTY);
         Path basePath = createTempDir();
         Settings nodeSettings = Settings.builder()
             .put("path.home", createTempDir().toString())
@@ -387,7 +387,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
     }
 
     public void testNodeSelfWarmupSchedulerTaskIsNotConstructedByDefault() {
-        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin();
+        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin(Settings.EMPTY);
         Path basePath = createTempDir();
         Settings nodeSettings = Settings.builder()
             .put("path.home", createTempDir().toString())
@@ -405,7 +405,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
     }
 
     public void testCloseCancelsTheNodeSelfWarmupSchedulerTask() throws Exception {
-        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin();
+        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin(Settings.EMPTY);
         Path basePath = createTempDir();
         Settings nodeSettings = Settings.builder()
             .put("path.home", createTempDir().toString())
@@ -468,7 +468,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
             .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_BUNDLE_CACHE_SIZE_SETTING.getKey(), "1mb")
             .build();
         Environment environment = TestEnvironment.newEnvironment(buildEnvSettings(nodeSettings));
-        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin();
+        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin(Settings.EMPTY);
         plugin.createComponents(null, clusterServiceFor(plugin), null, null, null, null, environment, null, null, null, null);
 
         InMemoryPlaintextBundleCache sharedCache = plugin.sharedBundleCache();
@@ -524,7 +524,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
         }
         assertFalse("expected at least one declared Setting field to sanity-check the reflection itself", declaredSettingKeys.isEmpty());
 
-        java.util.Set<String> registeredSettingKeys = new ServerlessStoragePlugin().getSettings()
+        java.util.Set<String> registeredSettingKeys = new ServerlessStoragePlugin(Settings.EMPTY).getSettings()
             .stream()
             .map(Setting::getKey)
             .collect(java.util.stream.Collectors.toSet());
@@ -544,7 +544,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
         // This doesn't inspect each handler's actual route target (RestHandler exposes no
         // machine-readable "which action does this dispatch to" surface), but the count itself is
         // still a real, cheap signal: it catches the exact mistake of adding one without the other.
-        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin();
+        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin(Settings.EMPTY);
         int actionCount = plugin.getActions().size();
         int restHandlerCount = plugin.getRestHandlers(null, null, null, null, null, null, null).size();
         assertEquals(
@@ -563,7 +563,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
         // wrongly-UNAVAILABLE) one here would be silently unreachable the moment serverless-mode
         // enforcement is wired into RestController, exactly the kind of easy-to-miss omission this
         // annotation exists to catch before that enforcement lands.
-        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin();
+        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin(Settings.EMPTY);
         for (org.opensearch.rest.RestHandler handler : plugin.getRestHandlers(null, null, null, null, null, null, null)) {
             assertEquals(
                 handler.getClass().getSimpleName() + " must declare itself AVAILABLE under serverless mode",

@@ -40,7 +40,6 @@ import org.opensearch.common.Nullable;
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.logging.DeprecationLogger;
 import org.opensearch.common.path.PathTrie;
-import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.RequestUtils;
 import org.opensearch.common.util.concurrent.ThreadContext;
@@ -126,28 +125,7 @@ public class RestController implements HttpServerTransport.Dispatcher {
     /** Rest headers that are copied to internal requests made during a rest request. */
     private final Set<RestHeaderDefinition> headersToCopy;
     private final UsageService usageService;
-    private final boolean serverlessModeEnabled;
 
-    /**
-     * Node-level switch enforcing every {@link RestHandler}'s {@link RestHandler#serverlessScope()}
-     * declaration (rfc-serverless-opensearch.md &sect;11): once enabled, a handler that isn't
-     * {@link RestHandler.ServerlessScope#AVAILABLE} is refused before {@link RestHandler#handleRequest}
-     * ever runs, rather than executing normally. Default {@code false} (this setting's own default,
-     * and the default for every existing call site that doesn't pass a value at all -- see the
-     * 5-arg constructor below) is a strict no-op: zero behavior change for every node not opting
-     * into it.
-     */
-    public static final Setting<Boolean> SERVERLESS_MODE_ENABLED_SETTING = Setting.boolSetting(
-        "rest.serverless_mode.enabled",
-        false,
-        Setting.Property.NodeScope
-    );
-
-    /**
-     * Creates a controller with serverless-mode enforcement off, unconditionally -- the shape
-     * every pre-existing call site (this class's own direct constructors, test fixtures) already
-     * relies on, unaffected by {@link #SERVERLESS_MODE_ENABLED_SETTING} even existing.
-     */
     public RestController(
         Set<RestHeaderDefinition> headersToCopy,
         UnaryOperator<RestHandler> handlerWrapper,
@@ -155,25 +133,8 @@ public class RestController implements HttpServerTransport.Dispatcher {
         CircuitBreakerService circuitBreakerService,
         UsageService usageService
     ) {
-        this(headersToCopy, handlerWrapper, client, circuitBreakerService, usageService, false);
-    }
-
-    /**
-     * Creates a controller with serverless-mode enforcement resolved from {@code serverlessModeEnabled}.
-     *
-     * @param serverlessModeEnabled see {@link #SERVERLESS_MODE_ENABLED_SETTING}'s own javadoc.
-     */
-    public RestController(
-        Set<RestHeaderDefinition> headersToCopy,
-        UnaryOperator<RestHandler> handlerWrapper,
-        NodeClient client,
-        CircuitBreakerService circuitBreakerService,
-        UsageService usageService,
-        boolean serverlessModeEnabled
-    ) {
         this.headersToCopy = headersToCopy;
         this.usageService = usageService;
-        this.serverlessModeEnabled = serverlessModeEnabled;
         if (handlerWrapper == null) {
             handlerWrapper = h -> h; // passthrough if no wrapper set
         }
@@ -181,23 +142,11 @@ public class RestController implements HttpServerTransport.Dispatcher {
         this.handlerWrapper = handlerWrapper;
         this.client = client;
         this.circuitBreakerService = circuitBreakerService;
-        registerHandlerNoWrap(RestRequest.Method.GET, "/favicon.ico", new RestHandler() {
-            @Override
-            public void handleRequest(RestRequest request, RestChannel channel, NodeClient clnt) throws IOException {
-                channel.sendResponse(new BytesRestResponse(RestStatus.OK, "image/x-icon", FAVICON_RESPONSE));
-            }
-
-            // A static, cosmetic asset for browsers hitting the node directly, not a data or admin
-            // API -- §11's "unannotated handlers default to unavailable" gating is about the API
-            // surface, not this. Explicit, not left to default to UNAVAILABLE: without this
-            // override, enabling SERVERLESS_MODE_ENABLED_SETTING would start 410-ing the favicon on
-            // every node that opts in, an unintended side effect this class's own introduction of
-            // that setting would otherwise have silently caused.
-            @Override
-            public ServerlessScope serverlessScope() {
-                return ServerlessScope.AVAILABLE;
-            }
-        });
+        registerHandlerNoWrap(
+            RestRequest.Method.GET,
+            "/favicon.ico",
+            (request, channel, clnt) -> channel.sendResponse(new BytesRestResponse(RestStatus.OK, "image/x-icon", FAVICON_RESPONSE))
+        );
     }
 
     public void setRequestIdMaxLength(int maxLength) {
@@ -378,21 +327,6 @@ public class RestController implements HttpServerTransport.Dispatcher {
     }
 
     private void dispatchRequest(RestRequest request, RestChannel channel, RestHandler handler) throws Exception {
-        if (serverlessModeEnabled && handler.serverlessScope() != RestHandler.ServerlessScope.AVAILABLE) {
-            // INTERNAL_ONLY is refused here too, not just UNAVAILABLE -- this method is reached
-            // exclusively via external HTTP dispatch (tryAllHandlers -> here), so there is no such
-            // thing as an "internal/system caller" arriving through this path by definition; a
-            // handler declaring INTERNAL_ONLY is explicitly saying ordinary HTTP callers should
-            // never reach it.
-            channel.sendResponse(
-                BytesRestResponse.createSimpleErrorResponse(
-                    channel,
-                    RestStatus.GONE,
-                    "this API is not available on a node running in serverless mode"
-                )
-            );
-            return;
-        }
         final int contentLength = request.content().length();
         final MediaType mediaType = request.getMediaType();
         if (contentLength > 0) {

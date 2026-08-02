@@ -1724,10 +1724,22 @@ as an operator/managed-service API gating mechanism).
 **Status: implemented and enforced.** `RestHandler#serverlessScope()` (`server/src/main/java/org/opensearch/rest/RestHandler.java`)
 is exactly this annotation: a three-way `ServerlessScope` enum (`AVAILABLE`, `INTERNAL_ONLY`,
 `UNAVAILABLE`), defaulting to `UNAVAILABLE` so an unannotated handler must opt in consciously,
-matching this section's own design verbatim. `RestController` enforces it (`RestController.java`,
-guarded by a real node-level `serverlessModeEnabled` field resolved from its own
-`SERVERLESS_MODE_ENABLED_SETTING`): `if (serverlessModeEnabled && handler.serverlessScope() !=
-AVAILABLE)` rejects the request before it ever reaches the handler. Every REST handler this plugin
+matching this section's own design verbatim. Enforcement lives in the plugin, not in core:
+`ServerlessRestGate` (`plugins/serverless-storage/.../rest/ServerlessRestGate.java`) refuses any
+handler that is not `AVAILABLE` before the request reaches it, and the plugin hands that gate to
+core through `ActionPlugin.getRestHandlerWrapper`, an extension point upstream already provides.
+It is off unless `serverless_storage.rest_gating.enabled` is set.
+
+This was originally built the other way, with a `rest.serverless_mode.enabled` setting and an
+enforcement branch inside `RestController`. That worked and was default-off, but it put a
+serverless-specific decision in core rather than a hook, and it needed a special case to stop its
+own new setting from returning 410 for `/favicon.ico`. Moving it out deleted the setting, the
+field, the extra constructor, the enforcement branch and the favicon workaround. Core now carries
+the `serverlessScope()` vocabulary and reads it nowhere, so a node without this plugin cannot be
+affected by the declaration at all. The favicon case disappeared rather than being reproduced,
+because `RestController` registers it through `registerHandlerNoWrap`, which wrappers never see.
+
+Every REST handler this plugin
 registers declares `ServerlessScope.AVAILABLE` explicitly (e.g. `RestNodeManifestLagAction`,
 `RestCompactionTriggerAction`, `RestShardCloneAction`), since every one of this plugin's own APIs
 is meaningful only when serverless storage is enabled for the target index -- unlike `_forcemerge`
@@ -2220,6 +2232,18 @@ RFC claims them deliberately rather than leaving them implicit:
    default and misreport its delegate's real availability. Every one of this plugin's own 9 REST
    handlers overrides it to `AVAILABLE`, verified by a plugin test that iterates `getRestHandlers()`
    and fails if any handler reports anything else.
+
+   **Superseded: enforcement has since moved out of core entirely.** Everything from here to the end
+   of this entry describes where enforcement first landed, inside `RestController`. It has been
+   replaced by `ServerlessRestGate` in this plugin, installed through the `getRestHandlerWrapper`
+   extension point upstream already provides and switched by `serverless_storage.rest_gating.enabled`.
+   The core setting, the `serverlessModeEnabled` field, the 6-arg constructor, the `dispatchRequest`
+   branch and the favicon override are all gone; core keeps `serverlessScope()` as a declaration and
+   reads it nowhere. Two of the bugs described below stopped existing rather than being fixed again:
+   the favicon is registered through `registerHandlerNoWrap`, which no wrapper ever sees, and the
+   `DeprecationRestHandler` delegation still matters but now only because the plugin's gate reads
+   the same method. The account below is kept because the reasoning that produced it is still worth
+   reading, and because the annotation-coverage work it describes is unaffected.
 
    **Enforcement landed in a follow-up pass**, once the annotation itself had something real to
    consume it: a new node-level `rest.serverless_mode.enabled` setting (`RestController.SERVERLESS_MODE_ENABLED_SETTING`,

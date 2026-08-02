@@ -142,12 +142,22 @@ public interface RestHandler {
      *
      * <p>Defaults to {@link ServerlessScope#UNAVAILABLE} deliberately: new APIs must opt in
      * consciously to running under serverless mode rather than being silently exposed by omission.
-     * This default has <b>no behavioral effect today</b> -- nothing in {@link RestController} reads
-     * this method yet, since enforcement needs a node-level "is this node in serverless mode" flag
-     * that does not yet exist as a wired setting. Declaring the annotation now, ahead of that
-     * enforcement, lets handlers (this core module's own and every plugin's) start recording their
-     * intended availability incrementally rather than needing one atomic cross-cutting change once
-     * enforcement lands.
+     *
+     * <p><b>This is a declaration, and core never acts on it.</b>
+     * Nothing in {@link RestController} or anywhere else in core reads this method, and that is the
+     * design rather than an unfinished state. A handler declaring {@code UNAVAILABLE} is served
+     * exactly as before on an ordinary node, so this method cannot change the behaviour of a node
+     * running without a serverless plugin.
+     *
+     * <p>Enforcement belongs to whichever plugin defines what "serverless mode" means for a
+     * deployment, and it already has somewhere to live: a plugin returning a wrapper from
+     * {@link org.opensearch.plugins.ActionPlugin#getRestHandlerWrapper} sees every registered
+     * handler and can refuse the ones this method excludes. That needs no core setting and no core
+     * enforcement branch, which is why neither exists.
+     *
+     * <p>Core carries the vocabulary alone so that handlers, this module's own and every plugin's,
+     * can record their intended availability incrementally instead of a plugin having to maintain
+     * an external list of route names that drifts every time a handler is added.
      */
     default ServerlessScope serverlessScope() {
         return ServerlessScope.UNAVAILABLE;

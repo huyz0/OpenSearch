@@ -569,14 +569,8 @@ serverless coupling at all and would stand on its own merits.
 > regression against `main`", was false, and the attempt to act on it is described in section 3.1. Upstream
 > removed that SPI deliberately. There is no such regression. The list below is what remains.
 
-**1. `RestController` holds a serverless mode.** `rest.serverless_mode.enabled`, a `serverlessModeEnabled`
-field, `ServerlessScope` on `RestHandler` defaulting to `UNAVAILABLE`, and a 410 for handlers not marked
-`AVAILABLE`. Default-off, so R1 holds. Siting it in core is what strains R2, and the tell is that
-`RestController` had to give `/favicon.ico` an explicit `AVAILABLE` override to stop its own new setting
-from 410-ing a static asset. Upstream already ships `ActionPlugin.getRestHandlerWrapper(ThreadContext)`,
-which lets a plugin wrap every handler and refuse the ones it wants refused. So the question to settle is
-not how to build a seam but whether the existing extension point already suffices. Ten core handlers
-currently carry `serverlessScope()` overrides that would move to the plugin with it.
+**1. `RestController` holds a serverless mode.** ~~Resolved, see section 14.~~ Moved to the plugin. Core no
+longer has the setting, the field, the extra constructor or the enforcement branch.
 
 **2. Five public members were removed from `ShardRouting` and `OperationRouting`**, all by CC1, all
 verifiably dead on the baseline. Not a blocker so much as something to disclose and offer upstream on its
@@ -591,8 +585,8 @@ justify, and the reason the raw diff looks several times larger than the metadat
 
 ### The sequence that would work
 
-1. Settle whether `RestController`'s serverless mode can move onto the existing `getRestHandlerWrapper`
-   extension point. Removes the clearest R2 strain and needs no new seam if it can.
+1. ~~Settle whether `RestController`'s serverless mode can move onto the existing `getRestHandlerWrapper`
+   extension point.~~ Done, section 14. It could.
 2. Offer CC1's write-rejection fix to `main` separately, with its dead-scaffolding removal attached.
 3. Read the remaining unexamined non-trivial files, against the fork point this time.
 4. Only then attempt the branch split, because until 3 is done nobody knows which side each file belongs on.
@@ -666,3 +660,73 @@ parent, is core behaviour that applies with no plugin installed. That is a genui
 document has found that is not default-off. It is also a real bug fix: without it, documents acknowledged by
 the parent after a child cloned its manifest but before the split committed became permanently unreachable.
 Both things are true, and the resolution is the same either way, which is to offer it to `main` on its own.
+
+---
+
+## 14. H5: the REST gate moves out of core
+
+Section 12 listed `RestController`'s serverless mode as the clearest remaining strain on R2 and asked whether
+the existing `ActionPlugin.getRestHandlerWrapper` hook could carry it instead of a new seam. It can, and it
+now does.
+
+### What core had
+
+A `rest.serverless_mode.enabled` setting, a `serverlessModeEnabled` field, a sixth constructor parameter, a
+registration in `ClusterSettings`, a resolution in `ActionModule`, and a branch at the top of
+`dispatchRequest` returning 410 for any handler not declaring itself `AVAILABLE`. All default-off, so R1 was
+never at risk. The problem was R2: that is a decision living in core, not a hook, and it was serverless's
+decision specifically.
+
+There was also a tell. `RestController` had to give `/favicon.ico` an explicit `AVAILABLE` override, because
+the handler it registers for the favicon is a bare lambda and `serverlessScope()` defaults to `UNAVAILABLE`.
+So core's own new setting would have started returning 410 for the favicon on any node that opted in. A
+mechanism that has to defend core against itself is sited wrong.
+
+### What core has now
+
+`RestHandler.serverlessScope()` and the `ServerlessScope` enum, and nothing that reads them. The declaration
+is inert by construction rather than by a default value, which is a stronger guarantee than the old one:
+before, R1 held because a setting defaulted to false; now it holds because there is no code path.
+
+Everything else is deleted. The setting, the field, the six-argument constructor, the `ClusterSettings`
+entry, the `ActionModule` resolution, the `dispatchRequest` branch, and the favicon workaround.
+
+### What the plugin has
+
+`ServerlessRestGate`, a `UnaryOperator<RestHandler>` handed to core through `getRestHandlerWrapper`, switched
+by `serverless_storage.rest_gating.enabled`. Three details that are not incidental:
+
+- **It returns `null`, not an identity wrapper, when gating is off.** Core allows exactly one plugin to
+  install a REST wrapper and throws if a second tries. Returning a passthrough would consume that slot for
+  nothing and stop any other plugin from wrapping handlers.
+- **An `AVAILABLE` handler is returned unwrapped**, so it keeps its own identity for anything that inspects
+  it rather than being hidden behind a delegate for no reason.
+- **A refused handler still delegates everything that describes it**, via `RestHandler.Wrapper`. Core
+  registers a wrapped handler under the wrapper's routes, so a gate that dropped `routes()` would unregister
+  the path instead of refusing it, and the request would 404 rather than 410.
+
+The favicon case did not need reproducing. `RestController` registers it through `registerHandlerNoWrap`,
+which wrappers never see, so the bug the core version had to patch cannot occur in this one.
+
+### Tests
+
+Six in `ServerlessRestGateTests`, all behaviour-based rather than timing-based: an `AVAILABLE` handler is
+returned unwrapped and still runs; `UNAVAILABLE` and `INTERNAL_ONLY` are refused with 410 **and never
+execute**, asserted by recording whether the handler ran rather than by reading the status alone; an
+undeclared handler is refused, which is the case that shows why core cannot own this check; a refused
+handler still reports its routes, content-stream support and scope; and the wrapper is absent unless gating
+is switched on.
+
+Verified by mutation. Replacing `return new Refused(handler)` with `return handler` fails three of the six.
+
+Core keeps one test, rewritten to assert the opposite of what it used to. `RestControllerTests`
+`testCoreDispatchesAnUnavailableHandlerNormally` pins that an `UNAVAILABLE`-declaring handler is dispatched
+completely normally, because with no plugin installed there is no serverless mode to be unavailable under.
+The four tests that covered the old core enforcement are gone with the thing they covered.
+
+### One incidental fix
+
+`ServerlessStoragePlugin` needed node settings to read its own switch, so its no-arg constructor became
+`ServerlessStoragePlugin(Settings)`. It had to *replace* the no-arg one rather than sit beside it:
+`PluginsService.loadPlugin` refuses any plugin class with more than one public constructor, so keeping both
+would have loaded fine in every unit test, which calls `new` directly, and failed every real node.

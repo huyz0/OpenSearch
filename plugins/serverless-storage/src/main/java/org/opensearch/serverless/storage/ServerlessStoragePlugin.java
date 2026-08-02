@@ -60,6 +60,7 @@ import org.opensearch.serverless.storage.readerengine.ObjectStoreCommitMateriali
 import org.opensearch.serverless.storage.readerengine.ReaderEngineFactory;
 import org.opensearch.serverless.storage.readerengine.ReaderShardAdmissionController;
 import org.opensearch.serverless.storage.readerengine.lazydirectory.ServerlessStorageLazyDirectoryFactory;
+import org.opensearch.serverless.storage.rest.ServerlessRestGate;
 import org.opensearch.serverless.storage.retention.BlobContainerDurablePinRegistry;
 import org.opensearch.serverless.storage.retention.DurablePinRegistry;
 import org.opensearch.serverless.storage.retention.PitrRetentionConfig;
@@ -116,8 +117,21 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         ServerlessStoragePlugin.class
     );
 
+    /**
+     * Node settings, held because a few plugin hooks are called before {@link #createComponents} and are
+     * not handed settings of their own. {@link #getRestHandlerWrapper} is the case that forced this: core
+     * builds the wrapper inside {@code ActionModule}'s constructor and passes only a thread context.
+     *
+     * <p>This is the sole public constructor on purpose. {@code PluginsService.loadPlugin} refuses any
+     * plugin class with more than one public constructor, so keeping a no-arg overload alongside this one
+     * would load fine in unit tests, which call {@code new} directly, and fail every real node.
+     */
+    private final Settings settings;
+
     /** Creates the plugin; all real wiring happens in {@link #createComponents} once node services are available. */
-    public ServerlessStoragePlugin() {}
+    public ServerlessStoragePlugin(Settings settings) {
+        this.settings = settings;
+    }
 
     /**
      * Constructed eagerly (not in {@link #createComponents}) because {@link #getActionFilters()} is
@@ -300,6 +314,22 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      */
     public static final Setting<Boolean> SERVERLESS_STORAGE_NODE_ENABLED_SETTING = Setting.boolSetting(
         "serverless_storage.enabled",
+        false,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * Whether this node refuses REST handlers that have not declared themselves available under serverless
+     * mode, per each handler's {@link org.opensearch.rest.RestHandler#serverlessScope()}.
+     *
+     * <p>Off by default, and enforcement lives entirely in {@link ServerlessRestGate}, which this plugin
+     * hands to core through the pre-existing {@code ActionPlugin.getRestHandlerWrapper} hook. Core has no
+     * serverless-mode setting and no enforcement branch of its own; it carries the scope declaration and
+     * nothing reads it there. A node without this plugin therefore serves every API exactly as before,
+     * which is the point.
+     */
+    public static final Setting<Boolean> SERVERLESS_STORAGE_REST_GATING_ENABLED_SETTING = Setting.boolSetting(
+        "serverless_storage.rest_gating.enabled",
         false,
         Setting.Property.NodeScope
     );
@@ -1376,6 +1406,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_WILDCARD_MAX_EXPANDED_INDICES_SETTING,
             DESCRIPTOR_BACKEND_SETTING,
             SERVERLESS_STORAGE_NODE_ENABLED_SETTING,
+            SERVERLESS_STORAGE_REST_GATING_ENABLED_SETTING,
             SERVERLESS_STORAGE_MAX_FILE_CACHE_USAGE_RATIO_SETTING,
             SERVERLESS_STORAGE_MAX_CONCURRENT_REWRITES_SETTING,
             SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING,
@@ -2814,6 +2845,25 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 org.opensearch.serverless.storage.resharding.action.TransportOrchestrateShardSplitAction.class
             )
         );
+    }
+
+    /**
+     * Supplies the serverless REST gate, or nothing at all when gating is off.
+     *
+     * <p>Returning {@code null} rather than an identity wrapper matters: {@code RestController} already
+     * substitutes a passthrough when no plugin supplies one, and {@code ActionModule} rejects a second
+     * plugin trying to install a wrapper. Handing back an identity function when this node is not gating
+     * would consume that single slot and stop any other plugin from wrapping handlers, for no benefit.
+     */
+    @Override
+    public java.util.function.UnaryOperator<org.opensearch.rest.RestHandler> getRestHandlerWrapper(
+        org.opensearch.common.util.concurrent.ThreadContext threadContext,
+        java.util.Set<org.opensearch.rest.RestHeaderDefinition> headersToCopy
+    ) {
+        if (SERVERLESS_STORAGE_REST_GATING_ENABLED_SETTING.get(settings) == false) {
+            return null;
+        }
+        return new ServerlessRestGate();
     }
 
     @Override

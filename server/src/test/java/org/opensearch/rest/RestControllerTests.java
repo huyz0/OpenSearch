@@ -238,80 +238,22 @@ public class RestControllerTests extends OpenSearchTestCase {
         assertTrue(channel.getSendResponseCalled());
     }
 
-    public void testFaviconStaysAvailableUnderServerlessMode() {
-        // The favicon handler is registered internally by RestController's own constructor, not by
-        // a caller who could annotate it -- a real bug caught by this suite's own review: without
-        // an explicit ServerlessScope.AVAILABLE override, it would default to UNAVAILABLE just like
-        // any other unannotated handler and start 410-ing once serverless mode is enabled, an
-        // unintended side effect of introducing that mode at all.
-        final ThreadContext threadContext = client.threadPool().getThreadContext();
-        final RestController restController = new RestController(
-            Collections.emptySet(),
-            null,
-            client,
-            circuitBreakerService,
-            usageService,
-            true
-        );
-        RestRequest fakeRequest = new FakeRestRequest.Builder(xContentRegistry()).withPath("/favicon.ico").build();
-        AssertingChannel channel = new AssertingChannel(fakeRequest, false, RestStatus.OK);
-        restController.dispatchRequest(fakeRequest, channel, threadContext);
-        assertTrue(channel.getSendResponseCalled());
-    }
-
-    public void testServerlessModeRefusesAHandlerThatDoesNotDeclareItselfAvailable() {
-        final ThreadContext threadContext = client.threadPool().getThreadContext();
-        final RestController restController = new RestController(
-            Collections.emptySet(),
-            null,
-            client,
-            circuitBreakerService,
-            usageService,
-            true
-        );
-        RestRequest fakeRequest = new FakeRestRequest.Builder(xContentRegistry()).withPath("/unavailable").build();
-        restController.registerHandler(RestRequest.Method.GET, "/unavailable", new RestHandler() {
-            @Override
-            public void handleRequest(RestRequest request, RestChannel channel, NodeClient client) {
-                throw new AssertionError("must never be reached -- serverless mode must refuse this request before handleRequest runs");
-            }
-        });
-        AssertingChannel channel = new AssertingChannel(fakeRequest, false, RestStatus.GONE);
-        restController.dispatchRequest(fakeRequest, channel, threadContext);
-        assertTrue(channel.getSendResponseCalled());
-    }
-
-    public void testServerlessModeAllowsAHandlerThatDeclaresItselfAvailable() {
-        final ThreadContext threadContext = client.threadPool().getThreadContext();
-        final RestController restController = new RestController(
-            Collections.emptySet(),
-            null,
-            client,
-            circuitBreakerService,
-            usageService,
-            true
-        );
-        RestRequest fakeRequest = new FakeRestRequest.Builder(xContentRegistry()).withPath("/available").build();
-        restController.registerHandler(RestRequest.Method.GET, "/available", new RestHandler() {
-            @Override
-            public void handleRequest(RestRequest request, RestChannel channel, NodeClient client) throws Exception {
-                channel.sendResponse(new BytesRestResponse(RestStatus.OK, BytesRestResponse.TEXT_CONTENT_TYPE, BytesArray.EMPTY));
-            }
-
-            @Override
-            public ServerlessScope serverlessScope() {
-                return ServerlessScope.AVAILABLE;
-            }
-        });
-        AssertingChannel channel = new AssertingChannel(fakeRequest, false, RestStatus.OK);
-        restController.dispatchRequest(fakeRequest, channel, threadContext);
-        assertTrue(channel.getSendResponseCalled());
-    }
-
-    public void testServerlessModeDisabledIgnoresServerlessScopeEntirely() {
-        // The default (5-arg) constructor -- unaffected by SERVERLESS_MODE_ENABLED_SETTING even
-        // existing -- must still dispatch an UNAVAILABLE-declaring handler normally, exactly as
-        // every pre-existing call site already relies on.
+    /**
+     * Core never acts on {@link RestHandler#serverlessScope()}, and this is the test that says so.
+     *
+     * <p>An earlier version of this class enforced the declaration itself, behind a
+     * {@code rest.serverless_mode.enabled} setting. It worked, and it was default-off, but it put a
+     * serverless-specific decision inside core rather than a hook, and it needed a special case to stop its
+     * own new setting from 410-ing {@code /favicon.ico}. Enforcement now lives in the serverless plugin,
+     * which reaches every handler through the {@code getRestHandlerWrapper} extension point that upstream
+     * already provides. See {@code ServerlessRestGateTests}.
+     *
+     * <p>So the property core owes is the opposite of the old one: a handler declaring itself
+     * {@code UNAVAILABLE} must be dispatched completely normally, because with no plugin installed there is
+     * no such thing as serverless mode to be unavailable under. UNAVAILABLE is also the default for any
+     * handler that has never heard of this, which is what makes it the case worth pinning.
+     */
+    public void testCoreDispatchesAnUnavailableHandlerNormally() {
         final ThreadContext threadContext = client.threadPool().getThreadContext();
         final RestController restController = new RestController(Collections.emptySet(), null, client, circuitBreakerService, usageService);
         RestRequest fakeRequest = new FakeRestRequest.Builder(xContentRegistry()).withPath("/unannotated").build();
@@ -319,6 +261,11 @@ public class RestControllerTests extends OpenSearchTestCase {
             @Override
             public void handleRequest(RestRequest request, RestChannel channel, NodeClient client) throws Exception {
                 channel.sendResponse(new BytesRestResponse(RestStatus.OK, BytesRestResponse.TEXT_CONTENT_TYPE, BytesArray.EMPTY));
+            }
+
+            @Override
+            public ServerlessScope serverlessScope() {
+                return ServerlessScope.UNAVAILABLE;
             }
         });
         AssertingChannel channel = new AssertingChannel(fakeRequest, false, RestStatus.OK);
