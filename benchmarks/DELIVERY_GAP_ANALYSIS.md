@@ -863,3 +863,61 @@ Applying it upstream would still leave this branch carrying the same change, so 
 account for it. And it removes public members from `ShardRouting`, which is a compatibility decision for
 whoever reviews it rather than something this branch can settle. The dead-code evidence is in section 13
 and reproducible with a single `git grep` against the fork point.
+
+---
+
+## 17. S1: population-scale evidence, restored in count form
+
+Section 13's cleanup deleted every test that built a large population, on the grounds that they asserted on
+elapsed time and were the branch's largest source of flaky failures. That was right about the assertions and
+wrong about the coverage. What went with them was the only evidence above a few dozen indices, leaving R6,
+the claim the whole design exists to serve, resting on 25 creations.
+
+This restores it in the form those tests should have taken.
+
+### The two new tests
+
+**`DescriptorResolutionIsFlatAtScaleTests`** builds two populations differing twentyfold and asserts that a
+cold point read costs one round trip at both, a miss costs two at both, and a creation costs the same at
+both. Reads go through a second backend over the same container so the cache is cold, which is the case that
+matters: a node joining a cluster that already holds a large population must not find its first read of a
+tenant more expensive because other tenants exist.
+
+**`GatedCreationClusterStateFootprintIT`** serialises the whole cluster state before and after 25 creations
+of each kind. Measured:
+
+```
+  ordinary      20,625 bytes        825 per index
+  gated              0 bytes
+```
+
+This is the first time the central claim has been measured in bytes rather than in publications. It matters
+because the two are different claims: a design could publish nothing per creation and still accumulate
+state, if entries were added to a map that rode along in some later unrelated publication. That would cost
+zero versions and still put 100M entries in every node's heap and every full state transfer. At 825 bytes
+per index, 100M traditional indices is roughly 82 GB of cluster state. Gated is zero.
+
+### One design mistake worth recording
+
+The flatness test originally compared total request counts at the two populations, which is weaker than it
+looks against a filesystem fixture. `FsBlobContainer` answers any listing in a single call however many
+blobs it returns, so a stray enumeration on the read path costs exactly one extra request at *both*
+populations, the totals still match, and the assertion passes while the thing it exists to catch has
+happened. Confirmed by mutation: injecting a `listBlobsByPrefix` into the read path left both totals equal
+at 2.
+
+An attempt to fix it by charging per thousand-key page, the way S3 bills, ran into its own problem worth
+noting: `FilterBlobContainer` does not forward the register operations, because `BlobContainer` declares
+them as defaults that throw, so a filter silently inherits the throwing default rather than the delegate's
+implementation. Anything wrapping a container for the descriptor path has to forward them explicitly.
+
+The simpler expression turned out to be the better one. A listing is the only operation whose cost grows
+with the population, so **"the read path issues zero listings" is the honest statement of flatness**, and
+the counter already tracks listings separately. That assertion does catch the injected regression, and it
+is the one that would still hold against a real object store rather than against this fixture.
+
+### What this does not cover
+
+The populations are thousands, not millions. `-Dtests.descriptor.population` raises them and the assertions
+need no retuning, since they are equalities and zeroes rather than thresholds, but nothing runs at 100M and
+nothing here says the object store behind it would keep up. That is the request-budget question, still open.
