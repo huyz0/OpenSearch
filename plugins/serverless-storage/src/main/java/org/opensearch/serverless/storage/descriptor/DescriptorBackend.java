@@ -147,4 +147,21 @@ public interface DescriptorBackend {
      * system index charged against it that simply does not arise.
      */
     boolean available();
+
+    /**
+     * Reads these names into whatever cache serves {@link #get}, without blocking the caller.
+     *
+     * <p>This is C1's prefetch, and "without blocking" is the requirement rather than a nicety. The caller
+     * is {@code TransportBulkAction.doExecute}, which runs on a transport worker and, through an
+     * acknowledgement continuation, sometimes on the cluster applier thread. Both forbid blocking, and the
+     * first implementation looped over the blocking {@link #get}.
+     *
+     * <p>Best effort: a backend that cannot warm must still complete the listener successfully, because a
+     * request must not fail for want of a warm cache. Whatever does not warm is resolved inline later.
+     *
+     * <p>Deliberately not a defaulted no-op. A default would let a backend opt out of the one mechanism C1
+     * exists for without anyone noticing, which is the "correct and unreachable" failure this area keeps
+     * producing -- and a prefetch that does nothing is indistinguishable from a fast one.
+     */
+    void warmAsync(java.util.Collection<String> names, org.opensearch.core.action.ActionListener<Void> listener);
 }

@@ -240,6 +240,25 @@ public final class DescriptorCache {
         }
     }
 
+    /**
+     * Admits a descriptor that was read somewhere else, counting the read.
+     *
+     * <p>For the prefetch path, which resolves a whole request's names in one round trip and so cannot go
+     * through {@link #get}: that takes a loader and calls it synchronously, which is exactly what the
+     * prefetcher must not do. The read is counted here because it happened, and leaving it uncounted would
+     * make the hit rate this cache reports flattering rather than true -- warmed names would look like hits
+     * with no read behind them.
+     */
+    public void warm(String name, IndexDescriptor descriptor) {
+        if (descriptor == null) {
+            // Same rule as load: absence is never cached, so a name created a moment ago stays resolvable
+            // immediately rather than after the window.
+            return;
+        }
+        reads.incrementAndGet();
+        admit(name, descriptor, clock.getAsLong());
+    }
+
     /** Runs the loader, counts the read, and admits a hit. A miss is deliberately not cached. */
     private IndexDescriptor load(String name, Function<String, IndexDescriptor> loader, long now) {
         reads.incrementAndGet();

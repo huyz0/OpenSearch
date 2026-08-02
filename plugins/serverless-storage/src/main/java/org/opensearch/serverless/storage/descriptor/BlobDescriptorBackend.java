@@ -284,6 +284,42 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
         return true;
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * <p>A blob read per name, moved off the calling thread rather than made concurrent. An object store
+     * has no multi-get, so the round trips this saves are the caller's, not the store's: the request thread
+     * returns immediately instead of waiting out M sequential reads inside the document loop.
+     *
+     * <p>Sequential on the executor deliberately. Fanning M names across the pool would let one bulk
+     * request over many tenants occupy the whole of GENERIC, and prefetching is the lowest-value work on
+     * the node -- everything it warms would otherwise be read inline anyway.
+     */
+    @Override
+    public void warmAsync(java.util.Collection<String> names, org.opensearch.core.action.ActionListener<Void> listener) {
+        if (names.isEmpty()) {
+            listener.onResponse(null);
+            return;
+        }
+        try {
+            executor.execute(() -> {
+                for (String name : names) {
+                    try {
+                        get(name);
+                    } catch (RuntimeException e) {
+                        // One name failing must not abandon the rest, and must not fail the request.
+                        logger.debug("could not prefetch the descriptor for [{}]", name, e);
+                    }
+                }
+                listener.onResponse(null);
+            });
+        } catch (Exception e) {
+            // A rejected execution is a busy node, which is exactly when prefetching should be skipped.
+            logger.debug("could not submit the descriptor prefetch", e);
+            listener.onResponse(null);
+        }
+    }
+
     private static String keyFor(String name) {
         return DESCRIPTOR_PREFIX + name;
     }

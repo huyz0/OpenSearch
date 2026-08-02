@@ -1458,3 +1458,56 @@ the honest description, and it is neither a regression nor a win.
 
 Net: 70 passing to 165, no regressions, six real defects in the gated creation paths that were previously
 masked. Those six are the next thing to look at.
+
+### The prefetcher blocked, and it was breaking nearly everything gated
+
+Fixing I4's teardown unskipped 118 tests and made six failures visible. Four of them, plus three that had
+been failing since before this work, had a single cause, and it was C1's own prefetcher.
+
+```
+TransportBulkAction.doExecute:266 -> DescriptorPrefetch.prefetch:92
+ -> DescriptorGate.lambda$install$1 -> DescriptorStore.get -> DescriptorCache.load
+ -> readFromIndex -> ActionRequestBuilder.get -> BaseFuture.get   <- blocking
+```
+
+W1 registered a prefetcher that looped over `get`, which blocks. The hook runs in
+`TransportBulkAction.doExecute`, on a transport worker and sometimes -- through an acknowledgement
+continuation whose future was completed on the cluster applier thread -- on that thread too. Both assert
+against blocking.
+
+**The failure surfaced nowhere near the cause**, which is why it survived so long. The `AssertionError` was
+captured into the gated creation future by `CompletableFuture`, carried to `MetadataCreateIndexService`'s
+`onAllNodesAcked`, wrapped by `unwrap` because an `AssertionError` is not an `Exception`, and reported as a
+create or delete failing with a thread assertion naming `MetadataCreateIndexService`. Nothing in that
+message points at a prefetcher in a plugin.
+
+**The seam was already right; the implementation ignored it.** `DescriptorPrefetch.Prefetcher` takes an
+`ActionListener<Void>` precisely so warming can be asynchronous. W1 completed it synchronously at the end of
+a blocking loop, which satisfies the type and defeats the point.
+
+Each backend now warms in the way that is non-blocking for it: one multi-get for the system index, an
+executor hop for the object store. The multi-get is also what C1 said the prefetch was for -- M tenants
+resolved together rather than one at a time from inside the document loop -- so the fix and the original
+justification finally agree. `warmAsync` is deliberately not a defaulted no-op on `DescriptorBackend`: a
+default would let a backend opt out silently, which is the failure this area keeps producing, and a prefetch
+that does nothing is indistinguishable from a fast one.
+
+`DescriptorCache.warm` counts the read. Not counting it would make the hit rate the cache reports flattering
+rather than true, since warmed names would look like hits with no read behind them.
+
+**Result, whole plugin suite, against the base measured the same way:**
+
+| | baseline | after I4 + D2 | after this |
+|---|---|---|---|
+| passing | 70 | 165 | **178** |
+| failing | 23 | 14 | **1** |
+| skipped | 118 | 2 | 2 |
+| class-level aborts | 8 | 0 | 0 |
+
+The one remaining failure, `ServerlessStorageShardRetentionStatsActionIT`, fails at baseline too and is
+unrelated to any of this.
+
+**What this says about the earlier numbers.** Every "gated creation" measurement this branch has recorded --
+throughput against ordinary creation, sustained creation profile, batching headroom -- was taken with a
+blocking get per index on the request path. Those numbers were measuring the prefetcher, not the design.
+They should be re-run before any of them is cited again.

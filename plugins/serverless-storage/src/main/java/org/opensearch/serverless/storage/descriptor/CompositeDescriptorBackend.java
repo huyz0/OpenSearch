@@ -83,6 +83,17 @@ public final class CompositeDescriptorBackend implements DescriptorBackend, Desc
     }
 
     /**
+     * Warms the point half only, since that is the half {@link #get} reads.
+     *
+     * <p>Warming the prefix half would be warming an index for queries this never issues: prefix searches
+     * are refresh-bound and served by a search, not by the descriptor cache a point read consults.
+     */
+    @Override
+    public void warmAsync(java.util.Collection<String> names, org.opensearch.core.action.ActionListener<Void> listener) {
+        points.warmAsync(names, listener);
+    }
+
+    /**
      * Both halves have to be ready, because a cluster that can resolve a name but not a wildcard is not
      * usable and would report itself healthy.
      */

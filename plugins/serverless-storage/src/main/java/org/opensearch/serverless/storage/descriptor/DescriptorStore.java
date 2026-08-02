@@ -231,6 +231,62 @@ public final class DescriptorStore implements DescriptorBackend, DescriptorPrefi
     }
 
     /**
+     * Warms the cache for a whole request's names in one round trip, without blocking the caller.
+     *
+     * <p><b>Asynchronous because the caller is a request thread, and that is not a preference.</b> The first
+     * version of C1's prefetcher looped over {@link #get}, which blocks, and it ran inside
+     * {@code TransportBulkAction.doExecute}. On a transport worker or the cluster applier thread that trips
+     * OpenSearch's "Blocking operation" assertion, and the failure surfaced somewhere else entirely: an
+     * {@code AssertionError} captured into the gated creation future and re-thrown at the acknowledgement,
+     * so four suites reported a create or delete failing with a thread assertion naming code nowhere near
+     * them.
+     *
+     * <p>One multi-get rather than N gets, which is also what C1 said this was for: a bulk touching M
+     * tenants resolves M descriptors together instead of one at a time from inside the document loop.
+     *
+     * <p>Best effort by contract. Any failure completes the listener successfully, because a request must
+     * not fail for want of a warm cache -- whatever did not warm is resolved inline later, slowly.
+     */
+    @Override
+    public void warmAsync(java.util.Collection<String> names, org.opensearch.core.action.ActionListener<Void> listener) {
+        if (names.isEmpty()) {
+            listener.onResponse(null);
+            return;
+        }
+        try {
+            org.opensearch.action.get.MultiGetRequest request = new org.opensearch.action.get.MultiGetRequest();
+            for (String name : names) {
+                request.add(DESCRIPTOR_INDEX, name);
+            }
+            client.multiGet(request, new org.opensearch.core.action.ActionListener<>() {
+                @Override
+                public void onResponse(org.opensearch.action.get.MultiGetResponse response) {
+                    for (org.opensearch.action.get.MultiGetItemResponse item : response.getResponses()) {
+                        if (item.isFailed() || item.getResponse() == null || item.getResponse().isExists() == false) {
+                            continue;
+                        }
+                        try {
+                            descriptorCache.warm(item.getId(), DescriptorCodec.fromSource(item.getResponse().getSourceAsMap()));
+                        } catch (Exception e) {
+                            logger.debug("could not warm the descriptor for [{}]", item.getId(), e);
+                        }
+                    }
+                    listener.onResponse(null);
+                }
+
+                @Override
+                public void onFailure(Exception e) {
+                    logger.debug("could not prefetch descriptors", e);
+                    listener.onResponse(null);
+                }
+            });
+        } catch (Exception e) {
+            logger.debug("could not submit the descriptor prefetch", e);
+            listener.onResponse(null);
+        }
+    }
+
+    /**
      * One read of one descriptor from the index, with no caching of its own.
      *
      * <p>T7 moved the freshness window, the eviction and the in-flight collapsing into

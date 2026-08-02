@@ -178,22 +178,25 @@ public final class DescriptorGate {
         // has produced repeatedly and which is invisible because a no-op prefetch looks exactly like a
         // successful one.
         //
-        // Warming is a plain get per name, which is what puts the descriptor in the cache the eleven
-        // synchronous sites read from. Doing it here rather than at those sites is the whole point: this
-        // runs once per request with the full name set, so a bulk touching M tenants resolves M
-        // descriptors together instead of one at a time from inside the document loop.
+        // Warming puts descriptors in the cache the eleven synchronous sites read from. Doing it here rather
+        // than at those sites is the whole point: this runs once per request with the full name set, so a
+        // bulk touching M tenants resolves M descriptors together instead of one at a time from inside the
+        // document loop.
+        //
+        // Delegated to the backend rather than looped here, because the loop was the bug. This registered a
+        // plain get per name, and get blocks. The hook runs in TransportBulkAction.doExecute, on a transport
+        // worker and sometimes on the cluster applier thread, both of which assert against blocking. The
+        // resulting AssertionError was captured into the gated creation future and re-thrown at the
+        // acknowledgement, so four suites failed a create or a delete with a thread assertion pointing at
+        // code nowhere near them. Each backend now warms in whatever way is non-blocking for it: one
+        // multi-get for the system index, an executor hop for the object store.
         DescriptorPrefetch.register((indexNames, listener) -> {
-            for (String indexName : indexNames) {
-                try {
-                    store.get(indexName);
-                } catch (RuntimeException e) {
-                    // One name failing must not abandon the rest, and must not fail the request either.
-                    // Whatever did not warm is resolved inline later, slowly, which is the contract
-                    // DescriptorPrefetch states and the reason this is allowed to be best effort.
-                    logger.debug("could not prefetch the descriptor for [{}]", indexName, e);
-                }
+            try {
+                store.warmAsync(indexNames, listener);
+            } catch (RuntimeException e) {
+                logger.debug("could not prefetch descriptors", e);
+                listener.onResponse(null);
             }
-            listener.onResponse(null);
         });
         // The write path. H2b dual-writes the descriptor at creation and H4 records deletions as
         // tombstones, and neither has ever had a publisher registered, so no index creation outside a test
