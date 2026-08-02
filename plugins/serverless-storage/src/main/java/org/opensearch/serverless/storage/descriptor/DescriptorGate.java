@@ -14,6 +14,7 @@ import org.opensearch.action.admin.cluster.stats.GatedMappingStatsAggregator;
 import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.DescriptorOnlyCreation;
 import org.opensearch.cluster.metadata.DescriptorPrefetch;
+import org.opensearch.cluster.metadata.DurableTombstones;
 import org.opensearch.cluster.metadata.IndexDescriptor;
 import org.opensearch.cluster.metadata.IndexDescriptorPublisher;
 import org.opensearch.cluster.metadata.MappingGenerationStore;
@@ -257,6 +258,33 @@ public final class DescriptorGate {
             }
             recordChange(descriptor);
         });
+        // The durable half of deletion, which had a hook in MetadataDeleteIndexService and no registrar, so
+        // every gated delete acknowledged with nothing durable behind it.
+        //
+        // The publisher above is fire-and-forget by necessity: it runs inside cluster state construction,
+        // where blocking deadlocks. That is fine for a creation, whose index is in cluster state anyway, and
+        // not fine for a tombstone. For a gated index there is no cluster state entry and no graveyard entry
+        // standing behind the tombstone, so losing it means a node holding that shard's data can adopt it
+        // again on rejoin -- the resurrection IndexGraveyard exists to prevent, reintroduced.
+        //
+        // This runs after the state is committed and before the client is told the delete succeeded, which
+        // is the one window where a write can be both off the cluster state thread and ahead of the
+        // acknowledgement. Nothing blocks; the acknowledgement is deferred, not waited on.
+        DurableTombstones.register((deleted, whenStored) -> {
+            if (deleted.isEmpty()) {
+                whenStored.onResponse(null);
+                return;
+            }
+            // Grouped so the acknowledgement waits for all of them and reports the first failure. A delete
+            // naming several indices is not durable until the last tombstone is.
+            org.opensearch.core.action.ActionListener<Void> perTombstone = new org.opensearch.action.support.GroupedActionListener<>(
+                org.opensearch.core.action.ActionListener.wrap(ignored -> whenStored.onResponse(null), whenStored::onFailure),
+                deleted.size()
+            );
+            for (org.opensearch.cluster.metadata.IndexMetadata metadata : deleted) {
+                store.putTombstoneAsync(IndexDescriptor.from(metadata).tombstoned(), perTombstone);
+            }
+        });
         // T18. The creator is a separate registration from the publisher because the two have opposite
         // failure semantics, and T17 and T23 are what happened while one stood in for the other. The
         // publisher records an index that already exists in cluster state, so a lost write costs a
@@ -460,6 +488,7 @@ public final class DescriptorGate {
         // otherwise decide the behaviour of every suite that ran after it in the same JVM.
         WILDCARD_EXPANSION_LIMIT.set(DEFAULT_WILDCARD_EXPANSION_LIMIT);
         IndexDescriptorPublisher.register(null);
+        DurableTombstones.register(null);
         IndexDescriptorPublisher.registerCreator(null);
         MappingGenerationStore.register(null);
         GatedMappingStatsAggregator.register(null);

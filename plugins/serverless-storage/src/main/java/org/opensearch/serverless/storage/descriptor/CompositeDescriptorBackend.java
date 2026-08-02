@@ -83,6 +83,20 @@ public final class CompositeDescriptorBackend implements DescriptorBackend, Desc
     }
 
     /**
+     * Durability is the point half's answer.
+     *
+     * <p>The prefix half is an index over descriptors rather than the record itself, so a tombstone that
+     * reached the object store and not yet the index is durable in the sense that matters: a node rejoining
+     * with dangling shard data reads the point half to find out whether the index still exists. The prefix
+     * half is written separately by the gate, and losing that write costs a wildcard match rather than the
+     * resurrection this listener guards.
+     */
+    @Override
+    public void putTombstoneAsync(IndexDescriptor tombstone, org.opensearch.core.action.ActionListener<Void> whenDurable) {
+        points.putTombstoneAsync(tombstone, whenDurable);
+    }
+
+    /**
      * Warms the point half only, since that is the half {@link #get} reads.
      *
      * <p>Warming the prefix half would be warming an index for queries this never issues: prefix searches

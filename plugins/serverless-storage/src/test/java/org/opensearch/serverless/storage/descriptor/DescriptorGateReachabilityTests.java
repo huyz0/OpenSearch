@@ -76,6 +76,11 @@ public class DescriptorGateReachabilityTests extends OpenSearchTestCase {
             DescriptorPrefetch.isRegistered()
         );
         assertTrue("the creation gate", DescriptorOnlyCreation.isRegistered());
+        assertTrue(
+            "the durable tombstone writer, which had its hook in MetadataDeleteIndexService from the start "
+                + "and no registrar, so every gated delete acknowledged with nothing durable behind it",
+            org.opensearch.cluster.metadata.DurableTombstones.isRegistered()
+        );
         assertTrue("the mapping store", MappingGenerationStore.isRegistered());
         assertTrue("the unknown field refresher", UnknownFieldRefresh.isRegistered());
     }
@@ -89,6 +94,7 @@ public class DescriptorGateReachabilityTests extends OpenSearchTestCase {
         assertFalse(AbsentIndexDescriptorSuppliers.isExpanderRegistered());
         assertFalse("a prefetcher left behind would outlive the plugin that installed it", DescriptorPrefetch.isRegistered());
         assertFalse(DescriptorOnlyCreation.isRegistered());
+        assertFalse(org.opensearch.cluster.metadata.DurableTombstones.isRegistered());
         assertFalse(MappingGenerationStore.isRegistered());
         assertFalse(UnknownFieldRefresh.isRegistered());
     }

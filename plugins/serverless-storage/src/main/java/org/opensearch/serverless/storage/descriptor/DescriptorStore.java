@@ -532,28 +532,46 @@ public final class DescriptorStore implements DescriptorBackend, DescriptorPrefi
      * rather than half-built here.
      */
     public void putTombstoneAsync(IndexDescriptor tombstone) {
-        submitTombstone(tombstone, 1);
+        // Nobody waiting. The listener still runs the retries; it just has nothing to tell.
+        putTombstoneAsync(tombstone, org.opensearch.core.action.ActionListener.wrap(() -> {}));
     }
 
-    private void submitTombstone(IndexDescriptor tombstone, int attempt) {
+    /**
+     * {@inheritDoc}
+     *
+     * <p>The listener is completed when the write has actually landed, which is what lets a deletion defer
+     * its acknowledgement until the tombstone is durable rather than merely submitted.
+     */
+    @Override
+    public void putTombstoneAsync(IndexDescriptor tombstone, org.opensearch.core.action.ActionListener<Void> whenDurable) {
+        submitTombstone(tombstone, 1, whenDurable);
+    }
+
+    private void submitTombstone(IndexDescriptor tombstone, int attempt, org.opensearch.core.action.ActionListener<Void> whenDurable) {
         // Same bootstrap as putAsync, and for the same reason: a tombstone is also a first-touch path, since
         // deleting an index is a perfectly ordinary first thing for a cluster to do to the descriptor store.
-        ensureIndexExistsAsync().whenComplete((ignored, bootstrapFailure) -> submitTombstoneNow(tombstone, attempt));
+        ensureIndexExistsAsync().whenComplete((ignored, bootstrapFailure) -> submitTombstoneNow(tombstone, attempt, whenDurable));
     }
 
-    private void submitTombstoneNow(IndexDescriptor tombstone, int attempt) {
+    private void submitTombstoneNow(
+        IndexDescriptor tombstone,
+        int attempt,
+        org.opensearch.core.action.ActionListener<Void> whenDurable
+    ) {
         try {
             logger.debug("recording tombstone for [{}], attempt [{}]", tombstone.name(), attempt);
             client.index(
                 new IndexRequest(DESCRIPTOR_INDEX).id(tombstone.name()).source(DescriptorCodec.toSource(tombstone)),
                 new org.opensearch.core.action.ActionListener<>() {
                     @Override
-                    public void onResponse(org.opensearch.action.index.IndexResponse response) {}
+                    public void onResponse(org.opensearch.action.index.IndexResponse response) {
+                        whenDurable.onResponse(null);
+                    }
 
                     @Override
                     public void onFailure(Exception e) {
                         if (attempt < TOMBSTONE_ATTEMPTS) {
-                            submitTombstone(tombstone, attempt + 1);
+                            submitTombstone(tombstone, attempt + 1, whenDurable);
                             return;
                         }
                         // Logged at warn rather than swallowed: a lost tombstone means a node may later
@@ -565,11 +583,16 @@ public final class DescriptorStore implements DescriptorBackend, DescriptorPrefi
                             TOMBSTONE_ATTEMPTS,
                             e
                         );
+                        // Failed rather than swallowed, so a caller waiting on durability is told. A delete
+                        // that cannot record its tombstone has not achieved what a delete promises, and
+                        // reporting success would be the scale-down bug this project already found once.
+                        whenDurable.onFailure(e);
                     }
                 }
             );
         } catch (Exception e) {
             logger.warn("failed to submit tombstone write for [{}]", tombstone.name(), e);
+            whenDurable.onFailure(e);
         }
     }
 

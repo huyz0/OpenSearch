@@ -241,16 +241,37 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
      */
     @Override
     public void putTombstoneAsync(IndexDescriptor tombstone) {
-        executor.execute(() -> {
-            try {
-                writeTombstone(tombstone);
-            } catch (RuntimeException e) {
-                // Louder than the others. A lost tombstone is the one descriptor write that cannot be
-                // reconstructed: for a gated index there is no cluster state entry and no graveyard entry
-                // behind it, so the name silently stays live.
-                logger.error("could not write the tombstone for [{}]; the index may resurrect", tombstone.name(), e);
-            }
-        });
+        putTombstoneAsync(tombstone, org.opensearch.core.action.ActionListener.wrap(() -> {}));
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Still on the executor, because a blob write blocks and the caller is a cluster state thread. What
+     * the listener adds is an answer: the write either landed or it did not, and a deletion waiting on
+     * durability is entitled to know which.
+     */
+    @Override
+    public void putTombstoneAsync(IndexDescriptor tombstone, org.opensearch.core.action.ActionListener<Void> whenDurable) {
+        try {
+            executor.execute(() -> {
+                try {
+                    writeTombstone(tombstone);
+                    whenDurable.onResponse(null);
+                } catch (RuntimeException e) {
+                    // Louder than the others. A lost tombstone is the one descriptor write that cannot be
+                    // reconstructed: for a gated index there is no cluster state entry and no graveyard entry
+                    // behind it, so the name silently stays live.
+                    logger.error("could not write the tombstone for [{}]; the index may resurrect", tombstone.name(), e);
+                    whenDurable.onFailure(e);
+                }
+            });
+        } catch (Exception e) {
+            // A rejected execution has to fail the listener too, or the deletion waits forever on a write
+            // that was never going to run.
+            logger.error("could not submit the tombstone write for [{}]; the index may resurrect", tombstone.name(), e);
+            whenDurable.onFailure(e);
+        }
     }
 
     private void writeTombstone(IndexDescriptor tombstone) {
