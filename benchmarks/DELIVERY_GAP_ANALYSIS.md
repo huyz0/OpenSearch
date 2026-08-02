@@ -85,20 +85,26 @@ Section 3.1 records what that corrected. Measure against the merge base, never a
 |---|---|
 | added (new seams and mechanisms) | 37 |
 | modified | 106 |
-| of the modified, files whose diff references a seam | **49** |
-| of the modified, files that do not | **57** |
+| of the modified, files reaching a seam | **59** |
+| of the modified, files that do not | **47** |
 | of all modified, files changing six lines or fewer | 17 |
 | core files deleted | **0** |
 
 That split is the whole R2 story.
 
-The 49 are the metadata plane's real footprint. They follow one shape: a static registry holding a
+The 59 are the metadata plane's real footprint. They follow one shape: a static registry holding a
 nullable supplier, a call site that checks for null, and identical behaviour when nothing is registered.
 That is a defensible extension-point design and it scales to the ten seams listed in section 4.
 
-The 57 are not that. They belong to the pluggable engine work the branch was originally cut for. Section
-11 reports what reading them found; the short version is that the engine work is a genuine second change
-sharing a branch with the metadata plane, and section 12 is about separating them.
+The 47 are not that. Section 15 reads all of them, and in particular reads every one of the 18 that
+alters an existing line. Two things came out of it: the default path is unchanged in all 18, by
+construction rather than by luck, and the branch turns out to contain a third body of work rather than
+two.
+
+A note on the seam count, because it moved. An earlier version of this table said 49 and 57, matching
+seam names as text in each diff. That undercounts, because seam reach is transitive:
+`IndicesStore` and `IncrementalClusterStateWriter` mention no seam but call
+`RoutingNodes.localRoutingNode`, which calls one. Resolve callees, do not grep the patch.
 
 ### 3.1 What the stale baseline had wrong
 
@@ -109,7 +115,7 @@ The corrected numbers are roughly half the previously reported ones, and two cla
 | core files changed | 303 | **143** |
 | insertions | 17,959 | **11,341** |
 | deletions | 1,605 | **449** |
-| non-seam modified files | 198 | **57** |
+| non-seam modified files | 198 | **47** |
 | removed public/protected members | 34, across 21 files | **5, across 2 files** |
 | core files deleted | reported as a concern | **0** |
 
@@ -580,8 +586,12 @@ own merits. Section 13.
 split. It applies with no plugin installed, so it is a real R1 deviation, and it fixes a genuine upstream
 data-loss window. It is separable and should be proposed to `main` as its own bug fix.
 
-**4. The engine work is the 57 non-seam modified files plus most of the 37 new ones.** Not this design's to
-justify, and the reason the raw diff looks several times larger than the metadata plane is.
+**4. The engine work is most of the 47 non-seam modified files plus part of the 37 new ones.** Not this
+design's to justify, and the reason the raw diff looks several times larger than the metadata plane is.
+
+**5. Ten of the new core files are neither.** They complete in-place shard split and add in-place merge,
+a core feature upstream had started and left without an API. Additive, so R1 is untouched, and the most
+straightforwardly upstreamable part of the branch. Section 15.
 
 ### The sequence that would work
 
@@ -730,3 +740,84 @@ The four tests that covered the old core enforcement are gone with the thing the
 `ServerlessStoragePlugin(Settings)`. It had to *replace* the no-arg one rather than sit beside it:
 `PluginsService.loadPlugin` refuses any plugin class with more than one public constructor, so keeping both
 would have loaded fine in every unit test, which calls `new` directly, and failed every real node.
+
+---
+
+## 15. H8: the non-seam core files, read against the corrected baseline
+
+Sections 7 and 11 audited these against the stale `main`, so their denominators counted upstream files
+this branch never touched. Redone against the fork point, and this time every file that alters an
+existing line was read rather than sampled.
+
+### The population
+
+47 non-seam modified core files, not 57. The difference is that the earlier count matched seam names as
+plain text in the diff, and several seams were missing from that list. 29 are pure additions, adding
+methods or fields without touching an existing line. 18 alter existing lines, and those 18 are where the
+R1 question lives.
+
+### The finding on R1
+
+**All 18 leave the default path unchanged**, and each does so by one of five mechanisms rather than by
+luck:
+
+| mechanism | files | why it is inert |
+|---|---|---|
+| default-`false` hook on `EngineFactory` | `StoreRecovery`, `IndexShard` | `recoverMissingLocalStore`, `recoverInPlaceSplitLocalStore`, `recoverInPlaceMergeLocalStore`, `supportsEngineNativeSnapshots`, `ownsRemoteSegmentDurability` all default false, so the new branch falls through to the original code |
+| default-method overload on a plugin interface | `IndexStorePlugin`, `EnginePlugin`, `IndicesService`, `IndexService` | the new signature delegates to the old one, so existing implementations are unaffected |
+| null-guard for metadata without routing | `SnapshotsService`, `DiskThresholdDecider`, `TieringServiceValidator`, `IndexRoutingTable` | a traditional index always has a routing entry, so the guard cannot fire |
+| behaviour-equivalent optimisation | `IndicesStore`, `IncrementalClusterStateWriter` | `RoutingNodes.localRoutingNode` selects the same shards for a data node as the full constructor |
+| deliberate removal, verified dead | `ShardRouting`, `ShardRoutingState`, `SplitShardsMetadata` | CC1, section 13 |
+
+Two are worth singling out because they are the two most likely to have been wrong.
+
+`IndexShard` now routes snapshot recovery through `restoreFromEngineNativeSnapshot` instead of
+`restoreFromRepository`. That reads like an extra remote probe on every restore. It is not:
+`recoverFromEngineNativeSnapshot` checks `supportsEngineNativeSnapshots()` **locally first**, and when it
+is false, which is the default, it delegates without issuing any blob request at all. The probe only
+happens for an engine that has said it produces such snapshots.
+
+`BufferedAsyncIOProcessor` grew a byte-threshold early drain. `getBufferByteThreshold()` defaults to
+`-1` and `itemSizeInBytes()` to `0`, so the threshold can never be crossed and the new
+`scheduleProcess(immediate)` is always called with `false`, which is the original code path.
+
+### A flaw in the audit method itself
+
+`IndicesStore` and `IncrementalClusterStateWriter` were classified as non-seam because neither diff
+mentions a seam. Both call `RoutingNodes.localRoutingNode`, which is new on this branch and calls
+`AbsentIndexRoutingSuppliers.localShards`. So both reach a seam one level down.
+
+That does not change the R1 answer for either, since the seam returns nothing when unregistered. It does
+mean **seam reach is transitive and a text match on the diff undercounts it**. Any future pass should
+resolve callees rather than grep the patch.
+
+### A third body of work, not two
+
+The branch is not "metadata plane plus engine work". It also completes and extends a core feature that
+has nothing to do with either.
+
+Upstream shipped `MetadataInPlaceSplitShardService` and `InPlaceSplitShardClusterStateUpdateRequest` and
+no API surface at all. This branch adds ten new core files: the action, transport action and REST
+handler for in-place split, the whole of in-place merge (action, transport, request, two metadata
+services, REST handler), plus registrations in `ActionModule`, a `ClusterManagerTask` entry, an
+`IN_PLACE_MERGE_SHARD` recovery source, and new wire fields on `SplitShardsMetadata` correctly gated on
+`Version.V_3_8_0`.
+
+This is additive, so R1 holds: nothing existing behaves differently. But it is core feature work sitting
+outside any plugin, which is neither a seam nor engine work, and it is a third thing to decide about
+when splitting the branch. It is also the most straightforwardly upstreamable part of the whole branch,
+since it finishes something upstream started.
+
+### Where R1 and R2 actually stand
+
+R1 has exactly one deviation, and it is the one section 13 already named: CC1's write rejection on an
+in-progress split parent. Everything else in core is inert without a plugin, by construction rather than
+by a setting default.
+
+R2 is a judgement rather than a measurement. The metadata plane's 49 files follow the seam shape
+faithfully. The engine work reaches core mostly through default methods on `EnginePlugin` and
+`IndexStorePlugin`, which is the right shape, plus visibility widening on `InternalEngine` so an
+alternative engine can subclass rather than reimplement. Widening `private` to `protected` is a
+maintenance commitment rather than a behaviour change, and it is worth being explicit that this is the
+mechanism, because "no behaviour changed" and "core's API surface did not grow" are different claims and
+only the first is true.
