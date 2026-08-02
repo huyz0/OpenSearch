@@ -362,3 +362,32 @@ gated branch plus a test that proves the branch is taken, and that is a task eac
 That the residency problem is bounded and locatable rather than diffuse: two thirds of the call sites cannot
 see a gated index at all, and the ones that can are a list of about a dozen. It does not establish that the
 dozen are safe. Four are now known unsafe and three of those are still unsafe.
+
+### G9b: triaging the server internalClusterTest failures
+
+Two full runs of `:server:internalClusterTest`, 5,931 tests each. The first reported 37 failures. The
+question was whether any belonged to this work.
+
+**The failing sets are almost disjoint.** Run one: `RemoteCloseIndexIT`, `SnapshotStatusApisIT`,
+`SearchFieldsIT`, `QueryStringIT`, `RestoreShallowSnapshotV2IT` and others. Run two, over the same code:
+`RemoteMigrationIndexMetadataUpdateIT`, `RemoteStoreRepositoryRegistrationIT`, `LegacyGeoShapeIntegrationIT`,
+`CreateRemoteIndexClusterDefaultDocRepIT`. One class, `AutoExpandSearchReplicasIT`, appears in both.
+
+That is the attribution. A regression fails the same thing every time. A set that changes between runs of
+identical code is the machine, and several of the failures say so directly: "Test abandoned because suite
+timeout was reached", a translog transfer timeout, a temporary-file cleanup assertion.
+
+**Passing in isolation was deliberately not treated as sufficient.** That exact reasoning would have cleared
+the D2 sweep regression, which also failed only under whole-suite load and also passed alone, and was real.
+What separated that case was that its failures were *stable* across runs and the suite's wall clock doubled.
+Neither holds here.
+
+Two descriptor suites did appear and were checked directly rather than waved through, because they are in
+this work's own area: `DescriptorResolutionScaleIT` asserts a point lookup does not scale with population,
+which is the property the whole design rests on, and `DescriptorScalingCurveIT` guards against warmup
+contaminating its own baseline. Both pass in isolation, in 2m55s.
+
+**What is not established.** The second run was killed at about 60 percent, so its total is unknown, and no
+baseline arm was run. The disjointness answers the attribution question without one; it does not tell anyone
+how many of these suites are chronically flaky on this hardware, which is a separate and useful thing to
+know.
