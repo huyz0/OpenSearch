@@ -309,3 +309,56 @@ Writes invalidate. `put` invalidates after the write rather than before, since d
 leaves a window where a concurrent read repopulates from the old value and outlives the write. Deletion
 invalidates once the tombstone lands, because a deleted index that still resolves would accept a write
 against a shard the cluster no longer believes in.
+
+---
+
+## 9. G9: the residency audit
+
+Section 4d said 212 core files had never been checked for code that assumes an index is in cluster state.
+This narrows that to the accessor that actually fails and walks the results.
+
+### The signal
+
+`Metadata.getIndexSafe` throws `IndexNotFoundException` for an index cluster state has no entry for, which
+is a gated index by definition. It is the "assume residency, fail loudly" accessor, and it is where both
+previously-found residency bugs lived. 58 call sites across 37 core files.
+
+`metadata().index()` returning null is the quieter half of the same problem and is not covered here.
+
+### Classification
+
+| | files | reachable for a gated index? |
+|---|---|---|
+| allocation, deciders, routing, gateway | 20 | **no**. A gated index publishes no routing table and gets no allocator involvement, so none of this ever sees one. |
+| the metadata plane's own files | 5 | already handled, and the reason they call it |
+| request and admin paths | 12 | **yes**, and this is where the audit had to look |
+
+### Found and fixed
+
+**`TransportGetAction.getExecutor`** called `getIndexSafe` purely to choose a thread pool, so **every
+single-document get on a gated index failed** with "no such index". Bulk and search worked throughout,
+because this is the only read path that picks its executor from metadata, which is exactly why nothing
+caught it: the class of test that would have found it is a get by id, and none existed.
+
+Proven before fixing rather than after, by adding the get-by-id case to `BlobBackedDescriptorIT` and
+watching it fail with `IndexNotFoundException[no such index [tenant-getbyid]]`.
+
+### Found and left, with reasons
+
+**`TransportBroadcastReplicationAction`** calls `getIndexSafe` only inside `onFailure`, to count replicas
+for the failure report. A gated index reaching it would throw while handling another failure and mask the
+original cause. Worth fixing; it degrades an error message rather than breaking a working path, and it needs
+a shard failure on a gated index to reach, which no current test produces.
+
+**`MetadataUpdateSettingsService`** (three sites) and **`MetadataIndexStateService`** (two) are unguarded.
+Update-settings, open and close on a gated index would fail the same way the delete path did before D1.
+These are real gaps and they are not fixed here because each needs the same treatment D1 got, which is a
+gated branch plus a test that proves the branch is taken, and that is a task each rather than a line each.
+
+**`TransportUpdateSettingsAction`**, tiering, and `TruncateTranslogAction` were not walked.
+
+### What this pass establishes
+
+That the residency problem is bounded and locatable rather than diffuse: two thirds of the call sites cannot
+see a gated index at all, and the ones that can are a list of about a dozen. It does not establish that the
+dozen are safe. Four are now known unsafe and three of those are still unsafe.

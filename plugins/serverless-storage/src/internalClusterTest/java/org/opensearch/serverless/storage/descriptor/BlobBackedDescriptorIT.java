@@ -303,6 +303,28 @@ public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.Se
     }
 
     /**
+     * A get by id, which is the one read path the other tests here never exercise.
+     *
+     * <p>G9's residency audit found {@code TransportGetAction.getExecutor} calling
+     * {@code metadata().getIndexSafe(shardId.getIndex())} purely to decide which thread pool to use. For a
+     * gated index that is an index cluster state has no entry for, so the accessor that throws on absence is
+     * consulted on every single-document get. Bulk and search were covered and this was not, which is why it
+     * survived: the failure needs a get by id specifically.
+     */
+    public void testAGatedIndexCanBeReadByIdAndNotJustSearched() throws Exception {
+        createGated("tenant-getbyid");
+        assertGated("tenant-getbyid");
+        awaitDescriptor("tenant-getbyid");
+
+        client().prepareIndex("tenant-getbyid").setId("doc-1").setSource("value", 7).get();
+        client().admin().indices().prepareRefresh("tenant-getbyid").get();
+
+        org.opensearch.action.get.GetResponse response = client().prepareGet("tenant-getbyid", "doc-1").get();
+        assertTrue("a document written to a gated index must be readable by id", response.isExists());
+        assertEquals(7, response.getSourceAsMap().get("value"));
+    }
+
+    /**
      * Reads the descriptor straight out of the object store, so the claim is about where the bytes are and
      * not merely about whether a request succeeded. A request succeeding proves the system index could
      * have served it too.
