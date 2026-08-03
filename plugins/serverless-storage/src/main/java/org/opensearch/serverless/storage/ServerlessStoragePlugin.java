@@ -1386,6 +1386,40 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      * been stalled, and an hour is far longer than any pass takes. Longer costs storage for nothing, since
      * a node behind by more than this has an empty cache anyway and does not need the history.
      */
+    /**
+     * How long a tombstone is kept before it can be reclaimed.
+     *
+     * <p>A tombstone records that an index was deleted, so that a node partitioned through the delete drops
+     * its local shard data on rejoin instead of keeping it. It is not what stops a deleted index being
+     * served, since a gated shard only opens through a successful descriptor lookup, so the window this has
+     * to cover is the longest a node can be partitioned and still come back carrying that data.
+     *
+     * <p>Seven days is deliberately generous. Reclaiming late costs storage; reclaiming early costs a node
+     * the record it needed, and the two are not worth trading evenly.
+     */
+    public static final Setting<TimeValue> TOMBSTONE_RETENTION_SETTING = Setting.timeSetting(
+        "serverless_storage.descriptor.tombstone_retention",
+        TimeValue.timeValueDays(7),
+        TimeValue.timeValueMinutes(1),
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * How often tombstones past the retention window are reclaimed, or zero to leave it to the object store.
+     *
+     * <p>Zero by default, because an object-store lifecycle rule over the tombstone prefix does the same job
+     * for no requests at all and is the better answer wherever it exists. This scrubber is for stores with no
+     * such facility, and for a deployment where the rule was never configured; it costs one listing plus a
+     * read per tombstone examined per pass, which is affordable at a modest population and is not how anyone
+     * should reclaim a hundred million of them.
+     */
+    public static final Setting<TimeValue> TOMBSTONE_SCRUB_INTERVAL_SETTING = Setting.timeSetting(
+        "serverless_storage.descriptor.tombstone_scrub_interval",
+        TimeValue.ZERO,
+        TimeValue.ZERO,
+        Setting.Property.NodeScope
+    );
+
     public static final Setting<TimeValue> DESCRIPTOR_CHANGE_LOG_RETENTION_SETTING = Setting.timeSetting(
         "serverless_storage.descriptor.change_log_retention",
         TimeValue.timeValueHours(1),
@@ -1413,6 +1447,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             DESCRIPTOR_CHANGE_TAIL_INTERVAL_SETTING,
             DESCRIPTOR_CACHE_FRESHNESS_SETTING,
             DESCRIPTOR_CHANGE_LOG_RETENTION_SETTING,
+            TOMBSTONE_RETENTION_SETTING,
+            TOMBSTONE_SCRUB_INTERVAL_SETTING,
             COMPUTED_PLACEMENT_ENABLED_SETTING,
             SERVERLESS_STORAGE_ENABLED_SETTING,
             SERVERLESS_STORAGE_BASE_PATH_SETTING,
@@ -1917,6 +1953,31 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                         pruneTarget.pruneOlderThan(changeLogRetention.millis());
                     }
                 }, changeLogRetention, ThreadPool.Names.GENERIC);
+
+                // Tombstone reclamation, off unless asked for, and on the elected cluster manager alone for
+                // the same reason as pruning: a pass is one listing, and every node doing it pays that N
+                // times for one pass worth of work.
+                final TimeValue scrubInterval = TOMBSTONE_SCRUB_INTERVAL_SETTING.get(environment.settings());
+                if (scrubInterval.equals(TimeValue.ZERO) == false) {
+                    final long tombstoneRetention = TOMBSTONE_RETENTION_SETTING.get(environment.settings()).millis();
+                    final org.opensearch.serverless.storage.descriptor.TombstoneScrubber scrubber =
+                        new org.opensearch.serverless.storage.descriptor.TombstoneScrubber(
+                            path -> {
+                                try {
+                                    return resolveContainerForDescriptors(path, "no blob store for tombstone reclamation");
+                                } catch (IOException e) {
+                                    throw new java.io.UncheckedIOException(e);
+                                }
+                            },
+                            BlobPath.cleanPath().add("descriptors-root"),
+                            System::currentTimeMillis
+                        );
+                    threadPool.scheduleWithFixedDelay(() -> {
+                        if (clusterService.state().nodes().isLocalNodeElectedClusterManager()) {
+                            scrubber.scrubOnce(tombstoneRetention);
+                        }
+                    }, scrubInterval, ThreadPool.Names.GENERIC);
+                }
             } catch (Exception e) {
                 // A cluster with no object store configured still publishes descriptors and still resolves
                 // them; it simply has no cross-node feed, which is the state it was in before this existed.
