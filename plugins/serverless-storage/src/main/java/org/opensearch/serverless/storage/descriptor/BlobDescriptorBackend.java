@@ -421,8 +421,37 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
     }
 
     /** The descriptor's existing wire format, so there is one serialisation rather than two that drift. */
+    /**
+     * Marks a stored descriptor as carrying a format version, and cannot be the start of an unversioned one.
+     *
+     * <p>An unversioned blob begins with {@code writeString(name)}, which is a vInt length followed by the
+     * name's bytes. Index names are limited to 255 bytes, so that vInt is at most two bytes and its first
+     * byte sets the continuation bit only when the length exceeds 127. This value's first three bytes all
+     * set it, which would describe a name of roughly 450,000 characters. No unversioned blob can begin this
+     * way, so the two formats are distinguishable rather than merely unlikely to collide.
+     */
+    private static final int FORMAT_MAGIC = 0xD3C21B1F;
+
+    /** Bumped whenever the stored layout changes in a way an older reader would misread. */
+    static final int FORMAT_VERSION = 1;
+
+    /**
+     * Serialises a descriptor for storage, behind a magic and a version.
+     *
+     * <p>The stored format had neither, and {@link IndexDescriptor} appends fields without gating them on a
+     * transport version, so every field added to that class silently invalidated everything already in the
+     * store. Two fields had already been added that way. For a live descriptor that is survivable, since it
+     * is rewritten whenever its index changes; for a tombstone it is not, because a tombstone is written
+     * once and then has to outlive exactly this kind of change for a whole retention window.
+     *
+     * <p>Transport versioning cannot substitute for this. These bytes never travel over a transport
+     * connection, so {@code StreamInput#getVersion} on them is whatever the reading node happens to be, and
+     * a reader would always believe the newest fields are present.
+     */
     static BytesReference encode(IndexDescriptor descriptor) {
         try (BytesStreamOutput out = new BytesStreamOutput()) {
+            out.writeInt(FORMAT_MAGIC);
+            out.writeVInt(FORMAT_VERSION);
             descriptor.writeTo(out);
             return out.bytes();
         } catch (IOException e) {
@@ -432,8 +461,33 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
         }
     }
 
+    /**
+     * Reads a stored descriptor, refusing anything it cannot read rather than guessing.
+     *
+     * <p>Refusing is the point. Without the magic, a blob written before the format was versioned is not
+     * detectably different from a current one: the reader parses the name, then reads whichever later
+     * fields it believes in, and produces a descriptor built from misaligned bytes. A shard count read out
+     * of a uuid is worse than an error, because it is an answer. Both failure modes below name what
+     * happened so an operator sees the version boundary rather than an EOF from deep inside a parser.
+     *
+     * <p>Descriptors written before this version are not readable, which is a statement of fact rather than
+     * a decision taken here: the two field additions that preceded this had already made them unreadable,
+     * silently. This makes it loud.
+     */
     static IndexDescriptor decode(BytesReference bytes) throws IOException {
         try (StreamInput in = bytes.streamInput()) {
+            if (bytes.length() < Integer.BYTES || in.readInt() != FORMAT_MAGIC) {
+                throw new IOException(
+                    "stored descriptor has no format marker, so it was written before the stored format carried a "
+                        + "version and cannot be read; its layout is not recoverable from the bytes alone"
+                );
+            }
+            int version = in.readVInt();
+            if (version != FORMAT_VERSION) {
+                throw new IOException(
+                    "stored descriptor is format version [" + version + "] and this node reads [" + FORMAT_VERSION + "]"
+                );
+            }
             return new IndexDescriptor(in);
         }
     }
