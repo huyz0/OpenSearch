@@ -159,6 +159,59 @@ public final class BlobDescriptorChangeLog {
     }
 
     /**
+     * Deletes whole buckets older than {@code retentionMillis}, and reports how many went.
+     *
+     * <p><b>The path structure is the worklist, which is what makes this leak-proof.</b> There is no index
+     * of what to delete and nothing to keep in step: the set of buckets is the set of things that exist, so
+     * a bucket cannot become invisible to this the way an entry can become invisible to a secondary index.
+     * Whatever was written is either inside a bucket this will eventually reach, or inside one too young to
+     * reach yet.
+     *
+     * <p>Safe to run because nothing reads history any more. The tailer starts at the bucket its node
+     * started in and only ever revisits that one, so a bucket older than the retention window has no reader
+     * by construction. That was not true while the log fed a name index built by replaying it from the
+     * beginning, and pruning then would have silently broken a joining node.
+     *
+     * <p>The bucket being written to is never deleted, and that falls out of the arithmetic rather than
+     * needing a guard: the cutoff is {@code bucketOf(now - retention)} and the live bucket is
+     * {@code bucketOf(now)}, so for any non-negative window the cutoff is at or before it and the
+     * at-or-after test below already spares it. A zero window prunes nothing at all for the same reason.
+     *
+     * <p>The clock is read once for that reason. Deriving the cutoff and the live bucket from two separate
+     * reads would let a backwards clock jump between them put the live bucket before the cutoff, and the
+     * bucket every tailer's cursor names would be deleted underneath it.
+     *
+     * <p>Failures are logged and swallowed per bucket rather than aborting the pass. A bucket that resists
+     * deletion is retried on the next pass, and one that half-deletes leaves entries the tailer will not
+     * read anyway because the whole bucket is behind every cursor.
+     */
+    public int pruneOlderThan(long retentionMillis) {
+        long nowMillis = clock.getAsLong();
+        String cutoff = bucketOf(nowMillis - retentionMillis);
+        int pruned = 0;
+        try {
+            BlobContainer root = containers.apply(changelogPath());
+            for (Map.Entry<String, BlobContainer> bucket : new TreeMap<>(root.children()).entrySet()) {
+                if (bucket.getKey().compareTo(cutoff) >= 0) {
+                    continue;
+                }
+                try {
+                    bucket.getValue().delete();
+                    pruned++;
+                } catch (IOException | RuntimeException e) {
+                    logger.warn("could not prune change log bucket [{}]; will retry on the next pass", bucket.getKey(), e);
+                }
+            }
+        } catch (IOException | RuntimeException e) {
+            logger.warn("could not list change log buckets to prune", e);
+        }
+        if (pruned > 0) {
+            logger.debug("pruned [{}] change log buckets older than [{}]", pruned, cutoff);
+        }
+        return pruned;
+    }
+
+    /**
      * One entry as it sits in the log, so a reader can remember what it has already consumed.
      *
      * <p>The key is needed because entry names are random. A reader resuming inside a bucket cannot say

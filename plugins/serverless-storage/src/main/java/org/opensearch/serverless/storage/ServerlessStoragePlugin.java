@@ -1375,6 +1375,24 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      * change log entry can go unnoticed. Shortening it buys nothing that the tailer does not already
      * provide, and costs a read per tenant per window.
      */
+    /**
+     * How long descriptor change log buckets are kept before being deleted.
+     *
+     * <p>The log had no retention at all and grew with every descriptor write, forever. Nothing reads it
+     * beyond the tailer's own poll interval: a tailer starts at the bucket its node started in and revisits
+     * only that one, so a bucket older than a few intervals has no reader.
+     *
+     * <p>An hour rather than minutes because the only thing retention buys is slack for a tailer that has
+     * been stalled, and an hour is far longer than any pass takes. Longer costs storage for nothing, since
+     * a node behind by more than this has an empty cache anyway and does not need the history.
+     */
+    public static final Setting<TimeValue> DESCRIPTOR_CHANGE_LOG_RETENTION_SETTING = Setting.timeSetting(
+        "serverless_storage.descriptor.change_log_retention",
+        TimeValue.timeValueHours(1),
+        TimeValue.timeValueMinutes(2),
+        Setting.Property.NodeScope
+    );
+
     public static final Setting<TimeValue> DESCRIPTOR_CACHE_FRESHNESS_SETTING = Setting.timeSetting(
         "serverless_storage.descriptor.cache_freshness",
         TimeValue.timeValueSeconds(60),
@@ -1394,6 +1412,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         return List.of(
             DESCRIPTOR_CHANGE_TAIL_INTERVAL_SETTING,
             DESCRIPTOR_CACHE_FRESHNESS_SETTING,
+            DESCRIPTOR_CHANGE_LOG_RETENTION_SETTING,
             COMPUTED_PLACEMENT_ENABLED_SETTING,
             SERVERLESS_STORAGE_ENABLED_SETTING,
             SERVERLESS_STORAGE_BASE_PATH_SETTING,
@@ -1887,6 +1906,17 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                     DESCRIPTOR_CHANGE_TAIL_INTERVAL_SETTING.get(environment.settings()),
                     ThreadPool.Names.GENERIC
                 );
+
+                // Pruning, on the elected cluster manager alone. Every node could safely run this, since
+                // deleting an already-deleted bucket is not an error, but every node running it would pay
+                // the listing N times over for one bucket's worth of work.
+                final org.opensearch.serverless.storage.descriptor.BlobDescriptorChangeLog pruneTarget = changeLog;
+                final TimeValue changeLogRetention = DESCRIPTOR_CHANGE_LOG_RETENTION_SETTING.get(environment.settings());
+                threadPool.scheduleWithFixedDelay(() -> {
+                    if (clusterService.state().nodes().isLocalNodeElectedClusterManager()) {
+                        pruneTarget.pruneOlderThan(changeLogRetention.millis());
+                    }
+                }, changeLogRetention, ThreadPool.Names.GENERIC);
             } catch (Exception e) {
                 // A cluster with no object store configured still publishes descriptors and still resolves
                 // them; it simply has no cross-node feed, which is the state it was in before this existed.
