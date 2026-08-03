@@ -281,7 +281,7 @@ public final class DescriptorGate {
                 deleted.size()
             );
             for (org.opensearch.cluster.metadata.IndexMetadata metadata : deleted) {
-                store.putTombstoneAsync(IndexDescriptor.from(metadata).tombstoned(), perTombstone);
+                store.putTombstoneAsync(IndexDescriptor.from(metadata).tombstoned(System.currentTimeMillis()), perTombstone);
             }
         });
         // T18. The creator is a separate registration from the publisher because the two have opposite

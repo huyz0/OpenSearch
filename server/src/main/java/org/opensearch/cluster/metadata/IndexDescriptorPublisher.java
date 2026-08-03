@@ -117,7 +117,7 @@ public final class IndexDescriptorPublisher {
             return false;
         }
         try {
-            publisher.accept(IndexDescriptor.from(indexMetadata).tombstoned());
+            publisher.accept(IndexDescriptor.from(indexMetadata).tombstoned(System.currentTimeMillis()));
             return true;
         } catch (Exception e) {
             logger.warn("failed to publish tombstone for [" + indexMetadata.getIndex().getName() + "]", e);

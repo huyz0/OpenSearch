@@ -108,6 +108,20 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
      * <p>Advances only when the mapping actually changes. A generation that moved on every write would
      * invalidate every cache continuously, and one that never moved would serve stale field types forever.
      */
+    /**
+     * When this descriptor was tombstoned, epoch millis, or {@code 0} if it is not a tombstone.
+     *
+     * <p>A tombstone is the one descriptor that is written once and then has to survive on its own for a
+     * retention window, so it is the one that needs to be able to say how old it is. Live descriptors are
+     * rewritten whenever anything about the index changes and can always be re-derived; a tombstone has
+     * nothing behind it, which is the same property that makes losing one a resurrection.
+     *
+     * <p>Zero means "not a tombstone, or written before this field existed", and those two are deliberately
+     * not distinguished. Both must be read as an unknown age, and an unknown age must never be treated as
+     * old enough to reclaim.
+     */
+    private final long deletedAtMillis;
+
     private final long mappingGeneration;
 
     /**
@@ -178,6 +192,48 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         int routingNumShards,
         int routingPartitionSize
     ) {
+        this(
+            name,
+            uuid,
+            shardCount,
+            searchOnlyReplicaCount,
+            serverless,
+            state,
+            aliases,
+            createdVersion,
+            system,
+            hidden,
+            remoteSnapshot,
+            warm,
+            mappingGeneration,
+            creationDate,
+            routingNumShards,
+            routingPartitionSize,
+            0L
+        );
+    }
+
+    /** The form that also carries a tombstone's age. See {@link #deletedAtMillis}. */
+    public IndexDescriptor(
+        String name,
+        String uuid,
+        int shardCount,
+        int searchOnlyReplicaCount,
+        boolean serverless,
+        State state,
+        List<String> aliases,
+        long createdVersion,
+        boolean system,
+        boolean hidden,
+        boolean remoteSnapshot,
+        boolean warm,
+        long mappingGeneration,
+        long creationDate,
+        int routingNumShards,
+        int routingPartitionSize,
+        long deletedAtMillis
+    ) {
+        this.deletedAtMillis = deletedAtMillis;
         this.routingNumShards = routingNumShards;
         this.routingPartitionSize = routingPartitionSize;
         this.name = Objects.requireNonNull(name, "descriptor needs a name");
@@ -246,6 +302,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         // exactly what would make such a transposition invisible until an index was resharded.
         this.routingNumShards = in.readVInt();
         this.routingPartitionSize = in.readVInt();
+        this.deletedAtMillis = in.readLong();
     }
 
     @Override
@@ -266,6 +323,7 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         out.writeLong(creationDate);
         out.writeVInt(routingNumShards);
         out.writeVInt(routingPartitionSize);
+        out.writeLong(deletedAtMillis);
     }
 
     /** The index, which is what placement hashes and what every shard id is built from. */
@@ -379,6 +437,11 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         return creationDate;
     }
 
+    /** See the field's own javadoc: {@code 0} means unknown age and must never be read as old. */
+    public long deletedAtMillis() {
+        return deletedAtMillis;
+    }
+
     private IndexDescriptor copyWith(long generation) {
         return new IndexDescriptor(
             name,
@@ -460,6 +523,19 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
 
     /** The same descriptor, tombstoned. Deletion records rather than removes, so absence stays meaningful. */
     public IndexDescriptor tombstoned() {
+        return tombstoned(0L);
+    }
+
+    /**
+     * The same descriptor, tombstoned, and recording when.
+     *
+     * <p>The timestamp is what lets a tombstone be reclaimed later without a separate index saying it is
+     * safe. Reclamation reads the tombstone's own age rather than trusting whatever worklist pointed at it,
+     * so a corrupt or replayed worklist still cannot delete a young tombstone.
+     *
+     * <p>{@code 0} keeps the meaning it has on the field: unknown age, never old enough to reclaim.
+     */
+    public IndexDescriptor tombstoned(long deletedAtMillis) {
         return new IndexDescriptor(
             name,
             uuid,
@@ -474,7 +550,10 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
             remoteSnapshot,
             warm,
             mappingGeneration,
-            creationDate
+            creationDate,
+            routingNumShards,
+            routingPartitionSize,
+            deletedAtMillis
         );
     }
 
