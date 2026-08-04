@@ -8,6 +8,8 @@
 
 package org.opensearch.cluster.metadata;
 
+import org.opensearch.common.settings.Settings;
+
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Predicate;
 
@@ -40,6 +42,8 @@ public final class DescriptorOnlyCreation {
 
     private static final AtomicReference<Predicate<IndexMetadata>> GATE = new AtomicReference<>();
 
+    private static final AtomicReference<Predicate<Settings>> ADMISSION = new AtomicReference<>();
+
     private DescriptorOnlyCreation() {}
 
     /** Opens the gate for indices the predicate accepts. Registering null closes it entirely. */
@@ -67,6 +71,61 @@ public final class DescriptorOnlyCreation {
         try {
             return gate.test(indexMetadata);
         } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * Registers the cheap check that decides whether a creation request is worth admitting off the
+     * cluster-manager's state update thread. Registering null restores the ordinary path for everything.
+     */
+    public static void registerAdmissionCheck(Predicate<Settings> admission) {
+        ADMISSION.set(admission);
+    }
+
+    /**
+     * Whether a creation request looks gated enough to be admitted without the cluster state update thread.
+     *
+     * <h4>Why this exists when {@link #skipsClusterState} already answers the question</h4>
+     *
+     * {@link #skipsClusterState} takes the finished {@link IndexMetadata}, and building that is the expensive
+     * part: templates resolved, settings aggregated, and a whole throwaway {@code IndexService} constructed to
+     * validate the mapping. By the time it can be asked, the work it was supposed to let us avoid has already
+     * been done, and it has been done on the one thread in the cluster that serialises state updates. That is
+     * why gating removed publication and left creation costing what it always cost.
+     *
+     * <p>So the decision has to be made earlier, from the only thing available earlier: the request's own
+     * settings. This is that check, and it is deliberately a different question. It does not decide whether
+     * the index is gated -- {@link #skipsClusterState} still decides that, in the same place as before, from
+     * the same finished metadata. It decides only <em>which road the request takes to get there</em>.
+     *
+     * <h4>The two ways it can be wrong are not symmetric, and that sets its direction</h4>
+     *
+     * Answering false for a request that turns out gated costs nothing but speed: the request takes the
+     * ordinary road, reaches the same gate at the bottom, and is gated exactly as it is today. An index gated
+     * only by a template lands here, because a template's settings are not in the request.
+     *
+     * <p>Answering true for a request that turns out <em>not</em> gated costs a repeat: the off-thread attempt
+     * finds the index needs its cluster state entry after all, discards what it built, and falls back to the
+     * ordinary path, which redoes it. Correct, and paid for twice.
+     *
+     * <p>Both are safe, so this may be liberal, and neither is silent. What it must never be is the third
+     * thing -- a request admitted off-thread that then writes to cluster state from a thread that may not.
+     * That cannot happen here, because this predicate does not authorise the write; it only chooses a road.
+     *
+     * <p>Unregistered answers false, so a cluster with no serverless plugin takes exactly the path it took
+     * before this existed.
+     */
+    public static boolean mayBypassClusterState(Settings requestSettings) {
+        Predicate<Settings> admission = ADMISSION.get();
+        if (admission == null || requestSettings == null) {
+            return false;
+        }
+        try {
+            return admission.test(requestSettings);
+        } catch (Exception e) {
+            // Same direction as the gate above: a broken check sends the request down the road that has
+            // always worked rather than the new one.
             return false;
         }
     }

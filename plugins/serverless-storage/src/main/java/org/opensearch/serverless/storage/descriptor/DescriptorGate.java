@@ -358,6 +358,11 @@ public final class DescriptorGate {
         UnknownFieldRefresh.register(fieldRefresher);
 
         DescriptorOnlyCreation.register(DescriptorGate::gatable);
+        // And the road that reaches it. Registered after the gate rather than before, for the same reason the
+        // gate is registered last: this only chooses which path a creation takes, and a path installed ahead
+        // of the gate it is meant to reach would pull requests off the cluster state thread only to have them
+        // find nothing gating them and fall back.
+        DescriptorOnlyCreation.registerAdmissionCheck(DescriptorGate::worthAdmittingOffThread);
         logger.info("descriptor resolution installed against [{}]", DescriptorStore.DESCRIPTOR_INDEX);
     }
 
@@ -422,6 +427,24 @@ public final class DescriptorGate {
         return true;
     }
 
+    /**
+     * Whether a creation request is worth admitting off the cluster state update thread.
+     *
+     * <p>Only the first of {@link #gatable}'s two conditions, and only the part of it that can be read from
+     * the request itself. {@code ownsIndex} reads exactly this setting off the finished metadata, so a request
+     * that carries it will almost always turn out gatable; the second condition needs resolved aliases, which
+     * do not exist yet here, and is left to the real gate.
+     *
+     * <p><b>Request settings only, so a template-gated index is deliberately missed.</b> An index made gated
+     * by a matching template carries nothing in its own request that says so, and resolving templates to find
+     * out would be doing the expensive work in order to decide whether to avoid it. Such an index takes the
+     * ordinary path and is gated at the bottom exactly as it was before -- correct, and no faster. That is the
+     * cheap direction to be wrong in, and it is the one chosen.
+     */
+    private static boolean worthAdmittingOffThread(org.opensearch.common.settings.Settings requestSettings) {
+        return requestSettings.getAsBoolean("index.serverless_storage.enabled", false);
+    }
+
     /** Clears both registrations, which a node shutting down must do. */
     /**
      * The change log, which had nowhere to be called from until the publisher above called it.
@@ -484,6 +507,7 @@ public final class DescriptorGate {
         IndexDescriptorPublisher.registerCreator(null);
         MappingGenerationStore.register(null);
         GatedMappingStatsAggregator.register(null);
+        DescriptorOnlyCreation.registerAdmissionCheck(null);
         DescriptorOnlyCreation.register(null);
         UnknownFieldRefresh.register(null);
         STORE.set(null);

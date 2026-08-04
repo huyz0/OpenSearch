@@ -78,6 +78,7 @@ import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.FeatureFlags;
+import org.opensearch.common.util.concurrent.AbstractRunnable;
 import org.opensearch.common.util.set.Sets;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.Strings;
@@ -186,6 +187,11 @@ public class MetadataCreateIndexService {
     private final Environment env;
     private final IndexScopedSettings indexScopedSettings;
     private final ActiveShardsObserver activeShardsObserver;
+    /**
+     * Kept as a field, unlike before, because a gated creation has to be admitted somewhere other than the
+     * cluster state update thread and this is what dispatches it there.
+     */
+    private final ThreadPool threadPool;
     private final NamedXContentRegistry xContentRegistry;
     private final SystemIndices systemIndices;
     private final ShardLimitValidator shardLimitValidator;
@@ -223,6 +229,7 @@ public class MetadataCreateIndexService {
         this.env = env;
         this.indexScopedSettings = indexScopedSettings;
         this.activeShardsObserver = new ActiveShardsObserver(clusterService, threadPool);
+        this.threadPool = threadPool;
         this.xContentRegistry = xContentRegistry;
         this.systemIndices = systemIndices;
         this.forbidPrivateIndexSettings = forbidPrivateIndexSettings;
@@ -360,6 +367,14 @@ public class MetadataCreateIndexService {
         final CreateIndexClusterStateUpdateRequest request,
         final ActionListener<CreateIndexClusterStateUpdateResponse> listener
     ) {
+        // The road, chosen before any of the work that would tell us which road we needed. See
+        // DescriptorOnlyCreation#mayBypassClusterState for why the decision has to be made from the request's
+        // own settings rather than from the finished metadata, and why being wrong in either direction is
+        // safe. Unregistered answers false, so an ordinary cluster never reaches the branch below.
+        if (DescriptorOnlyCreation.mayBypassClusterState(request.settings())) {
+            createGatedIndex(request, listener);
+            return;
+        }
         onlyCreateIndex(request, ActionListener.wrap(response -> {
             if (response.isAcknowledged()) {
                 activeShardsObserver.waitForActiveShards(
@@ -381,6 +396,131 @@ public class MetadataCreateIndexService {
                 listener.onResponse(new CreateIndexClusterStateUpdateResponse(false, false));
             }
         }, listener::onFailure));
+    }
+
+    /**
+     * Creates a gated index without going through the cluster state update thread.
+     *
+     * <h4>Why this is a separate road rather than a branch inside the old one</h4>
+     *
+     * A gated creation writes nothing to cluster state: {@link #clusterStateCreateIndex} returns the state it
+     * was given, unchanged. It has done so since gating was turned on, and yet every such creation was still
+     * submitted as an URGENT cluster state update task, ran on the single {@code clusterManagerService#
+     * updateTask} thread, and did all of its validation there before reaching the branch that decided it had
+     * nothing to publish.
+     *
+     * <p>Profiling put a number on that. Twenty-seven percent of all on-CPU samples across a three node
+     * cluster were that one thread, about 3.9 ms of single-threaded CPU per creation, of which the largest
+     * part was {@code IndicesService.withTempIndexService} building a whole throwaway {@code IndexService} to
+     * validate a mapping that {@link IndexDescriptor#from} then discards. Batching does not help: the batch
+     * executor folds tasks one at a time, so it amortises the diff and the publication -- the costs gating had
+     * already reduced to zero -- and not the per-index validation, which is what remains. So N concurrent
+     * creations were N times 3.9 ms on one thread however they arrived.
+     *
+     * <p>Externalising the record without externalising the admission left the ceiling exactly where it was.
+     * This is the other half.
+     *
+     * <h4>What still has to be true</h4>
+     *
+     * Uniqueness does not come from here and never did. H3 put it in the store: {@code op_type=create} is what
+     * makes a name unique, which is precisely what makes the cluster manager unnecessary for this. Two nodes
+     * admitting the same name concurrently is now possible and is resolved the way it was always designed to
+     * be -- one write wins, the loser's future completes false, and the client gets
+     * {@link ResourceAlreadyExistsException}.
+     *
+     * <p>What is needed from cluster state is a <em>read</em>: templates, scoped settings and the name
+     * collision check against ordinary indices. A snapshot is enough for that, and every node has one.
+     *
+     * <h4>When it turns out not to be gated</h4>
+     *
+     * The admission check reads request settings; the real gate reads finished metadata and can still decline,
+     * for instance because {@code DescriptorRepresentable} refuses an index with a filtered alias. That is
+     * detected here by the descriptor write never being handed over, and the request falls back to the
+     * ordinary path, which redoes the work correctly on the update thread. Paid for twice and correct, rather
+     * than fast and wrong.
+     */
+    private void createGatedIndex(
+        final CreateIndexClusterStateUpdateRequest request,
+        final ActionListener<CreateIndexClusterStateUpdateResponse> listener
+    ) {
+        // GENERIC rather than the calling thread, and that is not a preference. TransportCreateIndexAction
+        // declares Names.SAME, so clusterManagerOperation runs on a transport worker; doing the descriptor
+        // work there is the same defect this branch found in the read path, where a blocking descriptor read
+        // on node_t0's only transport worker stalled the connection until it was dropped.
+        threadPool.executor(ThreadPool.Names.GENERIC).execute(new AbstractRunnable() {
+            @Override
+            public void onFailure(Exception e) {
+                listener.onFailure(e);
+            }
+
+            @Override
+            protected void doRun() {
+                final ClusterState snapshot = clusterService.state();
+                normalizeRequestSetting(request);
+                try {
+                    // The state this returns is discarded. For a gated index it is the snapshot unchanged,
+                    // and for one that turns out not to be gated it is a state built against a snapshot this
+                    // thread has no right to publish -- which is why that case falls back rather than
+                    // applying what it just computed.
+                    applyCreateIndexRequest(snapshot, request, false);
+                } catch (Exception e) {
+                    listener.onFailure(e);
+                    return;
+                }
+
+                final java.util.concurrent.CompletableFuture<Boolean> write = request.descriptorWrite();
+                if (write == null) {
+                    // Admitted as gated, decided otherwise by the gate that actually decides. Nothing has
+                    // been written anywhere -- clusterStateCreateIndex only hands over a descriptor write for
+                    // an index it gated -- so the ordinary path can start from the beginning.
+                    logger.debug(
+                        "index [{}] was admitted off the cluster state thread but needs a cluster state entry; "
+                            + "retrying it on the ordinary path",
+                        request.index()
+                    );
+                    onlyCreateIndex(request, ActionListener.wrap(response -> {
+                        if (response.isAcknowledged()) {
+                            activeShardsObserver.waitForActiveShards(
+                                new String[] { request.index() },
+                                request.waitForActiveShards(),
+                                request.ackTimeout(),
+                                shardsAcknowledged -> listener.onResponse(
+                                    new CreateIndexClusterStateUpdateResponse(true, shardsAcknowledged)
+                                ),
+                                listener::onFailure
+                            );
+                        } else {
+                            listener.onResponse(new CreateIndexClusterStateUpdateResponse(false, false));
+                        }
+                    }, listener::onFailure));
+                    return;
+                }
+
+                write.whenComplete((created, failure) -> {
+                    if (failure != null) {
+                        listener.onFailure(unwrapCompletion(failure));
+                    } else if (Boolean.TRUE.equals(created) == false) {
+                        // H3's uniqueness gate reporting a lost race, which is the same answer an ordinary
+                        // duplicate gets.
+                        listener.onFailure(new ResourceAlreadyExistsException(request.index()));
+                    } else {
+                        // Shards are reported acknowledged without consulting the observer, because for a
+                        // gated index the observer can only agree: ActiveShardCount#enoughShardsActive finds
+                        // no metadata entry for the name and treats that as nothing left to wait for. Asking
+                        // it would be a round trip to be told what is already known here.
+                        listener.onResponse(new CreateIndexClusterStateUpdateResponse(true, true));
+                    }
+                });
+            }
+        });
+    }
+
+    /** Strips the wrapper the future stage adds, so the client sees the cause rather than the plumbing. */
+    private static Exception unwrapCompletion(Throwable failure) {
+        Throwable cause = failure instanceof java.util.concurrent.CompletionException && failure.getCause() != null
+            ? failure.getCause()
+            : failure;
+        return cause instanceof Exception e ? e : new OpenSearchException(cause);
     }
 
     private void onlyCreateIndex(
