@@ -447,9 +447,8 @@ public final class ShardSuspensionCoordinator {
 
     /**
      * Force-unassigns the suspended shard's copies. Deliberately unconditional -- it does <em>not</em>
-     * check whether the engine's best-effort final quiescent publish (see {@code
-     * ObjectStoreWriterEngine#flushAndPublishQuiescentBestEffort}) actually succeeded, and that is
-     * safe on the durability axis, not an oversight:
+     * check whether the engine's last publish attempt succeeded, and that is safe on the durability
+     * axis, not an oversight:
      *
      * <ul>
      *   <li>A publish that fails does <em>not</em> advance the durability watermark ({@code

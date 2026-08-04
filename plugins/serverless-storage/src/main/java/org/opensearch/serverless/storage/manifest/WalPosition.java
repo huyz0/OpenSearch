@@ -50,9 +50,9 @@ public final class WalPosition implements Writeable {
         out.writeString(writerEpoch);
         // writeZLong, not writeVLong: offset() legitimately goes negative (-1, WalMirroringTranslog's
         // own "nothing flushed yet" sentinel from lastFlushedWalChunkSequence()) -- confirmed a real,
-        // reachable case, not a defensive guess, by ObjectStoreWriterEngine#flushAndPublishQuiescent
-        // (called from close()) hitting exactly this path and failing with writeVLong's own "Negative
-        // longs unsupported" exception in ServerlessStorageWriterFailoverIT.
+        // reachable case, not a defensive guess, by a forced commit on a shard that has flushed no WAL
+        // chunk yet hitting exactly this path and failing with writeVLong's own "Negative longs
+        // unsupported" exception in ServerlessStorageWriterFailoverIT.
         out.writeZLong(offset);
     }
 

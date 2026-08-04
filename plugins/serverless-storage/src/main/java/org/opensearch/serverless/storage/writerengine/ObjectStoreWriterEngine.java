@@ -250,16 +250,6 @@ public class ObjectStoreWriterEngine extends InternalEngine {
     private final AtomicLong windowWriteCount = new AtomicLong(0);
     private final AtomicLong completedWindowWriteCount = new AtomicLong(0);
 
-    /**
-     * Set just before {@link #flushAndPublishQuiescent} forces a commit, read (and cleared) by
-     * {@link #commitIndexWriter} to mark that one resulting manifest as {@link
-     * CommitManifest#quiescent()} -- see {@link #flushAndPublishQuiescent}'s own javadoc for why
-     * threading this through a field, rather than a parameter, is needed: {@link #commitIndexWriter}
-     * is core's own callback, invoked from deep inside {@link InternalEngine#flush}, with a fixed
-     * signature this class cannot add a parameter to.
-     */
-    private final java.util.concurrent.atomic.AtomicBoolean nextCommitIsQuiescent = new java.util.concurrent.atomic.AtomicBoolean(false);
-
     // Deliberately has NO initializer expression. InternalEngine's own constructor calls
     // getTranslogDeletionPolicy(EngineConfig) (overridden below) from inside super(engineConfig),
     // i.e. before this class's own field initializers would normally run -- an explicit
@@ -1186,65 +1176,13 @@ public class ObjectStoreWriterEngine extends InternalEngine {
         if (dedicatedWalGcSchedulerTask != null) {
             dedicatedWalGcSchedulerTask.close();
         }
-        flushAndPublishQuiescentBestEffort();
+        // No final "quiescent" flush here, and that absence is deliberate. See the note on
+        // commitIndexWriter's publish call about why the quiescent manifest flag was removed: the
+        // publish this used to attempt ran after IndexShard.close had already called
+        // Indexer#flushAndClose, so it met a closed engine and threw AlreadyClosedException every
+        // single time -- 54 of 54 attempts in the run that finally got measured, logging a warning
+        // with a full stack trace per shard and publishing nothing.
         super.close();
-    }
-
-    /**
-     * The "final flush+publication, manifest marked quiescent" nuance rfc-serverless-opensearch.md
-     * &sect;7.3 describes for writer scale-to-zero suspension -- called unconditionally from {@link
-     * #close()} (not only when the close is actually suspension-triggered) so this engine's very
-     * last published manifest is both as fresh as possible (a real forced commit, not whatever
-     * happened to be last published on the normal refresh/flush schedule) and marked {@link
-     * CommitManifest#quiescent()}, for whatever future consumer eventually reads that flag.
-     *
-     * <p>Deliberately unconditional rather than suspension-aware: distinguishing "closing because of
-     * suspension" from "closing for an ordinary reason" (relocation, node restart, primary-term
-     * change) is exactly the coordinator-to-live-engine communication {@code
-     * ShardSuspensionCoordinator}'s own javadoc already documents as out of scope for that class
-     * (it acts purely through cluster state/allocation, never talking to the node hosting the live
-     * engine) -- building that channel is a materially larger, still-open increment. Marking every
-     * closing engine's very last manifest quiescent is harmless in the meantime: nothing in this
-     * plugin consumes {@link CommitManifest#quiescent()} yet, and for the one case where it matters
-     * semantically (ordinary relocation), the new engine that immediately opens on the new node
-     * publishes its own non-quiescent manifests right away, which simply supersede the old one --
-     * there is no lasting incorrectness, only an unused bit on a manifest that's about to be
-     * superseded anyway.
-     *
-     * <p>Deliberately best-effort: {@link #close()} must still tear this engine down even if the
-     * object store is unreachable or this shard has already been fenced out by a newer writer (both
-     * real, already-possible outcomes of an ordinary {@link #commitIndexWriter} publish) -- failing
-     * to quiesce cleanly is a missed optimization (a future cold-start reads a slightly older
-     * manifest than it could have), never a correctness gap, exactly the same distinction {@code
-     * ShardSuspensionCoordinator}'s own javadoc already draws for the rest of this feature.
-     */
-    private void flushAndPublishQuiescentBestEffort() {
-        try {
-            flushAndPublishQuiescent();
-        } catch (Exception e) {
-            logger.warn("failed to publish a final quiescent commit before closing, a later reactivation will republish", e);
-        }
-    }
-
-    /**
-     * Forces one real final commit (unconditionally, even if nothing has changed since the last
-     * one, so this engine's very last published manifest is guaranteed as fresh as it can possibly
-     * be) and marks the resulting manifest {@link CommitManifest#quiescent()}.
-     *
-     * <p>Threaded through {@link #nextCommitIsQuiescent} rather than a parameter: {@link #flush}
-     * only ever leads to {@link #commitIndexWriter} being invoked by core's own {@code
-     * InternalEngine} machinery deep inside {@link #flush}, with a fixed signature this class
-     * cannot add a "this one is quiescent" parameter to -- the field is set immediately before the
-     * forced flush and consumed (cleared) by the very next {@link #commitIndexWriter} call, which
-     * {@code force=true} guarantees happens synchronously within this method's own call.
-     */
-    public void flushAndPublishQuiescent() throws IOException {
-        nextCommitIsQuiescent.set(true);
-        try {
-            flush(true, true);
-        } finally {
-            nextCommitIsQuiescent.set(false);
-        }
     }
 
     /**
@@ -1370,7 +1308,6 @@ public class ObjectStoreWriterEngine extends InternalEngine {
         WalPosition walPositionBeforeCommit = currentWalPosition();
         super.commitIndexWriter(writer, translogUUID);
 
-        boolean quiescent = nextCommitIsQuiescent.getAndSet(false);
         try {
             SegmentInfos segmentInfos = store.readLastCommittedSegmentsInfo();
             long primaryTerm = engineConfig.getPrimaryTermSupplier().getAsLong();
@@ -1387,8 +1324,7 @@ public class ObjectStoreWriterEngine extends InternalEngine {
                 localCheckpoint,
                 walPositionBeforeCommit,
                 0,
-                PruningStats.empty(),
-                quiescent
+                PruningStats.empty()
             );
             if (published == false) {
                 throw new EngineException(

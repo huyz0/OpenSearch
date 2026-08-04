@@ -40,16 +40,13 @@ public final class CommitManifest implements Writeable {
     private final long mappingVersion;
     private final PruningStats pruningStats;
     private final long createdAtMillis;
-    private final boolean quiescent;
     private final long totalDocCount;
     private final long deletedDocCount;
 
     /**
-     * Creates a non-quiescent manifest for one immutable Lucene commit -- equivalent to the
-     * fuller constructor with {@code quiescent = false} and both doc-count fields {@code 0}, kept
-     * so every pre-existing caller (the ordinary hot commit path, and every test that never cared
-     * about delete-ratio accounting) is unaffected by {@link #quiescent}'s or {@link
-     * #deleteRatio()}'s addition. {@code deleteRatio()} on a manifest built this way is always
+     * Creates a manifest for one immutable Lucene commit -- equivalent to the fuller constructor
+     * with both doc-count fields {@code 0}, kept so every caller that never cared about
+     * delete-ratio accounting is unaffected by {@link #deleteRatio()}'s addition. {@code deleteRatio()} on a manifest built this way is always
      * {@code 0.0} -- the same honest "unknown, treated as no deletions" default {@link
      * org.opensearch.serverless.storage.compaction.ManifestSegmentMetrics} itself used to report
      * unconditionally before real doc counts existed to derive it from.
@@ -95,63 +92,6 @@ public final class CommitManifest implements Writeable {
             mappingVersion,
             pruningStats,
             createdAtMillis,
-            false,
-            0,
-            0
-        );
-    }
-
-    /**
-     * Same as the twelve-argument constructor, additionally marking the published manifest {@link
-     * #quiescent()}. Both doc-count fields default to {@code 0} -- see that constructor's own
-     * javadoc for what that means for {@link #deleteRatio()}.
-     *
-     * @param indexUuid the UUID of the index this shard belongs to
-     * @param shardId the shard number
-     * @param primaryTerm the primary term this commit was written under
-     * @param generation the generation of this commit, unique within {@code primaryTerm}
-     * @param segmentsFileName the name of the Lucene segments file for this commit, which must be
-     *                         a key of {@code files}
-     * @param files the manifest's file map, keyed by file name
-     * @param maxSeqNo the maximum sequence number included in this commit
-     * @param localCheckpoint the local checkpoint at this commit
-     * @param walPosition the write-ahead log position folded into this commit, or {@code null}
-     * @param mappingVersion the mapping version in effect at this commit
-     * @param pruningStats summary statistics used to decide whether this shard can be pruned
-     * @param createdAtMillis the wall-clock time this manifest was created, in epoch millis
-     * @param quiescent whether this is a writer's deliberate final commit before scale-to-zero
-     *                  suspension (rfc-serverless-opensearch.md &sect;7.3) -- {@code true} means no
-     *                  further commit is expected from this writer until it is reactivated.
-     */
-    public CommitManifest(
-        String indexUuid,
-        int shardId,
-        long primaryTerm,
-        long generation,
-        String segmentsFileName,
-        Map<String, FileReference> files,
-        long maxSeqNo,
-        long localCheckpoint,
-        WalPosition walPosition,
-        long mappingVersion,
-        PruningStats pruningStats,
-        long createdAtMillis,
-        boolean quiescent
-    ) {
-        this(
-            indexUuid,
-            shardId,
-            primaryTerm,
-            generation,
-            segmentsFileName,
-            files,
-            maxSeqNo,
-            localCheckpoint,
-            walPosition,
-            mappingVersion,
-            pruningStats,
-            createdAtMillis,
-            quiescent,
             0,
             0
         );
@@ -173,9 +113,6 @@ public final class CommitManifest implements Writeable {
      * @param mappingVersion the mapping version in effect at this commit
      * @param pruningStats summary statistics used to decide whether this shard can be pruned
      * @param createdAtMillis the wall-clock time this manifest was created, in epoch millis
-     * @param quiescent whether this is a writer's deliberate final commit before scale-to-zero
-     *                  suspension (rfc-serverless-opensearch.md &sect;7.3) -- {@code true} means no
-     *                  further commit is expected from this writer until it is reactivated.
      * @param totalDocCount the total document count (live + deleted) across every segment in this
      *                      commit, i.e. the sum of each segment's {@code maxDoc} -- {@code 0} means
      *                      unknown, not "zero documents" (see {@link #deleteRatio()}).
@@ -199,7 +136,6 @@ public final class CommitManifest implements Writeable {
         long mappingVersion,
         PruningStats pruningStats,
         long createdAtMillis,
-        boolean quiescent,
         long totalDocCount,
         long deletedDocCount
     ) {
@@ -235,7 +171,6 @@ public final class CommitManifest implements Writeable {
         this.mappingVersion = mappingVersion;
         this.pruningStats = Objects.requireNonNull(pruningStats, "pruningStats");
         this.createdAtMillis = createdAtMillis;
-        this.quiescent = quiescent;
         this.totalDocCount = totalDocCount;
         this.deletedDocCount = deletedDocCount;
     }
@@ -258,7 +193,6 @@ public final class CommitManifest implements Writeable {
         this.mappingVersion = in.readVLong();
         this.pruningStats = new PruningStats(in);
         this.createdAtMillis = in.readVLong();
-        this.quiescent = in.readBoolean();
         this.totalDocCount = in.readVLong();
         this.deletedDocCount = in.readVLong();
     }
@@ -277,7 +211,6 @@ public final class CommitManifest implements Writeable {
         out.writeVLong(mappingVersion);
         pruningStats.writeTo(out);
         out.writeVLong(createdAtMillis);
-        out.writeBoolean(quiescent);
         out.writeVLong(totalDocCount);
         out.writeVLong(deletedDocCount);
     }
@@ -340,15 +273,6 @@ public final class CommitManifest implements Writeable {
     /** The wall-clock time this manifest was created, in epoch millis. */
     public long createdAtMillis() {
         return createdAtMillis;
-    }
-
-    /**
-     * Whether this is a writer's deliberate final commit before scale-to-zero suspension --
-     * {@code true} means no further commit is expected from this writer until it is reactivated
-     * (rfc-serverless-opensearch.md &sect;7.3).
-     */
-    public boolean quiescent() {
-        return quiescent;
     }
 
     /**
@@ -441,7 +365,6 @@ public final class CommitManifest implements Writeable {
             && localCheckpoint == that.localCheckpoint
             && mappingVersion == that.mappingVersion
             && createdAtMillis == that.createdAtMillis
-            && quiescent == that.quiescent
             && totalDocCount == that.totalDocCount
             && deletedDocCount == that.deletedDocCount
             && indexUuid.equals(that.indexUuid)
@@ -466,7 +389,6 @@ public final class CommitManifest implements Writeable {
             mappingVersion,
             pruningStats,
             createdAtMillis,
-            quiescent,
             totalDocCount,
             deletedDocCount
         );

@@ -209,7 +209,6 @@ public final class LuceneMergeCompactionPublisher implements CompactionPublisher
                     sourceManifest.walPosition(),
                     sourceManifest.mappingVersion(),
                     sourceManifest.pruningStats(),
-                    false,
                     bundleNameSuffix,
                     false
                 );

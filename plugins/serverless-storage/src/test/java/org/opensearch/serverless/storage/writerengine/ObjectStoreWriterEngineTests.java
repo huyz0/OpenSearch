@@ -411,51 +411,6 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
         }
     }
 
-    public void testFlushAndPublishQuiescentMarksTheManifestQuiescent() throws Exception {
-        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
-        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
-        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
-        BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(blobContainer);
-        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
-            new BlobContainerBundleStore(blobContainer),
-            manifestStore
-        );
-
-        ObjectStoreWriterEngine engine = openWriterEngine(shardStateStore, commitPublisher);
-        try {
-            index(engine, "1");
-            engine.flush(true, true);
-
-            org.opensearch.serverless.storage.shardstate.VersionedShardHead beforeQuiesce = shardStateStore.get(
-                shardId.getIndex().getUUID(),
-                shardId.getId()
-            ).orElseThrow();
-            org.opensearch.serverless.storage.manifest.CommitManifest ordinaryManifest = manifestStore.readManifest(
-                beforeQuiesce.head().primaryTerm(),
-                beforeQuiesce.head().latestManifestGeneration()
-            );
-            assertFalse("an ordinary flush must not mark its manifest quiescent", ordinaryManifest.quiescent());
-
-            engine.flushAndPublishQuiescent();
-
-            org.opensearch.serverless.storage.shardstate.VersionedShardHead afterQuiesce = shardStateStore.get(
-                shardId.getIndex().getUUID(),
-                shardId.getId()
-            ).orElseThrow();
-            assertTrue(
-                "flushAndPublishQuiescent must publish a strictly newer generation",
-                afterQuiesce.head().latestManifestGeneration() > beforeQuiesce.head().latestManifestGeneration()
-            );
-            org.opensearch.serverless.storage.manifest.CommitManifest quiescentManifest = manifestStore.readManifest(
-                afterQuiesce.head().primaryTerm(),
-                afterQuiesce.head().latestManifestGeneration()
-            );
-            assertTrue("flushAndPublishQuiescent's own manifest must be marked quiescent", quiescentManifest.quiescent());
-        } finally {
-            IOUtils.close(engine, lastOpenedStore);
-        }
-    }
-
     public void testAttemptEngineNativeSnapshotPinsTheLatestPublishedManifest() throws Exception {
         FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
         BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
@@ -518,49 +473,6 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
             );
         } finally {
             IOUtils.close(engine, lastOpenedStore);
-        }
-    }
-
-    public void testClosingTheEnginePublishesAFinalQuiescentManifest() throws Exception {
-        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
-        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
-        ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
-        BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(blobContainer);
-        ObjectStoreCommitPublisher commitPublisher = new ObjectStoreCommitPublisher(
-            new BlobContainerBundleStore(blobContainer),
-            manifestStore
-        );
-
-        ObjectStoreWriterEngine engine = openWriterEngine(shardStateStore, commitPublisher);
-        index(engine, "1");
-        engine.flush(true, true);
-        try {
-            org.opensearch.serverless.storage.shardstate.VersionedShardHead beforeClose = shardStateStore.get(
-                shardId.getIndex().getUUID(),
-                shardId.getId()
-            ).orElseThrow();
-
-            // Index one more document without an explicit flush -- close() itself must force the
-            // final commit rather than relying on whatever was last published on the normal schedule.
-            index(engine, "2");
-
-            IOUtils.close(engine);
-
-            org.opensearch.serverless.storage.shardstate.VersionedShardHead afterClose = shardStateStore.get(
-                shardId.getIndex().getUUID(),
-                shardId.getId()
-            ).orElseThrow();
-            assertTrue(
-                "close() must force a strictly newer final commit, not just reuse the last flush",
-                afterClose.head().latestManifestGeneration() > beforeClose.head().latestManifestGeneration()
-            );
-            org.opensearch.serverless.storage.manifest.CommitManifest finalManifest = manifestStore.readManifest(
-                afterClose.head().primaryTerm(),
-                afterClose.head().latestManifestGeneration()
-            );
-            assertTrue("close()'s own final manifest must be marked quiescent", finalManifest.quiescent());
-        } finally {
-            IOUtils.close(lastOpenedStore);
         }
     }
 
@@ -974,22 +886,24 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
 
     /**
      * Scale-to-zero suspend eviction ({@code ShardSuspensionCoordinator#evict}) force-unassigns the
-     * shard unconditionally, without checking whether {@code close()}'s best-effort final quiescent
-     * publish actually succeeded. This test proves that is safe on the durability axis: a quiescent
-     * publish that throws (object store unreachable at exactly the wrong moment) does NOT advance the
-     * durability watermark past the un-published op, so {@link
-     * ObjectStoreDurabilityTranslogDeletionPolicy} keeps that op's local translog generation. Nothing
-     * acked is dropped locally by the failed publish -- and because the shard is force-unassigned (not
-     * started anywhere), core's {@code IndicesStore.shardCanBeDeleted} never authorizes deleting that
-     * local data either, so a subsequent same-node reactivation replays it. The final assertion shows
-     * the durability watermark staying put, which is what keeps the un-published op's translog
-     * generation retained. (A publish failure inside {@code commitIndexWriter} is a tragic flush
-     * event that then fails/closes the engine -- exactly why {@code close()}'s quiescent publish is
-     * best-effort and swallows it; the acked op is already fsynced in the local translog and
-     * unaffected by the engine closing.) See dynamic-partitioning-progress.md's scale-to-zero
-     * CONCERN 2 section for the full argument.
+     * shard unconditionally, without checking whether the engine's last publish attempt succeeded.
+     * This test proves that is safe on the durability axis: a publish that throws (object store
+     * unreachable at exactly the wrong moment) does NOT advance the durability watermark past the
+     * un-published op, so {@link ObjectStoreDurabilityTranslogDeletionPolicy} keeps that op's local
+     * translog generation. Nothing acked is dropped locally by the failed publish -- and because the
+     * shard is force-unassigned (not started anywhere), core's {@code IndicesStore.shardCanBeDeleted}
+     * never authorizes deleting that local data either, so a subsequent same-node reactivation
+     * replays it. The final assertion shows the durability watermark staying put, which is what keeps
+     * the un-published op's translog generation retained. See dynamic-partitioning-progress.md's
+     * scale-to-zero CONCERN 2 section for the full argument.
+     *
+     * <p>Drives the failure through an ordinary forced flush rather than the "final quiescent
+     * publish" this used to call. That method has been removed: it only ever ran from {@code close()},
+     * and by then {@code IndexShard.close} had already called {@code flushAndClose}, so in production
+     * it met a closed engine and threw every time. The durability property asserted here is a property
+     * of any failed publish, so it survives the removal unchanged.
      */
-    public void testFailedQuiescentPublishDoesNotAdvanceDurabilitySoTheUnpublishedOpSurvivesLocally() throws Exception {
+    public void testAFailedPublishDoesNotAdvanceDurabilitySoTheUnpublishedOpSurvivesLocally() throws Exception {
         FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
         FailableBlobContainer blobContainer = new FailableBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
         ShardStateStore shardStateStore = new BlobContainerShardStateStore(blobContainer);
@@ -1013,12 +927,12 @@ public class ObjectStoreWriterEngineTests extends EngineTestCase {
             long opsBeforePublish = org.opensearch.index.engine.EngineTestCase.getTranslog(engine).totalOperations();
             assertEquals("both acked ops must be in the local translog before the publish attempt", 2, opsBeforePublish);
 
-            // Object store goes unreachable exactly as the final quiescent publish runs.
+            // Object store goes unreachable exactly as the publish runs.
             blobContainer.failWrites = true;
-            expectThrows(Exception.class, engine::flushAndPublishQuiescent);
+            expectThrows(Exception.class, () -> engine.flush(true, true));
 
             assertEquals(
-                "a failed quiescent publish must NOT advance the durability watermark past the un-published "
+                "a failed publish must NOT advance the durability watermark past the un-published "
                     + "op -- its translog generation stays retained locally, so eviction proceeding loses nothing "
                     + "(a same-node reactivation replays it; core's IndicesStore never deletes the unassigned "
                     + "shard's local data either)",

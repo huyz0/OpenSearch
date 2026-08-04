@@ -79,10 +79,7 @@ public class ServerlessStorageShardRetentionStatsActionIT extends ServerlessStor
             // >= [600000ms]". Fifteen minutes clears that minimum and is still not the thirty-minute
             // default, so the assertion below proves the stats action reports the window it was configured
             // with rather than one it never read.
-            .put(
-                ServerlessStoragePlugin.SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING.getKey(),
-                TimeValue.timeValueMinutes(15)
-            )
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING.getKey(), TimeValue.timeValueMinutes(15))
             .build();
 
         internalCluster().startClusterManagerOnlyNode(nodeSettings);
@@ -164,7 +161,6 @@ public class ServerlessStorageShardRetentionStatsActionIT extends ServerlessStor
             firstManifest.mappingVersion(),
             firstManifest.pruningStats(),
             System.currentTimeMillis() - TimeValue.timeValueHours(1).millis(),
-            firstManifest.quiescent(),
             firstManifest.totalDocCount(),
             firstManifest.deletedDocCount()
         );

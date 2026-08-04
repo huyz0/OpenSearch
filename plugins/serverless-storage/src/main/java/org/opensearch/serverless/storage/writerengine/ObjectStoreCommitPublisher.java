@@ -116,65 +116,13 @@ public final class ObjectStoreCommitPublisher {
             walPosition,
             mappingVersion,
             pruningStats,
-            false
-        );
-    }
-
-    /**
-     * Same as {@link #publishCommit(Directory, SegmentInfos, String, int, long, long, long, long,
-     * WalPosition, long, PruningStats)}, additionally marking the published manifest {@link
-     * CommitManifest#quiescent()} -- a writer's deliberate final commit before scale-to-zero
-     * suspension (rfc-serverless-opensearch.md &sect;7.3), used by {@code
-     * ObjectStoreWriterEngine#flushAndPublishQuiescent}.
-     *
-     * @param directory the local Lucene {@link Directory} holding the files referenced by {@code segmentInfos}
-     * @param segmentInfos the local Lucene commit to package
-     * @param indexUuid the index this shard belongs to
-     * @param shardId the shard this commit belongs to
-     * @param primaryTerm the primary term this commit is published under
-     * @param generation the manifest generation this commit is published at
-     * @param maxSeqNo the maximum sequence number covered by this commit
-     * @param localCheckpoint the local checkpoint covered by this commit
-     * @param walPosition the WAL position this commit's manifest should record
-     * @param mappingVersion the mapping version in effect for this commit
-     * @param pruningStats pruning statistics to record in the manifest
-     * @param quiescent whether to mark the published manifest as this writer's final commit before suspension.
-     * @return the manifest describing the packaged commit
-     */
-    public CommitManifest publishCommit(
-        Directory directory,
-        SegmentInfos segmentInfos,
-        String indexUuid,
-        int shardId,
-        long primaryTerm,
-        long generation,
-        long maxSeqNo,
-        long localCheckpoint,
-        WalPosition walPosition,
-        long mappingVersion,
-        PruningStats pruningStats,
-        boolean quiescent
-    ) throws IOException {
-        return publishCommit(
-            directory,
-            segmentInfos,
-            indexUuid,
-            shardId,
-            primaryTerm,
-            generation,
-            maxSeqNo,
-            localCheckpoint,
-            walPosition,
-            mappingVersion,
-            pruningStats,
-            quiescent,
             ""
         );
     }
 
     /**
      * Same as {@link #publishCommit(Directory, SegmentInfos, String, int, long, long, long, long,
-     * WalPosition, long, PruningStats, boolean)}, additionally appending {@code bundleNameSuffix}
+     * WalPosition, long, PruningStats)}, additionally appending {@code bundleNameSuffix}
      * to the otherwise-deterministic {@code (indexUuid, shardId, primaryTerm, generation)} bundle
      * name. Every ordinary caller passes {@code ""} (via the other overloads) and gets the exact
      * same deterministic name as before -- this exists only for {@code
@@ -201,7 +149,6 @@ public final class ObjectStoreCommitPublisher {
      * @param walPosition the WAL position this commit's manifest should record
      * @param mappingVersion the mapping version in effect for this commit
      * @param pruningStats pruning statistics to record in the manifest
-     * @param quiescent whether to mark the published manifest as this writer's final commit before suspension.
      * @param bundleNameSuffix appended verbatim to the deterministic bundle name; {@code ""} for the
      *                         normal deterministic name every other caller uses.
      * @return the manifest describing the packaged commit
@@ -218,7 +165,6 @@ public final class ObjectStoreCommitPublisher {
         WalPosition walPosition,
         long mappingVersion,
         PruningStats pruningStats,
-        boolean quiescent,
         String bundleNameSuffix
     ) throws IOException {
         return publishCommit(
@@ -233,7 +179,6 @@ public final class ObjectStoreCommitPublisher {
             walPosition,
             mappingVersion,
             pruningStats,
-            quiescent,
             bundleNameSuffix,
             true
         );
@@ -241,7 +186,7 @@ public final class ObjectStoreCommitPublisher {
 
     /**
      * Same as {@link #publishCommit(Directory, SegmentInfos, String, int, long, long, long, long,
-     * WalPosition, long, PruningStats, boolean, String)}, with {@code verifyIdempotentContent}
+     * WalPosition, long, PruningStats, String)}, with {@code verifyIdempotentContent}
      * controlling whether the idempotency short-circuit below trusts an existing manifest by
      * identity ({@code (primaryTerm, generation)} alone) or requires it to also describe the exact
      * same file content this call is about to publish (see {@link #requireSameContent}'s own
@@ -278,7 +223,6 @@ public final class ObjectStoreCommitPublisher {
         WalPosition walPosition,
         long mappingVersion,
         PruningStats pruningStats,
-        boolean quiescent,
         String bundleNameSuffix,
         boolean verifyIdempotentContent
     ) throws IOException {
@@ -330,7 +274,6 @@ public final class ObjectStoreCommitPublisher {
             mappingVersion,
             pruningStats,
             System.currentTimeMillis(),
-            quiescent,
             totalDocCount,
             deletedDocCount
         );

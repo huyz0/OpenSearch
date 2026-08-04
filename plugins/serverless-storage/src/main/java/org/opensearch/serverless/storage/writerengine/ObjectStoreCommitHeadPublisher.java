@@ -96,54 +96,6 @@ public final class ObjectStoreCommitHeadPublisher {
         long mappingVersion,
         PruningStats pruningStats
     ) throws IOException {
-        return publishCommitAsHead(
-            directory,
-            segmentInfos,
-            indexUuid,
-            shardId,
-            primaryTerm,
-            maxSeqNo,
-            localCheckpoint,
-            walPosition,
-            mappingVersion,
-            pruningStats,
-            false
-        );
-    }
-
-    /**
-     * Same as {@link #publishCommitAsHead(Directory, SegmentInfos, String, int, long, long, long,
-     * WalPosition, long, PruningStats)}, additionally marking the published manifest {@link
-     * CommitManifest#quiescent()} -- see {@code ObjectStoreWriterEngine#flushAndPublishQuiescent}.
-     *
-     * @param directory the local Lucene {@link Directory} holding the files referenced by {@code segmentInfos}
-     * @param segmentInfos the local Lucene commit to package and attempt to publish
-     * @param indexUuid the index this shard belongs to
-     * @param shardId the shard being published
-     * @param primaryTerm the primary term this writer believes it is currently active under
-     * @param maxSeqNo the maximum sequence number covered by this commit
-     * @param localCheckpoint the local checkpoint covered by this commit
-     * @param walPosition the WAL position this commit's manifest should record
-     * @param mappingVersion the mapping version in effect for this commit
-     * @param pruningStats pruning statistics to record in the manifest
-     * @param quiescent whether to mark the published manifest as this writer's final commit before suspension.
-     * @return {@code true} if this commit's content is now reflected in the shard's published head;
-     *         {@code false} if a different term currently holds the head, meaning this writer has
-     *         been fenced out and must stop writing.
-     */
-    public boolean publishCommitAsHead(
-        Directory directory,
-        SegmentInfos segmentInfos,
-        String indexUuid,
-        int shardId,
-        long primaryTerm,
-        long maxSeqNo,
-        long localCheckpoint,
-        WalPosition walPosition,
-        long mappingVersion,
-        PruningStats pruningStats,
-        boolean quiescent
-    ) throws IOException {
         for (;;) {
             Optional<VersionedShardHead> current = shardStateStore.get(indexUuid, shardId);
 
@@ -193,8 +145,7 @@ public final class ObjectStoreCommitHeadPublisher {
                 localCheckpoint,
                 walPosition,
                 mappingVersion,
-                pruningStats,
-                quiescent
+                pruningStats
             );
 
             ShardHead newHead = currentHead == null
