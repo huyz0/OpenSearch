@@ -80,6 +80,104 @@ Two worth knowing about up front:
 - `serverless_storage.encryption_key` — a base64 AES key stored in the node
   keystore. Unset means bundles are written unencrypted.
 
+## Reclaiming deleted index records
+
+Deleting a gated index does not remove its record. It writes a tombstone at
+`<base>/descriptors-root/tombstones/<name>`, so that a node partitioned through
+the delete consults the descriptor on rejoin, finds the deletion recorded, and
+drops its local shard data instead of keeping it. Absence alone would not tell it
+that: a name that resolves to nothing is indistinguishable from one that never
+existed.
+
+Tombstones are small, a few hundred bytes each, and nothing removes them unless
+you arrange it. Left alone they accumulate with every index ever deleted, not
+with the number that currently exist, so the count tracks the cluster's lifetime
+rather than its size.
+
+**How long they need to live.** A tombstone has to outlast the longest a node can
+be partitioned and still rejoin carrying shard data from before the delete. That
+is an operational judgement about your own failure modes rather than something
+the plugin can derive, so pick it deliberately. Seven days is a reasonable
+starting point and is what `serverless_storage.descriptor.tombstone_retention`
+defaults to.
+
+Reclaiming late costs storage. Reclaiming early costs a node the record it needed
+to drop stale data, so err long.
+
+### Preferred: let the object store expire them
+
+An object-store lifecycle rule over the tombstone prefix costs nothing to run.
+There is no listing, no read, and no request of any kind charged to the cluster,
+and the store enforces it whether or not any node is healthy. Where your store
+supports it, this is the right mechanism.
+
+On S3, scoped to the tombstone prefix and nothing else:
+
+```json
+{
+  "Rules": [
+    {
+      "ID": "serverless-descriptor-tombstones",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "descriptors-root/tombstones/" },
+      "Expiration": { "Days": 7 }
+    }
+  ]
+}
+```
+
+Prefix it with your repository's own base path if the repository is not rooted at
+the bucket. GCS calls the same thing an Object Lifecycle rule with an `age`
+condition; Azure calls it a blob lifecycle management policy.
+
+Expiring by object age is exactly right here, because a tombstone is written once
+and never rewritten. Its age and its recorded deletion time are the same thing.
+
+**Scope the rule.** It must match only `descriptors-root/tombstones/`. A rule over
+`descriptors-root/` would expire live descriptors, which are not rewritten unless
+the index changes, so a quiet index would lose its record and its shards would
+stop resolving.
+
+### Fallback: the built-in scrubber
+
+For stores with no lifecycle facility, and for deployments where nobody
+configured a rule, the plugin can reclaim tombstones itself. It is off unless you
+set an interval:
+
+```yaml
+serverless_storage.descriptor.tombstone_scrub_interval: 1h
+serverless_storage.descriptor.tombstone_retention: 7d
+```
+
+A pass costs one listing of the tombstone space plus one read per tombstone it
+examines, and runs on the elected cluster manager only. That is affordable at a
+modest population and is not how anyone should reclaim a hundred million records:
+prefer the lifecycle rule where you can have it.
+
+The scrubber decides from each tombstone's own recorded deletion time rather than
+from any index of what to delete, so there is no second structure to fall out of
+step with the first. It refuses to reclaim anything whose age it cannot establish,
+including tombstones written before the record carried a timestamp.
+
+### If you configure neither
+
+Nothing breaks and nothing is lost. Tombstones accumulate, and the storage they
+occupy grows with the number of indices ever deleted. At a few hundred bytes each
+that is cheap for a long time, and it is still unbounded, so it is worth deciding
+rather than defaulting into.
+
+## Bounding the descriptor change log
+
+Nodes learn about descriptor writes on other nodes by tailing a change log under
+`<base>/descriptors-root/changelog/`, bucketed by minute. Buckets older than
+`serverless_storage.descriptor.change_log_retention` (default one hour) are
+deleted by the elected cluster manager.
+
+Nothing reads history: a starting node begins at the bucket it started in,
+because its descriptor cache is empty and it has no shards open, so there is
+nothing for older entries to act on. The retention window is slack for a tailer
+that has been stalled, not a replay buffer, and there is no reason to raise it far.
+
 ## Operator REST API
 
 All under `/_plugins/_serverless/storage`.
