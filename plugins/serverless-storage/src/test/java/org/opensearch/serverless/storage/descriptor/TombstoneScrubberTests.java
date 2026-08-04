@@ -139,6 +139,33 @@ public class TombstoneScrubberTests extends OpenSearchTestCase {
     }
 
     /**
+     * A tombstone refreshed after the pass began is not reclaimed on the strength of what was read first.
+     *
+     * <p>This is the realistic shape of the delete-recreate-delete race. The scrubber lists the keyspace,
+     * and by the time it reaches a given name that name may have been deleted again, replacing an ancient
+     * tombstone with a new one. Deleting it then would strip the record a node needs for the <em>second</em>
+     * deletion, which is the one still inside its window.
+     *
+     * <p>Covered by re-reading each candidate immediately before deciding, rather than trusting the listing.
+     * What remains uncovered is the gap between that read and the delete itself, which cannot be closed
+     * without a conditional delete the blob store does not offer, and is stated in the scrubber rather than
+     * implied. This test pins the part that is closed; the part that is not is microseconds wide and costs a
+     * node stale shard data rather than an index returning.
+     */
+    public void testATombstoneRefreshedDuringThePassIsKept() {
+        tombstone("tenant-churn", now - 10 * DAY);
+
+        // The same name deleted again, a moment before the scrubber would have reached the old record.
+        backend.putTombstoneAsync(descriptor("tenant-churn").tombstoned(now - 1));
+
+        assertEquals("the record that matters now is the recent one, and it is inside the window", 0, scrubber.scrubOnce(7 * DAY));
+
+        IndexDescriptor still = backend.get("tenant-churn");
+        assertNotNull("deleting it would lose the record for the deletion that just happened", still);
+        assertFalse(still.exists());
+    }
+
+    /**
      * The scrubber finds tombstones on a filesystem store, which the obvious implementation would not.
      *
      * <p>{@code listBlobsByPrefix("tombstones/")} on the root container returns every tombstone on an object

@@ -80,6 +80,28 @@ Two worth knowing about up front:
 - `serverless_storage.encryption_key` — a base64 AES key stored in the node
   keystore. Unset means bundles are written unencrypted.
 
+## Upgrading a blob store written by an older build
+
+Descriptors are stored with a format marker and a version. A blob written before
+that marker existed is refused on read, with a message saying so, rather than
+parsed as though its layout matched the current one.
+
+This matters because it used to fail the other way. The descriptor record gains
+fields over time and the stored bytes carry no transport version to gate them, so
+a reader always assumed the newest layout was present. A blob written before a
+field was added parsed without complaint and returned values read from the wrong
+offsets: a shard count taken from the middle of a uuid, which routes.
+
+There is no migration. If you have a blob store written by a build from before
+this change, clear its `descriptors-root` prefix and recreate the indices. The
+alternative was to keep guessing, and a wrong answer about where a shard lives is
+worse than a refusal to answer.
+
+Live descriptors would heal on their own, since they are rewritten whenever their
+index changes. Tombstones would not: they are written once and then left for a
+retention window, so an unreadable one stays unreadable, and the scrubber will
+decline to reclaim it rather than delete something whose age it cannot establish.
+
 ## Reclaiming deleted index records
 
 Deleting a gated index does not remove its record. It writes a tombstone at
