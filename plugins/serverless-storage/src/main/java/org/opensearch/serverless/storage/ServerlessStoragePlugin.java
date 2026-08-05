@@ -1893,7 +1893,17 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                         threadPool.executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC),
                         DESCRIPTOR_CACHE_FRESHNESS_SETTING.get(environment.settings()).nanos()
                     ),
-                    descriptorStore
+                    // Wildcards come from the object store too, now that expansion is one bounded listing
+                    // rather than a search. This is what takes the descriptor system index off the request
+                    // path: the enumerator addresses the same descriptor prefix the point half writes, so
+                    // there is no second copy to keep in step and nothing to dual-write.
+                    new org.opensearch.serverless.storage.descriptor.DescriptorEnumerator(path -> {
+                        try {
+                            return resolveContainerForDescriptors(path, "no blob store for wildcard expansion");
+                        } catch (IOException e) {
+                            throw new java.io.UncheckedIOException(e);
+                        }
+                    }, BlobPath.cleanPath().add("descriptors-root"))
                 );
             } catch (java.io.IOException e) {
                 // Falling back would be worse than failing: the operator asked for the object store, and

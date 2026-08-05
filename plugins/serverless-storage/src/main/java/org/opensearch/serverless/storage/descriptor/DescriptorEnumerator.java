@@ -10,10 +10,15 @@ package org.opensearch.serverless.storage.descriptor;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
+import org.opensearch.cluster.metadata.DescriptorUnavailableException;
 import org.opensearch.common.blobstore.BlobContainer;
+import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.common.blobstore.BlobPath;
 
+import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.nio.file.NoSuchFileException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
@@ -49,7 +54,7 @@ import java.util.function.Function;
  * A layout that left them in place would need a read per key to find out which names are live, turning a
  * listing into a full fetch of the population.
  */
-public final class DescriptorEnumerator {
+public final class DescriptorEnumerator implements DescriptorPrefixBackend {
 
     private static final Logger logger = LogManager.getLogger(DescriptorEnumerator.class);
 
@@ -123,6 +128,73 @@ public final class DescriptorEnumerator {
         return new ArrayList<>(names);
     }
 
+    /**
+     * Expands a wildcard prefix from one bounded listing, which is what lets the descriptor system index go.
+     *
+     * <h4>Why a listing can serve this when it cannot serve enumeration</h4>
+     *
+     * The class javadoc above says a listing is not a query path, and that stays true of enumeration: paging
+     * millions of keys behind a serial continuation token is seconds to minutes. What makes <em>this</em> a
+     * query is the cap. {@code DescriptorGate.DEFAULT_WILDCARD_EXPANSION_LIMIT} refuses an expansion past a
+     * hundred matches, so asking for {@code limit + 1} keys is a single request that stops as soon as it has
+     * them. S3 seeks to the prefix rather than scanning and returns keys in lexicographic order, so this is
+     * one {@code ListObjectsV2} with {@code maxKeys} set: the same cost class as a GET, not a walk.
+     *
+     * <p>Asking for one more than the cap is the whole of the over-limit detection, which is the trick the
+     * system index used with {@code size(limit + 1)}. Getting {@code limit + 1} keys back proves there are
+     * more than {@code limit} without counting them.
+     *
+     * <h4>What a key can answer, and why that is now everything</h4>
+     *
+     * A key carries a name and nothing else. The other two fields of a match used to need the descriptor
+     * itself; both are now constants for a gated index rather than unknowns:
+     *
+     * <ul>
+     *   <li><b>open</b> is always true, because {@code MetadataIndexStateService} refuses to close a gated
+     *       index at all. There is no other state a live descriptor can be in.</li>
+     *   <li><b>hidden</b> is always false, because {@code DescriptorRepresentable} refuses to gate a hidden
+     *       index. That refusal exists precisely so this can come from a listing rather than from a GET per
+     *       match, or from a second keyspace written on every create.</li>
+     * </ul>
+     *
+     * <p>Deleted names are absent for free, for the reason the class javadoc already gives: tombstones live
+     * under their own prefix, so this listing is exactly the set of live names.
+     *
+     * <h4>Absence and failure are different answers</h4>
+     *
+     * A missing container means no gated index has ever been created, which is complete and empty rather
+     * than broken -- the blob equivalent of the {@code IndexNotFoundException} the system index treated the
+     * same way. Anything else propagates, because this decides which indices a request touches and a
+     * swallowed failure turns "the catalogue was unreadable" into "there are no such indices".
+     */
+    @Override
+    public AbsentIndexDescriptorSuppliers.PrefixExpansion expandPrefix(String prefix, int limit) {
+        List<BlobMetadata> found;
+        try {
+            found = descriptors().listBlobsByPrefixInSortedOrder(prefix, limit + 1, BlobContainer.BlobNameSortOrder.LEXICOGRAPHIC);
+        } catch (NoSuchFileException | FileNotFoundException e) {
+            return AbsentIndexDescriptorSuppliers.PrefixExpansion.of(List.of());
+        } catch (IOException | RuntimeException e) {
+            throw new DescriptorUnavailableException(prefix + "*", e);
+        }
+        if (found.size() > limit) {
+            return AbsentIndexDescriptorSuppliers.PrefixExpansion.tooMany(limit);
+        }
+        List<AbsentIndexDescriptorSuppliers.PrefixMatch> matches = new ArrayList<>(found.size());
+        for (BlobMetadata blob : found) {
+            matches.add(new AbsentIndexDescriptorSuppliers.PrefixMatch(blob.name(), true, false));
+        }
+        return AbsentIndexDescriptorSuppliers.PrefixExpansion.of(matches);
+    }
+
+    /**
+     * The descriptor space as a child container, which is the one addressing that works on both stores.
+     *
+     * <p>Not interchangeable with listing the base container under a {@code "descriptors/"} prefix. On an
+     * object store a key is flat and the slash is just a character, so that would work; on a filesystem
+     * repository the slash is a directory separator and the listing iterates one level, returning nothing at
+     * all. S7 shipped exactly that mistake for tombstones and it passed review.
+     */
     private BlobContainer descriptors() {
         return containers.apply(basePath.add(trimmed(BlobDescriptorBackend.DESCRIPTOR_PREFIX)));
     }
