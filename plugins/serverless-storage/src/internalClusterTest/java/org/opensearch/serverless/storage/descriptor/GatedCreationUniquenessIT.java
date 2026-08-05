@@ -27,8 +27,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  *
  * <p>H3's design names the mechanism that prevents this: a descriptor written with
  * {@code op_type=create} is the uniqueness gate, so the store rather than the cluster manager decides that
- * a name is taken, and a version conflict is a lost race rather than an error. {@code DescriptorStore}
- * implements it as {@link DescriptorStore#create}.
+ * a name is taken, and a version conflict is a lost race rather than an error. {@code BlobDescriptorBackend}
+ * implements it as {@link BlobDescriptorBackend#create}.
  *
  * <p>The gated creation path does not call it. {@code MetadataCreateIndexService.clusterStateCreateIndex}
  * calls {@code IndexDescriptorPublisher.publish}, and {@code DescriptorGate} routes a live descriptor to
@@ -85,7 +85,7 @@ public class GatedCreationUniquenessIT extends org.opensearch.serverless.storage
     }
 
     @After
-    public void clearGate() {
+    public void clearGate() throws Exception {
         DescriptorGate.uninstall();
     }
 
@@ -107,17 +107,11 @@ public class GatedCreationUniquenessIT extends org.opensearch.serverless.storage
      *
      * <p>Committed under {@code AwaitsFix} alongside T17, because both are the same defect seen from
      * different sides and both are fixed by the same change: route gated creation through
-     * {@code DescriptorStore.create}, which is {@code op_type=create} and therefore atomic, and make the
+     * {@code BlobDescriptorBackend.create}, which is {@code op_type=create} and therefore atomic, and make the
      * acknowledgement wait for its result instead of for a cluster state update that does nothing.
      */
     public void testAGatedIndexNameCanOnlyBeCreatedOnce() throws Exception {
-        DescriptorGate.install(
-            new DescriptorStore(client(), 1),
-            new IndexBackedMappingStore(client()),
-            new IndexBackedMappingStatsAggregator(client()),
-            new StoreBackedFieldRefresher(),
-            true
-        );
+        installBlobBackedDescriptorPlane();
 
         Outcome outcome = createConcurrently(CONTESTED, true);
 

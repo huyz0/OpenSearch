@@ -176,16 +176,6 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     public static final String LAZY_DIRECTORY_STORE_TYPE = "serverless_storage_lazy";
 
     /** Per-index opt-in switch for serverless storage; final once set, since switching modes on a live index is unsupported. */
-    /**
-     * How many shards the descriptor index gets.
-     *
-     * <p>Fixed rather than settable because S23 measured descriptor point lookup as flat against the
-     * descriptor index's own shard count, 0.476 ms at one shard against 0.435 ms at sixty, so there is no
-     * lookup reason to tune it. More shards spread merging, which S29 made load-bearing, and that is the
-     * only reason this is above one.
-     */
-    static final int DESCRIPTOR_INDEX_SHARDS = 5;
-
     public static final Setting<Boolean> SERVERLESS_STORAGE_ENABLED_SETTING = Setting.boolSetting(
         "index.serverless_storage.enabled",
         false,
@@ -331,30 +321,6 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     public static final Setting<Boolean> SERVERLESS_STORAGE_REST_GATING_ENABLED_SETTING = Setting.boolSetting(
         "serverless_storage.rest_gating.enabled",
         false,
-        Setting.Property.NodeScope
-    );
-
-    /**
-     * Which store answers a descriptor point read: {@code index} or {@code blob}.
-     *
-     * <p>Prefix searches are not selectable and stay with the system index whichever this says, because
-     * T3 established that three of eleven operations need an index over names and a bucket has none. So
-     * this switches the durability of a descriptor, not the whole store.
-     *
-     * <p>Defaults to {@code index}, which leaves an existing deployment exactly as it was. The switch is
-     * reversible while it stays that way: the gate dual-writes, so the system index keeps every descriptor
-     * even when point reads are being served from the object store.
-     */
-    public static final Setting<String> DESCRIPTOR_BACKEND_SETTING = Setting.simpleString(
-        "serverless_storage.descriptor.backend",
-        "index",
-        value -> {
-            if (value.equals("index") == false && value.equals("blob") == false) {
-                throw new IllegalArgumentException(
-                    "[serverless_storage.descriptor.backend] must be [index] or [blob], got [" + value + "]"
-                );
-            }
-        },
         Setting.Property.NodeScope
     );
 
@@ -1457,7 +1423,6 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_PITR_WINDOW_SETTING,
             SERVERLESS_STORAGE_MAX_CONCURRENT_READER_SHARDS_SETTING,
             SERVERLESS_STORAGE_WILDCARD_MAX_EXPANDED_INDICES_SETTING,
-            DESCRIPTOR_BACKEND_SETTING,
             SERVERLESS_STORAGE_NODE_ENABLED_SETTING,
             SERVERLESS_STORAGE_REST_GATING_ENABLED_SETTING,
             SERVERLESS_STORAGE_MAX_FILE_CACHE_USAGE_RATIO_SETTING,
@@ -1855,8 +1820,6 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         // node and a gated index could not be named by any request. Installing is the whole of the wiring
         // for the same reason computed placement's is: the registries are static and each node answers
         // locally.
-        org.opensearch.serverless.storage.descriptor.DescriptorStore descriptorStore =
-            new org.opensearch.serverless.storage.descriptor.DescriptorStore(client, DESCRIPTOR_INDEX_SHARDS);
         // T28's wildcard cap, applied before the gate is installed so no expansion can run against the
         // default when the operator configured something else, and kept current afterwards. Registering the
         // update consumer is what makes the setting dynamic rather than merely declared as such.
@@ -1868,58 +1831,57 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 SERVERLESS_STORAGE_WILDCARD_MAX_EXPANDED_INDICES_SETTING,
                 org.opensearch.serverless.storage.descriptor.DescriptorGate::setWildcardExpansionLimit
             );
-        // I1-I3. Point reads and writes go to the object store when the operator asks for it; prefix
-        // searches stay with the system index either way, because T3 established a bucket cannot serve
-        // them. Defaulting to the index leaves an existing deployment untouched, and the index still holds
-        // every descriptor because the gate dual-writes, which is what makes the switch reversible.
-        org.opensearch.serverless.storage.descriptor.DescriptorBackend descriptorBackend = descriptorStore;
-        if (DESCRIPTOR_BACKEND_SETTING.get(environment.settings()).equals("blob")) {
+        // Both halves are the object store. There is no longer a choice to make: the point half is a
+        // conditional write and a read of one key, and the prefix half is one bounded listing over the same
+        // descriptors/ prefix, so nothing a request touches lives in an index any more. That removes the
+        // dual write too -- the two halves address one keyspace, so there is no second copy to keep in step.
+        //
+        // A configured object store is therefore a hard requirement of this plugin rather than an option,
+        // the same posture remote-backed storage already takes. Failing at startup is the point: quietly
+        // serving descriptors from somewhere else would be a durability guarantee nobody would notice was
+        // missing.
+        // Only built when this node is actually running serverless storage. Resolving the container is
+        // I/O against a configured repository, and a node that merely has the plugin on its classpath has
+        // not asked for one -- doing it unconditionally would fail startup for an ordinary cluster, which
+        // is precisely the R1 breakage the enabled flag exists to prevent.
+        org.opensearch.serverless.storage.descriptor.DescriptorBackend descriptorBackend = null;
+        if (SERVERLESS_STORAGE_NODE_ENABLED_SETTING.get(environment.settings())) {
+            final org.opensearch.serverless.storage.descriptor.DescriptorEnumerator descriptorPrefixes;
             try {
-                descriptorBackend = new org.opensearch.serverless.storage.descriptor.CompositeDescriptorBackend(
-                    new org.opensearch.serverless.storage.descriptor.BlobDescriptorBackend(
-                        resolveContainerForDescriptors(
-                            BlobPath.cleanPath().add("descriptors-root"),
-                            "["
-                                + DESCRIPTOR_BACKEND_SETTING.getKey()
-                                + "] is [blob] but no container could be resolved; set ["
-                                + SERVERLESS_STORAGE_REPOSITORY_SETTING.getKey()
-                                + "] or ["
-                                + SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey()
-                                + "]"
-                        ),
-                        // GENERIC, because the descriptor hooks are registered on the cluster state thread
-                        // and must not do I/O there. Which pool is the caller's decision precisely because
-                        // getting it wrong hangs a node rather than slowing one down.
-                        threadPool.executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC),
-                        DESCRIPTOR_CACHE_FRESHNESS_SETTING.get(environment.settings()).nanos()
+                descriptorBackend = new org.opensearch.serverless.storage.descriptor.BlobDescriptorBackend(
+                    resolveContainerForDescriptors(
+                        BlobPath.cleanPath().add("descriptors-root"),
+                        "no container could be resolved for descriptors; set ["
+                            + SERVERLESS_STORAGE_REPOSITORY_SETTING.getKey()
+                            + "] or ["
+                            + SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey()
+                            + "]"
                     ),
-                    // Wildcards come from the object store too, now that expansion is one bounded listing
-                    // rather than a search. This is what takes the descriptor system index off the request
-                    // path: the enumerator addresses the same descriptor prefix the point half writes, so
-                    // there is no second copy to keep in step and nothing to dual-write.
-                    new org.opensearch.serverless.storage.descriptor.DescriptorEnumerator(path -> {
-                        try {
-                            return resolveContainerForDescriptors(path, "no blob store for wildcard expansion");
-                        } catch (IOException e) {
-                            throw new java.io.UncheckedIOException(e);
-                        }
-                    }, BlobPath.cleanPath().add("descriptors-root"))
+                    // GENERIC, because the descriptor hooks are registered on the cluster state thread and
+                    // must not do I/O there. Which pool is the caller's decision precisely because getting
+                    // it wrong hangs a node rather than slowing one down.
+                    threadPool.executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC),
+                    DESCRIPTOR_CACHE_FRESHNESS_SETTING.get(environment.settings()).nanos()
                 );
+                descriptorPrefixes = new org.opensearch.serverless.storage.descriptor.DescriptorEnumerator(path -> {
+                    try {
+                        return resolveContainerForDescriptors(path, "no blob store for wildcard expansion");
+                    } catch (IOException e) {
+                        throw new java.io.UncheckedIOException(e);
+                    }
+                }, BlobPath.cleanPath().add("descriptors-root"));
             } catch (java.io.IOException e) {
-                // Falling back would be worse than failing: the operator asked for the object store, and
-                // quietly serving descriptors from the index instead is a durability guarantee nobody
-                // would notice was missing.
-                throw new IllegalStateException("could not resolve the descriptor container for the blob backend", e);
+                throw new IllegalStateException("could not resolve the descriptor container", e);
             }
+            org.opensearch.serverless.storage.descriptor.DescriptorGate.install(
+                descriptorBackend,
+                descriptorPrefixes,
+                new org.opensearch.serverless.storage.descriptor.IndexBackedMappingStore(client),
+                new org.opensearch.serverless.storage.descriptor.IndexBackedMappingStatsAggregator(client),
+                new org.opensearch.serverless.storage.descriptor.StoreBackedFieldRefresher(),
+                true
+            );
         }
-        org.opensearch.serverless.storage.descriptor.DescriptorGate.install(
-            descriptorBackend,
-            descriptorStore,
-            new org.opensearch.serverless.storage.descriptor.IndexBackedMappingStore(client),
-            new org.opensearch.serverless.storage.descriptor.IndexBackedMappingStatsAggregator(client),
-            new org.opensearch.serverless.storage.descriptor.StoreBackedFieldRefresher(),
-            SERVERLESS_STORAGE_NODE_ENABLED_SETTING.get(environment.settings())
-        );
 
         // G2. The change feed, both ends of it.
         //
@@ -1991,7 +1953,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             }
         }
 
-        return java.util.List.of(this, descriptorStore);
+        return java.util.List.of(this);
     }
 
     /**

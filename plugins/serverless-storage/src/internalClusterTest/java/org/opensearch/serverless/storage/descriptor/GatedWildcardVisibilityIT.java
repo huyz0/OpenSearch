@@ -17,7 +17,6 @@ import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.UnsupportedWildcardException;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.concurrent.ThreadContext;
-import org.opensearch.test.OpenSearchIntegTestCase;
 import org.junit.After;
 
 import java.util.List;
@@ -48,35 +47,27 @@ import java.util.Locale;
  * an answer. An end-to-end search would fold in shard placement, wake and query execution, none of which is
  * being asked about here.
  */
-public class GatedWildcardVisibilityIT extends OpenSearchIntegTestCase {
+public class GatedWildcardVisibilityIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
 
     private static final int TENANTS = 5;
 
     @After
-    public void clearGate() {
+    public void clearGate() throws Exception {
         DescriptorGate.uninstall();
     }
 
-    private IndexNameExpressionResolver resolver() {
+    private IndexNameExpressionResolver resolver() throws Exception {
         return new IndexNameExpressionResolver(new ThreadContext(Settings.EMPTY));
     }
 
     /** Installs the gate over a store holding {@link #TENANTS} gated tenants. */
-    private DescriptorStore installWithTenants() {
-        DescriptorStore store = new DescriptorStore(client(), 1);
+    private BlobDescriptorBackend installWithTenants() throws Exception {
+        BlobDescriptorBackend store = installBlobBackedDescriptorPlane().points();
         for (int i = 0; i < TENANTS; i++) {
             store.create(descriptor(tenant(i)));
         }
         // Expansion is a search and searches are refresh-bound, per H18. Without this the tests below
         // measure an empty index, which looks identical to the defect they exist to catch.
-        client().admin().indices().prepareRefresh(DescriptorStore.DESCRIPTOR_INDEX).get();
-        DescriptorGate.install(
-            store,
-            new IndexBackedMappingStore(client()),
-            new IndexBackedMappingStatsAggregator(client()),
-            new StoreBackedFieldRefresher(),
-            true
-        );
         return store;
     }
 
@@ -84,7 +75,7 @@ public class GatedWildcardVisibilityIT extends OpenSearchIntegTestCase {
      * The guard. An exact gated name resolves, so anything the wildcard cases report is about the wildcard
      * rather than about a gate that was never installed.
      */
-    public void testAnExactGatedNameResolves() {
+    public void testAnExactGatedNameResolves() throws Exception {
         installWithTenants();
 
         ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
@@ -100,7 +91,7 @@ public class GatedWildcardVisibilityIT extends OpenSearchIntegTestCase {
      *
      * <p>Reported rather than asserted at first, because the number and the failure mode are the finding.
      */
-    public void testAPrefixWildcardOverGatedTenants() {
+    public void testAPrefixWildcardOverGatedTenants() throws Exception {
         installWithTenants();
 
         ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
@@ -129,7 +120,7 @@ public class GatedWildcardVisibilityIT extends OpenSearchIntegTestCase {
      * {@code *} silently omits gated indices, which is a real wart and is why this test asserts the omission
      * out loud instead of leaving it to be rediscovered.
      */
-    public void testMatchAllDeliberatelyDoesNotExpandOverGatedTenants() {
+    public void testMatchAllDeliberatelyDoesNotExpandOverGatedTenants() throws Exception {
         installWithTenants();
 
         ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
@@ -146,7 +137,7 @@ public class GatedWildcardVisibilityIT extends OpenSearchIntegTestCase {
      * can distinguish "no such tenants" from "cannot see these tenants", which is what makes this a
      * correctness problem rather than a missing feature.
      */
-    public void testWhetherTheMissIsReportedAtAll() {
+    public void testWhetherTheMissIsReportedAtAll() throws Exception {
         installWithTenants();
 
         ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
@@ -176,7 +167,7 @@ public class GatedWildcardVisibilityIT extends OpenSearchIntegTestCase {
      * the alternatives are reading every name in the population or answering wrongly, and at a hundred
      * million the first is not an answer either. Refusing says which of the two the cluster is doing.
      */
-    public void testALeadingWildcardIsRefusedRatherThanAnswered() {
+    public void testALeadingWildcardIsRefusedRatherThanAnswered() throws Exception {
         installWithTenants();
 
         ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
@@ -191,7 +182,7 @@ public class GatedWildcardVisibilityIT extends OpenSearchIntegTestCase {
     }
 
     /** An embedded wildcard is refused for the same reason, and it is a separate branch of the check. */
-    public void testAnEmbeddedWildcardIsRefused() {
+    public void testAnEmbeddedWildcardIsRefused() throws Exception {
         installWithTenants();
 
         ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
@@ -208,7 +199,7 @@ public class GatedWildcardVisibilityIT extends OpenSearchIntegTestCase {
      * four measured times: an answer that is wrong and looks complete. A tenant given a hundred of their
      * five thousand indices has no way to tell.
      */
-    public void testAPrefixOverTheCapIsRefusedRatherThanTruncated() {
+    public void testAPrefixOverTheCapIsRefusedRatherThanTruncated() throws Exception {
         installWithTenants();
         DescriptorGate.setWildcardExpansionLimit(TENANTS - 1);
 
@@ -225,7 +216,7 @@ public class GatedWildcardVisibilityIT extends OpenSearchIntegTestCase {
     }
 
     /** Exactly at the cap is answered, so the boundary is inclusive rather than off by one. */
-    public void testAPrefixExactlyAtTheCapIsAnswered() {
+    public void testAPrefixExactlyAtTheCapIsAnswered() throws Exception {
         installWithTenants();
         DescriptorGate.setWildcardExpansionLimit(TENANTS);
 
@@ -241,7 +232,7 @@ public class GatedWildcardVisibilityIT extends OpenSearchIntegTestCase {
      * <p>Worth a test because it is a stated configuration rather than an accident of the arithmetic: the
      * narrowest form of the contract has to be reachable by setting a number, not by a different build.
      */
-    public void testALimitOfZeroRefusesEveryWildcard() {
+    public void testALimitOfZeroRefusesEveryWildcard() throws Exception {
         installWithTenants();
         DescriptorGate.setWildcardExpansionLimit(0);
 
@@ -253,7 +244,7 @@ public class GatedWildcardVisibilityIT extends OpenSearchIntegTestCase {
     }
 
     /** A prefix matching nothing is an empty answer rather than an error, as it is for ordinary indices. */
-    public void testAPrefixMatchingNoGatedIndexIsEmptyRatherThanRefused() {
+    public void testAPrefixMatchingNoGatedIndexIsEmptyRatherThanRefused() throws Exception {
         installWithTenants();
 
         ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
@@ -268,10 +259,9 @@ public class GatedWildcardVisibilityIT extends OpenSearchIntegTestCase {
      * <p>H4 records a deletion as a tombstone rather than an absence, so the document is still there and
      * only its state says otherwise. T27 found listing had the same gap.
      */
-    public void testATombstonedIndexDoesNotMatchAWildcard() {
-        DescriptorStore store = installWithTenants();
+    public void testATombstonedIndexDoesNotMatchAWildcard() throws Exception {
+        BlobDescriptorBackend store = installWithTenants();
         store.put(descriptorWithState(tenant(0), IndexDescriptor.State.DELETED));
-        client().admin().indices().prepareRefresh(DescriptorStore.DESCRIPTOR_INDEX).get();
 
         ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
         String[] resolved = resolver().concreteIndexNames(empty, IndicesOptions.lenientExpandOpen(), "tenant-*");
@@ -301,7 +291,7 @@ public class GatedWildcardVisibilityIT extends OpenSearchIntegTestCase {
      * expression list had turned a query limit into an outage. An empty list now keeps its cluster state
      * meaning, and only a pattern the caller actually wrote is capped.
      */
-    public void testWhatAnOverCapPopulationDoesToClusterHealth() {
+    public void testWhatAnOverCapPopulationDoesToClusterHealth() throws Exception {
         installWithTenants();
         DescriptorGate.setWildcardExpansionLimit(TENANTS - 1);
 
@@ -340,8 +330,8 @@ public class GatedWildcardVisibilityIT extends OpenSearchIntegTestCase {
      * <p>Harmless while H8a's seam existed and no wildcard reached it. A per-request cost the moment T28
      * made wildcards a normal path, which is why it is counted here rather than reasoned about.
      */
-    public void testAWildcardDoesNotAlsoPayAPointLookup() {
-        DescriptorStore store = installWithTenants();
+    public void testAWildcardDoesNotAlsoPayAPointLookup() throws Exception {
+        BlobDescriptorBackend store = installWithTenants();
 
         // A prefix that matches nothing, which is what isolates the question. Measured against a matching
         // prefix the count was five, and five is correct: each resolved gated name needs a descriptor read
@@ -364,7 +354,7 @@ public class GatedWildcardVisibilityIT extends OpenSearchIntegTestCase {
      * a pattern the contract would refuse is not refused, because there is no gated population for the
      * contract to be about.
      */
-    public void testWithoutTheGateALeadingWildcardStillWorks() {
+    public void testWithoutTheGateALeadingWildcardStillWorks() throws Exception {
         for (int i = 0; i < TENANTS; i++) {
             createIndex(tenant(i));
         }
@@ -381,7 +371,7 @@ public class GatedWildcardVisibilityIT extends OpenSearchIntegTestCase {
      * The control that proves the pattern itself is fine: the identical wildcard over ordinary indices with
      * cluster state entries resolves all of them.
      */
-    public void testTheSameWildcardResolvesOrdinaryIndices() {
+    public void testTheSameWildcardResolvesOrdinaryIndices() throws Exception {
         for (int i = 0; i < TENANTS; i++) {
             createIndex(tenant(i));
         }
@@ -392,17 +382,17 @@ public class GatedWildcardVisibilityIT extends OpenSearchIntegTestCase {
         assertEquals("the control: the same pattern over ordinary indices finds all of them", TENANTS, resolved.length);
     }
 
-    private String[] report(String expression, ClusterState state, IndicesOptions options) {
+    private String[] report(String expression, ClusterState state, IndicesOptions options) throws Exception {
         String[] resolved = resolver().concreteIndexNames(state, options, expression);
         logger.warn("T25: [{}] over {} gated tenants resolved {} names", expression, TENANTS, resolved.length);
         return resolved;
     }
 
-    private static String tenant(int i) {
+    private static String tenant(int i) throws Exception {
         return String.format(Locale.ROOT, "tenant-%03d", i);
     }
 
-    private static IndexDescriptor descriptorWithState(String name, IndexDescriptor.State state) {
+    private static IndexDescriptor descriptorWithState(String name, IndexDescriptor.State state) throws Exception {
         return new IndexDescriptor(
             name,
             name + "-uuid",
@@ -421,7 +411,7 @@ public class GatedWildcardVisibilityIT extends OpenSearchIntegTestCase {
         );
     }
 
-    private static IndexDescriptor descriptor(String name) {
+    private static IndexDescriptor descriptor(String name) throws Exception {
         return new IndexDescriptor(
             name,
             name + "-uuid",

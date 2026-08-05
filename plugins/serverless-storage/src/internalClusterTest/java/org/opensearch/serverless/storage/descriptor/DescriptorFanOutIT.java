@@ -10,7 +10,6 @@ package org.opensearch.serverless.storage.descriptor;
 
 import org.opensearch.Version;
 import org.opensearch.cluster.metadata.IndexDescriptor;
-import org.opensearch.test.OpenSearchIntegTestCase;
 
 import java.util.List;
 import java.util.Locale;
@@ -20,7 +19,7 @@ import java.util.concurrent.TimeUnit;
 /**
  * T1. What concurrent resolution of one name costs, when the callers all miss together.
  *
- * <p>P8 gave {@link DescriptorStore#get} a one second window, and {@link DescriptorReadCountIT} pins that
+ * <p>P8 gave {@link BlobDescriptorBackend#get} a one second window, and {@link DescriptorReadCountIT} pins that
  * fifty <em>sequential</em> resolutions cost one read. Nothing pins what concurrent ones cost, and the two
  * are different questions: the window only helps a caller that arrives after some other caller has finished
  * reading and populated it. Callers that arrive together all see the same empty slot and all go to the index.
@@ -56,7 +55,7 @@ import java.util.concurrent.TimeUnit;
  * sharing it makes a freshly created index unnameable for the length of one read and so breaks the realtime
  * contract H18 pinned. {@code DescriptorReadCountIT} holds that boundary.
  */
-public class DescriptorFanOutIT extends OpenSearchIntegTestCase {
+public class DescriptorFanOutIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
 
     /** One is the uncontended floor. The rest are shard counts a gated index plausibly has. */
     private static final int[] CONCURRENCY = { 1, 4, 16, 64 };
@@ -64,7 +63,7 @@ public class DescriptorFanOutIT extends OpenSearchIntegTestCase {
     private static final String NAME = "fanned-out-idx";
 
     public void testConcurrentMissesCollapseToOneRead() throws Exception {
-        DescriptorStore store = new DescriptorStore(client(), 1);
+        BlobDescriptorBackend store = installBlobBackedDescriptorPlane().points();
         store.create(descriptor(NAME));
 
         // Warm once, so the measurement is not paying for the descriptor index's first ever read.
@@ -107,7 +106,7 @@ public class DescriptorFanOutIT extends OpenSearchIntegTestCase {
      * Every caller released at once, so they all observe the empty slot before any of them fills it.
      * Staggering them would measure the P8 window instead, which {@link DescriptorReadCountIT} already pins.
      */
-    private void resolveConcurrently(DescriptorStore store, int callers) throws Exception {
+    private void resolveConcurrently(BlobDescriptorBackend store, int callers) throws Exception {
         CountDownLatch release = new CountDownLatch(1);
         CountDownLatch finished = new CountDownLatch(callers);
         // Captured rather than counted, since a run where every caller silently resolved to null would
@@ -136,7 +135,7 @@ public class DescriptorFanOutIT extends OpenSearchIntegTestCase {
         assertEquals("a caller resolving to null measured a failure, not a read", 0, nulls.get());
     }
 
-    private static IndexDescriptor descriptor(String name) {
+    private static IndexDescriptor descriptor(String name) throws Exception {
         return new IndexDescriptor(
             name,
             name + "-uuid",

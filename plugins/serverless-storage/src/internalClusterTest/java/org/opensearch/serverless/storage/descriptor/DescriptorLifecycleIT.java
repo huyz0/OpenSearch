@@ -18,7 +18,6 @@ import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.serverless.storage.scaletozero.GatedShardSuspensionRegistry;
-import org.opensearch.test.OpenSearchIntegTestCase;
 import org.junit.After;
 
 import java.util.Map;
@@ -48,18 +47,19 @@ import java.util.Map;
  * the per-seam tests: those each install their own dependencies, so every one of them would keep passing
  * on a node where nothing was wired at all.
  */
-public class DescriptorLifecycleIT extends OpenSearchIntegTestCase {
+public class DescriptorLifecycleIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
 
     private static final String INDEX = "lifecycle-idx";
     private static final String UUID = "lifecycle-idx-uuid";
     private static final int SHARDS = 3;
 
-    private DescriptorStore store;
+    private BlobDescriptorBackend store;
+    private DescriptorEnumerator prefixes;
     private IndexBackedMappingStore mappings;
     private GatedShardSuspensionRegistry suspensions;
 
     @After
-    public void tearDownSeams() {
+    public void tearDownSeams() throws Exception {
         DescriptorGate.uninstall();
         AbsentIndexRoutingSuppliers.register(null);
         if (suspensions != null) {
@@ -97,8 +97,7 @@ public class DescriptorLifecycleIT extends OpenSearchIntegTestCase {
         //
         // Recorded rather than quietly dropped because the first version of this test did assert the race,
         // and it passed until W12's run happened to be slow enough to expose it.
-        client().admin().indices().prepareRefresh(DescriptorStore.DESCRIPTOR_INDEX).get();
-        assertEquals("a refreshed wildcard must find the gated index", 1, store.expandPrefix("lifecycle-", 10).matches().size());
+        assertEquals("a refreshed wildcard must find the gated index", 1, prefixes.expandPrefix("lifecycle-", 10).matches().size());
 
         // 4. Mapped, with the generation advancing and no shard informed. H4c required this to leave
         // cluster state; W5 gave it somewhere to live.
@@ -142,12 +141,21 @@ public class DescriptorLifecycleIT extends OpenSearchIntegTestCase {
     }
 
     /** Installs the seams the plugin installs at node start, so this exercises the wired arrangement. */
-    private void installEverySeam() {
-        store = new DescriptorStore(client(), 1);
+    private void installEverySeam() throws Exception {
+        InstalledDescriptorPlane plane = installBlobBackedDescriptorPlane();
+        store = plane.points();
+        prefixes = plane.prefixes();
         mappings = new IndexBackedMappingStore(client());
         suspensions = new GatedShardSuspensionRegistry();
 
-        DescriptorGate.install(store, mappings, new IndexBackedMappingStatsAggregator(client()), new StoreBackedFieldRefresher(), true);
+        DescriptorGate.install(
+            store,
+            prefixes,
+            mappings,
+            new IndexBackedMappingStatsAggregator(client()),
+            new StoreBackedFieldRefresher(),
+            true
+        );
         suspensions.install();
         AbsentIndexRoutingSuppliers.register((state, metadata) -> placement());
     }
@@ -170,7 +178,7 @@ public class DescriptorLifecycleIT extends OpenSearchIntegTestCase {
         return placement.build();
     }
 
-    private static IndexDescriptor descriptor() {
+    private static IndexDescriptor descriptor() throws Exception {
         return new IndexDescriptor(
             INDEX,
             UUID,

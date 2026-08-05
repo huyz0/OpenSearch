@@ -18,7 +18,6 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.concurrent.ThreadContext;
-import org.opensearch.test.OpenSearchIntegTestCase;
 import org.junit.After;
 
 import java.util.List;
@@ -60,38 +59,30 @@ import java.util.List;
  * <p>Probed rather than argued, and the probe is what changed the answer: the resolution gap was the visible
  * problem and the mutation gap was the one that mattered.
  */
-public class GatedAliasResolutionIT extends OpenSearchIntegTestCase {
+public class GatedAliasResolutionIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
 
     private static final String INDEX = "aliased-tenant";
 
     private static final String ALIAS = "tenant-alias";
 
     @After
-    public void clearGate() {
+    public void clearGate() throws Exception {
         DescriptorGate.uninstall();
     }
 
-    private IndexNameExpressionResolver resolver() {
+    private IndexNameExpressionResolver resolver() throws Exception {
         return new IndexNameExpressionResolver(new ThreadContext(Settings.EMPTY));
     }
 
-    private DescriptorStore installWithAliasedIndex() {
-        DescriptorStore store = new DescriptorStore(client(), 1);
+    private BlobDescriptorBackend installWithAliasedIndex() throws Exception {
+        BlobDescriptorBackend store = installBlobBackedDescriptorPlane().points();
         store.create(descriptor(INDEX, List.of(ALIAS)));
-        client().admin().indices().prepareRefresh(DescriptorStore.DESCRIPTOR_INDEX).get();
-        DescriptorGate.install(
-            store,
-            new IndexBackedMappingStore(client()),
-            new IndexBackedMappingStatsAggregator(client()),
-            new StoreBackedFieldRefresher(),
-            true
-        );
         return store;
     }
 
     /** The premise. The alias is on the descriptor, so anything below is about reading it, not writing it. */
-    public void testTheAliasIsRecordedOnTheDescriptor() {
-        DescriptorStore store = installWithAliasedIndex();
+    public void testTheAliasIsRecordedOnTheDescriptor() throws Exception {
+        BlobDescriptorBackend store = installWithAliasedIndex();
 
         IndexDescriptor recorded = store.get(INDEX);
         assertNotNull(recorded);
@@ -104,7 +95,7 @@ public class GatedAliasResolutionIT extends OpenSearchIntegTestCase {
      * <p>This is what makes the resolution gap unreachable rather than fixed: there is no such thing as a
      * gated index with an alias, so there is nothing for resolution to miss.
      */
-    public void testAnIndexWithAnAliasIsNotGatable() {
+    public void testAnIndexWithAnAliasIsNotGatable() throws Exception {
         IndexMetadata aliased = IndexMetadata.builder("with-alias")
             .settings(
                 Settings.builder()
@@ -123,7 +114,7 @@ public class GatedAliasResolutionIT extends OpenSearchIntegTestCase {
     }
 
     /** The other half of the rule: an index without aliases is still gatable, so this did not gate nothing. */
-    public void testAnIndexWithoutAliasesIsStillGatable() {
+    public void testAnIndexWithoutAliasesIsStillGatable() throws Exception {
         IndexMetadata plain = IndexMetadata.builder("no-alias")
             .settings(
                 Settings.builder()
@@ -137,7 +128,7 @@ public class GatedAliasResolutionIT extends OpenSearchIntegTestCase {
     }
 
     /** The control. The same alias on an ordinary index resolves, so the pattern of the test is sound. */
-    public void testTheSameAliasOnAnOrdinaryIndexResolves() {
+    public void testTheSameAliasOnAnOrdinaryIndexResolves() throws Exception {
         createIndex("ordinary-aliased");
         assertTrue(client().admin().indices().prepareAliases().addAlias("ordinary-aliased", "ordinary-alias").get().isAcknowledged());
 
@@ -148,7 +139,7 @@ public class GatedAliasResolutionIT extends OpenSearchIntegTestCase {
         assertEquals("ordinary-aliased", resolved[0]);
     }
 
-    private static IndexDescriptor descriptor(String name, List<String> aliases) {
+    private static IndexDescriptor descriptor(String name, List<String> aliases) throws Exception {
         return new IndexDescriptor(
             name,
             name + "-uuid",

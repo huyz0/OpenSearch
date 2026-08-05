@@ -10,7 +10,6 @@ package org.opensearch.serverless.storage.descriptor;
 
 import org.opensearch.Version;
 import org.opensearch.cluster.metadata.IndexDescriptor;
-import org.opensearch.test.OpenSearchIntegTestCase;
 
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
@@ -32,17 +31,17 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>So these tests count reads rather than asserting a cache exists, because the shape of this mistake is
  * a cache that is present and useless.
  */
-public class DescriptorReadCountIT extends OpenSearchIntegTestCase {
+public class DescriptorReadCountIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
 
     private final AtomicLong now = new AtomicLong(1_000_000_000L);
 
-    private DescriptorStore store() {
-        return new DescriptorStore(client(), 1, now::get);
+    private BlobDescriptorBackend store() throws Exception {
+        return blobBackend(now::get, DescriptorCache.DEFAULT_CAPACITY);
     }
 
     /** Repeated resolution of the same name must not repeatedly go to the index. */
-    public void testRepeatedResolutionCostsOneRead() {
-        DescriptorStore store = store();
+    public void testRepeatedResolutionCostsOneRead() throws Exception {
+        BlobDescriptorBackend store = store();
         store.create(descriptor("cached-idx"));
         long readsAfterCreate = store.readCount();
 
@@ -59,8 +58,8 @@ public class DescriptorReadCountIT extends OpenSearchIntegTestCase {
     }
 
     /** Past the window it reads again, so a descriptor changed elsewhere is eventually seen. */
-    public void testTheWindowExpires() {
-        DescriptorStore store = store();
+    public void testTheWindowExpires() throws Exception {
+        BlobDescriptorBackend store = store();
         store.create(descriptor("expiring-idx"));
         store.get("expiring-idx");
         long afterFirst = store.readCount();
@@ -68,7 +67,7 @@ public class DescriptorReadCountIT extends OpenSearchIntegTestCase {
         store.get("expiring-idx");
         assertEquals("inside the window, no further read", afterFirst, store.readCount());
 
-        now.addAndGet(DescriptorStore.CACHE_TTL_NANOS + 1);
+        now.addAndGet(BlobDescriptorBackend.DEFAULT_CACHE_TTL_NANOS + 1);
         store.get("expiring-idx");
 
         assertEquals("past the window it must look again", afterFirst + 1, store.readCount());
@@ -78,8 +77,8 @@ public class DescriptorReadCountIT extends OpenSearchIntegTestCase {
      * A miss is not cached, so an index created a moment ago is nameable immediately. H18 made that the
      * contract for exact names, and caching absence would have quietly broken it.
      */
-    public void testAMissIsNotCachedSoANewIndexIsVisibleImmediately() {
-        DescriptorStore store = store();
+    public void testAMissIsNotCachedSoANewIndexIsVisibleImmediately() throws Exception {
+        BlobDescriptorBackend store = store();
 
         assertNull("not there yet", store.get("appearing-idx"));
         store.create(descriptor("appearing-idx"));
@@ -88,8 +87,8 @@ public class DescriptorReadCountIT extends OpenSearchIntegTestCase {
     }
 
     /** A write invalidates, so the store never serves a value it has just replaced. */
-    public void testAWriteInvalidatesItsOwnCachedValue() {
-        DescriptorStore store = store();
+    public void testAWriteInvalidatesItsOwnCachedValue() throws Exception {
+        BlobDescriptorBackend store = store();
         store.create(descriptor("evolving-idx"));
         assertEquals(0L, store.get("evolving-idx").mappingGeneration());
 
@@ -107,8 +106,8 @@ public class DescriptorReadCountIT extends OpenSearchIntegTestCase {
      * slow-read scenario nothing can arrange, because an untested fallback is how this area has repeatedly
      * produced mechanisms that were correct and never reached.
      */
-    public void testAWaiterFallsBackWhenTheReaderNeverFinishes() {
-        DescriptorStore store = new DescriptorStore(client(), 1, now::get, 50);
+    public void testAWaiterFallsBackWhenTheReaderNeverFinishes() throws Exception {
+        BlobDescriptorBackend store = blobBackend(now::get, 50);
         store.create(descriptor("stuck-idx"));
         store.invalidate("stuck-idx");
 
@@ -132,8 +131,8 @@ public class DescriptorReadCountIT extends OpenSearchIntegTestCase {
      * the same class of bug this area keeps producing, introduced by the fix for a different one, which is
      * why the review after T4b went looking for it rather than assuming collapsing was free.
      */
-    public void testAWaiterDoesNotInheritAMissForAnIndexThatNowExists() {
-        DescriptorStore store = new DescriptorStore(client(), 1, now::get);
+    public void testAWaiterDoesNotInheritAMissForAnIndexThatNowExists() throws Exception {
+        BlobDescriptorBackend store = blobBackend(now::get, DescriptorCache.DEFAULT_CAPACITY);
 
         // A read for this name is already in flight and is about to come back empty, because it started
         // before the creation below.
@@ -148,7 +147,7 @@ public class DescriptorReadCountIT extends OpenSearchIntegTestCase {
         );
     }
 
-    private static IndexDescriptor descriptor(String name) {
+    private static IndexDescriptor descriptor(String name) throws Exception {
         return new IndexDescriptor(
             name,
             name + "-uuid",

@@ -18,7 +18,6 @@ import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.index.IndexNotFoundException;
-import org.opensearch.test.OpenSearchIntegTestCase;
 import org.junit.After;
 
 import java.util.List;
@@ -35,28 +34,21 @@ import java.util.List;
  * gate has turned every typo into a silent success; and an ordinary index must not reach the store at all,
  * or every cluster pays a descriptor read per resolution.
  */
-public class DescriptorGateIT extends OpenSearchIntegTestCase {
+public class DescriptorGateIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
 
     @After
-    public void clearGate() {
+    public void clearGate() throws Exception {
         DescriptorGate.uninstall();
     }
 
-    private IndexNameExpressionResolver resolver() {
+    private IndexNameExpressionResolver resolver() throws Exception {
         return new IndexNameExpressionResolver(new ThreadContext(Settings.EMPTY));
     }
 
     /** The property. A name that exists only as a descriptor resolves, carrying the descriptor's uuid. */
-    public void testAGatedNameResolvesOnceTheGateIsInstalled() {
-        DescriptorStore store = new DescriptorStore(client(), 1);
+    public void testAGatedNameResolvesOnceTheGateIsInstalled() throws Exception {
+        BlobDescriptorBackend store = installBlobBackedDescriptorPlane().points();
         store.create(descriptor("gated-logs"));
-        DescriptorGate.install(
-            store,
-            new IndexBackedMappingStore(client()),
-            new IndexBackedMappingStatsAggregator(client()),
-            new StoreBackedFieldRefresher(),
-            true
-        );
 
         ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
         var resolved = resolver().concreteIndices(empty, IndicesOptions.strictExpandOpen(), "gated-logs");
@@ -71,8 +63,8 @@ public class DescriptorGateIT extends OpenSearchIntegTestCase {
     }
 
     /** Without the gate the same name is unresolvable, which is what production looked like until now. */
-    public void testTheSameNameIsUnresolvableWithoutTheGate() {
-        DescriptorStore store = new DescriptorStore(client(), 1);
+    public void testTheSameNameIsUnresolvableWithoutTheGate() throws Exception {
+        BlobDescriptorBackend store = blobBackendWithoutInstalling();
         store.create(descriptor("gated-logs"));
         // Deliberately not installed.
 
@@ -84,14 +76,8 @@ public class DescriptorGateIT extends OpenSearchIntegTestCase {
     }
 
     /** A genuinely missing name must still raise, or the gate turns every typo into a silent success. */
-    public void testAMissingNameStillRaises() {
-        DescriptorGate.install(
-            new DescriptorStore(client(), 1),
-            new IndexBackedMappingStore(client()),
-            new IndexBackedMappingStatsAggregator(client()),
-            new StoreBackedFieldRefresher(),
-            true
-        );
+    public void testAMissingNameStillRaises() throws Exception {
+        installBlobBackedDescriptorPlane();
 
         ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
         expectThrows(
@@ -101,27 +87,15 @@ public class DescriptorGateIT extends OpenSearchIntegTestCase {
     }
 
     /** Disabled means untouched, so an ordinary cluster carries none of this. */
-    public void testInstallingWhileDisabledRegistersNothing() {
-        DescriptorGate.install(
-            new DescriptorStore(client(), 1),
-            new IndexBackedMappingStore(client()),
-            new IndexBackedMappingStatsAggregator(client()),
-            new StoreBackedFieldRefresher(),
-            false
-        );
+    public void testInstallingWhileDisabledRegistersNothing() throws Exception {
+        installBlobBackedDescriptorPlane(false);
 
         assertFalse("a disabled gate must register no supplier", AbsentIndexDescriptorSuppliers.isRegistered());
     }
 
     /** Uninstalling clears both, which node close depends on to avoid outliving itself. */
-    public void testUninstallClearsBothRegistrations() {
-        DescriptorGate.install(
-            new DescriptorStore(client(), 1),
-            new IndexBackedMappingStore(client()),
-            new IndexBackedMappingStatsAggregator(client()),
-            new StoreBackedFieldRefresher(),
-            true
-        );
+    public void testUninstallClearsBothRegistrations() throws Exception {
+        installBlobBackedDescriptorPlane();
         assertTrue(AbsentIndexDescriptorSuppliers.isRegistered());
 
         DescriptorGate.uninstall();
@@ -137,14 +111,7 @@ public class DescriptorGateIT extends OpenSearchIntegTestCase {
      * runs end to end.
      */
     public void testCreatingAnIndexRecordsADescriptor() throws Exception {
-        DescriptorStore store = new DescriptorStore(client(), 1);
-        DescriptorGate.install(
-            store,
-            new IndexBackedMappingStore(client()),
-            new IndexBackedMappingStatsAggregator(client()),
-            new StoreBackedFieldRefresher(),
-            true
-        );
+        BlobDescriptorBackend store = installBlobBackedDescriptorPlane().points();
 
         createIndex("recorded-index");
 
@@ -174,7 +141,7 @@ public class DescriptorGateIT extends OpenSearchIntegTestCase {
      * what this converts it into. Before T12 these loops silently relied on the old answer, since an
      * unreadable index and an absent descriptor both came back null.
      */
-    private static IndexDescriptor readWhenAvailable(DescriptorStore store, String name) {
+    private static IndexDescriptor readWhenAvailable(BlobDescriptorBackend store, String name) throws Exception {
         try {
             return store.get(name);
         } catch (org.opensearch.cluster.metadata.DescriptorUnavailableException e) {
@@ -188,14 +155,7 @@ public class DescriptorGateIT extends OpenSearchIntegTestCase {
      * rejoin.
      */
     public void testDeletingAnIndexLeavesATombstoneRatherThanAnAbsence() throws Exception {
-        DescriptorStore store = new DescriptorStore(client(), 1);
-        DescriptorGate.install(
-            store,
-            new IndexBackedMappingStore(client()),
-            new IndexBackedMappingStatsAggregator(client()),
-            new StoreBackedFieldRefresher(),
-            true
-        );
+        BlobDescriptorBackend store = installBlobBackedDescriptorPlane().points();
         createIndex("doomed-index");
         // assertBusy on the premise too. The write is asynchronous, so a bare read here races it, and this
         // test passed once by timing before failing on a later run.
@@ -216,8 +176,8 @@ public class DescriptorGateIT extends OpenSearchIntegTestCase {
     }
 
     /** Without the gate, the same creation records nothing, which is what production did until now. */
-    public void testWithoutTheGateCreationRecordsNothing() {
-        DescriptorStore store = new DescriptorStore(client(), 1);
+    public void testWithoutTheGateCreationRecordsNothing() throws Exception {
+        BlobDescriptorBackend store = blobBackendWithoutInstalling();
         // Deliberately not installed.
 
         createIndex("unrecorded-index");
@@ -225,7 +185,7 @@ public class DescriptorGateIT extends OpenSearchIntegTestCase {
         assertNull("no publisher means no descriptor, silently", store.get("unrecorded-index"));
     }
 
-    private static IndexDescriptor descriptor(String name) {
+    private static IndexDescriptor descriptor(String name) throws Exception {
         return new IndexDescriptor(
             name,
             name + "-uuid",

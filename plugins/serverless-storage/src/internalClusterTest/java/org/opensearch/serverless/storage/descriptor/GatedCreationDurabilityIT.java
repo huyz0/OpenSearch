@@ -76,25 +76,20 @@ public class GatedCreationDurabilityIT extends org.opensearch.serverless.storage
     }
 
     @After
-    public void clearGate() {
+    public void clearGate() throws Exception {
         DescriptorGate.uninstall();
     }
 
-    private DescriptorStore install() {
-        DescriptorStore store = new DescriptorStore(client(), 1);
-        DescriptorGate.install(
-            store,
-            new IndexBackedMappingStore(client()),
-            new IndexBackedMappingStatsAggregator(client()),
-            new StoreBackedFieldRefresher(),
-            true
-        );
-        return store;
+    private FailableDescriptorContainer container;
+
+    private BlobDescriptorBackend install() throws Exception {
+        container = newFailableDescriptorContainer();
+        return installOverFailableContainer(container).points();
     }
 
     /** The control: with a healthy descriptor index, an acknowledged creation is a real index. */
     public void testAnAcknowledgedCreationNormallyExists() throws Exception {
-        DescriptorStore store = install();
+        BlobDescriptorBackend store = install();
 
         assertTrue(client().admin().indices().create(gated("healthy-idx")).actionGet().isAcknowledged());
 
@@ -126,12 +121,12 @@ public class GatedCreationDurabilityIT extends org.opensearch.serverless.storage
      * signature failure into a specification.
      */
     public void testAcknowledgementWhenTheDescriptorWriteCannotLand() throws Exception {
-        DescriptorStore store = install();
+        BlobDescriptorBackend store = install();
 
         // Force the descriptor index into existence, then close it so writes to it fail.
         assertTrue(client().admin().indices().create(gated("seed-idx")).actionGet().isAcknowledged());
         assertBusy(() -> assertNotNull(readWhenAvailable(store, "seed-idx")));
-        client().admin().indices().prepareClose(DescriptorStore.DESCRIPTOR_INDEX).get();
+        container.failing = true;
 
         boolean acknowledged;
         try {
@@ -149,8 +144,7 @@ public class GatedCreationDurabilityIT extends org.opensearch.serverless.storage
         );
 
         // Reopen so the store can be asked what actually exists.
-        client().admin().indices().prepareOpen(DescriptorStore.DESCRIPTOR_INDEX).get();
-        ensureGreen(DescriptorStore.DESCRIPTOR_INDEX);
+        container.failing = false;
         store.invalidate("doomed-idx");
 
         assertFalse(
@@ -166,7 +160,8 @@ public class GatedCreationDurabilityIT extends org.opensearch.serverless.storage
      * an absent descriptor from an unreadable one, and a descriptor index whose shard is still recovering
      * is genuinely unreadable, so a loop waiting for a write to land should keep waiting.
      */
-    private static org.opensearch.cluster.metadata.IndexDescriptor readWhenAvailable(DescriptorStore store, String name) {
+    private static org.opensearch.cluster.metadata.IndexDescriptor readWhenAvailable(BlobDescriptorBackend store, String name)
+        throws Exception {
         try {
             return store.get(name);
         } catch (org.opensearch.cluster.metadata.DescriptorUnavailableException e) {
@@ -174,7 +169,7 @@ public class GatedCreationDurabilityIT extends org.opensearch.serverless.storage
         }
     }
 
-    private static CreateIndexRequest gated(String name) {
+    private static CreateIndexRequest gated(String name) throws Exception {
         return new CreateIndexRequest(name).settings(
             Settings.builder()
                 .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)

@@ -94,7 +94,7 @@ public class GatedPopulationSoakIT extends org.opensearch.serverless.storage.Ser
      * Opens the progress file and says where it is, on the one channel that is never buffered away: the
      * file itself. Failing to open it is not a reason to abandon the run, only to lose the live view.
      */
-    private void openProgress() {
+    private void openProgress() throws Exception {
         try {
             progress = new java.io.PrintWriter(new java.io.FileWriter(PROGRESS_FILE, false), true);
             note("soak starting, progress at " + PROGRESS_FILE);
@@ -150,7 +150,7 @@ public class GatedPopulationSoakIT extends org.opensearch.serverless.storage.Ser
     }
 
     @After
-    public void clearGate() {
+    public void clearGate() throws Exception {
         DescriptorGate.uninstall();
     }
 
@@ -168,13 +168,7 @@ public class GatedPopulationSoakIT extends org.opensearch.serverless.storage.Ser
         ensureStableCluster(3);
         note(String.format(Locale.ROOT, "cluster up in %,d ms", (System.nanoTime() - clusterNanos) / 1_000_000));
 
-        DescriptorGate.install(
-            new DescriptorStore(client(), 1),
-            new IndexBackedMappingStore(client()),
-            new IndexBackedMappingStatsAggregator(client()),
-            new StoreBackedFieldRefresher(),
-            true
-        );
+        installBlobBackedDescriptorPlane();
 
         StringBuilder report = new StringBuilder(String.format(Locale.ROOT, "%ngated population soak, %,d indices%n", population));
 
@@ -284,7 +278,7 @@ public class GatedPopulationSoakIT extends org.opensearch.serverless.storage.Ser
      * everything measured before it is the one taken with one. Both are available, and which was used is
      * printed with the result rather than left to be inferred.
      */
-    private int createPopulation(int population, long budgetNanos, StringBuilder report) {
+    private int createPopulation(int population, long budgetNanos, StringBuilder report) throws Exception {
         Settings settings = Settings.builder()
             .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
             .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
@@ -383,7 +377,7 @@ public class GatedPopulationSoakIT extends org.opensearch.serverless.storage.Ser
      * timeout multiplied by a population is not slow, it is unbounded, and it takes every other number in the
      * run down with it when the suite timeout fires.
      */
-    private int resolveWorkingSet(int created, long budgetNanos, StringBuilder report) {
+    private int resolveWorkingSet(int created, long budgetNanos, StringBuilder report) throws Exception {
         int target = Math.max(1, created / WORKING_SET_DIVISOR);
         note(String.format(Locale.ROOT, "resolving a working set of %,d", target));
         Random random = new Random(42);
@@ -452,7 +446,7 @@ public class GatedPopulationSoakIT extends org.opensearch.serverless.storage.Ser
      * only end by running out of names cannot report anything if it is stopped, and a swallowed failure here
      * would make a delete that never happened look like a delete that was merely slow.
      */
-    private int deleteSlice(int created, long budgetNanos) {
+    private int deleteSlice(int created, long budgetNanos) throws Exception {
         int target = Math.max(1, created / 10);
         note(String.format(Locale.ROOT, "deleting %,d", target));
         int deleted = 0;
@@ -490,11 +484,11 @@ public class GatedPopulationSoakIT extends org.opensearch.serverless.storage.Ser
         return deleted;
     }
 
-    private static String tenant(int i) {
+    private static String tenant(int i) throws Exception {
         return String.format(Locale.ROOT, "tenant-%08d", i);
     }
 
-    private long clusterVersion() {
+    private long clusterVersion() throws Exception {
         return client().admin().cluster().prepareState().get().getState().version();
     }
 
@@ -513,7 +507,7 @@ public class GatedPopulationSoakIT extends org.opensearch.serverless.storage.Ser
      * request for a collection is a request rather than a guarantee. What it can still show is the order of
      * magnitude of what an index costs to keep, which is the number that decides whether a working set fits.
      */
-    private static long usedHeapBytes() {
+    private static long usedHeapBytes() throws Exception {
         System.gc();
         Runtime runtime = Runtime.getRuntime();
         return runtime.totalMemory() - runtime.freeMemory();

@@ -12,7 +12,6 @@ import org.opensearch.Version;
 import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.DescriptorUnavailableException;
 import org.opensearch.cluster.metadata.IndexDescriptor;
-import org.opensearch.test.OpenSearchIntegTestCase;
 import org.junit.After;
 
 import java.util.List;
@@ -20,7 +19,7 @@ import java.util.List;
 /**
  * T12. Telling "this index is not there" apart from "I could not find out".
  *
- * <p>{@link DescriptorStore#get} swallowed every exception and returned null, and null already meant no
+ * <p>{@link BlobDescriptorBackend#get} swallowed every exception and returned null, and null already meant no
  * such index. A gated index has no cluster state entry, so the descriptor store is the only thing that can
  * answer whether its name is taken. A node that could not read that store therefore reported <em>every</em>
  * gated index in the cluster as non-existent, with nothing in the answer to say otherwise.
@@ -38,16 +37,19 @@ import java.util.List;
  * means no gated index has ever been created, so absent is true. Anything else means the index exists and
  * could not be read.
  */
-public class DescriptorUnavailabilityIT extends OpenSearchIntegTestCase {
+public class DescriptorUnavailabilityIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
+
+    private FailableDescriptorContainer container;
 
     @After
-    public void clearRegistration() {
+    public void clearRegistration() throws Exception {
         AbsentIndexDescriptorSuppliers.register(null);
     }
 
     /** Before the first gated creation there is no descriptor index, and absent is the true answer. */
-    public void testNoDescriptorIndexMeansGenuinelyAbsent() {
-        DescriptorStore store = new DescriptorStore(client(), 1);
+    public void testNoDescriptorIndexMeansGenuinelyAbsent() throws Exception {
+        container = newFailableDescriptorContainer();
+        BlobDescriptorBackend store = installOverFailableContainer(container).points();
 
         assertNull(
             "with no descriptor index at all, nothing has ever been gated, so a name is genuinely free. "
@@ -57,14 +59,15 @@ public class DescriptorUnavailabilityIT extends OpenSearchIntegTestCase {
     }
 
     /** A descriptor index that exists but cannot be read must not answer absent. */
-    public void testAnUnreadableDescriptorIndexIsNotAnAbsentIndex() {
-        DescriptorStore store = new DescriptorStore(client(), 1);
+    public void testAnUnreadableDescriptorIndexIsNotAnAbsentIndex() throws Exception {
+        container = newFailableDescriptorContainer();
+        BlobDescriptorBackend store = installOverFailableContainer(container).points();
         store.create(descriptor("real-idx"));
         assertNotNull("the premise: this index exists and resolves", store.get("real-idx"));
 
         // Close the descriptor index. It still exists, so this is "cannot read" rather than "never
         // created", which is exactly the pair the old blanket catch could not tell apart.
-        client().admin().indices().prepareClose(DescriptorStore.DESCRIPTOR_INDEX).get();
+        container.failing = true;
         store.invalidate("real-idx");
 
         DescriptorUnavailableException thrown = expectThrows(DescriptorUnavailableException.class, () -> store.get("real-idx"));
@@ -81,7 +84,7 @@ public class DescriptorUnavailabilityIT extends OpenSearchIntegTestCase {
      * settled: resolution is already a degradation path and a plugin bug should not fail a request. That
      * reasoning holds for a bug and fails for unreachable data, so exactly one type propagates.
      */
-    public void testTheSeamPropagatesUnavailabilityButStillSwallowsBugs() {
+    public void testTheSeamPropagatesUnavailabilityButStillSwallowsBugs() throws Exception {
         AbsentIndexDescriptorSuppliers.register(name -> { throw new DescriptorUnavailableException(name, new RuntimeException("down")); });
         expectThrows(DescriptorUnavailableException.class, () -> AbsentIndexDescriptorSuppliers.supply("some-idx"));
 
@@ -93,7 +96,7 @@ public class DescriptorUnavailabilityIT extends OpenSearchIntegTestCase {
         );
     }
 
-    private static IndexDescriptor descriptor(String name) {
+    private static IndexDescriptor descriptor(String name) throws Exception {
         return new IndexDescriptor(
             name,
             name + "-uuid",

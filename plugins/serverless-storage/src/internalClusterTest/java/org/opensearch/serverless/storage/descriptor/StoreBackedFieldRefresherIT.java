@@ -12,7 +12,6 @@ import org.opensearch.cluster.metadata.MappingGenerationStore;
 import org.opensearch.index.IndexService;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.indices.IndicesService;
-import org.opensearch.test.OpenSearchIntegTestCase;
 import org.junit.After;
 
 import java.util.Map;
@@ -30,7 +29,7 @@ import java.util.Map;
  * meeting a genuinely new field must not pay a merge per field. Asserted by counting rather than by
  * inspection, since counting is the only way to tell "did not need to" from "did and got the same answer".
  */
-public class StoreBackedFieldRefresherIT extends OpenSearchIntegTestCase {
+public class StoreBackedFieldRefresherIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
 
     private static final String INDEX = "refresh-target";
 
@@ -160,7 +159,7 @@ public class StoreBackedFieldRefresherIT extends OpenSearchIntegTestCase {
      * <p>T9 replaced this cache's {@code synchronizedMap} around an access-ordered {@code LinkedHashMap},
      * which P1 measured running backwards under contention, with the write-stamped concurrent map P2
      * established. Eviction therefore takes a threshold from sorted stamps and drops everything strictly
-     * below it, and T4 found in {@code DescriptorStore} that a wall clock cannot supply those stamps:
+     * below it, and T4 found in {@code BlobDescriptorBackend} that a wall clock cannot supply those stamps:
      * entries written within one tick share a value, the threshold equals every candidate, and nothing is
      * evicted.
      *

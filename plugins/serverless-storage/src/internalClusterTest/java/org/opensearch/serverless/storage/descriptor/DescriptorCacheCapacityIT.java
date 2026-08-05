@@ -10,7 +10,6 @@ package org.opensearch.serverless.storage.descriptor;
 
 import org.opensearch.Version;
 import org.opensearch.cluster.metadata.IndexDescriptor;
-import org.opensearch.test.OpenSearchIntegTestCase;
 
 import java.util.List;
 import java.util.Locale;
@@ -44,15 +43,15 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>The capacity is a constructor seam so the bound can be reached with a handful of descriptors instead
  * of fifty thousand. The behaviour under test is the admission rule, which does not care what the number is.
  */
-public class DescriptorCacheCapacityIT extends OpenSearchIntegTestCase {
+public class DescriptorCacheCapacityIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
 
     /** Small enough to fill quickly, large enough that a per-name effect is not a rounding error. */
     private static final int CAPACITY = 20;
 
     private final AtomicLong now = new AtomicLong(1_000_000_000L);
 
-    public void testTheCacheKeepsWorkingOnceItIsFull() {
-        DescriptorStore store = new DescriptorStore(client(), 1, now::get, DescriptorStore.COLLAPSE_WAIT_MILLIS, CAPACITY);
+    public void testTheCacheKeepsWorkingOnceItIsFull() throws Exception {
+        BlobDescriptorBackend store = blobBackend(now::get, CAPACITY);
         for (int i = 0; i < CAPACITY * 2; i++) {
             store.create(descriptor(name(i)));
         }
@@ -65,7 +64,7 @@ public class DescriptorCacheCapacityIT extends OpenSearchIntegTestCase {
         long readsForRepeatWhileFresh = readsFor(store, () -> resolveAll(store, 0, CAPACITY));
 
         // Past the window every entry must be re-read. That read is expected, and is not the finding.
-        now.addAndGet(DescriptorStore.CACHE_TTL_NANOS + 1);
+        now.addAndGet(BlobDescriptorBackend.DEFAULT_CACHE_TTL_NANOS + 1);
         long readsForFirstRefresh = readsFor(store, () -> resolveAll(store, 0, CAPACITY));
 
         // The finding: having just re-read all of them, are they cached again? With admission gated on a
@@ -131,8 +130,8 @@ public class DescriptorCacheCapacityIT extends OpenSearchIntegTestCase {
      * <p>A frozen clock is the worst case rather than an artificial one: it is what a coarse timer looks
      * like during a bulk warm-up, which is exactly when a cache fills.
      */
-    public void testTheBoundHoldsEvenWhenEveryEntrySharesATimestamp() {
-        DescriptorStore store = new DescriptorStore(client(), 1, now::get, DescriptorStore.COLLAPSE_WAIT_MILLIS, CAPACITY);
+    public void testTheBoundHoldsEvenWhenEveryEntrySharesATimestamp() throws Exception {
+        BlobDescriptorBackend store = blobBackend(now::get, CAPACITY);
         int names = CAPACITY * 10;
         for (int i = 0; i < names; i++) {
             store.create(descriptor(name(i)));
@@ -178,9 +177,9 @@ public class DescriptorCacheCapacityIT extends OpenSearchIntegTestCase {
      * <p>The capacity here is deliberately far above the number of names resolved, so if the byte budget
      * did nothing the cache would simply grow and this would fail.
      */
-    public void testTheByteBudgetBindsBeforeTheEntryCount() {
+    public void testTheByteBudgetBindsBeforeTheEntryCount() throws Exception {
         long budget = 64 * 1024;
-        DescriptorStore store = new DescriptorStore(client(), 1, now::get, DescriptorStore.COLLAPSE_WAIT_MILLIS, 100_000, budget);
+        BlobDescriptorBackend store = blobBackend(now::get, 100_000, budget);
 
         int names = 200;
         for (int i = 0; i < names; i++) {
@@ -226,10 +225,10 @@ public class DescriptorCacheCapacityIT extends OpenSearchIntegTestCase {
      * <p>Refusing to cache it costs one read per resolution for one index. Admitting it costs the read path
      * a full scan per admission for every index.
      */
-    public void testADescriptorLargerThanTheWholeBudgetIsNotCached() {
+    public void testADescriptorLargerThanTheWholeBudgetIsNotCached() throws Exception {
         // Far below one descriptor, which is a misconfiguration rather than a realistic setting. The point
         // is that the failure is bounded rather than that the setting is sensible.
-        DescriptorStore store = new DescriptorStore(client(), 1, now::get, DescriptorStore.COLLAPSE_WAIT_MILLIS, 100, 32);
+        BlobDescriptorBackend store = blobBackend(now::get, 100, 32);
         store.create(heavilyAliasedDescriptor(name(0)));
 
         assertNotNull("the descriptor must still resolve, since not caching is not the same as not finding", store.get(name(0)));
@@ -243,7 +242,7 @@ public class DescriptorCacheCapacityIT extends OpenSearchIntegTestCase {
     }
 
     /** Twenty plain aliases, the case T4b measured at 5.8 times a typical descriptor. */
-    private static IndexDescriptor heavilyAliasedDescriptor(String name) {
+    private static IndexDescriptor heavilyAliasedDescriptor(String name) throws Exception {
         List<String> aliases = new java.util.ArrayList<>();
         for (int i = 0; i < 20; i++) {
             aliases.add(String.format(Locale.ROOT, "%s-alias-%04d-padding-to-a-realistic-length", name, i));
@@ -266,13 +265,13 @@ public class DescriptorCacheCapacityIT extends OpenSearchIntegTestCase {
         );
     }
 
-    private static void resolveAll(DescriptorStore store, int from, int to) {
+    private static void resolveAll(BlobDescriptorBackend store, int from, int to) {
         for (int i = from; i < to; i++) {
             assertNotNull(store.get(name(i)));
         }
     }
 
-    private static long readsFor(DescriptorStore store, Runnable work) {
+    private static long readsFor(BlobDescriptorBackend store, Runnable work) throws Exception {
         long before = store.readCount();
         work.run();
         return store.readCount() - before;

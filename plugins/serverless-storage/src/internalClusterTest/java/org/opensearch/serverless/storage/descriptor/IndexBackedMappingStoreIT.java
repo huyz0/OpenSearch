@@ -9,7 +9,6 @@
 package org.opensearch.serverless.storage.descriptor;
 
 import org.opensearch.cluster.metadata.MappingGenerationStore;
-import org.opensearch.test.OpenSearchIntegTestCase;
 import org.junit.After;
 
 import java.util.Map;
@@ -30,7 +29,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * rather than silently overwriting, because H6a's convergence argument depends on the loser re-reading and
  * merging.
  */
-public class IndexBackedMappingStoreIT extends OpenSearchIntegTestCase {
+public class IndexBackedMappingStoreIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
 
     @After
     public void clearRegistration() {

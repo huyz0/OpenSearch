@@ -103,8 +103,9 @@ public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.Se
             // and is precisely what this class must not do: the thing under test is that the plugin
             // installs the blob backend, not that a backend works when a test installs it.
             .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_NODE_ENABLED_SETTING.getKey(), true)
-            // The whole reason this class exists, and the one line that differs from GatedEndToEndIT.
-            .put(ServerlessStoragePlugin.DESCRIPTOR_BACKEND_SETTING.getKey(), "blob")
+            // This class used to select the blob backend explicitly here. There is no longer a choice to
+            // make: the object store is the only descriptor backend, so what the class asserts is now the
+            // only arrangement there is.
             // Without this a gated index has no routing table at all, since computed placement supplies
             // one and is off by default. T36 found every earlier run of the sibling class lacked it.
             .put(ServerlessStoragePlugin.COMPUTED_PLACEMENT_ENABLED_SETTING.getKey(), true)
@@ -230,22 +231,16 @@ public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.Se
     private void quiesceDescriptorWrites() throws Exception {
         assertBusy(() -> {
             for (String name : created) {
-                org.opensearch.action.get.GetResponse response;
-                try {
-                    response = client().prepareGet(DescriptorStore.DESCRIPTOR_INDEX, name).get();
-                } catch (Exception e) {
-                    // The store may not exist yet, or may be mid-recreation after a previous test's wipe.
-                    // Both mean "not landed", and both have to keep the wait going rather than end it: an
-                    // exception escaping here would abort the retry loop and leave the write in flight,
-                    // which is the state this method exists to rule out.
-                    fail("[" + name + "] descriptor store not readable yet: " + e);
-                    return;
-                }
-                assertTrue("[" + name + "] has no descriptor document yet, so a write is still in flight", response.isExists());
-                assertEquals(
+                // Read through the installed supplier rather than out of an index. There is one keyspace
+                // now, so "the write landed" is answerable at the same place a request would ask -- and a
+                // tombstone is readable there by design, because a get falls back to the tombstone prefix
+                // when the live key is gone.
+                org.opensearch.cluster.metadata.IndexDescriptor descriptor = org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers
+                    .supply(name);
+                assertNotNull("[" + name + "] has no descriptor yet, so a write is still in flight", descriptor);
+                assertFalse(
                     "[" + name + "] is recorded but not yet tombstoned, so the tombstone write is still in flight",
-                    org.opensearch.cluster.metadata.IndexDescriptor.State.DELETED.name(),
-                    response.getSourceAsMap().get("state")
+                    descriptor.exists()
                 );
             }
         }, 30, TimeUnit.SECONDS);

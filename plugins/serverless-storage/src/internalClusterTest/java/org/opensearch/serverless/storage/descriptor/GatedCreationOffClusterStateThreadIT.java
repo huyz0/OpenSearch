@@ -104,7 +104,7 @@ public class GatedCreationOffClusterStateThreadIT extends org.opensearch.serverl
     }
 
     @After
-    public void clearGate() {
+    public void clearGate() throws Exception {
         DescriptorGate.uninstall();
     }
 
@@ -190,28 +190,21 @@ public class GatedCreationOffClusterStateThreadIT extends org.opensearch.serverl
     }
 
     /** The store the gate was installed against, so this can read a descriptor without going through an API. */
-    private DescriptorStore store;
+    private BlobDescriptorBackend store;
 
-    private void installGate() {
-        store = new DescriptorStore(client(), 1);
-        DescriptorGate.install(
-            store,
-            new IndexBackedMappingStore(client()),
-            new IndexBackedMappingStatsAggregator(client()),
-            new StoreBackedFieldRefresher(),
-            true
-        );
+    private void installGate() throws Exception {
+        store = installBlobBackedDescriptorPlane().points();
     }
 
-    private static Settings plainSettings() {
+    private static Settings plainSettings() throws Exception {
         return Settings.builder().put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1).put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0).build();
     }
 
-    private static Settings gatedSettings() {
+    private static Settings gatedSettings() throws Exception {
         return Settings.builder().put(plainSettings()).put("index.serverless_storage.enabled", true).build();
     }
 
-    private void createGated(String name) {
+    private void createGated(String name) throws Exception {
         client().admin().indices().create(new CreateIndexRequest(name).settings(gatedSettings())).actionGet();
     }
 
@@ -222,7 +215,7 @@ public class GatedCreationOffClusterStateThreadIT extends org.opensearch.serverl
      * lower priority here would let the creation run ahead of the block and the test would pass without ever
      * demonstrating anything.
      */
-    private void blockClusterStateThread(CountDownLatch release, CountDownLatch held) {
+    private void blockClusterStateThread(CountDownLatch release, CountDownLatch held) throws Exception {
         ClusterService clusterService = internalCluster().getCurrentClusterManagerNodeInstance(ClusterService.class);
         clusterService.submitStateUpdateTask("block the cluster state update thread", new ClusterStateUpdateTask(Priority.URGENT) {
             @Override
@@ -240,7 +233,7 @@ public class GatedCreationOffClusterStateThreadIT extends org.opensearch.serverl
     }
 
     /** Whether the future completed within the control window. Any outcome counts as completion. */
-    private static boolean awaitQuietly(PlainActionFuture<CreateIndexResponse> future) {
+    private static boolean awaitQuietly(PlainActionFuture<CreateIndexResponse> future) throws Exception {
         try {
             future.actionGet(CONTROL_WAIT_SECONDS, TimeUnit.SECONDS);
             return true;

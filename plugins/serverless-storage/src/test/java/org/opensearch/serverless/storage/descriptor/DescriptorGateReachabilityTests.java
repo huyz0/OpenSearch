@@ -48,7 +48,8 @@ public class DescriptorGateReachabilityTests extends OpenSearchTestCase {
 
     private void install() {
         DescriptorGate.install(
-            new DescriptorStore(mock(org.opensearch.transport.client.Client.class), 1),
+            mock(DescriptorBackend.class),
+            mock(DescriptorPrefixBackend.class),
             mock(MappingGenerationStore.Store.class),
             mock(org.opensearch.action.admin.cluster.stats.GatedMappingStatsAggregator.Aggregator.class),
             mock(UnknownFieldRefresh.Refresher.class),

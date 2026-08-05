@@ -152,15 +152,78 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
 
     /** The form that names its own freshness window, which the plugin uses to make it a setting. */
     public BlobDescriptorBackend(BlobContainer blobContainer, Executor executor, long cacheTtlNanos) {
+        this(blobContainer, executor, cacheTtlNanos, System::nanoTime, DescriptorCache.DEFAULT_CAPACITY);
+    }
+
+    /**
+     * The form that names its own clock and capacity, so the cache's behaviour can be exercised without
+     * sleeping or admitting fifty thousand descriptors to reach the bound.
+     *
+     * <p>These were seams on {@code DescriptorStore} and nowhere else, which is why the tests that use them
+     * were the tests still pinned to the system index. Both backends wrap the same {@link DescriptorCache},
+     * so the behaviour under test was never index-specific -- only the constructor that could reach it was.
+     */
+    public BlobDescriptorBackend(
+        BlobContainer blobContainer,
+        Executor executor,
+        long cacheTtlNanos,
+        java.util.function.LongSupplier clock,
+        int cacheCapacity
+    ) {
+        this(blobContainer, executor, cacheTtlNanos, clock, cacheCapacity, DescriptorCache.DEFAULT_BYTES);
+    }
+
+    /**
+     * The form that also names the byte budget, which T4b established is the bound that actually holds.
+     *
+     * <p>An entry count admits a fiftyfold range of memory, because a descriptor with two hundred aliases is
+     * 51.6 times a typical one, so a test that means to exercise the bound has to be able to name it.
+     */
+    public BlobDescriptorBackend(
+        BlobContainer blobContainer,
+        Executor executor,
+        long cacheTtlNanos,
+        java.util.function.LongSupplier clock,
+        int cacheCapacity,
+        long cacheBytes
+    ) {
         this.blobContainer = blobContainer;
         this.executor = executor;
         this.descriptorCache = new DescriptorCache(
-            System::nanoTime,
+            clock,
             cacheTtlNanos,
             DescriptorCache.DEFAULT_COLLAPSE_WAIT_MILLIS,
-            DescriptorCache.DEFAULT_CAPACITY,
-            DescriptorCache.DEFAULT_BYTES
+            cacheCapacity,
+            cacheBytes
         );
+    }
+
+    /** How many times this backend has actually gone to the object store, which is what a test counts. */
+    public long readCount() {
+        return descriptorCache.readCount();
+    }
+
+    /** How many cached descriptors have been evicted, which distinguishes a small cache from a broken one. */
+    public long evictionCount() {
+        return descriptorCache.evictionCount();
+    }
+
+    /** How many descriptors are cached, which the capacity bounds and what a test checks. */
+    public int cachedCount() {
+        return descriptorCache.cachedCount();
+    }
+
+    /** How much memory the cached descriptors occupy, which is the bound T4b established has to hold. */
+    public long cachedBytes() {
+        return descriptorCache.cachedBytes();
+    }
+
+    /**
+     * Pretends a read for this name is already in flight and will never finish, so a test can prove a
+     * waiter falls back rather than hanging behind it.
+     */
+    java.util.concurrent.CompletableFuture<IndexDescriptor> pretendReadIsInFlight(String name) {
+        return descriptorCache.pretendReadIsInFlight(name);
     }
 
     /**

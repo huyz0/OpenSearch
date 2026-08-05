@@ -12,7 +12,6 @@ import org.opensearch.Version;
 import org.opensearch.cluster.metadata.DescriptorOnlyCreation;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.Settings;
-import org.opensearch.test.OpenSearchIntegTestCase;
 import org.junit.After;
 
 /**
@@ -32,25 +31,19 @@ import org.junit.After;
  * An index gated without computed placement would have metadata nothing could place; one with computed
  * placement but not gated would have published routing and duplicated metadata.
  */
-public class GatedCreationSwitchIT extends OpenSearchIntegTestCase {
+public class GatedCreationSwitchIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
 
     @After
-    public void clearGate() {
+    public void clearGate() throws Exception {
         DescriptorGate.uninstall();
     }
 
-    private void install(boolean enabled) {
-        DescriptorGate.install(
-            new DescriptorStore(client(), 1),
-            new IndexBackedMappingStore(client()),
-            new IndexBackedMappingStatsAggregator(client()),
-            new StoreBackedFieldRefresher(),
-            enabled
-        );
+    private void install(boolean enabled) throws Exception {
+        installBlobBackedDescriptorPlane(enabled);
     }
 
     /** With nothing installed, no index is gated, which is what production looked like until now. */
-    public void testWithoutTheGateNothingIsEverGated() {
+    public void testWithoutTheGateNothingIsEverGated() throws Exception {
         assertFalse(
             "an unregistered gate must answer false, so every index keeps costing what it always cost",
             DescriptorOnlyCreation.skipsClusterState(serverlessIndex("anything"))
@@ -58,7 +51,7 @@ public class GatedCreationSwitchIT extends OpenSearchIntegTestCase {
     }
 
     /** Disabled installs nothing, so an ordinary cluster is untouched by any of this. */
-    public void testInstallingWhileDisabledLeavesNothingGated() {
+    public void testInstallingWhileDisabledLeavesNothingGated() throws Exception {
         install(false);
 
         assertFalse("a disabled gate must gate nothing", DescriptorOnlyCreation.skipsClusterState(serverlessIndex("anything")));
@@ -68,7 +61,7 @@ public class GatedCreationSwitchIT extends OpenSearchIntegTestCase {
      * An ordinary index is never gated, whatever the setting. This is the control that keeps the switch
      * from turning a normal cluster's indices into descriptors nothing was built to serve.
      */
-    public void testAnOrdinaryIndexIsNeverGated() {
+    public void testAnOrdinaryIndexIsNeverGated() throws Exception {
         install(true);
 
         assertFalse(
@@ -81,7 +74,7 @@ public class GatedCreationSwitchIT extends OpenSearchIntegTestCase {
      * Gating and computed placement must give the same answer for the same index, since a gated index has
      * no cluster state entry and therefore can have no published routing.
      */
-    public void testGatingAgreesWithComputedPlacement() {
+    public void testGatingAgreesWithComputedPlacement() throws Exception {
         install(true);
         IndexMetadata serverless = serverlessIndex("gated-candidate");
         IndexMetadata ordinary = ordinaryIndex("plain-candidate");
@@ -99,14 +92,14 @@ public class GatedCreationSwitchIT extends OpenSearchIntegTestCase {
     }
 
     /** Uninstalling stops new gating immediately, which node close depends on. */
-    public void testUninstallStopsGating() {
+    public void testUninstallStopsGating() throws Exception {
         install(true);
         DescriptorGate.uninstall();
 
         assertFalse("a closed node must not keep gating", DescriptorOnlyCreation.skipsClusterState(serverlessIndex("anything")));
     }
 
-    private static IndexMetadata serverlessIndex(String name) {
+    private static IndexMetadata serverlessIndex(String name) throws Exception {
         return IndexMetadata.builder(name)
             .settings(
                 Settings.builder()
@@ -120,7 +113,7 @@ public class GatedCreationSwitchIT extends OpenSearchIntegTestCase {
             .build();
     }
 
-    private static IndexMetadata ordinaryIndex(String name) {
+    private static IndexMetadata ordinaryIndex(String name) throws Exception {
         return IndexMetadata.builder(name)
             .settings(
                 Settings.builder()

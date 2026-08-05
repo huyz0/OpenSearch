@@ -85,18 +85,12 @@ public class GatedCreationBatchingHeadroomIT extends org.opensearch.serverless.s
     }
 
     @After
-    public void clearGate() {
+    public void clearGate() throws Exception {
         DescriptorGate.uninstall();
     }
 
     public void testHowManyPublicationsEachKindOfCreationCosts() throws Exception {
-        DescriptorGate.install(
-            new DescriptorStore(client(), 1),
-            new IndexBackedMappingStore(client()),
-            new IndexBackedMappingStatsAggregator(client()),
-            new StoreBackedFieldRefresher(),
-            true
-        );
+        installBlobBackedDescriptorPlane();
 
         long ordinaryVersions = createAndCountVersions("plain-batch", false);
         long gatedVersions = createAndCountVersions("gated-batch", true);
@@ -128,7 +122,7 @@ public class GatedCreationBatchingHeadroomIT extends org.opensearch.serverless.s
     }
 
     /** Creates {@link #INDICES} indices and returns how far the cluster state version moved. */
-    private long createAndCountVersions(String prefix, boolean serverless) {
+    private long createAndCountVersions(String prefix, boolean serverless) throws Exception {
         Settings.Builder settings = Settings.builder()
             .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
             .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0);
@@ -149,7 +143,7 @@ public class GatedCreationBatchingHeadroomIT extends org.opensearch.serverless.s
         return clusterVersion() - before;
     }
 
-    private long clusterVersion() {
+    private long clusterVersion() throws Exception {
         return client().admin().cluster().prepareState().get().getState().version();
     }
 }

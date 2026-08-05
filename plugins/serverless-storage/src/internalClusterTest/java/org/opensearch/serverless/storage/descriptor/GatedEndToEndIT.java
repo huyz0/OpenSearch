@@ -131,7 +131,7 @@ public class GatedEndToEndIT extends org.opensearch.serverless.storage.Serverles
     }
 
     @After
-    public void clearGate() {
+    public void clearGate() throws Exception {
         DescriptorGate.uninstall();
     }
 
@@ -142,13 +142,7 @@ public class GatedEndToEndIT extends org.opensearch.serverless.storage.Serverles
      * numbers can be compared against the component measurements that predicted them.
      */
     public void testAGatedIndexCanBeWrittenToAndSearched() throws Exception {
-        DescriptorGate.install(
-            new DescriptorStore(client(), 1),
-            new IndexBackedMappingStore(client()),
-            new IndexBackedMappingStatsAggregator(client()),
-            new StoreBackedFieldRefresher(),
-            true
-        );
+        installBlobBackedDescriptorPlane();
 
         Settings gated = Settings.builder()
             .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
@@ -233,13 +227,7 @@ public class GatedEndToEndIT extends org.opensearch.serverless.storage.Serverles
      * request then fans out to every index that expansion returned.
      */
     public void testOneWildcardSearchesEveryGatedTenant() throws Exception {
-        DescriptorGate.install(
-            new DescriptorStore(client(), 1),
-            new IndexBackedMappingStore(client()),
-            new IndexBackedMappingStatsAggregator(client()),
-            new StoreBackedFieldRefresher(),
-            true
-        );
+        installBlobBackedDescriptorPlane();
 
         Settings gated = Settings.builder()
             .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
@@ -256,7 +244,6 @@ public class GatedEndToEndIT extends org.opensearch.serverless.storage.Serverles
         }
         client().admin().indices().prepareRefresh(created.toArray(new String[0])).get();
         // The expansion is a search over the descriptor index, which is refresh-bound by H18.
-        client().admin().indices().prepareRefresh(DescriptorStore.DESCRIPTOR_INDEX).get();
 
         long start = System.nanoTime();
         SearchResponse response = client().prepareSearch("e2e-tenant-*").setQuery(QueryBuilders.matchAllQuery()).setSize(0).get();
@@ -299,14 +286,7 @@ public class GatedEndToEndIT extends org.opensearch.serverless.storage.Serverles
     @AwaitsFix(bugUrl = "order-dependent: a gated index's recorded shard count sometimes disagrees with its request. "
         + "Reproduces only when the whole class runs; asking for 1/2/4/7 in isolation is honoured every time")
     public void testHowManyShardsAGatedIndexActuallyGets() throws Exception {
-        DescriptorStore store = new DescriptorStore(client(), 1);
-        DescriptorGate.install(
-            store,
-            new IndexBackedMappingStore(client()),
-            new IndexBackedMappingStatsAggregator(client()),
-            new StoreBackedFieldRefresher(),
-            true
-        );
+        BlobDescriptorBackend store = installBlobBackedDescriptorPlane().points();
 
         String name = "shardcount-probe";
         Settings gated = Settings.builder()
@@ -390,14 +370,7 @@ public class GatedEndToEndIT extends org.opensearch.serverless.storage.Serverles
      * only 1 is special. If they come back unrelated to the request, the setting is being discarded.
      */
     public void testWhetherTheRequestedShardCountSurvivesAtAll() throws Exception {
-        DescriptorStore store = new DescriptorStore(client(), 1);
-        DescriptorGate.install(
-            store,
-            new IndexBackedMappingStore(client()),
-            new IndexBackedMappingStatsAggregator(client()),
-            new StoreBackedFieldRefresher(),
-            true
-        );
+        BlobDescriptorBackend store = installBlobBackedDescriptorPlane().points();
 
         StringBuilder report = new StringBuilder("\nT31 requested vs recorded shard count\n");
         for (int asked : new int[] { 1, 2, 4, 7 }) {
@@ -453,14 +426,7 @@ public class GatedEndToEndIT extends org.opensearch.serverless.storage.Serverles
      */
     @AwaitsFix(bugUrl = "T35/T36: the gated write path needs ten metadata call sites and then an assigned primary shard; see S52")
     public void testWhetherTheDisagreeingIndexIsEvenGated() throws Exception {
-        DescriptorStore store = new DescriptorStore(client(), 1);
-        DescriptorGate.install(
-            store,
-            new IndexBackedMappingStore(client()),
-            new IndexBackedMappingStatsAggregator(client()),
-            new StoreBackedFieldRefresher(),
-            true
-        );
+        BlobDescriptorBackend store = installBlobBackedDescriptorPlane().points();
 
         String name = "gatedness-probe";
         assertTrue(
@@ -523,14 +489,7 @@ public class GatedEndToEndIT extends org.opensearch.serverless.storage.Serverles
      * primary, is it assigned, and is the node it names one the cluster knows.
      */
     public void testWhetherComputedPlacementAssignsAGatedPrimary() throws Exception {
-        DescriptorStore store = new DescriptorStore(client(), 1);
-        DescriptorGate.install(
-            store,
-            new IndexBackedMappingStore(client()),
-            new IndexBackedMappingStatsAggregator(client()),
-            new StoreBackedFieldRefresher(),
-            true
-        );
+        BlobDescriptorBackend store = installBlobBackedDescriptorPlane().points();
 
         String name = "placement-probe";
         assertTrue(
@@ -582,7 +541,7 @@ public class GatedEndToEndIT extends org.opensearch.serverless.storage.Serverles
      * indices. There is a {@code testWhetherTheDisagreeingIndexIsEvenGated} beside this that established
      * the check.
      */
-    private void assertEveryTenantIsGated(List<String> names, String when) {
+    private void assertEveryTenantIsGated(List<String> names, String when) throws Exception {
         var metadata = client().admin().cluster().prepareState().get().getState().metadata();
         List<String> published = new ArrayList<>();
         for (String name : names) {
@@ -600,7 +559,7 @@ public class GatedEndToEndIT extends org.opensearch.serverless.storage.Serverles
         );
     }
 
-    private static String tenant(int i) {
+    private static String tenant(int i) throws Exception {
         return String.format(Locale.ROOT, "e2e-tenant-%03d", i);
     }
 }

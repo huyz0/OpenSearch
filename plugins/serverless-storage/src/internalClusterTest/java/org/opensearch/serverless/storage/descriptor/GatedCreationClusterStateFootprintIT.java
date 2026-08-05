@@ -89,18 +89,12 @@ public class GatedCreationClusterStateFootprintIT extends org.opensearch.serverl
     }
 
     @After
-    public void clearGate() {
+    public void clearGate() throws Exception {
         DescriptorGate.uninstall();
     }
 
     public void testWhatEachKindOfCreationAddsToTheClusterState() throws Exception {
-        DescriptorGate.install(
-            new DescriptorStore(client(), 1),
-            new IndexBackedMappingStore(client()),
-            new IndexBackedMappingStatsAggregator(client()),
-            new StoreBackedFieldRefresher(),
-            true
-        );
+        installBlobBackedDescriptorPlane();
 
         long ordinaryGrowth = createAndMeasureGrowth("plain-footprint", false);
         long gatedGrowth = createAndMeasureGrowth("gated-footprint", true);

@@ -10,7 +10,6 @@ package org.opensearch.serverless.storage.descriptor;
 
 import org.opensearch.action.admin.cluster.stats.GatedMappingStatsAggregator;
 import org.opensearch.cluster.metadata.MappingGenerationStore;
-import org.opensearch.test.OpenSearchIntegTestCase;
 import org.junit.After;
 
 import java.util.Map;
@@ -26,7 +25,7 @@ import java.util.Map;
  * numbers would be the same failure H19 was about, arrived at from the other direction, so the counts are
  * checked against known mappings.
  */
-public class GatedMappingStatsIT extends OpenSearchIntegTestCase {
+public class GatedMappingStatsIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
 
     @After
     public void clearRegistrations() {
