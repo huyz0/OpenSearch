@@ -36,6 +36,20 @@ public final class ServerlessStorageRemoteClusterStateValidator implements Index
     /** Creates a validator with no configuration state; every decision is derived from the {@link IndexSettings} passed to it. */
     public ServerlessStorageRemoteClusterStateValidator() {}
 
+    /**
+     * False, and the {@link #validate} body below is the whole argument: it reads two settings and never
+     * names {@code mapperService}.
+     *
+     * <p>This is what lets a gated creation skip building a throwaway {@link org.opensearch.index.IndexService}
+     * purely to hand one over. Being the only validator this plugin registers, saying so here is what makes
+     * that bypass reachable at all -- {@code MetadataCreateIndexService} checks every registered validator,
+     * so one answering true would keep every gated creation on the slow path.
+     */
+    @Override
+    public boolean requiresMappings() {
+        return false;
+    }
+
     @Override
     public void validate(MapperService mapperService, IndexSettings indexSettings) {
         if (ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.get(indexSettings.getSettings()) == false) {

@@ -793,8 +793,19 @@ public class MetadataCreateIndexService {
         final List<Map<String, Object>> mappings,
         final BiFunction<IndexService, Map<String, AliasMetadata>, List<AliasMetadata>> aliasSupplier,
         final List<String> templatesApplied,
+        final List<Map<String, AliasMetadata>> templateAliases,
         final BiConsumer<Metadata.Builder, IndexMetadata> metadataTransformer
     ) throws Exception {
+        if (needsNothingFromATemporaryIndexService(
+            request,
+            sourceMetadata,
+            temporaryIndexMeta,
+            mappings,
+            templatesApplied,
+            templateAliases
+        )) {
+            return applyCreateIndexWithoutTemporaryService(currentState, request, temporaryIndexMeta, metadataTransformer);
+        }
         // create the index here (on the master) to validate it can be created, as well as adding the mapping
         return indicesService.<ClusterState, Exception>withTempIndexService(temporaryIndexMeta, indexService -> {
             Settings.Builder tmpSettingsBuilder = Settings.builder().put(temporaryIndexMeta.getSettings());
@@ -854,6 +865,201 @@ public class MetadataCreateIndexService {
                 request::descriptorWrite
             );
         });
+    }
+
+    /**
+     * Whether a creation can be finished without building a throwaway {@link IndexService} to validate it.
+     *
+     * <h4>Why this exists</h4>
+     *
+     * {@link IndicesService#withTempIndexService} builds a complete {@code IndexService} -- settings,
+     * analysis, mappers, caches, the engine factory, every plugin's {@code onIndexModule} hook -- runs the
+     * validation against it, and throws it away. For an index with a mapping that is what pays for the
+     * mapping being checked before anything is published. For a gated index it buys nothing twice over:
+     * there is no mapping to check, and {@link IndexDescriptor#from} discards mappings anyway, so the object
+     * is built to produce a result that is then dropped.
+     *
+     * <p>It is also built under a lock. {@code IndicesService.createIndexService} is {@code synchronized},
+     * so every concurrent creation queues on one monitor on the cluster manager. Profiling 215,000 gated
+     * creations at concurrency 16 recorded 122,222 blocking events on that monitor totalling 1,453 seconds
+     * of blocked thread time in a 120 second run -- around 60% of all generic-thread time -- with a further
+     * 41.5% of on-CPU samples inside the same call tree. That is the ceiling, and it is spent on an object
+     * whose output is discarded.
+     *
+     * <p>The lock is not touched. It is inherited from upstream with no recorded rationale, and changing it
+     * would change concurrency for every index in every cluster, which is exactly what R1 forbids. Not
+     * entering it is a decision this path can make for itself.
+     *
+     * <h4>Every condition, and what would go wrong without it</h4>
+     *
+     * <ul>
+     *   <li><b>Admitted as gated.</b> Restricts the whole bypass to indices the descriptor gate already
+     *       claimed, so an ordinary cluster cannot reach it at all.</li>
+     *   <li><b>No mappings, from the request or a template.</b> Otherwise there is a mapping to merge and
+     *       validate, and skipping it would accept a malformed mapping silently.</li>
+     *   <li><b>No aliases, from the request or a template.</b> Alias resolution validates a filter against a
+     *       {@link org.opensearch.index.query.QueryShardContext} that only an {@code IndexService} can make.
+     *       <p>This condition is about aliases rather than about templates, and the difference is the whole
+     *       value of the change. The first version declined whenever any template applied at all, which is
+     *       simpler and made the bypass almost unreachable: a template that carries only settings needs
+     *       nothing validated, and settings-only templates are the normal way to configure a large tenant
+     *       population. It is also how the defect was found -- every internal cluster test runs under a
+     *       wildcard {@code random_index_template} that sets settings and nothing else, so the fast path
+     *       never once fired and the test asserting it fires is what said so.</li>
+     *   <li><b>No index sort.</b> {@code getIndexSortSupplier} resolves sort fields against the merged
+     *       mappings, which is a real check with no cheaper form.</li>
+     *   <li><b>No source metadata and no data stream.</b> Both add validation of their own further in.</li>
+     *   <li><b>No context.</b> {@code applyContext} can add mappings and settings after this point, so a
+     *       request carrying one has not finished being assembled.</li>
+     *   <li><b>Every registered {@link IndexCreationValidator} answers {@code requiresMappings() == false}.</b>
+     *       They still run below, against real {@link IndexSettings} and a null mapper service, which is the
+     *       contract that method exists to state. The default is true, so a plugin that says nothing keeps
+     *       the temporary service and its own behaviour unchanged.</li>
+     * </ul>
+     *
+     * <p>Fails closed: every condition has to hold, and anything unrecognised takes the ordinary path.
+     */
+    private boolean needsNothingFromATemporaryIndexService(
+        final CreateIndexClusterStateUpdateRequest request,
+        final IndexMetadata sourceMetadata,
+        final IndexMetadata temporaryIndexMeta,
+        final List<Map<String, Object>> mappings,
+        final List<String> templatesApplied,
+        final List<Map<String, AliasMetadata>> templateAliases
+    ) {
+        String declined = whyATemporaryIndexServiceIsStillNeeded(
+            request,
+            sourceMetadata,
+            temporaryIndexMeta,
+            mappings,
+            templatesApplied,
+            templateAliases
+        );
+        if (declined != null) {
+            logger.debug("[{}] keeping the temporary index service: {}", request.index(), declined);
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * The first condition that fails, named, or null when none do.
+     *
+     * <p>Separated from the predicate so a decline has a reason rather than a boolean. Eight conditions
+     * reduced to one {@code false} is a thing that can be quietly wrong for months: the bypass would simply
+     * never fire, every measurement would look like the change did nothing, and there would be nothing to
+     * read. That is not hypothetical -- the first run of
+     * {@code GatedCreationWithoutTemporaryIndexServiceIT} failed exactly this way, and this method is what
+     * turned it from a guess into a lookup.
+     */
+    private String whyATemporaryIndexServiceIsStillNeeded(
+        final CreateIndexClusterStateUpdateRequest request,
+        final IndexMetadata sourceMetadata,
+        final IndexMetadata temporaryIndexMeta,
+        final List<Map<String, Object>> mappings,
+        final List<String> templatesApplied,
+        final List<Map<String, AliasMetadata>> templateAliases
+    ) {
+        if (DescriptorOnlyCreation.mayBypassClusterState(request.settings()) == false) {
+            return "the index was not admitted as gated";
+        }
+        if (sourceMetadata != null) {
+            return "it is being built from an existing index";
+        }
+        if (request.dataStreamName() != null) {
+            return "it backs the data stream [" + request.dataStreamName() + "]";
+        }
+        if (request.context() != null) {
+            return "it carries a context, which can still add mappings and settings";
+        }
+        if (request.aliases().isEmpty() == false) {
+            return "it has " + request.aliases().size() + " alias(es), whose filters need a query shard context";
+        }
+        // Every map, not the list. resolveAliases returns one entry per template, so a template that
+        // declares no aliases still contributes an empty map and leaves the outer list non-empty. Reading
+        // the outer list is the same predicate as "any template applied", which is exactly the condition
+        // this replaced -- so getting the level wrong here silently reverts the change while looking correct.
+        for (Map<String, AliasMetadata> fromOneTemplate : templateAliases) {
+            if (fromOneTemplate.isEmpty() == false) {
+                return "templates " + templatesApplied + " contribute alias(es) " + fromOneTemplate.keySet();
+            }
+        }
+        for (Map<String, Object> mapping : mappings) {
+            if (mapping.isEmpty() == false) {
+                return "it has a mapping to merge and validate";
+            }
+        }
+        if (org.opensearch.index.IndexSortConfig.INDEX_SORT_FIELD_SETTING.exists(temporaryIndexMeta.getSettings())) {
+            return "it configures an index sort, which resolves against the merged mappings";
+        }
+        for (IndexCreationValidator validator : indexCreationValidators) {
+            if (validator.requiresMappings()) {
+                return "the validator " + validator.getClass().getName() + " reads the mapper service";
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The same creation, with the temporary {@link IndexService} not built.
+     *
+     * <p>Reachable only when {@link #needsNothingFromATemporaryIndexService} holds, which is what makes the
+     * omissions here safe rather than merely cheap. There are no mappings so the document mapper is null and
+     * {@link #buildIndexMetadata} puts none; there are no aliases so the list is empty; the settings are
+     * {@code temporaryIndexMeta}'s unchanged, because the only thing that rewrites them at this point is
+     * {@code applyContext}, and a request carrying a context does not get here.
+     *
+     * <p><b>One thing is genuinely not done, and it is worth naming rather than leaving to be discovered.</b>
+     * {@code IndexEventListener.beforeIndexAddedToCluster} is not called, because the listener chain belongs
+     * to the {@code IndexService} that is no longer built. Nothing in this repository implements it -- the
+     * interface's own method is an empty default and {@code CompositeIndexEventListener} only forwards -- so
+     * this changes no behaviour here. A third-party plugin that implements it would not see the hook for a
+     * gated creation. That is the one behavioural difference on this path, and it is confined to indices the
+     * descriptor gate has already claimed.
+     */
+    private ClusterState applyCreateIndexWithoutTemporaryService(
+        final ClusterState currentState,
+        final CreateIndexClusterStateUpdateRequest request,
+        final IndexMetadata temporaryIndexMeta,
+        final BiConsumer<Metadata.Builder, IndexMetadata> metadataTransformer
+    ) {
+        if (indexCreationValidators.isEmpty() == false) {
+            // Real settings, so a validator sees exactly what it would have seen through the index service.
+            // Null mapper service, which every validator reaching this point has declared it does not read.
+            IndexSettings indexSettings = new IndexSettings(temporaryIndexMeta, settings, indexScopedSettings);
+            for (IndexCreationValidator validator : indexCreationValidators) {
+                validator.validate(null, indexSettings);
+            }
+        }
+
+        IndexMetadata indexMetadata = buildIndexMetadata(
+            request.index(),
+            List.of(),
+            () -> null,
+            temporaryIndexMeta.getSettings(),
+            temporaryIndexMeta.getRoutingNumShards(),
+            null,
+            temporaryIndexMeta.isSystem(),
+            temporaryIndexMeta.getCustomData(),
+            temporaryIndexMeta.context()
+        );
+
+        logger.debug(
+            "[{}] creating index off the temporary index service path, cause [{}], shards [{}]/[{}]",
+            request.index(),
+            request.cause(),
+            indexMetadata.getNumberOfShards(),
+            indexMetadata.getNumberOfReplicas()
+        );
+
+        return clusterStateCreateIndex(
+            currentState,
+            request.blocks(),
+            indexMetadata,
+            allocationService::reroute,
+            metadataTransformer,
+            request::descriptorWrite
+        );
     }
 
     Template applyContext(
@@ -1053,6 +1259,7 @@ public class MetadataCreateIndexService {
                 indexService.newQueryShardContext(0, null, () -> 0L, null)
             ),
             templates.stream().map(IndexTemplateMetadata::getName).collect(toList()),
+            MetadataIndexTemplateService.resolveAliases(templates),
             metadataTransformer
         );
     }
@@ -1121,6 +1328,7 @@ public class MetadataCreateIndexService {
                 indexService.newQueryShardContext(0, null, () -> 0L, null)
             ),
             Collections.singletonList(templateName),
+            MetadataIndexTemplateService.resolveAliases(currentState.metadata(), templateName),
             metadataTransformer
         );
     }
@@ -1205,6 +1413,7 @@ public class MetadataCreateIndexService {
                 // shard id and the current timestamp
                 indexService.newQueryShardContext(0, null, () -> 0L, null)
             ),
+            List.of(),
             List.of(),
             metadataTransformer
         );
