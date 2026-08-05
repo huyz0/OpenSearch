@@ -80,12 +80,24 @@ public class MappingGenerationStoreTests extends OpenSearchTestCase {
     /**
      * The control that the retry loop is actually exercised. If the writers never collided this test
      * would pass against an implementation with no retry at all, so the collision itself is asserted.
+     *
+     * <p><b>The collision is arranged, not hoped for, and it took a failure to get there.</b> The first
+     * version started eight threads from a common latch and asserted afterwards that some swap had failed.
+     * That is a race about a race: nothing stops the scheduler running the threads far enough apart that
+     * each reads a generation the previous one already wrote, and then every swap succeeds and the
+     * assertion fails having found nothing wrong. It survived in isolation and fell over inside a full run
+     * of 8,808 tests, which is exactly the load where thread starts spread out.
+     *
+     * <p>So the store now holds every reader until all of them have read. All eight leave with generation
+     * zero, seven swaps must fail, and the assertion below tests the retry loop instead of testing the
+     * scheduler's mood.
      */
     public void testConcurrentWritersActuallyCollide() throws Exception {
         InMemoryStore store = new InMemoryStore();
         MappingGenerationStore.register(store);
 
         int writers = 8;
+        store.readsBeforeAnySwap = new CountDownLatch(writers);
         CountDownLatch startTogether = new CountDownLatch(1);
         CountDownLatch finished = new CountDownLatch(writers);
 
@@ -106,11 +118,15 @@ public class MappingGenerationStoreTests extends OpenSearchTestCase {
         startTogether.countDown();
         assertTrue(finished.await(30, TimeUnit.SECONDS));
 
+        // At least writers - 1, not merely more than zero. Every writer left the gate holding generation
+        // zero, so exactly one swap can land and the rest have to come back. Asserting the number the
+        // arrangement guarantees is what keeps this a control: "more than zero" would pass again if the
+        // gate were removed and one accidental collision happened to occur.
         assertTrue(
             "the writers must have contended, or this suite is not testing the retry loop at all: "
                 + store.failedSwaps.get()
                 + " failed swaps",
-            store.failedSwaps.get() > 0
+            store.failedSwaps.get() >= writers - 1
         );
     }
 
@@ -163,9 +179,36 @@ public class MappingGenerationStoreTests extends OpenSearchTestCase {
         private final AtomicInteger swaps = new AtomicInteger();
         private final AtomicInteger failedSwaps = new AtomicInteger();
 
+        /**
+         * Holds every reader until all of them have read, so a collision is arranged rather than hoped for.
+         *
+         * <p>Null unless a test sets it, because only the collision test needs it. When set, each reader
+         * takes its value, counts down, and waits, so all of them leave holding the same generation and all
+         * but one swap must then fail.
+         *
+         * <p><b>Self-clearing, which is what lets the retry loop still run.</b> Once the count reaches zero
+         * the latch stays open: {@code await} returns at once and {@code countDown} is a no-op, so the
+         * re-reads the retry loop performs pass straight through. A {@code CyclicBarrier} would deadlock
+         * here instead, because only the losers come back round and the party count would never be met.
+         */
+        private volatile CountDownLatch readsBeforeAnySwap;
+
         @Override
         public MappingGenerationStore.MappingGeneration read(String indexUuid) {
-            return byUuid.get(indexUuid);
+            MappingGenerationStore.MappingGeneration value = byUuid.get(indexUuid);
+            CountDownLatch gate = readsBeforeAnySwap;
+            if (gate != null) {
+                gate.countDown();
+                try {
+                    if (gate.await(30, TimeUnit.SECONDS) == false) {
+                        throw new AssertionError("the readers never all arrived, so no collision was arranged");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("interrupted while waiting for the other readers", e);
+                }
+            }
+            return value;
         }
 
         @Override
