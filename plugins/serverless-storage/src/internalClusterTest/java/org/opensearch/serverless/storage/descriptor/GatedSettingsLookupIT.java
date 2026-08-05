@@ -117,6 +117,43 @@ public class GatedSettingsLookupIT extends org.opensearch.serverless.storage.Ser
     }
 
     /**
+     * The same index through {@code GET /index}, which failed differently and worse.
+     *
+     * <p>{@code TransportGetIndexAction} read {@code state.metadata().index(name).getSettings()} with no
+     * null check at all, so a gated index did not come back empty -- it threw a {@link NullPointerException}
+     * on a name the resolver had just accepted as valid. Same root cause as the settings action, opposite
+     * symptom, which is why an audit was worth more than fixing the one site the soak happened to exercise.
+     *
+     * <p>Mappings and aliases are deliberately not asserted here. Those features are answered from
+     * {@code Metadata.findMappings} and {@code findAllAliases}, which walk the cluster state map, and a
+     * descriptor carries neither: mappings live in {@code MappingGenerationStore} and
+     * {@code IndexDescriptor#toIndexMetadata} does not put them back. Asking for them returns empty, and
+     * that is a real limitation rather than a fixed one.
+     */
+    public void testAGatedIndexCanBeFetchedByGetIndex() throws Exception {
+        installBlobBackedDescriptorPlane();
+
+        client().admin()
+            .indices()
+            .create(
+                new CreateIndexRequest("gated-getindex").settings(
+                    Settings.builder()
+                        .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 2)
+                        .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+                        .put("index.serverless_storage.enabled", true)
+                        .build()
+                )
+            )
+            .actionGet();
+
+        var response = client().admin().indices().prepareGetIndex().setIndices("gated-getindex").get();
+
+        Settings settings = response.getSettings().get("gated-getindex");
+        assertNotNull("GET /index on a gated index must return its settings rather than throwing", settings);
+        assertEquals("2", settings.get(IndexMetadata.SETTING_NUMBER_OF_SHARDS));
+    }
+
+    /**
      * An ordinary index keeps answering exactly as it did, which is the R1 half.
      *
      * <p>The seam falls back to the metadata map when nothing is registered, so this should be untouched --

@@ -478,6 +478,18 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
         final Map<String, List<AliasMetadata>> mapBuilder = new HashMap<>();
         for (String index : concreteIndices) {
             IndexMetadataHolder indexMetadata = indices.get(index);
+            if (indexMetadata == null) {
+                // A gated index, which resolves by name and has no entry in this map. Reporting no aliases
+                // is correct rather than merely safe: DescriptorRepresentable refuses to gate an index that
+                // has any alias at all -- T29 widened that from filtered aliases to every alias, because an
+                // alias operation is a cluster state update and a gated index cannot take one, so an alias
+                // could be set at creation and then never added, removed or repointed. A gated index
+                // therefore provably has none.
+                //
+                // Without this the next line threw a NullPointerException, in production as well as under
+                // assertions, for GET /index on any gated name.
+                continue;
+            }
             List<AliasMetadata> filteredValues = new ArrayList<>();
             for (final AliasMetadata value : indexMetadata.getAliases().values()) {
                 boolean matched = matchAllAliases;
@@ -537,7 +549,20 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
         final SortedMap<String, IndexAbstraction> lookup = getIndicesLookup();
         for (String indexName : concreteIndices) {
             IndexAbstraction index = lookup.get(indexName);
-            assert index != null;
+            if (index == null) {
+                // A gated index resolves by name and has no abstraction: getIndicesLookup is built from the
+                // metadata map and a gated index is deliberately absent from it. The assertion that stood
+                // here encoded "every concrete index is in the lookup", which gating makes false.
+                //
+                // Skipping is the correct answer rather than a lenient one. Neither IndexDescriptor nor
+                // DescriptorRepresentable can express a parent data stream, so a gated index provably has
+                // none, and reporting none is what this method owes its caller.
+                //
+                // This was a production fault as well as a failed assertion. Assertions are off outside
+                // tests, so the next line dereferenced null and threw -- from GET /index, on a name the
+                // resolver had just accepted as valid.
+                continue;
+            }
             assert index.getType() == IndexAbstraction.Type.CONCRETE_INDEX;
             if (index.getParentDataStream() != null) {
                 builder.put(indexName, index.getParentDataStream());
