@@ -8,7 +8,6 @@
 
 package org.opensearch.serverless.storage.descriptor;
 
-import org.apache.lucene.tests.util.LuceneTestCase.AwaitsFix;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.action.bulk.BulkRequestBuilder;
 import org.opensearch.action.bulk.BulkResponse;
@@ -83,6 +82,22 @@ import java.util.Locale;
  * asserted here, before and after the write, by {@link #assertEveryTenantIsGated}: without it a pass here
  * says nothing that S45's pass did not also say. S55 has the numbers and the four call sites T39 found
  * behind the eleven that S52 and S53 had mapped.
+ *
+ * <h2>The two tests that were muted, and why they are not any more</h2>
+ *
+ * {@code testHowManyShardsAGatedIndexActuallyGets} was muted as order-dependent: a gated index's recorded
+ * shard count disagreed with its request, but only when the whole class ran. {@code
+ * testWhetherTheDisagreeingIndexIsEvenGated} was muted on T35/T36, needing a gated write path that did not
+ * exist yet.
+ *
+ * <p>Both were describing one thing from opposite ends -- an index that was gated at creation and had been
+ * rebuilt from cluster-state defaults by the time anything looked at it again. T39 fixed that by giving a
+ * gated index a write path that does not un-gate it, and neither annotation was revisited afterwards. A
+ * muted test stops being counted, so nothing announced that they had started passing.
+ *
+ * <p>Unmuted after four consecutive runs of the whole class with fresh seeds, which is the condition the
+ * first one needed in order to reproduce at all. A single green run would have proved nothing about a test
+ * whose entire failure mode was passing intermittently.
  */
 public class GatedEndToEndIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
 
@@ -283,8 +298,6 @@ public class GatedEndToEndIT extends org.opensearch.serverless.storage.Serverles
      * say, what the descriptor recorded, and what a search reports touching. Disagreement between them is
      * the finding.
      */
-    @AwaitsFix(bugUrl = "order-dependent: a gated index's recorded shard count sometimes disagrees with its request. "
-        + "Reproduces only when the whole class runs; asking for 1/2/4/7 in isolation is honoured every time")
     public void testHowManyShardsAGatedIndexActuallyGets() throws Exception {
         BlobDescriptorBackend store = installBlobBackedDescriptorPlane().points();
 
@@ -424,7 +437,6 @@ public class GatedEndToEndIT extends org.opensearch.serverless.storage.Serverles
      * If the index is present in cluster state, it was never gated and there is no defect in the gated path
      * to find.
      */
-    @AwaitsFix(bugUrl = "T35/T36: the gated write path needs ten metadata call sites and then an assigned primary shard; see S52")
     public void testWhetherTheDisagreeingIndexIsEvenGated() throws Exception {
         BlobDescriptorBackend store = installBlobBackedDescriptorPlane().points();
 
