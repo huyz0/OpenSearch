@@ -111,7 +111,6 @@ public class DescriptorGateIT extends OpenSearchIntegTestCase {
         );
 
         assertFalse("a disabled gate must register no supplier", AbsentIndexDescriptorSuppliers.isRegistered());
-        assertFalse("and no pager", AbsentIndexDescriptorSuppliers.isPagerRegistered());
     }
 
     /** Uninstalling clears both, which node close depends on to avoid outliving itself. */
@@ -124,12 +123,10 @@ public class DescriptorGateIT extends OpenSearchIntegTestCase {
             true
         );
         assertTrue(AbsentIndexDescriptorSuppliers.isRegistered());
-        assertTrue(AbsentIndexDescriptorSuppliers.isPagerRegistered());
 
         DescriptorGate.uninstall();
 
         assertFalse("a closed node must not keep answering resolution", AbsentIndexDescriptorSuppliers.isRegistered());
-        assertFalse(AbsentIndexDescriptorSuppliers.isPagerRegistered());
     }
 
     /**

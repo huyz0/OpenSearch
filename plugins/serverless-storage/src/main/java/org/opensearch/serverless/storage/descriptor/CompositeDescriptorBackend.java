@@ -113,6 +113,22 @@ public final class CompositeDescriptorBackend implements DescriptorBackend, Desc
         points.warmAsync(names, listener);
     }
 
+    @Override
+    public AbsentIndexDescriptorSuppliers.PrefixExpansion expandPrefix(String prefix, int limit) {
+        return prefixes.expandPrefix(prefix, limit);
+    }
+
+    /**
+     * The half that answers prefix queries, so a caller that must write through both can reach it.
+     *
+     * <p>Needed because a point write to the object store leaves the prefix half not knowing the name
+     * exists, and until the name index serves prefix resolution that half is a real index that has to be
+     * told. See {@code DescriptorGate}, which dual-writes for exactly this reason.
+     */
+    public DescriptorPrefixBackend prefixBackend() {
+        return prefixes;
+    }
+
     /**
      * Both halves have to be ready, because a cluster that can resolve a name but not a wildcard is not
      * usable and would report itself healthy.
@@ -131,31 +147,5 @@ public final class CompositeDescriptorBackend implements DescriptorBackend, Desc
     @Override
     public List<IndexDescriptor> findByPrefix(String prefix, String afterName, int size) {
         return prefixes.findByPrefix(prefix, afterName, size);
-    }
-
-    @Override
-    public List<AbsentIndexDescriptorSuppliers.PagedIndex> findNamesForPage(
-        String afterName,
-        long afterCreationDate,
-        boolean ascending,
-        int size
-    ) {
-        return prefixes.findNamesForPage(afterName, afterCreationDate, ascending, size);
-    }
-
-    @Override
-    public AbsentIndexDescriptorSuppliers.PrefixExpansion expandPrefix(String prefix, int limit) {
-        return prefixes.expandPrefix(prefix, limit);
-    }
-
-    /**
-     * The half that answers prefix queries, so a caller that must write through both can reach it.
-     *
-     * <p>Needed because a point write to the object store leaves the prefix half not knowing the name
-     * exists, and until the name index serves prefix resolution that half is a real index that has to be
-     * told. See {@code DescriptorGate}, which dual-writes for exactly this reason.
-     */
-    public DescriptorPrefixBackend prefixBackend() {
-        return prefixes;
     }
 }

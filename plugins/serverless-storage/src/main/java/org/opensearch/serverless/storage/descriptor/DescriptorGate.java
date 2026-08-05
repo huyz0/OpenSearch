@@ -164,7 +164,6 @@ public final class DescriptorGate {
         // registered supplier backed by a null store.
         STORE.set(store);
         AbsentIndexDescriptorSuppliers.register(DescriptorGate::supplyExceptForTheStoreItself);
-        AbsentIndexDescriptorSuppliers.registerPager(pagerFor(prefixBackend));
         // T28. Wildcards, which until now matched no gated index at all: every branch of the resolver's
         // matching reads cluster state, and a gated index is absent from it by construction, so T25
         // measured tenant-* over five gated tenants returning nothing and returning it without an error.
@@ -495,7 +494,6 @@ public final class DescriptorGate {
     public static void uninstall() {
         // Cleared in the reverse order, so the supplier is gone before the store it reads.
         AbsentIndexDescriptorSuppliers.register(null);
-        AbsentIndexDescriptorSuppliers.registerPager(null);
         AbsentIndexDescriptorSuppliers.registerExpander(null);
         DescriptorPrefetch.register(null);
         setChangeFeed(null);
@@ -513,22 +511,4 @@ public final class DescriptorGate {
         STORE.set(null);
     }
 
-    /**
-     * A pager over the descriptor index.
-     *
-     * <p>The {@code size} argument is the point of the interface rather than a convenience: H16 measured
-     * that pagination sorted the whole population to make one page, so a pager that fetched everything and
-     * then trimmed would satisfy the type and reintroduce the cost. This asks the index for exactly the page.
-     *
-     * <p>It is a method reference rather than a lambda because every argument now goes through unchanged.
-     * The lambda that used to be here dropped {@code afterCreationDate} and served descending by reversing
-     * an ascending page, and T27 measured what that cost: a descending walk returned the same names as an
-     * ascending one, and pages were selected in name order while the caller merged them in creation-date
-     * order. A pager that quietly reinterprets its arguments is worse than one that cannot express them.
-     */
-    private static AbsentIndexDescriptorSuppliers.DescriptorPager pagerFor(DescriptorPrefixBackend store) {
-        // Names and creation dates only. T5 measured that decoding the full descriptor for every hit is a
-        // quarter to a third of what a page costs, and pagination reads exactly these two fields.
-        return store::findNamesForPage;
-    }
 }

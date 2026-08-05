@@ -170,66 +170,6 @@ public final class AbsentIndexDescriptorSuppliers {
      * page and returns a page, which is what the descriptor index can actually do cheaply: S24 measured
      * paging by sorted name with {@code search_after} at roughly 33 ms per thousand names.
      */
-    /**
-     * One entry of a page: the two fields pagination orders and displays, and nothing else.
-     *
-     * <p>This is deliberately not an {@link IndexDescriptor}. T5 measured that building the full fourteen
-     * field record for every hit is roughly a quarter to a third of what a page costs, and
-     * {@code IndexPaginationStrategy} reads exactly {@code name} and {@code creationDate} from it. The
-     * alternative of returning {@code IndexDescriptor} with the other twelve fields left at their defaults
-     * would have been cheaper to write and is precisely the failure this area keeps producing: a value that
-     * reads fine and answers wrong, where a later caller asking for a shard count gets a confident zero.
-     * A narrow type cannot be misread that way.
-     */
-    public record PagedIndex(String name, long creationDate) {
-    }
-
-    @FunctionalInterface
-    public interface DescriptorPager {
-        /**
-         * The next {@code size} gated indices after the given position, in the given order.
-         *
-         * @param afterName the last name of the previous page, or null for the first page
-         * @param afterCreationDate the last creation date of the previous page, ignored when afterName is null
-         * @param ascending whether the order is ascending
-         * @param size how many to return, which bounds the work
-         */
-        List<PagedIndex> page(String afterName, long afterCreationDate, boolean ascending, int size);
-    }
-
-    private static final AtomicReference<DescriptorPager> PAGER = new AtomicReference<>();
-
-    /** Installs the pager. Registering null clears it, which is how a test restores the default. */
-    public static void registerPager(DescriptorPager pager) {
-        PAGER.set(pager);
-    }
-
-    /** Whether anything can supply gated pages. With nothing installed, pagination behaves as before. */
-    public static boolean isPagerRegistered() {
-        return PAGER.get() != null;
-    }
-
-    /**
-     * One page of gated indices, or empty when nothing is installed or the pager fails.
-     *
-     * <p>Failing to empty rather than throwing matches how a failing supplier is treated everywhere else in
-     * this class. It does mean a broken pager silently returns short pages, which is the failure mode this
-     * area exists to be suspicious of, so callers that need to distinguish the two should ask {@link
-     * #isPagerRegistered()} rather than inferring it from an empty result.
-     */
-    public static List<PagedIndex> page(String afterName, long afterCreationDate, boolean ascending, int size) {
-        DescriptorPager pager = PAGER.get();
-        if (pager == null || size <= 0) {
-            return List.of();
-        }
-        try {
-            List<PagedIndex> page = pager.page(afterName, afterCreationDate, ascending, size);
-            return page == null ? List.of() : page;
-        } catch (Exception e) {
-            return List.of();
-        }
-    }
-
     public static List<IndexDescriptor> supplyAll(List<String> indexNames) {
         if (isRegistered() == false) {
             return List.of();
@@ -240,8 +180,10 @@ public final class AbsentIndexDescriptorSuppliers {
     /**
      * One gated index that matched a prefix, carrying only what wildcard expansion filters on.
      *
-     * <p>Three fields rather than an {@link IndexDescriptor} for the reason {@link PagedIndex} gives, and
-     * three rather than one because expansion is not just a name lookup. {@code IndicesOptions} decides
+     * <p>Three fields rather than an {@link IndexDescriptor}, because T5 measured that building the full
+     * fourteen field record for every hit is a quarter to a third of what an expansion costs and only three
+     * are read. Three rather than one because expansion is not just a name lookup. {@code IndicesOptions}
+     * decides
      * whether closed indices and hidden indices are in the answer, so an expander returning bare names
      * forces the caller either to ignore those options or to fetch each descriptor to honour them. The first
      * is wrong and the second reintroduces the cost the cap exists to avoid.
@@ -315,7 +257,7 @@ public final class AbsentIndexDescriptorSuppliers {
      * Expands {@code prefix}, or returns null when nothing is installed.
      *
      * <p><b>A failing expander propagates rather than answering empty</b>, which is the opposite of how
-     * {@link #supply} and {@link #page} treat failure and is deliberate. Those two degrade a request; this
+     * {@link #supply} treats failure and is deliberate. That one degrades a request; this
      * one decides which indices a request touches, so a swallowed failure turns "I could not read the
      * catalogue" into "there are no such indices" and the caller acts on the second. That distinction is
      * what {@link DescriptorUnavailableException} was created for.

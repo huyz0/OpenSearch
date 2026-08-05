@@ -44,9 +44,6 @@ public interface DescriptorPrefixBackend {
      */
     List<IndexDescriptor> findByPrefix(String prefix, String afterName, int size);
 
-    /** One page of names in creation order, for pagination that cannot hold the population in memory. */
-    List<AbsentIndexDescriptorSuppliers.PagedIndex> findNamesForPage(String afterName, long afterCreationDate, boolean ascending, int size);
-
     /**
      * Expands a wildcard prefix, or reports that it matched more than {@code limit}.
      *

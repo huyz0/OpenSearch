@@ -52,7 +52,6 @@ public class CoreIsInertWithoutAPluginTests extends OpenSearchTestCase {
     /** A stock node: every seam this branch adds, unset. */
     private static void clearEverySeam() {
         AbsentIndexDescriptorSuppliers.register(null);
-        AbsentIndexDescriptorSuppliers.registerPager(null);
         AbsentIndexDescriptorSuppliers.registerExpander(null);
         AbsentIndexRoutingSuppliers.register(null);
         DescriptorOnlyCreation.register(null);
@@ -92,7 +91,6 @@ public class CoreIsInertWithoutAPluginTests extends OpenSearchTestCase {
      */
     public void testNoSeamIsRegisteredOnAStockNode() {
         assertFalse("descriptor resolution", AbsentIndexDescriptorSuppliers.isRegistered());
-        assertFalse("descriptor pagination", AbsentIndexDescriptorSuppliers.isPagerRegistered());
         assertFalse("wildcard expansion over gated indices", AbsentIndexDescriptorSuppliers.isExpanderRegistered());
         assertFalse("computed routing", AbsentIndexRoutingSuppliers.isRegistered());
         assertFalse("the creation gate", DescriptorOnlyCreation.isRegistered());

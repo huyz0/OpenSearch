@@ -125,16 +125,6 @@ public class DurableTombstoneWriterTests extends OpenSearchTestCase {
         }
 
         @Override
-        public List<org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.PagedIndex> findNamesForPage(
-            String afterName,
-            long afterCreationDate,
-            boolean ascending,
-            int size
-        ) {
-            return List.of();
-        }
-
-        @Override
         public org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.PrefixExpansion expandPrefix(String prefix, int limit) {
             return org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.PrefixExpansion.of(List.of());
         }

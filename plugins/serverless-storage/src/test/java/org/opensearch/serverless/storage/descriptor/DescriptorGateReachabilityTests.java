@@ -69,7 +69,6 @@ public class DescriptorGateReachabilityTests extends OpenSearchTestCase {
         install();
 
         assertTrue("the descriptor supplier", AbsentIndexDescriptorSuppliers.isRegistered());
-        assertTrue("the pager", AbsentIndexDescriptorSuppliers.isPagerRegistered());
         assertTrue("the wildcard expander", AbsentIndexDescriptorSuppliers.isExpanderRegistered());
         assertTrue(
             "the prefetcher, which had no registrar at all until the wiring pass and so did nothing",
@@ -90,7 +89,6 @@ public class DescriptorGateReachabilityTests extends OpenSearchTestCase {
         DescriptorGate.uninstall();
 
         assertFalse(AbsentIndexDescriptorSuppliers.isRegistered());
-        assertFalse(AbsentIndexDescriptorSuppliers.isPagerRegistered());
         assertFalse(AbsentIndexDescriptorSuppliers.isExpanderRegistered());
         assertFalse("a prefetcher left behind would outlive the plugin that installed it", DescriptorPrefetch.isRegistered());
         assertFalse(DescriptorOnlyCreation.isRegistered());
