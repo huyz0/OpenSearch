@@ -424,7 +424,7 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
         // AbsentIndexDescriptorSuppliers refuses to answer on a cluster state thread because W4 measured that
         // deadlocking. That is also why this cannot simply be folded into applyClusterState.
         ClusterState state = clusterService.state();
-        for (Index index : List.copyOf(openedOnDemand)) {
+        for (Index index : List.copyOf(openedOnDemand.keySet())) {
             if (state.metadata().index(index) != null) {
                 // Published after all, so the ordinary path owns its lifecycle now.
                 continue;
@@ -511,7 +511,7 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
             Index coldest = null;
             long coldestIdle = -1;
             int sampled = 0;
-            for (Index candidate : openedOnDemand) {
+            for (Index candidate : openedOnDemand.keySet()) {
                 AllocatedIndex<? extends Shard> indexService = indicesService.indexService(candidate);
                 if (indexService == null) {
                     continue;
@@ -541,7 +541,7 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
             return;
         }
         final long idleAfterMillis = idleAfter.millis();
-        for (Index index : List.copyOf(openedOnDemand)) {
+        for (Index index : List.copyOf(openedOnDemand.keySet())) {
             AllocatedIndex<? extends Shard> indexService = indicesService.indexService(index);
             if (indexService == null) {
                 continue;
@@ -600,7 +600,11 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
      * is no longer in {@code indicesService} for the loop to reach at all.
      */
     private void releaseGatedIndex(Index index, String reason) {
-        if (openedOnDemand.contains(index) == false) {
+        // Captured before the close, so the removal afterwards can tell whether this is still the same open.
+        // A request that reopens the index while this close runs stamps a new token, and the removal then
+        // matches nothing rather than erasing an entry that describes a live index.
+        Long token = openedOnDemand.get(index);
+        if (token == null) {
             return;
         }
         logger.debug("{} closing gated index opened on demand: {}", index, reason);
@@ -612,7 +616,7 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
             logger.warn(() -> new ParameterizedMessage("[{}] could not be closed", index), e);
             return;
         }
-        openedOnDemand.remove(index);
+        openedOnDemand.remove(index, token);
     }
 
     @Override
@@ -786,7 +790,7 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
                 // index the cluster manager never knew about, absence is its ordinary condition.
                 continue;
             }
-            if (openedOnDemand.remove(index)) {
+            if (openedOnDemand.remove(index) != null) {
                 // Was held on demand and is not any more, which heldOnDemand has just decided. Removed
                 // here rather than fallen through to the checks below, because the assertion in them
                 // states that an index absent from cluster state must have been deleted or the cluster
@@ -918,11 +922,29 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
     /**
      * Indices this node built from a descriptor rather than from an applied cluster state.
      *
-     * <p>Node-local and deliberately not a static registry, which is what every other seam in this area
-     * is. A registry keyed on nothing would be shared by every node in a test JVM, and the question this
-     * set answers -- "did <em>I</em> open this" -- is one only a node can answer about itself.
+     * <p>Node-local and deliberately not a static registry, which is what every other seam in this area is.
+     * A registry keyed on nothing would be shared by every node in a test JVM, and the question this answers
+     * -- "did <em>I</em> open this" -- is one only a node can answer about itself.
+     *
+     * <p><b>A map rather than a set, and the token is the reason.</b> A release closes an index and then
+     * forgets it, and those cannot be one atomic step: closing is slow and this instance's monitor is the
+     * one {@link #applyClusterState} takes, so holding it across a close stalls cluster state application
+     * behind a request. Both orderings then leave a window, and this is the second one -- a request that
+     * reopens the index between the close and the forget has its entry erased by the release that was
+     * finishing, leaving the index live on this node and absent from the bookkeeping that says so.
+     *
+     * <p>Removing by key <em>and</em> value closes it. A reopen stamps a new token, so a release whose token
+     * no longer matches removes nothing and the index stays correctly recorded as held.
+     *
+     * <p>An earlier attempt guarded {@link #removeIndices} by asking the index's own metadata whether it
+     * skips cluster state. That works only while a descriptor supplier is registered, so it made the symptom
+     * rare rather than absent: on teardown, or on any node whose gate has been released, the guard answers
+     * false and the stale entry surfaces as exactly the assertion it was meant to prevent.
      */
-    private final Set<Index> openedOnDemand = ConcurrentCollections.newConcurrentSet();
+    private final Map<Index, Long> openedOnDemand = ConcurrentCollections.newConcurrentMap();
+
+    /** Stamps each on-demand open, so a release can tell its own entry from a later one for the same index. */
+    private final java.util.concurrent.atomic.AtomicLong openedOnDemandTokens = new java.util.concurrent.atomic.AtomicLong();
 
     /**
      * Whether this index is one this node opened from a descriptor and should still be holding.
@@ -944,7 +966,7 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
      * rather than left to be discovered.
      */
     private boolean heldOnDemand(Index index) {
-        return openedOnDemand.contains(index) && AbsentIndexDescriptorSuppliers.isRegistered();
+        return openedOnDemand.containsKey(index) && AbsentIndexDescriptorSuppliers.isRegistered();
     }
 
     /**
@@ -1023,7 +1045,7 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
                     // dangling index is imported into cluster state on the next restart, which would
                     // un-gate it exactly the way auto-creation used to.
                     indexService = indicesService.createIndex(indexMetadata, builtInIndexListener, false);
-                    openedOnDemand.add(index);
+                    openedOnDemand.put(index, openedOnDemandTokens.incrementAndGet());
                 } catch (Exception e) {
                     logger.warn(() -> new ParameterizedMessage("[{}] failed to open gated index on demand", index), e);
                     return;
