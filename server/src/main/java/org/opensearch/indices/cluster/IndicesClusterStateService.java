@@ -42,6 +42,7 @@ import org.opensearch.cluster.ClusterStateApplier;
 import org.opensearch.cluster.action.index.NodeMappingRefreshAction;
 import org.opensearch.cluster.action.shard.ShardStateAction;
 import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
+import org.opensearch.cluster.metadata.DescriptorOnlyCreation;
 import org.opensearch.cluster.metadata.GatedIndexRelease;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.node.DiscoveryNode;
@@ -681,6 +682,22 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
                 // must be new. Neither is true of this one: it was never in cluster state to be deleted.
                 logger.debug("{} releasing index opened on demand, nothing supplies its descriptor now", index);
                 indicesService.removeIndex(index, NO_LONGER_ASSIGNED, "removing index (no descriptor supplier)");
+                continue;
+            }
+            if (DescriptorOnlyCreation.skipsClusterState(indexService.getIndexSettings().getIndexMetadata())) {
+                // Live, gated, and not in openedOnDemand -- which is a bookkeeping race rather than a state
+                // worth asserting about. Both orderings of "claim and close" have one: claiming before the
+                // close leaves a window where this node still holds an index nothing has claimed, and
+                // claiming after it leaves a window where a request that re-opened the index in the meantime
+                // has its entry erased by the release that was finishing.
+                //
+                // Deciding from the index's own metadata closes both, because the answer stops depending on
+                // a set that two threads are editing. An index that says it skips cluster state was never in
+                // cluster state, so the assertion below -- that an absent index must have been deleted or
+                // the cluster must be new -- is asking the wrong question about it.
+                //
+                // Left open rather than closed here: the sweep and the on-demand opener between them own
+                // this index's lifecycle, and the next pass reconciles it.
                 continue;
             }
             final IndexMetadata indexMetadata = state.metadata().index(index);
