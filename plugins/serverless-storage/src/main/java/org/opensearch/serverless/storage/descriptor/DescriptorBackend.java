@@ -13,27 +13,30 @@ import org.opensearch.cluster.metadata.IndexDescriptor;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * Where descriptors are actually stored, separated from {@link DescriptorStore}'s caching so the two can
- * vary independently.
+ * Where descriptors are actually stored, separated from caching so the two can vary independently.
  *
- * <h2>Why this is only eight operations</h2>
+ * <h2>Why this is only point operations</h2>
  *
- * T3 audited {@link DescriptorStore}'s eleven public operations against what an object store can serve.
- * Eight are point operations on a single named descriptor and map onto blob primitives directly. Three are
- * prefix searches, and no object store answers those: a bucket has no inverted index, and a LIST over a
- * hundred million keys is a rebuild path rather than a query path.
+ * T3 audited the eleven public operations of the index-backed store this replaced against what an object
+ * store can serve. Eight are point operations on a single named descriptor and map onto blob primitives
+ * directly. Three are prefix searches, and no object store answers those: a bucket has no inverted index,
+ * and a LIST over a hundred million keys is a rebuild path rather than a query path.
  *
  * <p>So they are a separate interface, {@link DescriptorPrefixBackend}, rather than methods here that one
- * implementation throws from. The split is the point. It makes "the blob backend cannot resolve
- * {@code logs-*}" a fact the compiler knows, instead of a runtime surprise on the one code path that is
- * hardest to test, and it states the ordering constraint in the type system: the name index tier has to
- * serve prefix resolution before the descriptor index can be removed, even though the blob backend can be
- * added alongside it long before that.
+ * implementation throws from. The split is the point: it makes "this backend cannot resolve
+ * {@code logs-*} the same way it resolves a name" a fact the compiler knows, instead of a runtime surprise
+ * on the code path that is hardest to test.
+ *
+ * <p>The ordering constraint that split was originally stating is spent. It read that a name index tier had
+ * to serve prefix resolution before the descriptor system index could be removed; in the end the tier was
+ * deleted and the index removed anyway, because {@code DescriptorEnumerator} answers a wildcard from one
+ * bounded listing with a cap, which is a query path after all. The separation is kept for the first reason,
+ * which was always the better one.
  *
  * <h2>What stays above this</h2>
  *
- * Caching, TTL, eviction and in-flight request collapsing all live in {@link DescriptorStore}. A backend
- * does I/O and nothing else. That matters more under an object store than it did under a system index:
+ * Caching, TTL, eviction and in-flight request collapsing live in {@link DescriptorCache}. A backend does
+ * I/O and nothing else. That matters more under an object store than it did under a system index:
  * collapsing turns M concurrent readers of one cold descriptor into a single round trip, and duplicating
  * that per backend would mean two chances to get it subtly different.
  *
