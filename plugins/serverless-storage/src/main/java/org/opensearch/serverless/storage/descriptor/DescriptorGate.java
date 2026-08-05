@@ -309,6 +309,7 @@ public final class DescriptorGate {
         // of the gate it is meant to reach would pull requests off the cluster state thread only to have them
         // find nothing gating them and fall back.
         DescriptorOnlyCreation.registerAdmissionCheck(DescriptorGate::worthAdmittingOffThread);
+        nodeInstalled();
         logger.info("descriptor resolution installed against the object store");
     }
 
@@ -400,7 +401,47 @@ public final class DescriptorGate {
         }
     }
 
+    /**
+     * How many nodes in this JVM currently hold the gate installed.
+     *
+     * <p>One in production, where a JVM hosts one node and this is decoration. More than one under
+     * {@code InternalTestCluster}, which is where its absence was a defect: every registry this class
+     * touches is static, so the first node to close called {@link #uninstall} and disarmed gating for every
+     * other node still running in the same process.
+     *
+     * <p>The symptom was a suite failing nondeterministically -- a different test each run, green on a rerun
+     * of identical code. {@code GatedCreationSwitchIT} asserting an unregistered gate answers false is one
+     * shape; a resolution that suddenly returns nothing is another. It was treated as test-only for a while,
+     * and it is not: {@code IndicesClusterStateService.heldOnDemand} reads
+     * {@code AbsentIndexDescriptorSuppliers.isRegistered}, so an unbalanced uninstall can make a node stop
+     * recognising gated indices it is currently holding open.
+     */
+    private static final java.util.concurrent.atomic.AtomicInteger INSTALLED_NODES = new java.util.concurrent.atomic.AtomicInteger();
+
+    /** Records that a node has installed the gate. Called at the end of a successful {@link #install}. */
+    private static void nodeInstalled() {
+        INSTALLED_NODES.incrementAndGet();
+    }
+
+    /**
+     * Releases one node's claim, clearing the registries only once the last node has gone.
+     *
+     * <p>What a node's {@code close()} calls. {@link #uninstall} is the unconditional reset, which is what a
+     * test wants between methods and what a node emphatically does not want while its neighbours are still
+     * serving requests through the registries it would be clearing.
+     */
+    public static void uninstallOneNode() {
+        if (INSTALLED_NODES.get() <= 0 || INSTALLED_NODES.decrementAndGet() > 0) {
+            return;
+        }
+        uninstall();
+    }
+
     public static void uninstall() {
+        // Back to zero rather than decremented: this is the unconditional reset, so whatever nodes thought
+        // they had claims no longer do. A test calling this between methods must not leave a count behind
+        // that makes the next install look like a second node.
+        INSTALLED_NODES.set(0);
         // Cleared in the reverse order, so the supplier is gone before the store it reads.
         AbsentIndexDescriptorSuppliers.register(null);
         AbsentIndexDescriptorSuppliers.registerExpander(null);

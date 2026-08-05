@@ -3099,8 +3099,14 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         // leaves a dead Client answering resolution for whatever runs next. In a test JVM that is every
         // subsequent suite; in production it is a restart inheriting a closed node's seams. Computed
         // placement had the same leak and never cleared itself either, which is why both are here.
-        org.opensearch.serverless.storage.descriptor.DescriptorGate.uninstall();
-        org.opensearch.serverless.storage.placement.ComputedPlacementGate.uninstall();
+        //
+        // One node's claim rather than everyone's. Clearing outright disarmed gating for every other node
+        // still running in the same JVM, which InternalTestCluster always has several of. That is not only a
+        // test problem: IndicesClusterStateService.heldOnDemand reads whether a descriptor supplier is
+        // registered to decide whether it is holding an index on demand, so an unbalanced uninstall can make
+        // a live node stop recognising gated indices it is currently serving.
+        org.opensearch.serverless.storage.descriptor.DescriptorGate.uninstallOneNode();
+        org.opensearch.serverless.storage.placement.ComputedPlacementGate.uninstallOneNode();
         org.opensearch.serverless.storage.scaletozero.GatedShardSuspensionRegistry suspensions = gatedShardSuspensions;
         if (suspensions != null) {
             suspensions.uninstall();

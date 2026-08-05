@@ -46,10 +46,35 @@ public final class ComputedPlacementGate {
         // entry for every index, and a supplier only runs when there is none, so the mechanism looks
         // wired and is dead. Registering both together is what makes it reachable.
         AbsentIndexRoutingSuppliers.registerUnpublished(ComputedPlacementGate::ownsIndex);
+        INSTALLED_NODES.incrementAndGet();
     }
 
-    /** Removes the supplier, restoring Phase A's behaviour. Used on node shutdown and by tests. */
+    /**
+     * How many nodes in this JVM currently hold placement installed.
+     *
+     * <p>The registries are static and a JVM hosts one node in production, so this counts to one there. It
+     * exists for {@code InternalTestCluster}, which runs several: without it the first node to close
+     * unregistered computed placement for every node still running, and a gated index whose placement has
+     * gone has no routing table and cannot be reached at all.
+     */
+    private static final java.util.concurrent.atomic.AtomicInteger INSTALLED_NODES = new java.util.concurrent.atomic.AtomicInteger();
+
+    /**
+     * Releases one node's claim, clearing the suppliers only once the last node has gone.
+     *
+     * <p>What a node's {@code close()} calls, as against {@link #uninstall}, which resets unconditionally
+     * and is what a test wants between methods.
+     */
+    public static void uninstallOneNode() {
+        if (INSTALLED_NODES.get() <= 0 || INSTALLED_NODES.decrementAndGet() > 0) {
+            return;
+        }
+        uninstall();
+    }
+
+    /** Removes the supplier, restoring Phase A's behaviour. Used by tests, and by the last node to close. */
     public static void uninstall() {
+        INSTALLED_NODES.set(0);
         AbsentIndexRoutingSuppliers.register(null);
         AbsentIndexRoutingSuppliers.registerUnpublished(null);
     }
