@@ -36,18 +36,27 @@ import java.util.Map;
  * right one this area keeps producing, except that here it silently changes the field types the user asked
  * for.
  *
- * <h2>What it does now</h2>
+ * <h2>What it does now, in two steps</h2>
  *
- * Refuses, in the same place and for the same reason as the other two: an index the descriptor cannot
- * represent keeps its cluster state entry and is created as an ordinary index. The mapping survives, the
- * index works, and the cost is that this one index does not get the gated path.
+ * <b>First it refused</b>, in the same place and for the same reason as the other rules: an index the
+ * descriptor could not represent kept its cluster state entry. That stopped the loss and left a hole big
+ * enough to make the feature useless, since a deployment giving every tenant an explicit mapping got no
+ * gated indices at all -- which is the case this design exists for. A refusal is a way of not losing data,
+ * not a way of supporting something.
  *
- * <p><b>That is a real limitation, not a fix.</b> A multi-tenant deployment that gives every tenant an
- * explicit mapping would get no gated indices at all, which is the main use case this design exists for.
- * Carrying create-time mappings into {@code MappingGenerationStore} at creation is the change that would
- * make gating usable with them, and it is a larger one: the fields have to be extracted from the built
- * metadata, written through the store, and the generation reflected on the descriptor. Refusing first is
- * what stops data being lost while that is built.
+ * <p><b>Then it carried them.</b> The declared fields are written to {@code MappingGenerationStore} during
+ * gated creation, which is where a gated index's mapping lives anyway once documents start arriving, and
+ * the refusal narrowed to what genuinely cannot round-trip.
+ *
+ * <p>Two orderings carry the correctness. The mapping is written before the descriptor, because the
+ * descriptor is the acknowledgement: if the mapping write fails the creation fails and no index exists,
+ * where the reverse order would leave a name that resolves to an index whose declared fields are missing.
+ * And the extraction returns nothing at all rather than a partial map when some property will not fit,
+ * because carrying the fields that do fit and dropping the rest is the original silent loss one level in.
+ *
+ * <p>What still cannot be carried is an object or nested field, since the store holds a flat map of field
+ * name to type and a property with its own properties has nowhere to go in it. That limit is the mapping
+ * store's shape rather than the descriptor's, and lifting it means changing what the store holds.
  */
 public class GatedCreateTimeMappingIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
 
@@ -91,7 +100,18 @@ public class GatedCreateTimeMappingIT extends org.opensearch.serverless.storage.
         DescriptorGate.uninstall();
     }
 
-    public void testAMappingGivenAtCreationSurvives() throws Exception {
+    /**
+     * A mapping of plain typed fields is carried into the mapping store, and the index is still gated.
+     *
+     * <p>The first version of this asserted the opposite: that such an index kept its cluster state entry,
+     * because refusing was the only thing standing between an accepted mapping and a discarded one. That
+     * stopped the loss and left a hole big enough to make the feature useless -- a deployment giving every
+     * tenant an explicit mapping got no gated indices at all, which is the case this design exists for.
+     *
+     * <p>So the fields now go to {@code MappingGenerationStore} at creation, which is where a gated index's
+     * mapping lives, and the refusal narrows to what genuinely cannot round-trip.
+     */
+    public void testAMappingOfPlainFieldsIsCarriedAndTheIndexStaysGated() throws Exception {
         installBlobBackedDescriptorPlane();
 
         client().admin()
@@ -102,20 +122,53 @@ public class GatedCreateTimeMappingIT extends org.opensearch.serverless.storage.
             )
             .actionGet();
 
-        // Through cluster state, because an index the descriptor cannot represent keeps its entry there.
-        // Asserting on the mapping rather than on which path it took, since the mapping is the thing that
-        // must not be lost and the path is only how that is achieved.
         ClusterState state = client().admin().cluster().prepareState().get().getState();
-        IndexMetadata metadata = state.metadata().index("gated-mapped");
-        assertNotNull(
-            "an index whose mapping a descriptor cannot carry must keep its cluster state entry rather than "
-                + "being gated with the mapping discarded",
-            metadata
+        assertNull(
+            "an index whose mapping can be carried field by field must still be gated, or carrying it " + "bought nothing",
+            state.metadata().index("gated-mapped")
         );
-        assertNotNull("and the mapping it was created with must still be there", metadata.mapping());
-        String source = metadata.mapping().source().toString();
-        assertTrue("the declared keyword field must have survived: " + source, source.contains("tenant"));
-        assertTrue("and so must the declared double field: " + source, source.contains("amount"));
+
+        // The fields themselves, from the store that now holds them. Asserting the index is gated proves
+        // only that it took the fast path; asserting the types proves the mapping was not lost on the way,
+        // which is the whole question.
+        String uuid = descriptorUuid("gated-mapped");
+        var generation = org.opensearch.cluster.metadata.MappingGenerationStore.currentMapping(uuid);
+        assertNotNull("the declared fields must be in the mapping store after a gated creation", generation);
+        assertEquals("keyword", generation.fields().get("tenant"));
+        assertEquals("double", generation.fields().get("amount"));
+    }
+
+    /**
+     * An object field is still refused, because the store has nowhere to put it.
+     *
+     * <p>The relaxation is to what round-trips, not to mappings in general.
+     * {@code MappingGenerationStore} holds a flat map of field name to type, so a property with its own
+     * properties has no representation there. Carrying the fields that do fit and dropping the rest would
+     * be the original silent loss one level further in.
+     */
+    public void testAnObjectFieldIsStillRefused() throws Exception {
+        installBlobBackedDescriptorPlane();
+
+        client().admin()
+            .indices()
+            .create(
+                new CreateIndexRequest("gated-object").settings(gated())
+                    .mapping(Map.of("properties", Map.of("nested", Map.of("properties", Map.of("inner", Map.of("type", "keyword"))))))
+            )
+            .actionGet();
+
+        ClusterState state = client().admin().cluster().prepareState().get().getState();
+        IndexMetadata metadata = state.metadata().index("gated-object");
+        assertNotNull("an index with an object field must keep its cluster state entry rather than losing it", metadata);
+        assertNotNull("and its mapping must still be there", metadata.mapping());
+        assertTrue("including the object field: " + metadata.mapping().source(), metadata.mapping().source().toString().contains("inner"));
+    }
+
+    /** The descriptor's uuid for a gated name, which is the key the mapping store is written under. */
+    private String descriptorUuid(String name) throws Exception {
+        var descriptor = org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.supply(name);
+        assertNotNull("the gated index must resolve through the descriptor seam", descriptor);
+        return descriptor.uuid();
     }
 
     /**

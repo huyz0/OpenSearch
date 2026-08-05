@@ -8,6 +8,9 @@
 
 package org.opensearch.cluster.metadata;
 
+import java.util.HashMap;
+import java.util.Map;
+
 /**
  * Every reason an index must keep its cluster state entry, in one place.
  *
@@ -105,12 +108,59 @@ public final class DescriptorRepresentable {
         // mappings into MappingGenerationStore is what would make gating work with them; until that exists a
         // deployment giving every tenant an explicit mapping gets no gated indices at all, which is the main
         // use case this design is for. Refusing is what stops data being lost while that is built.
-        if (indexMetadata.mapping() != null) {
-            return "index declares a mapping, which a descriptor cannot carry: a descriptor holds a mapping "
-                + "generation while the mapping itself lives in the mapping store, so gating this index "
-                + "would accept the mapping and then discard it";
+        if (indexMetadata.mapping() != null && simpleFieldsOrNull(indexMetadata) == null) {
+            return "index declares a mapping that cannot be carried field by field: a descriptor holds a "
+                + "mapping generation while the fields live in the mapping store, and only top-level "
+                + "properties with a declared type round-trip through it, so an object or nested field "
+                + "would be accepted and then discarded";
         }
         return null;
+    }
+
+    /**
+     * The mapping's top-level fields as name to type, or null if any of it would not round-trip.
+     *
+     * <p>A descriptor carries a mapping generation and the fields live in {@code MappingGenerationStore},
+     * so gating an index with a mapping means writing those fields there at creation. That works exactly as
+     * far as the store's shape allows: a flat map of field name to type. A property with no declared type,
+     * or one whose definition is an object or nested field with its own properties, has no representation
+     * in that map.
+     *
+     * <p><b>Null rather than a partial map, and the difference is the whole point.</b> Returning the fields
+     * that do round-trip and dropping the rest is the silent loss this check exists to prevent, one level
+     * further in. An index that cannot be carried completely is not gated at all, keeps its cluster state
+     * entry, and works normally.
+     *
+     * <p>Mirrors the extraction {@code MetadataMappingService} already does for a put-mapping on a gated
+     * index, deliberately: two extractors that disagreed would mean a field gated at creation and refused
+     * on update, or the reverse.
+     */
+    static Map<String, String> simpleFieldsOrNull(IndexMetadata indexMetadata) {
+        MappingMetadata mapping = indexMetadata.mapping();
+        if (mapping == null) {
+            return Map.of();
+        }
+        Object properties = mapping.sourceAsMap().get("properties");
+        if (properties instanceof Map == false) {
+            // A mapping with no properties at all carries nothing, so there is nothing to lose.
+            return Map.of();
+        }
+        Map<String, String> fields = new HashMap<>();
+        for (Map.Entry<?, ?> property : ((Map<?, ?>) properties).entrySet()) {
+            Object definition = property.getValue();
+            if (definition instanceof Map == false) {
+                return null;
+            }
+            Map<?, ?> asMap = (Map<?, ?>) definition;
+            Object type = asMap.get("type");
+            if (type == null || asMap.containsKey("properties")) {
+                // No declared type, or an object with its own properties. Either way the store's flat
+                // name-to-type map has nowhere to put it.
+                return null;
+            }
+            fields.put(String.valueOf(property.getKey()), String.valueOf(type));
+        }
+        return fields;
     }
 
     /** Whether gating this index would lose nothing. */

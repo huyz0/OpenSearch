@@ -2112,6 +2112,25 @@ public class MetadataCreateIndexService {
             // The cluster state thread does not wait here. It hands the future to the task, which defers
             // its response until the write completes, which is what keeps W4's deadlock closed: the thread
             // that would have to supply a cluster state for this write to route is this one.
+            // The mapping first, because the descriptor is the acknowledgement. A descriptor carries a
+            // mapping generation and not a mapping, so declared fields have to reach MappingGenerationStore
+            // or they are lost -- which is what DescriptorRepresentable had to refuse the whole index for.
+            // Writing them here is what lets it stop refusing.
+            //
+            // Ordered before the descriptor write deliberately. If this fails, the creation fails and no
+            // descriptor exists, so neither does the index. The reverse order would leave a name that
+            // resolves to an index whose declared fields are missing, which is the same silent loss wearing
+            // a different shape.
+            //
+            // Blocking is safe here. Every path reaching this branch came through createGatedIndex on
+            // GENERIC: the admission check reads index.serverless_storage.enabled from the request settings
+            // and that setting is also a precondition of gating, so a gated creation is never on the cluster
+            // state thread. An index admitted and then refused by the gate falls back to the ordinary path
+            // and never reaches this line.
+            java.util.Map<String, String> declaredFields = DescriptorRepresentable.simpleFieldsOrNull(indexMetadata);
+            if (declaredFields != null && declaredFields.isEmpty() == false) {
+                MappingGenerationStore.updateMapping(indexMetadata.getIndexUUID(), declaredFields);
+            }
             java.util.concurrent.CompletableFuture<Boolean> write = IndexDescriptorPublisher.createGated(indexMetadata);
             if (write == null) {
                 throw new IllegalStateException(
