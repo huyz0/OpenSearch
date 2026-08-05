@@ -284,6 +284,29 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
         Setting.Property.NodeScope
     );
 
+    /**
+     * How long a gated index this node opened on demand may sit untouched before it is closed again.
+     *
+     * <p>Zero disables eviction, restoring the previous behaviour. That behaviour is the defect this
+     * setting exists for: {@link #removeIndices} skips every gated index and {@link #openedOnDemand}
+     * shrinks only on deletion or shutdown, so a node's resident set counts every distinct tenant it has
+     * ever served rather than the ones it is serving. Measured at 150,888 bytes of heap and 3 file
+     * descriptors per open index, a node reaches roughly 110,000 of them at a 31 GiB heap, and at a hundred
+     * million tenants nothing else stops it getting there. The design's whole premise is that residency
+     * tracks the working set; without this it tracks the population with a delay.
+     *
+     * <p>Thirty minutes rather than something shorter because the cost of being wrong is asymmetric.
+     * Evicting a shard about to be used again costs one cold start -- a descriptor read and a shard open.
+     * Not evicting costs heap that is never given back. Thirty minutes keeps an hourly reporting job's
+     * shards warm while stopping a day of one-off tenants accumulating.
+     */
+    public static final Setting<TimeValue> GATED_SHARD_IDLE_EVICTION_SETTING = Setting.timeSetting(
+        "indices.gated.idle_eviction_after",
+        TimeValue.timeValueMinutes(30),
+        TimeValue.ZERO,
+        Setting.Property.NodeScope
+    );
+
     private volatile Scheduler.Cancellable gatedSweep;
 
     @Override
@@ -296,8 +319,18 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
             // on a timer; this lets whatever already knows say so at once. Both close a shard the same way.
             GatedIndexRelease.register(index -> releaseGatedIndex(index, "gated index was deleted"));
             TimeValue interval = GATED_SHARD_SWEEP_INTERVAL_SETTING.get(settings);
+            TimeValue idleAfter = GATED_SHARD_IDLE_EVICTION_SETTING.get(settings);
             if (interval.millis() > 0) {
-                gatedSweep = threadPool.scheduleWithFixedDelay(this::sweepDeletedGatedIndices, interval, ThreadPool.Names.GENERIC);
+                // Both halves of the on-demand lifecycle on one timer rather than two. They walk the same
+                // set, they close through the same method, and running them apart would mean two schedules
+                // to reason about for one question -- which of the indices this node opened should it still
+                // be holding.
+                gatedSweep = threadPool.scheduleWithFixedDelay(() -> {
+                    sweepDeletedGatedIndices();
+                    if (idleAfter.millis() > 0) {
+                        evictIdleGatedIndices(idleAfter);
+                    }
+                }, interval, ThreadPool.Names.GENERIC);
             }
         }
     }
@@ -372,6 +405,58 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
             // Giving up atomicity between the claim and the close is safe for the same reason closing is:
             // if an on-demand open races in and rebuilds the shard, that costs a cold start, not an index.
             releaseGatedIndex(index, "gated index no longer has a descriptor");
+        }
+    }
+
+    /**
+     * Closes gated indices this node opened on demand that nothing has touched for long enough.
+     *
+     * <p>The other half of the on-demand lifecycle, and the half that decides whether this design works at
+     * scale. {@link #sweepDeletedGatedIndices} answers "is this index gone", which bounds nothing: a node
+     * serving live tenants keeps every one of them open forever, so its resident set is the number of
+     * distinct tenants it has ever seen. See {@link #GATED_SHARD_IDLE_EVICTION_SETTING} for what that costs.
+     *
+     * <p><b>Every shard of the index, not any.</b> An index is evicted only when all of its shards are cold,
+     * because closing the index closes all of them, and one busy shard is reason enough to keep the whole
+     * thing. Reading it the other way round would evict an index that is actively serving on one shard and
+     * quiet on the rest, which is the ordinary shape of a skewed tenant rather than an unusual one.
+     *
+     * <p><b>An index with no shards on this node is left alone rather than treated as maximally idle.</b>
+     * That state means the on-demand opener is mid-flight, or every shard has already gone, and evicting on
+     * it would race the opener that is building the shard this very moment.
+     *
+     * <p>Closing flushes, so this does not lose writes: {@code IndexService.closeShard} passes
+     * {@code flushEngine = deleted == false && closed}, and an eviction is a close without a delete.
+     */
+    private void evictIdleGatedIndices(TimeValue idleAfter) {
+        if (openedOnDemand.isEmpty()) {
+            return;
+        }
+        final long idleAfterMillis = idleAfter.millis();
+        for (Index index : List.copyOf(openedOnDemand)) {
+            AllocatedIndex<? extends Shard> indexService = indicesService.indexService(index);
+            if (indexService == null) {
+                continue;
+            }
+            boolean anyShard = false;
+            boolean allCold = true;
+            // The index has been idle for as long as its *most recently used* shard, which is the minimum
+            // of the per-shard figures rather than the maximum. Reporting the maximum would claim an index
+            // had been quiet for as long as its stalest shard while another was still being written.
+            long indexIdleMillis = Long.MAX_VALUE;
+            for (Shard shard : indexService) {
+                anyShard = true;
+                long idle = shard.idleMillis();
+                indexIdleMillis = Math.min(indexIdleMillis, idle);
+                if (idle < idleAfterMillis) {
+                    allCold = false;
+                    break;
+                }
+            }
+            if (anyShard && allCold) {
+                logger.debug("{} evicting gated index idle for {} ms", index, indexIdleMillis);
+                releaseGatedIndex(index, "gated index idle for " + indexIdleMillis + " ms");
+            }
         }
     }
 
@@ -1510,6 +1595,19 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
          * Returns the recovery state associated with this shard.
          */
         RecoveryState recoveryState();
+
+        /**
+         * How long since anything read from or wrote to this shard, in milliseconds.
+         *
+         * <p>On the interface rather than reached through a cast because the only caller,
+         * {@link IndicesClusterStateService#evictIdleGatedIndices}, sees shards through this type and a cast
+         * would make a test double impossible to write. Defaulted to zero -- never idle -- so an
+         * implementation that cannot answer keeps its shards rather than losing them to a default that
+         * happened to look cold.
+         */
+        default long idleMillis() {
+            return 0L;
+        }
 
         /**
          * Updates the shard state based on an incoming cluster state:

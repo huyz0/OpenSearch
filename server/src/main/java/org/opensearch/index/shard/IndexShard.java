@@ -3627,6 +3627,43 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         return active.get();
     }
 
+    /**
+     * How long since anything read from or wrote to this shard, in milliseconds.
+     *
+     * <p>Added for gated indices, whose shards are opened by a request arriving rather than by a cluster
+     * state diff and are therefore closed by nothing. A node that has served a hundred thousand tenants
+     * holds a hundred thousand open shards, which is the ceiling the serverless design exists to avoid, so
+     * something has to be able to ask which of them have gone cold.
+     *
+     * <p><b>The minimum of the two figures, not the maximum.</b> A shard is idle only while <em>both</em>
+     * reads and writes have been quiet, so what matters is the time since the most recent activity of
+     * either kind, and that is the smaller elapsed time. Taking the maximum would report a shard as idle
+     * because nobody had searched it, while it was being written to continuously.
+     *
+     * <p>{@link #isActive} does not answer this: it is driven by {@link #flushOnIdle} from the indexing
+     * memory controller and so reflects writes alone, and a shard being searched hard with no writes is not
+     * idle by any definition worth evicting on.
+     *
+     * <p><b>A shard with no indexer -- still recovering, or already closing -- reports zero, meaning not
+     * idle.</b> The first version returned the search figure alone here, which is not merely imprecise but
+     * backwards: {@code lastSearcherAccess} is zero until something searches, so a shard that had never been
+     * searched reported the entire uptime of the node as its idle time. A recovering shard would therefore
+     * look maximally cold and be evicted before it finished opening. Zero is the safe direction, and it is
+     * the same answer {@link IndicesClusterStateService.Shard#idleMillis} defaults to for the same reason.
+     *
+     * <p>An open shard that has never been searched is not affected by that: its indexer's last write time
+     * is set when the engine starts, so the figure is time since the shard opened, which is exactly right.
+     */
+    public long idleMillis() {
+        final Indexer indexer = getIndexerOrNull();
+        if (indexer == null) {
+            return 0L;
+        }
+        final long sinceSearch = threadPool.relativeTimeInMillis() - lastSearcherAccess.get();
+        final long sinceWrite = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - indexer.getLastWriteNanos());
+        return Math.min(sinceSearch, sinceWrite);
+    }
+
     public ShardPath shardPath() {
         return path;
     }

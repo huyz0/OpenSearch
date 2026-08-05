@@ -567,6 +567,7 @@ public final class ClusterSettings extends AbstractScopedSettings {
                 HunspellService.HUNSPELL_DICTIONARY_OPTIONS,
                 IndicesStore.INDICES_STORE_DELETE_SHARD_TIMEOUT,
                 org.opensearch.indices.cluster.IndicesClusterStateService.GATED_SHARD_SWEEP_INTERVAL_SETTING,
+                org.opensearch.indices.cluster.IndicesClusterStateService.GATED_SHARD_IDLE_EVICTION_SETTING,
                 Environment.PATH_DATA_SETTING,
                 Environment.PATH_HOME_SETTING,
                 Environment.PATH_LOGS_SETTING,
