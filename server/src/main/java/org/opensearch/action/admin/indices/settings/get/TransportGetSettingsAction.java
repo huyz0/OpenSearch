@@ -38,6 +38,7 @@ import org.opensearch.action.support.clustermanager.TransportClusterManagerNodeR
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.block.ClusterBlockLevel;
+import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.ResolvedIndices;
@@ -120,7 +121,15 @@ public class TransportGetSettingsAction extends TransportClusterManagerNodeReadA
         final Map<String, Settings> indexToSettingsBuilder = new HashMap<>();
         final Map<String, Settings> indexToDefaultSettingsBuilder = new HashMap<>();
         for (Index concreteIndex : concreteIndices) {
-            IndexMetadata indexMetadata = state.getMetadata().index(concreteIndex);
+            // Through the descriptor seam rather than straight at the metadata map. A gated index has no
+            // metadata entry by design, so the map alone answers null for every one of them and the
+            // continue below drops it -- silently, because a name that resolved to nothing is
+            // indistinguishable in the response from a name nobody asked about.
+            //
+            // GatedPopulationSoakIT measured what that looks like at population: 50,000 gated names looked
+            // up, 0 resolved, 0 failures. An empty settings map reads exactly like a correct answer for an
+            // index that has no settings, which is why it survived this long unnoticed.
+            IndexMetadata indexMetadata = AbsentIndexDescriptorSuppliers.metadataOrDescriptor(state.getMetadata(), concreteIndex);
             if (indexMetadata == null) {
                 continue;
             }
