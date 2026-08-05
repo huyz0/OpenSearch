@@ -14,6 +14,13 @@ what the measurements say and what remains to build.
 The short version: goal 3 is reachable, the remaining work is well-scoped, and the thing that makes it
 work is that goals 1 and 2 already removed the constraints that would otherwise block it.
 
+**Read the dates on the evidence.** This document was written when the metadata plane was a design with
+spikes behind it. Most of it is now built, and two of its central proposals were replaced rather than
+implemented: the name index tier was deleted, and the descriptor system index it was meant to unblock was
+removed without it. Sections describing measurements are kept as measurements; sections describing plans
+have been rewritten to say what happened. A design document that quietly keeps recommending work that was
+already abandoned is worse than no document, because it reads as current.
+
 ## The constraint that shapes everything
 
 OpenSearch keeps a description of every index in memory on every node, and places every shard through a
@@ -106,21 +113,21 @@ to a millisecond search. What matters is that the allocator must do a superlinea
 computed placement never does one. The pass S6's curve says is impossible is not made faster. It is never
 executed.
 
-### The global name index fits on one node
+### The global name index was measured, built, and then deleted
 
-`NameIndexSpike`, 2M names sampled:
+`NameIndexSpike` measured 2M names at 45.0 B each, so 4.2 GiB at 100M, with prefix resolution as a binary
+search plus a forward scan: 3.2 ms for a wildcard returning 65,536 indices, 9.2 us for one returning none.
+It was the highest-risk item in the design, because wildcards are inherently global and the alternatives
+were scattering every wildcard to every partition or restricting the query language.
 
-| representation | per name | at 100M |
-|---|---|---|
-| `HashMap<String, byte[]>` | 145.5 B | 13.6 GiB |
-| sorted name blob + offsets, raw UUIDs, state byte | **45.0 B** | **4.2 GiB** |
+**None of that is in the system.** S5 deleted the tier and S8 removed the descriptor system index without
+it, because a wildcard turned out to be answerable from one bounded `ListObjectsV2` against the descriptor
+prefix with a `maxKeys` cap. That is a single request whose cost is set by the cap rather than by the
+population, which is what the tier existed to provide, and it needs no second copy of the name set to keep
+consistent.
 
-Prefix resolution is a binary search plus a forward scan, so cost tracks matches rather than index count:
-3.2 ms for a wildcard returning 65,536 indices, 9.2 us for one returning none.
-
-This was the highest-risk item in the design, because wildcards are inherently global and the fallbacks
-were scattering every wildcard to every partition or restricting the query language. Neither is needed.
-At 4.2 GiB the name tier is replicated for availability rather than sharded for capacity.
+The measurements are kept because they are true and because they record what the alternative would have
+cost. They are not a description of anything running.
 
 ## The architecture
 
@@ -130,12 +137,13 @@ At 4.2 GiB the name tier is replicated for availability rather than sharded for 
       [ LB, consistent hash on index ]        Envoy maglev / NGINX ketama / HAProxy
                    |
       [ coordinating-only nodes ]             descriptor cache, request resolution
+                   |                          wildcards: one bounded LIST, capped
            |                  |
-   [ name index tier ]   [ writer nodes ]  [ search nodes ]
-    4.2 GiB, replicated   single-owner      top-K candidates
-    wildcards, aliases    lease-fenced      chosen by ARS
-                              |                  |
-                    [ object storage: segments, manifests, WAL, shard heads ]
+      [ writer nodes ]   [ search nodes ]
+       single-owner       top-K candidates
+       lease-fenced       chosen by ARS
+              |                  |
+     [ object storage: descriptors, tombstones, segments, manifests, WAL, shard heads ]
 ```
 
 **Routing is hash-derived at two levels, for two different reasons.**
@@ -169,42 +177,62 @@ no such constraint, which is exactly why top-K applies to them and where the cac
 - Routing absence tolerated by core: an index can be in metadata and absent from the routing table.
 - Cache affinity recording, and an allocator fast path that uses it.
 
-**Designed and measured, not built.**
+**Built since this document was first written.**
 
-- Computed placement replacing the allocator for serverless indices. Measured optimal; the code change
-  is to make `IndexRoutingTable` derived and lazy per index rather than stored and published, reusing the
-  holder seam C5 introduced for `IndexMetadata`.
-- The name index tier. Measured at 4.2 GiB with microsecond prefix resolution; no implementation exists.
-- Hash routing at the LB. Configuration rather than code, but the resolve-and-forward hop for
-  multi-index requests (`_bulk`, `_msearch`, wildcards) does need building.
+- Gated indices: an index with no cluster state entry at all, its record a descriptor in object storage.
+  Creation is one conditional PUT, resolution one GET, deletion a tombstone PUT, and a wildcard one
+  bounded `ListObjectsV2`. The descriptor system index that used to back it is gone.
+- Computed placement, installed and reachable. A gated index publishes no routing entry and every node
+  derives the same answer from the node list.
+- Admission off the cluster state update thread, for both creation and deletion. Creation went from 1,194
+  to 10,505 per second at concurrency 16, deletion from 407 to 646 in a controlled A/B.
+- On-demand shard opening, and idle eviction to close the loop: a node opens a gated shard because a
+  request arrived and gives it back when nothing has touched it, so residency tracks the working set.
+
+**Measured, with the numbers that matter.**
+
+| | |
+|---|---|
+| heap per open gated index | 150,888 B |
+| file descriptors per open gated index | 3.0 |
+| open gated indices per node, 31 GiB heap, half to residency | ~110,000 |
+| creates per second, one 20-core box, concurrency 16 | 10,505 |
+| deletes per second, same | 646 |
 
 **Unknown, and honestly so.**
 
+- How far idle eviction lags under CPU pressure. Expected residency is arrival rate times the idle
+  window and a quiet run measures exactly that; a run on a loaded box measured seven times higher. The
+  sweep runs on `GENERIC` and closing an index flushes, so eviction competes with the traffic that
+  caused it, which is the wrong way round.
+- Create-time mappings. A descriptor carries a mapping generation, not a mapping, so an index that
+  declares one is refused rather than gated. Until that is carried into the mapping store, a deployment
+  that gives every tenant an explicit mapping gets no gated indices at all.
+- `.opensearch-index-mappings` is a second system index. One shared index rather than one per tenant, so
+  far cheaper than what was removed, but a fixed-geometry funnel on the mapping write path.
 - Cluster-state publication latency against cluster size, which decides whether wake and sleep need
-  batching the way create-index did in C7. Estimated at 50-200 ms; not measured.
+  batching. Estimated at 50-200 ms; not measured.
 - Whether ARS's latency signal is a good enough proxy for cache warmth, or whether it oscillates and
   needs the direct signal from `ReaderCacheAffinityRecorder` blended in.
-- Leading wildcards (`*-logs`) degenerate to a full scan of the name index and need either a
-  reversed-name structure or an explicit restriction.
-- Alias resolution fan-out, unmeasured.
-- Name index updates: the compact form is built sorted and does not support insertion, so index creation
-  needs periodic rebuild plus an overlay of recent changes, or a different structure.
+- Leading wildcards (`*-logs`) cannot be served by a prefix listing and need either a reversed keyspace
+  or an explicit restriction.
+- Alias resolution fan-out, unmeasured. A gated index may carry no alias at all today.
 - Hot-tenant skew. A hash cannot know one tenant takes a thousand times the traffic. K=3 gives room to
   choose rather than solving it.
 
 ## Order of work
 
-1. **Name index tier.** Highest risk retired, no dependencies, and it unblocks wildcards for everything
-   else. Build the compact structure, the update path, and the replicated service around it.
-2. **Resolve-and-forward hop.** Small, no core changes, makes multi-index requests work under hash
+1. **Bound eviction under load.** The residency ceiling is the whole argument for reaching ten billion
+   shards, and it currently weakens exactly when a node is busiest. Decide between a dedicated thread, a
+   work budget per pass, and eviction driven by memory pressure rather than a timer.
+2. **Carry create-time mappings into the mapping store**, so gating is usable by the deployments it was
+   designed for.
+3. **Resolve-and-forward hop.** Small, no core changes, makes multi-index requests work under hash
    routing. Lets the LB configuration ship.
-3. **Computed lazy routing table.** The large one. Apply C5's holder pattern to `IndexRoutingTable` so
-   it is derived from (nodes, descriptor, hash) on first access per index rather than published.
-4. **Pre-warm before rotation.** Promoted from optional. Under computed placement every large scale
-   event puts some shards on cold nodes, and the 12.4% figure at fleet-doubling is the number to design
-   against.
-5. **Manifest sharding aligned with the routing hash.** C3b and C4, with the shard function matched to
-   the coordinator hash so a coordinator warms its whole partition in one read.
+4. **Pre-warm before rotation.** Under computed placement every large scale event puts some shards on
+   cold nodes, and the 12.4% figure at fleet-doubling is the number to design against.
+5. **Manifest sharding aligned with the routing hash**, so a coordinator warms its whole partition in one
+   read.
 6. **Publication latency measurement**, and wake/sleep batching only if it confirms the need.
 
 ## The one decision this does not make

@@ -1794,20 +1794,6 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         // constructor-injected with it and reach blobContainerForDirectoryFactory -- the same
         // resolution ServerlessStorageLazyDirectoryFactory already depends on, just handed to a
         // different consumer via a different injection path (Guice component vs. direct reference).
-        // The name index tier. Shipped disabled, as C5 and C6 were: it answers questions core already
-        // answers, so running both is pure cost until the switchover. Registered as a cluster state
-        // listener so a node's copy tracks index creates and deletes without anything else having to
-        // remember to update it.
-        //
-        // G3. The checkpoint store had no caller, so every node rebuilt the whole name set on every start
-        // however large the population, which is what A16 chose checkpointing to avoid. It is resolved here
-        // and handed to the service, which loads the newest checkpoint in its constructor: a tier that
-        // filled in lazily would answer a wildcard arriving early with an empty result, and an empty result
-        // reads as a correct answer rather than an unfinished one.
-        //
-        // A store that cannot be resolved is not fatal. DescriptorEnumerator rebuilds the tier from the
-        // object store, which is what keeps a checkpoint an optimisation rather than a second source of
-        // truth, so failing here costs a slower start and nothing else.
         // Computed placement. Installing the supplier is the whole of the wiring: a serverless index
         // publishes no routing entry and each node fills the gap locally, so there is nothing to
         // subscribe to and nothing to keep in sync.
