@@ -92,6 +92,24 @@ public final class DescriptorRepresentable {
                 + "IndexDescriptor#toIndexMetadata drops it, so the index would be hidden from wildcards and "
                 + "visible to everything else";
         }
+        // A descriptor carries a mappingGeneration, not a mapping. Mappings live in MappingGenerationStore,
+        // IndexDescriptor#from does not copy them, and nothing writes them there at creation -- so an index
+        // created with an explicit mapping had it parsed, validated, built into this very IndexMetadata, and
+        // then dropped when the descriptor was written.
+        //
+        // Worse than simply losing it: the creation was acknowledged, nothing failed, and the first document
+        // to arrive inferred the fields again from its own values. A tenant that declared a field as a
+        // keyword and then indexed a number got a long, silently, having been told its mapping was accepted.
+        //
+        // This is a refusal rather than a fix, and the difference is worth stating. Carrying create-time
+        // mappings into MappingGenerationStore is what would make gating work with them; until that exists a
+        // deployment giving every tenant an explicit mapping gets no gated indices at all, which is the main
+        // use case this design is for. Refusing is what stops data being lost while that is built.
+        if (indexMetadata.mapping() != null) {
+            return "index declares a mapping, which a descriptor cannot carry: a descriptor holds a mapping "
+                + "generation while the mapping itself lives in the mapping store, so gating this index "
+                + "would accept the mapping and then discard it";
+        }
         return null;
     }
 
