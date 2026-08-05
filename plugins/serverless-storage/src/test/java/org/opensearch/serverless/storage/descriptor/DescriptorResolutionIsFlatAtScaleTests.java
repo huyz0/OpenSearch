@@ -80,10 +80,7 @@ public class DescriptorResolutionIsFlatAtScaleTests extends OpenSearchTestCase {
 
     private BlobContainer countingContainer() throws Exception {
         counter = new ObjectStoreRequestCounter();
-        return new RequestCountingBlobContainer(
-            new FsBlobStore(1024, createTempDir(), false).blobContainer(BlobPath.cleanPath()),
-            counter
-        );
+        return new RequestCountingBlobContainer(new FsBlobStore(1024, createTempDir(), false).blobContainer(BlobPath.cleanPath()), counter);
     }
 
     private static IndexDescriptor descriptor(String name) {
@@ -199,11 +196,7 @@ public class DescriptorResolutionIsFlatAtScaleTests extends OpenSearchTestCase {
         long atSmall = creationCostAfterPopulating(small);
         long atLarge = creationCostAfterPopulating(POPULATION);
 
-        assertEquals(
-            "creating the " + POPULATION + "th index must cost what creating the " + small + "th did",
-            atSmall,
-            atLarge
-        );
+        assertEquals("creating the " + POPULATION + "th index must cost what creating the " + small + "th did", atSmall, atLarge);
     }
 
     private long creationCostAfterPopulating(int population) throws Exception {

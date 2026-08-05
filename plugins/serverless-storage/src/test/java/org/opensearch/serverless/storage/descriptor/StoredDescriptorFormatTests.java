@@ -152,6 +152,9 @@ public class StoredDescriptorFormatTests extends OpenSearchTestCase {
 
     /** Truncated or foreign bytes are refused too, rather than read as a descriptor of some shape. */
     public void testTooShortToHoldAMarkerIsRefused() {
-        expectThrows(IOException.class, () -> BlobDescriptorBackend.decode(new org.opensearch.core.common.bytes.BytesArray(new byte[] { 1, 2 })));
+        expectThrows(
+            IOException.class,
+            () -> BlobDescriptorBackend.decode(new org.opensearch.core.common.bytes.BytesArray(new byte[] { 1, 2 }))
+        );
     }
 }

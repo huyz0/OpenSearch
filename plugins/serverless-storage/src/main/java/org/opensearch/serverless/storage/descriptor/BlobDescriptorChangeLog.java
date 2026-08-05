@@ -218,7 +218,8 @@ public final class BlobDescriptorChangeLog {
      * "everything after key K" the way it could with an ordered name, so it has to name the individual
      * entries it has seen.
      */
-    public record LoggedChange(String bucket, String key, DescriptorChange change) {}
+    public record LoggedChange(String bucket, String key, DescriptorChange change) {
+    }
 
     /**
      * Everything from {@code fromBucket} onward except the entries in {@code alreadyConsumed}.

@@ -111,10 +111,7 @@ public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.Se
             // A gated delete tells no node anything, so the shard it opened on demand is reclaimed by a
             // sweep. The production default is a minute; a second here so a test does not spend one waiting
             // for a reclamation whose latency is not what it is testing.
-            .put(
-                org.opensearch.indices.cluster.IndicesClusterStateService.GATED_SHARD_SWEEP_INTERVAL_SETTING.getKey(),
-                "1s"
-            )
+            .put(org.opensearch.indices.cluster.IndicesClusterStateService.GATED_SHARD_SWEEP_INTERVAL_SETTING.getKey(), "1s")
             .build();
     }
 

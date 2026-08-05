@@ -152,8 +152,7 @@ public class ShardCountDimensionTests extends OpenSearchTestCase {
         int hundredShards = serialisedSize(index("tenant-narrow", MAX_SHARDS));
 
         assertEquals(
-            "a hundred shards must cost the same stored bytes as one, or per-index cost is really per-shard "
-                + "cost wearing a disguise",
+            "a hundred shards must cost the same stored bytes as one, or per-index cost is really per-shard " + "cost wearing a disguise",
             oneShard,
             hundredShards
         );

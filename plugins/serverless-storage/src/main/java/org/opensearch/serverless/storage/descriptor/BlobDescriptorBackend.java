@@ -484,9 +484,7 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
             }
             int version = in.readVInt();
             if (version != FORMAT_VERSION) {
-                throw new IOException(
-                    "stored descriptor is format version [" + version + "] and this node reads [" + FORMAT_VERSION + "]"
-                );
+                throw new IOException("stored descriptor is format version [" + version + "] and this node reads [" + FORMAT_VERSION + "]");
             }
             return new IndexDescriptor(in);
         }

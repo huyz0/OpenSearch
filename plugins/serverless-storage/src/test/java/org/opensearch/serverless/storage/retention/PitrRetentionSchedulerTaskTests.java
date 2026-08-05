@@ -137,7 +137,9 @@ public class PitrRetentionSchedulerTaskTests extends OpenSearchTestCase {
             // lands before the final assertion: a stall that outlasts the whole test would let the
             // test pass for the wrong reason, having never observed the tick at all.
             TimeValue stall = TimeValue.timeValueMillis(50);
-            BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(new StallingBlobContainer(newFsBlobContainer(), stall));
+            BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(
+                new StallingBlobContainer(newFsBlobContainer(), stall)
+            );
             DurablePinRegistry pinRegistry = new BlobContainerDurablePinRegistry(newFsBlobContainer());
 
             java.util.concurrent.atomic.AtomicInteger tickCount = new java.util.concurrent.atomic.AtomicInteger();

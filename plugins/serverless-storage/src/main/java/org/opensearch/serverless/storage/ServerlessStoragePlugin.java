@@ -1961,17 +1961,13 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 if (scrubInterval.equals(TimeValue.ZERO) == false) {
                     final long tombstoneRetention = TOMBSTONE_RETENTION_SETTING.get(environment.settings()).millis();
                     final org.opensearch.serverless.storage.descriptor.TombstoneScrubber scrubber =
-                        new org.opensearch.serverless.storage.descriptor.TombstoneScrubber(
-                            path -> {
-                                try {
-                                    return resolveContainerForDescriptors(path, "no blob store for tombstone reclamation");
-                                } catch (IOException e) {
-                                    throw new java.io.UncheckedIOException(e);
-                                }
-                            },
-                            BlobPath.cleanPath().add("descriptors-root"),
-                            System::currentTimeMillis
-                        );
+                        new org.opensearch.serverless.storage.descriptor.TombstoneScrubber(path -> {
+                            try {
+                                return resolveContainerForDescriptors(path, "no blob store for tombstone reclamation");
+                            } catch (IOException e) {
+                                throw new java.io.UncheckedIOException(e);
+                            }
+                        }, BlobPath.cleanPath().add("descriptors-root"), System::currentTimeMillis);
                     threadPool.scheduleWithFixedDelay(() -> {
                         if (clusterService.state().nodes().isLocalNodeElectedClusterManager()) {
                             scrubber.scrubOnce(tombstoneRetention);

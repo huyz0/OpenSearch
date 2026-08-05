@@ -187,7 +187,9 @@ public class MetadataIndexStateService {
         if (gated.isEmpty() == false) {
             listener.onFailure(
                 new UnsupportedOperationException(
-                    "cannot close serverless " + names(gated) + ": a serverless index has no cluster state entry, and closing one is not implemented"
+                    "cannot close serverless "
+                        + names(gated)
+                        + ": a serverless index has no cluster state entry, and closing one is not implemented"
                 )
             );
             return;
@@ -956,7 +958,9 @@ public class MetadataIndexStateService {
         if (gatedToOpen.isEmpty() == false) {
             listener.onFailure(
                 new UnsupportedOperationException(
-                    "cannot open serverless " + names(gatedToOpen) + ": a serverless index has no cluster state entry, and opening one is not implemented"
+                    "cannot open serverless "
+                        + names(gatedToOpen)
+                        + ": a serverless index has no cluster state entry, and opening one is not implemented"
                 )
             );
             return;

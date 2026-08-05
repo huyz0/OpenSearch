@@ -96,8 +96,7 @@ public class DescriptorChangeTailerTests extends OpenSearchTestCase {
 
         IndexDescriptor after = readerBackend.get("tenant-x");
         assertTrue(
-            "after tailing the delete, the cached live descriptor must be gone rather than served until the "
-                + "freshness window expires",
+            "after tailing the delete, the cached live descriptor must be gone rather than served until the " + "freshness window expires",
             after == null || after.exists() == false
         );
     }

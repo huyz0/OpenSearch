@@ -553,11 +553,7 @@ public final class DescriptorStore implements DescriptorBackend, DescriptorPrefi
         ensureIndexExistsAsync().whenComplete((ignored, bootstrapFailure) -> submitTombstoneNow(tombstone, attempt, whenDurable));
     }
 
-    private void submitTombstoneNow(
-        IndexDescriptor tombstone,
-        int attempt,
-        org.opensearch.core.action.ActionListener<Void> whenDurable
-    ) {
+    private void submitTombstoneNow(IndexDescriptor tombstone, int attempt, org.opensearch.core.action.ActionListener<Void> whenDurable) {
         try {
             logger.debug("recording tombstone for [{}], attempt [{}]", tombstone.name(), attempt);
             client.index(

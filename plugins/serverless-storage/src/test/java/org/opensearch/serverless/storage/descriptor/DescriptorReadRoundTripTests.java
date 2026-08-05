@@ -76,11 +76,7 @@ public class DescriptorReadRoundTripTests extends OpenSearchTestCase {
             assertNotNull(backend.get("tenant-hot"));
         }
 
-        assertEquals(
-            "twelve resolutions of one name must cost one read, not twelve",
-            1,
-            counter.getCount() - afterCreate
-        );
+        assertEquals("twelve resolutions of one name must cost one read, not twelve", 1, counter.getCount() - afterCreate);
     }
 
     /**
@@ -138,8 +134,7 @@ public class DescriptorReadRoundTripTests extends OpenSearchTestCase {
 
         IndexDescriptor after = backend.get("tenant-doomed");
         assertTrue(
-            "a deleted index still resolving as live would accept a write against a shard the cluster no "
-                + "longer believes in",
+            "a deleted index still resolving as live would accept a write against a shard the cluster no " + "longer believes in",
             after == null || after.exists() == false
         );
     }

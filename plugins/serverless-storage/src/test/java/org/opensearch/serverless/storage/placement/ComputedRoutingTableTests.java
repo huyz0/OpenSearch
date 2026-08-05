@@ -281,7 +281,10 @@ public class ComputedRoutingTableTests extends OpenSearchTestCase {
 
         assertTrue(
             "warmth must put more search replicas on nodes that already hold the data than ignoring history "
-                + "does, but placed " + searchReplicasOn(warm, metadata, before) + " against " + searchReplicasOn(cold, metadata, before),
+                + "does, but placed "
+                + searchReplicasOn(warm, metadata, before)
+                + " against "
+                + searchReplicasOn(cold, metadata, before),
             searchReplicasOn(warm, metadata, before) > searchReplicasOn(cold, metadata, before)
         );
     }

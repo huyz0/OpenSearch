@@ -111,7 +111,10 @@ public class CoreIsInertWithoutAPluginTests extends OpenSearchTestCase {
 
         assertNull("no descriptor can be supplied when nothing supplies descriptors", AbsentIndexDescriptorSuppliers.supply("absent"));
         assertTrue(AbsentIndexDescriptorSuppliers.exists(metadata, "present"));
-        assertFalse("an absent name must stay absent rather than being looked for elsewhere", AbsentIndexDescriptorSuppliers.exists(metadata, "absent"));
+        assertFalse(
+            "an absent name must stay absent rather than being looked for elsewhere",
+            AbsentIndexDescriptorSuppliers.exists(metadata, "absent")
+        );
 
         assertNotNull(AbsentIndexDescriptorSuppliers.metadataOrDescriptor(metadata, metadata.index("present").getIndex()));
         assertNull(
