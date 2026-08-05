@@ -308,6 +308,48 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
         Setting.Property.NodeScope
     );
 
+    /**
+     * The most gated indices this node will hold open at once, or zero to derive one from the heap.
+     *
+     * <p>The idle sweep bounds residency only while it can keep up, and T10 measured that it cannot.
+     * Draining a hundred indices takes 5.1 seconds on a quiet node and 66.7 under twenty busy threads --
+     * 19.6 per second against 1.5, a thirteenfold collapse. It is not the sweep interval, since the sweep
+     * runs throughout, and not queue depth, since {@code GENERIC} is a scaling pool. It is CPU: the threads
+     * exist and are not scheduled, and closing an index flushes, so eviction competes for exactly the
+     * resource whose scarcity caused the backlog.
+     *
+     * <p>A timer-driven bound is therefore weakest when the node is busiest, which is the wrong direction
+     * for the property this whole design rests on. A cap enforced where an index is <em>opened</em> does not
+     * depend on scheduling at all: the work happens on the request that would breach it, so the ceiling
+     * holds whatever the background threads are managing.
+     *
+     * <p><b>The default is derived rather than chosen.</b> {@code GatedResidencySoakIT} measured 150,888
+     * bytes of heap per open gated index, flat from 100 of them to 11,470, so half the heap divided by that
+     * is a number with a measurement behind it rather than a guess -- about 110,000 on a 31 GiB node. Half
+     * rather than all, because the other half is what the node is for.
+     */
+    public static final Setting<Integer> GATED_MAX_OPEN_SETTING = Setting.intSetting(
+        "indices.gated.max_open",
+        0,
+        0,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * Heap cost of one open gated index, measured rather than estimated.
+     *
+     * <p>{@code GatedResidencySoakIT}: 150,888 B per index, holding flat across two orders of magnitude of
+     * population. Used only to derive a default cap, so being wrong here puts the ceiling in the wrong place
+     * rather than breaking anything, and an operator who has measured their own workload should set the
+     * setting instead.
+     */
+    static final long MEASURED_BYTES_PER_OPEN_GATED_INDEX = 150_888L;
+
+    /** How many resident indices to sample when choosing one to evict. See {@link #evictColdestOfASample}. */
+    static final int EVICTION_SAMPLE_SIZE = 32;
+
+    private volatile int gatedMaxOpen;
+
     private volatile Scheduler.Cancellable gatedSweep;
 
     @Override
@@ -319,6 +361,8 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
             // The push half of the same lifecycle. The sweep below re-derives which gated indices are gone
             // on a timer; this lets whatever already knows say so at once. Both close a shard the same way.
             GatedIndexRelease.register(index -> releaseGatedIndex(index, "gated index was deleted"));
+            gatedMaxOpen = resolveGatedMaxOpen();
+            logger.debug("gated indices capped at {} open on this node", gatedMaxOpen);
             TimeValue interval = GATED_SHARD_SWEEP_INTERVAL_SETTING.get(settings);
             TimeValue idleAfter = GATED_SHARD_IDLE_EVICTION_SETTING.get(settings);
             if (interval.millis() > 0) {
@@ -425,6 +469,73 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
      * <p>Closing flushes, so this does not lose writes: {@code IndexService.closeShard} passes
      * {@code flushEngine = deleted == false && closed}, and an eviction is a close without a delete.
      */
+    /**
+     * The ceiling this node enforces, resolving zero to a figure derived from the heap.
+     *
+     * <p>Computed once at start rather than per open, since it depends on nothing that changes.
+     */
+    private int resolveGatedMaxOpen() {
+        int configured = GATED_MAX_OPEN_SETTING.get(settings);
+        if (configured > 0) {
+            return configured;
+        }
+        long derived = (Runtime.getRuntime().maxMemory() / 2) / MEASURED_BYTES_PER_OPEN_GATED_INDEX;
+        // Clamped so a tiny heap does not produce a cap of nought or one, which would evict an index the
+        // request that opened it is about to use, and so a very large heap does not overflow an int.
+        return (int) Math.max(16, Math.min(Integer.MAX_VALUE, derived));
+    }
+
+    /**
+     * Closes gated indices until this node is below its ceiling, or gives up trying.
+     *
+     * <p>Called on the path that opens an index, which is the point of it. The idle sweep closes what has
+     * gone cold and depends on getting CPU to do so; this closes what has to go for the ceiling to hold, on
+     * the thread of the request that would otherwise breach it. The cost lands on the request that caused
+     * the growth rather than on an unrelated one, and it lands whether or not anything else is scheduled.
+     *
+     * <p><b>Sampled rather than exhaustive.</b> Choosing the genuinely coldest index means comparing every
+     * resident one, which is a scan of up to a hundred thousand entries on a request path. Sampling a few
+     * and evicting the coldest of those is the trade Redis makes for the same reason: the coldest of 32
+     * random entries is close enough to the coldest overall for a policy whose job is bounding a total, and
+     * it costs a fixed amount however large the population.
+     *
+     * <p>Bounded attempts, because the alternative is a request that spins. If sampling keeps choosing
+     * indices that another thread closes first, or every sampled index is busy, this gives up and lets the
+     * open proceed over the ceiling. A cap that is occasionally exceeded is a bound; a request that never
+     * returns is an outage.
+     */
+    private void evictColdestOfASample(int cap) {
+        int attempts = 0;
+        while (openedOnDemand.size() >= cap && attempts < EVICTION_SAMPLE_SIZE) {
+            attempts++;
+            Index coldest = null;
+            long coldestIdle = -1;
+            int sampled = 0;
+            for (Index candidate : openedOnDemand) {
+                AllocatedIndex<? extends Shard> indexService = indicesService.indexService(candidate);
+                if (indexService == null) {
+                    continue;
+                }
+                long idle = Long.MAX_VALUE;
+                for (Shard shard : indexService) {
+                    idle = Math.min(idle, shard.idleMillis());
+                }
+                if (idle != Long.MAX_VALUE && idle > coldestIdle) {
+                    coldestIdle = idle;
+                    coldest = candidate;
+                }
+                if (++sampled >= EVICTION_SAMPLE_SIZE) {
+                    break;
+                }
+            }
+            if (coldest == null) {
+                return;
+            }
+            logger.debug("{} evicting to stay under the gated ceiling of {}, idle for {} ms", coldest, cap, coldestIdle);
+            releaseGatedIndex(coldest, "gated index evicted to stay under the ceiling of " + cap);
+        }
+    }
+
     private void evictIdleGatedIndices(TimeValue idleAfter) {
         if (openedOnDemand.isEmpty()) {
             return;
@@ -888,6 +999,18 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
         }
         if (mine.isEmpty()) {
             return;
+        }
+
+        // Before the lock, because closing an index is slow and this instance's monitor is the one
+        // applyClusterState takes. Holding it across an eviction would stall cluster state application
+        // behind a request, which is the mistake the first version of the deletion sweep made and paid five
+        // suites for.
+        //
+        // Only when this node does not already hold the index: reopening something already resident is not
+        // growth and must not evict anything to make room for what is already there.
+        int cap = gatedMaxOpen;
+        if (cap > 0 && indicesService.indexService(index) == null && openedOnDemand.size() >= cap) {
+            evictColdestOfASample(cap);
         }
 
         List<ShardId> opening = new ArrayList<>();

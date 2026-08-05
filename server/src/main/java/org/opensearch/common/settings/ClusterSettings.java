@@ -568,6 +568,7 @@ public final class ClusterSettings extends AbstractScopedSettings {
                 IndicesStore.INDICES_STORE_DELETE_SHARD_TIMEOUT,
                 org.opensearch.indices.cluster.IndicesClusterStateService.GATED_SHARD_SWEEP_INTERVAL_SETTING,
                 org.opensearch.indices.cluster.IndicesClusterStateService.GATED_SHARD_IDLE_EVICTION_SETTING,
+                org.opensearch.indices.cluster.IndicesClusterStateService.GATED_MAX_OPEN_SETTING,
                 Environment.PATH_DATA_SETTING,
                 Environment.PATH_HOME_SETTING,
                 Environment.PATH_LOGS_SETTING,

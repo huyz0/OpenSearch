@@ -57,6 +57,9 @@ public class GatedIdleEvictionIT extends org.opensearch.serverless.storage.Serve
 
     private static final int TENANTS = 12;
 
+    /** A cap small enough to be breached quickly and large enough that in-flight slack is not the whole test. */
+    private static final int CEILING = 20;
+
     /**
      * Enough tenants that the population is many times the expected resident set.
      *
@@ -276,6 +279,62 @@ public class GatedIdleEvictionIT extends org.opensearch.serverless.storage.Serve
             (100 * peakResident) / PLATEAU_TENANTS,
             IDLE_AFTER.millis() / PACE_MILLIS
         );
+    }
+
+    /**
+     * The ceiling holds even when the sweep cannot keep up, which is the whole reason it exists.
+     *
+     * <p>T10 measured idle eviction collapsing thirteenfold under CPU pressure -- 19.6 indices closed per
+     * second on a quiet node against 1.5 under load -- because the sweep runs on {@code GENERIC} and closing
+     * an index flushes, so it competes for exactly the resource whose scarcity caused the backlog. A bound
+     * that depends on a background task getting scheduled is weakest when the node is busiest.
+     *
+     * <p>So this switches the idle sweep off entirely and leaves only the cap. If residency stays under the
+     * ceiling with nothing sweeping, the ceiling is being enforced where indices are opened rather than
+     * where they are closed, which is the property that does not care about scheduling.
+     *
+     * <p>Disabling the sweep rather than applying CPU pressure is deliberate: pressure makes the sweep slow,
+     * which is a matter of degree and of how busy the machine happens to be. Removing it is the limiting
+     * case, and a bound that survives the limiting case survives everything short of it.
+     */
+    public void testTheCeilingHoldsWithNoSweepAtAll() throws Exception {
+        internalCluster().startClusterManagerOnlyNode();
+        String dataNode = internalCluster().startDataOnlyNode(
+            Settings.builder()
+                // No idle eviction and no sweep: the cap is the only thing left that can bound residency.
+                .put(IndicesClusterStateService.GATED_SHARD_IDLE_EVICTION_SETTING.getKey(), TimeValue.ZERO)
+                .put(IndicesClusterStateService.GATED_SHARD_SWEEP_INTERVAL_SETTING.getKey(), TimeValue.ZERO)
+                .put(IndicesClusterStateService.GATED_MAX_OPEN_SETTING.getKey(), CEILING)
+                .build()
+        );
+        ensureStableCluster(2);
+        installBlobBackedDescriptorPlane();
+
+        IndicesService indices = internalCluster().getInstance(IndicesService.class, dataNode);
+
+        int peak = 0;
+        for (int i = 0; i < CEILING * 3; i++) {
+            String name = String.format(Locale.ROOT, "ceiling-%04d", i);
+            client().admin().indices().create(new CreateIndexRequest(name).settings(gated())).actionGet();
+            client().prepareIndex(name).setId("1").setSource("tenant", name).get();
+            peak = Math.max(peak, gatedOpenCount(indices));
+        }
+
+        logger.warn("ceiling: opened {} with a cap of {}, peak resident {}", CEILING * 3, CEILING, peak);
+
+        // Some slack over the cap, because eviction happens before the open that would breach it and two
+        // opens can be in flight at once. What must not happen is residency tracking the population.
+        assertTrue(
+            "the ceiling of "
+                + CEILING
+                + " was exceeded by more than the in-flight slack: peak "
+                + peak
+                + " of "
+                + (CEILING * 3)
+                + " opened, with no sweep running at all",
+            peak <= CEILING + 8
+        );
+        assertTrue("and indices must actually have been opened for that to mean anything", peak > 0);
     }
 
     private static int gatedOpenCount(IndicesService indices) throws Exception {
