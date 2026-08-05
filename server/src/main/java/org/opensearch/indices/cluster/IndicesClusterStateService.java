@@ -394,16 +394,12 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
             if (descriptorMetadata != null) {
                 continue;
             }
-            // Claimed with an atomic remove, closed without holding this instance's monitor. The first
-            // version wrapped both in synchronized(this) and it cost five previously-passing suites: that
-            // monitor is the one applyClusterState takes, closing a shard is slow, and this runs on GENERIC,
-            // so a sweep would stall cluster state application on its node until it finished. The symptom
-            // was an unrelated index delete returning "not acked", nowhere near this code, only under
-            // whole-suite load, and passing in isolation. It also doubled the suite's wall clock, 6m35s to
-            // 12m37s, which is the part that says this was contention rather than bad luck.
+            // Closed without holding this instance's monitor, and without removing the entry first. See
+            // releaseGatedIndex for both reasons: the monitor is the one applyClusterState takes, and
+            // claiming the index before the close opens a window where removeIndices sees a live index that
+            // is absent from cluster state and unclaimed, which trips its assertion.
             //
-            // Giving up atomicity between the claim and the close is safe for the same reason closing is:
-            // if an on-demand open races in and rebuilds the shard, that costs a cold start, not an index.
+            // A racing on-demand open that rebuilds the shard costs a cold start, not an index.
             releaseGatedIndex(index, "gated index no longer has a descriptor");
         }
     }
@@ -467,26 +463,44 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
      * makes this fast in the common case and the sweep makes it certain in the uncommon one, and both have
      * to close a shard the same way or a shard closed by one route would differ from the other.
      *
-     * <p>Claimed with an atomic remove, closed without holding this instance's monitor. The first version of
-     * the sweep wrapped both in {@code synchronized(this)} and it cost five previously-passing suites: that
-     * monitor is the one {@link #applyClusterState} takes, closing a shard is slow, and this runs on GENERIC,
-     * so it would stall cluster state application on its node until it finished. The symptom was an
-     * unrelated index delete returning "not acked", nowhere near this code, only under whole-suite load, and
-     * passing in isolation. It also doubled the suite's wall clock.
+     * <p>Closed without holding this instance's monitor. The first version of the sweep wrapped the whole
+     * thing in {@code synchronized(this)} and it cost five previously-passing suites: that monitor is the
+     * one {@link #applyClusterState} takes, closing a shard is slow, and this runs on GENERIC, so it would
+     * stall cluster state application on its node until it finished. The symptom was an unrelated index
+     * delete returning "not acked", nowhere near this code, only under whole-suite load, and passing in
+     * isolation. It also doubled the suite's wall clock.
      *
-     * <p>Giving up atomicity between the claim and the close is safe for the same reason closing is: if an
-     * on-demand open races in and rebuilds the shard, that costs a cold start, not an index.
+     * <p><b>The index stays in {@code openedOnDemand} until the close has finished, and the order is
+     * load-bearing.</b> An earlier version claimed the index by removing it from the set first, on the
+     * reasoning that an atomic claim prevents a double close. It does, and {@code removeIndex} is idempotent
+     * anyway, so it was buying nothing -- while opening a window in which {@link #heldOnDemand} answered
+     * false for an index this node still held. A cluster state application landing in that window reaches
+     * {@link #removeIndices}, finds a live index that is absent from the metadata and unclaimed, and trips
+     * its assertion that such an index must have been deleted or the cluster must be new. Neither is true of
+     * one that was never published.
+     *
+     * <p>That was latent for as long as deletion was the only thing that closed a gated index, because a
+     * deleted gated index is rare and the window is short. Idle eviction closes them constantly, and the
+     * assertion fired within a hundred and twenty creations.
+     *
+     * <p>Keeping the entry until afterwards closes the window from both sides: while the close runs
+     * {@code heldOnDemand} is true so {@code removeIndices} skips the index, and once it returns the index
+     * is no longer in {@code indicesService} for the loop to reach at all.
      */
     private void releaseGatedIndex(Index index, String reason) {
-        if (openedOnDemand.remove(index) == false) {
+        if (openedOnDemand.contains(index) == false) {
             return;
         }
         logger.debug("{} closing gated index opened on demand: {}", index, reason);
         try {
             indicesService.removeIndex(index, NO_LONGER_ASSIGNED, reason);
         } catch (Exception e) {
-            logger.warn(() -> new ParameterizedMessage("[{}] could not be closed after its descriptor went away", index), e);
+            // Left in openedOnDemand deliberately, so the next sweep tries again rather than abandoning an
+            // index this node is still holding but no longer tracking.
+            logger.warn(() -> new ParameterizedMessage("[{}] could not be closed", index), e);
+            return;
         }
+        openedOnDemand.remove(index);
     }
 
     @Override

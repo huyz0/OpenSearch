@@ -57,6 +57,12 @@ public class GatedIdleEvictionIT extends org.opensearch.serverless.storage.Serve
 
     private static final int TENANTS = 12;
 
+    /** Enough tenants that the population is several times the expected resident set, and no more. */
+    private static final int PLATEAU_TENANTS = 120;
+
+    /** A pause between creations, so the run spans several idle windows instead of fitting inside one. */
+    private static final long PACE_MILLIS = 40;
+
     /** How long a shard may be untouched before this cluster evicts it. Short, because the test waits for it. */
     private static final TimeValue IDLE_AFTER = TimeValue.timeValueSeconds(2);
 
@@ -181,6 +187,61 @@ public class GatedIdleEvictionIT extends org.opensearch.serverless.storage.Serve
         );
     }
 
+    /**
+     * The property the design actually needs: residency is bounded by arrival rate, not by population.
+     *
+     * <p>{@link #testAnIdleGatedIndexIsClosedAndReopensOnTheNextRequest} shows eviction happens. It does not
+     * show it happens fast enough to matter, and those are different claims: an eviction that only runs once
+     * the population has already gone resident bounds nothing. What has to hold is that a node steadily
+     * serving new tenants keeps roughly {@code rate x idle window} of them open, whatever the total.
+     *
+     * <p>So this opens a population several times larger than that product and watches the peak. With a two
+     * second window and creation paced to a few tens per second, the expected resident count is a few dozen
+     * out of {@link #PLATEAU_TENANTS}; the assertion allows half the population, which is far above what the
+     * mechanism should produce and far below what no eviction at all would produce. A loose bound on the
+     * right side of the interesting line beats a tight one that fails on a slow machine.
+     *
+     * <p>The pacing is deliberate rather than incidental. Without it a fast machine creates the whole
+     * population inside one idle window, every index is legitimately warm, and the test would fail while
+     * nothing was wrong -- measuring the machine instead of the mechanism.
+     */
+    public void testResidencyIsBoundedByArrivalRateRatherThanByPopulation() throws Exception {
+        internalCluster().startClusterManagerOnlyNode();
+        String dataNode = internalCluster().startDataOnlyNode();
+        ensureStableCluster(2);
+        installBlobBackedDescriptorPlane();
+
+        IndicesService indices = internalCluster().getInstance(IndicesService.class, dataNode);
+
+        int peakResident = 0;
+        for (int i = 0; i < PLATEAU_TENANTS; i++) {
+            String name = plateauTenant(i);
+            client().admin().indices().create(new CreateIndexRequest(name).settings(gated())).actionGet();
+            client().prepareIndex(name).setId("1").setSource("tenant", name).get();
+            // Paced so the run spans several idle windows rather than fitting inside one.
+            Thread.sleep(PACE_MILLIS);
+            // Every iteration, not every tenth. Sampling sparsely can only ever miss a peak, never invent
+            // one, so an under-sampled run passes an assertion the real peak would have failed -- which is
+            // the wrong direction for a bound to be wrong in.
+            peakResident = Math.max(peakResident, gatedOpenCount(indices));
+        }
+
+        logger.warn("plateau: opened {} gated indices, peak resident {}", PLATEAU_TENANTS, peakResident);
+
+        assertTrue(
+            "the whole point is that residency does not track the population: "
+                + peakResident
+                + " of "
+                + PLATEAU_TENANTS
+                + " were resident at once, so eviction is not keeping up with arrivals and a node serving a "
+                + "hundred million tenants would still end up holding all of them",
+            peakResident <= PLATEAU_TENANTS / 2
+        );
+        // And the population really was opened, so the bound above is a bound rather than a count of
+        // indices that were never built. Without this the test would pass against a broken opener.
+        assertTrue("the run must actually have opened indices for the peak to mean anything", peakResident > 0);
+    }
+
     private static int gatedOpenCount(IndicesService indices) throws Exception {
         int count = 0;
         for (IndexService indexService : indices) {
@@ -193,6 +254,11 @@ public class GatedIdleEvictionIT extends org.opensearch.serverless.storage.Serve
 
     private static String tenant(int i) throws Exception {
         return String.format(Locale.ROOT, "tenant-%04d", i);
+    }
+
+    /** A separate name space, so a plateau run cannot resolve a name an earlier test left behind. */
+    private static String plateauTenant(int i) throws Exception {
+        return String.format(Locale.ROOT, "plateau-%04d", i);
     }
 
     private static Settings gated() throws Exception {
