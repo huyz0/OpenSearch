@@ -9,9 +9,6 @@
 package org.opensearch.serverless.storage.descriptor;
 
 import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
-import org.opensearch.cluster.metadata.IndexDescriptor;
-
-import java.util.List;
 
 /**
  * The three descriptor operations that need an index over names rather than a key-value store.
@@ -34,15 +31,6 @@ import java.util.List;
  * still answers these, but the system index cannot be removed until something else does.
  */
 public interface DescriptorPrefixBackend {
-
-    /**
-     * Descriptors whose name starts with {@code prefix}, after {@code afterName} in name order.
-     *
-     * <p>Refresh-bound rather than realtime. A descriptor written a moment ago may not appear yet, which
-     * is the documented wildcard contract rather than a defect, and is why a caller needing immediate
-     * visibility has to name the index exactly and go through {@link DescriptorBackend#get}.
-     */
-    List<IndexDescriptor> findByPrefix(String prefix, String afterName, int size);
 
     /**
      * Expands a wildcard prefix, or reports that it matched more than {@code limit}.

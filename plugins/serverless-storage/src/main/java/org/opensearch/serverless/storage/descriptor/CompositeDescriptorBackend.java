@@ -11,7 +11,6 @@ package org.opensearch.serverless.storage.descriptor;
 import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.IndexDescriptor;
 
-import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -140,12 +139,5 @@ public final class CompositeDescriptorBackend implements DescriptorBackend, Desc
 
     private boolean prefixAvailable() {
         return prefixes instanceof DescriptorBackend ? ((DescriptorBackend) prefixes).available() : true;
-    }
-
-    // ---------------------------------------------------------------- prefix operations
-
-    @Override
-    public List<IndexDescriptor> findByPrefix(String prefix, String afterName, int size) {
-        return prefixes.findByPrefix(prefix, afterName, size);
     }
 }

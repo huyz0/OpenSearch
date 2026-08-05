@@ -18,7 +18,6 @@ import org.opensearch.cluster.metadata.DescriptorUnavailableException;
 import org.opensearch.cluster.metadata.IndexDescriptor;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.Settings;
-import org.opensearch.core.common.Strings;
 import org.opensearch.index.engine.VersionConflictEngineException;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.search.SearchHit;
@@ -43,7 +42,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <p><b>The three operations have different consistency, and that is measured rather than chosen.</b> H18
  * established that a get by id reads through the translog and so sees a descriptor the instant its write is
  * acknowledged, while a search sees only refreshed segments. So {@link #get} is realtime and {@link
- * #findByPrefix} is refresh-bound, and callers needing immediate visibility must name the index exactly.
+ * #expandPrefix} is refresh-bound, and callers needing immediate visibility must name the index exactly.
  *
  * <p><b>The index is created lazily.</b> A cluster that never creates a gated index never pays for it, and
  * creating at node start would put an index creation on every node's startup path for a feature most
@@ -589,36 +588,6 @@ public final class DescriptorStore implements DescriptorBackend, DescriptorPrefi
         } catch (Exception e) {
             logger.warn("failed to submit tombstone write for [{}]", tombstone.name(), e);
             whenDurable.onFailure(e);
-        }
-    }
-
-    /**
-     * One page of descriptors whose name starts with {@code prefix}, ordered by name.
-     *
-     * <p>Refresh-bound, per H18, because it is a search. A descriptor written microseconds ago may not
-     * appear until the next refresh, which is the documented wildcard contract rather than a defect.
-     *
-     * @param afterName the last name of the previous page, or null for the first page
-     */
-    public List<IndexDescriptor> findByPrefix(String prefix, String afterName, int size) {
-        try {
-            var request = client.prepareSearch(DESCRIPTOR_INDEX)
-                .setQuery(QueryBuilders.prefixQuery("name", prefix))
-                .addSort("name", SortOrder.ASC)
-                .setSize(size);
-            if (Strings.isNullOrEmpty(afterName) == false) {
-                request.searchAfter(new Object[] { afterName });
-            }
-            SearchResponse response = request.get();
-            List<IndexDescriptor> descriptors = new ArrayList<>();
-            for (SearchHit hit : response.getHits().getHits()) {
-                descriptors.add(DescriptorCodec.fromSource(hit.getSourceAsMap()));
-            }
-            return descriptors;
-        } catch (Exception e) {
-            // Same reasoning as get: no descriptor index means no descriptors, not a failed request.
-            logger.debug("descriptor prefix search for [{}] failed", prefix, e);
-            return List.of();
         }
     }
 

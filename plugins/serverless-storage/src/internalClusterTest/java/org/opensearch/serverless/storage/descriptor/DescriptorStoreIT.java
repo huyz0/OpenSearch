@@ -78,31 +78,6 @@ public class DescriptorStoreIT extends OpenSearchIntegTestCase {
         assertNull("a name never written must read as absent", store().get("never-written"));
     }
 
-    /** Paging, which is what keeps a listing bounded by the page rather than the population. */
-    public void testPrefixSearchPages() {
-        DescriptorStore store = store();
-        for (int i = 0; i < 25; i++) {
-            store.create(descriptor(String.format(java.util.Locale.ROOT, "logs-%03d", i)));
-        }
-        store.create(descriptor("metrics-000"));
-        client().admin().indices().prepareRefresh(DescriptorStore.DESCRIPTOR_INDEX).get();
-
-        List<IndexDescriptor> firstPage = store.findByPrefix("logs-", null, 10);
-        assertEquals("the page must be bounded by the requested size", 10, firstPage.size());
-        assertEquals("and ordered by name", "logs-000", firstPage.get(0).name());
-
-        List<IndexDescriptor> secondPage = store.findByPrefix("logs-", firstPage.get(firstPage.size() - 1).name(), 10);
-        assertEquals(10, secondPage.size());
-        assertEquals("the second page must continue after the first", "logs-010", secondPage.get(0).name());
-
-        List<IndexDescriptor> lastPage = store.findByPrefix("logs-", secondPage.get(secondPage.size() - 1).name(), 10);
-        assertEquals("the last page must hold the remainder", 5, lastPage.size());
-        assertTrue(
-            "and the prefix must exclude non-matching names",
-            lastPage.stream().noneMatch(each -> each.name().startsWith("metrics"))
-        );
-    }
-
     /**
      * The contract settings, asserted by value rather than by presence. H18 makes the refresh interval the
      * wildcard staleness bound and S29 makes the merge policy the lookup latency bound, so a deployment

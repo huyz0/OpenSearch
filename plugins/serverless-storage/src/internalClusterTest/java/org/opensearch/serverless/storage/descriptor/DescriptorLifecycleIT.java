@@ -98,7 +98,7 @@ public class DescriptorLifecycleIT extends OpenSearchIntegTestCase {
         // Recorded rather than quietly dropped because the first version of this test did assert the race,
         // and it passed until W12's run happened to be slow enough to expose it.
         client().admin().indices().prepareRefresh(DescriptorStore.DESCRIPTOR_INDEX).get();
-        assertEquals("a refreshed wildcard must find the gated index", 1, store.findByPrefix("lifecycle-", null, 10).size());
+        assertEquals("a refreshed wildcard must find the gated index", 1, store.expandPrefix("lifecycle-", 10).matches().size());
 
         // 4. Mapped, with the generation advancing and no shard informed. H4c required this to leave
         // cluster state; W5 gave it somewhere to live.

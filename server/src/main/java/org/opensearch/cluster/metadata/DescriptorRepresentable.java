@@ -75,6 +75,23 @@ public final class DescriptorRepresentable {
         if (indexMetadata.getCustomData().isEmpty() == false) {
             return "index carries custom metadata " + indexMetadata.getCustomData().keySet() + ", which a descriptor cannot carry";
         }
+        // Hidden was already only half-honoured, which is what makes refusing it a correction rather than a
+        // narrowing. IndexDescriptor carries the flag and wildcard expansion is the single line that reads
+        // it, but IndexDescriptor#toIndexMetadata does not put index.hidden back, so the metadata a node
+        // synthesises to open the shard says the index is not hidden. One of the two answers was always
+        // going to be wrong, and an index that hides from wildcards while presenting itself as visible
+        // everywhere else is the worse of them.
+        //
+        // Refusing also keeps expansion honest against an object store, where the answer has to be derivable
+        // from a listing. A key under the descriptor prefix carries a name and nothing else, so serving
+        // hidden from a bucket needs either a GET for every match -- a hundred round trips for a wildcard
+        // the cap exists to keep cheap -- or a second keyspace written on create and deleted on delete,
+        // which is a consistency problem bought for a flag that has one reader.
+        if (indexMetadata.isHidden()) {
+            return "index is hidden, and a descriptor's hidden flag is read by wildcard expansion while "
+                + "IndexDescriptor#toIndexMetadata drops it, so the index would be hidden from wildcards and "
+                + "visible to everything else";
+        }
         return null;
     }
 
