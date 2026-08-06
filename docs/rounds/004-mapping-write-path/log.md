@@ -264,3 +264,29 @@ and the build fails on that.
 - Gates: one failure, `CompletionStatsCacheTests.testCompletionStatsCache`, unrelated to this diff;
   passed alone three times at load 8.
 - Deferred: T50, a mapping written after its index was deleted is stranded forever.
+
+## T48 — A deleted mapping index still reads as "no index has a mapping"
+
+- Status: complete
+- Commit: 2a61064cf90
+- Result: `MappingIndexWatcher` latches when `.opensearch-index-mappings` disappears or comes back
+  with a different UUID, and the store refuses both absence paths while that latch is set.
+- Mutation: making the branch unreachable fails `testADeletedMappingIndexIsNotReportedAsNoMapping`;
+  removing `clusterService.addListener` fails `GatedMappingIndexLossIT`. The second one matters more
+  — it is the wiring, and this area has shipped "configured, registered, never consulted" twice.
+- Notes:
+  - The first version watched presence and cleared the latch on reappearance. That undoes itself: the
+    index comes back empty via auto-creation on the next write, the watcher reports "not deleted", and
+    the merge-onto-empty resumes. Found by review. The signal is the UUID now, and the latch is
+    permanent until the node restarts.
+  - Both absence paths are guarded. The recreated-empty case arrives as a successful get with no
+    document, which is the path that matters after a deletion, and the first version guarded only the
+    exception.
+  - The end-to-end test needed its own class: it deletes the mapping index, which poisons every later
+    method sharing that cluster. Under mutation it failed two methods, one of them innocent.
+  - Two limits, in the watcher's javadoc: the latch is per node and the node that matters is the
+    elected cluster manager, so a restart or failover after the deletion turns the guard off for the
+    cluster; and there is a one-read window because cluster state is visible before listeners run.
+- Gates: green, 7m58s.
+- Deferred: none. The two limits are stated, not filed — closing either needs durable evidence that
+  the store was lost, which means recording it somewhere that is not the store.
