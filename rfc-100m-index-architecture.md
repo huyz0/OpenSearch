@@ -197,7 +197,7 @@ no such constraint, which is exactly why top-K applies to them and where the cac
 | file descriptors per open gated index | 3.0 |
 | open gated indices per node, 31 GiB heap, half to residency | ~110,000 |
 | creates per second, one 20-core box, concurrency 16, no declared mapping | 10,505 |
-| creates per second, same, with a declared mapping | ~10x slower |
+| creates per second, with a declared mapping, concurrency 8 | 2x to 10x slower than the unmapped arm beside it, depending on warm-up; at least ~80% of it the index-backed mapping store |
 | deletes per second, same | 646 |
 
 **Unknown, and honestly so.**
@@ -206,15 +206,47 @@ no such constraint, which is exactly why top-K applies to them and where the cac
   window and a quiet run measures exactly that; a run on a loaded box measured seven times higher. The
   sweep runs on `GENERIC` and closing an index flushes, so eviction competes with the traffic that
   caused it, which is the wrong way round.
-- **A declared mapping still costs about 10x on creation, down from about 14x.** The bypass that
-  produced 10,505 declined on any non-empty mapping, so a mapped index -- the common case since mappings
-  began to be carried -- took the slow path through a `synchronized` block. A mapping whose fields
-  declare nothing but a type is now validated against the field type registry instead, an unlocked
-  lookup that is complete for that shape. Measured against the parent commit in a worktree, two runs
-  each at comparable load, with the unmapped arm as the control: 13.6x and 15.3x before, 9.9x and 10.9x
-  after. So the index-service lock was about a quarter of it and most of the cost is elsewhere. The
-  leading candidate is the mapping store write, a blocking get and index per creation against a shared
-  5-shard index that the unmapped arm never pays; unmeasured, and not to be assumed.
+- **What a declared mapping costs a creation is the index-backed mapping store, and what remains is
+  which part of that store.** The bypass that produced 10,505 declined on any non-empty mapping, so a
+  mapped index -- the common case since mappings began to be carried -- took the slow path through a
+  `synchronized` block. A mapping whose fields declare nothing but a type is now validated against the
+  field type registry instead, an unlocked lookup that is complete for that shape, which moved the ratio
+  from about 14x to about 10x. The "so the lock was a quarter of it" that followed subtracted two
+  single-run ratios, and T23 has since measured that ratio moving by more than that on warm-up alone, so
+  treat the lock's share as unquantified rather than as a quarter.
+
+  T23 attributed it by adding a third arm: the same mapped creations with an in-memory
+  `MappingGenerationStore.Store` registered in place of the index-backed one. Each run reports the
+  store's share twice, taking the index-backed arm from the front of the round and from a repeat of the
+  same arm at the end, so a reader can see whether the answer depended on where the arm ran. Five runs:
+
+  | run | share, front arm | share, repeat | in-memory arm, control over arm |
+  |---|---|---|---|
+  | 1 | 99% | 99% | 1.03x |
+  | 2 | 115% | 109% | 0.84x |
+  | 3 | 83% | 83% | 1.18x |
+  | 4 | 95% | 94% | 1.07x |
+  | 5 | 101% | 101% | 0.98x |
+
+  Over 100% is not a typo. The residual came out negative in runs 2 and 5 because the in-memory arm
+  finished *faster* than the unmapped control (the last column is control over arm, so below 1 means the
+  mapped arm won), which cannot be true of a mapping that costs something. So the honest statement is a floor and a
+  bound: the index-backed store is at least about 80% of what a declared mapping costs, and the residual
+  -- parsing, merging, validation, the descriptor write's share -- is not resolvable at this precision.
+
+  **Two limits on that, both real.** The measurement cannot separate the store's round trips from the
+  local work in the same implementation: building the indexing request, deriving the field type counts,
+  and checking that the mapping index exists. It prices removing the index-backed store, not the network
+  specifically. And only the index-backed arm has a positional control; the in-memory and unmapped arms
+  always run second and third and are never transposed, so the residual carries whatever the drift
+  between those two positions is worth.
+
+  **The multiple itself is not a constant and should not be quoted as one.** The repeat arm is what
+  makes that visible: within the measured round the same arm's throughput differed by up to 1.9x between
+  its two positions, and by up to 3x in the unwarmed round, while the share computed from either end
+  moved by at most 6 points. The mapped-to-unmapped ratio ran 2.0x to 2.9x in a settled round and 4.3x
+  to 10.0x in an unwarmed one, at concurrency 8. The share is the finding; the multiple depends on how
+  warm the mapping index is.
 - `.opensearch-index-mappings` is a second system index. One shared index rather than one per tenant, so
   far cheaper than what was removed, but a fixed-geometry funnel on the mapping write path.
 - Cluster-state publication latency against cluster size, which decides whether wake and sleep need
@@ -232,9 +264,12 @@ no such constraint, which is exactly why top-K applies to them and where the cac
 1. **Bound eviction under load.** The residency ceiling is the whole argument for reaching ten billion
    shards, and it currently weakens exactly when a node is busiest. Decide between a dedicated thread, a
    work budget per pass, and eviction driven by memory pressure rather than a timer.
-2. **Attribute the 8.5x that a declared mapping still costs.** The index-service half is done. The
-   mapping store write is the untested candidate for the rest, and it is the same shared fixed-geometry
-   index listed below.
+2. **Cut what the index-backed mapping store costs a creation.** Attribution is done: T23 measured that
+   store at 83% or more of what a declared mapping costs, with the residual unresolvable at that
+   precision. One of its two round trips is provably wasted, since a creation reads a mapping for a UUID
+   that cannot yet have one, and removing it is also the experiment that says how much of the store's
+   cost is round trips rather than the local work beside them. What remains after that is a question
+   about the shared fixed-geometry index listed below.
 3. **Resolve-and-forward hop.** Small, no core changes, makes multi-index requests work under hash
    routing. Lets the LB configuration ship.
 4. **Pre-warm before rotation.** Under computed placement every large scale event puts some shards on
