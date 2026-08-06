@@ -49,6 +49,7 @@ import org.opensearch.common.Priority;
 import org.opensearch.common.compress.CompressedXContent;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.common.util.concurrent.AbstractRunnable;
 import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.core.action.ActionListener;
@@ -61,6 +62,7 @@ import org.opensearch.index.mapper.DocumentMapper;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.mapper.MapperService.MergeReason;
 import org.opensearch.indices.IndicesService;
+import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -83,15 +85,17 @@ public class MetadataMappingService {
 
     private final ClusterService clusterService;
     private final IndicesService indicesService;
+    private final ThreadPool threadPool;
     private final ClusterManagerTaskThrottler.ThrottlingKey putMappingTaskKey;
 
     final RefreshTaskExecutor refreshExecutor = new RefreshTaskExecutor();
     final PutMappingExecutor putMappingExecutor = new PutMappingExecutor();
 
     @Inject
-    public MetadataMappingService(ClusterService clusterService, IndicesService indicesService) {
+    public MetadataMappingService(ClusterService clusterService, IndicesService indicesService, ThreadPool threadPool) {
         this.clusterService = clusterService;
         this.indicesService = indicesService;
+        this.threadPool = threadPool;
 
         // Task is onboarded for throttling, it will get retried from associated TransportClusterManagerNodeAction.
         putMappingTaskKey = clusterService.registerClusterManagerTask(PUT_MAPPING, true);
@@ -237,14 +241,17 @@ public class MetadataMappingService {
                     try {
                         // A gated index has no metadata entry by design (H3, H5), so getIndexSafe below
                         // would throw and a document carrying a new field would fail. Its mapping lives in
-                        // the store instead, updated by compare-and-swap scoped to that index, and no
-                        // cluster state change happens at all. Handled before the loop rather than inside
-                        // it so the request never reaches a mapper service that has nothing to merge into.
-                        if (MappingGenerationStore.isRegistered() && isGated(currentState, request)) {
-                            recordGatedMapping(request);
-                            builder.success(request);
-                            continue;
-                        }
+                        // the store instead, and that is handled in putMapping before anything is submitted
+                        // here -- see T19: doing it in this method did it on the cluster manager's update
+                        // thread, and the store blocks.
+                        //
+                        // Deliberately not left here as a fallback. putMapping is the only submitter of this
+                        // executor, so a copy of the branch would be unreachable, and an unreachable copy of
+                        // a blocking call on this thread is worse than none: it reads as a safety net while
+                        // being the defect. If a gated request ever does arrive here, getIndexSafe fails it
+                        // loudly, which is the outcome that gets noticed.
+                        assert MappingGenerationStore.isRegistered() == false || isGated(currentState, request) == false
+                            : "a gated put-mapping reached the cluster state update thread, which T19 moved it off";
                         for (Index index : request.indices()) {
                             final IndexMetadata indexMetadata = currentState.metadata().getIndexSafe(index);
                             if (indexMapperServices.containsKey(indexMetadata.getIndex()) == false) {
@@ -272,7 +279,7 @@ public class MetadataMappingService {
         }
 
         /** Whether every index in this request is absent from cluster state, which is what gated means. */
-        private boolean isGated(ClusterState currentState, PutMappingClusterStateUpdateRequest request) {
+        boolean isGated(ClusterState currentState, PutMappingClusterStateUpdateRequest request) {
             for (Index index : request.indices()) {
                 if (currentState.metadata().hasIndex(index.getName())) {
                     return false;
@@ -293,7 +300,7 @@ public class MetadataMappingService {
          * object or nested field, or a field parameter such as a date format. That is the store's shape
          * rather than this wiring's, and lifting it means changing what the store holds.
          */
-        private void recordGatedMapping(PutMappingClusterStateUpdateRequest request) throws IOException {
+        void recordGatedMapping(PutMappingClusterStateUpdateRequest request) throws IOException {
             Map<String, Object> parsed = XContentHelper.convertToMap(MediaTypeRegistry.JSON.xContent(), request.source(), false);
             Map<String, String> fields = DescriptorRepresentable.fieldTypesOrNull(parsed.get("properties"));
             if (fields == null) {
@@ -427,6 +434,39 @@ public class MetadataMappingService {
     }
 
     public void putMapping(final PutMappingClusterStateUpdateRequest request, final ActionListener<ClusterStateUpdateResponse> listener) {
+        // A gated index has no cluster state entry, so a put-mapping against one changes no cluster state at
+        // all: the fields go to MappingGenerationStore and nothing is published. Handling that here, before
+        // any task is submitted, is what keeps it off the cluster manager's update thread.
+        //
+        // It used to be handled inside PutMappingExecutor#execute, which runs on that thread, and the store
+        // is backed by an ordinary index whose read and write both block. So every put-mapping on a gated
+        // index made two blocking round trips on the single thread whose serialization is the ceiling this
+        // whole design exists to remove -- the same mistake creation and deletion were moved off in T4, in
+        // the one metadata path that was not looked at.
+        //
+        // It was also an assertion failure rather than merely slow: "Expected current thread to not be the
+        // cluster-manager service thread. Reason: [Blocking operation]". IndexBackedMappingStore's javadoc
+        // argues the blocking is safe because a mapping update runs on a transport thread "not on the
+        // cluster state thread", which is true of dynamic field inference and false of put-mapping.
+        //
+        // GENERIC rather than the calling thread, because TransportPutMappingAction declares
+        // ThreadPool.Names.SAME: the caller here is a transport thread, and blocking one of those trades a
+        // stalled cluster manager for a stalled transport pool.
+        if (MappingGenerationStore.isRegistered() && putMappingExecutor.isGated(clusterService.state(), request)) {
+            threadPool.executor(ThreadPool.Names.GENERIC).execute(new AbstractRunnable() {
+                @Override
+                protected void doRun() throws Exception {
+                    putMappingExecutor.recordGatedMapping(request);
+                    listener.onResponse(new ClusterStateUpdateResponse(true));
+                }
+
+                @Override
+                public void onFailure(Exception e) {
+                    listener.onFailure(e);
+                }
+            });
+            return;
+        }
         clusterService.submitStateUpdateTask(
             "put-mapping " + Strings.arrayToCommaDelimitedString(request.indices()),
             request,

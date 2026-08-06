@@ -2143,7 +2143,11 @@ public class SnapshotResiliencyTests extends OpenSearchTestCase {
                     threadPool
                 );
                 nodeConnectionsService = createTestNodeConnectionsService(clusterService.getSettings(), threadPool, transportService);
-                final MetadataMappingService metadataMappingService = new MetadataMappingService(clusterService, indicesService);
+                final MetadataMappingService metadataMappingService = new MetadataMappingService(
+                    clusterService,
+                    indicesService,
+                    threadPool
+                );
                 indicesClusterStateService = new IndicesClusterStateService(
                     settings,
                     indicesService,

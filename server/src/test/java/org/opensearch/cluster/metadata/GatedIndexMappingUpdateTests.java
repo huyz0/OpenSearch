@@ -10,14 +10,19 @@ package org.opensearch.cluster.metadata;
 
 import org.opensearch.Version;
 import org.opensearch.action.admin.indices.mapping.put.PutMappingClusterStateUpdateRequest;
+import org.opensearch.action.support.PlainActionFuture;
 import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.ClusterState;
-import org.opensearch.cluster.ClusterStateTaskExecutor;
+import org.opensearch.cluster.ack.ClusterStateUpdateResponse;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.Index;
 import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.test.OpenSearchTestCase;
+import org.opensearch.threadpool.TestThreadPool;
+import org.opensearch.threadpool.ThreadPool;
 import org.junit.After;
+import org.junit.Before;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -42,6 +47,49 @@ import java.util.Set;
  * and the write path no longer depends on it.
  */
 public class GatedIndexMappingUpdateTests extends OpenSearchTestCase {
+
+    private ThreadPool threadPool;
+
+    @Before
+    public void startThreadPool() {
+        // A real pool rather than a mock, because the point of T19 is which thread the work runs on: the
+        // gated path dispatches to GENERIC, and a mock would let that dispatch be removed silently.
+        threadPool = new TestThreadPool(getTestName());
+    }
+
+    @After
+    public void stopThreadPool() {
+        ThreadPool.terminate(threadPool, 10, java.util.concurrent.TimeUnit.SECONDS);
+    }
+
+    /**
+     * Drives a put-mapping the store cannot carry, and asserts it failed with nothing recorded.
+     *
+     * <p>Shared by the two refusal cases so they differ only in the mapping, which is the one thing that
+     * should differ: an object field and a field parameter fail the same guard for different reasons, and a
+     * reader comparing them should see the mappings side by side rather than two copies of the wiring.
+     */
+    private void expectRefusal(String mappingSource, Map<String, Map<String, String>> stored) {
+        ClusterService clusterService = org.mockito.Mockito.mock(ClusterService.class);
+        org.mockito.Mockito.when(clusterService.state()).thenReturn(ClusterState.builder(ClusterName.DEFAULT).build());
+        MetadataMappingService service = new MetadataMappingService(
+            clusterService,
+            org.mockito.Mockito.mock(org.opensearch.indices.IndicesService.class),
+            threadPool
+        );
+
+        PutMappingClusterStateUpdateRequest request = new PutMappingClusterStateUpdateRequest(mappingSource);
+        request.indices(new Index[] { new Index("gated-idx", "gated-uuid") });
+
+        PlainActionFuture<ClusterStateUpdateResponse> future = PlainActionFuture.newFuture();
+        service.putMapping(request, future);
+        expectThrows(IllegalArgumentException.class, future::actionGet);
+
+        assertTrue(
+            "nothing may be recorded, because a partial record is the loss this refuses: " + stored,
+            stored.isEmpty() || stored.get("gated-uuid") == null
+        );
+    }
 
     @After
     public void clearRegistrations() {
@@ -98,38 +146,51 @@ public class GatedIndexMappingUpdateTests extends OpenSearchTestCase {
     }
 
     /**
-     * H7a. The wiring, exercised through the executor a real mapping update goes through.
+     * H7a. The wiring, exercised through the entry point a real mapping update goes through.
      *
-     * <p>An earlier version of this test called {@code MappingGenerationStore} directly and passed with
-     * the wiring in {@code MetadataMappingService} disabled entirely, which is the "correct and
-     * unreachable" failure this project has shipped twice. It is written against the executor now, so
-     * removing the wiring fails it.
+     * <p>An earlier version of this test called {@code MappingGenerationStore} directly and passed with the
+     * wiring in {@code MetadataMappingService} disabled entirely, which is the "correct and unreachable"
+     * failure this project has shipped twice. It went to the executor for that reason, and to
+     * {@link MetadataMappingService#putMapping} for T19's: the executor runs on the cluster manager's update
+     * thread, and this work is precisely what must not happen there.
+     *
+     * <p>So the assertion is not only that the field reached the store. It is that no cluster state task was
+     * ever submitted -- which is what "off the cluster manager thread" means, stated as something a test can
+     * observe rather than as a claim in a comment. The previous claim was in a comment, and it was wrong.
      */
-    public void testTheExecutorRecordsAGatedIndexMapping() throws Exception {
+    public void testAGatedMappingIsRecordedWithoutTouchingTheClusterManager() throws Exception {
         Map<String, Map<String, String>> stored = new HashMap<>();
         registerStore(stored);
 
+        ClusterService clusterService = org.mockito.Mockito.mock(ClusterService.class);
+        // A cluster state with no entry for the index, which is what gated means.
+        ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
+        org.mockito.Mockito.when(clusterService.state()).thenReturn(empty);
+
         MetadataMappingService service = new MetadataMappingService(
-            org.mockito.Mockito.mock(org.opensearch.cluster.service.ClusterService.class),
-            org.mockito.Mockito.mock(org.opensearch.indices.IndicesService.class)
+            clusterService,
+            org.mockito.Mockito.mock(org.opensearch.indices.IndicesService.class),
+            threadPool
         );
 
-        Index gated = new Index("gated-idx", "gated-uuid");
         PutMappingClusterStateUpdateRequest request = new PutMappingClusterStateUpdateRequest(
             "{\"properties\":{\"age\":{\"type\":\"long\"}}}"
         );
-        request.indices(new Index[] { gated });
+        request.indices(new Index[] { new Index("gated-idx", "gated-uuid") });
 
-        // A cluster state with no entry for the index, which is what gated means.
-        ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
+        PlainActionFuture<ClusterStateUpdateResponse> future = PlainActionFuture.newFuture();
+        service.putMapping(request, future);
+        assertTrue("a gated put-mapping must be acknowledged", future.actionGet().isAcknowledged());
 
-        ClusterStateTaskExecutor.ClusterTasksResult<PutMappingClusterStateUpdateRequest> result = service.new PutMappingExecutor().execute(
-            empty,
-            java.util.List.of(request)
-        );
-
-        assertSame("a gated mapping update must not change cluster state at all", empty, result.resultingState);
         assertEquals("the field must have reached the store", "long", stored.get("gated-uuid").get("age"));
+        org.mockito.Mockito.verify(clusterService, org.mockito.Mockito.never())
+            .submitStateUpdateTask(
+                org.mockito.ArgumentMatchers.anyString(),
+                org.mockito.ArgumentMatchers.any(),
+                org.mockito.ArgumentMatchers.any(),
+                org.mockito.ArgumentMatchers.any(),
+                org.mockito.ArgumentMatchers.any()
+            );
     }
 
     /** A second field from another shard must join the first rather than replace it. */
@@ -163,32 +224,8 @@ public class GatedIndexMappingUpdateTests extends OpenSearchTestCase {
         Map<String, Map<String, String>> stored = new HashMap<>();
         registerStore(stored);
 
-        MetadataMappingService service = new MetadataMappingService(
-            org.mockito.Mockito.mock(org.opensearch.cluster.service.ClusterService.class),
-            org.mockito.Mockito.mock(org.opensearch.indices.IndicesService.class)
-        );
-
-        Index gated = new Index("gated-idx", "gated-uuid");
         // An object field: the store holds a flat name-to-type map and has nowhere to put it.
-        PutMappingClusterStateUpdateRequest request = new PutMappingClusterStateUpdateRequest(
-            "{\"properties\":{\"profile\":{\"properties\":{\"city\":{\"type\":\"keyword\"}}}}}"
-        );
-        request.indices(new Index[] { gated });
-
-        ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
-        ClusterStateTaskExecutor.ClusterTasksResult<PutMappingClusterStateUpdateRequest> result = service.new PutMappingExecutor().execute(
-            empty,
-            java.util.List.of(request)
-        );
-
-        assertNotNull(
-            "a mapping the store cannot carry must fail the request, not be acknowledged with the field " + "missing",
-            result.executionResults.get(request).getFailure()
-        );
-        assertTrue(
-            "and nothing may be recorded, because a partial record is the loss this refuses: " + stored,
-            stored.isEmpty() || stored.get("gated-uuid") == null
-        );
+        expectRefusal("{\"properties\":{\"profile\":{\"properties\":{\"city\":{\"type\":\"keyword\"}}}}}", stored);
     }
 
     /**
@@ -203,28 +240,7 @@ public class GatedIndexMappingUpdateTests extends OpenSearchTestCase {
         Map<String, Map<String, String>> stored = new HashMap<>();
         registerStore(stored);
 
-        MetadataMappingService service = new MetadataMappingService(
-            org.mockito.Mockito.mock(org.opensearch.cluster.service.ClusterService.class),
-            org.mockito.Mockito.mock(org.opensearch.indices.IndicesService.class)
-        );
-
-        Index gated = new Index("gated-idx", "gated-uuid");
-        PutMappingClusterStateUpdateRequest request = new PutMappingClusterStateUpdateRequest(
-            "{\"properties\":{\"code\":{\"type\":\"keyword\",\"ignore_above\":256}}}"
-        );
-        request.indices(new Index[] { gated });
-
-        ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
-        ClusterStateTaskExecutor.ClusterTasksResult<PutMappingClusterStateUpdateRequest> result = service.new PutMappingExecutor().execute(
-            empty,
-            java.util.List.of(request)
-        );
-
-        assertNotNull(
-            "a field carrying a parameter the store would drop must fail rather than be reduced to its type",
-            result.executionResults.get(request).getFailure()
-        );
-        assertTrue("and nothing may be recorded: " + stored, stored.isEmpty() || stored.get("gated-uuid") == null);
+        expectRefusal("{\"properties\":{\"code\":{\"type\":\"keyword\",\"ignore_above\":256}}}", stored);
     }
 
     private static void registerStore(Map<String, Map<String, String>> stored) {

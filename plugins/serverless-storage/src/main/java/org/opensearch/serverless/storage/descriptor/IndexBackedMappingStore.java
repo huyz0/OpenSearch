@@ -40,9 +40,19 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <p>A {@code VersionConflictEngineException} is therefore a lost race and a correct answer. The caller
  * re-reads and merges, which is what {@code MappingGenerationStore}'s retry loop already does.
  *
- * <p>Reads and writes here are blocking, unlike the descriptor publish path. That is safe because a mapping
- * update runs on a transport thread handling a put-mapping or a dynamic-field inference, not on the cluster
- * state thread, which is where W4 found that blocking deadlocks.
+ * <p><b>Reads and writes here are blocking, unlike the descriptor publish path.</b> That is a claim about
+ * the callers rather than about this class, and it was wrong for one of them. It said a mapping update runs
+ * on a transport thread handling a put-mapping or a dynamic-field inference, "not on the cluster state
+ * thread, which is where W4 found that blocking deadlocks" -- true of dynamic inference, and false of
+ * put-mapping, whose gated branch ran inside {@code MetadataMappingService.PutMappingExecutor}. That
+ * executor <em>is</em> the cluster state thread, so every put-mapping on a gated index made two blocking
+ * round trips on the one thread whose serialization is the ceiling this design exists to remove. It tripped
+ * an assertion rather than merely being slow, and went unnoticed because the only test of the path drove
+ * the executor with an in-memory double.
+ *
+ * <p>T19 moved that work to {@code MetadataMappingService#putMapping}, which dispatches to {@code GENERIC}
+ * before submitting anything. So the safety argument now rests on both callers running off the cluster
+ * state thread by construction, rather than on one of them happening to.
  */
 public final class IndexBackedMappingStore implements MappingGenerationStore.Store {
 

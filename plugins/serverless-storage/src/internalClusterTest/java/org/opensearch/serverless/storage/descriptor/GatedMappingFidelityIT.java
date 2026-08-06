@@ -255,25 +255,34 @@ public class GatedMappingFidelityIT extends org.opensearch.serverless.storage.Se
         );
     }
 
-    // The control for the case above -- a put-mapping the store *can* carry still succeeds -- is
-    // GatedIndexMappingUpdateTests#testTheExecutorRecordsAGatedIndexMapping rather than a case here, and
-    // that is not a preference about where tests live.
-    //
-    // Written here it fails, and for a reason that has nothing to do with fidelity:
-    //
-    // Expected current thread [opensearch[node_s0][clusterManagerService#updateTask]] to not be the
-    // cluster-manager service thread. Reason: [Blocking operation]
-    //
-    // PutMappingExecutor.execute runs on the cluster manager's update thread, and the gated branch reaches
-    // MappingGenerationStore, whose backing store does a blocking get and a blocking index. So every
-    // put-mapping on a gated index makes two blocking round trips on the one thread whose serialization is
-    // the ceiling this whole design exists to remove. IndexBackedMappingStore's javadoc argues it is safe
-    // precisely because a mapping update runs "not on the cluster state thread", which is true of dynamic
-    // field inference and false of put-mapping.
-    //
-    // That is T19, it predates this change, and it is not something a fidelity fix should quietly absorb.
-    // The unit test covers the same control on the same executor with an in-memory store, so the control
-    // is not lost -- only the part of it that is really a test of T19.
+    /**
+     * The control: a put-mapping the store can carry still succeeds, end to end against a real store.
+     *
+     * <p>Without it, making the refusal throw on everything would satisfy the case above while breaking
+     * every dynamic field inference on every gated index, which is the path this store was built for.
+     *
+     * <p>This case could not be written when the refusal landed, and what stopped it was not fidelity. It
+     * failed with "Expected current thread [clusterManagerService#updateTask] to not be the cluster-manager
+     * service thread. Reason: [Blocking operation]" -- the gated branch lived inside {@code
+     * PutMappingExecutor}, which runs on the cluster manager's update thread, and the store's read and write
+     * both block. T19 moved the work to {@code putMapping}, before any task is submitted, so this now
+     * exercises the real path against the real backing index rather than an in-memory double.
+     */
+    public void testAPutMappingOfPlainFieldsStillSucceeds() throws Exception {
+        installBlobBackedDescriptorPlane();
+
+        client().admin().indices().create(new CreateIndexRequest("fidelity-put-ok").settings(gated())).actionGet();
+        client().admin()
+            .indices()
+            .preparePutMapping("fidelity-put-ok")
+            .setSource(Map.of("properties", Map.of("level", Map.of("type", "keyword"))))
+            .get();
+
+        String uuid = descriptorUuid("fidelity-put-ok");
+        MappingGenerationStore.MappingGeneration generation = MappingGenerationStore.currentMapping(uuid);
+        assertNotNull("a put-mapping that round-trips must reach the store", generation);
+        assertEquals("keyword", generation.fields().get("level"));
+    }
 
     /** The descriptor's uuid for a gated name, which is the key the mapping store is written under. */
     private String descriptorUuid(String name) throws Exception {
