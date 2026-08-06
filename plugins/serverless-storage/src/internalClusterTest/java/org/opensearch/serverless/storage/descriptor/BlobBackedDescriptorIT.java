@@ -103,6 +103,10 @@ public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.Se
             // and is precisely what this class must not do: the thing under test is that the plugin
             // installs the blob backend, not that a backend works when a test installs it.
             .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_NODE_ENABLED_SETTING.getKey(), true)
+            // Deliberately not the default of 5, so the test below can tell a configured value from an
+            // unconsulted one. This class is the only place the plugin's own install path runs, and that
+            // path is the only thing that reads the setting.
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_MAPPING_INDEX_SHARDS_SETTING.getKey(), 3)
             // This class used to select the blob backend explicitly here. There is no longer a choice to
             // make: the object store is the only descriptor backend, so what the class asserts is now the
             // only arrangement there is.
@@ -419,4 +423,44 @@ public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.Se
             enumerator.allNames().contains("tenant-doomed")
         );
     }
+
+    /**
+     * The configured shard count reaches the mapping index the plugin's own store creates.
+     *
+     * <p>Round 004's T28 made the count a setting, and the unit test for it constructs the store directly,
+     * which proves the constructor argument is used and nothing about whether anything passes it. The wiring
+     * runs only here: every other IT installs the gate by hand with a default-constructed store, so
+     * reverting the plugin to `new IndexBackedMappingStore(client)` left the entire suite green. That is the
+     * "configured, registered, and never consulted" shape this area has shipped before.
+     */
+    public void testTheConfiguredMappingIndexShardCountIsUsed() throws Exception {
+        client().admin()
+            .indices()
+            .create(
+                new org.opensearch.action.admin.indices.create.CreateIndexRequest("gated-geometry").settings(
+                    Settings.builder()
+                        .put(org.opensearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+                        .put(org.opensearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+                        .put("index.serverless_storage.enabled", true)
+                        .build()
+                ).mapping(java.util.Map.of("properties", java.util.Map.of("tenant", java.util.Map.of("type", "keyword"))))
+            )
+            .actionGet();
+
+        assertBusy(() -> {
+            var settings = client().admin()
+                .indices()
+                .prepareGetSettings(org.opensearch.serverless.storage.descriptor.IndexBackedMappingStore.MAPPING_INDEX)
+                .get();
+            assertEquals(
+                "the node setting must decide the mapping index's geometry, not the literal it replaced",
+                "3",
+                settings.getSetting(
+                    org.opensearch.serverless.storage.descriptor.IndexBackedMappingStore.MAPPING_INDEX,
+                    org.opensearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_SHARDS
+                )
+            );
+        });
+    }
+
 }

@@ -10,9 +10,11 @@ package org.opensearch.serverless.storage.descriptor;
 
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.ActionType;
+import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.action.get.GetAction;
 import org.opensearch.action.get.GetResponse;
 import org.opensearch.cluster.block.ClusterBlockException;
+import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.MappingGenerationStore;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.core.action.ActionListener;
@@ -26,6 +28,7 @@ import org.opensearch.test.client.NoOpClient;
 
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
 /**
@@ -131,6 +134,57 @@ public class IndexBackedMappingStoreTests extends OpenSearchTestCase {
                 MappingGenerationStore.register(null);
             }
         }
+    }
+
+    /**
+     * The configured shard count reaches the index that gets created, rather than a literal.
+     *
+     * <p>Asserted on the captured request because there is nowhere else to see it: the index's shard count
+     * is fixed when it is created, so a setting that failed to arrive would be undetectable afterwards
+     * without deleting the index.
+     */
+    public void testTheConfiguredShardCountReachesTheCreatedIndex() {
+        AtomicReference<CreateIndexRequest> captured = new AtomicReference<>();
+        try (NoOpClient client = capturingCreate(captured)) {
+            new IndexBackedMappingStore(client, 17).compareAndSwap("idx", 0L, new MappingGenerationStore.MappingGeneration(1L, Map.of()));
+
+            assertNotNull("the mapping index must be created on first write", captured.get());
+            assertEquals(Integer.valueOf(17), IndexMetadata.INDEX_NUMBER_OF_SHARDS_SETTING.get(captured.get().settings()));
+        }
+    }
+
+    /** And the default is the number the code used before it was configurable. */
+    public void testTheDefaultShardCountIsUnchanged() {
+        AtomicReference<CreateIndexRequest> captured = new AtomicReference<>();
+        try (NoOpClient client = capturingCreate(captured)) {
+            new IndexBackedMappingStore(client).compareAndSwap("idx", 0L, new MappingGenerationStore.MappingGeneration(1L, Map.of()));
+
+            assertEquals(
+                Integer.valueOf(IndexBackedMappingStore.DEFAULT_SHARDS),
+                IndexMetadata.INDEX_NUMBER_OF_SHARDS_SETTING.get(captured.get().settings())
+            );
+            assertEquals(
+                "the number this index was born with, so T28 changed nothing at the default",
+                5,
+                IndexBackedMappingStore.DEFAULT_SHARDS
+            );
+        }
+    }
+
+    private NoOpClient capturingCreate(AtomicReference<CreateIndexRequest> captured) {
+        return new NoOpClient(getTestName()) {
+            @Override
+            protected <Request extends ActionRequest, Response extends ActionResponse> void doExecute(
+                ActionType<Response> action,
+                Request request,
+                ActionListener<Response> listener
+            ) {
+                if (request instanceof CreateIndexRequest create) {
+                    captured.set(create);
+                }
+                listener.onResponse(null);
+            }
+        };
     }
 
     /**

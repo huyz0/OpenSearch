@@ -324,6 +324,34 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         Setting.Property.NodeScope
     );
 
+    /**
+     * How many primary shards {@code .opensearch-index-mappings} is created with.
+     *
+     * <p>The index holds one small document per gated index, so this is not about bytes. What it is about is
+     * unmeasured: every gated creation declaring a mapping writes here, and round 004 measured this store at
+     * least about 80% of what such a creation costs, but nothing has shown that the shard count is what
+     * governs that. A single-document write goes to one shard whatever the count is. Five is the number this
+     * index was hardcoded to; naming it is what lets the question be answered rather than argued.
+     *
+     * <p>Raising it is not free on the read side: {@code IndexBackedMappingStatsAggregator} runs a nested
+     * aggregation across every shard of this index, and with one replica the cluster carries 2n shards for
+     * it, on a system whose point is not paying for idle shards.
+     *
+     * <p><b>Read once, at node startup.</b> Not when the index is created, which is the case that bites: a
+     * node started after the index exists reads a value that can never apply, because an index's shard count
+     * is fixed at creation. The store logs when it finds the index already there.
+     */
+    public static final Setting<Integer> SERVERLESS_STORAGE_MAPPING_INDEX_SHARDS_SETTING = Setting.intSetting(
+        "serverless_storage.mapping_index.shards",
+        org.opensearch.serverless.storage.descriptor.IndexBackedMappingStore.DEFAULT_SHARDS,
+        1,
+        // Bounded so a typo fails the node at startup rather than the first gated creation that declares a
+        // mapping, where it would surface as an error about the user's index. 1024 is what core caps an
+        // index at by default, via the opensearch.index.max_number_of_shards property.
+        1024,
+        Setting.Property.NodeScope
+    );
+
     public static final Setting<Integer> SERVERLESS_STORAGE_WILDCARD_MAX_EXPANDED_INDICES_SETTING = Setting.intSetting(
         "serverless_storage.wildcard.max_expanded_indices",
         org.opensearch.serverless.storage.descriptor.DescriptorGate.DEFAULT_WILDCARD_EXPANSION_LIMIT,
@@ -1423,6 +1451,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_PITR_WINDOW_SETTING,
             SERVERLESS_STORAGE_MAX_CONCURRENT_READER_SHARDS_SETTING,
             SERVERLESS_STORAGE_WILDCARD_MAX_EXPANDED_INDICES_SETTING,
+            SERVERLESS_STORAGE_MAPPING_INDEX_SHARDS_SETTING,
             SERVERLESS_STORAGE_NODE_ENABLED_SETTING,
             SERVERLESS_STORAGE_REST_GATING_ENABLED_SETTING,
             SERVERLESS_STORAGE_MAX_FILE_CACHE_USAGE_RATIO_SETTING,
@@ -1862,7 +1891,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             org.opensearch.serverless.storage.descriptor.DescriptorGate.install(
                 descriptorBackend,
                 descriptorPrefixes,
-                new org.opensearch.serverless.storage.descriptor.IndexBackedMappingStore(client),
+                new org.opensearch.serverless.storage.descriptor.IndexBackedMappingStore(
+                    client,
+                    SERVERLESS_STORAGE_MAPPING_INDEX_SHARDS_SETTING.get(environment.settings())
+                ),
                 new org.opensearch.serverless.storage.descriptor.IndexBackedMappingStatsAggregator(client),
                 new org.opensearch.serverless.storage.descriptor.StoreBackedFieldRefresher(),
                 true

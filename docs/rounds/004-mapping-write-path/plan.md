@@ -133,9 +133,19 @@ the one with tasks that fit a single invocation each.
 - Depends on: T23, T28
 - Goal: decide whether the shared fixed-geometry index is a funnel on the creation path or
   merely a shared index.
+- Constraint found while doing T28, and it invalidates the obvious approach: three shard counts
+  cannot be had in one cluster. The setting is node-scope and read once at startup; the mapping
+  index is created lazily by the first write and never deleted, so a second store with a different
+  count gets `ResourceAlreadyExistsException` and runs against the first geometry while reporting
+  the second. Deleting the index between arms does not help either, because the retained store
+  still believes it exists and the next write auto-creates it at the cluster default of one shard.
+  Three counts means three clusters, and every arm must read the live `index.number_of_shards` of
+  `.opensearch-index-mappings` before timing anything.
 - Acceptance:
-  - the T23 harness run at three shard counts for the mapping index, with the unmapped arm as
-    the control in each run
+  - the T23 harness run at three shard counts for the mapping index, one cluster per count, with
+    the unmapped arm as the control in each run
+  - each arm asserts the mapping index's actual shard count before it times anything, so an arm
+    that silently ran against another geometry fails instead of being reported
   - a stated threshold before the run: a difference smaller than the control's own spread
     across runs is reported as no measurable effect, which is a completed task and not a
     failure

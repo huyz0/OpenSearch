@@ -63,11 +63,29 @@ public final class IndexBackedMappingStore implements MappingGenerationStore.Sto
     /** Where gated mappings live. Separate from the descriptor index because they change independently. */
     public static final String MAPPING_INDEX = ".opensearch-index-mappings";
 
+    /**
+     * Shards for the mapping index when nobody says otherwise.
+     *
+     * <p>Five, and until T28 that was a literal in the middle of {@code ensureIndexExists} with no reasoning
+     * attached and no way to change it. It is a guess: the index holds one small document per gated index,
+     * so its bytes are trivial, and what it actually has to survive is write concurrency on the creation
+     * path -- every gated creation with a declared mapping writes here. Five spreads that across five
+     * primaries. Whether that is the right number is what T29 measures; until then the point of naming it
+     * is that a wrong guess can now be corrected without a code change.
+     */
+    public static final int DEFAULT_SHARDS = 5;
+
     private final Client client;
+    private final int shards;
     private final AtomicBoolean indexKnownToExist = new AtomicBoolean();
 
     public IndexBackedMappingStore(Client client) {
+        this(client, DEFAULT_SHARDS);
+    }
+
+    public IndexBackedMappingStore(Client client, int shards) {
         this.client = client;
+        this.shards = shards;
     }
 
     /**
@@ -185,7 +203,7 @@ public final class IndexBackedMappingStore implements MappingGenerationStore.Sto
                 .create(
                     new CreateIndexRequest(MAPPING_INDEX).settings(
                         Settings.builder()
-                            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 5)
+                            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, shards)
                             .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 1)
                             .build()
                     )
@@ -221,6 +239,11 @@ public final class IndexBackedMappingStore implements MappingGenerationStore.Sto
             if (e instanceof org.opensearch.ResourceAlreadyExistsException
                 || e.getCause() instanceof org.opensearch.ResourceAlreadyExistsException) {
                 indexKnownToExist.set(true);
+                // Logged because this is the one moment a configured shard count is silently discarded. An
+                // index's geometry is fixed at creation, so a node that starts after this index exists reads
+                // a setting that can never apply, and without this line the only evidence is that the number
+                // in the config and the number on the index disagree.
+                logger.debug("[{}] already exists, so this node's configured shard count of {} does not apply", MAPPING_INDEX, shards);
                 return;
             }
             throw e instanceof RuntimeException runtime ? runtime : new RuntimeException(e);
