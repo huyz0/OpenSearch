@@ -209,7 +209,7 @@ is not a threshold.
 ## T46 — Measure the mapping index's geometry against creation throughput
 
 - Status: complete, negative result
-- Commit: in this entry's commit
+- Commit: c84d3268bec
 - Result: no measurable effect at this precision. Condition medians 3.58x (1 shard), 2.15x (5) and
   2.90x (20) against the unmapped control, with a largest within-condition spread of 3.91x. The
   between-condition spread of medians, 1.43, is well inside it, and the ordering is not monotonic in
