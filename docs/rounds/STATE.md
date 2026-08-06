@@ -10,8 +10,8 @@ Updated: 2026-08-06
 | | |
 |---|---|
 | Active round | 004, the mapping write path ([plan](004-mapping-write-path/plan.md)) |
-| Next action | `/round-next`, task T26 |
-| Last task | T25 complete |
+| Next action | `/round-next`, task T27 |
+| Last task | T26 complete |
 | Branch | `feature/serverless` |
 
 Rounds 001 to 003 predate this file and have no round directories. Their work is in the git

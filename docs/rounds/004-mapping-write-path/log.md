@@ -114,3 +114,26 @@ Append-only. One entry per task, written when the task's commit lands.
   - Anyone re-running this on eight pairs should expect a null result about as often as not.
 - Deferred: none. The swap's own cost, and the shared five-shard geometry behind it, are T28 and
   T29.
+
+## T26 — A store read that fails must not read as an absent mapping
+
+- Status: complete
+- Commit: d501a8408e8
+- Result: `IndexBackedMappingStore.read` propagates everything except `IndexNotFoundException`.
+  `updateMapping` retries a failing read the same 16 times the old accidental loop gave it, then
+  raises the read's own failure instead of "did not converge, which means sustained contention".
+- Mutation: restoring the blanket catch fails all three propagation tests. Verified twice, because
+  the first two versions of the update-path test were green under mutation: one used a throwing
+  double that never touched the store holding the catch, the other failed every client action so
+  the exception came from the swap rather than the read.
+- Notes:
+  - The premise in the task and in the first write-up was wrong. A swallowed read cannot silently
+    overwrite through this store: a merge from empty proposes generation 1 and external versioning
+    refuses it. The real cost was 32 wasted round trips and a misdiagnosis.
+  - `StoreBackedFieldRefresher` still degrades rather than fails, now explicitly. It does not
+    protect the document, because inferring the field sends an auto put-mapping into the same
+    unreadable store; the comment says so.
+  - Deliberate hole: a mapping index deleted under a live cluster reads as absence and the merge
+    that follows would write one field where there were many. Filed as T31.
+- Gates: green, 9m11s.
+- Deferred: T31.
