@@ -205,3 +205,27 @@ is not a threshold.
   task, not a failure. Only a between-condition spread exceeding the within-condition noise counts
   as the geometry mattering.
 - Every run asserts the live shard count of `.opensearch-index-mappings` before timing anything.
+
+## T46 — Measure the mapping index's geometry against creation throughput
+
+- Status: complete, negative result
+- Commit: in this entry's commit
+- Result: no measurable effect at this precision. Condition medians 3.58x (1 shard), 2.15x (5) and
+  2.90x (20) against the unmapped control, with a largest within-condition spread of 3.91x. The
+  between-condition spread of medians, 1.43, is well inside it, and the ordering is not monotonic in
+  shard count. By the rule fixed before the runs, that is "no measurable effect".
+- Runs: 1, 5 and 20 shards, three runs each, one cluster per run, interleaved by run so drift spreads
+  across conditions. Load medians 13.7, 11.7 and 14.6 respectively.
+  Raw: 1 shard 2.03/3.58/3.72, 5 shards 2.05/2.15/3.13, 20 shards 2.44/2.90/6.35.
+- Every run asserted the live shard count of `.opensearch-index-mappings` before timing. Without that
+  assertion this measurement is not possible to do correctly: the index is created lazily and never
+  deleted, so a second geometry in the same cluster silently runs against the first.
+- Why the answer makes sense, and why it was still worth measuring: a creation writes one document,
+  one document goes to one shard, so the shard count cannot divide a cost that was never spread
+  across shards. The RFC had called this index "a fixed-geometry funnel on the mapping write path"
+  for several rounds. It is a funnel in the sense that everything goes through it, and not in the
+  sense that its width matters.
+- Consequence: the remaining cost of the mapping write is the round trip itself, so the levers are
+  batching or moving it off the blocking path. The T45 setting stays, because the read side has its
+  own reason to care about the shard count.
+- Deferred: none.

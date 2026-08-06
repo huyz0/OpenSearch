@@ -271,8 +271,21 @@ no such constraint, which is exactly why top-K applies to them and where the cac
   moved by at most 6 points. Over the 36 runs T42 added, the ratio in a settled round ran 1.4x to
   4.1x, and 4.3x to 10.6x in an unwarmed one, at concurrency 8. The share is the finding; the multiple depends on how
   warm the mapping index is.
-- `.opensearch-index-mappings` is a second system index. One shared index rather than one per tenant, so
-  far cheaper than what was removed, but a fixed-geometry funnel on the mapping write path.
+- `.opensearch-index-mappings` is a second system index, one shared index rather than one per tenant.
+  It was described here as a fixed-geometry funnel on the mapping write path. **T46 measured that and
+  found nothing.** Three shard counts, 1, 5 and 20, one cluster each because the geometry cannot be
+  varied within a cluster, three runs apiece, decision rule fixed before the runs: condition medians
+  3.58x, 2.15x and 2.90x against a within-condition spread of up to 3.91x, and not even monotonic in
+  shard count. No measurable effect at this precision.
+
+  That is the expected answer once stated plainly, which is the argument for having measured it: a
+  creation writes one document, one document goes to one shard, and the shard count cannot divide a
+  cost that was never spread across shards. What is left of the mapping write path's cost is the
+  latency of the round trip itself, not contention over it. The setting from T45 stays, because the
+  read side has its own reason to care -- the stats aggregator fans out over every shard -- but a
+  wider mapping index is not a lever on creation throughput.
+
+  The geometry is still fixed at creation, and that remains true and unaddressed.
 - Cluster-state publication latency against cluster size, which decides whether wake and sleep need
   batching. Estimated at 50-200 ms; not measured.
 - Whether ARS's latency signal is a good enough proxy for cache warmth, or whether it oscillates and
@@ -291,8 +304,10 @@ no such constraint, which is exactly why top-K applies to them and where the cac
 2. **Cut what the index-backed mapping store costs a creation.** Attribution is done and the cheap half
    is taken: T40 measured the store at 83% or more of what a declared mapping costs, and T41 removed the
    read a creation issues for a UUID that cannot yet have one, which T42 measured at a seventh to a fifth
-   of the penalty. The swap is what is left, and it is a write against the shared fixed-geometry index
-   listed below, which is the next thing to measure rather than the next thing to assume.
+   of the penalty. The swap is what is left, and T46 has ruled out the shared index's geometry as the
+   reason it costs what it does: 1, 5 and 20 shards are indistinguishable, because one document goes to
+   one shard however many there are. What remains is the round trip itself, so the levers are batching
+   several creations' mapping writes or moving them off the blocking path, not widening the index.
 3. **Resolve-and-forward hop.** Small, no core changes, makes multi-index requests work under hash
    routing. Lets the LB configuration ship.
 4. **Pre-warm before rotation.** Under computed placement every large scale event puts some shards on
