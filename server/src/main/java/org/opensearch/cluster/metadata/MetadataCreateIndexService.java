@@ -2225,9 +2225,15 @@ public class MetadataCreateIndexService {
             // and that setting is also a precondition of gating, so a gated creation is never on the cluster
             // state thread. An index admitted and then refused by the gate falls back to the ordinary path
             // and never reaches this line.
+            //
+            // T24 sends this through createMapping rather than updateMapping. The two differ by one round
+            // trip: updateMapping opens by reading the current mapping so it has something to merge onto,
+            // and this UUID came from UUIDs.randomBase64UUID in aggregateIndexSettings moments ago and has
+            // been given to nobody, so that read can only answer "absent". createMapping attempts the swap
+            // first and keeps the read-and-merge loop as its fallback for a write the store itself retried.
             java.util.Map<String, Object> declaredFields = DescriptorRepresentable.fieldDefinitionsOrNull(indexMetadata);
             if (declaredFields != null && declaredFields.isEmpty() == false) {
-                MappingGenerationStore.updateMapping(indexMetadata.getIndexUUID(), declaredFields);
+                MappingGenerationStore.createMapping(indexMetadata.getIndexUUID(), declaredFields);
             }
             java.util.concurrent.CompletableFuture<Boolean> write = IndexDescriptorPublisher.createGated(indexMetadata);
             if (write == null) {

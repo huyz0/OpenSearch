@@ -175,8 +175,12 @@ public class GatedMappedCreationCostIT extends org.opensearch.serverless.storage
     @After
     public void deleteWhatWasCreated() throws Exception {
         if (Boolean.getBoolean("tests.mappingcost") == false) {
-            // The body was skipped, so nothing was created, no gate was installed, and sweeping anyway
-            // would issue about a hundred pointless round trips per skipped run.
+            // The body was skipped, so nothing was created and sweeping would be about a hundred pointless
+            // round trips. The uninstall still runs: it costs nothing, and this class used to run it
+            // unconditionally, so anything that had come to depend on that would break silently here rather
+            // than anywhere near the cause. Registry state leaking between classes is how this package's
+            // failures usually present.
+            DescriptorGate.uninstall();
             return;
         }
         List<String> survivors = new java.util.ArrayList<>();
@@ -349,6 +353,15 @@ public class GatedMappedCreationCostIT extends org.opensearch.serverless.storage
             "every arm must have made progress, or this measured nothing",
             measured.indexBacked() > 0 && measured.inMemory() > 0 && measured.unmapped() > 0 && measured.indexBackedRepeat() > 0
         );
+        // T24, asserted here rather than only in MappingGenerationStoreTests because this project has twice
+        // shipped a fix that passed its own tests while never entering the path it claimed to fix. Nothing
+        // in this test does anything but create, and a creation now swaps without reading first, so any read
+        // at all means the creation path is still going through updateMapping.
+        assertEquals(
+            "a gated creation read a mapping that cannot exist, so it is not taking the create path",
+            0L,
+            productionStore().reads()
+        );
     }
 
     /**
@@ -419,6 +432,7 @@ public class GatedMappedCreationCostIT extends org.opensearch.serverless.storage
 
         private final MappingGenerationStore.Store delegate;
         private final java.util.concurrent.atomic.AtomicLong swaps = new java.util.concurrent.atomic.AtomicLong();
+        private final java.util.concurrent.atomic.AtomicLong reads = new java.util.concurrent.atomic.AtomicLong();
 
         CountingStore(MappingGenerationStore.Store delegate) {
             this.delegate = delegate;
@@ -426,6 +440,7 @@ public class GatedMappedCreationCostIT extends org.opensearch.serverless.storage
 
         @Override
         public MappingGenerationStore.MappingGeneration read(String indexUuid) {
+            reads.incrementAndGet();
             return delegate.read(indexUuid);
         }
 
@@ -437,6 +452,10 @@ public class GatedMappedCreationCostIT extends org.opensearch.serverless.storage
 
         long swaps() {
             return swaps.get();
+        }
+
+        long reads() {
+            return reads.get();
         }
     }
 

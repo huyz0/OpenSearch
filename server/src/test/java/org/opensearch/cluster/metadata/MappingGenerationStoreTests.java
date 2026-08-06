@@ -13,6 +13,7 @@ import org.junit.After;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -166,6 +167,90 @@ public class MappingGenerationStoreTests extends OpenSearchTestCase {
     public void testWithoutAStoreNothingHappens() {
         assertEquals(-1L, MappingGenerationStore.updateMapping("idx", Map.of("age", "long")));
         assertEquals(-1L, MappingGenerationStore.currentGeneration("idx"));
+        assertEquals(-1L, MappingGenerationStore.createMapping("idx", Map.of("age", "long")));
+    }
+
+    /**
+     * A creation does not read a mapping that cannot exist.
+     *
+     * <p>T24, and the assertion is the read count rather than a duration. The UUID is generated during the
+     * creation and has never been given to anyone, so the read {@code updateMapping} opens with can only
+     * answer "absent" -- one blocking round trip per creation, against the store T23 measured at 83% or more
+     * of what a declared mapping costs.
+     */
+    public void testCreatingAMappingDoesNotReadOneThatCannotExist() {
+        InMemoryStore store = new InMemoryStore();
+        MappingGenerationStore.register(store);
+
+        long generation = MappingGenerationStore.createMapping("idx", Map.of("tenant", Map.of("type", "keyword")));
+
+        assertEquals("a create writes the first generation", 1L, generation);
+        assertEquals("a fresh UUID cannot have a stored mapping, so nothing is worth reading", 0, store.reads.get());
+        assertEquals("one swap, and only one", 1, store.swaps.get());
+        assertEquals(Map.of("type", "keyword"), store.byUuid.get("idx").definitionOf("tenant"));
+    }
+
+    /**
+     * A create whose swap is refused merges rather than failing or overwriting.
+     *
+     * <p>The case is a retried creation task: it carries the same {@code IndexMetadata}, so the same UUID,
+     * and finds generation 1 already there. The fields already stored must survive, because the only thing
+     * that can have written them is an earlier attempt at this same index, and dropping them would leave an
+     * index whose declared fields are missing -- the silent loss T13 found, arriving by a different route.
+     */
+    public void testACreateThatLosesTheSwapMergesRatherThanOverwriting() {
+        InMemoryStore store = new InMemoryStore();
+        MappingGenerationStore.register(store);
+        // Whatever got there first. A retry of this creation writes exactly the declared fields; this test
+        // uses a different field so that a merge and an overwrite give visibly different answers.
+        MappingGenerationStore.updateMapping("idx", Map.of("city", "keyword"));
+
+        long generation = MappingGenerationStore.createMapping("idx", Map.of("age", "long"));
+
+        assertEquals("the merge advances past what was already stored", 2L, generation);
+        assertEquals(
+            "the field that was already there must survive the create",
+            Set.of("city", "age"),
+            store.byUuid.get("idx").fields().keySet()
+        );
+        assertTrue("the optimistic swap must have been refused, or this proves nothing", store.failedSwaps.get() >= 1);
+    }
+
+    /**
+     * A create whose write landed but was reported as a conflict converges without writing again.
+     *
+     * <p>The reachable shape of a refused create: the store's own {@code client.index} is retried underneath
+     * it after the first attempt already landed, so the second comes back as a version conflict. The
+     * creation has in fact succeeded, and the fallback has to notice that rather than fail it.
+     *
+     * <p>Asserted on the counts, not only on the outcome. Returning the right generation is something a
+     * plain {@code updateMapping} delegation also does, so an outcome-only version of this test would pass
+     * against the implementation T24 replaced. One swap and one read is what says the optimistic path ran
+     * and then deferred.
+     */
+    public void testACreateWhoseWriteAlreadyLandedConvergesWithoutWritingAgain() {
+        InMemoryStore store = new InMemoryStore();
+        MappingGenerationStore.register(store);
+        Map<String, Object> declared = Map.of("tenant", Map.of("type", "keyword"));
+        assertEquals(1L, MappingGenerationStore.createMapping("idx", declared));
+
+        long generation = MappingGenerationStore.createMapping("idx", declared);
+
+        assertEquals("the second attempt converges on the generation already stored", 1L, generation);
+        assertEquals(Set.of("tenant"), store.byUuid.get("idx").fields().keySet());
+        assertEquals("one write for the first create, and none for the second", 1, store.swaps.get());
+        assertEquals("the first create must not have read, and the second must have read once", 1, store.reads.get());
+    }
+
+    /** Nothing declared means nothing written, the same answer updateMapping gives for an empty map. */
+    public void testCreatingWithNothingDeclaredWritesNothing() {
+        InMemoryStore store = new InMemoryStore();
+        MappingGenerationStore.register(store);
+
+        assertEquals(0L, MappingGenerationStore.createMapping("idx", Map.of()));
+
+        assertEquals("an empty declaration must not leave a document behind", 0, store.swaps.get());
+        assertNull(store.byUuid.get("idx"));
     }
 
     // ---------------------------------------------------------------- helpers
@@ -178,6 +263,8 @@ public class MappingGenerationStoreTests extends OpenSearchTestCase {
         private final Map<String, MappingGenerationStore.MappingGeneration> byUuid = new ConcurrentHashMap<>();
         private final AtomicInteger swaps = new AtomicInteger();
         private final AtomicInteger failedSwaps = new AtomicInteger();
+        /** Counted so a caller can be held to not issuing a read whose answer it already knows. */
+        private final AtomicInteger reads = new AtomicInteger();
 
         /**
          * Holds every reader until all of them have read, so a collision is arranged rather than hoped for.
@@ -195,6 +282,7 @@ public class MappingGenerationStoreTests extends OpenSearchTestCase {
 
         @Override
         public MappingGenerationStore.MappingGeneration read(String indexUuid) {
+            reads.incrementAndGet();
             MappingGenerationStore.MappingGeneration value = byUuid.get(indexUuid);
             CountDownLatch gate = readsBeforeAnySwap;
             if (gate != null) {

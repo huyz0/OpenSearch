@@ -134,6 +134,50 @@ public final class MappingGenerationStore {
     }
 
     /**
+     * Writes the fields an index declared at creation, for an index that cannot yet have any.
+     *
+     * <p>T24. A creation reached {@link #updateMapping}, whose first act is to read the current mapping so
+     * it has something to merge onto. For a creation there is nothing to merge onto and there cannot be: the
+     * UUID was generated moments earlier and has never been given to anyone, so the read is a blocking round
+     * trip whose answer is known to be "absent" before it is issued. T23 measured the index-backed store at
+     * 83% or more of what a declared mapping costs a creation, and this is one of its two round trips.
+     *
+     * <p>So the swap is attempted first, at generation 1, and the read-and-merge loop is kept as the
+     * fallback for when the swap is refused.
+     *
+     * <p><b>What makes the fallback reachable is not a retried creation.</b> That was the first answer and
+     * it is wrong: {@code aggregateIndexSettings} puts a fresh {@code UUIDs.randomBase64UUID} into every
+     * attempt, so a re-executed creation is a different UUID and finds nothing. What can refuse the swap is
+     * the store's own write being retried underneath it -- a primary relocating or failing over after the
+     * write landed, so the replication layer reissues it and the second attempt comes back as a version
+     * conflict. The fallback then reads, finds the fields already there, and returns the stored generation
+     * without writing again. Removing it would fail those creations for having already succeeded.
+     *
+     * @return the generation the mapping reached, or -1 when no store is installed, or 0 when there is
+     *         nothing to declare
+     * @throws MappingConflictException when a field already exists with a different type
+     */
+    public static long createMapping(String indexUuid, Map<String, ?> declaredFields) {
+        Store store = STORE.get();
+        if (store == null) {
+            return -1L;
+        }
+        if (declaredFields.isEmpty()) {
+            // Matching updateMapping, which takes its "nothing changed" exit here and writes nothing. Without
+            // this the two entry points disagree on the same input, and this one leaves a document holding an
+            // empty mapping in a shared index that nothing ever deletes from.
+            return 0L;
+        }
+        if (store.compareAndSwap(indexUuid, 0L, new MappingGeneration(1L, new java.util.HashMap<>(declaredFields)))) {
+            return 1L;
+        }
+        // Something is already stored under this UUID. Merge rather than overwrite: this path cannot tell
+        // what put it there, and the one thing that must never happen is dropping fields someone is relying
+        // on.
+        return updateMapping(indexUuid, declaredFields);
+    }
+
+    /**
      * Adds fields to an index's mapping, retrying against concurrent writers until the swap takes.
      *
      * @param newFields the fields this caller inferred, which are merged onto whatever is current rather

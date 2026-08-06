@@ -11,6 +11,7 @@ package org.opensearch.serverless.storage.descriptor;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.metadata.MappingGenerationStore;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.plugins.Plugin;
 import org.junit.After;
@@ -100,6 +101,72 @@ public class GatedCreateTimeMappingIT extends org.opensearch.serverless.storage.
     @After
     public void clearGate() throws Exception {
         DescriptorGate.uninstall();
+    }
+
+    /**
+     * A gated creation writes its declared mapping without reading one first.
+     *
+     * <p>T24, and it lives here rather than only in the measurement class because a criterion that only
+     * holds behind {@code -Dtests.mappingcost} is a criterion CI never checks. Reverting
+     * {@code MetadataCreateIndexService} to {@code updateMapping} leaves every other test in this file
+     * green: the stored fields are identical either way, and the only difference is one round trip that
+     * nothing else looks at.
+     *
+     * <p>The count is asserted rather than a duration, for the usual reason. One creation is enough --
+     * this is about which code path ran, and a population would only add flakiness and the cleanup problem
+     * that put the measurement class behind a flag in the first place.
+     */
+    public void testAGatedCreationDoesNotReadAMappingThatCannotExist() throws Exception {
+        installBlobBackedDescriptorPlane();
+        ReadCountingStore counting = new ReadCountingStore(new IndexBackedMappingStore(client()));
+        MappingGenerationStore.register(counting);
+
+        client().admin()
+            .indices()
+            .create(
+                new CreateIndexRequest("gated-unread").settings(gated())
+                    .mapping(Map.of("properties", Map.of("tenant", Map.of("type", "keyword"))))
+            )
+            .actionGet();
+
+        assertEquals("a creation's mapping read can only answer absent, so it must not be issued", 0L, counting.reads());
+        assertEquals("the mapping still has to be written", 1L, counting.swaps());
+        // And it landed, so this cannot pass by the creation having skipped the store altogether.
+        var generation = MappingGenerationStore.currentMapping(descriptorUuid("gated-unread"));
+        assertNotNull("the declared fields must still reach the store", generation);
+        assertEquals("keyword", MappingGenerationStore.typeOf(generation.fields().get("tenant")));
+    }
+
+    /** Counts what the creation path asks of the store, delegating everything else to the real one. */
+    private static final class ReadCountingStore implements MappingGenerationStore.Store {
+
+        private final MappingGenerationStore.Store delegate;
+        private final java.util.concurrent.atomic.AtomicLong reads = new java.util.concurrent.atomic.AtomicLong();
+        private final java.util.concurrent.atomic.AtomicLong swaps = new java.util.concurrent.atomic.AtomicLong();
+
+        ReadCountingStore(MappingGenerationStore.Store delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public MappingGenerationStore.MappingGeneration read(String indexUuid) {
+            reads.incrementAndGet();
+            return delegate.read(indexUuid);
+        }
+
+        @Override
+        public boolean compareAndSwap(String indexUuid, long expectedGeneration, MappingGenerationStore.MappingGeneration updated) {
+            swaps.incrementAndGet();
+            return delegate.compareAndSwap(indexUuid, expectedGeneration, updated);
+        }
+
+        long reads() {
+            return reads.get();
+        }
+
+        long swaps() {
+            return swaps.get();
+        }
     }
 
     /**
