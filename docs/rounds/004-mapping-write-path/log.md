@@ -40,3 +40,37 @@ Append-only. One entry per task, written when the task's commit lands.
   suite: the measurement stays behind `-Dtests.mappingcost`.
 - Deferred: none. The positional control on the residual arm is noted in the RFC as a limit
   rather than filed as a task, because T24 changes the arm it would measure.
+
+## T24 — Stop reading a mapping that cannot exist yet
+
+- Status: complete
+- Commit: 20079e11096
+- Result: a gated creation's mapping write is one round trip instead of two.
+  `MappingGenerationStore.createMapping` swaps at generation 1 and keeps read-and-merge as its
+  fallback. Whether that made creations measurably faster is not claimed here: one run after
+  the change read 2.21x against the unmapped control, inside the 2.0x to 2.9x range measured
+  before it, at load average 20. T25 measures it.
+- Proof it entered the path: `GatedCreateTimeMappingIT` creates one mapped gated index through
+  a counting store and asserts zero reads and one swap. Reverting the call site to
+  `updateMapping` fails it, verified. Before that assertion existed the revert left every test
+  CI runs green, because the only other check was behind `-Dtests.mappingcost`.
+- Mutation: both unit tests fail against a `createMapping` that just delegates to
+  `updateMapping`; removing the fallback branch fails the merge test. Verified in that order,
+  test first.
+- Notes:
+  - The fallback's first stated justification was wrong and the review caught it. A retried
+    creation task does not reuse its UUID: `aggregateIndexSettings` puts a fresh
+    `UUIDs.randomBase64UUID` into every attempt. The reachable case is the store's own write
+    being retried after it landed, surfacing as a version conflict. Corrected in the javadoc
+    and at the call site.
+  - `createMapping` with an empty map now returns without writing, matching `updateMapping`.
+    No caller reaches it today, but the two entry points disagreeing on the same input is a
+    trap, and this one would leave an empty document in an index nothing deletes from.
+  - T23's early return in the measurement class's teardown had also dropped an unconditional
+    `DescriptorGate.uninstall`. Restored. See the gates note below.
+- Gates: green, 12m01s at load average 16. An earlier run failed
+  `GatedCreationSwitchIT.testInstallingWhileDisabledLeavesNothingGated` on "a disabled gate
+  must gate nothing" at load average 30, which is the leaked-registry signature this package
+  produces. It passed alone three times and twice beside the classes this task touches; the
+  dropped `uninstall` was the one plausible link and is restored either way.
+- Deferred: none.
