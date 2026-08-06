@@ -179,3 +179,25 @@ the one with tasks that fit a single invocation each.
   - the guard is mutation-tested: making the two cases indistinguishable again fails the test
 - Risk: medium
 - Kind: fix
+
+### T32 — A template-gated creation writes its mapping from the cluster state thread
+
+- Depends on: T27
+- Goal: `DescriptorGate.worthAdmittingOffThread` reads only the request's own settings, so an index made
+  gated by a matching template is not admitted onto GENERIC. It takes the ordinary path, and at the
+  bottom `clusterStateCreateIndex` reads the finished settings, finds it gated, and calls
+  `MappingGenerationStore.createMapping` from the cluster manager's update thread. That is a blocking
+  store call, and `compareAndSwap` can submit a cluster state update of its own through
+  `ensureIndexExists`, which is the W4 deadlock T19 removed from put-mapping arriving by another door.
+- Acceptance:
+  - `GatedMappingOffClusterStateThreadIT` gains a template-gated creation phase using the same recording
+    store and bounded wait, and it fails before the fix
+  - after the fix no recorded call comes from a cluster state thread for either shape
+  - the comments falsified by this are corrected in the same commit: `MetadataCreateIndexService`'s
+    "Blocking is safe here. Every path reaching this branch came through createGatedIndex on GENERIC",
+    `IndexBackedMappingStore`'s "both callers running off the cluster state thread by construction", and
+    `DescriptorGate`'s "takes the ordinary path and is gated at the bottom exactly as it was before --
+    correct, and no faster"
+  - mutation: reverting the fix fails the new phase with the offending thread named
+- Risk: medium
+- Kind: fix
