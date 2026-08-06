@@ -78,7 +78,7 @@ Append-only. One entry per task, written when the task's commit lands.
 ## T25 — Re-measure the mapped ratio with the create-path read gone
 
 - Status: complete
-- Commit: pending in this entry's commit
+- Commit: ed4e984ba46
 - Result: T24 is worth about a seventh to a fifth of what a declared mapping costs a creation.
   Final batch, eight pairs on matched storage with alternating order: median ratio 2.82x to
   2.42x, median per-creation penalty down 15%, the same runs read as 22% in ratio units. HEAD
