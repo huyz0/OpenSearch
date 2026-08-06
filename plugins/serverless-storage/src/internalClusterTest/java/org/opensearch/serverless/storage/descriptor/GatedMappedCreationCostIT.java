@@ -307,6 +307,9 @@ public class GatedMappedCreationCostIT extends org.opensearch.serverless.storage
         MappingGenerationStore.register(productionStore());
 
         createConcurrently("warmup", DECLARED, 1);
+        // After the warm-up, because that is the write that creates the mapping index, and before any arm,
+        // because a run against the wrong geometry should cost seconds rather than a full measurement.
+        assertMappingIndexGeometry();
 
         InMemoryMappingStore inMemory = new InMemoryMappingStore();
         Round warmUp = measureRound("1", inMemory);
@@ -315,7 +318,8 @@ public class GatedMappedCreationCostIT extends org.opensearch.serverless.storage
         logger.warn(
             String.format(
                 Locale.ROOT,
-                "%nT23 gated creation, %d indices per arm at concurrency %d, two rounds%n"
+                "%nT40 gated creation, %d indices per arm at concurrency %d, two rounds, "
+                    + "mapping index at %d shards%n"
                     + "                                round 1 (warm-up)   round 2 (measured)%n"
                     + "  mapped, index-backed store  : %,10.0f per second  %,10.0f per second%n"
                     + "  mapped, in-memory store     : %,10.0f per second  %,10.0f per second%n"
@@ -330,6 +334,7 @@ public class GatedMappedCreationCostIT extends org.opensearch.serverless.storage
                     + "    taking its repeat from the end of the round             : %.0f%%%n",
                 INDICES_PER_ARM,
                 CONCURRENCY,
+                mappingIndexShards(),
                 warmUp.indexBacked(),
                 measured.indexBacked(),
                 warmUp.inMemory(),
@@ -420,9 +425,46 @@ public class GatedMappedCreationCostIT extends org.opensearch.serverless.storage
      */
     private synchronized CountingStore productionStore() {
         if (productionStore == null) {
-            productionStore = new CountingStore(new IndexBackedMappingStore(client()));
+            productionStore = new CountingStore(new IndexBackedMappingStore(client(), mappingIndexShards()));
         }
         return productionStore;
+    }
+
+    /**
+     * The geometry this run gives the mapping index, from {@code -Dtests.mappingshards}.
+     *
+     * <p>T46 needs three geometries and cannot have them in one cluster: the index is created lazily by the
+     * first write and never deleted, so a second store with a different count is told the index already
+     * exists and then runs against the first one's geometry while the report claims the second. One run of
+     * this class per count, each with its own cluster, is the only arrangement that measures what it says.
+     */
+    private static int mappingIndexShards() {
+        return Integer.getInteger("tests.mappingshards", IndexBackedMappingStore.DEFAULT_SHARDS);
+    }
+
+    /**
+     * Fails unless the mapping index really has the geometry this run asked for.
+     *
+     * <p>Every way of getting a second geometry wrong reports success: the create loses to an existing
+     * index and returns normally, and a delete between arms leaves the store believing the index exists, so
+     * the next write auto-creates it at the cluster default of one shard. Without this the harness would
+     * print three numbers for one geometry and nothing would say so.
+     */
+    private void assertMappingIndexGeometry() {
+        String actual = client().admin()
+            .indices()
+            .prepareGetSettings(IndexBackedMappingStore.MAPPING_INDEX)
+            .get()
+            .getSetting(IndexBackedMappingStore.MAPPING_INDEX, IndexMetadata.SETTING_NUMBER_OF_SHARDS);
+        assertEquals(
+            "this run asked for a mapping index of "
+                + mappingIndexShards()
+                + " shards and got "
+                + actual
+                + ", so it is about to measure a geometry it did not configure",
+            String.valueOf(mappingIndexShards()),
+            actual
+        );
     }
 
     private volatile CountingStore productionStore;

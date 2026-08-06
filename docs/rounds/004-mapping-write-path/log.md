@@ -190,3 +190,18 @@ Append-only. One entry per task, written when the task's commit lands.
 Committed as 6848ad5471f, after T45 landed. This round was planned as T23 to T32 on the strength
 of STATE.md saying numbering ran to T22; the tree cites up to T39 and eight of the ten were taken.
 Renumbered to T40 to T49. Commit messages from this round still carry the old numbers.
+
+## T46 — pre-registered before the runs
+
+Written and committed before any measurement, because a threshold chosen after seeing the numbers
+is not a threshold.
+
+- Conditions: mapping index at 1, 5 and 20 shards. One cluster per condition, since the geometry
+  cannot be varied within a cluster; three runs per condition, each its own cluster.
+- Metric: the round 2 mapped-to-unmapped ratio, which normalises the machine within each run.
+- Decision rule: compare the median ratio across the three conditions. If the spread between
+  condition medians is no larger than the largest within-condition spread (max minus min of the
+  three runs at one geometry), the result is "no measurable effect at this precision" — a completed
+  task, not a failure. Only a between-condition spread exceeding the within-condition noise counts
+  as the geometry mattering.
+- Every run asserts the live shard count of `.opensearch-index-mappings` before timing anything.
