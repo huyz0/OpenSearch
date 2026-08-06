@@ -211,6 +211,22 @@ the one with tasks that fit a single invocation each.
   - mutation: reverting the fix fails the new phase with the offending thread named
 - Risk: medium
 - Kind: fix
+- **Not started. Handoff, written after T48 closed:** the fix is one of two, and choosing between them
+  is the first thing to do rather than a detail.
+  - *Widen admission.* `DescriptorOnlyCreation.mayBypassClusterState` takes only
+    `request.settings()`, which is why a template-gated index is missed. Giving it the index name and
+    cluster state so it can resolve templates would admit those creations onto GENERIC like any other,
+    and the cluster-state branch would become unreachable for gated indices. The existing comment
+    rejects this as "doing the expensive work in order to decide whether to avoid it", which is worth
+    re-examining: template resolution is a local metadata lookup, not the index-service construction
+    that admission exists to avoid.
+  - *Do not write the mapping there.* Leave admission alone and stop `clusterStateCreateIndex` making
+    a blocking store call on the cluster manager's thread. The constraint to respect is the ordering
+    already recorded in that method: the mapping must land before the descriptor, because the
+    descriptor is the acknowledgement, so this cannot simply be made asynchronous without moving the
+    acknowledgement too.
+  - Either way the three falsified comments listed above must be corrected in the same commit, and
+    `GatedMappingOffClusterStateThreadIT` is where the phase belongs.
 
 ## Numbering
 

@@ -290,3 +290,13 @@ and the build fails on that.
 - Gates: green, 7m58s.
 - Deferred: none. The two limits are stated, not filed — closing either needs durable evidence that
   the store was lost, which means recording it somewhere that is not the store.
+
+## Round status after T48
+
+T40 to T48 are complete. T49 is planned, not started, and its plan entry now carries a handoff naming
+the two candidate fixes and the constraint each has to respect. T50 was filed during T47.
+
+The round's exit criteria are met: the RFC's "leading candidate ... unmeasured" wording is replaced by
+a measured split with controls, the creation path no longer issues a read that cannot return anything,
+and the store has tests for read failure, deletion and geometry. T49 and T50 are work this round
+discovered rather than work it set out to do, and they belong to the next round's plan.

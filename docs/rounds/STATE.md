@@ -10,7 +10,7 @@ Updated: 2026-08-06
 | | |
 |---|---|
 | Active round | 004, the mapping write path ([plan](004-mapping-write-path/plan.md)) |
-| Next action | `/round-next`, task T49 (the last of round 004) |
+| Next action | `/round-next`, task T49 (the last of round 004, not started) |
 | Last task | T48 complete |
 | Branch | `feature/serverless` |
 
