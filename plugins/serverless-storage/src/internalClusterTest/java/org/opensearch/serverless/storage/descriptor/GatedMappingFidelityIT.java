@@ -26,7 +26,7 @@ import java.util.Map;
  *
  * T11 stopped a create-time mapping being discarded by writing its fields to
  * {@code MappingGenerationStore}, and guarded the write with
- * {@code DescriptorRepresentable#simpleFieldsOrNull}, which returns null rather than a partial map when
+ * {@code DescriptorRepresentable#fieldDefinitionsOrNull}, which returns null rather than a partial map when
  * something will not round-trip. Its own javadoc names the reason: "carrying the fields that do fit and
  * dropping the rest is the original silent loss one level in."
  *
@@ -44,7 +44,7 @@ import java.util.Map;
  *
  * <h2>And the two extractors do not mirror each other</h2>
  *
- * {@code simpleFieldsOrNull} is documented as mirroring the extraction
+ * {@code fieldDefinitionsOrNull} is documented as mirroring the extraction
  * {@code MetadataMappingService#recordGatedMapping} does for a put-mapping on a gated index, "deliberately:
  * two extractors that disagreed would mean a field gated at creation and refused on update, or the reverse."
  *
@@ -119,7 +119,7 @@ public class GatedMappingFidelityIT extends org.opensearch.serverless.storage.Se
             )
             .actionGet();
 
-        assertMappingIsNotSilentlyReduced("fidelity-date", "when");
+        assertMappingIsNotSilentlyReduced("fidelity-date", "when", "format");
     }
 
     /**
@@ -145,7 +145,7 @@ public class GatedMappingFidelityIT extends org.opensearch.serverless.storage.Se
             )
             .actionGet();
 
-        assertMappingIsNotSilentlyReduced("fidelity-limit", "code");
+        assertMappingIsNotSilentlyReduced("fidelity-limit", "code", "ignore_above");
     }
 
     /**
@@ -173,7 +173,7 @@ public class GatedMappingFidelityIT extends org.opensearch.serverless.storage.Se
         String uuid = descriptorUuid("fidelity-plain");
         MappingGenerationStore.MappingGeneration generation = MappingGenerationStore.currentMapping(uuid);
         assertNotNull("and its fields must be in the store", generation);
-        assertEquals("keyword", generation.fields().get("tenant"));
+        assertEquals("keyword", MappingGenerationStore.typeOf(generation.fields().get("tenant")));
     }
 
     /**
@@ -185,44 +185,52 @@ public class GatedMappingFidelityIT extends org.opensearch.serverless.storage.Se
      * test states the property rather than the implementation, and survives a change of mind about which
      * of the two answers to give.
      */
-    private void assertMappingIsNotSilentlyReduced(String index, String field) throws Exception {
+    private void assertMappingIsNotSilentlyReduced(String index, String field, String parameter) throws Exception {
         ClusterState state = client().admin().cluster().prepareState().get().getState();
-        boolean gated = state.metadata().index(index) == null;
-        if (gated == false) {
-            // Refused, and the mapping is intact in cluster state where an ordinary index keeps it.
+        if (state.metadata().index(index) != null) {
+            // Refused, and the mapping is intact in cluster state where an ordinary index keeps it. This was
+            // the answer between T13 and T15: honest, and it cost residency for most real mappings.
             assertNotNull("a refused index must keep the mapping it was created with", state.metadata().index(index).mapping());
             assertTrue(
                 "and the parameter must be in it: " + state.metadata().index(index).mapping().source(),
-                state.metadata().index(index).mapping().source().toString().contains(field)
+                state.metadata().index(index).mapping().source().toString().contains(parameter)
             );
             return;
         }
 
-        String uuid = descriptorUuid(index);
-        MappingGenerationStore.MappingGeneration generation = MappingGenerationStore.currentMapping(uuid);
-        fail(
-            "index ["
-                + index
-                + "] was gated and the store holds only ["
-                + (generation == null ? "nothing" : generation.fields())
-                + "], so every parameter declared on ["
+        // Gated, so the store must hold the parameter as well as the type. Asserting the index is gated
+        // proves only that it took the fast path; asserting the parameter is what says nothing was dropped
+        // on the way, which is the whole question this class exists for.
+        MappingGenerationStore.MappingGeneration generation = MappingGenerationStore.currentMapping(descriptorUuid(index));
+        assertNotNull("a gated index's declared fields must be in the mapping store", generation);
+        Map<String, Object> definition = generation.definitionOf(field);
+        assertNotNull("field [" + field + "] must be in the store, not only its neighbours: " + generation.fields(), definition);
+        assertTrue(
+            "field ["
                 + field
-                + "] was accepted and then dropped. A tenant that declared a date format or an analyzer got "
-                + "neither, and was told its mapping was accepted"
+                + "] was stored as ["
+                + definition
+                + "], so ["
+                + parameter
+                + "] was accepted and then dropped. A tenant that declared a date format or a length limit "
+                + "got neither, and was told its mapping was accepted",
+            definition.containsKey(parameter)
         );
     }
 
     /**
      * A put-mapping the store cannot carry must fail, not succeed with the field missing.
      *
-     * <p>The other half of the defect, and the worse half. The creation path refused an object field, so an
-     * index using one stayed resident and worked. The put-mapping path skipped whatever it could not read,
-     * recorded the rest and reported success -- so the same field arriving by update was acknowledged and
-     * dropped.
+     * <p>The other half of the defect T13 fixed, and the worse half. The creation path refused what it
+     * could not hold, so the index stayed resident and worked. The put-mapping path skipped whatever it
+     * could not read, recorded the rest and reported success -- so the same declaration arriving by update
+     * was acknowledged and silently reduced.
      *
-     * <p>There is no third option here. The index is not in cluster state, so the mapping cannot be applied
-     * the ordinary way, and the store cannot hold it. Failing is the only answer that does not lose the
-     * field.
+     * <p>The case here is a shorthand definition ({@code "profile": "keyword"}) rather than the object field
+     * it used to be, because T15 made object fields carry. What is left with no representation is a
+     * property whose definition is not an object at all, and there is still no third option for it: the
+     * index is not in cluster state, so the mapping cannot be applied the ordinary way, and the store
+     * cannot hold it. Failing is the only answer that does not lose the field.
      */
     public void testAPutMappingTheStoreCannotCarryFailsRatherThanSucceeding() throws Exception {
         installBlobBackedDescriptorPlane();
@@ -236,18 +244,19 @@ public class GatedMappingFidelityIT extends org.opensearch.serverless.storage.Se
             () -> client().admin()
                 .indices()
                 .preparePutMapping("fidelity-put")
-                .setSource(Map.of("properties", Map.of("profile", Map.of("properties", Map.of("city", Map.of("type", "keyword"))))))
+                .setSource(Map.of("properties", Map.of("profile", "keyword")))
                 .get()
         );
 
         assertTrue(
             "the failure must say the store cannot carry the field, rather than being an unrelated error: " + failure,
-            failure.toString().contains("cannot carry") || failure.toString().contains("held outside cluster state")
+            failure.toString().contains("cannot carry")
+                || failure.toString().contains("held outside cluster state")
+                || failure.toString().contains("no representation")
         );
 
         // And nothing was recorded, because a partial record is the loss this refuses.
-        String uuid = descriptorUuid("fidelity-put");
-        MappingGenerationStore.MappingGeneration generation = MappingGenerationStore.currentMapping(uuid);
+        MappingGenerationStore.MappingGeneration generation = MappingGenerationStore.currentMapping(descriptorUuid("fidelity-put"));
         assertTrue(
             "a refused put-mapping must leave the store untouched, not half-applied: "
                 + (generation == null ? "nothing" : generation.fields()),
@@ -278,10 +287,9 @@ public class GatedMappingFidelityIT extends org.opensearch.serverless.storage.Se
             .setSource(Map.of("properties", Map.of("level", Map.of("type", "keyword"))))
             .get();
 
-        String uuid = descriptorUuid("fidelity-put-ok");
-        MappingGenerationStore.MappingGeneration generation = MappingGenerationStore.currentMapping(uuid);
+        MappingGenerationStore.MappingGeneration generation = MappingGenerationStore.currentMapping(descriptorUuid("fidelity-put-ok"));
         assertNotNull("a put-mapping that round-trips must reach the store", generation);
-        assertEquals("keyword", generation.fields().get("level"));
+        assertEquals("keyword", MappingGenerationStore.typeOf(generation.fields().get("level")));
     }
 
     /** The descriptor's uuid for a gated name, which is the key the mapping store is written under. */

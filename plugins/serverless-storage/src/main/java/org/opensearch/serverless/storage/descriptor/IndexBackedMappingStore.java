@@ -76,7 +76,7 @@ public final class IndexBackedMappingStore implements MappingGenerationStore.Sto
                 return null;
             }
             @SuppressWarnings("unchecked")
-            Map<String, String> fields = (Map<String, String>) response.getSourceAsMap().getOrDefault("fields", Map.of());
+            Map<String, Object> fields = (Map<String, Object>) response.getSourceAsMap().getOrDefault("fields", Map.of());
             return new MappingGenerationStore.MappingGeneration(response.getVersion(), fields);
         } catch (Exception e) {
             // No mapping index yet means no mapping, which is what an index with no fields looks like.
@@ -118,10 +118,16 @@ public final class IndexBackedMappingStore implements MappingGenerationStore.Sto
     }
 
     /** Collapses a mapping into one {type, count} entry per distinct field type. */
-    private static java.util.List<Map<String, Object>> typeCountsOf(Map<String, String> fields) {
+    private static java.util.List<Map<String, Object>> typeCountsOf(Map<String, Object> fields) {
         Map<String, Long> perType = new HashMap<>();
-        for (String type : fields.values()) {
-            perType.merge(type, 1L, Long::sum);
+        for (Object value : fields.values()) {
+            // Reads the type out of the definition rather than treating the value as one. Since T15 the
+            // stored value is a field's whole definition; a value written before that is a bare type name,
+            // and MappingGenerationStore#typeOf resolves both.
+            String type = MappingGenerationStore.typeOf(value);
+            if (type != null) {
+                perType.merge(type, 1L, Long::sum);
+            }
         }
         java.util.List<Map<String, Object>> counts = new java.util.ArrayList<>(perType.size());
         for (Map.Entry<String, Long> each : perType.entrySet()) {

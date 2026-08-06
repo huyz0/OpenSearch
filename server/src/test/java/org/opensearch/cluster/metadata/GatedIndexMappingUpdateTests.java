@@ -69,7 +69,7 @@ public class GatedIndexMappingUpdateTests extends OpenSearchTestCase {
      * should differ: an object field and a field parameter fail the same guard for different reasons, and a
      * reader comparing them should see the mappings side by side rather than two copies of the wiring.
      */
-    private void expectRefusal(String mappingSource, Map<String, Map<String, String>> stored) {
+    private void expectRefusal(String mappingSource, Map<String, Map<String, Object>> stored) {
         ClusterService clusterService = org.mockito.Mockito.mock(ClusterService.class);
         org.mockito.Mockito.when(clusterService.state()).thenReturn(ClusterState.builder(ClusterName.DEFAULT).build());
         MetadataMappingService service = new MetadataMappingService(
@@ -159,7 +159,7 @@ public class GatedIndexMappingUpdateTests extends OpenSearchTestCase {
      * observe rather than as a claim in a comment. The previous claim was in a comment, and it was wrong.
      */
     public void testAGatedMappingIsRecordedWithoutTouchingTheClusterManager() throws Exception {
-        Map<String, Map<String, String>> stored = new HashMap<>();
+        Map<String, Map<String, Object>> stored = new HashMap<>();
         registerStore(stored);
 
         ClusterService clusterService = org.mockito.Mockito.mock(ClusterService.class);
@@ -182,7 +182,7 @@ public class GatedIndexMappingUpdateTests extends OpenSearchTestCase {
         service.putMapping(request, future);
         assertTrue("a gated put-mapping must be acknowledged", future.actionGet().isAcknowledged());
 
-        assertEquals("the field must have reached the store", "long", stored.get("gated-uuid").get("age"));
+        assertEquals("the field must have reached the store", "long", MappingGenerationStore.typeOf(stored.get("gated-uuid").get("age")));
         org.mockito.Mockito.verify(clusterService, org.mockito.Mockito.never())
             .submitStateUpdateTask(
                 org.mockito.ArgumentMatchers.anyString(),
@@ -195,7 +195,7 @@ public class GatedIndexMappingUpdateTests extends OpenSearchTestCase {
 
     /** A second field from another shard must join the first rather than replace it. */
     public void testASecondFieldJoinsTheFirst() {
-        Map<String, Map<String, String>> stored = new HashMap<>();
+        Map<String, Map<String, Object>> stored = new HashMap<>();
         registerStore(stored);
 
         MappingGenerationStore.updateMapping("gated-uuid", Map.of("age", "long"));
@@ -213,37 +213,98 @@ public class GatedIndexMappingUpdateTests extends OpenSearchTestCase {
      * A put-mapping the store cannot carry must fail the request rather than record part of it.
      *
      * <p>The extraction here used to skip any property it could not read, record the rest and report
-     * success. So an object field added to a gated index was acknowledged and silently absent, while the
-     * same field at creation was refused and kept the index in cluster state -- the "gated at creation and
+     * success. So a declaration added to a gated index was acknowledged and silently absent, while the same
+     * declaration at creation was refused and kept the index in cluster state -- the "gated at creation and
      * refused on update, or the reverse" that the shared extractor exists to make impossible.
      *
-     * <p>Asserted through the executor rather than against the extractor, for the reason the test beside it
-     * records: an extractor test passes just as well with the wiring removed.
+     * <p>The case is a shorthand definition rather than the object field it was when T13 wrote it, because
+     * T15 widened the store to hold whole definitions and object fields now carry. What remains
+     * unrepresentable is a definition that is not an object at all.
+     *
+     * <p>Asserted through {@code putMapping} rather than against the extractor, for the reason the test
+     * above records: an extractor test passes just as well with the wiring removed.
      */
-    public void testTheExecutorRefusesAMappingTheStoreCannotCarry() throws Exception {
-        Map<String, Map<String, String>> stored = new HashMap<>();
+    public void testAPutMappingTheStoreCannotCarryIsRefused() throws Exception {
+        Map<String, Map<String, Object>> stored = new HashMap<>();
         registerStore(stored);
 
-        // An object field: the store holds a flat name-to-type map and has nowhere to put it.
-        expectRefusal("{\"properties\":{\"profile\":{\"properties\":{\"city\":{\"type\":\"keyword\"}}}}}", stored);
+        expectRefusal("{\"properties\":{\"profile\":\"keyword\"}}", stored);
     }
 
     /**
-     * A field parameter must not pass the guard and then be dropped.
+     * A field parameter is carried rather than refused, which is what T15 changed.
      *
-     * <p>Separate from the object-field case because they fail differently. An object field has no
-     * top-level type and was visibly unrepresentable; {@code ignore_above} sits beside a perfectly good
-     * {@code keyword} and was invisible -- the guard asked whether a type was declared, which is true here,
-     * rather than whether the definition was nothing but the type.
+     * <p>This asserted a refusal when T13 wrote it, and the refusal was correct at the time: the store held
+     * a flat name-to-type map, so {@code ignore_above} sitting beside a perfectly good {@code keyword} had
+     * nowhere to go. The guard before that asked whether a type was declared -- true here -- rather than
+     * whether the definition was nothing but the type, which is why the parameter was dropped invisibly.
+     *
+     * <p>Now the stored value is the definition, so the assertion is that the parameter arrived, not that
+     * the request was rejected. Asserting only that the field is present would pass against the old
+     * behaviour, which stored the type and dropped the rest.
      */
-    public void testTheExecutorRefusesAFieldParameterItWouldDrop() throws Exception {
-        Map<String, Map<String, String>> stored = new HashMap<>();
+    public void testAFieldParameterIsCarriedIntoTheStore() throws Exception {
+        Map<String, Map<String, Object>> stored = new HashMap<>();
         registerStore(stored);
 
-        expectRefusal("{\"properties\":{\"code\":{\"type\":\"keyword\",\"ignore_above\":256}}}", stored);
+        ClusterService clusterService = org.mockito.Mockito.mock(ClusterService.class);
+        org.mockito.Mockito.when(clusterService.state()).thenReturn(ClusterState.builder(ClusterName.DEFAULT).build());
+        MetadataMappingService service = new MetadataMappingService(
+            clusterService,
+            org.mockito.Mockito.mock(org.opensearch.indices.IndicesService.class),
+            threadPool
+        );
+
+        PutMappingClusterStateUpdateRequest request = new PutMappingClusterStateUpdateRequest(
+            "{\"properties\":{\"code\":{\"type\":\"keyword\",\"ignore_above\":256}}}"
+        );
+        request.indices(new Index[] { new Index("gated-idx", "gated-uuid") });
+
+        PlainActionFuture<ClusterStateUpdateResponse> future = PlainActionFuture.newFuture();
+        service.putMapping(request, future);
+        assertTrue("a definition the store can hold must be acknowledged", future.actionGet().isAcknowledged());
+
+        Map<String, Object> definition = MappingGenerationStore.definition(stored.get("gated-uuid").get("code"));
+        assertNotNull("the field must have reached the store", definition);
+        assertEquals("keyword", definition.get("type"));
+        assertEquals("and its parameter with it, or the store reduced it to a type again", 256, definition.get("ignore_above"));
     }
 
-    private static void registerStore(Map<String, Map<String, String>> stored) {
+    /**
+     * An object field is carried too, with its sub-properties.
+     *
+     * <p>The limitation that forced every refusal in this area was the store's flat name-to-type map, and a
+     * property with its own properties was the case that could not be squeezed into it at all. Kept as a
+     * separate case from the parameter above because they were unrepresentable for different reasons, and a
+     * widening that handled one and not the other would leave the feature half-usable.
+     */
+    public void testAnObjectFieldIsCarriedIntoTheStore() throws Exception {
+        Map<String, Map<String, Object>> stored = new HashMap<>();
+        registerStore(stored);
+
+        ClusterService clusterService = org.mockito.Mockito.mock(ClusterService.class);
+        org.mockito.Mockito.when(clusterService.state()).thenReturn(ClusterState.builder(ClusterName.DEFAULT).build());
+        MetadataMappingService service = new MetadataMappingService(
+            clusterService,
+            org.mockito.Mockito.mock(org.opensearch.indices.IndicesService.class),
+            threadPool
+        );
+
+        PutMappingClusterStateUpdateRequest request = new PutMappingClusterStateUpdateRequest(
+            "{\"properties\":{\"profile\":{\"properties\":{\"city\":{\"type\":\"keyword\"}}}}}"
+        );
+        request.indices(new Index[] { new Index("gated-idx", "gated-uuid") });
+
+        PlainActionFuture<ClusterStateUpdateResponse> future = PlainActionFuture.newFuture();
+        service.putMapping(request, future);
+        assertTrue("an object field must be acknowledged now that the store can hold it", future.actionGet().isAcknowledged());
+
+        Map<String, Object> definition = MappingGenerationStore.definition(stored.get("gated-uuid").get("profile"));
+        assertNotNull("the object field must have reached the store", definition);
+        assertTrue("with its sub-properties, or carrying it bought nothing: " + definition, definition.containsKey("properties"));
+    }
+
+    private static void registerStore(Map<String, Map<String, Object>> stored) {
         MappingGenerationStore.register(new MappingGenerationStore.Store() {
             private final Map<String, MappingGenerationStore.MappingGeneration> byUuid = new HashMap<>();
 

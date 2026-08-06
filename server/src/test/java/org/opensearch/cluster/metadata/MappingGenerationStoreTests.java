@@ -70,7 +70,7 @@ public class MappingGenerationStoreTests extends OpenSearchTestCase {
         assertTrue("every writer must finish", finished.await(30, TimeUnit.SECONDS));
         assertNull("no writer may fail: " + failure.get(), failure.get());
 
-        Map<String, String> finalFields = store.read("idx").fields();
+        Map<String, Object> finalFields = store.read("idx").fields();
         assertEquals("every concurrently inferred field must survive the merge, none may be overwritten", writers, finalFields.size());
         for (int i = 0; i < writers; i++) {
             assertTrue("field-" + i + " was lost, so a document that introduced it is unqueryable", finalFields.containsKey("field-" + i));

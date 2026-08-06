@@ -95,99 +95,76 @@ public final class DescriptorRepresentable {
                 + "IndexDescriptor#toIndexMetadata drops it, so the index would be hidden from wildcards and "
                 + "visible to everything else";
         }
-        // A descriptor carries a mappingGeneration, not a mapping. Mappings live in MappingGenerationStore,
-        // IndexDescriptor#from does not copy them, and nothing writes them there at creation -- so an index
-        // created with an explicit mapping had it parsed, validated, built into this very IndexMetadata, and
-        // then dropped when the descriptor was written.
+        // A descriptor carries a mappingGeneration, not a mapping. The fields live in
+        // MappingGenerationStore, and until T11 nothing wrote them there at creation, so an index created
+        // with an explicit mapping had it parsed, validated, built into this very IndexMetadata, and then
+        // dropped when the descriptor was written -- acknowledged, with the first document to arrive
+        // inferring the fields again from its own values.
         //
-        // Worse than simply losing it: the creation was acknowledged, nothing failed, and the first document
-        // to arrive inferred the fields again from its own values. A tenant that declared a field as a
-        // keyword and then indexed a number got a long, silently, having been told its mapping was accepted.
-        //
-        // This is a refusal rather than a fix, and the difference is worth stating. Carrying create-time
-        // mappings into MappingGenerationStore is what would make gating work with them; until that exists a
-        // deployment giving every tenant an explicit mapping gets no gated indices at all, which is the main
-        // use case this design is for. Refusing is what stops data being lost while that is built.
-        if (indexMetadata.mapping() != null && simpleFieldsOrNull(indexMetadata) == null) {
-            return "index declares a mapping that cannot be carried field by field: a descriptor holds a "
-                + "mapping generation while the fields live in the mapping store, which holds a flat map of "
-                + "field name to type, so only a top-level property whose definition is exactly a declared "
-                + "type round-trips. An object or nested field, or any field parameter such as a date "
-                + "format or an analyzer, would be accepted and then discarded";
+        // T11 carried them, T13 stopped the carrying being lossy, and T15 widened the store to hold a
+        // field's whole definition rather than its type. What is left to refuse is small: a property whose
+        // definition is not an object at all. Object and nested fields, and every field parameter, now
+        // round-trip.
+        if (indexMetadata.mapping() != null && fieldDefinitionsOrNull(indexMetadata) == null) {
+            return "index declares a mapping with a property whose definition is not an object, which the "
+                + "mapping store has no representation for";
         }
         return null;
     }
 
     /**
-     * The mapping's top-level fields as name to type, or null if any of it would not round-trip.
+     * The mapping's top-level fields as name to definition, or null if any of it would not round-trip.
      *
      * <p>A descriptor carries a mapping generation and the fields live in {@code MappingGenerationStore},
-     * so gating an index with a mapping means writing those fields there at creation. That works exactly as
-     * far as the store's shape allows: a flat map of field name to type. A property with no declared type,
-     * one whose definition is an object or nested field with its own properties, or one carrying any
-     * parameter beside the type, has no representation in that map.
+     * so gating an index with a mapping means writing those fields there at creation.
      *
-     * <p><b>Any parameter, not only a structural one.</b> The first version of this required a declared
-     * type and no sub-properties, which reads like a completeness check and is not one: a definition may
-     * name a type and carry six other things, and only the type survives. So {@code format}, {@code
-     * analyzer}, {@code normalizer}, {@code ignore_above}, {@code null_value} and multi-{@code fields} all
-     * passed the guard and were dropped. Losing a date format is not a lost setting, it is a document that
-     * parses to a different day than the tenant's mapping said it would.
+     * <p><b>What this refuses shrank twice, and the order matters.</b> It first required a declared type and
+     * no sub-properties, which reads like a completeness check and was not one: a definition may name a type
+     * and carry six other things, and only the type was stored, so {@code format}, {@code analyzer},
+     * {@code ignore_above} and multi-{@code fields} passed the guard and were dropped. T13 made the rule
+     * match what was kept -- the type and nothing beside it -- which was honest and refused most real
+     * mappings. T15 then widened the store to hold the definition itself, so the rule could shrink to what
+     * genuinely has no representation.
      *
-     * <p><b>Null rather than a partial map, and the difference is the whole point.</b> Returning the fields
-     * that do round-trip and dropping the rest is the silent loss this check exists to prevent, one level
-     * further in. An index that cannot be carried completely is not gated at all, keeps its cluster state
-     * entry, and works normally.
-     *
-     * <p>Mirrors the extraction {@code MetadataMappingService} already does for a put-mapping on a gated
-     * index, deliberately: two extractors that disagreed would mean a field gated at creation and refused
-     * on update, or the reverse.
+     * <p><b>Null rather than a partial map, throughout.</b> Returning the fields that do round-trip and
+     * dropping the rest is the silent loss this check exists to prevent, one level further in. An index that
+     * cannot be carried completely is not gated at all, keeps its cluster state entry, and works normally.
      */
-    static Map<String, String> simpleFieldsOrNull(IndexMetadata indexMetadata) {
+    static Map<String, Object> fieldDefinitionsOrNull(IndexMetadata indexMetadata) {
         MappingMetadata mapping = indexMetadata.mapping();
         if (mapping == null) {
             return Map.of();
         }
-        return fieldTypesOrNull(mapping.sourceAsMap().get("properties"));
+        return fieldDefinitionsOrNull(mapping.sourceAsMap().get("properties"));
     }
 
     /**
      * The one extraction, shared by both paths that write a gated mapping.
      *
-     * <p>{@link #simpleFieldsOrNull} calls it for a create-time mapping and
+     * <p>{@link #fieldDefinitionsOrNull} calls it for a create-time mapping and
      * {@code MetadataMappingService#recordGatedMapping} for a put-mapping. They used to be two
      * implementations described as mirroring each other, and they did not: this one refused a partial
      * result while that one skipped whatever it could not read and reported success, so an object field was
      * refused at creation and silently dropped on update. One function is what makes the claim true.
      *
      * @param properties the mapping's {@code properties} object, however the caller obtained it
-     * @return name to type for every field, or null if any of it would not round-trip
+     * @return name to definition for every field, or null if any of it would not round-trip
      */
-    static Map<String, String> fieldTypesOrNull(Object properties) {
+    static Map<String, Object> fieldDefinitionsOrNull(Object properties) {
         if (properties instanceof Map == false) {
             // A mapping with no properties at all carries nothing, so there is nothing to lose.
             return Map.of();
         }
-        Map<String, String> fields = new HashMap<>();
+        Map<String, Object> fields = new HashMap<>();
         for (Map.Entry<?, ?> property : ((Map<?, ?>) properties).entrySet()) {
             Object definition = property.getValue();
             if (definition instanceof Map == false) {
+                // A definition that is not an object at all -- a bare string shorthand, say. The store
+                // holds definitions, so there is nothing sensible to store for this, and guessing is how
+                // the losses this guard exists for happened in the first place.
                 return null;
             }
-            Map<?, ?> asMap = (Map<?, ?>) definition;
-            Object type = asMap.get("type");
-            // The type alone, and nothing beside it. Requiring a declared type and no sub-properties was
-            // not enough: it let every field *parameter* through the guard and then dropped it, because
-            // only the type is what gets stored. A date declared with format dd/MM/yyyy was stored as a
-            // bare date, so documents that used to parse began failing or landing on a different day, from
-            // an index whose creation had been acknowledged.
-            //
-            // Checking the size is what makes the rule "this definition is exactly the type" rather than
-            // "this definition mentions a type", and only the first of those is true of what is kept.
-            if (type == null || asMap.size() != 1) {
-                return null;
-            }
-            fields.put(String.valueOf(property.getKey()), String.valueOf(type));
+            fields.put(String.valueOf(property.getKey()), definition);
         }
         return fields;
     }

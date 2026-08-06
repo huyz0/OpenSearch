@@ -111,7 +111,7 @@ public class IndexBackedMappingStoreIT extends org.opensearch.serverless.storage
         assertTrue("every writer must finish", done.await(2, TimeUnit.MINUTES));
         assertEquals("no writer may fail outright", 0, failures.get());
 
-        Map<String, String> fields = store().read("converging").fields();
+        Map<String, Object> fields = store().read("converging").fields();
         assertEquals(
             "every concurrently inferred field must survive, or a document is accepted and its field is "
                 + "silently lost, which is worse than rejecting the write",

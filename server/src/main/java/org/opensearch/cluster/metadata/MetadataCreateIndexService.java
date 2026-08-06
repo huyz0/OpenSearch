@@ -2127,7 +2127,7 @@ public class MetadataCreateIndexService {
             // and that setting is also a precondition of gating, so a gated creation is never on the cluster
             // state thread. An index admitted and then refused by the gate falls back to the ordinary path
             // and never reaches this line.
-            java.util.Map<String, String> declaredFields = DescriptorRepresentable.simpleFieldsOrNull(indexMetadata);
+            java.util.Map<String, Object> declaredFields = DescriptorRepresentable.fieldDefinitionsOrNull(indexMetadata);
             if (declaredFields != null && declaredFields.isEmpty() == false) {
                 MappingGenerationStore.updateMapping(indexMetadata.getIndexUUID(), declaredFields);
             }

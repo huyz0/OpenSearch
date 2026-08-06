@@ -291,18 +291,18 @@ public class MetadataMappingService {
         /**
          * Records the request's fields against the index's mapping generation.
          *
-         * <p>Extraction is {@link DescriptorRepresentable#fieldTypesOrNull}, the same call the creation path
-         * makes. Sharing it is the point rather than a tidy-up: these were two implementations documented as
-         * mirroring each other, and the divergence was not cosmetic. A mapping the creation path refused
-         * outright, this one accepted and silently reduced.
+         * <p>Extraction is {@link DescriptorRepresentable#fieldDefinitionsOrNull(Object)}, the same call the
+         * creation path makes. Sharing it is the point rather than a tidy-up: these were two implementations
+         * documented as mirroring each other, and the divergence was not cosmetic. A mapping the creation
+         * path refused outright, this one accepted and silently reduced.
          *
-         * <p>What still cannot be carried is anything the store's flat name-to-type map has no room for: an
-         * object or nested field, or a field parameter such as a date format. That is the store's shape
-         * rather than this wiring's, and lifting it means changing what the store holds.
+         * <p>Since T15 the store holds a field's whole definition, so object and nested fields and every
+         * field parameter round-trip. What is left to refuse is a property whose definition is not an object
+         * at all.
          */
         void recordGatedMapping(PutMappingClusterStateUpdateRequest request) throws IOException {
             Map<String, Object> parsed = XContentHelper.convertToMap(MediaTypeRegistry.JSON.xContent(), request.source(), false);
-            Map<String, String> fields = DescriptorRepresentable.fieldTypesOrNull(parsed.get("properties"));
+            Map<String, Object> fields = DescriptorRepresentable.fieldDefinitionsOrNull(parsed.get("properties"));
             if (fields == null) {
                 // Refused rather than partially recorded, and this is the half of the defect that was
                 // worse. The extraction here used to skip any property it could not read and record the

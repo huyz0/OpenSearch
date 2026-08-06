@@ -54,9 +54,11 @@ import java.util.Map;
  * And the extraction returns nothing at all rather than a partial map when some property will not fit,
  * because carrying the fields that do fit and dropping the rest is the original silent loss one level in.
  *
- * <p>What still cannot be carried is an object or nested field, since the store holds a flat map of field
- * name to type and a property with its own properties has nowhere to go in it. That limit is the mapping
- * store's shape rather than the descriptor's, and lifting it means changing what the store holds.
+ * <p>Two more rounds followed, and the shape of them is the point. T13 found the carrying was leakier than
+ * it read: the guard asked whether a type was declared, not whether the definition was nothing but the type,
+ * so a date format or a length limit passed it and was dropped. Tightening the guard fixed the loss and
+ * refused most real mappings. T15 then widened the store to hold a field's whole definition, which is what
+ * the limitation always was, and both refusals shrank to a property whose definition is not an object at all.
  */
 public class GatedCreateTimeMappingIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
 
@@ -134,19 +136,23 @@ public class GatedCreateTimeMappingIT extends org.opensearch.serverless.storage.
         String uuid = descriptorUuid("gated-mapped");
         var generation = org.opensearch.cluster.metadata.MappingGenerationStore.currentMapping(uuid);
         assertNotNull("the declared fields must be in the mapping store after a gated creation", generation);
-        assertEquals("keyword", generation.fields().get("tenant"));
-        assertEquals("double", generation.fields().get("amount"));
+        assertEquals("keyword", org.opensearch.cluster.metadata.MappingGenerationStore.typeOf(generation.fields().get("tenant")));
+        assertEquals("double", org.opensearch.cluster.metadata.MappingGenerationStore.typeOf(generation.fields().get("amount")));
     }
 
     /**
-     * An object field is still refused, because the store has nowhere to put it.
+     * An object field is carried too, which is what T15 changed.
      *
-     * <p>The relaxation is to what round-trips, not to mappings in general.
-     * {@code MappingGenerationStore} holds a flat map of field name to type, so a property with its own
-     * properties has no representation there. Carrying the fields that do fit and dropping the rest would
-     * be the original silent loss one level further in.
+     * <p>This asserted the opposite until then, and the reason it did is worth keeping. The store held a
+     * flat map of field name to type, so a property with its own properties had no representation in it and
+     * refusing was the only answer that did not lose the field. T13 found the refusal was leakier than it
+     * read -- a definition naming a type and carrying anything else passed the guard and was reduced to the
+     * type -- and tightened it, which was honest and refused most real mappings.
+     *
+     * <p>T15 widened the store to hold a field's whole definition rather than its type, so the limitation
+     * that forced both refusals is gone. An object field is a definition like any other now.
      */
-    public void testAnObjectFieldIsStillRefused() throws Exception {
+    public void testAnObjectFieldIsCarried() throws Exception {
         installBlobBackedDescriptorPlane();
 
         client().admin()
@@ -158,10 +164,16 @@ public class GatedCreateTimeMappingIT extends org.opensearch.serverless.storage.
             .actionGet();
 
         ClusterState state = client().admin().cluster().prepareState().get().getState();
-        IndexMetadata metadata = state.metadata().index("gated-object");
-        assertNotNull("an index with an object field must keep its cluster state entry rather than losing it", metadata);
-        assertNotNull("and its mapping must still be there", metadata.mapping());
-        assertTrue("including the object field: " + metadata.mapping().source(), metadata.mapping().source().toString().contains("inner"));
+        assertNull("an index with an object field must now be gated rather than kept resident", state.metadata().index("gated-object"));
+
+        var generation = org.opensearch.cluster.metadata.MappingGenerationStore.currentMapping(descriptorUuid("gated-object"));
+        assertNotNull("its declared fields must be in the mapping store", generation);
+        Map<String, Object> nested = generation.definitionOf("nested");
+        assertNotNull("the object field must be in the store: " + generation.fields(), nested);
+        assertTrue(
+            "and its sub-properties must have come with it, or carrying it bought nothing: " + nested,
+            nested.containsKey("properties")
+        );
     }
 
     /** The descriptor's uuid for a gated name, which is the key the mapping store is written under. */

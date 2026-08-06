@@ -63,8 +63,21 @@ public final class MappingGenerationStore {
         boolean compareAndSwap(String indexUuid, long expectedGeneration, MappingGeneration updated);
     }
 
-    /** A mapping and the generation it was read at, which is what makes the swap safe. */
-    public record MappingGeneration(long generation, Map<String, String> fields) {
+    /**
+     * A mapping and the generation it was read at, which is what makes the swap safe.
+     *
+     * <p><b>Each value is a field's whole definition, not its type.</b> It held the type alone until T15,
+     * and that shape was the reason gating had to refuse most real mappings: a definition naming a type and
+     * carrying anything else -- {@code format}, {@code analyzer}, {@code ignore_above} -- had nowhere to put
+     * the rest, and an object field had nowhere to put its properties. T13 made those refusals honest after
+     * they were found silently dropping what they could not hold. Widening the value is what makes them
+     * narrow, because the limitation was always this map rather than either caller.
+     *
+     * <p>A plain string value is still accepted and read as {@code {"type": value}}. That covers documents
+     * written before the widening and callers that only ever mean a type, and {@link #definitionOf} is the
+     * one place that difference is resolved.
+     */
+    public record MappingGeneration(long generation, Map<String, Object> fields) {
         public MappingGeneration {
             fields = Map.copyOf(fields);
         }
@@ -72,11 +85,35 @@ public final class MappingGenerationStore {
         public static MappingGeneration empty() {
             return new MappingGeneration(0L, Map.of());
         }
+
+        /** A field's definition as a map, normalising the bare-type form. Null when the field is absent. */
+        public Map<String, Object> definitionOf(String field) {
+            return definition(fields.get(field));
+        }
+    }
+
+    /** Normalises a stored value to a definition map: a bare type string becomes {@code {"type": it}}. */
+    @SuppressWarnings("unchecked")
+    public static Map<String, Object> definition(Object value) {
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof Map) {
+            return (Map<String, Object>) value;
+        }
+        return Map.of("type", String.valueOf(value));
+    }
+
+    /** A stored value's declared type, whichever form it is in. Null when it declares none. */
+    public static String typeOf(Object value) {
+        Map<String, Object> definition = definition(value);
+        Object type = definition == null ? null : definition.get("type");
+        return type == null ? null : String.valueOf(type);
     }
 
     /** Raised when two inferences disagree about a field's type, which no retry can reconcile. */
     public static class MappingConflictException extends IllegalArgumentException {
-        public MappingConflictException(String field, String existing, String proposed) {
+        public MappingConflictException(String field, Object existing, Object proposed) {
             super("field [" + field + "] is mapped as [" + existing + "] and cannot be changed to [" + proposed + "]");
         }
     }
@@ -104,7 +141,7 @@ public final class MappingGenerationStore {
      * @return the generation the mapping reached, or -1 when no store is installed
      * @throws MappingConflictException when a field already exists with a different type
      */
-    public static long updateMapping(String indexUuid, Map<String, String> newFields) {
+    public static long updateMapping(String indexUuid, Map<String, ?> newFields) {
         Store store = STORE.get();
         if (store == null) {
             return -1L;
@@ -117,14 +154,26 @@ public final class MappingGenerationStore {
 
             // Merge onto what is there. Conflicts are raised before the swap is attempted, so a genuine
             // disagreement fails rather than being retried until it wins.
-            java.util.Map<String, String> merged = new java.util.HashMap<>(current.fields());
+            java.util.Map<String, Object> merged = new java.util.HashMap<>(current.fields());
             boolean changed = false;
-            for (Map.Entry<String, String> field : newFields.entrySet()) {
-                String existing = merged.get(field.getKey());
+            for (Map.Entry<String, ?> field : newFields.entrySet()) {
+                Object existing = merged.get(field.getKey());
                 if (existing == null) {
                     merged.put(field.getKey(), field.getValue());
                     changed = true;
-                } else if (existing.equals(field.getValue()) == false) {
+                    continue;
+                }
+                // Compared on the declared type rather than the whole definition, which matters once the
+                // value carries parameters. A field declared at creation as {"type":"keyword",
+                // "ignore_above":256} and later seen by a shard that only knows it is a keyword must
+                // converge, not conflict: the shard's view is less specific, not contradictory. Comparing
+                // definitions whole would raise a conflict there and fail the write.
+                //
+                // So the stored definition wins when the types agree. It is the declared one, and the
+                // incoming one is at best equally specific.
+                String existingType = typeOf(existing);
+                String proposedType = typeOf(field.getValue());
+                if (java.util.Objects.equals(existingType, proposedType) == false) {
                     throw new MappingConflictException(field.getKey(), existing, field.getValue());
                 }
             }

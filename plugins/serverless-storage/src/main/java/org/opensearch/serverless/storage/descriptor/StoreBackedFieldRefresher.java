@@ -167,8 +167,8 @@ public final class StoreBackedFieldRefresher implements UnknownFieldRefresh.Refr
             return false;
         }
 
-        String type = stored.fields().get(fieldName);
-        if (type == null) {
+        Map<String, Object> definition = stored.definitionOf(fieldName);
+        if (definition == null) {
             // The store does not have it either. Recording the check is what stops the next unknown field
             // on this shard re-reading a mapping that has not moved.
             record(indexUuid, stored.generation(), now);
@@ -176,8 +176,12 @@ public final class StoreBackedFieldRefresher implements UnknownFieldRefresh.Refr
         }
 
         try {
+            // The definition as stored, not a type rebuilt from it. Before T15 the store held only a type
+            // name, so this could only ever merge {"type": t} -- and a field declared with a date format or
+            // an analyzer came back without it, on the shard that had to re-learn it. The store carries the
+            // whole definition now, so what is merged here is what was declared.
             Map<String, Object> fragment = new HashMap<>();
-            fragment.put("properties", Map.of(fieldName, Map.of("type", type)));
+            fragment.put("properties", Map.of(fieldName, definition));
             mapperService.merge(MapperService.SINGLE_MAPPING_NAME, fragment, MapperService.MergeReason.MAPPING_UPDATE);
             record(indexUuid, stored.generation(), now);
             return mapperService.documentMapper() != null && mapperService.documentMapper().mappers().getMapper(fieldName) != null;

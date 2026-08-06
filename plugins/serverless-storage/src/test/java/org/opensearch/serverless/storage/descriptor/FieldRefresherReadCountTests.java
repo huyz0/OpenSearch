@@ -40,7 +40,7 @@ public class FieldRefresherReadCountTests extends OpenSearchTestCase {
     }
 
     /** A store that counts how often it is asked, which is the whole instrument. */
-    private void registerCountingStore(Map<String, String> fields) {
+    private void registerCountingStore(Map<String, Object> fields) {
         MappingGenerationStore.register(new MappingGenerationStore.Store() {
             @Override
             public MappingGenerationStore.MappingGeneration read(String indexUuid) {
