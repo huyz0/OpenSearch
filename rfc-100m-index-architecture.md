@@ -196,7 +196,8 @@ no such constraint, which is exactly why top-K applies to them and where the cac
 | heap per open gated index | 150,888 B |
 | file descriptors per open gated index | 3.0 |
 | open gated indices per node, 31 GiB heap, half to residency | ~110,000 |
-| creates per second, one 20-core box, concurrency 16 | 10,505 |
+| creates per second, one 20-core box, concurrency 16, no declared mapping | 10,505 |
+| creates per second, same, with a declared mapping | 22x slower |
 | deletes per second, same | 646 |
 
 **Unknown, and honestly so.**
@@ -205,9 +206,12 @@ no such constraint, which is exactly why top-K applies to them and where the cac
   window and a quiet run measures exactly that; a run on a loaded box measured seven times higher. The
   sweep runs on `GENERIC` and closing an index flushes, so eviction competes with the traffic that
   caused it, which is the wrong way round.
-- Create-time mappings. A descriptor carries a mapping generation, not a mapping, so an index that
-  declares one is refused rather than gated. Until that is carried into the mapping store, a deployment
-  that gives every tenant an explicit mapping gets no gated indices at all.
+- **A declared mapping costs 22x on creation, and that is now the common case.** The bypass that
+  produced 10,505 skips building a throwaway `IndexService` inside a `synchronized` block, and it
+  declines on any non-empty mapping. Measured in one run against one cluster with the mapping as the
+  only variable: 275 per second against 6,011. Filling 100M mapped indices is about four days rather
+  than 2.6 hours. The lock rather than the validation is the cost, so validating against a mapper service
+  built outside it is the direction; the shared lock itself cannot move under R1.
 - `.opensearch-index-mappings` is a second system index. One shared index rather than one per tenant, so
   far cheaper than what was removed, but a fixed-geometry funnel on the mapping write path.
 - Cluster-state publication latency against cluster size, which decides whether wake and sleep need
@@ -225,8 +229,9 @@ no such constraint, which is exactly why top-K applies to them and where the cac
 1. **Bound eviction under load.** The residency ceiling is the whole argument for reaching ten billion
    shards, and it currently weakens exactly when a node is busiest. Decide between a dedicated thread, a
    work budget per pass, and eviction driven by memory pressure rather than a timer.
-2. **Carry create-time mappings into the mapping store**, so gating is usable by the deployments it was
-   designed for.
+2. **Make a mapped gated creation take the fast path.** Carrying create-time mappings is done, and it
+   made mapped indices the common gated index; they are 22x slower to create than the population every
+   throughput figure here was measured on.
 3. **Resolve-and-forward hop.** Small, no core changes, makes multi-index requests work under hash
    routing. Lets the LB configuration ship.
 4. **Pre-warm before rotation.** Under computed placement every large scale event puts some shards on
