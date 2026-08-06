@@ -74,3 +74,43 @@ Append-only. One entry per task, written when the task's commit lands.
   produces. It passed alone three times and twice beside the classes this task touches; the
   dropped `uninstall` was the one plausible link and is restored either way.
 - Deferred: none.
+
+## T25 — Re-measure the mapped ratio with the create-path read gone
+
+- Status: complete
+- Commit: pending in this entry's commit
+- Result: T24 is worth about a seventh to a fifth of what a declared mapping costs a creation.
+  Final batch, eight pairs on matched storage with alternating order: median ratio 2.82x to
+  2.42x, median per-creation penalty down 15%, the same runs read as 22% in ratio units. HEAD
+  won 5 of 8 pairs in that batch, which is not significant. Across all four batches, 36 pairs,
+  HEAD won 27, sign test p = 0.004, and every batch's median favoured HEAD.
+- Control: the unmapped arm within each run, plus T23's repeat arm, which moves with the front
+  arm on both sides (median ratio 2.73x parent to 2.32x HEAD).
+- Deviation from the acceptance criteria, stated plainly:
+  - The criterion was two runs a side with the unmapped control agreeing within 10% across the
+    four. Five consecutive sets failed it, best spread 13.4%. This box cannot hold a control
+    that still for four consecutive runs, so the design changed: the metric is the within-run
+    ratio, which normalises the machine by construction, and the sample is eight pairs.
+  - The criterion said "the T23 harness, unchanged". Not strictly true: T24 added a read counter
+    and an assertion to it. Neither can move a rate -- the counter never increments on HEAD and
+    the assertion runs after the timing -- but the two sides did not run byte-identical files.
+- Two confounds found by measuring, both removed, both had been working against the finding:
+  - Order. The first design ran parent first in every pair. The second slot is slower, so the
+    order effect landed entirely on HEAD; its control arm came out 11.5% slower than parent's,
+    p = 0.019. Order now alternates by pair.
+  - Storage. The worktree was under /tmp, which is tmpfs here, while HEAD is on ext4. The parent
+    side had faster storage on the I/O-heavy arm under comparison. Worktree moved to
+    /home/tuong/work/t25-parent, both sides ext4.
+- Batches, in order run: tmpfs + parent-first 6/10 (p = 0.75); tmpfs + parent-first 9/10
+  (p = 0.021); tmpfs + balanced 7/8 (p = 0.070); ext4 + balanced 5/8 (p = 0.727).
+- Load averages, final batch, per run in pair order: 5.1, 6.8, 7.0, 8.4, 13.2, 9.2, 8.2, 9.1,
+  9.9, 9.4, 7.5, 9.6, 8.8, 8.0, 6.6, 7.2. Parent-side median 8.9, HEAD-side 7.8.
+- Notes:
+  - The review of the first write-up killed it, correctly. It had converted an 18.7% ratio drop
+    into "the read was 19% of the penalty", which is neither of the two consistent conversions
+    (28% in ratio units, 11% in microseconds); it offered the in-memory arm as a control against
+    contention when that arm has no power to detect it and is itself treated by T24; and it
+    quoted an unpaired rank test on a paired design at 30x the confidence the design supports.
+  - Anyone re-running this on eight pairs should expect a null result about as often as not.
+- Deferred: none. The swap's own cost, and the shared five-shard geometry behind it, are T28 and
+  T29.

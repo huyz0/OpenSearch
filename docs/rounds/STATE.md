@@ -10,8 +10,8 @@ Updated: 2026-08-06
 | | |
 |---|---|
 | Active round | 004, the mapping write path ([plan](004-mapping-write-path/plan.md)) |
-| Next action | `/round-next`, task T25 |
-| Last task | T24 complete, commit 20079e11096 |
+| Next action | `/round-next`, task T26 |
+| Last task | T25 complete |
 | Branch | `feature/serverless` |
 
 Rounds 001 to 003 predate this file and have no round directories. Their work is in the git
@@ -32,7 +32,7 @@ Measured, with controls:
 | file descriptors per open gated index | 3.0 |
 | open gated indices per node, 31 GiB heap | ~110,000 |
 | creates per second, no declared mapping | 10,505 |
-| creates per second, with a declared mapping | 2x to 10x slower, by warm-up; 80%+ of it the mapping store |
+| creates per second, with a declared mapping | 2x to 10x slower, by warm-up; 80%+ of it the mapping store, of which T24 removed ~a seventh |
 | deletes per second | 646 |
 | eviction under CPU pressure | 19.6 to 1.5 per second |
 

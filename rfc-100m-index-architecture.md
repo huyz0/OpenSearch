@@ -197,7 +197,7 @@ no such constraint, which is exactly why top-K applies to them and where the cac
 | file descriptors per open gated index | 3.0 |
 | open gated indices per node, 31 GiB heap, half to residency | ~110,000 |
 | creates per second, one 20-core box, concurrency 16, no declared mapping | 10,505 |
-| creates per second, with a declared mapping, concurrency 8 | 2x to 10x slower than the unmapped arm beside it, depending on warm-up; at least ~80% of it the index-backed mapping store |
+| creates per second, with a declared mapping, concurrency 8 | 2x to 10x slower than the unmapped arm beside it, depending on warm-up; at least ~80% of it the index-backed mapping store, of which T24 removed about a seventh |
 | deletes per second, same | 646 |
 
 **Unknown, and honestly so.**
@@ -241,11 +241,35 @@ no such constraint, which is exactly why top-K applies to them and where the cac
   always run second and third and are never transposed, so the residual carries whatever the drift
   between those two positions is worth.
 
+  **T25: removing the creation's read is worth something, and less than the arithmetic suggests.**
+  T24 removed one of the store's two round trips, the read whose answer can only be "absent".
+  Measured in a worktree at the parent commit against HEAD, the two sides run in adjacent pairs so
+  a pair shares a machine state, eight pairs: the median mapped-to-unmapped ratio in the settled
+  round fell from 2.82x to 2.42x, and the median per-creation penalty by 15%. Both framings of the
+  same runs agree on direction and disagree on size, 15% against 22%, which is the honest width.
+
+  **It does not reach significance in that batch on its own: HEAD won 5 pairs of 8.** Across four
+  batches run over the evening -- 36 pairs in total, every batch's median favouring HEAD -- HEAD
+  won 27, a two-sided sign test at p = 0.004. So the effect is real and it is small enough that
+  eight pairs on this box cannot see it. Anyone re-running this should expect a null result as
+  often as not.
+
+  Two confounds were found by measuring them rather than by argument, and both are gone from the
+  final batch. The first design ran the parent side first in every pair, and the second slot is
+  measurably slower, so the whole order effect landed on HEAD; order now alternates by pair. The
+  worktree also sat on tmpfs while HEAD sat on ext4, giving the parent side faster storage on the
+  I/O-heavy arm being compared; both sides are now on ext4. Both biases had been working against
+  the finding, which is the direction that flatters it least.
+
+  A seventh to a fifth, from deleting one of two round trips, says the two are not equal. What is
+  left is the swap, plus the local work in the same implementation that no arm here separates from
+  it.
+
   **The multiple itself is not a constant and should not be quoted as one.** The repeat arm is what
   makes that visible: within the measured round the same arm's throughput differed by up to 1.9x between
   its two positions, and by up to 3x in the unwarmed round, while the share computed from either end
-  moved by at most 6 points. The mapped-to-unmapped ratio ran 2.0x to 2.9x in a settled round and 4.3x
-  to 10.0x in an unwarmed one, at concurrency 8. The share is the finding; the multiple depends on how
+  moved by at most 6 points. Over the 36 runs T25 added, the ratio in a settled round ran 1.4x to
+  4.1x, and 4.3x to 10.6x in an unwarmed one, at concurrency 8. The share is the finding; the multiple depends on how
   warm the mapping index is.
 - `.opensearch-index-mappings` is a second system index. One shared index rather than one per tenant, so
   far cheaper than what was removed, but a fixed-geometry funnel on the mapping write path.
@@ -264,12 +288,11 @@ no such constraint, which is exactly why top-K applies to them and where the cac
 1. **Bound eviction under load.** The residency ceiling is the whole argument for reaching ten billion
    shards, and it currently weakens exactly when a node is busiest. Decide between a dedicated thread, a
    work budget per pass, and eviction driven by memory pressure rather than a timer.
-2. **Cut what the index-backed mapping store costs a creation.** Attribution is done: T23 measured that
-   store at 83% or more of what a declared mapping costs, with the residual unresolvable at that
-   precision. One of its two round trips is provably wasted, since a creation reads a mapping for a UUID
-   that cannot yet have one, and removing it is also the experiment that says how much of the store's
-   cost is round trips rather than the local work beside them. What remains after that is a question
-   about the shared fixed-geometry index listed below.
+2. **Cut what the index-backed mapping store costs a creation.** Attribution is done and the cheap half
+   is taken: T23 measured the store at 83% or more of what a declared mapping costs, and T24 removed the
+   read a creation issues for a UUID that cannot yet have one, which T25 measured at a seventh to a fifth
+   of the penalty. The swap is what is left, and it is a write against the shared fixed-geometry index
+   listed below, which is the next thing to measure rather than the next thing to assume.
 3. **Resolve-and-forward hop.** Small, no core changes, makes multi-index requests work under hash
    routing. Lets the LB configuration ship.
 4. **Pre-warm before rotation.** Under computed placement every large scale event puts some shards on
