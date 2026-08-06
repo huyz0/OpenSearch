@@ -229,3 +229,13 @@ is not a threshold.
   batching or moving it off the blocking path. The T45 setting stays, because the read side has its
   own reason to care about the shard count.
 - Deferred: none.
+
+### T46 gates
+
+Run after the commit rather than before it, which is out of order and worth recording as such. Two
+failures, both unrelated to a diff of documentation plus an opt-in test:
+`ChaosMultiOperationRegressionTests.testMaterializationDetects...` and
+`SegmentReplicationWithNodeToNodeIndexShardTests.testSnapshotWhileFailoverIncomplete`. Each passed
+alone three times at load ~14. The first appeared to fail three times alone as well, which was the
+command rather than the code: the filter was passed to `:server:test` too, where it matches nothing
+and the build fails on that.
