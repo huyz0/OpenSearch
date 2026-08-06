@@ -159,3 +159,34 @@ Append-only. One entry per task, written when the task's commit lands.
   what it does and does not prove.
 - Gates: green, 9m43s.
 - Deferred: T49.
+
+## T45 (planned as T28) — The mapping index's geometry is a hardcoded 5
+
+- Status: complete
+- Commit: dd524288c65
+- Result: `serverless_storage.mapping_index.shards`, defaulting to the 5 the code already used,
+  bounded at 1024 so a typo fails the node at startup rather than the first mapped gated creation.
+- Mutation: making the store ignore its constructor argument fails
+  `testTheConfiguredShardCountReachesTheCreatedIndex` with "expected:<17> but was:<5>".
+- Wiring: the unit test proves the constructor argument is used and nothing about whether anything
+  passes it. Reverting the plugin edit left the entire suite green, because every IT installs the
+  gate by hand with a default-constructed store. `BlobBackedDescriptorIT`, the only class that runs
+  the plugin's own install path, now sets the count to 3 and reads the created index back.
+- Notes:
+  - The first javadoc claimed the shard count is "the width of the funnel" the creation cost runs
+    through. Nothing shows that: a single-document write goes to one shard whatever the count is,
+    and it pre-judges what T46 is meant to decide. Rewritten, and the read-side cost of raising it
+    is now stated (the stats aggregator fans out across every shard; 2n with a replica).
+  - A node started after the index exists reads a value that can never apply. The store logs it,
+    which is the only evidence available.
+  - T46 cannot vary the geometry within one cluster. Recorded in its plan entry with the three
+    ways it silently fails.
+- Gates: one full run failed `GatedIdleEvictionIT.testAnIdleGatedIndexIsClosed...` at load 16-18;
+  it passed alone three times at load 6-10. This task adds one gated creation to an existing IT.
+- Deferred: none.
+
+## Numbering correction
+
+Committed as 6848ad5471f, after T45 landed. This round was planned as T23 to T32 on the strength
+of STATE.md saying numbering ran to T22; the tree cites up to T39 and eight of the ten were taken.
+Renumbered to T40 to T49. Commit messages from this round still carry the old numbers.
