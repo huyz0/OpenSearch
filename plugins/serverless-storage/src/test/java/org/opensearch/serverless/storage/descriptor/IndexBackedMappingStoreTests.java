@@ -86,6 +86,105 @@ public class IndexBackedMappingStoreTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * A mapping index that was deleted under a running cluster is missing, not absent.
+     *
+     * <p>Both cases arrive as the same exception, so the difference has to come from somewhere else. The
+     * signal is the transition -- the index was there and is not now -- which {@link MappingIndexWatcher}
+     * observes and this store consults. Without it the caller merges onto empty and writes one field where
+     * there had been many, successfully.
+     */
+    public void testADeletedMappingIndexIsNotReportedAsNoMapping() {
+        try (NoOpClient client = failingGet(() -> new IndexNotFoundException(new Index(IndexBackedMappingStore.MAPPING_INDEX, "_na_")))) {
+            IndexBackedMappingStore store = new IndexBackedMappingStore(client, IndexBackedMappingStore.DEFAULT_SHARDS, () -> true);
+
+            IllegalStateException thrown = expectThrows(IllegalStateException.class, () -> store.read("idx"));
+
+            assertTrue(
+                "the message must say which of the two cases this is: " + thrown.getMessage(),
+                thrown.getMessage().contains("was lost while this node was running")
+            );
+        }
+    }
+
+    /** The watcher's transitions: never seen, seen, gone, and the one that matters, recreated. */
+    public void testTheWatcherReportsLossAndDoesNotUnreportIt() {
+        MappingIndexWatcher watcher = new MappingIndexWatcher();
+        assertFalse("an index never seen cannot have been lost", watcher.getAsBoolean());
+
+        watcher.clusterChanged(eventWithMappingIndex(null));
+        assertFalse("still never seen", watcher.getAsBoolean());
+
+        watcher.clusterChanged(eventWithMappingIndex("uuid-1"));
+        assertFalse("present is not lost", watcher.getAsBoolean());
+
+        watcher.clusterChanged(eventWithMappingIndex(null));
+        assertTrue("seen and then gone is a loss", watcher.getAsBoolean());
+
+        watcher.clusterChanged(eventWithMappingIndex("uuid-2"));
+        assertTrue(
+            "a recreated index is empty, so absence still means loss rather than truth; clearing here is "
+                + "what made the first version of this undo itself on the next write",
+            watcher.getAsBoolean()
+        );
+    }
+
+    /** Replaced without ever being observed absent -- a delete and create between two cluster states. */
+    public void testAnIndexReplacedBetweenTwoStatesIsALoss() {
+        MappingIndexWatcher watcher = new MappingIndexWatcher();
+
+        watcher.clusterChanged(eventWithMappingIndex("uuid-1"));
+        watcher.clusterChanged(eventWithMappingIndex("uuid-2"));
+
+        assertTrue("a different index wearing the same name is the old one's contents gone", watcher.getAsBoolean());
+    }
+
+    /** The recreated-empty case reaches the other absence path, and must be refused there too. */
+    public void testAnEmptyRecreatedIndexDoesNotReportTheMappingAsAbsent() {
+        try (
+            NoOpClient client = getReturning(
+                new GetResult(
+                    IndexBackedMappingStore.MAPPING_INDEX,
+                    "idx",
+                    SequenceNumbers.UNASSIGNED_SEQ_NO,
+                    SequenceNumbers.UNASSIGNED_PRIMARY_TERM,
+                    -1,
+                    false,
+                    null,
+                    Map.of(),
+                    Map.of()
+                )
+            )
+        ) {
+            IndexBackedMappingStore store = new IndexBackedMappingStore(client, IndexBackedMappingStore.DEFAULT_SHARDS, () -> true);
+
+            expectThrows(IllegalStateException.class, () -> store.read("idx"));
+        }
+    }
+
+    private static org.opensearch.cluster.ClusterChangedEvent eventWithMappingIndex(String uuid) {
+        Metadata.Builder metadata = Metadata.builder();
+        if (uuid != null) {
+            metadata.put(
+                IndexMetadata.builder(IndexBackedMappingStore.MAPPING_INDEX)
+                    .settings(
+                        org.opensearch.common.settings.Settings.builder()
+                            .put(IndexMetadata.SETTING_VERSION_CREATED, org.opensearch.Version.CURRENT)
+                            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+                            .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+                            .put(IndexMetadata.SETTING_INDEX_UUID, uuid)
+                            .build()
+                    )
+                    .build(),
+                false
+            );
+        }
+        org.opensearch.cluster.ClusterState state = org.opensearch.cluster.ClusterState.builder(
+            new org.opensearch.cluster.ClusterName("test")
+        ).metadata(metadata).build();
+        return new org.opensearch.cluster.ClusterChangedEvent("test", state, state);
+    }
+
     /** A get that succeeds and says the document is not there is an absence, and reads as one. */
     public void testAnIndexWithNoStoredMappingReadsAsNull() {
         try (

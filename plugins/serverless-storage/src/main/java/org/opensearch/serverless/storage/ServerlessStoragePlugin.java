@@ -1888,12 +1888,19 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             } catch (java.io.IOException e) {
                 throw new IllegalStateException("could not resolve the descriptor container", e);
             }
+            // Watches for the mapping index being deleted under a running cluster, which is the only thing
+            // that tells a missing mapping apart from a lost one. Registered before the gate, so no read
+            // can happen through a store whose signal is not yet listening.
+            org.opensearch.serverless.storage.descriptor.MappingIndexWatcher mappingIndexWatcher =
+                new org.opensearch.serverless.storage.descriptor.MappingIndexWatcher();
+            clusterService.addListener(mappingIndexWatcher);
             org.opensearch.serverless.storage.descriptor.DescriptorGate.install(
                 descriptorBackend,
                 descriptorPrefixes,
                 new org.opensearch.serverless.storage.descriptor.IndexBackedMappingStore(
                     client,
-                    SERVERLESS_STORAGE_MAPPING_INDEX_SHARDS_SETTING.get(environment.settings())
+                    SERVERLESS_STORAGE_MAPPING_INDEX_SHARDS_SETTING.get(environment.settings()),
+                    mappingIndexWatcher
                 ),
                 new org.opensearch.serverless.storage.descriptor.IndexBackedMappingStatsAggregator(client),
                 new org.opensearch.serverless.storage.descriptor.StoreBackedFieldRefresher(),

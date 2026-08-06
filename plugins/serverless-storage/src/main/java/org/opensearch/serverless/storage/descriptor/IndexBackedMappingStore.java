@@ -82,6 +82,7 @@ public final class IndexBackedMappingStore implements MappingGenerationStore.Sto
 
     private final Client client;
     private final int shards;
+    private final java.util.function.BooleanSupplier mappingIndexWasDeleted;
     private final AtomicBoolean indexKnownToExist = new AtomicBoolean();
 
     public IndexBackedMappingStore(Client client) {
@@ -89,8 +90,18 @@ public final class IndexBackedMappingStore implements MappingGenerationStore.Sto
     }
 
     public IndexBackedMappingStore(Client client, int shards) {
+        this(client, shards, () -> false);
+    }
+
+    /**
+     * @param mappingIndexWasDeleted whether the mapping index has gone away after having been present, which
+     *                               is the one thing that distinguishes "nothing was ever written" from
+     *                               "everything that was written is gone". See {@link MappingIndexWatcher}.
+     */
+    public IndexBackedMappingStore(Client client, int shards, java.util.function.BooleanSupplier mappingIndexWasDeleted) {
         this.client = client;
         this.shards = shards;
+        this.mappingIndexWasDeleted = mappingIndexWasDeleted;
     }
 
     /**
@@ -114,12 +125,12 @@ public final class IndexBackedMappingStore implements MappingGenerationStore.Sto
      * times, so nothing loses the resilience the accident provided, and raises the read's own failure
      * instead of a contention message.
      *
-     * <p><b>A missing mapping index is still null, and that is a judgement, not a certainty.</b> Nothing has
-     * ever been written to it in the ordinary case, so no index can have a stored mapping. If the index is
-     * deleted out from under a live cluster the same absence means the opposite, and the merge that follows
-     * really would write a mapping holding one field where there had been many. Deleting it is not
-     * something anything here does, and treating it as unreadable would fail every cluster before its first
-     * mapped gated creation, so this is the trade rather than an oversight. T48 covers closing it.
+     * <p><b>A missing mapping index is null only while it has never been lost.</b> Nothing has ever been
+     * written to it in the ordinary case, so no index can have a stored mapping, and treating that as
+     * unreadable would fail every cluster before its first mapped gated creation. If the index is instead
+     * deleted or replaced under a live cluster, the same absence means the opposite. T48 made that a
+     * different answer rather than the same one: {@link MappingIndexWatcher} reports the loss and
+     * {@code failIfTheStoreWasLost} refuses both absence paths.
      */
     @Override
     public MappingGenerationStore.MappingGeneration read(String indexUuid) {
@@ -127,16 +138,48 @@ public final class IndexBackedMappingStore implements MappingGenerationStore.Sto
         try {
             response = client.prepareGet(MAPPING_INDEX, indexUuid).get();
         } catch (IndexNotFoundException e) {
-            // Nothing has ever been written, so no index has a mapping. The only absence this can infer.
+            failIfTheStoreWasLost(indexUuid, e);
+            // Nothing has ever been written, so no index has a mapping.
             logger.debug("no mapping index yet, so [{}] has no stored mapping", indexUuid);
             return null;
         }
         if (response.isExists() == false) {
+            // Guarded too, and this is the path that matters more. An index recreated after a deletion
+            // answers here rather than throwing: the get succeeds against an empty index and reports the
+            // document missing, which is indistinguishable from an index that never declared fields.
+            failIfTheStoreWasLost(indexUuid, null);
             return null;
         }
         @SuppressWarnings("unchecked")
         Map<String, Object> fields = (Map<String, Object>) response.getSourceAsMap().getOrDefault("fields", Map.of());
         return new MappingGenerationStore.MappingGeneration(response.getVersion(), fields);
+    }
+
+    /**
+     * T48. Refuses to answer "no mapping" once the store's contents are known to be gone.
+     *
+     * <p>Absence means two opposite things and the difference is not in the response: nothing was ever
+     * written, or everything that was written is lost. Answering null for the second lets the caller merge
+     * onto empty and write one field where there had been many, and the write succeeds, because the document
+     * that external versioning would have refused it against is gone too.
+     *
+     * <p>Only {@code updateMapping} and the refresher reach this. {@code createMapping} attempts its swap
+     * without reading, so a creation into a lost store never consults this -- correctly, since a fresh UUID
+     * has nothing to lose.
+     */
+    private void failIfTheStoreWasLost(String indexUuid, Exception cause) {
+        if (mappingIndexWasDeleted.getAsBoolean() == false) {
+            return;
+        }
+        throw new IllegalStateException(
+            "["
+                + MAPPING_INDEX
+                + "] was lost while this node was running, so the mapping for ["
+                + indexUuid
+                + "] is missing rather than absent. Treating it as absent would replace whatever was "
+                + "declared with whatever this caller happens to know.",
+            cause
+        );
     }
 
     @Override
