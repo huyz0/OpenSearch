@@ -137,3 +137,25 @@ Append-only. One entry per task, written when the task's commit lands.
     that follows would write one field where there were many. Filed as T31.
 - Gates: green, 9m11s.
 - Deferred: T31.
+
+## T27 — Prove the mapping store is never touched from a cluster state thread
+
+- Status: complete
+- Commit: adc0c1a183d
+- Result: the property holds for the shape tested. A gated creation carrying
+  `index.serverless_storage.enabled` in its request settings, and a put-mapping against a gated
+  index, both reach the store only from GENERIC.
+- Mutation: restoring the pre-T19 code (no GENERIC dispatch, `recordGatedMapping` inside
+  `PutMappingExecutor#execute`) fails in about a minute with "put-mapping called the mapping store
+  from [opensearch[node_s2][clusterManagerService#updateTask][T#1]]". Against the first version of
+  the test the same mutation hung instead and was killed at ten minutes, because the request never
+  returned and the thread check sat after it. Bounded waits and a finally fixed that.
+- Second mutation, for sensitivity: adding "generic" to the forbidden list fails with the thread the
+  calls actually come from, which confirms the recording path is wired rather than silently empty.
+- Notes: the review found a real hole this test does not cover. A template-gated index is not
+  admitted off-thread (the admission check reads request settings only), so it reaches
+  `clusterStateCreateIndex` on the cluster manager thread and calls `createMapping` there. Three
+  comments in the tree currently assert that cannot happen. Filed as T32; the class javadoc says
+  what it does and does not prove.
+- Gates: green, 9m43s.
+- Deferred: T32.
