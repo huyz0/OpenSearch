@@ -91,8 +91,22 @@ public class DescriptorOnlyCreationScalingTests extends OpenSearchTestCase {
     }
 
     /**
-     * The kill criterion itself. Creation through the descriptor must not scale with the number of
-     * indices already present, which is the single property Area H exists to deliver.
+     * The kill criterion, asserted on what creation does rather than on how long it takes.
+     *
+     * <p>Creation through the descriptor must not scale with the number of indices already present, which
+     * is the single property Area H exists to deliver. This asserted that with a stopwatch and a 3x bound
+     * on a few microseconds per operation, and produced a false failure in two consecutive cycles: it fails
+     * whenever the box is busy and passes alone, so what it was measuring was the machine.
+     *
+     * <p>The property has a deterministic witness. A gated creation returns the caller's {@code ClusterState}
+     * instance unchanged -- it writes a descriptor and rebuilds no metadata -- and an operation that does not
+     * touch the population cannot scale with it. Identity is that statement, exactly, with no clock in it.
+     *
+     * <p>The timing is kept and still asserted, at a bound loose enough to survive a loaded machine, because
+     * identity alone would not catch a population-dependent scan that happened to leave the state alone. It
+     * is a backstop against a regression of that shape rather than the measurement, and the figures are
+     * logged either way. {@link #testCreationCostAgainstPopulation} is where the numbers are for
+     * reading.
      */
     public void testDescriptorOnlyCreationIsFlatAgainstPopulation() {
         IndexDescriptorPublisher.register(descriptor -> {});
@@ -116,6 +130,31 @@ public class DescriptorOnlyCreationScalingTests extends OpenSearchTestCase {
         );
 
         assertTrue("both measurements must be non-zero, or this measured nothing", atThousand > 0 && atFiftyThousand > 0);
+
+        // The deterministic half: creation returns the state it was given, at either population, so it
+        // rebuilt no metadata and therefore did no work proportional to the population.
+        for (int population : new int[] { 1_000, 50_000 }) {
+            ClusterState base = stateWith(population);
+            ClusterState result = MetadataCreateIndexService.clusterStateCreateIndex(
+                base,
+                Set.of(),
+                index("identity-" + population),
+                (state, reason) -> state,
+                null,
+                write -> {}
+            );
+            assertSame(
+                "a gated creation must return the cluster state it was given at population "
+                    + population
+                    + ". A new instance means metadata was rebuilt, which is the cost that scales and the "
+                    + "one thing this path exists to avoid",
+                base,
+                result
+            );
+        }
+
+        // The backstop: loose enough that only a regression in the shape of the cost, rather than a busy
+        // machine, can trip it. A tight bound here is what made this test a contention detector.
         assertTrue(
             String.format(
                 Locale.ROOT,
@@ -124,7 +163,7 @@ public class DescriptorOnlyCreationScalingTests extends OpenSearchTestCase {
                 atThousand,
                 atFiftyThousand
             ),
-            atFiftyThousand < atThousand * 3
+            atFiftyThousand < atThousand * 20
         );
     }
 
