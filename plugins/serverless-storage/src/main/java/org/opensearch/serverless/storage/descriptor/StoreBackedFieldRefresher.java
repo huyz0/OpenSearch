@@ -37,7 +37,7 @@ import java.util.Map;
  * rather than trusting that comparison.
  *
  * <p>Returning false means the field is not being supplied from the store, and the caller then rejects or
- * dynamically infers it exactly as it would have without any of this. Since T26 that covers two cases
+ * dynamically infers it exactly as it would have without any of this. Since T43 that covers two cases
  * rather than one: the field is genuinely new, or the store could not be read. They are deliberately not
  * distinguished here, because the caller's next move is the same either way and the write path it takes
  * next meets the same store.
@@ -169,7 +169,7 @@ public final class StoreBackedFieldRefresher implements UnknownFieldRefresh.Refr
         try {
             stored = MappingGenerationStore.currentMapping(indexUuid);
         } catch (Exception e) {
-            // T26 stopped the store reporting an unreadable mapping as an absent one, so this is now the
+            // T43 stopped the store reporting an unreadable mapping as an absent one, so this is now the
             // place that decides what to do about it, and the answer here is the same as everywhere else in
             // this method: leave the caller to infer or reject the field.
             //

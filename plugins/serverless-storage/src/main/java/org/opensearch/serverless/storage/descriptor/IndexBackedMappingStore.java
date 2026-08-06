@@ -66,11 +66,11 @@ public final class IndexBackedMappingStore implements MappingGenerationStore.Sto
     /**
      * Shards for the mapping index when nobody says otherwise.
      *
-     * <p>Five, and until T28 that was a literal in the middle of {@code ensureIndexExists} with no reasoning
+     * <p>Five, and until T45 that was a literal in the middle of {@code ensureIndexExists} with no reasoning
      * attached and no way to change it. It is a guess: the index holds one small document per gated index,
      * so its bytes are trivial, and what it actually has to survive is write concurrency on the creation
      * path -- every gated creation with a declared mapping writes here. Five spreads that across five
-     * primaries. Whether that is the right number is what T29 measures; until then the point of naming it
+     * primaries. Whether that is the right number is what T46 measures; until then the point of naming it
      * is that a wrong guess can now be corrected without a code change.
      */
     public static final int DEFAULT_SHARDS = 5;
@@ -91,7 +91,7 @@ public final class IndexBackedMappingStore implements MappingGenerationStore.Sto
     /**
      * The stored mapping, or null when there genuinely is not one.
      *
-     * <p><b>T26: absent and unreadable are different answers, and this used to give the same one.</b> Every
+     * <p><b>T43: absent and unreadable are different answers, and this used to give the same one.</b> Every
      * exception was caught and reported as null, and null is what an index with no fields looks like, so a
      * cluster block, an unavailable shard and a timeout all arrived at callers as an empty mapping.
      *
@@ -114,7 +114,7 @@ public final class IndexBackedMappingStore implements MappingGenerationStore.Sto
      * deleted out from under a live cluster the same absence means the opposite, and the merge that follows
      * really would write a mapping holding one field where there had been many. Deleting it is not
      * something anything here does, and treating it as unreadable would fail every cluster before its first
-     * mapped gated creation, so this is the trade rather than an oversight. T31 covers closing it.
+     * mapped gated creation, so this is the trade rather than an oversight. T48 covers closing it.
      */
     @Override
     public MappingGenerationStore.MappingGeneration read(String indexUuid) {

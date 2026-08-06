@@ -32,7 +32,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
 /**
- * T26. Whether this store can tell "there is no mapping" from "I could not find out".
+ * T43. Whether this store can tell "there is no mapping" from "I could not find out".
  *
  * <p>It could not. Every exception was caught and answered null, and null is what an index with no fields
  * looks like, so a cluster block, an unavailable shard and a timeout were all reported to callers as an
@@ -164,7 +164,7 @@ public class IndexBackedMappingStoreTests extends OpenSearchTestCase {
                 IndexMetadata.INDEX_NUMBER_OF_SHARDS_SETTING.get(captured.get().settings())
             );
             assertEquals(
-                "the number this index was born with, so T28 changed nothing at the default",
+                "the number this index was born with, so T45 changed nothing at the default",
                 5,
                 IndexBackedMappingStore.DEFAULT_SHARDS
             );

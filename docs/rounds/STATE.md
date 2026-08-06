@@ -10,13 +10,22 @@ Updated: 2026-08-06
 | | |
 |---|---|
 | Active round | 004, the mapping write path ([plan](004-mapping-write-path/plan.md)) |
-| Next action | `/round-next`, task T28 |
-| Last task | T27 complete |
+| Next action | `/round-next`, task T46 |
+| Last task | T45 complete (the geometry setting), commit dd524288c65 |
 | Branch | `feature/serverless` |
 
 Rounds 001 to 003 predate this file and have no round directories. Their work is in the git
-history and in [rfc-100m-index-architecture.md](../../rfc-100m-index-architecture.md);
-T-numbers run to T22 and the next round starts at T23.
+history and in [rfc-100m-index-architecture.md](../../rfc-100m-index-architecture.md).
+
+**T-numbers are cited in permanent code comments, so check the tree before allocating them.**
+This file used to say they ran to T22, which was wrong: the tree cites up to T39, and round 004
+was planned as T23 to T32 on the strength of that sentence. Eight of those ten numbers already
+belonged to earlier work, so the round was renumbered to T40 to T49 after T45 landed. To find the
+next free number, do not trust this paragraph either:
+
+```
+git grep -hoE '\bT[0-9]{1,3}\b' -- server/src plugins/serverless-storage/src | sort -u -V | tail -3
+```
 
 ## Progress
 

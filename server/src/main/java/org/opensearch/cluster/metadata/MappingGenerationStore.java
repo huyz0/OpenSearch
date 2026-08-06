@@ -56,7 +56,7 @@ public final class MappingGenerationStore {
          *
          * <p><b>Null means absent, and only absent.</b> An implementation that cannot find out must throw,
          * not answer null: a caller that reads "could not find out" as "has no fields" merges onto empty,
-         * and T26 removed exactly that from the index-backed implementation. Callers that would rather
+         * and T43 removed exactly that from the index-backed implementation. Callers that would rather
          * degrade than fail decide so themselves.
          */
         MappingGeneration read(String indexUuid);
@@ -143,10 +143,10 @@ public final class MappingGenerationStore {
     /**
      * Writes the fields an index declared at creation, for an index that cannot yet have any.
      *
-     * <p>T24. A creation reached {@link #updateMapping}, whose first act is to read the current mapping so
+     * <p>T41. A creation reached {@link #updateMapping}, whose first act is to read the current mapping so
      * it has something to merge onto. For a creation there is nothing to merge onto and there cannot be: the
      * UUID was generated moments earlier and has never been given to anyone, so the read is a blocking round
-     * trip whose answer is known to be "absent" before it is issued. T23 measured the index-backed store at
+     * trip whose answer is known to be "absent" before it is issued. T40 measured the index-backed store at
      * 83% or more of what a declared mapping costs a creation, and this is one of its two round trips.
      *
      * <p>So the swap is attempted first, at generation 1, and the read-and-merge loop is kept as the
@@ -203,7 +203,7 @@ public final class MappingGenerationStore {
             try {
                 current = store.read(indexUuid);
             } catch (RuntimeException e) {
-                // T26 stopped the store answering null for a read it could not perform, which means this
+                // T43 stopped the store answering null for a read it could not perform, which means this
                 // loop now sees the failures it used to be lied to about. Retrying them is what keeps the
                 // change from being a regression: a mapping index shard relocating fails a read where the
                 // write path underneath would have retried, and the old code got its retries by accident --

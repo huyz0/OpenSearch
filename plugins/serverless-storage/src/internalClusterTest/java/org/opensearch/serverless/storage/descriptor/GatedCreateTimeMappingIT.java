@@ -106,7 +106,7 @@ public class GatedCreateTimeMappingIT extends org.opensearch.serverless.storage.
     /**
      * A gated creation writes its declared mapping without reading one first.
      *
-     * <p>T24, and it lives here rather than only in the measurement class because a criterion that only
+     * <p>T41, and it lives here rather than only in the measurement class because a criterion that only
      * holds behind {@code -Dtests.mappingcost} is a criterion CI never checks. Reverting
      * {@code MetadataCreateIndexService} to {@code updateMapping} leaves every other test in this file
      * green: the stored fields are identical either way, and the only difference is one round trip that

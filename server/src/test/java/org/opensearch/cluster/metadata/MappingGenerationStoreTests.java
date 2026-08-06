@@ -173,9 +173,9 @@ public class MappingGenerationStoreTests extends OpenSearchTestCase {
     /**
      * A creation does not read a mapping that cannot exist.
      *
-     * <p>T24, and the assertion is the read count rather than a duration. The UUID is generated during the
+     * <p>T41, and the assertion is the read count rather than a duration. The UUID is generated during the
      * creation and has never been given to anyone, so the read {@code updateMapping} opens with can only
-     * answer "absent" -- one blocking round trip per creation, against the store T23 measured at 83% or more
+     * answer "absent" -- one blocking round trip per creation, against the store T40 measured at 83% or more
      * of what a declared mapping costs.
      */
     public void testCreatingAMappingDoesNotReadOneThatCannotExist() {
@@ -225,7 +225,7 @@ public class MappingGenerationStoreTests extends OpenSearchTestCase {
      *
      * <p>Asserted on the counts, not only on the outcome. Returning the right generation is something a
      * plain {@code updateMapping} delegation also does, so an outcome-only version of this test would pass
-     * against the implementation T24 replaced. One swap and one read is what says the optimistic path ran
+     * against the implementation T41 replaced. One swap and one read is what says the optimistic path ran
      * and then deferred.
      */
     public void testACreateWhoseWriteAlreadyLandedConvergesWithoutWritingAgain() {

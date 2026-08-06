@@ -197,7 +197,7 @@ no such constraint, which is exactly why top-K applies to them and where the cac
 | file descriptors per open gated index | 3.0 |
 | open gated indices per node, 31 GiB heap, half to residency | ~110,000 |
 | creates per second, one 20-core box, concurrency 16, no declared mapping | 10,505 |
-| creates per second, with a declared mapping, concurrency 8 | 2x to 10x slower than the unmapped arm beside it, depending on warm-up; at least ~80% of it the index-backed mapping store, of which T24 removed about a seventh |
+| creates per second, with a declared mapping, concurrency 8 | 2x to 10x slower than the unmapped arm beside it, depending on warm-up; at least ~80% of it the index-backed mapping store, of which T41 removed about a seventh |
 | deletes per second, same | 646 |
 
 **Unknown, and honestly so.**
@@ -212,10 +212,10 @@ no such constraint, which is exactly why top-K applies to them and where the cac
   `synchronized` block. A mapping whose fields declare nothing but a type is now validated against the
   field type registry instead, an unlocked lookup that is complete for that shape, which moved the ratio
   from about 14x to about 10x. The "so the lock was a quarter of it" that followed subtracted two
-  single-run ratios, and T23 has since measured that ratio moving by more than that on warm-up alone, so
+  single-run ratios, and T40 has since measured that ratio moving by more than that on warm-up alone, so
   treat the lock's share as unquantified rather than as a quarter.
 
-  T23 attributed it by adding a third arm: the same mapped creations with an in-memory
+  T40 attributed it by adding a third arm: the same mapped creations with an in-memory
   `MappingGenerationStore.Store` registered in place of the index-backed one. Each run reports the
   store's share twice, taking the index-backed arm from the front of the round and from a repeat of the
   same arm at the end, so a reader can see whether the answer depended on where the arm ran. Five runs:
@@ -241,8 +241,8 @@ no such constraint, which is exactly why top-K applies to them and where the cac
   always run second and third and are never transposed, so the residual carries whatever the drift
   between those two positions is worth.
 
-  **T25: removing the creation's read is worth something, and less than the arithmetic suggests.**
-  T24 removed one of the store's two round trips, the read whose answer can only be "absent".
+  **T42: removing the creation's read is worth something, and less than the arithmetic suggests.**
+  T41 removed one of the store's two round trips, the read whose answer can only be "absent".
   Measured in a worktree at the parent commit against HEAD, the two sides run in adjacent pairs so
   a pair shares a machine state, eight pairs: the median mapped-to-unmapped ratio in the settled
   round fell from 2.82x to 2.42x, and the median per-creation penalty by 15%. Both framings of the
@@ -268,7 +268,7 @@ no such constraint, which is exactly why top-K applies to them and where the cac
   **The multiple itself is not a constant and should not be quoted as one.** The repeat arm is what
   makes that visible: within the measured round the same arm's throughput differed by up to 1.9x between
   its two positions, and by up to 3x in the unwarmed round, while the share computed from either end
-  moved by at most 6 points. Over the 36 runs T25 added, the ratio in a settled round ran 1.4x to
+  moved by at most 6 points. Over the 36 runs T42 added, the ratio in a settled round ran 1.4x to
   4.1x, and 4.3x to 10.6x in an unwarmed one, at concurrency 8. The share is the finding; the multiple depends on how
   warm the mapping index is.
 - `.opensearch-index-mappings` is a second system index. One shared index rather than one per tenant, so
@@ -289,8 +289,8 @@ no such constraint, which is exactly why top-K applies to them and where the cac
    shards, and it currently weakens exactly when a node is busiest. Decide between a dedicated thread, a
    work budget per pass, and eviction driven by memory pressure rather than a timer.
 2. **Cut what the index-backed mapping store costs a creation.** Attribution is done and the cheap half
-   is taken: T23 measured the store at 83% or more of what a declared mapping costs, and T24 removed the
-   read a creation issues for a UUID that cannot yet have one, which T25 measured at a seventh to a fifth
+   is taken: T40 measured the store at 83% or more of what a declared mapping costs, and T41 removed the
+   read a creation issues for a UUID that cannot yet have one, which T42 measured at a seventh to a fifth
    of the penalty. The swap is what is left, and it is a write against the shared fixed-geometry index
    listed below, which is the next thing to measure rather than the next thing to assume.
 3. **Resolve-and-forward hop.** Small, no core changes, makes multi-index requests work under hash

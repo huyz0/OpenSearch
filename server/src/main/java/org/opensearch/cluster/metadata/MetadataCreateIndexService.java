@@ -2226,7 +2226,7 @@ public class MetadataCreateIndexService {
             // state thread. An index admitted and then refused by the gate falls back to the ordinary path
             // and never reaches this line.
             //
-            // T24 sends this through createMapping rather than updateMapping. The two differ by one round
+            // T41 sends this through createMapping rather than updateMapping. The two differ by one round
             // trip: updateMapping opens by reading the current mapping so it has something to merge onto,
             // and this UUID came from UUIDs.randomBase64UUID in aggregateIndexSettings moments ago and has
             // been given to nobody, so that read can only answer "absent". createMapping attempts the swap

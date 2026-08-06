@@ -2,7 +2,7 @@
 
 Append-only. One entry per task, written when the task's commit lands.
 
-## T23 — Split the mapped creation cost into store traffic and mapping work
+## T40 — Split the mapped creation cost into store traffic and mapping work
 
 - Status: complete
 - Commit: 5eb5ca0976b
@@ -20,7 +20,7 @@ Append-only. One entry per task, written when the task's commit lands.
   - Do not quote a single mapped-to-unmapped multiple. It ran 2.0x to 2.9x in a settled round
     and 4.3x to 10.0x in an unwarmed one, same code, same run.
   - The measurement cannot separate the store's round trips from the local work in the same
-    implementation (request building, field type counts, the exists check). T24 removing one
+    implementation (request building, field type counts, the exists check). T41 removing one
     round trip is also the experiment that separates them.
   - Only the index-backed arm has a positional control. The in-memory and unmapped arms
     always run second and third and are never transposed, so the residual carries whatever
@@ -39,9 +39,9 @@ Append-only. One entry per task, written when the task's commit lands.
   25. Each passed alone three times at load 8 to 16. This task adds nothing to the default
   suite: the measurement stays behind `-Dtests.mappingcost`.
 - Deferred: none. The positional control on the residual arm is noted in the RFC as a limit
-  rather than filed as a task, because T24 changes the arm it would measure.
+  rather than filed as a task, because T41 changes the arm it would measure.
 
-## T24 — Stop reading a mapping that cannot exist yet
+## T41 — Stop reading a mapping that cannot exist yet
 
 - Status: complete
 - Commit: 20079e11096
@@ -49,7 +49,7 @@ Append-only. One entry per task, written when the task's commit lands.
   `MappingGenerationStore.createMapping` swaps at generation 1 and keeps read-and-merge as its
   fallback. Whether that made creations measurably faster is not claimed here: one run after
   the change read 2.21x against the unmapped control, inside the 2.0x to 2.9x range measured
-  before it, at load average 20. T25 measures it.
+  before it, at load average 20. T42 measures it.
 - Proof it entered the path: `GatedCreateTimeMappingIT` creates one mapped gated index through
   a counting store and asserts zero reads and one swap. Reverting the call site to
   `updateMapping` fails it, verified. Before that assertion existed the revert left every test
@@ -66,7 +66,7 @@ Append-only. One entry per task, written when the task's commit lands.
   - `createMapping` with an empty map now returns without writing, matching `updateMapping`.
     No caller reaches it today, but the two entry points disagreeing on the same input is a
     trap, and this one would leave an empty document in an index nothing deletes from.
-  - T23's early return in the measurement class's teardown had also dropped an unconditional
+  - T40's early return in the measurement class's teardown had also dropped an unconditional
     `DescriptorGate.uninstall`. Restored. See the gates note below.
 - Gates: green, 12m01s at load average 16. An earlier run failed
   `GatedCreationSwitchIT.testInstallingWhileDisabledLeavesNothingGated` on "a disabled gate
@@ -75,23 +75,23 @@ Append-only. One entry per task, written when the task's commit lands.
   dropped `uninstall` was the one plausible link and is restored either way.
 - Deferred: none.
 
-## T25 — Re-measure the mapped ratio with the create-path read gone
+## T42 — Re-measure the mapped ratio with the create-path read gone
 
 - Status: complete
 - Commit: ed4e984ba46
-- Result: T24 is worth about a seventh to a fifth of what a declared mapping costs a creation.
+- Result: T41 is worth about a seventh to a fifth of what a declared mapping costs a creation.
   Final batch, eight pairs on matched storage with alternating order: median ratio 2.82x to
   2.42x, median per-creation penalty down 15%, the same runs read as 22% in ratio units. HEAD
   won 5 of 8 pairs in that batch, which is not significant. Across all four batches, 36 pairs,
   HEAD won 27, sign test p = 0.004, and every batch's median favoured HEAD.
-- Control: the unmapped arm within each run, plus T23's repeat arm, which moves with the front
+- Control: the unmapped arm within each run, plus T40's repeat arm, which moves with the front
   arm on both sides (median ratio 2.73x parent to 2.32x HEAD).
 - Deviation from the acceptance criteria, stated plainly:
   - The criterion was two runs a side with the unmapped control agreeing within 10% across the
     four. Five consecutive sets failed it, best spread 13.4%. This box cannot hold a control
     that still for four consecutive runs, so the design changed: the metric is the within-run
     ratio, which normalises the machine by construction, and the sample is eight pairs.
-  - The criterion said "the T23 harness, unchanged". Not strictly true: T24 added a read counter
+  - The criterion said "the T40 harness, unchanged". Not strictly true: T41 added a read counter
     and an assertion to it. Neither can move a rate -- the counter never increments on HEAD and
     the assertion runs after the timing -- but the two sides did not run byte-identical files.
 - Two confounds found by measuring, both removed, both had been working against the finding:
@@ -109,13 +109,13 @@ Append-only. One entry per task, written when the task's commit lands.
   - The review of the first write-up killed it, correctly. It had converted an 18.7% ratio drop
     into "the read was 19% of the penalty", which is neither of the two consistent conversions
     (28% in ratio units, 11% in microseconds); it offered the in-memory arm as a control against
-    contention when that arm has no power to detect it and is itself treated by T24; and it
+    contention when that arm has no power to detect it and is itself treated by T41; and it
     quoted an unpaired rank test on a paired design at 30x the confidence the design supports.
   - Anyone re-running this on eight pairs should expect a null result about as often as not.
-- Deferred: none. The swap's own cost, and the shared five-shard geometry behind it, are T28 and
-  T29.
+- Deferred: none. The swap's own cost, and the shared five-shard geometry behind it, are T45 and
+  T46.
 
-## T26 — A store read that fails must not read as an absent mapping
+## T43 — A store read that fails must not read as an absent mapping
 
 - Status: complete
 - Commit: d501a8408e8
@@ -134,11 +134,11 @@ Append-only. One entry per task, written when the task's commit lands.
     protect the document, because inferring the field sends an auto put-mapping into the same
     unreadable store; the comment says so.
   - Deliberate hole: a mapping index deleted under a live cluster reads as absence and the merge
-    that follows would write one field where there were many. Filed as T31.
+    that follows would write one field where there were many. Filed as T48.
 - Gates: green, 9m11s.
-- Deferred: T31.
+- Deferred: T48.
 
-## T27 — Prove the mapping store is never touched from a cluster state thread
+## T44 — Prove the mapping store is never touched from a cluster state thread
 
 - Status: complete
 - Commit: adc0c1a183d
@@ -155,7 +155,7 @@ Append-only. One entry per task, written when the task's commit lands.
 - Notes: the review found a real hole this test does not cover. A template-gated index is not
   admitted off-thread (the admission check reads request settings only), so it reaches
   `clusterStateCreateIndex` on the cluster manager thread and calls `createMapping` there. Three
-  comments in the tree currently assert that cannot happen. Filed as T32; the class javadoc says
+  comments in the tree currently assert that cannot happen. Filed as T49; the class javadoc says
   what it does and does not prove.
 - Gates: green, 9m43s.
-- Deferred: T32.
+- Deferred: T49.

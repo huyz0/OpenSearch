@@ -26,7 +26,7 @@ the one with tasks that fit a single invocation each.
 
 ## Tasks
 
-### T23 — Split the mapped creation cost into store traffic and mapping work
+### T40 — Split the mapped creation cost into store traffic and mapping work
 
 - Depends on: none
 - Goal: say how much of the surviving ~10x is the mapping store's two blocking round trips and
@@ -47,7 +47,7 @@ the one with tasks that fit a single invocation each.
 - Risk: medium
 - Kind: measurement
 
-### T24 — Stop reading a mapping that cannot exist yet
+### T41 — Stop reading a mapping that cannot exist yet
 
 - Depends on: none
 - Goal: a creation's mapping write costs one round trip rather than two.
@@ -65,12 +65,12 @@ the one with tasks that fit a single invocation each.
 - Risk: low
 - Kind: fix
 
-### T25 — Re-measure the mapped ratio with the create-path read gone
+### T42 — Re-measure the mapped ratio with the create-path read gone
 
-- Depends on: T23, T24
-- Goal: a number for what T24 bought, or evidence it bought nothing.
+- Depends on: T40, T41
+- Goal: a number for what T41 bought, or evidence it bought nothing.
 - Acceptance:
-  - the T23 harness, unchanged, run twice on each side of T24 in a worktree at the parent
+  - the T40 harness, unchanged, run twice on each side of T41 in a worktree at the parent
     commit and at HEAD
   - the unmapped control arm is within 10% across the four runs, or the runs are discarded and
     repeated; the load average at each run is recorded in `log.md`
@@ -79,7 +79,7 @@ the one with tasks that fit a single invocation each.
 - Risk: medium
 - Kind: measurement
 
-### T26 — A store read that fails must not read as an absent mapping
+### T43 — A store read that fails must not read as an absent mapping
 
 - Depends on: none
 - Goal: a transient failure to read the mapping index currently returns null, which every
@@ -94,7 +94,7 @@ the one with tasks that fit a single invocation each.
 - Risk: low
 - Kind: fix
 
-### T27 — Prove the mapping store is never touched from a cluster state thread
+### T44 — Prove the mapping store is never touched from a cluster state thread
 
 - Depends on: none
 - Goal: T19 moved the put-mapping work to `MetadataMappingService#putMapping` so both callers
@@ -112,12 +112,12 @@ the one with tasks that fit a single invocation each.
 - Risk: medium
 - Kind: proof
 
-### T28 — The mapping index's geometry is a hardcoded 5
+### T45 — The mapping index's geometry is a hardcoded 5
 
 - Depends on: none
 - Goal: `IndexBackedMappingStore.ensureIndexExists` fixes the shard count at 5 with no
   reasoning recorded and no way to change it, on a shared index that every gated creation
-  writes through. Make it a node setting so T29 can vary it and an operator can size it.
+  writes through. Make it a node setting so T46 can vary it and an operator can size it.
 - Acceptance:
   - a node setting with 5 as its default, registered by the plugin and documented in the
     javadoc with what the number means
@@ -128,12 +128,12 @@ the one with tasks that fit a single invocation each.
 - Risk: low
 - Kind: fix
 
-### T29 — Measure the mapping index's geometry against creation throughput
+### T46 — Measure the mapping index's geometry against creation throughput
 
-- Depends on: T23, T28
+- Depends on: T40, T45
 - Goal: decide whether the shared fixed-geometry index is a funnel on the creation path or
   merely a shared index.
-- Constraint found while doing T28, and it invalidates the obvious approach: three shard counts
+- Constraint found while doing T45, and it invalidates the obvious approach: three shard counts
   cannot be had in one cluster. The setting is node-scope and read once at startup; the mapping
   index is created lazily by the first write and never deleted, so a second store with a different
   count gets `ResourceAlreadyExistsException` and runs against the first geometry while reporting
@@ -142,7 +142,7 @@ the one with tasks that fit a single invocation each.
   Three counts means three clusters, and every arm must read the live `index.number_of_shards` of
   `.opensearch-index-mappings` before timing anything.
 - Acceptance:
-  - the T23 harness run at three shard counts for the mapping index, one cluster per count, with
+  - the T40 harness run at three shard counts for the mapping index, one cluster per count, with
     the unmapped arm as the control in each run
   - each arm asserts the mapping index's actual shard count before it times anything, so an arm
     that silently ran against another geometry fails instead of being reported
@@ -153,7 +153,7 @@ the one with tasks that fit a single invocation each.
 - Risk: high
 - Kind: measurement
 
-### T30 — A deleted gated index leaves its mapping behind forever
+### T47 — A deleted gated index leaves its mapping behind forever
 
 - Depends on: none
 - Goal: nothing ever removes a document from `.opensearch-index-mappings`. The interface has no
@@ -172,10 +172,10 @@ the one with tasks that fit a single invocation each.
 - Risk: medium
 - Kind: fix
 
-### T31 — A deleted mapping index still reads as "no index has a mapping"
+### T48 — A deleted mapping index still reads as "no index has a mapping"
 
-- Depends on: T26, T30
-- Goal: T26 made an unreadable store say so, with one deliberate exception: a missing
+- Depends on: T43, T47
+- Goal: T43 made an unreadable store say so, with one deliberate exception: a missing
   `.opensearch-index-mappings` still reads as absence, because nothing has ever been written to it
   before the first mapped gated creation. If the index is instead deleted out from under a live
   cluster, that same absence means the opposite, and the merge that follows writes a mapping holding
@@ -190,9 +190,9 @@ the one with tasks that fit a single invocation each.
 - Risk: medium
 - Kind: fix
 
-### T32 — A template-gated creation writes its mapping from the cluster state thread
+### T49 — A template-gated creation writes its mapping from the cluster state thread
 
-- Depends on: T27
+- Depends on: T44
 - Goal: `DescriptorGate.worthAdmittingOffThread` reads only the request's own settings, so an index made
   gated by a matching template is not admitted onto GENERIC. It takes the ordinary path, and at the
   bottom `clusterStateCreateIndex` reads the finished settings, finds it gated, and calls
@@ -211,3 +211,20 @@ the one with tasks that fit a single invocation each.
   - mutation: reverting the fix fails the new phase with the offending thread named
 - Risk: medium
 - Kind: fix
+
+## Numbering
+
+This round was planned as T23 to T32, on the strength of STATE.md saying "T-numbers run to T22
+and the next round starts at T23". That was wrong. The tree cites T-numbers up to T39, and eight
+of the ten numbers this round claimed already belonged to earlier work: T23 to concurrent
+creation uniqueness, T25 and T27 to wildcards, T28 to the wildcard expansion cap, T29 to alias
+representability, T30 to gated serving, T32 to creation batching.
+
+Renumbered to T40 to T49 after the geometry task landed. The mapping is T23→T40, T24→T41,
+T25→T42, T26→T43, T27→T44, T28→T45, T29→T46, T30→T47, T31→T48, T32→T49. Code comments, this
+plan, the log, the RFC and STATE all use the new numbers. **Commit messages from this round still
+use the old ones**, since rewriting them would rewrite history that has already been pushed
+through review; a reader following T23 out of a commit message from 2026-08-06 should read T40.
+
+The convention's whole point is that a number cites one decision. Two rounds sharing T28 is the
+failure it exists to prevent, and the check that would have caught it costs one grep.

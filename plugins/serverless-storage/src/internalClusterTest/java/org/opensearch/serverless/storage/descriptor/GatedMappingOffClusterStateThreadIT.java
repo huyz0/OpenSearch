@@ -22,7 +22,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * T27. Which thread reaches the mapping store, asserted rather than argued.
+ * T44. Which thread reaches the mapping store, asserted rather than argued.
  *
  * <h2>Why this needs a test at all</h2>
  *
@@ -48,7 +48,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * index made gated by a matching template carries nothing in its request that says so, is deliberately not
  * admitted, and reaches {@code clusterStateCreateIndex} on the cluster manager's update thread -- where the
  * finished settings do say it is gated, so it calls the store from exactly the thread this class exists to
- * keep it off. T32 covers that shape; this class does not, and saying so is the point of this paragraph.
+ * keep it off. T49 covers that shape; this class does not, and saying so is the point of this paragraph.
  *
  * <h2>The two ways a proof like this passes for the wrong reason</h2>
  *

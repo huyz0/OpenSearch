@@ -427,7 +427,7 @@ public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.Se
     /**
      * The configured shard count reaches the mapping index the plugin's own store creates.
      *
-     * <p>Round 004's T28 made the count a setting, and the unit test for it constructs the store directly,
+     * <p>Round 004's T45 made the count a setting, and the unit test for it constructs the store directly,
      * which proves the constructor argument is used and nothing about whether anything passes it. The wiring
      * runs only here: every other IT installs the gate by hand with a default-constructed store, so
      * reverting the plugin to `new IndexBackedMappingStore(client)` left the entire suite green. That is the

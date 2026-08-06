@@ -62,7 +62,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * from arms measured together is worth more than any of the absolute figures: throughput on a shared build
  * machine says as much about the machine as the code, and this box has been running at load average 45.
  *
- * <h2>T23: where the surviving cost actually is</h2>
+ * <h2>T40: where the surviving cost actually is</h2>
  *
  * T20 removed the index-service lock and the ratio moved from about 14x to about 10x, leaving most of the
  * cost somewhere else -- and the somewhere else was named rather than measured: the mapping store's
@@ -107,7 +107,7 @@ public class GatedMappedCreationCostIT extends org.opensearch.serverless.storage
      * Large enough that the arms are comparing steady-state creation rather than warm-up.
      *
      * <p>Chosen by getting it wrong: at 120 per arm the ratio read 13.6x where the same code read 8.5x at
-     * 300. That was attributed to population size at the time. T23's repeat arm says it was warm-up -- the
+     * 300. That was attributed to population size at the time. T40's repeat arm says it was warm-up -- the
      * same arm, same code, same run, measured three times apart depending only on where in the round it ran
      * -- so 300 is defensible as "long enough to amortise the fixed costs" and the 13.6-against-8.5
      * comparison should not be read as a finding about population.
@@ -353,7 +353,7 @@ public class GatedMappedCreationCostIT extends org.opensearch.serverless.storage
             "every arm must have made progress, or this measured nothing",
             measured.indexBacked() > 0 && measured.inMemory() > 0 && measured.unmapped() > 0 && measured.indexBackedRepeat() > 0
         );
-        // T24, asserted here rather than only in MappingGenerationStoreTests because this project has twice
+        // T41, asserted here rather than only in MappingGenerationStoreTests because this project has twice
         // shipped a fix that passed its own tests while never entering the path it claimed to fix. Nothing
         // in this test does anything but create, and a creation now swaps without reading first, so any read
         // at all means the creation path is still going through updateMapping.
