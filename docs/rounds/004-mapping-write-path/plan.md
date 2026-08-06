@@ -228,3 +228,22 @@ through review; a reader following T23 out of a commit message from 2026-08-06 s
 
 The convention's whole point is that a number cites one decision. Two rounds sharing T28 is the
 failure it exists to prevent, and the check that would have caught it costs one grep.
+
+### T50 — A mapping written after its index was deleted is stranded forever
+
+- Depends on: T47
+- Goal: T47 prunes a gated index's mapping when the index is deleted. A write that arrives after the
+  prune re-creates the document, and nothing will ever remove it again. The window is real: the
+  tombstone invalidates only the writing node's descriptor cache, so another node keeps resolving the
+  name until its freshness window expires, and an in-flight put-mapping or dynamic-field inference on
+  that node reaches `recordGatedMapping` and writes generation 1 under the deleted UUID.
+- Acceptance:
+  - a test that writes a mapping for a UUID whose tombstone is already durable, and asserts the write
+    is refused or the document does not survive
+  - whichever way it is closed is stated in the code: refusing the write needs the tombstone consulted
+    on the mapping path; letting it land needs something that prunes it later, and a scrubber is a
+    second sweep to justify
+  - the same test covers the read-side symptom: a query against the still-resolving name must not
+    silently return zero hits on a declared field
+- Risk: medium
+- Kind: fix

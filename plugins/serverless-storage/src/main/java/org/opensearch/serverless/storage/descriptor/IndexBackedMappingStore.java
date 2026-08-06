@@ -53,8 +53,13 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * the executor with an in-memory double.
  *
  * <p>T19 moved that work to {@code MetadataMappingService#putMapping}, which dispatches to {@code GENERIC}
- * before submitting anything. So the safety argument now rests on both callers running off the cluster
- * state thread by construction, rather than on one of them happening to.
+ * before submitting anything. So the safety argument rests on the callers running off the cluster state
+ * thread by construction, rather than on one of them happening to. There are three of them now: creation
+ * through {@code MetadataCreateIndexService}, put-mapping and dynamic inference through
+ * {@code MetadataMappingService}, and since T47 the prune in {@code MetadataDeleteIndexService}, which runs
+ * from the tombstone writer's completion after the client has already been answered.
+ *
+ * <p>T44 asserts the first two rather than arguing them. The third is not covered there yet.
  */
 public final class IndexBackedMappingStore implements MappingGenerationStore.Store {
 
@@ -163,6 +168,22 @@ public final class IndexBackedMappingStore implements MappingGenerationStore.Sto
             // Someone advanced the generation first. The caller re-reads and merges, which is the whole
             // point of returning false rather than throwing.
             return false;
+        }
+    }
+
+    /**
+     * Removes an index's mapping document.
+     *
+     * <p>A missing mapping index means there is nothing to remove, the same absence {@link #read} infers
+     * and for the same reason. Anything else propagates: the caller decides whether a mapping that could
+     * not be removed should fail the deletion, and it decides no.
+     */
+    @Override
+    public void delete(String indexUuid) {
+        try {
+            client.prepareDelete(MAPPING_INDEX, indexUuid).get();
+        } catch (IndexNotFoundException e) {
+            logger.debug("no mapping index, so [{}] has no mapping to remove", indexUuid);
         }
     }
 

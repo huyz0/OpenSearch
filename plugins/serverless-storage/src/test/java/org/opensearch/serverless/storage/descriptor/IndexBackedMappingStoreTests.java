@@ -11,6 +11,7 @@ package org.opensearch.serverless.storage.descriptor;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.ActionType;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
+import org.opensearch.action.delete.DeleteAction;
 import org.opensearch.action.get.GetAction;
 import org.opensearch.action.get.GetResponse;
 import org.opensearch.cluster.block.ClusterBlockException;
@@ -134,6 +135,41 @@ public class IndexBackedMappingStoreTests extends OpenSearchTestCase {
                 MappingGenerationStore.register(null);
             }
         }
+    }
+
+    /** A missing mapping index means there is nothing to remove, the same absence a read infers. */
+    public void testDeletingWhenThereIsNoMappingIndexIsNotAnError() {
+        try (
+            NoOpClient client = failingDelete(() -> new IndexNotFoundException(new Index(IndexBackedMappingStore.MAPPING_INDEX, "_na_")))
+        ) {
+            new IndexBackedMappingStore(client).delete("idx");
+        }
+    }
+
+    /** Anything else propagates, and the deletion path is what decides that a stranded document is fine. */
+    public void testADeleteThatFailsPropagates() {
+        try (NoOpClient client = failingDelete(() -> new ClusterBlockException(Set.of(Metadata.CLUSTER_READ_ONLY_BLOCK)))) {
+            IndexBackedMappingStore store = new IndexBackedMappingStore(client);
+
+            expectThrows(ClusterBlockException.class, () -> store.delete("idx"));
+        }
+    }
+
+    private NoOpClient failingDelete(Supplier<RuntimeException> failure) {
+        return new NoOpClient(getTestName()) {
+            @Override
+            protected <Request extends ActionRequest, Response extends ActionResponse> void doExecute(
+                ActionType<Response> action,
+                Request request,
+                ActionListener<Response> listener
+            ) {
+                if (action.name().equals(DeleteAction.NAME)) {
+                    listener.onFailure(failure.get());
+                } else {
+                    listener.onResponse(null);
+                }
+            }
+        };
     }
 
     /**

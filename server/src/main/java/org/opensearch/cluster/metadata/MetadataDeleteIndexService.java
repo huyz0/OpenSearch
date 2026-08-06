@@ -144,10 +144,14 @@ public class MetadataDeleteIndexService {
         // the delete succeeded, is the only place a write can be both off the cluster state thread and
         // ahead of the acknowledgement. Nothing blocks: the listener is deferred, not waited on.
         final ActionListener<ClusterStateUpdateResponse> durableListener = ActionListener.wrap(
-            response -> DurableTombstones.whenDurable(
-                deletedIndices.get(),
-                ActionListener.wrap(ignored -> listener.onResponse(response), listener::onFailure)
-            ),
+            response -> DurableTombstones.whenDurable(deletedIndices.get(), ActionListener.wrap(ignored -> {
+                listener.onResponse(response);
+                // The same prune the all-gated path does. It belongs here too, and leaving it out was a
+                // real leak rather than an omission of symmetry: a request naming one gated index and one
+                // ordinary one -- which is what any wildcard over a mixed cluster is -- takes this path,
+                // and its gated indices' mappings would outlive them permanently.
+                removeStoredMappings(deletedIndices.get());
+            }, listener::onFailure)),
             listener::onFailure
         );
 
@@ -246,10 +250,56 @@ public class MetadataDeleteIndexService {
             logger.info("{} deleting gated index, recording a tombstone rather than a cluster state change", index);
             deleted.add(metadata);
         }
-        DurableTombstones.whenDurable(
-            java.util.List.copyOf(deleted),
-            ActionListener.wrap(ignored -> listener.onResponse(new ClusterStateUpdateResponse(true)), listener::onFailure)
-        );
+        DurableTombstones.whenDurable(java.util.List.copyOf(deleted), ActionListener.wrap(ignored -> {
+            listener.onResponse(new ClusterStateUpdateResponse(true));
+            removeStoredMappings(deleted);
+        }, listener::onFailure));
+    }
+
+    /**
+     * Removes the mappings of indices that have just been deleted.
+     *
+     * <p>T47. Nothing ever removed one: {@code MappingGenerationStore.Store} had no delete at all, so
+     * {@code .opensearch-index-mappings} grew with every index that had ever existed rather than with the
+     * live population. That is the residency problem this area exists to remove, reproduced one level down,
+     * and churn is what makes it bite -- a tenant that creates and drops an index a day leaves a document a
+     * day behind forever.
+     *
+     * <p><b>After the tombstone is durable, and that order is the safety argument.</b> The tombstone is what
+     * makes the deletion real. Removing the mapping first would mean a failure between the two left an index
+     * that still exists and whose declared fields are gone, which is a silent loss; this way the same
+     * failure leaves a document nobody references, which is exactly the status quo before this existed.
+     *
+     * <p><b>A failure here does not fail the deletion.</b> The index is gone either way, and reporting the
+     * delete as failed would invite a retry of something that already happened. A stranded document is the
+     * lesser outcome, and it is logged rather than swallowed.
+     *
+     * <p><b>After the acknowledgement, not before it.</b> Each prune is a blocking round trip, and a request
+     * naming five hundred gated indices would otherwise make the client wait for five hundred of them --
+     * including for every index that never declared a mapping, since removing an absent document still costs
+     * a round trip -- before hearing about a deletion that had already happened. With an unassigned primary
+     * on the mapping index each one waits out the replication timeout instead. Making the caller wait for
+     * work whose result is then discarded is the worst of both.
+     *
+     * <p>Catching {@link Throwable} rather than {@link Exception}, which is deliberate and narrow. A
+     * blocking client call from the wrong thread raises an {@code AssertionError}, and an {@code Error}
+     * escaping here would leave the completion chain broken on a path whose entire purpose is best-effort
+     * cleanup after the client has already been answered.
+     */
+    private void removeStoredMappings(java.util.List<IndexMetadata> deleted) {
+        for (IndexMetadata metadata : deleted) {
+            try {
+                MappingGenerationStore.deleteMapping(metadata.getIndexUUID());
+            } catch (Throwable e) {
+                logger.warn(
+                    () -> new org.apache.logging.log4j.message.ParameterizedMessage(
+                        "{} was deleted but its stored mapping could not be removed, leaving a document nobody references",
+                        metadata.getIndex()
+                    ),
+                    e
+                );
+            }
+        }
     }
 
     /**

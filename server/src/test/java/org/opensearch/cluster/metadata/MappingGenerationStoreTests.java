@@ -253,6 +253,32 @@ public class MappingGenerationStoreTests extends OpenSearchTestCase {
         assertNull(store.byUuid.get("idx"));
     }
 
+    /** Removing a mapping that was never written is not an error, since the caller cannot know. */
+    public void testDeletingAMappingThatWasNeverWrittenIsNotAnError() {
+        InMemoryStore store = new InMemoryStore();
+        MappingGenerationStore.register(store);
+
+        MappingGenerationStore.deleteMapping("never-written");
+
+        assertNull(store.read("never-written"));
+    }
+
+    /** With no store installed, deleting is a no-op rather than an exception, like every other entry. */
+    public void testDeletingWithoutAStoreDoesNothing() {
+        MappingGenerationStore.deleteMapping("idx");
+    }
+
+    /** A delete removes the mapping, so a later read sees nothing rather than a stale generation. */
+    public void testDeletingRemovesTheMapping() {
+        InMemoryStore store = new InMemoryStore();
+        MappingGenerationStore.register(store);
+        MappingGenerationStore.updateMapping("idx", Map.of("age", "long"));
+
+        MappingGenerationStore.deleteMapping("idx");
+
+        assertNull("a deleted mapping must not be readable, or nothing was pruned", store.read("idx"));
+    }
+
     // ---------------------------------------------------------------- helpers
 
     /**
@@ -297,6 +323,11 @@ public class MappingGenerationStoreTests extends OpenSearchTestCase {
                 }
             }
             return value;
+        }
+
+        @Override
+        public void delete(String indexUuid) {
+            byUuid.remove(indexUuid);
         }
 
         @Override

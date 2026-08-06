@@ -487,6 +487,11 @@ public class GatedMappedCreationCostIT extends org.opensearch.serverless.storage
         }
 
         @Override
+        public void delete(String indexUuid) {
+            delegate.delete(indexUuid);
+        }
+
+        @Override
         public boolean compareAndSwap(String indexUuid, long expectedGeneration, MappingGenerationStore.MappingGeneration updated) {
             swaps.incrementAndGet();
             return delegate.compareAndSwap(indexUuid, expectedGeneration, updated);
@@ -516,6 +521,11 @@ public class GatedMappedCreationCostIT extends org.opensearch.serverless.storage
         @Override
         public MappingGenerationStore.MappingGeneration read(String indexUuid) {
             return byUuid.get(indexUuid);
+        }
+
+        @Override
+        public void delete(String indexUuid) {
+            byUuid.remove(indexUuid);
         }
 
         @Override

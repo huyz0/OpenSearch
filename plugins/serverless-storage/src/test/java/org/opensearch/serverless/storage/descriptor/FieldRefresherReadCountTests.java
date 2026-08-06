@@ -43,6 +43,11 @@ public class FieldRefresherReadCountTests extends OpenSearchTestCase {
     private void registerCountingStore(Map<String, Object> fields) {
         MappingGenerationStore.register(new MappingGenerationStore.Store() {
             @Override
+            public void delete(String indexUuid) {
+                throw new AssertionError("nothing on this path deletes a mapping");
+            }
+
+            @Override
             public MappingGenerationStore.MappingGeneration read(String indexUuid) {
                 reads.incrementAndGet();
                 return new MappingGenerationStore.MappingGeneration(1L, fields);

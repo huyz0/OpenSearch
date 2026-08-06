@@ -306,6 +306,11 @@ public class GatedIndexMappingUpdateTests extends OpenSearchTestCase {
 
     private static void registerStore(Map<String, Map<String, Object>> stored) {
         MappingGenerationStore.register(new MappingGenerationStore.Store() {
+            @Override
+            public void delete(String indexUuid) {
+                throw new AssertionError("nothing on this path deletes a mapping");
+            }
+
             private final Map<String, MappingGenerationStore.MappingGeneration> byUuid = new HashMap<>();
 
             @Override

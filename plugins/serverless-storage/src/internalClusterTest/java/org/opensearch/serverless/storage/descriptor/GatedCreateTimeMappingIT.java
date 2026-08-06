@@ -137,6 +137,138 @@ public class GatedCreateTimeMappingIT extends org.opensearch.serverless.storage.
         assertEquals("keyword", MappingGenerationStore.typeOf(generation.fields().get("tenant")));
     }
 
+    /**
+     * A deleted gated index takes its mapping with it.
+     *
+     * <p>T47. Nothing ever removed a document from the mapping index, so it grew with every index that had
+     * ever existed rather than with the live population. Asserted through the store rather than by counting
+     * documents, because the store is what every reader goes through and a document that is unreachable
+     * through it is not the thing being fixed.
+     */
+    public void testDeletingAGatedIndexRemovesItsStoredMapping() throws Exception {
+        installBlobBackedDescriptorPlane();
+
+        client().admin()
+            .indices()
+            .create(
+                new CreateIndexRequest("gated-deleted").settings(gated())
+                    .mapping(Map.of("properties", Map.of("tenant", Map.of("type", "keyword"))))
+            )
+            .actionGet();
+        String uuid = descriptorUuid("gated-deleted");
+        assertNotNull("the mapping must be there before the delete, or this asserts nothing", MappingGenerationStore.currentMapping(uuid));
+
+        client().admin().indices().prepareDelete("gated-deleted").get();
+
+        assertBusy(
+            () -> assertNull(
+                "a deleted index's mapping must not outlive it in a shared index nothing else prunes",
+                MappingGenerationStore.currentMapping(uuid)
+            )
+        );
+    }
+
+    /**
+     * A prune that fails does not fail the deletion.
+     *
+     * <p>The index is gone by the time this runs, so reporting the delete as failed would invite a retry of
+     * something that already happened. Without this the swallow in {@code removeStoredMappings} is untested:
+     * every other double's delete succeeds, so removing the catch left the whole suite green.
+     */
+    public void testADeleteThatCannotPruneTheMappingStillSucceeds() throws Exception {
+        installBlobBackedDescriptorPlane();
+        MappingGenerationStore.register(new ThrowingDeleteStore(new IndexBackedMappingStore(client())));
+
+        client().admin()
+            .indices()
+            .create(
+                new CreateIndexRequest("gated-unprunable").settings(gated())
+                    .mapping(Map.of("properties", Map.of("tenant", Map.of("type", "keyword"))))
+            )
+            .actionGet();
+
+        assertTrue(
+            "a mapping that could not be removed must not turn its index's deletion into a failure",
+            client().admin().indices().prepareDelete("gated-unprunable").get().isAcknowledged()
+        );
+    }
+
+    /**
+     * A request naming a gated index and an ordinary one prunes the gated one's mapping too.
+     *
+     * <p>That request takes a different path -- the cluster state task, since there is state to change --
+     * and the prune was wired only into the all-gated one. Any wildcard over a mixed cluster is this
+     * request, so the leak it left was the common case rather than an edge.
+     */
+    public void testAMixedDeleteAlsoPrunesTheGatedMapping() throws Exception {
+        installBlobBackedDescriptorPlane();
+        client().admin()
+            .indices()
+            .create(
+                new CreateIndexRequest("mixed-gated").settings(gated())
+                    .mapping(Map.of("properties", Map.of("tenant", Map.of("type", "keyword"))))
+            )
+            .actionGet();
+        client().admin()
+            .indices()
+            .create(
+                new CreateIndexRequest("mixed-ordinary").settings(
+                    Settings.builder()
+                        .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+                        .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+                        .build()
+                )
+            )
+            .actionGet();
+        String uuid = descriptorUuid("mixed-gated");
+
+        client().admin().indices().prepareDelete("mixed-gated", "mixed-ordinary").get();
+
+        assertBusy(
+            () -> assertNull(
+                "a mixed delete must prune the gated index's mapping, or every wildcard delete leaks one",
+                MappingGenerationStore.currentMapping(uuid)
+            )
+        );
+    }
+
+    /** A store whose delete always fails, for the case where pruning cannot happen. */
+    private static final class ThrowingDeleteStore implements MappingGenerationStore.Store {
+
+        private final MappingGenerationStore.Store delegate;
+
+        ThrowingDeleteStore(MappingGenerationStore.Store delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public MappingGenerationStore.MappingGeneration read(String indexUuid) {
+            return delegate.read(indexUuid);
+        }
+
+        @Override
+        public boolean compareAndSwap(String indexUuid, long expectedGeneration, MappingGenerationStore.MappingGeneration updated) {
+            return delegate.compareAndSwap(indexUuid, expectedGeneration, updated);
+        }
+
+        @Override
+        public void delete(String indexUuid) {
+            throw new IllegalStateException("the mapping index cannot be written");
+        }
+    }
+
+    /** An index that never declared a mapping is deleted without the missing document failing anything. */
+    public void testDeletingAGatedIndexWithNoMappingSucceeds() throws Exception {
+        installBlobBackedDescriptorPlane();
+
+        client().admin().indices().create(new CreateIndexRequest("gated-plain").settings(gated())).actionGet();
+
+        assertTrue(
+            "a mapping that was never written must not turn its index's deletion into a failure",
+            client().admin().indices().prepareDelete("gated-plain").get().isAcknowledged()
+        );
+    }
+
     /** Counts what the creation path asks of the store, delegating everything else to the real one. */
     private static final class ReadCountingStore implements MappingGenerationStore.Store {
 
@@ -152,6 +284,11 @@ public class GatedCreateTimeMappingIT extends org.opensearch.serverless.storage.
         public MappingGenerationStore.MappingGeneration read(String indexUuid) {
             reads.incrementAndGet();
             return delegate.read(indexUuid);
+        }
+
+        @Override
+        public void delete(String indexUuid) {
+            delegate.delete(indexUuid);
         }
 
         @Override

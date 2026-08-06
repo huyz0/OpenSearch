@@ -47,8 +47,10 @@ import java.util.concurrent.atomic.AtomicReference;
 public final class MappingGenerationStore {
 
     /**
-     * What a store must implement. Deliberately narrow: read a generation, and attempt one swap. Anything
-     * richer would let a caller express an overwrite, which is the one thing that must be impossible.
+     * What a store must implement. Deliberately narrow: read a generation, attempt one swap, and remove a
+     * mapping whose index is gone. Anything richer would let a caller express an overwrite, which is the one
+     * thing that must be impossible -- the delete is not that, because it names an index that no longer
+     * exists rather than a mapping to replace.
      */
     public interface Store {
         /**
@@ -68,6 +70,20 @@ public final class MappingGenerationStore {
          *         re-read and merge rather than retry with the same value
          */
         boolean compareAndSwap(String indexUuid, long expectedGeneration, MappingGeneration updated);
+
+        /**
+         * Removes an index's mapping, for an index that is being deleted.
+         *
+         * <p>Deliberately not a default no-op. Until T47 this interface had no delete at all, so nothing
+         * ever removed a mapping and the store grew with every index that had ever existed rather than with
+         * the live population -- the residency problem this whole area exists to remove, one level down. A
+         * default would let the next implementation inherit that silently.
+         *
+         * <p>Removing a mapping that is not there is not an error. The caller cannot know whether the index
+         * declared one, and asking first would cost a round trip to learn something the delete already
+         * handles.
+         */
+        void delete(String indexUuid);
     }
 
     /**
@@ -272,6 +288,20 @@ public final class MappingGenerationStore {
     public static MappingGeneration currentMapping(String indexUuid) {
         Store store = STORE.get();
         return store == null ? null : store.read(indexUuid);
+    }
+
+    /**
+     * Removes an index's mapping, if a store is installed.
+     *
+     * <p>Failures propagate. The deletion path calls this after the index's tombstone is durable and
+     * treats a failure as a stranded document rather than a failed deletion, which is that caller's
+     * decision to make and not this seam's.
+     */
+    public static void deleteMapping(String indexUuid) {
+        Store store = STORE.get();
+        if (store != null) {
+            store.delete(indexUuid);
+        }
     }
 
     /** The current generation, for a caller deciding whether its cached mapping is stale. */

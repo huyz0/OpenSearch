@@ -178,6 +178,12 @@ public class GatedMappingOffClusterStateThreadIT extends org.opensearch.serverle
         }
 
         @Override
+        public void delete(String indexUuid) {
+            threads.add(Thread.currentThread().getName());
+            delegate.delete(indexUuid);
+        }
+
+        @Override
         public boolean compareAndSwap(String indexUuid, long expectedGeneration, MappingGenerationStore.MappingGeneration updated) {
             threads.add(Thread.currentThread().getName());
             return delegate.compareAndSwap(indexUuid, expectedGeneration, updated);
