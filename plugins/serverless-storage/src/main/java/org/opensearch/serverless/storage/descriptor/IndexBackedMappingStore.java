@@ -11,10 +11,12 @@ package org.opensearch.serverless.storage.descriptor;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
+import org.opensearch.action.get.GetResponse;
 import org.opensearch.action.index.IndexRequest;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.MappingGenerationStore;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.index.VersionType;
 import org.opensearch.index.engine.VersionConflictEngineException;
 import org.opensearch.transport.client.Client;
@@ -68,21 +70,50 @@ public final class IndexBackedMappingStore implements MappingGenerationStore.Sto
         this.client = client;
     }
 
+    /**
+     * The stored mapping, or null when there genuinely is not one.
+     *
+     * <p><b>T26: absent and unreadable are different answers, and this used to give the same one.</b> Every
+     * exception was caught and reported as null, and null is what an index with no fields looks like, so a
+     * cluster block, an unavailable shard and a timeout all arrived at callers as an empty mapping.
+     *
+     * <p><b>What that actually cost, which is not what it first looks like.</b> The obvious reading is
+     * silent field loss: {@code updateMapping} merges onto what it read, so reading empty for an index with
+     * fields would swap them away. That cannot happen through this store, and the reason is worth keeping.
+     * A merge from empty proposes generation 1, {@link #compareAndSwap} writes the generation as an external
+     * version, and external versioning refuses anything not greater than what is stored. So the write was
+     * rejected, the loop went round, and sixteen attempts later the caller was told its mapping update "did
+     * not converge, which means sustained contention" -- a wrong diagnosis of an unreachable store, arrived
+     * at through thirty-two wasted round trips. The failure was honest by accident and misleading on
+     * purpose.
+     *
+     * <p>Now a read that cannot be performed says so. {@code updateMapping} retries it the same number of
+     * times, so nothing loses the resilience the accident provided, and raises the read's own failure
+     * instead of a contention message.
+     *
+     * <p><b>A missing mapping index is still null, and that is a judgement, not a certainty.</b> Nothing has
+     * ever been written to it in the ordinary case, so no index can have a stored mapping. If the index is
+     * deleted out from under a live cluster the same absence means the opposite, and the merge that follows
+     * really would write a mapping holding one field where there had been many. Deleting it is not
+     * something anything here does, and treating it as unreadable would fail every cluster before its first
+     * mapped gated creation, so this is the trade rather than an oversight. T31 covers closing it.
+     */
     @Override
     public MappingGenerationStore.MappingGeneration read(String indexUuid) {
+        GetResponse response;
         try {
-            var response = client.prepareGet(MAPPING_INDEX, indexUuid).get();
-            if (response.isExists() == false) {
-                return null;
-            }
-            @SuppressWarnings("unchecked")
-            Map<String, Object> fields = (Map<String, Object>) response.getSourceAsMap().getOrDefault("fields", Map.of());
-            return new MappingGenerationStore.MappingGeneration(response.getVersion(), fields);
-        } catch (Exception e) {
-            // No mapping index yet means no mapping, which is what an index with no fields looks like.
-            logger.debug("mapping read for [{}] failed", indexUuid, e);
+            response = client.prepareGet(MAPPING_INDEX, indexUuid).get();
+        } catch (IndexNotFoundException e) {
+            // Nothing has ever been written, so no index has a mapping. The only absence this can infer.
+            logger.debug("no mapping index yet, so [{}] has no stored mapping", indexUuid);
             return null;
         }
+        if (response.isExists() == false) {
+            return null;
+        }
+        @SuppressWarnings("unchecked")
+        Map<String, Object> fields = (Map<String, Object>) response.getSourceAsMap().getOrDefault("fields", Map.of());
+        return new MappingGenerationStore.MappingGeneration(response.getVersion(), fields);
     }
 
     @Override

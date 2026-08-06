@@ -36,8 +36,11 @@ import java.util.Map;
  * mapping this shard already holds is at or ahead of the store's generation, and the tests count fetches
  * rather than trusting that comparison.
  *
- * <p>Returning false is a complete answer, not a failure: it means the field is genuinely new, and the
- * caller then rejects or dynamically infers it exactly as it would have without any of this.
+ * <p>Returning false means the field is not being supplied from the store, and the caller then rejects or
+ * dynamically infers it exactly as it would have without any of this. Since T26 that covers two cases
+ * rather than one: the field is genuinely new, or the store could not be read. They are deliberately not
+ * distinguished here, because the caller's next move is the same either way and the write path it takes
+ * next meets the same store.
  *
  * <h2>The other half of this idea, and why its cache would not be shaped like this one's</h2>
  *
@@ -162,7 +165,22 @@ public final class StoreBackedFieldRefresher implements UnknownFieldRefresh.Refr
             return false;
         }
 
-        MappingGenerationStore.MappingGeneration stored = MappingGenerationStore.currentMapping(indexUuid);
+        MappingGenerationStore.MappingGeneration stored;
+        try {
+            stored = MappingGenerationStore.currentMapping(indexUuid);
+        } catch (Exception e) {
+            // T26 stopped the store reporting an unreadable mapping as an absent one, so this is now the
+            // place that decides what to do about it, and the answer here is the same as everywhere else in
+            // this method: leave the caller to infer or reject the field.
+            //
+            // This does not make the document safe from the same failure, and it would be wrong to read it
+            // that way. The caller's next move on false is to infer the field, which sends an auto
+            // put-mapping, which reaches MappingGenerationStore.updateMapping and the same unreadable store.
+            // What this buys is that the failure surfaces once, from the path whose job is writing mappings,
+            // rather than twice from a path whose job is reading one.
+            logger.debug("could not read the stored mapping for [{}]", indexUuid, e);
+            return false;
+        }
         if (stored == null) {
             return false;
         }

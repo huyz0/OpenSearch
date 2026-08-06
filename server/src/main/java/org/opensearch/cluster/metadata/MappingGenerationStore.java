@@ -51,7 +51,14 @@ public final class MappingGenerationStore {
      * richer would let a caller express an overwrite, which is the one thing that must be impossible.
      */
     public interface Store {
-        /** The current mapping and its generation, or null when the index has no mapping object yet. */
+        /**
+         * The current mapping and its generation, or null when the index has no mapping object yet.
+         *
+         * <p><b>Null means absent, and only absent.</b> An implementation that cannot find out must throw,
+         * not answer null: a caller that reads "could not find out" as "has no fields" merges onto empty,
+         * and T26 removed exactly that from the index-backed implementation. Callers that would rather
+         * degrade than fail decide so themselves.
+         */
         MappingGeneration read(String indexUuid);
 
         /**
@@ -190,8 +197,22 @@ public final class MappingGenerationStore {
         if (store == null) {
             return -1L;
         }
+        RuntimeException lastReadFailure = null;
         for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-            MappingGeneration current = store.read(indexUuid);
+            MappingGeneration current;
+            try {
+                current = store.read(indexUuid);
+            } catch (RuntimeException e) {
+                // T26 stopped the store answering null for a read it could not perform, which means this
+                // loop now sees the failures it used to be lied to about. Retrying them is what keeps the
+                // change from being a regression: a mapping index shard relocating fails a read where the
+                // write path underneath would have retried, and the old code got its retries by accident --
+                // read null, merge onto empty, have the swap rejected by the stored generation, go round.
+                // Same number of attempts, an honest reason, and the last failure is raised rather than
+                // reported as contention.
+                lastReadFailure = e;
+                continue;
+            }
             if (current == null) {
                 current = MappingGeneration.empty();
             }
@@ -231,6 +252,9 @@ public final class MappingGenerationStore {
             if (store.compareAndSwap(indexUuid, current.generation(), updated)) {
                 return updated.generation();
             }
+        }
+        if (lastReadFailure != null) {
+            throw lastReadFailure;
         }
         throw new IllegalStateException(
             "mapping update for [" + indexUuid + "] did not converge after " + MAX_ATTEMPTS + " attempts, which means sustained contention"

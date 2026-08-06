@@ -161,3 +161,21 @@ the one with tasks that fit a single invocation each.
   - mutation: remove the delete call and the IT fails
 - Risk: medium
 - Kind: fix
+
+### T31 — A deleted mapping index still reads as "no index has a mapping"
+
+- Depends on: T26, T30
+- Goal: T26 made an unreadable store say so, with one deliberate exception: a missing
+  `.opensearch-index-mappings` still reads as absence, because nothing has ever been written to it
+  before the first mapped gated creation. If the index is instead deleted out from under a live
+  cluster, that same absence means the opposite, and the merge that follows writes a mapping holding
+  one field where there had been many, successfully. Close it or record why it cannot be closed.
+- Acceptance:
+  - a test that deletes the mapping index while a gated index has a stored mapping, then drives a
+    field inference, and asserts the previously declared fields are not silently replaced
+  - whatever distinguishes the two cases is named in the code rather than inferred from the
+    exception type: a marker document written at creation, a cluster-state check, or an explicit
+    "the index existed and now does not" signal
+  - the guard is mutation-tested: making the two cases indistinguishable again fails the test
+- Risk: medium
+- Kind: fix
