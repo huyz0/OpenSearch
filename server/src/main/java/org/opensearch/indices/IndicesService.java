@@ -1350,6 +1350,24 @@ public class IndicesService extends AbstractLifecycleComponent
     }
 
     /**
+     * Whether {@code type} is a field type this node knows how to build, without building anything.
+     *
+     * <p>Deliberately not synchronized, and that is the entire point of it existing. Every other route to
+     * this question -- {@link #createIndexMapperService}, {@link #withTempIndexService} -- constructs an
+     * {@link org.opensearch.index.IndexModule} and calls {@code pluginsService.onIndexModule} on it, which
+     * is why both hold this object's monitor. T18 measured what that costs a creation that only needs to
+     * know whether a type name is real: 275 gated creations per second against 6,011.
+     *
+     * <p>The registry is an immutable map fixed at node construction, so reading it needs no lock and
+     * cannot race. This answers exactly one question and is not a shortcut around mapping validation in
+     * general: for a field whose definition is nothing but {@code {"type": X}} it is complete, because
+     * there is no other parameter to check, and for anything richer the caller must still go the long way.
+     */
+    public boolean hasFieldTypeParser(String type) {
+        return mapperRegistry.getMapperParsers().containsKey(type);
+    }
+
+    /**
      * creates a new mapper service for the given index, in order to do administrative work like mapping updates.
      * This *should not* be used for document parsing. Doing so will result in an exception.
      * <p>

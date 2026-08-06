@@ -804,7 +804,7 @@ public class MetadataCreateIndexService {
             templatesApplied,
             templateAliases
         )) {
-            return applyCreateIndexWithoutTemporaryService(currentState, request, temporaryIndexMeta, metadataTransformer);
+            return applyCreateIndexWithoutTemporaryService(currentState, request, temporaryIndexMeta, mappings, metadataTransformer);
         }
         // create the index here (on the master) to validate it can be created, as well as adding the mapping
         return indicesService.<ClusterState, Exception>withTempIndexService(temporaryIndexMeta, indexService -> {
@@ -984,9 +984,27 @@ public class MetadataCreateIndexService {
                 return "templates " + templatesApplied + " contribute alias(es) " + fromOneTemplate.keySet();
             }
         }
-        for (Map<String, Object> mapping : mappings) {
-            if (mapping.isEmpty() == false) {
-                return "it has a mapping to merge and validate";
+        // A mapping used to end the matter, and T18 measured what that cost once mappings became the common
+        // case: 275 gated creations per second against 6,011, because merging and validating one means
+        // building a throwaway IndexService inside a synchronized block.
+        //
+        // The lock is not what validates. For a field whose definition is nothing but {"type": X}, the only
+        // thing validation establishes is that X is a field type this node can build, and IndicesService
+        // answers that from an immutable registry with no lock and no IndexModule. So a mapping made
+        // entirely of such fields is fully validated here, and nothing is traded away. Anything richer -- a
+        // parameter, an object field, a shorthand -- has more to check than a type name and still goes the
+        // long way.
+        List<Map<String, Object>> declared = mappings.stream().filter(mapping -> mapping.isEmpty() == false).collect(toList());
+        if (declared.size() > 1) {
+            // Two sources of mapping, so there is a merge with precedence rules to get right, and the
+            // temporary index service is what implements them. Declining is cheaper than reimplementing
+            // them here and being subtly wrong about which one wins.
+            return "it has " + declared.size() + " mappings to merge, whose precedence the index service resolves";
+        }
+        if (declared.isEmpty() == false) {
+            String unbuildable = whyThisMappingNeedsAMapperService(declared.get(0));
+            if (unbuildable != null) {
+                return unbuildable;
             }
         }
         if (org.opensearch.index.IndexSortConfig.INDEX_SORT_FIELD_SETTING.exists(temporaryIndexMeta.getSettings())) {
@@ -1017,10 +1035,71 @@ public class MetadataCreateIndexService {
      * gated creation. That is the one behavioural difference on this path, and it is confined to indices the
      * descriptor gate has already claimed.
      */
+    /**
+     * Why this mapping cannot be validated without a mapper service, or null when it can.
+     *
+     * <p>Answers only for the shape it can answer completely: every top-level property whose definition is
+     * exactly a declared type, and every one of those types registered on this node. That is not a subset
+     * of validation, it is all of it for such a field -- a definition with one key has nothing else that
+     * could be wrong.
+     *
+     * <p>Everything else is refused rather than half-checked. A parameter needs its own validation (an
+     * analyzer has to resolve against the index's analysis configuration, a date format has to parse), an
+     * object field needs its sub-properties walked, and a shorthand needs interpreting. Accepting any of
+     * those here on the strength of the type name would be a mapping accepted and not really checked,
+     * which is the failure this area has produced repeatedly.
+     */
+    private String whyThisMappingNeedsAMapperService(Map<String, Object> mapping) {
+        Object properties = propertiesOf(mapping).get("properties");
+        if (properties instanceof Map == false) {
+            // No properties to validate. Metadata fields and mapping-level settings are not covered by the
+            // registry check, so anything other than a plain properties object goes the long way.
+            return mapping.isEmpty() ? null : "its mapping declares more than field properties";
+        }
+        for (Map.Entry<?, ?> property : ((Map<?, ?>) properties).entrySet()) {
+            Object definition = property.getValue();
+            if (definition instanceof Map == false) {
+                return "field [" + property.getKey() + "] uses a shorthand definition, which needs interpreting";
+            }
+            Map<?, ?> asMap = (Map<?, ?>) definition;
+            Object type = asMap.get("type");
+            if (type == null || asMap.size() != 1) {
+                return "field [" + property.getKey() + "] declares more than a type, which needs a mapper service to validate";
+            }
+            if (indicesService.hasFieldTypeParser(String.valueOf(type)) == false) {
+                // Not a refusal of the fast path but of the request. Left to the ordinary path so the
+                // caller gets the same error it has always got, from the code that owns that message.
+                return "field [" + property.getKey() + "] declares unknown type [" + type + "]";
+            }
+        }
+        return null;
+    }
+
+    /**
+     * A parsed mapping with its single type key removed, if it has one.
+     *
+     * <p>The type key is excluded by name rather than by position, because "the only key" is ambiguous: a
+     * mapping written as {@code {"properties": {...}}} is also a single-entry map, and unwrapping it yields
+     * the field list where the caller expects the mapping body. That mistake does not fail loudly -- it
+     * reads as a mapping with no properties, so the fast path simply declines every request and the change
+     * appears to do nothing.
+     */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> propertiesOf(Map<String, Object> mapping) {
+        if (mapping.size() == 1) {
+            Map.Entry<String, Object> only = mapping.entrySet().iterator().next();
+            if (only.getValue() instanceof Map && "properties".equals(only.getKey()) == false) {
+                return (Map<String, Object>) only.getValue();
+            }
+        }
+        return mapping;
+    }
+
     private ClusterState applyCreateIndexWithoutTemporaryService(
         final ClusterState currentState,
         final CreateIndexClusterStateUpdateRequest request,
         final IndexMetadata temporaryIndexMeta,
+        final List<Map<String, Object>> mappings,
         final BiConsumer<Metadata.Builder, IndexMetadata> metadataTransformer
     ) {
         if (indexCreationValidators.isEmpty() == false) {
@@ -1043,6 +1122,25 @@ public class MetadataCreateIndexService {
             temporaryIndexMeta.getCustomData(),
             temporaryIndexMeta.context()
         );
+
+        // The declared mapping, put on the metadata by hand because there is no document mapper to take it
+        // from -- buildIndexMetadata is given () -> null above, since building one is the cost this path
+        // exists to avoid.
+        //
+        // This is not a nicety. Everything downstream reads an index's declared fields off IndexMetadata:
+        // DescriptorRepresentable decides gating from it, and clusterStateCreateIndex writes them to the
+        // mapping store from it. Without this the fast path would create a gated index whose mapping was
+        // parsed, validated against the registry, and then present nowhere -- acknowledged, with the fields
+        // silently absent. That is the loss T11, T13 and T15 were spent removing, and a performance change
+        // is exactly the kind of change that reintroduces it quietly.
+        for (Map<String, Object> mapping : mappings) {
+            if (mapping.isEmpty() == false) {
+                indexMetadata = IndexMetadata.builder(indexMetadata)
+                    .putMapping(new MappingMetadata(MapperService.SINGLE_MAPPING_NAME, mapping))
+                    .build();
+                break;
+            }
+        }
 
         logger.debug(
             "[{}] creating index off the temporary index service path, cause [{}], shards [{}]/[{}]",

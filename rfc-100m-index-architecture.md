@@ -197,7 +197,7 @@ no such constraint, which is exactly why top-K applies to them and where the cac
 | file descriptors per open gated index | 3.0 |
 | open gated indices per node, 31 GiB heap, half to residency | ~110,000 |
 | creates per second, one 20-core box, concurrency 16, no declared mapping | 10,505 |
-| creates per second, same, with a declared mapping | 22x slower |
+| creates per second, same, with a declared mapping | ~10x slower |
 | deletes per second, same | 646 |
 
 **Unknown, and honestly so.**
@@ -206,12 +206,15 @@ no such constraint, which is exactly why top-K applies to them and where the cac
   window and a quiet run measures exactly that; a run on a loaded box measured seven times higher. The
   sweep runs on `GENERIC` and closing an index flushes, so eviction competes with the traffic that
   caused it, which is the wrong way round.
-- **A declared mapping costs 22x on creation, and that is now the common case.** The bypass that
-  produced 10,505 skips building a throwaway `IndexService` inside a `synchronized` block, and it
-  declines on any non-empty mapping. Measured in one run against one cluster with the mapping as the
-  only variable: 275 per second against 6,011. Filling 100M mapped indices is about four days rather
-  than 2.6 hours. The lock rather than the validation is the cost, so validating against a mapper service
-  built outside it is the direction; the shared lock itself cannot move under R1.
+- **A declared mapping still costs about 10x on creation, down from about 14x.** The bypass that
+  produced 10,505 declined on any non-empty mapping, so a mapped index -- the common case since mappings
+  began to be carried -- took the slow path through a `synchronized` block. A mapping whose fields
+  declare nothing but a type is now validated against the field type registry instead, an unlocked
+  lookup that is complete for that shape. Measured against the parent commit in a worktree, two runs
+  each at comparable load, with the unmapped arm as the control: 13.6x and 15.3x before, 9.9x and 10.9x
+  after. So the index-service lock was about a quarter of it and most of the cost is elsewhere. The
+  leading candidate is the mapping store write, a blocking get and index per creation against a shared
+  5-shard index that the unmapped arm never pays; unmeasured, and not to be assumed.
 - `.opensearch-index-mappings` is a second system index. One shared index rather than one per tenant, so
   far cheaper than what was removed, but a fixed-geometry funnel on the mapping write path.
 - Cluster-state publication latency against cluster size, which decides whether wake and sleep need
@@ -229,9 +232,9 @@ no such constraint, which is exactly why top-K applies to them and where the cac
 1. **Bound eviction under load.** The residency ceiling is the whole argument for reaching ten billion
    shards, and it currently weakens exactly when a node is busiest. Decide between a dedicated thread, a
    work budget per pass, and eviction driven by memory pressure rather than a timer.
-2. **Make a mapped gated creation take the fast path.** Carrying create-time mappings is done, and it
-   made mapped indices the common gated index; they are 22x slower to create than the population every
-   throughput figure here was measured on.
+2. **Attribute the 8.5x that a declared mapping still costs.** The index-service half is done. The
+   mapping store write is the untested candidate for the rest, and it is the same shared fixed-geometry
+   index listed below.
 3. **Resolve-and-forward hop.** Small, no core changes, makes multi-index requests work under hash
    routing. Lets the LB configuration ship.
 4. **Pre-warm before rotation.** Under computed placement every large scale event puts some shards on

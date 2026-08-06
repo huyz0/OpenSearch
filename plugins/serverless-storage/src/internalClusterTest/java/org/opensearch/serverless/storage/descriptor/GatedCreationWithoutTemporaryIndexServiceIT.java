@@ -22,7 +22,6 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * A gated creation with nothing to validate must not build an index service to validate it.
@@ -62,9 +61,23 @@ public class GatedCreationWithoutTemporaryIndexServiceIT extends org.opensearch.
      * reach through. Cleared in {@link #forgetWhatWasValidated} so one case cannot read another's result --
      * which would be the difference between asserting the bypass ran and asserting it ran at some point.
      */
-    private static final AtomicReference<MapperService> LAST_MAPPER_SERVICE = new AtomicReference<>();
+    private static final java.util.Map<String, Boolean> BUILT_AN_INDEX_SERVICE = new java.util.concurrent.ConcurrentHashMap<>();
 
     private static final AtomicInteger VALIDATIONS = new AtomicInteger();
+
+    /**
+     * Whether an index service was built to validate {@code index}.
+     *
+     * <p>Keyed by index name rather than kept as "the last one", and that is a correction rather than a
+     * tidy-up. A creation that carries a mapping causes a second creation behind it -- the mapping store's
+     * own index, which is ordinary and does build one -- so a last-wins record reports that second creation
+     * and attributes it to the first. The fast path looked broken for a day because of it.
+     */
+    private static boolean builtAnIndexServiceFor(String index) {
+        Boolean built = BUILT_AN_INDEX_SERVICE.get(index);
+        assertNotNull("no validation was recorded for [" + index + "], so this asserts nothing", built);
+        return built;
+    }
 
     /**
      * A validator that records rather than rejects, declaring it needs no mappings.
@@ -81,7 +94,7 @@ public class GatedCreationWithoutTemporaryIndexServiceIT extends org.opensearch.
 
         @Override
         public void validate(MapperService mapperService, IndexSettings indexSettings) {
-            LAST_MAPPER_SERVICE.set(mapperService);
+            BUILT_AN_INDEX_SERVICE.put(indexSettings.getIndex().getName(), mapperService != null);
             VALIDATIONS.incrementAndGet();
         }
     }
@@ -131,7 +144,7 @@ public class GatedCreationWithoutTemporaryIndexServiceIT extends org.opensearch.
 
     @Before
     public void forgetWhatWasValidated() throws Exception {
-        LAST_MAPPER_SERVICE.set(null);
+        BUILT_AN_INDEX_SERVICE.clear();
         VALIDATIONS.set(0);
     }
 
@@ -159,10 +172,10 @@ public class GatedCreationWithoutTemporaryIndexServiceIT extends org.opensearch.
         client().admin().indices().create(new CreateIndexRequest("gated-plain").settings(gated())).actionGet();
 
         assertEquals("the validator must still have run; skipping it is not what this change does", 1, VALIDATIONS.get());
-        assertNull(
+        assertFalse(
             "a gated creation with no mappings, aliases, templates or sort must be validated without an "
-                + "index service, and a non-null mapper service here means one was built anyway",
-            LAST_MAPPER_SERVICE.get()
+                + "index service, and one built here means it was built anyway",
+            builtAnIndexServiceFor("gated-plain")
         );
     }
 
@@ -178,16 +191,33 @@ public class GatedCreationWithoutTemporaryIndexServiceIT extends org.opensearch.
 
         client().admin().indices().create(new CreateIndexRequest("ordinary").settings(ordinary())).actionGet();
 
-        assertNotNull("an index that was never gated must still be validated through a real index service", LAST_MAPPER_SERVICE.get());
+        assertTrue(
+            "an index that was never gated must still be validated through a real index service",
+            builtAnIndexServiceFor("ordinary")
+        );
     }
 
     /**
-     * A gated index that does have a mapping keeps the index service, because there is something to check.
+     * A mapping of plainly typed fields takes the fast path, and its fields still reach the store.
      *
-     * <p>The bypass is a statement about requests with nothing to validate, not about gated requests. Losing
-     * that distinction would mean a gated index could be created with a mapping nobody ever parsed.
+     * <p>This asserted the opposite until T21, and the reason it did was sound: the bypass is a statement
+     * about requests with nothing to validate, and losing that distinction would mean a gated index created
+     * with a mapping nobody ever parsed. What changed is not the principle but what "validate" costs. For a
+     * field whose definition is nothing but {@code {"type": X}}, validation establishes exactly one thing --
+     * that X is a field type this node can build -- and {@code IndicesService.hasFieldTypeParser} answers it
+     * from an immutable registry with no lock. Nothing is skipped; the same question is asked cheaply.
+     *
+     * <p>T18 is why it was worth doing: mapped gated creations ran at 275 per second against 6,011, and
+     * T11 through T15 had just made a mapped index the ordinary gated index rather than a refused one.
+     *
+     * <p><b>The second assertion is the one that matters more.</b> The fast path builds no document mapper,
+     * so it passes {@code () -> null} to {@code buildIndexMetadata} and the declared mapping has to be put
+     * on the metadata by hand. Miss that, and this creates a gated index whose mapping was parsed,
+     * validated, and then present nowhere -- acknowledged, fields silently absent, which is the loss T11,
+     * T13 and T15 were spent removing. Asserting only that the fast path ran would pass in exactly that
+     * case.
      */
-    public void testAGatedCreationCarryingAMappingStillBuildsOne() throws Exception {
+    public void testAMappingOfPlainlyTypedFieldsTakesTheFastPathAndStillReachesTheStore() throws Exception {
         installBlobBackedDescriptorPlane();
 
         client().admin()
@@ -198,10 +228,47 @@ public class GatedCreationWithoutTemporaryIndexServiceIT extends org.opensearch.
             )
             .actionGet();
 
+        assertFalse(
+            "a mapping of plainly typed fields can be validated against the type registry, so no index "
+                + "service should have been built to validate it",
+            builtAnIndexServiceFor("gated-mapped")
+        );
+
+        var descriptor = org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.supply("gated-mapped");
+        assertNotNull("the index must still be gated", descriptor);
+        var generation = org.opensearch.cluster.metadata.MappingGenerationStore.currentMapping(descriptor.uuid());
         assertNotNull(
-            "a gated creation carrying a mapping has something to validate, so it must still build the "
-                + "index service that validates it",
-            LAST_MAPPER_SERVICE.get()
+            "the declared fields must be in the mapping store. The fast path builds no document mapper, so "
+                + "a mapping it fails to put on the metadata is accepted and then present nowhere",
+            generation
+        );
+        assertEquals("keyword", org.opensearch.cluster.metadata.MappingGenerationStore.typeOf(generation.fields().get("tenant")));
+    }
+
+    /**
+     * A field carrying a parameter still builds one, because there is more than a type name to check.
+     *
+     * <p>The boundary of what T21 admits, and the reason it is drawn here. {@code ignore_above} sits beside
+     * a perfectly good {@code keyword}, so the registry check would pass and say nothing about the
+     * parameter. An analyzer has to resolve against the index's analysis configuration and a date format has
+     * to parse; neither is a registry lookup. Admitting these on the strength of the type name would be a
+     * mapping accepted and not really checked.
+     */
+    public void testAFieldCarryingAParameterStillBuildsOne() throws Exception {
+        installBlobBackedDescriptorPlane();
+
+        client().admin()
+            .indices()
+            .create(
+                new CreateIndexRequest("gated-parameterised").settings(gated())
+                    .mapping(Map.of("properties", Map.of("code", Map.of("type", "keyword", "ignore_above", 256))))
+            )
+            .actionGet();
+
+        assertTrue(
+            "a definition with more than a type in it has more to validate than the registry can answer, "
+                + "so it must still be validated through a real index service",
+            builtAnIndexServiceFor("gated-parameterised")
         );
     }
 
@@ -242,7 +309,10 @@ public class GatedCreationWithoutTemporaryIndexServiceIT extends org.opensearch.
             )
             .actionGet();
 
-        assertNotNull("an alias needs a query shard context, so the index service must still be built", LAST_MAPPER_SERVICE.get());
+        assertTrue(
+            "an alias needs a query shard context, so the index service must still be built",
+            builtAnIndexServiceFor("gated-aliased")
+        );
     }
 
     private static Settings ordinary() throws Exception {

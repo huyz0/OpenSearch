@@ -25,6 +25,22 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * What a declared mapping costs a gated creation, which is the case gating now exists for.
  *
+ * <p><b>Opt-in, like every other measurement here.</b> Run it with:
+ *
+ * <pre>
+ *   ./gradlew :plugins:serverless-storage:internalClusterTest \
+ *     --tests '*GatedMappedCreationCostIT*' -Dtests.mappingcost=true
+ * </pre>
+ *
+ * <p>It shipped without the guard and broke the suite around it three times over, differently each run: a
+ * cluster manager election timing out mid-creation, a residency test finding a stray index in cluster
+ * state, a field refresher failing on shared state. Every one of them passed alone, and the suite was green
+ * with this class removed. Deleting what it created and shrinking the population each fixed the run in
+ * front of them and moved the failure somewhere else, which is the signal that the problem was the class
+ * being there at all rather than its size. {@code GatedPopulationSoakIT} and {@code GatedResidencySoakIT}
+ * were already behind their own flags for the same reason -- the convention existed and this did not
+ * follow it.
+ *
  * <h2>Why this is asked now</h2>
  *
  * The headline figure for this work is 10,505 gated creations per second, from which "100M indices in about
@@ -56,6 +72,14 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public class GatedMappedCreationCostIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
 
+    /**
+     * Large enough that the arms are comparing steady-state creation rather than warm-up.
+     *
+     * <p>Chosen by getting it wrong. At 120 per arm the ratio read 13.6x where the same code measured 8.5x
+     * at 300, because the fixed costs -- the descriptor plane, the mapping index being created on first
+     * write, the JIT -- are a bigger share of a short arm, and the mapped arm runs first and absorbs them.
+     * A smaller population did not make the measurement noisier so much as make it measure something else.
+     */
     private static final int INDICES_PER_ARM = 300;
 
     private static final int CONCURRENCY = 8;
@@ -95,8 +119,25 @@ public class GatedMappedCreationCostIT extends org.opensearch.serverless.storage
             .build();
     }
 
+    /**
+     * Deletes everything this test made, before the gate comes down.
+     *
+     * <p>Not hygiene. Without it this class leaves 600 indices behind in a shared test cluster and the rest
+     * of the suite fails around it -- a cluster manager election timing out mid-creation, a residency test
+     * finding a stray index in cluster state, a mapping write hitting an index the framework had wiped.
+     * All three passed alone and only failed after this class ran, which is what a leak looks like from the
+     * outside: three unrelated failures, none of them where the problem is.
+     *
+     * <p>Ordered before the gate is uninstalled, because deleting a gated index needs the descriptor plane
+     * that resolves its name.
+     */
     @After
-    public void clearGate() throws Exception {
+    public void deleteWhatWasCreated() throws Exception {
+        try {
+            client().admin().indices().prepareDelete("mapped-*", "plain-*").get();
+        } catch (Exception e) {
+            logger.warn("could not clean up the indices this test created", e);
+        }
         DescriptorGate.uninstall();
     }
 
@@ -108,6 +149,11 @@ public class GatedMappedCreationCostIT extends org.opensearch.serverless.storage
      * Running the expensive arm first means any drift works against the finding rather than for it.
      */
     public void testWhatADeclaredMappingCostsAGatedCreation() throws Exception {
+        assumeTrue(
+            "set -Dtests.mappingcost=true to run this; it creates enough indices to disturb the tests "
+                + "around it, which is why every measurement in this package is opt-in",
+            Boolean.getBoolean("tests.mappingcost")
+        );
         installBlobBackedDescriptorPlane();
 
         double mapped = createConcurrently("mapped", Map.of("properties", Map.of("tenant", Map.of("type", "keyword"))));
