@@ -10,8 +10,8 @@ Updated: 2026-08-06
 | | |
 |---|---|
 | Active round | 004, the mapping write path ([plan](004-mapping-write-path/plan.md)) |
-| Next action | `/round-next`, task T47 |
-| Last task | T46 complete, negative result: the mapping index's shard count does not move creation throughput |
+| Next action | `/round-next`, task T48 |
+| Last task | T47 complete |
 | Branch | `feature/serverless` |
 
 Rounds 001 to 003 predate this file and have no round directories. Their work is in the git

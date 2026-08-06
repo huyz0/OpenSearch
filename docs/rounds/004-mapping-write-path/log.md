@@ -239,3 +239,28 @@ failures, both unrelated to a diff of documentation plus an opt-in test:
 alone three times at load ~14. The first appeared to fail three times alone as well, which was the
 command rather than the code: the filter was passed to `:server:test` too, where it matches nothing
 and the build fails on that.
+
+## T47 — A deleted gated index leaves its mapping behind forever
+
+- Status: complete
+- Commit: 5024c4edc92
+- Result: `MappingGenerationStore.Store` gains an abstract `delete`, implemented against the mapping
+  index, and both deletion paths call it after the tombstone is durable and after the client has been
+  acknowledged.
+- Mutation: removing the all-gated call site fails `testDeletingAGatedIndexRemovesItsStoredMapping`;
+  removing the mixed-path call site fails `testAMixedDeleteAlsoPrunesTheGatedMapping`. Both verified.
+- Notes:
+  - The first version wired the prune only into the all-gated path. A request naming one gated and one
+    ordinary index takes the cluster state path instead, and any wildcard over a mixed cluster is that
+    request, so the leak it left was the common case. Found by review.
+  - The prune was also on the acknowledgement path, so a deletion naming N gated indices made the
+    caller wait for N blocking round trips whose results are discarded. Moved after `onResponse`.
+  - The swallow is now tested. Every existing double's delete succeeds, so removing the catch left the
+    suite green; an IT registers a store whose delete throws and asserts the deletion still succeeds.
+  - The catch takes `Throwable`: a blocking call from the wrong thread raises `AssertionError`, and
+    an `Error` escaping here would break the completion chain after the client was answered.
+  - `testDeletingAGatedIndexWithNoMappingSucceeds` cannot fail while the swallow is there. Kept for
+    the end-to-end shape; the behaviour it names is actually pinned by the unit test.
+- Gates: one failure, `CompletionStatsCacheTests.testCompletionStatsCache`, unrelated to this diff;
+  passed alone three times at load 8.
+- Deferred: T50, a mapping written after its index was deleted is stranded forever.
