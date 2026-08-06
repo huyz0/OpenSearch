@@ -148,6 +148,85 @@ public class GatedIndexMappingUpdateTests extends OpenSearchTestCase {
         assertFalse("no store means no gated handling at all", MappingGenerationStore.isRegistered());
     }
 
+    /**
+     * A put-mapping the store cannot carry must fail the request rather than record part of it.
+     *
+     * <p>The extraction here used to skip any property it could not read, record the rest and report
+     * success. So an object field added to a gated index was acknowledged and silently absent, while the
+     * same field at creation was refused and kept the index in cluster state -- the "gated at creation and
+     * refused on update, or the reverse" that the shared extractor exists to make impossible.
+     *
+     * <p>Asserted through the executor rather than against the extractor, for the reason the test beside it
+     * records: an extractor test passes just as well with the wiring removed.
+     */
+    public void testTheExecutorRefusesAMappingTheStoreCannotCarry() throws Exception {
+        Map<String, Map<String, String>> stored = new HashMap<>();
+        registerStore(stored);
+
+        MetadataMappingService service = new MetadataMappingService(
+            org.mockito.Mockito.mock(org.opensearch.cluster.service.ClusterService.class),
+            org.mockito.Mockito.mock(org.opensearch.indices.IndicesService.class)
+        );
+
+        Index gated = new Index("gated-idx", "gated-uuid");
+        // An object field: the store holds a flat name-to-type map and has nowhere to put it.
+        PutMappingClusterStateUpdateRequest request = new PutMappingClusterStateUpdateRequest(
+            "{\"properties\":{\"profile\":{\"properties\":{\"city\":{\"type\":\"keyword\"}}}}}"
+        );
+        request.indices(new Index[] { gated });
+
+        ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
+        ClusterStateTaskExecutor.ClusterTasksResult<PutMappingClusterStateUpdateRequest> result = service.new PutMappingExecutor().execute(
+            empty,
+            java.util.List.of(request)
+        );
+
+        assertNotNull(
+            "a mapping the store cannot carry must fail the request, not be acknowledged with the field " + "missing",
+            result.executionResults.get(request).getFailure()
+        );
+        assertTrue(
+            "and nothing may be recorded, because a partial record is the loss this refuses: " + stored,
+            stored.isEmpty() || stored.get("gated-uuid") == null
+        );
+    }
+
+    /**
+     * A field parameter must not pass the guard and then be dropped.
+     *
+     * <p>Separate from the object-field case because they fail differently. An object field has no
+     * top-level type and was visibly unrepresentable; {@code ignore_above} sits beside a perfectly good
+     * {@code keyword} and was invisible -- the guard asked whether a type was declared, which is true here,
+     * rather than whether the definition was nothing but the type.
+     */
+    public void testTheExecutorRefusesAFieldParameterItWouldDrop() throws Exception {
+        Map<String, Map<String, String>> stored = new HashMap<>();
+        registerStore(stored);
+
+        MetadataMappingService service = new MetadataMappingService(
+            org.mockito.Mockito.mock(org.opensearch.cluster.service.ClusterService.class),
+            org.mockito.Mockito.mock(org.opensearch.indices.IndicesService.class)
+        );
+
+        Index gated = new Index("gated-idx", "gated-uuid");
+        PutMappingClusterStateUpdateRequest request = new PutMappingClusterStateUpdateRequest(
+            "{\"properties\":{\"code\":{\"type\":\"keyword\",\"ignore_above\":256}}}"
+        );
+        request.indices(new Index[] { gated });
+
+        ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
+        ClusterStateTaskExecutor.ClusterTasksResult<PutMappingClusterStateUpdateRequest> result = service.new PutMappingExecutor().execute(
+            empty,
+            java.util.List.of(request)
+        );
+
+        assertNotNull(
+            "a field carrying a parameter the store would drop must fail rather than be reduced to its type",
+            result.executionResults.get(request).getFailure()
+        );
+        assertTrue("and nothing may be recorded: " + stored, stored.isEmpty() || stored.get("gated-uuid") == null);
+    }
+
     private static void registerStore(Map<String, Map<String, String>> stored) {
         MappingGenerationStore.register(new MappingGenerationStore.Store() {
             private final Map<String, MappingGenerationStore.MappingGeneration> byUuid = new HashMap<>();

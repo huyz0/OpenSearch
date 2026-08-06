@@ -284,23 +284,36 @@ public class MetadataMappingService {
         /**
          * Records the request's fields against the index's mapping generation.
          *
-         * <p>Only top-level properties are extracted today, so a nested or object field is not yet
-         * carried. That is a limitation of this wiring rather than of the store, which holds whatever it
-         * is given, and it is stated here rather than discovered: an index using object fields must not
-         * be gated until this parses them.
+         * <p>Extraction is {@link DescriptorRepresentable#fieldTypesOrNull}, the same call the creation path
+         * makes. Sharing it is the point rather than a tidy-up: these were two implementations documented as
+         * mirroring each other, and the divergence was not cosmetic. A mapping the creation path refused
+         * outright, this one accepted and silently reduced.
+         *
+         * <p>What still cannot be carried is anything the store's flat name-to-type map has no room for: an
+         * object or nested field, or a field parameter such as a date format. That is the store's shape
+         * rather than this wiring's, and lifting it means changing what the store holds.
          */
         private void recordGatedMapping(PutMappingClusterStateUpdateRequest request) throws IOException {
             Map<String, Object> parsed = XContentHelper.convertToMap(MediaTypeRegistry.JSON.xContent(), request.source(), false);
-            Object properties = parsed.get("properties");
-            if (properties instanceof Map == false) {
-                return;
-            }
-            Map<String, String> fields = new HashMap<>();
-            for (Map.Entry<?, ?> property : ((Map<?, ?>) properties).entrySet()) {
-                Object definition = property.getValue();
-                if (definition instanceof Map && ((Map<?, ?>) definition).get("type") != null) {
-                    fields.put(String.valueOf(property.getKey()), String.valueOf(((Map<?, ?>) definition).get("type")));
-                }
+            Map<String, String> fields = DescriptorRepresentable.fieldTypesOrNull(parsed.get("properties"));
+            if (fields == null) {
+                // Refused rather than partially recorded, and this is the half of the defect that was
+                // worse. The extraction here used to skip any property it could not read and record the
+                // rest, then report success -- so a put-mapping adding an object field to a gated index was
+                // acknowledged with the field silently absent. The same field at creation was refused and
+                // kept the index resident, which is exactly the "gated at creation and refused on update,
+                // or the reverse" that the shared extractor's javadoc says must not exist.
+                //
+                // There is no fallback available: the index is not in cluster state, so this cannot be
+                // applied the ordinary way. Failing is the only answer that does not lose the field, and
+                // the outer catch turns it into a failure of this request alone.
+                throw new IllegalArgumentException(
+                    "index ["
+                        + request.indices()[0].getName()
+                        + "] is held outside cluster state and its mapping store holds a flat map of field "
+                        + "name to type, so it cannot carry an object or nested field, or a field parameter "
+                        + "such as a date format or an analyzer. Applying this mapping would drop them"
+                );
             }
             if (fields.isEmpty()) {
                 return;

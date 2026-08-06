@@ -110,9 +110,10 @@ public final class DescriptorRepresentable {
         // use case this design is for. Refusing is what stops data being lost while that is built.
         if (indexMetadata.mapping() != null && simpleFieldsOrNull(indexMetadata) == null) {
             return "index declares a mapping that cannot be carried field by field: a descriptor holds a "
-                + "mapping generation while the fields live in the mapping store, and only top-level "
-                + "properties with a declared type round-trip through it, so an object or nested field "
-                + "would be accepted and then discarded";
+                + "mapping generation while the fields live in the mapping store, which holds a flat map of "
+                + "field name to type, so only a top-level property whose definition is exactly a declared "
+                + "type round-trips. An object or nested field, or any field parameter such as a date "
+                + "format or an analyzer, would be accepted and then discarded";
         }
         return null;
     }
@@ -123,8 +124,15 @@ public final class DescriptorRepresentable {
      * <p>A descriptor carries a mapping generation and the fields live in {@code MappingGenerationStore},
      * so gating an index with a mapping means writing those fields there at creation. That works exactly as
      * far as the store's shape allows: a flat map of field name to type. A property with no declared type,
-     * or one whose definition is an object or nested field with its own properties, has no representation
-     * in that map.
+     * one whose definition is an object or nested field with its own properties, or one carrying any
+     * parameter beside the type, has no representation in that map.
+     *
+     * <p><b>Any parameter, not only a structural one.</b> The first version of this required a declared
+     * type and no sub-properties, which reads like a completeness check and is not one: a definition may
+     * name a type and carry six other things, and only the type survives. So {@code format}, {@code
+     * analyzer}, {@code normalizer}, {@code ignore_above}, {@code null_value} and multi-{@code fields} all
+     * passed the guard and were dropped. Losing a date format is not a lost setting, it is a document that
+     * parses to a different day than the tenant's mapping said it would.
      *
      * <p><b>Null rather than a partial map, and the difference is the whole point.</b> Returning the fields
      * that do round-trip and dropping the rest is the silent loss this check exists to prevent, one level
@@ -140,7 +148,22 @@ public final class DescriptorRepresentable {
         if (mapping == null) {
             return Map.of();
         }
-        Object properties = mapping.sourceAsMap().get("properties");
+        return fieldTypesOrNull(mapping.sourceAsMap().get("properties"));
+    }
+
+    /**
+     * The one extraction, shared by both paths that write a gated mapping.
+     *
+     * <p>{@link #simpleFieldsOrNull} calls it for a create-time mapping and
+     * {@code MetadataMappingService#recordGatedMapping} for a put-mapping. They used to be two
+     * implementations described as mirroring each other, and they did not: this one refused a partial
+     * result while that one skipped whatever it could not read and reported success, so an object field was
+     * refused at creation and silently dropped on update. One function is what makes the claim true.
+     *
+     * @param properties the mapping's {@code properties} object, however the caller obtained it
+     * @return name to type for every field, or null if any of it would not round-trip
+     */
+    static Map<String, String> fieldTypesOrNull(Object properties) {
         if (properties instanceof Map == false) {
             // A mapping with no properties at all carries nothing, so there is nothing to lose.
             return Map.of();
@@ -153,9 +176,15 @@ public final class DescriptorRepresentable {
             }
             Map<?, ?> asMap = (Map<?, ?>) definition;
             Object type = asMap.get("type");
-            if (type == null || asMap.containsKey("properties")) {
-                // No declared type, or an object with its own properties. Either way the store's flat
-                // name-to-type map has nowhere to put it.
+            // The type alone, and nothing beside it. Requiring a declared type and no sub-properties was
+            // not enough: it let every field *parameter* through the guard and then dropped it, because
+            // only the type is what gets stored. A date declared with format dd/MM/yyyy was stored as a
+            // bare date, so documents that used to parse began failing or landing on a different day, from
+            // an index whose creation had been acknowledged.
+            //
+            // Checking the size is what makes the rule "this definition is exactly the type" rather than
+            // "this definition mentions a type", and only the first of those is true of what is kept.
+            if (type == null || asMap.size() != 1) {
                 return null;
             }
             fields.put(String.valueOf(property.getKey()), String.valueOf(type));
