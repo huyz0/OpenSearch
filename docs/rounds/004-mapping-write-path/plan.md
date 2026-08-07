@@ -263,3 +263,48 @@ failure it exists to prevent, and the check that would have caught it costs one 
     silently return zero hits on a declared field
 - Risk: medium
 - Kind: fix
+
+### T51 — Three doors into gated creation have no admission check
+
+- Depends on: T49
+- Goal: `createIndex` is not the only way into the gated branch. Auto-creation, rollover and data stream
+  creation call `applyCreateIndexRequest` from inside a cluster state update task, so no admission check
+  runs and none can. With a gated template in place, indexing a document into a new name reaches the
+  gated branch on the state update thread. Before T49 that blocked, or deadlocked; after T49 the
+  tripwire refuses the creation, which fails the bulk. Better, and still wrong.
+- Acceptance:
+  - a test that puts a gated template and then indexes into a matching name that does not exist, and
+    asserts the document is indexed rather than the request refused
+  - the same for a rollover into a template-gated name
+  - whatever routes those three callers off-thread is one mechanism, not three
+  - mutation: reverting it fails both tests with the offending thread named
+- Risk: high
+- Kind: fix
+
+### T52 — Admission and creation resolve templates differently in three cases
+
+- Depends on: T49
+- Goal: `settingsForAdmission` is close to what creation computes but not identical. Creation resolves a
+  v2 template against the data stream name when there is one, and skips templates entirely for a resize
+  target and for system indices. Admission does none of those, so a resize target or a system index whose
+  name matches a gated template is over-admitted and pays the whole creation twice through the fallback.
+  Safe, not free, and the divergence is the thing T49 set out to remove.
+- Acceptance:
+  - one function computes the settings both readers use, or the differences are enumerated in code with
+    a reason each
+  - a test for the resize-target case, which is the one with a real cost today
+- Risk: low
+- Kind: fix
+
+### T53 — The threading proof cannot attribute a store call to a phase
+
+- Depends on: T44, T49
+- Goal: the recording store notes the calling thread and discards the index. A phase's "it reached the
+  store" assertion is therefore satisfied by any call landing in its window, including an asynchronous
+  one belonging to another index. The phases are only as strong as their attribution.
+- Acceptance:
+  - the recorder keeps the index with the thread, and each phase asserts its own index appears
+  - the deletion prune added in T47 gets a phase, since it is the one caller whose thread nothing checks
+  - mutation: making a phase's own call disappear fails that phase rather than passing on another's
+- Risk: low
+- Kind: proof
