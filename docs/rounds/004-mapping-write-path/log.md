@@ -300,3 +300,33 @@ The round's exit criteria are met: the RFC's "leading candidate ... unmeasured" 
 a measured split with controls, the creation path no longer issues a read that cannot return anything,
 and the store has tests for read failure, deletion and geometry. T49 and T50 are work this round
 discovered rather than work it set out to do, and they belong to the next round's plan.
+
+## T49 — A template-gated creation writes its mapping from the cluster state thread
+
+- Status: complete
+- Commit: d39300665c9
+- Result: admission is given template-merged, normalised settings, so a template-gated creation is
+  routed off the state update thread like any other. Reaching the mapping write on a thread where
+  blocking is unsafe now refuses the creation instead of performing it.
+- Mutation: reverting admission to the request's own settings fails the new template phase, naming the
+  index and `clusterManagerService#updateTask`.
+- Decisions taken, since this task had a fork in it:
+  - Core resolves templates and passes merged settings to the existing seam, rather than widening the
+    seam for the plugin to resolve them. One computation, two readers, no drift.
+  - The tripwire refuses rather than asserts. Assertions are off in production, and a rejected create
+    is better than a stalled cluster manager.
+  - Admission stays an over-approximation; aliases are not resolved.
+- Notes:
+  - The review found that under-admission now costs the request rather than only speed, which raises
+    the price of every remaining source of it. The un-prefixed REST settings form was one, and is
+    fixed by normalising before asking.
+  - Three callers reach that branch from inside a cluster state task and have no admission check:
+    auto-creation, rollover, data stream creation. Filed as T51. The refusal's message no longer
+    blames an admission check those paths never ran.
+  - The test needed a storage base path, and the reason first written down was wrong. The index under
+    test is confirmed gated, so the fallback explanation does not hold; what opens a gated shard in
+    that class is not established, and the comment says so rather than inventing a reason.
+- Gates: one failure, `GatedIdleEvictionIT.testResidencyIsBoundedByArrivalRate...`, which also failed
+  once in three runs alone at load 8.7. It failed in this session's first gate run too, before any of
+  this round's code changes, so it predates the work rather than tracking it.
+- Deferred: T51, T52, T53.
