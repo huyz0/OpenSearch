@@ -107,9 +107,31 @@ worth saying out loud rather than letting it slide.
     exist, asserting the document is indexed rather than the request refused
   - the same for a rollover into a template-gated name
   - whatever routes those callers off-thread is one mechanism rather than three, named in the code
+  - a gated rollover target's alias, and a gated data-stream target's backing-index membership, are
+    recorded correctly, not just the mapping write made safe -- see the scope note below
   - mutation: reverting it fails both tests with the offending thread named
 - Risk: high
 - Kind: fix
+- **One approach attempted and refuted. Start from this rather than repeating it.** Short-circuiting
+  T49's tripwire (`if (false && AbsentIndexDescriptorSuppliers.blockingIsUnsafeHere())`) makes the
+  write "succeed" but is not a fix: it removes the guard rather than moving the write off-thread, so
+  the mapping write goes back to happening unchecked on the cluster manager's update thread. A
+  silently-succeeding unsafe write is worse than the refusal it replaces. See round 005's log.md for
+  the full writeup.
+- **Scope is larger than first stated, found during the refuted attempt's investigation.** The
+  existing off-thread mechanism for the ordinary `createIndex` door (`createGatedIndex`) decides an
+  index is gated from the finished `IndexMetadata` alone, skipping cluster state entirely. A rollover
+  target's alias is attached in a later, separate step (`MetadataIndexAliasesService.applyAliasActions`)
+  that runs *after* `applyCreateIndexRequest` returns, so a gated rollover target has no cluster-state
+  entry for that step to attach the alias to -- it throws `IndexNotFoundException` even once the
+  mapping write itself is made safe. Data-stream rollover has the same shape: the
+  `metadataTransformer` that appends the new index to the backing-index list is never invoked, because
+  the gated branch returns early before reaching it. Routing the three callers off-thread is necessary
+  but not sufficient; the next attempt also has to decide how a gated rollover/data-stream target gets
+  its alias or backing-index membership recorded, given it deliberately has no cluster-state entry to
+  attach to. Also found live: the current tripwire failure is uncaught inside the cluster-state task
+  and kills the cluster-manager node, not just the bulk -- worth confirming that changes once the fix
+  lands, since it is a second, worse-than-stated symptom of the same gap.
 
 ### T52 — Admission and creation resolve templates differently in three cases
 

@@ -139,3 +139,23 @@ Append-only. One entry per task, written when the task's commit lands.
   applier thread) rather than doing the mapping write synchronously inside the state update itself.
   One shared mechanism, named in code, is still the requirement; do not solve auto-creation,
   rollover, and data-stream creation as three separate call-site patches.
+- A second, independent investigation (a separate agent working the same task before the above
+  refutation landed, reporting late) found something the plan itself is missing. It reproduced the
+  literal failure live: a template-gated rollover throws `IllegalStateException` from
+  `refuseToWriteAMappingFromTheClusterStateThread`, uncaught inside the cluster-state task, which
+  kills the cluster-manager node rather than just failing the bulk — worse than the plan's framing.
+  More importantly, it traced what happens *after* a hypothetical off-thread fix: `createGatedIndex`
+  (the existing off-thread mechanism for the ordinary `createIndex` door, which any fix should route
+  through rather than duplicate) decides an index is gated from the finished `IndexMetadata` alone,
+  skipping cluster state entirely. A rollover target's alias is attached in a later, separate step
+  (`MetadataIndexAliasesService.applyAliasActions`) that runs *after* `applyCreateIndexRequest`
+  returns — so a gated rollover target has no cluster-state entry for that step to attach the alias
+  to, and it would throw `IndexNotFoundException` even once the mapping write itself is safely
+  off-thread. Data-stream rollover has the same shape: the `metadataTransformer` that appends the new
+  index to the data stream's backing-index list is never invoked, because the gated branch returns
+  early before reaching it. So "route the three callers off-thread like the fourth already does" is
+  not sufficient by itself — the next attempt also has to decide how a gated rollover/data-stream
+  target gets its alias or backing-index membership recorded, given it deliberately has no
+  cluster-state entry to attach to. That is materially more scope than the plan states and should be
+  folded into T51 explicitly (or split into a dependency task) before the next attempt, rather than
+  discovered again partway through implementation.
