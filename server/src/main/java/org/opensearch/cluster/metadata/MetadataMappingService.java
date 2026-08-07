@@ -301,6 +301,9 @@ public class MetadataMappingService {
          * at all.
          */
         void recordGatedMapping(PutMappingClusterStateUpdateRequest request) throws IOException {
+            for (Index index : request.indices()) {
+                refuseIfDescriptorShowsTheIndexIsGone(index);
+            }
             Map<String, Object> parsed = XContentHelper.convertToMap(MediaTypeRegistry.JSON.xContent(), request.source(), false);
             Map<String, Object> fields = DescriptorRepresentable.fieldDefinitionsOrNull(parsed.get("properties"));
             if (fields == null) {
@@ -327,6 +330,56 @@ public class MetadataMappingService {
             }
             for (Index index : request.indices()) {
                 MappingGenerationStore.updateMapping(index.getUUID(), fields);
+            }
+        }
+
+        /**
+         * T50: refuses a gated put-mapping whose index the descriptor plane no longer says is live.
+         *
+         * <p>{@link #isGated} decides gating purely from the index's absence in cluster state, and that is
+         * equally true of a live gated index and one T47's deletion-time prune already removed: cluster
+         * state never carried an entry for either. The uuid this request names was resolved by the
+         * coordinating node from its own descriptor cache, which invalidates on a tombstone it has seen but
+         * not on one it has not -- so a node whose cache has not yet caught up can still route a put-mapping
+         * or a dynamic field inference at a uuid whose tombstone is already durable elsewhere. Nothing before
+         * T50 asked the store whether that uuid was still current, so the write landed, recreated the
+         * document T47 pruned, and nothing was ever going to remove it again.
+         *
+         * <p><b>The contract this closes T50 by:</b> refusing here, not letting the write land and sweeping
+         * it up later. The alternative -- a second pass that prunes stray mappings after the fact -- was
+         * tried first, keyed off the tombstone the deletion already wrote, and rejected: see the plan and log
+         * for T50. This resolves the descriptor for the uuid fresh, on the thread doing the write, which is
+         * off the cluster manager's update thread already and so may block. For a live index the resolution
+         * is a cache hit against the same descriptor cache every other resolution on this path already
+         * pays for, not a new cost.
+         *
+         * <p>Skipped when descriptor resolution is not registered at all, which is not a hole: {@code
+         * DescriptorGate} registers the descriptor supplier and {@link MappingGenerationStore} together in
+         * one {@code install} call, so a node that reached {@link #isGated} answering true by way of the
+         * store also has descriptor resolution to consult. A caller that registers only the store, as several
+         * tests below the descriptor plane do, is exercising the mapping store in isolation and has no
+         * tombstone to consult in the first place.
+         *
+         * <p><b>A null answer is not treated as "gone".</b> {@link AbsentIndexDescriptorSuppliers#supply}
+         * documents null as "no answer" and swallows any failure that is not a {@link
+         * DescriptorUnavailableException} into it, precisely so a resolver bug degrades a request rather than
+         * failing it -- every other caller of this seam relies on that. Refusing on null as well as on a
+         * confirmed tombstone would let that same resolver bug fail a live index's put-mapping outright,
+         * which is a regression this task must not introduce to close a narrower one. It is also not what a
+         * genuine deletion looks like here: {@code BlobDescriptorBackend#get} answers a tombstoned name with
+         * the tombstone record, not null, so this only ever refuses on an answer that actually says so.
+         */
+        private void refuseIfDescriptorShowsTheIndexIsGone(Index index) {
+            if (AbsentIndexDescriptorSuppliers.isRegistered() == false) {
+                return;
+            }
+            IndexDescriptor current = AbsentIndexDescriptorSuppliers.supply(index.getName());
+            if (current != null && (current.exists() == false || current.uuid().equals(index.getUUID()) == false)) {
+                throw new org.opensearch.index.IndexNotFoundException(
+                    "its tombstone is already durable; the mapping store refuses a write against a uuid the descriptor plane no "
+                        + "longer resolves as live",
+                    index.getName()
+                );
             }
         }
 
