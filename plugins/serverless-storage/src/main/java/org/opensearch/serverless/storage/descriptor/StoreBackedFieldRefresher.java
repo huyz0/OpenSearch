@@ -10,6 +10,8 @@ package org.opensearch.serverless.storage.descriptor;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
+import org.opensearch.cluster.metadata.IndexDescriptor;
 import org.opensearch.cluster.metadata.MappingGenerationStore;
 import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.mapper.UnknownFieldRefresh;
@@ -167,7 +169,16 @@ public final class StoreBackedFieldRefresher implements UnknownFieldRefresh.Refr
 
         MappingGenerationStore.MappingGeneration stored;
         try {
-            stored = MappingGenerationStore.currentMapping(indexUuid);
+            stored = MappingGenerationStore.currentMapping(indexUuid, expectedGeneration(mapperService, indexUuid));
+        } catch (MappingGenerationStore.MissingMappingException e) {
+            // T59. The descriptor this node resolved for the index says it declared fields; the store says
+            // it has none. That is the window between T47's deletion-time prune and the moment this node's
+            // descriptor cache catches up, and letting it through here would merge nothing, report the field
+            // absent, and send the caller to infer it fresh -- silently replacing whatever generation the
+            // descriptor claims with whatever this one document happens to carry. Unlike the catch below,
+            // this must not degrade: it names a real inconsistency rather than a store this node cannot
+            // reach.
+            throw e;
         } catch (Exception e) {
             // T43 stopped the store reporting an unreadable mapping as an absent one, so this is now the
             // place that decides what to do about it, and the answer here is the same as everywhere else in
@@ -214,5 +225,30 @@ public final class StoreBackedFieldRefresher implements UnknownFieldRefresh.Refr
     /** How many indices this node holds a merged generation for, which the capacity bounds. */
     public int trackedIndexCount() {
         return mergedGeneration.size();
+    }
+
+    /**
+     * The generation this node's own descriptor resolution says {@code indexUuid} is at, or 0 when there is
+     * nothing to check against.
+     *
+     * <p>T59. Zero rather than throwing whenever resolution cannot confirm the uuid, matching the "a null
+     * answer is not treated as gone" contract {@code MetadataMappingService#refuseIfDescriptorShowsTheIndexIsGone}
+     * settled for the write side in T50: a resolver that is not registered, cannot answer, or resolves the
+     * name to a different uuid than this shard's gives no evidence either way, and forcing a failure from
+     * that would fail an ordinary unreadable-resolver case rather than only the one this closes.
+     */
+    private static long expectedGeneration(MapperService mapperService, String indexUuid) {
+        if (AbsentIndexDescriptorSuppliers.isRegistered() == false) {
+            return 0L;
+        }
+        org.opensearch.core.index.Index index = mapperService.index();
+        if (index == null) {
+            return 0L;
+        }
+        IndexDescriptor current = AbsentIndexDescriptorSuppliers.supply(index.getName());
+        if (current == null || current.exists() == false || current.uuid().equals(indexUuid) == false) {
+            return 0L;
+        }
+        return current.mappingGeneration();
     }
 }

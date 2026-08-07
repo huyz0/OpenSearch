@@ -268,6 +268,50 @@ public class MappingGenerationStoreTests extends OpenSearchTestCase {
         MappingGenerationStore.deleteMapping("idx");
     }
 
+    /**
+     * T59, criterion 1. A descriptor claiming a non-zero generation against a store holding nothing must
+     * fail rather than answer "no fields".
+     */
+    public void testAnAbsentMappingWithANonZeroExpectedGenerationFails() {
+        InMemoryStore store = new InMemoryStore();
+        MappingGenerationStore.register(store);
+
+        MappingGenerationStore.MissingMappingException thrown = expectThrows(
+            MappingGenerationStore.MissingMappingException.class,
+            () -> MappingGenerationStore.currentMapping("idx", 3L)
+        );
+        assertTrue(thrown.getMessage().contains("idx"));
+        assertTrue(thrown.getMessage().contains("3"));
+    }
+
+    /**
+     * T59, criterion 2. A genuinely empty mapping -- generation zero expected -- still answers null rather
+     * than being swept up by the same check.
+     */
+    public void testAnAbsentMappingWithAZeroExpectedGenerationIsStillNull() {
+        InMemoryStore store = new InMemoryStore();
+        MappingGenerationStore.register(store);
+
+        assertNull(MappingGenerationStore.currentMapping("idx", 0L));
+    }
+
+    /** The presence case is unaffected: a real mapping is returned regardless of what was expected. */
+    public void testAPresentMappingIsReturnedRegardlessOfExpectedGeneration() {
+        InMemoryStore store = new InMemoryStore();
+        MappingGenerationStore.register(store);
+        MappingGenerationStore.updateMapping("idx", Map.of("age", "long"));
+
+        MappingGenerationStore.MappingGeneration current = MappingGenerationStore.currentMapping("idx", 1L);
+
+        assertNotNull(current);
+        assertEquals("long", MappingGenerationStore.typeOf(current.fields().get("age")));
+    }
+
+    /** With no store installed, the generation-aware overload degrades the same way the plain one does. */
+    public void testWithNoStoreInstalledTheGenerationAwareOverloadAnswersNull() {
+        assertNull(MappingGenerationStore.currentMapping("idx", 5L));
+    }
+
     /** A delete removes the mapping, so a later read sees nothing rather than a stale generation. */
     public void testDeletingRemovesTheMapping() {
         InMemoryStore store = new InMemoryStore();

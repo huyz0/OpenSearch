@@ -8,6 +8,8 @@
 
 package org.opensearch.index.mapper;
 
+import org.opensearch.cluster.metadata.MappingGenerationStore;
+
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -70,7 +72,19 @@ public final class UnknownFieldRefresh {
      * new field into an error: the caller's existing behaviour, rejecting or inferring, is a correct
      * outcome, while a failed write is not.
      *
+     * <p><b>T59's one exception to that, and why it has to be one.</b> {@link MappingGenerationStore.MissingMappingException}
+     * is not a store hiccup: it is the descriptor this node resolved for the index saying it declared
+     * fields, and the store answering that it has none. Swallowing that here and returning false would send
+     * the caller to infer the field fresh from this one document, silently replacing whatever generation the
+     * descriptor claims with whatever this document happens to carry -- the exact silent-empty-mapping shape
+     * T59 exists to close, reintroduced one layer up from where {@code StoreBackedFieldRefresher} raises it.
+     * Matches {@code AbsentIndexDescriptorSuppliers#supply}'s own precedent for {@code
+     * DescriptorUnavailableException}: everything else degrades because resolution is already a degradation
+     * path, and a bug in it must not become a failed request; this one is not a bug, it is the resolver
+     * doing its job and disagreeing with the store.
+     *
      * @return whether the field is now known, so the caller should look it up again
+     * @throws MappingGenerationStore.MissingMappingException propagated rather than swallowed; see above
      */
     public static boolean refreshed(MapperService mapperService, String indexUuid, String fieldName) {
         Refresher refresher = REFRESHER.get();
@@ -79,6 +93,8 @@ public final class UnknownFieldRefresh {
         }
         try {
             return refresher.refresh(mapperService, indexUuid, fieldName);
+        } catch (MappingGenerationStore.MissingMappingException e) {
+            throw e;
         } catch (Exception e) {
             return false;
         }

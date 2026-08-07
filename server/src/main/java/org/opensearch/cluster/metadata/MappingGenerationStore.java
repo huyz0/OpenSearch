@@ -292,6 +292,63 @@ public final class MappingGenerationStore {
     }
 
     /**
+     * The current mapping, refusing to answer "no fields" when a descriptor says otherwise.
+     *
+     * <p>T59. T43 and T48 taught {@code Store.read} to tell absent from unreadable and absent from lost, but
+     * neither covers a third case: the index resolves, the store answers "no document", and a caller with no
+     * other information reports that as an index declaring no fields. That is exactly what a reader sees in
+     * the window between T47's deletion-time prune and the moment a stale-cache node stops resolving the
+     * deleted name -- T50 closed the write half of that window; this is the read half.
+     *
+     * <p>The fix needs no new record. {@link IndexDescriptor#mappingGeneration()} already carries what
+     * settles it: a caller that resolved a descriptor to reach this point, and found it claiming generation
+     * {@code expectedGeneration > 0}, knows the index declared fields. A store answering null then is not
+     * "never written", it is "written and now missing", and only the caller holding that descriptor can tell
+     * the two apart -- the store itself cannot, which is why this lives here rather than in {@code
+     * Store.read}.
+     *
+     * @param expectedGeneration the calling descriptor's {@code mappingGeneration}, or 0 when there is none
+     *                           to check against, in which case this behaves exactly like {@link
+     *                           #currentMapping(String)}
+     * @throws MissingMappingException when the store answers absent but the descriptor says otherwise
+     */
+    public static MappingGeneration currentMapping(String indexUuid, long expectedGeneration) {
+        if (STORE.get() == null) {
+            // No store means the whole seam is off, the same as every other entry point here degrading to
+            // its no-op answer. A generation the caller cannot have gotten from a live descriptor plane
+            // proves nothing about this store, which does not exist.
+            return null;
+        }
+        MappingGeneration current = currentMapping(indexUuid);
+        if (current == null && expectedGeneration > 0) {
+            throw new MissingMappingException(indexUuid, expectedGeneration);
+        }
+        return current;
+    }
+
+    /**
+     * Raised by {@link #currentMapping(String, long)} when a descriptor's generation says an index has a
+     * mapping and the store holds nothing for it.
+     *
+     * <p>Deliberately not swallowed anywhere this is thrown from: T43 removed exactly this shape of failure
+     * being caught and reported as "no fields", and a caller here would be reintroducing it one level up if
+     * it caught this and returned null or false.
+     */
+    public static final class MissingMappingException extends IllegalStateException {
+        public MissingMappingException(String indexUuid, long expectedGeneration) {
+            super(
+                "index ["
+                    + indexUuid
+                    + "]'s descriptor claims mapping generation ["
+                    + expectedGeneration
+                    + "] but the mapping store holds no document for it, so the mapping is missing rather "
+                    + "than empty; answering null here would report an index with declared fields as one "
+                    + "with none"
+            );
+        }
+    }
+
+    /**
      * Removes an index's mapping, if a store is installed.
      *
      * <p>Failures propagate. The deletion path calls this after the index's tombstone is durable and
