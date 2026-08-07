@@ -60,6 +60,38 @@ worth saying out loud rather than letting it slide.
     was the design's central claim and it is false.
   What survives from the attempt: the prune has to stay on a path that runs unconditionally, and any
   mechanism keyed off tombstones has to handle name reuse before it can be trusted with a uuid.
+- **Second look, not yet implemented, and mechanical from here.** The deletion-time prune stays,
+  because it is the only unconditional path. What is missing is that the write never asks whether the
+  index still exists: `MetadataMappingService.PutMappingExecutor#isGated` decides an index is gated
+  purely because it is absent from cluster state, which is equally true of a live gated index and a
+  deleted one, and `recordGatedMapping` then writes against a uuid the coordinating node resolved from
+  a cache that may be stale. So the write is refused by resolving the descriptor for that uuid before
+  writing, on the node doing the write, which is the branch the criterion calls "the tombstone
+  consulted on the mapping path". It is a cache hit for a live index, and the residual window is a
+  cluster manager that failed over after the deletion and holds no invalidation.
+  The read-side half is a different mechanism and belongs in its own task, filed as T59.
+- Depends on: none
+
+### T59 — A missing mapping reads as an index with no fields
+
+- Depends on: T50
+- Goal: T43 taught the store to distinguish absent from unreadable, and T48 taught it to distinguish
+  absent from lost. Neither covers the third case: the index resolves, the store answers "no
+  document", and that is reported as an index declaring no fields. It is what a reader sees between
+  the deletion-time prune and the moment the name stops resolving on its node, and the symptom is the
+  one this project keeps producing -- a query returning no hits on a declared field, successfully.
+- Goal, second half: the descriptor already carries what settles it. `IndexDescriptor` has a
+  `mappingGeneration`, so a descriptor saying generation N > 0 against a store holding nothing is a
+  missing mapping rather than an empty one, and the two are distinguishable without a new record.
+- Acceptance:
+  - a read for an index whose descriptor claims a non-zero mapping generation, against a store with no
+    document for it, fails rather than answering "no fields"
+  - a genuinely empty mapping, generation zero, still answers null
+  - an integration test issues a real query against a name in that window and asserts it does not
+    return zero hits on a declared field, which is the symptom rather than its mechanism
+  - mutation: ignoring the descriptor's generation fails the first and third
+- Risk: medium
+- Kind: fix
 
 ### T51 — Three doors into gated creation have no admission check
 

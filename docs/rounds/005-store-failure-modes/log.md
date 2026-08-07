@@ -19,3 +19,19 @@ Append-only. One entry per task, written when the task's commit lands.
   tombstone was durable, and no test issued a query against a still-resolving name. Both were argued
   in javadoc instead. A design that cannot be tested against those two criteria is not the design.
 - Next attempt starts from the plan's refutation note.
+
+## T50 — second firing, design recorded, not implemented
+
+- Status: still not complete. Nothing in the tree changed this firing.
+- What the firing established: the write path cannot tell a live gated index from a deleted one
+  because `isGated` decides gating from absence in cluster state, which both cases share, and
+  `recordGatedMapping` writes against a uuid resolved by the coordinating node's cache. Refusing the
+  write means resolving the descriptor for that uuid before writing. That is a cache hit for a live
+  index, so it is affordable on the path.
+- And that the read-side half is a separate mechanism: `IndexDescriptor` already carries a
+  `mappingGeneration`, so a descriptor claiming generation N against a store with no document is a
+  missing mapping rather than an empty one. Filed as T59 rather than folded in, because a task with
+  two mechanisms is how the last attempt produced something that passed its tests and was wrong.
+- Stopped here deliberately. The loop's own rule is to stop when a task has not completed on two
+  consecutive firings, and the previous firing's failure was a design pushed through a context that
+  had no room left to check it. The design is now mechanical; the next firing should implement it.
