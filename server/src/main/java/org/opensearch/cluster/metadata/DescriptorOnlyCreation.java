@@ -83,6 +83,11 @@ public final class DescriptorOnlyCreation {
         ADMISSION.set(admission);
     }
 
+    /** Whether anything is asking, so a cluster with no gate does not pay to prepare an answer. */
+    public static boolean hasAdmissionCheck() {
+        return ADMISSION.get() != null;
+    }
+
     /**
      * Whether a creation request looks gated enough to be admitted without the cluster state update thread.
      *
@@ -101,15 +106,21 @@ public final class DescriptorOnlyCreation {
      *
      * <h4>The two ways it can be wrong are not symmetric, and that sets its direction</h4>
      *
-     * Answering false for a request that turns out gated costs nothing but speed: the request takes the
-     * ordinary road, reaches the same gate at the bottom, and is gated exactly as it is today. An index gated
-     * only by a template lands here, because a template's settings are not in the request.
+     * Answering false for a request that turns out gated was believed to cost nothing but speed: the request
+     * takes the ordinary road, reaches the same gate at the bottom, and is gated there. That was wrong, and
+     * round 004's T49 is why this method is now given template-merged settings rather than the request's own.
+     * The gate at the bottom runs on the state update thread, and gating there means writing the index's
+     * declared mapping to a store whose writes block -- on the one thread that must never block, by a caller
+     * that had already decided this request was not gated. An index gated only by a template took exactly
+     * that road, because a template's settings are not in the request.
      *
      * <p>Answering true for a request that turns out <em>not</em> gated costs a repeat: the off-thread attempt
      * finds the index needs its cluster state entry after all, discards what it built, and falls back to the
      * ordinary path, which redoes it. Correct, and paid for twice.
      *
-     * <p>Both are safe, so this may be liberal, and neither is silent. What it must never be is the third
+     * <p>So one direction is safe and the other is not, which is why the caller now resolves templates before
+     * asking: over-admitting is absorbed by a fallback that exists, and under-admitting is the defect. This
+     * check should stay liberal for the same reason. What it must never be is the third
      * thing -- a request admitted off-thread that then writes to cluster state from a thread that may not.
      * That cannot happen here, because this predicate does not authorise the write; it only chooses a road.
      *

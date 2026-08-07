@@ -42,13 +42,13 @@ import java.util.concurrent.ConcurrentHashMap;
  * calling thread of every call, a real gated creation and a real put-mapping drive it, and the assertion is
  * on the thread names collected.
  *
- * <p><b>What this proves is narrower than "no gated creation blocks that thread", and the gap is not
- * hypothetical.</b> The creation here carries {@code index.serverless_storage.enabled} in its own request
- * settings, which is what {@code DescriptorGate}'s admission check reads, so it is admitted onto GENERIC. An
- * index made gated by a matching template carries nothing in its request that says so, is deliberately not
- * admitted, and reaches {@code clusterStateCreateIndex} on the cluster manager's update thread -- where the
- * finished settings do say it is gated, so it calls the store from exactly the thread this class exists to
- * keep it off. T49 covers that shape; this class does not, and saying so is the point of this paragraph.
+ * <p><b>Both ways an index becomes gated are driven, and the second one is why T49 exists.</b> A request
+ * carrying {@code index.serverless_storage.enabled} says it is gated and is admitted off-thread on that
+ * basis. An index gated only by a matching template says nothing, and used to take the ordinary road and
+ * meet the gate at the bottom on the cluster manager's update thread -- where being gated means a blocking
+ * write to the mapping store, from the thread this class exists to keep it off, by a write that can submit
+ * a cluster state update of its own and wait for the thread it is standing on. T49 made admission resolve
+ * templates, so that road is no longer taken; the template phase below is what holds it to that.
  *
  * <h2>The two ways a proof like this passes for the wrong reason</h2>
  *
@@ -91,6 +91,40 @@ public class GatedMappingOffClusterStateThreadIT extends org.opensearch.serverle
         return List.of(org.opensearch.serverless.storage.ServerlessStoragePlugin.class);
     }
 
+    private static volatile java.nio.file.Path sharedBasePath;
+
+    private java.nio.file.Path basePath() {
+        if (sharedBasePath == null) {
+            synchronized (GatedMappingOffClusterStateThreadIT.class) {
+                if (sharedBasePath == null) {
+                    sharedBasePath = randomRepoPath();
+                }
+            }
+        }
+        return sharedBasePath;
+    }
+
+    /**
+     * A storage base path, which this class did without until the template phase needed it.
+     *
+     * <p>The class did without one until the template phase, and the reason first written here was wrong:
+     * that a template-gated creation falls back to the ordinary path and opens a shard. It does not. The
+     * assertion below confirms the index is gated, and removing this setting still fails the run with
+     * "serverless storage enabled but no usable container", so something in this class does open a gated
+     * shard. Which one is not established, and the setting is kept because it is required rather than
+     * because the explanation is understood.
+     */
+    @Override
+    protected Settings nodeSettings(int nodeOrdinal) {
+        return Settings.builder()
+            .put(super.nodeSettings(nodeOrdinal))
+            .put(
+                org.opensearch.serverless.storage.ServerlessStoragePlugin.SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey(),
+                basePath().toString()
+            )
+            .build();
+    }
+
     @After
     public void clearGate() throws Exception {
         DescriptorGate.uninstall();
@@ -111,6 +145,28 @@ public class GatedMappingOffClusterStateThreadIT extends org.opensearch.serverle
                         .mapping(Map.of("properties", Map.of("tenant", Map.of("type", "keyword"))))
                 )
                 .actionGet(REQUEST_DEADLINE)
+        );
+
+        // The shape T44 could not cover and T49 closed. Nothing in this request says the index is gated;
+        // the template does, and admission now resolves templates rather than reading the request alone.
+        client().admin().indices().preparePutTemplate("gated-by-template").setPatterns(List.of("templated-*")).setSettings(gated()).get();
+
+        checkPhase(
+            store,
+            "template-gated creation",
+            () -> client().admin()
+                .indices()
+                .create(
+                    new CreateIndexRequest("templated-threading").mapping(Map.of("properties", Map.of("tenant", Map.of("type", "keyword"))))
+                )
+                .actionGet(REQUEST_DEADLINE)
+        );
+
+        // The phase means nothing unless the template actually gated the index: an index that fell back to
+        // the ordinary path would still have reached the store once, off-thread, during the attempt.
+        assertNull(
+            "the template must be what gates this index, or the phase above proves nothing about the " + "template path",
+            client().admin().cluster().prepareState().get().getState().metadata().index("templated-threading")
         );
 
         checkPhase(
@@ -141,12 +197,35 @@ public class GatedMappingOffClusterStateThreadIT extends org.opensearch.serverle
      * and names the offending thread even when the request never comes back.
      */
     private void checkPhase(RecordingStore store, String phase, Runnable request) {
+        Throwable failure = null;
         try {
             request.run();
-        } finally {
-            Set<String> threads = store.takeThreads();
-            assertNoneForbidden(phase, threads);
-            assertFalse(phase + " never reached the mapping store, so this proves nothing about it", threads.isEmpty());
+        } catch (Throwable e) {
+            // Throwable rather than Exception. What this class exists to catch raises an AssertionError,
+            // and a catch that misses it is the exact mistake this file criticises PutMappingExecutor for.
+            // Rethrown below, after the evidence has been read.
+            failure = e;
+        }
+        Set<String> threads = store.takeThreads();
+        assertNoneForbidden(phase, threads);
+        // The request's own failure goes into this message rather than replacing it. With the tripwire in
+        // place a regression presents as a refused creation rather than a blocked thread, so the store is
+        // never reached, and "never reached the mapping store" on its own sends a reader to the wrong
+        // place. The reason is right here.
+        assertFalse(
+            phase
+                + " never reached the mapping store, so this proves nothing about it"
+                + (failure == null ? "" : ", and it failed with: " + failure),
+            threads.isEmpty()
+        );
+        if (failure instanceof RuntimeException runtime) {
+            throw runtime;
+        }
+        if (failure instanceof Error error) {
+            throw error;
+        }
+        if (failure != null) {
+            throw new AssertionError(phase + " failed", failure);
         }
     }
 

@@ -344,11 +344,13 @@ public final class DescriptorGate {
      * that carries it will almost always turn out gatable; the second condition needs resolved aliases, which
      * do not exist yet here, and is left to the real gate.
      *
-     * <p><b>Request settings only, so a template-gated index is deliberately missed.</b> An index made gated
-     * by a matching template carries nothing in its own request that says so, and resolving templates to find
-     * out would be doing the expensive work in order to decide whether to avoid it. Such an index takes the
-     * ordinary path and is gated at the bottom exactly as it was before -- correct, and no faster. That is the
-     * cheap direction to be wrong in, and it is the one chosen.
+     * <p><b>This reads whatever settings it is given, and since T49 those have templates merged into them.</b>
+     * It used to be handed the request's own settings only, on the reasoning that an index gated by a template
+     * takes the ordinary path and is gated at the bottom exactly as before: correct, and no faster. That was
+     * wrong. Being gated at the bottom means writing the declared mapping to a store whose writes block, from
+     * the state update thread, by a path that had already concluded the index was not gated. The resolution
+     * happens in {@code MetadataCreateIndexService} rather than here, so this predicate and the gate at the
+     * bottom read the same settings rather than two computations of the same idea.
      */
     private static boolean worthAdmittingOffThread(org.opensearch.common.settings.Settings requestSettings) {
         return requestSettings.getAsBoolean("index.serverless_storage.enabled", false);

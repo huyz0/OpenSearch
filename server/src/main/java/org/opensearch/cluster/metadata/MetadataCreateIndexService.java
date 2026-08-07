@@ -363,6 +363,7 @@ public class MetadataCreateIndexService {
      * @param request the index creation cluster state update request
      * @param listener the listener on which to send the index creation cluster state update response
      */
+
     public void createIndex(
         final CreateIndexClusterStateUpdateRequest request,
         final ActionListener<CreateIndexClusterStateUpdateResponse> listener
@@ -371,7 +372,7 @@ public class MetadataCreateIndexService {
         // DescriptorOnlyCreation#mayBypassClusterState for why the decision has to be made from the request's
         // own settings rather than from the finished metadata, and why being wrong in either direction is
         // safe. Unregistered answers false, so an ordinary cluster never reaches the branch below.
-        if (DescriptorOnlyCreation.mayBypassClusterState(request.settings())) {
+        if (DescriptorOnlyCreation.mayBypassClusterState(settingsForAdmission(request))) {
             createGatedIndex(request, listener);
             return;
         }
@@ -396,6 +397,61 @@ public class MetadataCreateIndexService {
                 listener.onResponse(new CreateIndexClusterStateUpdateResponse(false, false));
             }
         }, listener::onFailure));
+    }
+
+    /**
+     * The settings the admission decision is made from: the request's own, with matching templates merged
+     * underneath them.
+     *
+     * <p>T49. It used to be the request's settings alone, and that missed the case where a template is what
+     * makes an index gated. Such a request said nothing about gating, was sent down the ordinary road, and
+     * met the gate at the bottom on the state update thread -- where being gated means a blocking write of
+     * the declared mapping to the mapping store, from the one thread that must not block, and where that
+     * write can submit a cluster state update of its own and wait for the thread it is occupying.
+     *
+     * <p>Resolving templates here rather than in the plugin's predicate is deliberate. It means admission
+     * and the gate at the bottom are looking at the same settings rather than at two computations of the
+     * same idea, and two such computations drift. The cost is a metadata lookup, not the throwaway index
+     * service construction that admission exists to avoid, and it is paid only where something is asking.
+     *
+     * <p>Request settings win over template settings, which is the precedence creation itself applies.
+     */
+    private Settings settingsForAdmission(final CreateIndexClusterStateUpdateRequest request) {
+        if (DescriptorOnlyCreation.hasAdmissionCheck() == false) {
+            return request.settings();
+        }
+        try {
+            final Metadata metadata = clusterService.state().metadata();
+            final Boolean hidden = IndexMetadata.INDEX_HIDDEN_SETTING.exists(request.settings())
+                ? IndexMetadata.INDEX_HIDDEN_SETTING.get(request.settings())
+                : null;
+            final String v2Template = MetadataIndexTemplateService.findV2Template(
+                metadata,
+                request.index(),
+                hidden == null ? false : hidden
+            );
+            final Settings fromTemplates = v2Template != null
+                ? MetadataIndexTemplateService.resolveSettings(metadata, v2Template)
+                : MetadataIndexTemplateService.resolveSettings(
+                    MetadataIndexTemplateService.findV1Templates(metadata, request.index(), hidden)
+                );
+            // Normalised, because normalizeRequestSetting runs after this decision and the predicate looks
+            // for the prefixed key. Without this, a request writing "serverless_storage.enabled" beside
+            // "number_of_shards" -- the ordinary REST form -- is not admitted, is gated at the bottom
+            // anyway, and now meets the refusal there. Under-admission used to cost speed; it costs the
+            // request now, which raises the price of every remaining source of it.
+            return Settings.builder()
+                .put(fromTemplates)
+                .put(request.settings())
+                .normalizePrefix(IndexMetadata.INDEX_SETTING_PREFIX)
+                .build();
+        } catch (Exception e) {
+            // The road that has always worked, for the same reason the predicate itself falls back that way.
+            // A template that cannot be resolved here will be resolved again by creation proper, which is
+            // where its failure belongs.
+            logger.debug(() -> new ParameterizedMessage("could not resolve templates for [{}] before admission", request.index()), e);
+            return request.settings();
+        }
     }
 
     /**
@@ -960,7 +1016,11 @@ public class MetadataCreateIndexService {
         final List<String> templatesApplied,
         final List<Map<String, AliasMetadata>> templateAliases
     ) {
-        if (DescriptorOnlyCreation.mayBypassClusterState(request.settings()) == false) {
+        // The same question admission asked, asked the same way. It read the request's own settings until
+        // T49, which meant a template-gated creation was admitted off-thread and then denied the fast path
+        // here, paying for the throwaway IndexService that admission exists to avoid. Three readers of one
+        // idea is two too many; this is the second, and it now shares the first's computation.
+        if (DescriptorOnlyCreation.mayBypassClusterState(settingsForAdmission(request)) == false) {
             return "the index was not admitted as gated";
         }
         if (sourceMetadata != null) {
@@ -2167,6 +2227,39 @@ public class MetadataCreateIndexService {
      * name with no uniqueness. Callers that can create a gated index must use the six argument form and
      * carry the future to whoever answers the client.
      */
+    /**
+     * Fails a creation that reached the gated branch on the state update thread, instead of blocking there.
+     *
+     * <p>T49 removed the way that used to happen -- admission now resolves templates, so an index gated only
+     * by one is admitted off-thread like any other -- and this is the tripwire for the next way. Admission is
+     * an approximation by design, and the property it protects is not one to hold by care: a blocking store
+     * write here occupies the thread that serialises every cluster state update, and the write can submit an
+     * update of its own and then wait for the thread it is standing on.
+     *
+     * <p><b>Refusing rather than asserting, because assertions are off in production.</b> A rejected creation
+     * is visible, attributable and retryable. A stalled cluster manager presents as everything else being
+     * broken, which is how the same defect was found the last two times.
+     */
+    private static void refuseToWriteAMappingFromTheClusterStateThread(IndexMetadata indexMetadata) {
+        // The same list AbsentIndexDescriptorSuppliers refuses to resolve descriptors on, reused rather than
+        // copied: two lists of the threads where blocking is unsafe drift, and the narrower one is the one
+        // that lets something through.
+        if (AbsentIndexDescriptorSuppliers.blockingIsUnsafeHere()) {
+            String thread = Thread.currentThread().getName();
+            throw new IllegalStateException(
+                "index ["
+                    + indexMetadata.getIndex().getName()
+                    + "] is gated and declares a mapping, but reached the write on ["
+                    + thread
+                    + "], where the store's blocking write would occupy the thread that serialises cluster "
+                    + "state updates. Either admission failed to send this creation off that thread, or it "
+                    + "arrived through a door that has no admission check: auto-creation, rollover and data "
+                    + "stream creation all reach this from inside a cluster state task. Refusing costs this "
+                    + "request; blocking would cost the cluster."
+            );
+        }
+    }
+
     static ClusterState clusterStateCreateIndex(
         ClusterState currentState,
         Set<ClusterBlock> clusterBlocks,
@@ -2220,11 +2313,15 @@ public class MetadataCreateIndexService {
             // resolves to an index whose declared fields are missing, which is the same silent loss wearing
             // a different shape.
             //
-            // Blocking is safe here. Every path reaching this branch came through createGatedIndex on
-            // GENERIC: the admission check reads index.serverless_storage.enabled from the request settings
-            // and that setting is also a precondition of gating, so a gated creation is never on the cluster
-            // state thread. An index admitted and then refused by the gate falls back to the ordinary path
-            // and never reaches this line.
+            // Blocking here is safe only where admission ran, and T49 is the record of what that sentence
+            // used to hide. It said every path reaching this branch came through createGatedIndex on
+            // GENERIC, because the admission check reads the gating setting from the request. Two things
+            // were wrong with that. An index gated by a template says nothing in its request, so it took
+            // the ordinary road and reached this line on the state update thread; admission is now given
+            // template-merged settings, which closes that one. And createIndex is not the only door:
+            // auto-creation, rollover and data stream creation call applyCreateIndexRequest from inside a
+            // cluster state task, where no admission check runs and none can. The refusal below is what
+            // stands in for the argument, because the argument has been wrong twice.
             //
             // T41 sends this through createMapping rather than updateMapping. The two differ by one round
             // trip: updateMapping opens by reading the current mapping so it has something to merge onto,
@@ -2233,6 +2330,7 @@ public class MetadataCreateIndexService {
             // first and keeps the read-and-merge loop as its fallback for a write the store itself retried.
             java.util.Map<String, Object> declaredFields = DescriptorRepresentable.fieldDefinitionsOrNull(indexMetadata);
             if (declaredFields != null && declaredFields.isEmpty() == false) {
+                refuseToWriteAMappingFromTheClusterStateThread(indexMetadata);
                 MappingGenerationStore.createMapping(indexMetadata.getIndexUUID(), declaredFields);
             }
             java.util.concurrent.CompletableFuture<Boolean> write = IndexDescriptorPublisher.createGated(indexMetadata);
