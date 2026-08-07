@@ -10,8 +10,8 @@ Updated: 2026-08-07
 | | |
 |---|---|
 | Active round | 005, the doors into the mapping store ([plan](005-store-failure-modes/plan.md)) |
-| Next action | `/round-next`, task T59 (T51 to T58 are also open and unblocked; T59 is listed here because it was carried straight out of T50's closure) |
-| Last task | T50, a stranded gated mapping after a deletion, refused at the write path (commit d7b28f13909ee5fa8ccf6a217de17c2a20414f33) |
+| Next action | `/round-next`, T51 through T58 are open and unblocked (no declared dependencies among them; pick the first by plan order) |
+| Last task | T59, a missing mapping reading as an index with no fields, refused at the read path (commit 66a38381239) |
 | Branch | `feature/serverless` |
 
 Rounds 001 to 003 predate this file and have no round directories. Their work is in the git

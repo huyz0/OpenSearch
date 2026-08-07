@@ -67,3 +67,49 @@ Append-only. One entry per task, written when the task's commit lands.
     inside `IndicesClusterStateService`, unrelated to the mapping write path this task touches. Recorded
     as interference per round-next step 4 rather than chased further.
 - Deferred: none beyond T59, which was already filed and unblocks now that this landed.
+
+## T59 — a missing mapping reads as an index with no fields
+
+- Status: complete
+- Commit: 66a38381239 (feature/serverless)
+- Result: `MappingGenerationStore.currentMapping` gained a second-arg overload taking the caller's expected
+  mapping generation and throwing a new `MissingMappingException` when the store answers absent but the
+  generation says otherwise; the single-arg form is unchanged. `StoreBackedFieldRefresher.refresh` --
+  the one production caller with an index name in reach -- resolves the expected generation from
+  `AbsentIndexDescriptorSuppliers` before reading, with the same null-safety contract T50 established: no
+  registration, no answer, or a mismatched uuid all mean "no evidence", never a forced failure.
+- Notes:
+  - A second, unplanned fix was needed to make the first one reachable. `UnknownFieldRefresh.refreshed`
+    catches every exception a refresher throws and reports the field absent, deliberately, so a store
+    hiccup degrades a document instead of failing it (T43's contract). That catch also swallowed
+    `MissingMappingException`, so the new failure never surfaced anywhere -- an indexing request would
+    "succeed" by silently treating a declared-but-missing field as brand new, which is the exact defect
+    this task exists to close, one layer above where `StoreBackedFieldRefresher` raises it. Fixed by
+    re-throwing `MissingMappingException` specifically, mirroring the "must not degrade" carve-out
+    `AbsentIndexDescriptorSuppliers#supply` already makes for `DescriptorUnavailableException`. Found only
+    by driving the integration test through the real registered refresher and watching the write succeed
+    when it should have failed -- a unit test with a hand-rolled double would not have caught this, because
+    nothing stands between a double and its caller.
+  - The integration test does not drive the fix through a real `client().prepareIndex` write.
+    `DocumentParser`'s only call into `UnknownFieldRefresh` is inside its `disable_objects` flattening
+    branch, an unrelated mapping feature a document has to opt into; reaching it also collides with
+    `StoreBackedFieldRefresher`'s own one-second recheck window, keyed per index rather than per field, so
+    a same-index probe field silently absorbed the real assertion in an earlier version of this test.
+    `GatedMappingMissingWindowIT` installs the real `ServerlessStoragePlugin` -- so the store and the
+    descriptor resolver are the real seams `DescriptorGate.install` wires -- and drives the read directly
+    against a live shard's real `MapperService`, the same trade T50's `GatedMappingStrandedIndexTests`
+    already made on the write side rather than standing up two disagreeing nodes.
+  - A `task-reviewer` pass on the first version of this diff found both of the above: the IT calling the
+    refresher directly while claiming to exercise `DocumentParser` end to end, and the goal's "a reader
+    sees" / "a query" language implying a search-time symptom when the only production caller is a write
+    path (document parsing). Both fixed before commit -- the IT rewritten to install the real plugin and
+    say plainly what is real versus directly driven, and every doc comment corrected to say "read", not
+    "query", for what T59 actually closes.
+  - Mutation performed by hand: removed the generation check, confirmed both
+    `testAnAbsentMappingWithANonZeroExpectedGenerationFails` (unit) and `GatedMappingMissingWindowIT`'s
+    first assertion failed, restored it, confirmed the suite passed again.
+  - Considered and rejected: adding the generation parameter to `MappingGenerationStore.Store#read`
+    directly. That would force every one of the interface's seven-odd implementations (T56's still-open
+    complaint) to handle a parameter only one caller needs. Layering the check in a new overload on top of
+    the existing `read` needed no interface change.
+- Deferred: none. T51 through T58 remain open and unblocked.
