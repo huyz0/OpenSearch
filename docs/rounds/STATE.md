@@ -3,15 +3,15 @@
 Read this first, every time. It is the only source of truth for where work stands, and it
 is written to survive context loss: nothing here depends on remembering a previous session.
 
-Updated: 2026-08-06
+Updated: 2026-08-07
 
 ## Position
 
 | | |
 |---|---|
 | Active round | 005, the doors into the mapping store ([plan](005-store-failure-modes/plan.md)) |
-| Next action | `/round-next`, task T50 |
-| Last task | T49, which closed round 004 ([retro](004-mapping-write-path/retro.md)) |
+| Next action | `/round-next`, task T59 (T51 to T58 are also open and unblocked; T59 is listed here because it was carried straight out of T50's closure) |
+| Last task | T50, a stranded gated mapping after a deletion, refused at the write path (commit d7b28f13909ee5fa8ccf6a217de17c2a20414f33) |
 | Branch | `feature/serverless` |
 
 Rounds 001 to 003 predate this file and have no round directories. Their work is in the git
