@@ -45,6 +45,21 @@ worth saying out loud rather than letting it slide.
   - mutation: removing the guard leaves a document behind and fails the test
 - Risk: medium
 - Kind: fix
+- **One approach attempted and refuted. Start from this rather than repeating it.** Moving the prune
+  from the deletion to `TombstoneScrubber`, so a mapping lives exactly as long as its tombstone, is
+  wrong for two independent reasons, both found by review after it was built and both verified in the
+  code:
+  - The scrubber is opt-in. `serverless_storage.descriptor.tombstone_scrub_interval` defaults to
+    zero, and the plugin README recommends an object-store lifecycle rule instead, which expires the
+    tombstone blob without running any of this. So in the default deployment and in the recommended
+    one, nothing prunes at all, which is the leak T47 fixed, reintroduced.
+  - Tombstones are keyed by index name, not by uuid: `tombstoneKeyFor(name)` is
+    `TOMBSTONE_PREFIX + name`, and a second deletion of the same name overwrites the first. The
+    scrubber's worklist therefore carries one uuid per name, while mappings are keyed per uuid, so a
+    tenant recycling one name N times strands N-1 mappings permanently. "The worklist comes free"
+    was the design's central claim and it is false.
+  What survives from the attempt: the prune has to stay on a path that runs unconditionally, and any
+  mechanism keyed off tombstones has to handle name reuse before it can be trusted with a uuid.
 
 ### T51 — Three doors into gated creation have no admission check
 
