@@ -159,3 +159,78 @@ Append-only. One entry per task, written when the task's commit lands.
   cluster-state entry to attach to. That is materially more scope than the plan states and should be
   folded into T51 explicitly (or split into a dependency task) before the next attempt, rather than
   discovered again partway through implementation.
+
+## T51 — second firing, investigated, stopped without committing
+
+- Status: not complete. No code changed. Nothing committed.
+- What this firing did: read `createGatedIndex`, `clusterStateCreateIndex`, `DescriptorRepresentable`,
+  `DescriptorOnlyCreation`, and all three uncovered call sites (`AutoCreateAction`,
+  `MetadataRolloverService`, `MetadataCreateDataStreamService`) end to end, to answer the plan's
+  scope note before writing any test or fix.
+- What the ordinary door already does about aliases, and why it does not generalize: creation-time
+  aliases are not a solved case for gating, they are a *refused* one. `DescriptorRepresentable
+  .whyNotRepresentable` declines to gate any index whose finished `IndexMetadata` carries a
+  non-empty `getAliases()`, unconditionally, and says why in its own comment (T29): every alias
+  mutation is a cluster-state update that looks the index up in `Metadata` and rewrites it, a gated
+  index is not in `Metadata`, and building a resolution path for a set-once alias that can never be
+  repointed was considered and rejected as "a partial feature that invites exactly the usage it
+  cannot support." So the pattern the plan asked this task to look for and reuse does not exist:
+  the ordinary door's answer to "this index also needs an alias" is "then it isn't gated," not "gate
+  it and record the alias somewhere else."
+- Why that answer cannot be reused for T51 as scoped. The plan's acceptance criterion 4, as
+  expanded, requires *a gated rollover target's alias* — not a rollover target that opts out of
+  gating — to be recorded correctly. That is a different, harder claim than T29 declined to build,
+  and tracing what it would take confirms it is not a bounded addition:
+  - **First-hop alias looks fixable, and is not sufficient.** A rollover target's alias is not baked
+    into its `IndexMetadata` at creation today; `MetadataRolloverService.rolloverAlias` creates the
+    new index with none, then calls `MetadataIndexAliasesService.applyAliasActions` afterward to add
+    it. Moving that add into the create request would let `IndexDescriptor`'s existing `aliases`
+    field carry it, satisfying `DescriptorRepresentable`'s check by construction for the *new*
+    index. But `rolloverAliasToNewIndex` also emits an action against the *old* index — flipping
+    `is_write_index` (explicit-write-index case) or removing the alias outright (implicit case) —
+    and on the second and every later rollover of the same alias, that old index is itself a
+    previous gated rollover target with no cluster-state entry. `MetadataIndexAliasesService` has no
+    handling for a gated index at all (grepping that file for `Gated`/`Descriptor` returns nothing),
+    so the second rollover throws exactly the `IndexNotFoundException` the plan's scope note
+    predicted, once per generation after the first. "Bake it in at birth" only defers the problem to
+    generation two.
+  - **Data-stream backing-index membership is not a baking problem, it is a resolution problem.**
+    `DataStream` membership lives in `Metadata.custom`, as a list of `Index` (name+uuid) the data
+    stream object carries, appended by the `metadataTransformer` that `clusterStateCreateIndex`'s
+    gated branch (around line 2296 in `MetadataCreateIndexService`) never calls — it returns before
+    reaching the `metadataTransformer.accept(...)` line, which only runs in the non-gated branch
+    below it. Recording membership for a gated backing index would mean either running the
+    transformer against a `Metadata.Builder` for an index that is not itself being added to that
+    builder (untested, and every other consumer of `DataStream.getIndices()` assumes
+    `metadata.index(name)` resolves), or teaching data-stream resolution, write routing, and
+    health/allocation code that a backing index may exist with no cluster-state entry — the same
+    generalization `AbsentIndexRoutingSuppliers` and `AbsentIndexDescriptorSuppliers` already had to
+    build for ordinary get/search/bulk, applied to a second, structurally different subsystem.
+  - Both halves point the same direction: recording alias or data-stream membership for a genuinely
+    gated target is not a call-site patch, it is reversing or extending a deliberate design boundary
+    (T29's alias refusal) into two subsystems (classic aliases, data streams) that gating has never
+    covered, each roughly the size of the routing/resolution work gating already needed for the base
+    case.
+- What *is* bounded and was not attempted, deliberately, because it does not meet criterion 4 as
+  written: declining to gate a rollover target or data-stream backing index at all (extending
+  `DescriptorRepresentable`'s existing alias rule to also cover "this creation carries a
+  `metadataTransformer`" and "this creation's request will receive a post-creation alias action").
+  That closes the auto-creation case for real (the one with no alias or data-stream involvement) and
+  makes rollover/data-stream creation fall back to the ordinary, already-safe, non-gated path rather
+  than reach the tripwire at all — satisfying criteria 1 and 2 (the document is indexed) without
+  ever satisfying criterion 4 (the target would not be gated, so there is no "gated rollover target's
+  alias" to have recorded correctly). Not implemented, because building something that passes three
+  criteria and fails the fourth by redefining it away is the same shape of problem the first T51
+  attempt was refuted for.
+- No test was written. No mutation was performed. The tree is unchanged from the previous T51
+  attempt's revert.
+- Recommendation for the next attempt or for a human call: split T51. One task ("auto-creation, the
+  plain door") is bounded — reuse `createGatedIndex`'s off-thread dispatch for `AutoCreateAction`'s
+  non-data-stream branch, which has no alias or membership complication at all. A second task, larger
+  and its own risk assessment, is "can a gated index carry a post-creation-mutable alias or
+  data-stream membership at all" — which is a genuine design question (does
+  `MetadataIndexAliasesService` gain a gated branch, does data-stream resolution gain a
+  descriptor-backed fallback, or does gating stay permanently scoped to indices that will never need
+  either) rather than an implementation task, and should be answered before more code is written
+  against it.
+- Filed as Blocked in STATE.md (B2) with this question.

@@ -3,7 +3,7 @@
 Read this first, every time. It is the only source of truth for where work stands, and it
 is written to survive context loss: nothing here depends on remembering a previous session.
 
-Updated: 2026-08-07
+Updated: 2026-08-08
 
 ## Position
 
@@ -12,7 +12,7 @@ Updated: 2026-08-07
 | Active round | 005, the doors into the mapping store ([plan](005-store-failure-modes/plan.md)) |
 | Next action | `/round-next`, T51 through T58 are open and unblocked (no declared dependencies among them; pick the first by plan order) |
 | Last task | T59, a missing mapping reading as an index with no fields, refused at the read path (commit 66a38381239) |
-| T51 attempt | Refuted and reverted, nothing committed. Do not disable or short-circuit T49's tripwire (`AbsentIndexDescriptorSuppliers.blockingIsUnsafeHere()` in `MetadataCreateIndexService`) as a "fix" — that turns a refused write into a silent unsafe one. The next attempt needs a real off-thread dispatch mechanism for auto-creation, rollover, and data stream creation. Full write-up in [log.md](005-store-failure-modes/log.md#t51--attempted-refuted-reverted). |
+| T51 attempt | Two firings, neither committed. First: refuted (disabled T49's tripwire instead of fixing it). Second: investigated, stopped deliberately without writing code — the acceptance criteria as expanded require a *gated* rollover/data-stream target's alias or backing-index membership to be recorded correctly, which traces to genuinely new machinery (alias mutation and data-stream resolution for indices with no cluster-state entry), not a bounded fix. Blocked as B2. Full write-up in [log.md](005-store-failure-modes/log.md#t51--second-firing-investigated-stopped-without-committing). |
 | Branch | `feature/serverless` |
 
 Rounds 001 to 003 predate this file and have no round directories. Their work is in the git
@@ -93,6 +93,31 @@ serverless-only system. The codec namespace question, reserving a high integer r
 a distinct blob codec name, is downstream of this and straightforward either way.
 
 Nothing in the current task list depends on the answer, so the loop can run without it.
+
+### B2. Can a gated index carry a post-creation-mutable alias or data-stream membership at all
+
+T51 needs a gated rollover target's alias, and a gated data-stream target's backing-index
+membership, recorded correctly, not just its mapping write made safe. Both traced to the same wall:
+`DescriptorRepresentable` already refuses to gate any index with an alias, deliberately (T29) —
+alias mutation is a cluster-state update that looks the index up in `Metadata`, a gated index is not
+in `Metadata`, and a set-once alias that can never be repointed was rejected as a partial feature.
+Baking a rollover alias in at the target's own creation only survives the *first* rollover of that
+alias; the second rollover mutates the alias on what is by then a previous gated target, hitting the
+same wall from the other side, and `MetadataIndexAliasesService` has no gated-index handling to
+extend. Data-stream backing-index membership is worse: it lives in `Metadata.custom` as a list the
+`metadataTransformer` appends to, that transformer never runs for a gated creation, and every other
+reader of `DataStream.getIndices()` assumes `metadata.index(name)` resolves — teaching that
+assumption to tolerate absence is the same generalization `AbsentIndexRoutingSuppliers` and
+`AbsentIndexDescriptorSuppliers` already had to build for ordinary get/search/bulk, applied fresh to
+a second, structurally different subsystem.
+
+The question for a human: does gating extend to cover post-creation-mutable aliases and data-stream
+membership (a genuine design/build effort, roughly the size of the routing work gating already
+needed), or does gating stay permanently scoped to indices that will never need either — in which
+case T51's auto-creation door (no alias, no data stream) can still be fixed on its own, and the
+rollover/data-stream doors are declined from gating rather than fixed, closing the tripwire without
+meeting the letter of "a gated rollover target's alias ... recorded correctly." Full trace in
+[log.md](005-store-failure-modes/log.md#t51--second-firing-investigated-stopped-without-committing).
 
 ## Environment
 
