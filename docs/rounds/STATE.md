@@ -9,9 +9,9 @@ Updated: 2026-08-06
 
 | | |
 |---|---|
-| Active round | 004, the mapping write path ([plan](004-mapping-write-path/plan.md)) |
-| Next action | `/round-close` for round 004, then `/round-plan` for 005 |
-| Last task | T49 complete, the last of round 004 |
+| Active round | none. 004 closed ([retro](004-mapping-write-path/retro.md)) |
+| Next action | `/round-plan` for round 005 |
+| Last task | T49, the last of round 004 |
 | Branch | `feature/serverless` |
 
 Rounds 001 to 003 predate this file and have no round directories. Their work is in the git
@@ -41,19 +41,38 @@ Measured, with controls:
 | file descriptors per open gated index | 3.0 |
 | open gated indices per node, 31 GiB heap | ~110,000 |
 | creates per second, no declared mapping | 10,505 |
-| creates per second, with a declared mapping | 2x to 10x slower, by warm-up; 80%+ of it the mapping store, of which T24 removed ~a seventh |
+| creates per second, with a declared mapping | 2x to 10x slower, by warm-up; at least ~80% of it the mapping store. T41 removed one of its two round trips; T42 could not size that cleanly |
 | deletes per second | 646 |
 | eviction under CPU pressure | 19.6 to 1.5 per second |
 
-The last cycle (T13 to T21) was mostly defects found while doing something else rather than
-work that was planned: field parameters silently dropped from gated mappings, two blocking
+Two cycles running, most of the value came from defects found while doing something else rather
+than from work that was planned. Round 004's planned work was one measurement and one wasted round
+trip; what it found was a mapping store that reported every failure as "no fields", a shared index
+nothing ever deleted from, a template-gated creation writing from the cluster state thread, and a
+measurement class that had been leaking its whole population on every run. The cycle before it
+(T13 to T21) went the same way: field parameters silently dropped from gated mappings, two blocking
 round trips on the cluster manager update thread, and a headline throughput figure that only
 held for a population nobody would create.
+
+## Carried out of round 004
+
+Filed with acceptance criteria in [004's plan](004-mapping-write-path/plan.md), and the round-level
+review added eight more in [the retro](004-mapping-write-path/retro.md). The next plan starts here
+rather than from a blank page.
+
+- **T51**: three doors into gated creation have no admission check, so a document indexed into a new
+  name matching a gated template reaches the mapping write on the cluster state thread. Highest
+  severity of the carried work.
+- **Writes rebuild a lost mapping index quietly** while reads refuse loudly, which voids the shard
+  setting, lets the index absorb every gated index's field names, and drops the gated half of cluster
+  stats. Review finding 1.
+- **T50**: a mapping written after its index was deleted is stranded forever.
+- **T52**, **T53**, and the seven remaining review findings.
 
 ## Open, not blocked
 
 Work that can start without asking anyone. Round 004 took the mapping cost item; T22 was
-refiled as T23 in its plan. The rest are candidates for round 005:
+refiled as T40 in its plan. The rest are candidates for round 005:
 
 - **Eviction under load**, the RFC's first order-of-work item. Since it was written the
   ceiling gained `indices.gated.max_open` and an eviction on the open path, which may have

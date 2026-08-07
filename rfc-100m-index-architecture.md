@@ -197,7 +197,7 @@ no such constraint, which is exactly why top-K applies to them and where the cac
 | file descriptors per open gated index | 3.0 |
 | open gated indices per node, 31 GiB heap, half to residency | ~110,000 |
 | creates per second, one 20-core box, concurrency 16, no declared mapping | 10,505 |
-| creates per second, with a declared mapping, concurrency 8 | 2x to 10x slower than the unmapped arm beside it, depending on warm-up; at least ~80% of it the index-backed mapping store, of which T41 removed about a seventh |
+| creates per second, with a declared mapping, concurrency 8 | 2x to 10x slower than the unmapped arm beside it, depending on warm-up; at least ~80% of it the index-backed mapping store. T41 removed one of its two round trips; the clean batch measuring that could not separate the effect from noise (5 of 8 pairs), and the direction holds only across batches carrying confounds T42 itself identified |
 | deletes per second, same | 646 |
 
 **Unknown, and honestly so.**
@@ -302,10 +302,11 @@ no such constraint, which is exactly why top-K applies to them and where the cac
    shards, and it currently weakens exactly when a node is busiest. Decide between a dedicated thread, a
    work budget per pass, and eviction driven by memory pressure rather than a timer.
 2. **Cut what the index-backed mapping store costs a creation.** Attribution is done and the cheap half
-   is taken: T40 measured the store at 83% or more of what a declared mapping costs, and T41 removed the
-   read a creation issues for a UUID that cannot yet have one, which T42 measured at a seventh to a fifth
-   of the penalty. The swap is what is left, and T46 has ruled out the shared index's geometry as the
-   reason it costs what it does: 1, 5 and 20 shards are indistinguishable, because one document goes to
+   is taken: T40 measured the store at least about 80% of what a declared mapping costs, and T41 removed
+   the read a creation issues for a UUID that cannot yet have one. T42 could only establish a direction
+   for that, not a size: its confound-free batch was 5 of 8 pairs, and the seventh-to-a-fifth figure comes
+   from pooling batches whose confounds T42 itself identified. The swap is what is left, and T46 has ruled
+   out the shared index's geometry as the reason it costs what it does: 1, 5 and 20 shards are indistinguishable, because one document goes to
    one shard however many there are. What remains is the round trip itself, so the levers are batching
    several creations' mapping writes or moving them off the blocking path, not widening the index.
 3. **Resolve-and-forward hop.** Small, no core changes, makes multi-index requests work under hash

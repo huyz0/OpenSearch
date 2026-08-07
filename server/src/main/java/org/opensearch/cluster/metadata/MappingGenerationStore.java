@@ -163,7 +163,8 @@ public final class MappingGenerationStore {
      * it has something to merge onto. For a creation there is nothing to merge onto and there cannot be: the
      * UUID was generated moments earlier and has never been given to anyone, so the read is a blocking round
      * trip whose answer is known to be "absent" before it is issued. T40 measured the index-backed store at
-     * 83% or more of what a declared mapping costs a creation, and this is one of its two round trips.
+     * at least about 80% of what a declared mapping costs a creation, and this is one of its two round
+     * trips.
      *
      * <p>So the swap is attempted first, at generation 1, and the read-and-merge loop is kept as the
      * fallback for when the swap is refused.
