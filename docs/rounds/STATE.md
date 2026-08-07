@@ -12,6 +12,7 @@ Updated: 2026-08-07
 | Active round | 005, the doors into the mapping store ([plan](005-store-failure-modes/plan.md)) |
 | Next action | `/round-next`, T51 through T58 are open and unblocked (no declared dependencies among them; pick the first by plan order) |
 | Last task | T59, a missing mapping reading as an index with no fields, refused at the read path (commit 66a38381239) |
+| T51 attempt | Refuted and reverted, nothing committed. Do not disable or short-circuit T49's tripwire (`AbsentIndexDescriptorSuppliers.blockingIsUnsafeHere()` in `MetadataCreateIndexService`) as a "fix" — that turns a refused write into a silent unsafe one. The next attempt needs a real off-thread dispatch mechanism for auto-creation, rollover, and data stream creation. Full write-up in [log.md](005-store-failure-modes/log.md#t51--attempted-refuted-reverted). |
 | Branch | `feature/serverless` |
 
 Rounds 001 to 003 predate this file and have no round directories. Their work is in the git

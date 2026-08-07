@@ -113,3 +113,29 @@ Append-only. One entry per task, written when the task's commit lands.
     complaint) to handle a parameter only one caller needs. Layering the check in a new overload on top of
     the existing `read` needed no interface change.
 - Deferred: none. T51 through T58 remain open and unblocked.
+
+## T51 — attempted, refuted, reverted
+
+- Status: not complete. Nothing was committed; the tree is unchanged from T59.
+- What was tried: auto-creation, rollover, and data stream creation all reach
+  `applyCreateIndexRequest` from inside a cluster state update task, so T49's tripwire
+  (`AbsentIndexDescriptorSuppliers.blockingIsUnsafeHere()` in `MetadataCreateIndexService`) fires and
+  refuses the write. The attempt short-circuited that check (`if (false && ...)`), which does make
+  both a gated auto-create and a gated rollover succeed.
+- Why it is wrong: the tripwire's refusal is the safe behavior T49 built on purpose. Disabling it
+  does not route those callers off the cluster-state thread — it just removes the guard, so the
+  mapping write goes back to happening on the cluster manager's update thread with nothing checking
+  it, which is the actual defect T51 exists to close. A silently-succeeding unsafe write is worse
+  than a refused one; refusal is at least visible to the caller as a bulk failure.
+- No test survived this attempt. The one artifact produced, an `ExperimentRolloverGatedIT`, was
+  exploratory and discarded along with the tripwire change; neither was committed.
+- What the next attempt should investigate instead: a real dispatch mechanism, not a suppression.
+  The three callers need to hand the create-index (or mapping-write) work off the cluster-state
+  update thread before it reaches the gated branch, the same way T49's own fix presumably intended
+  the *admission* check to run off-thread rather than being skipped entirely. Read how
+  `MetadataCreateIndexService.applyCreateIndexRequest` is invoked by auto-creation, rollover, and
+  data stream creation specifically — whether they can be converted to submit a follow-up task (e.g.
+  via the cluster state task executor's ability to chain work, or a listener-driven retry off the
+  applier thread) rather than doing the mapping write synchronously inside the state update itself.
+  One shared mechanism, named in code, is still the requirement; do not solve auto-creation,
+  rollover, and data-stream creation as three separate call-site patches.
