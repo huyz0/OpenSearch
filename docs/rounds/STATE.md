@@ -9,9 +9,9 @@ Updated: 2026-08-06
 
 | | |
 |---|---|
-| Active round | none. 004 closed ([retro](004-mapping-write-path/retro.md)) |
-| Next action | `/round-plan` for round 005 |
-| Last task | T49, the last of round 004 |
+| Active round | 005, the doors into the mapping store ([plan](005-store-failure-modes/plan.md)) |
+| Next action | `/round-next`, task T50 |
+| Last task | T49, which closed round 004 ([retro](004-mapping-write-path/retro.md)) |
 | Branch | `feature/serverless` |
 
 Rounds 001 to 003 predate this file and have no round directories. Their work is in the git
@@ -56,18 +56,13 @@ held for a population nobody would create.
 
 ## Carried out of round 004
 
-Filed with acceptance criteria in [004's plan](004-mapping-write-path/plan.md), and the round-level
-review added eight more in [the retro](004-mapping-write-path/retro.md). The next plan starts here
-rather than from a blank page.
+All of it is planned as round 005, T50 to T58. The two that matter most: a document indexed into a
+name matching a gated template still reaches the mapping write on the cluster state thread (T51), and
+a lost mapping index is refused by reads and quietly rebuilt at cluster defaults by writes (T54).
 
-- **T51**: three doors into gated creation have no admission check, so a document indexed into a new
-  name matching a gated template reaches the mapping write on the cluster state thread. Highest
-  severity of the carried work.
-- **Writes rebuild a lost mapping index quietly** while reads refuse loudly, which voids the shard
-  setting, lets the index absorb every gated index's field names, and drops the gated half of cluster
-  stats. Review finding 1.
-- **T50**: a mapping written after its index was deleted is stranded forever.
-- **T52**, **T53**, and the seven remaining review findings.
+**Eviction under load is deferred a second time.** It is still the RFC's first order-of-work item and
+still unmeasured. Round 005 took live defects over a ceiling measurement; round 006 should not make
+that trade a third time without saying why.
 
 ## Open, not blocked
 
