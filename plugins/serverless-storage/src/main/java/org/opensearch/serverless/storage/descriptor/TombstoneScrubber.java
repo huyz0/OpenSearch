@@ -88,14 +88,27 @@ public final class TombstoneScrubber {
         }
 
         int reclaimed = 0;
+        List<String> toDeleteBatch = new ArrayList<>();
         for (String name : candidates) {
             try {
                 if (reclaimable(tombstones, name, cutoff)) {
-                    tombstones.deleteBlobsIgnoringIfNotExists(List.of(name));
-                    reclaimed++;
+                    toDeleteBatch.add(name);
+                    if (toDeleteBatch.size() >= 100) {
+                        tombstones.deleteBlobsIgnoringIfNotExists(toDeleteBatch);
+                        reclaimed += toDeleteBatch.size();
+                        toDeleteBatch.clear();
+                    }
                 }
             } catch (IOException | RuntimeException e) {
                 logger.debug("could not reclaim tombstone [{}]; leaving it for a later pass", name, e);
+            }
+        }
+        if (toDeleteBatch.isEmpty() == false) {
+            try {
+                tombstones.deleteBlobsIgnoringIfNotExists(toDeleteBatch);
+                reclaimed += toDeleteBatch.size();
+            } catch (IOException | RuntimeException e) {
+                logger.debug("could not reclaim remaining tombstone batch; leaving for a later pass", e);
             }
         }
         if (reclaimed > 0) {
