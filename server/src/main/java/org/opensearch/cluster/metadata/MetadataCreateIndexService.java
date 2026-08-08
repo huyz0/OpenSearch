@@ -200,6 +200,14 @@ public class MetadataCreateIndexService {
     private final List<IndexCreationValidator> indexCreationValidators = new ArrayList<>();
     private final ClusterManagerTaskThrottler.ThrottlingKey createIndexTaskKey;
     private AwarenessReplicaBalance awarenessReplicaBalance;
+    private final java.util.Map<String, Settings> admissionTemplateCache = java.util.Collections.synchronizedMap(
+        new java.util.LinkedHashMap<>(100, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(java.util.Map.Entry<String, Settings> eldest) {
+                return size() > 500;
+            }
+        }
+    );
 
     @Nullable
     private final RemoteStoreCustomMetadataResolver remoteStoreCustomMetadataResolver;
@@ -463,12 +471,17 @@ public class MetadataCreateIndexService {
             final Boolean hidden = IndexMetadata.INDEX_HIDDEN_SETTING.exists(request.settings())
                 ? IndexMetadata.INDEX_HIDDEN_SETTING.get(request.settings())
                 : null;
-            final String v2Template = MetadataIndexTemplateService.findV2Template(metadata, name, hidden == null ? false : hidden);
-            final Settings fromTemplates = v2Template != null
-                ? MetadataIndexTemplateService.resolveSettings(metadata, v2Template)
-                : MetadataIndexTemplateService.resolveSettings(
-                    MetadataIndexTemplateService.findV1Templates(metadata, request.index(), hidden)
-                );
+            final String cacheKey = metadata.version() + ":" + name + ":" + (hidden == null ? false : hidden);
+            Settings fromTemplates = admissionTemplateCache.get(cacheKey);
+            if (fromTemplates == null) {
+                final String v2Template = MetadataIndexTemplateService.findV2Template(metadata, name, hidden == null ? false : hidden);
+                fromTemplates = v2Template != null
+                    ? MetadataIndexTemplateService.resolveSettings(metadata, v2Template)
+                    : MetadataIndexTemplateService.resolveSettings(
+                        MetadataIndexTemplateService.findV1Templates(metadata, request.index(), hidden)
+                    );
+                admissionTemplateCache.put(cacheKey, fromTemplates);
+            }
             // Normalised, because normalizeRequestSetting runs after this decision and the predicate looks
             // for the prefixed key. Without this, a request writing "serverless_storage.enabled" beside
             // "number_of_shards" -- the ordinary REST form -- is not admitted, is gated at the bottom
