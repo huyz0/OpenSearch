@@ -442,7 +442,7 @@ public class MetadataCreateIndexService {
      */
     // Package-private rather than private so AdmissionTemplateResolutionTests (T52) can drive it directly,
     // the same accommodation clusterStateCreateIndex and friends already get for the same reason.
-    Settings settingsForAdmission(final CreateIndexClusterStateUpdateRequest request) {
+    public Settings settingsForAdmission(final CreateIndexClusterStateUpdateRequest request) {
         if (DescriptorOnlyCreation.hasAdmissionCheck() == false) {
             return request.settings();
         }
@@ -2370,6 +2370,11 @@ public class MetadataCreateIndexService {
                 );
             }
             descriptorWrite.accept(write);
+            if (metadataTransformer != null) {
+                Metadata.Builder builder = Metadata.builder(currentState.metadata());
+                metadataTransformer.accept(builder, indexMetadata);
+                return ClusterState.builder(currentState).metadata(builder.build()).build();
+            }
             return currentState;
         }
 

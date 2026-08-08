@@ -44,6 +44,7 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.ack.ClusterStateUpdateResponse;
 import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.block.ClusterBlocks;
+import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.AliasAction;
 import org.opensearch.cluster.metadata.AliasMetadata;
 import org.opensearch.cluster.metadata.IndexAbstraction;
@@ -216,6 +217,9 @@ public class TransportIndicesAliasesAction extends TransportClusterManagerNodeAc
             if (validate) {
                 for (Index concreteIndex : concreteIndices.concreteIndices()) {
                     IndexAbstraction indexAbstraction = state.metadata().getIndicesLookup().get(concreteIndex.getName());
+                    if (indexAbstraction == null && AbsentIndexDescriptorSuppliers.supply(concreteIndex.getName()) != null) {
+                        continue;
+                    }
                     assert indexAbstraction != null : "invalid cluster metadata. index [" + concreteIndex.getName() + "] was not found";
                     if (indexAbstraction.getParentDataStream() != null) {
                         throw new IllegalArgumentException(

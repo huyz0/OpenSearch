@@ -163,6 +163,10 @@ public class MetadataIndexAliasesService {
                 }
                 IndexMetadata index = metadata.get(action.getIndex());
                 if (index == null) {
+                    IndexDescriptor gated = AbsentIndexDescriptorSuppliers.supply(action.getIndex());
+                    if (gated != null && gated.exists()) {
+                        continue;
+                    }
                     throw new IndexNotFoundException(action.getIndex());
                 }
                 validateAliasTargetIsNotDSBackingIndex(currentState, action);
