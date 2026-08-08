@@ -185,6 +185,10 @@ public final class IndexBackedMappingStore implements MappingGenerationStore.Sto
 
     @Override
     public boolean compareAndSwap(String indexUuid, long expectedGeneration, MappingGenerationStore.MappingGeneration updated) {
+        java.util.Objects.requireNonNull(indexUuid, "indexUuid must not be null");
+        if (expectedGeneration < 0) {
+            throw new IllegalArgumentException("expectedGeneration must be non-negative: " + expectedGeneration);
+        }
         ensureIndexExists();
         try {
             Map<String, Object> source = new HashMap<>();
