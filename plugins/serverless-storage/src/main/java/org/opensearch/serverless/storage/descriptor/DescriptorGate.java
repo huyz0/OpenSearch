@@ -280,6 +280,12 @@ public final class DescriptorGate {
                 });
             });
         });
+        IndexDescriptorPublisher.registerUpdater(descriptor -> {
+            DescriptorBackedMappingStore.registerDescriptor(descriptor);
+            java.util.concurrent.CompletableFuture<Boolean> future = new java.util.concurrent.CompletableFuture<>();
+            store.putAsync(descriptor, org.opensearch.core.action.ActionListener.wrap(ignored -> future.complete(true), future::completeExceptionally));
+            return future;
+        });
         // Mappings, stored directly inside IndexDescriptors in Object Storage without system index round trips.
         MappingGenerationStore.register(new DescriptorBackedMappingStore(STORE::get, null));
         // Cluster stats. H19 measured that _cluster/stats reports a plausible wrong number for a gated
@@ -461,6 +467,7 @@ public final class DescriptorGate {
         IndexDescriptorPublisher.register(null);
         DurableTombstones.register(null);
         IndexDescriptorPublisher.registerCreator(null);
+        IndexDescriptorPublisher.registerUpdater(null);
         MappingGenerationStore.register(null);
         GatedMappingStatsAggregator.register(null);
         DescriptorOnlyCreation.registerAdmissionCheck(null);

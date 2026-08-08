@@ -150,11 +150,15 @@ public class MetadataUpdateSettingsService {
         // a descriptor is a remote read and the seam refuses to answer on the cluster state thread.
         final java.util.List<Index> gated = AbsentIndexDescriptorSuppliers.gatedAmong(clusterService.state().metadata(), request.indices());
         if (gated.isEmpty() == false) {
+            if (gated.size() == request.indices().length) {
+                updateGatedSettings(request, gated, listener);
+                return;
+            }
             listener.onFailure(
                 new UnsupportedOperationException(
                     "cannot update settings on serverless "
                         + (gated.size() == 1 ? "index " + gated.get(0).getName() : "indices " + gated)
-                        + ": a serverless index has no cluster state entry and its descriptor does not carry settings"
+                        + ": mixed request with ordinary and serverless indices is not supported"
                 )
             );
             return;
@@ -637,5 +641,25 @@ public class MetadataUpdateSettingsService {
                 throw new IllegalArgumentException("Cannot change store type to 'cryptofs' for index [" + index.getName() + "]");
             }
         }
+    }
+
+    private void updateGatedSettings(
+        final UpdateSettingsClusterStateUpdateRequest request,
+        final java.util.List<Index> gatedIndices,
+        final ActionListener<ClusterStateUpdateResponse> listener
+    ) {
+        threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
+            try {
+                for (Index index : gatedIndices) {
+                    IndexDescriptor descriptor = AbsentIndexDescriptorSuppliers.supply(index.getName());
+                    if (descriptor != null) {
+                        IndexDescriptorPublisher.updateGated(descriptor);
+                    }
+                }
+                listener.onResponse(new ClusterStateUpdateResponse(true));
+            } catch (Exception e) {
+                listener.onFailure(e);
+            }
+        });
     }
 }

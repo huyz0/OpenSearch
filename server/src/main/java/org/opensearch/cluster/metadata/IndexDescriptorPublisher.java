@@ -66,11 +66,21 @@ public final class IndexDescriptorPublisher {
     private static final AtomicReference<
         java.util.function.Function<IndexDescriptor, java.util.concurrent.CompletableFuture<Boolean>>> CREATOR = new AtomicReference<>();
 
+    private static final AtomicReference<
+        java.util.function.Function<IndexDescriptor, java.util.concurrent.CompletableFuture<Boolean>>> UPDATER = new AtomicReference<>();
+
     /** Installs the creator. Registering null clears it. */
     public static void registerCreator(
         java.util.function.Function<IndexDescriptor, java.util.concurrent.CompletableFuture<Boolean>> creator
     ) {
         CREATOR.set(creator);
+    }
+
+    /** Installs the updater. Registering null clears it. */
+    public static void registerUpdater(
+        java.util.function.Function<IndexDescriptor, java.util.concurrent.CompletableFuture<Boolean>> updater
+    ) {
+        UPDATER.set(updater);
     }
 
     /**
@@ -88,6 +98,21 @@ public final class IndexDescriptorPublisher {
         }
         try {
             return creator.apply(IndexDescriptor.from(indexMetadata));
+        } catch (Exception e) {
+            return java.util.concurrent.CompletableFuture.failedFuture(e);
+        }
+    }
+
+    /**
+     * Updates an existing gated index's descriptor in Object Storage off-thread.
+     */
+    public static java.util.concurrent.CompletableFuture<Boolean> updateGated(IndexDescriptor descriptor) {
+        java.util.function.Function<IndexDescriptor, java.util.concurrent.CompletableFuture<Boolean>> updater = UPDATER.get();
+        if (updater == null || descriptor == null) {
+            return null;
+        }
+        try {
+            return updater.apply(descriptor);
         } catch (Exception e) {
             return java.util.concurrent.CompletableFuture.failedFuture(e);
         }

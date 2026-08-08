@@ -138,6 +138,12 @@ public interface DescriptorBackend {
     /** {@link #put} without blocking the caller. */
     void putAsync(IndexDescriptor descriptor);
 
+    /** {@link #putAsync} notifying listener when durable. */
+    default void putAsync(IndexDescriptor descriptor, org.opensearch.core.action.ActionListener<Void> listener) {
+        putAsync(descriptor);
+        listener.onResponse(null);
+    }
+
     /**
      * Marks a name deleted durably.
      *

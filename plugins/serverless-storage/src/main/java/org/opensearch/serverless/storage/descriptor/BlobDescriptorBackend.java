@@ -342,11 +342,18 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
      */
     @Override
     public void putAsync(IndexDescriptor descriptor) {
+        putAsync(descriptor, org.opensearch.core.action.ActionListener.wrap(() -> {}));
+    }
+
+    @Override
+    public void putAsync(IndexDescriptor descriptor, org.opensearch.core.action.ActionListener<Void> listener) {
         executor.execute(() -> {
             try {
                 put(descriptor);
+                listener.onResponse(null);
             } catch (RuntimeException e) {
                 logger.warn("could not write the descriptor for [{}]", descriptor.name(), e);
+                listener.onFailure(e);
             }
         });
     }
