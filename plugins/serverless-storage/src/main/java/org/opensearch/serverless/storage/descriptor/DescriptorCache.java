@@ -371,6 +371,16 @@ public final class DescriptorCache {
         }
     }
 
+    /** Drops a batch of cached descriptors during bulk mutations or deletions. */
+    public void invalidateAll(Iterable<String> names) {
+        if (names == null) {
+            return;
+        }
+        for (String name : names) {
+            invalidate(name);
+        }
+    }
+
     /** How many times this cache has actually gone to the backend, which is what a test counts. */
     public long readCount() {
         return reads.get();
