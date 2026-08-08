@@ -170,9 +170,10 @@ public final class DescriptorEnumerator implements DescriptorPrefixBackend {
      */
     @Override
     public AbsentIndexDescriptorSuppliers.PrefixExpansion expandPrefix(String prefix, int limit) {
+        final String safePrefix = prefix == null ? "" : prefix;
         List<BlobMetadata> found;
         try {
-            found = descriptors().listBlobsByPrefixInSortedOrder(prefix, limit + 1, BlobContainer.BlobNameSortOrder.LEXICOGRAPHIC);
+            found = descriptors().listBlobsByPrefixInSortedOrder(safePrefix, limit + 1, BlobContainer.BlobNameSortOrder.LEXICOGRAPHIC);
         } catch (NoSuchFileException | FileNotFoundException e) {
             return AbsentIndexDescriptorSuppliers.PrefixExpansion.of(List.of());
         } catch (IOException | RuntimeException e) {
