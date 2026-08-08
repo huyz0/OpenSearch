@@ -100,4 +100,9 @@ public final class DescriptorPrefetch {
             listener.onResponse(null);
         }
     }
+
+    /** Convenient fire-and-forget prefetch when no completion callback is required. */
+    public static void prefetchAsync(Collection<String> indexNames) {
+        prefetch(indexNames, ActionListener.wrap(() -> {}));
+    }
 }
