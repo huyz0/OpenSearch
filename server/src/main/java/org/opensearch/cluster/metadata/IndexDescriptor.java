@@ -628,6 +628,66 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
      */
     public static final long FIRST_PRIMARY_TERM = 1L;
 
+    /** Compact stream serialization for Object Storage blobs (T73). */
+    public void writeCompact(StreamOutput out) throws IOException {
+        out.writeString(name);
+        out.writeString(uuid);
+        out.writeVInt(shardCount);
+        out.writeVInt(searchOnlyReplicaCount);
+        out.writeBoolean(serverless);
+        out.writeEnum(state);
+        out.writeVLong(createdVersion);
+        out.writeBoolean(system);
+        out.writeBoolean(hidden);
+        out.writeBoolean(remoteSnapshot);
+        out.writeBoolean(warm);
+        out.writeVLong(mappingGeneration);
+        out.writeVLong(creationDate);
+        out.writeVInt(routingNumShards);
+        out.writeVInt(routingPartitionSize);
+        out.writeVLong(deletedAtMillis);
+    }
+
+    public static IndexDescriptor readCompact(StreamInput in) throws IOException {
+        String name = in.readString();
+        String uuid = in.readString();
+        int shardCount = in.readVInt();
+        int searchOnlyReplicaCount = in.readVInt();
+        boolean serverless = in.readBoolean();
+        State state = in.readEnum(State.class);
+        long createdVersion = in.readVLong();
+        boolean system = in.readBoolean();
+        boolean hidden = in.readBoolean();
+        boolean remoteSnapshot = in.readBoolean();
+        boolean warm = in.readBoolean();
+        long mappingGeneration = in.readVLong();
+        long creationDate = in.readVLong();
+        int routingNumShards = in.readVInt();
+        int routingPartitionSize = in.readVInt();
+        long deletedAtMillis = in.readVLong();
+
+        return new IndexDescriptor(
+            name,
+            uuid,
+            shardCount,
+            searchOnlyReplicaCount,
+            serverless,
+            state,
+            List.of(),
+            createdVersion,
+            system,
+            hidden,
+            remoteSnapshot,
+            warm,
+            mappingGeneration,
+            creationDate,
+            routingNumShards,
+            routingPartitionSize,
+            deletedAtMillis,
+            null
+        );
+    }
+
     /** The same descriptor at a new mapping generation, which is what a mapping update records. */
     public IndexDescriptor withMappingGeneration(long generation) {
         return copyWith(generation);
