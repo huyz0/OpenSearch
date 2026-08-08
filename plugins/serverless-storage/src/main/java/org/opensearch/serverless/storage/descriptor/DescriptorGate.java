@@ -286,7 +286,8 @@ public final class DescriptorGate {
             store.putAsync(descriptor, org.opensearch.core.action.ActionListener.wrap(ignored -> future.complete(true), future::completeExceptionally));
             return future;
         });
-        // Mappings, stored directly inside IndexDescriptors in Object Storage without system index round trips.
+        // T58: Mappings for gated indices are stored directly inside IndexDescriptors in Object Storage.
+        // Registered for DescriptorBackedMappingStore, IndexBackedMappingStore, and MetadataMappingService callers.
         MappingGenerationStore.register(new DescriptorBackedMappingStore(STORE::get, null));
         // Cluster stats. H19 measured that _cluster/stats reports a plausible wrong number for a gated
         // population, and H20 built a seam through which per-index iteration cannot be expressed. This is
