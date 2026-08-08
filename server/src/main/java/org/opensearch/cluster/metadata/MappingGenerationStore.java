@@ -219,6 +219,7 @@ public final class MappingGenerationStore {
             MappingGeneration current;
             try {
                 current = store.read(indexUuid);
+                lastReadFailure = null;
             } catch (RuntimeException e) {
                 // T43 stopped the store answering null for a read it could not perform, which means this
                 // loop now sees the failures it used to be lied to about. Retrying them is what keeps the
