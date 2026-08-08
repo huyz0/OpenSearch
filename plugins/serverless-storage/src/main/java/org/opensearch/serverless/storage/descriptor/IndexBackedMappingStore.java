@@ -138,6 +138,7 @@ public final class IndexBackedMappingStore implements MappingGenerationStore.Sto
         try {
             response = client.prepareGet(MAPPING_INDEX, indexUuid).get();
         } catch (IndexNotFoundException e) {
+            indexKnownToExist.set(false);
             failIfTheStoreWasLost(indexUuid, e);
             // Nothing has ever been written, so no index has a mapping.
             logger.debug("no mapping index yet, so [{}] has no stored mapping", indexUuid);
@@ -226,6 +227,7 @@ public final class IndexBackedMappingStore implements MappingGenerationStore.Sto
         try {
             client.prepareDelete(MAPPING_INDEX, indexUuid).get();
         } catch (IndexNotFoundException e) {
+            indexKnownToExist.set(false);
             logger.debug("no mapping index, so [{}] has no mapping to remove", indexUuid);
         }
     }
