@@ -234,6 +234,11 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
      * that already exists.
      */
     @Override
+    public IndexDescriptor getIfFresh(String name) {
+        return descriptorCache.getIfFresh(name);
+    }
+
+    @Override
     public IndexDescriptor get(String name) {
         return descriptorCache.get(name, this::readFromStore);
     }

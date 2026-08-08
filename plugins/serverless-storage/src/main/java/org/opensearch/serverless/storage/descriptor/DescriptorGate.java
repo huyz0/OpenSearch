@@ -115,6 +115,11 @@ public final class DescriptorGate {
         return store == null ? null : store.get(name);
     }
 
+    private static IndexDescriptor supplyIfFresh(String name) {
+        DescriptorBackend store = STORE.get();
+        return store == null ? null : store.getIfFresh(name);
+    }
+
     public static void install(
         DescriptorBackend store,
         DescriptorPrefixBackend prefixBackend,
@@ -130,6 +135,7 @@ public final class DescriptorGate {
         // registered supplier backed by a null store.
         STORE.set(store);
         AbsentIndexDescriptorSuppliers.register(DescriptorGate::supply);
+        AbsentIndexDescriptorSuppliers.registerCached(DescriptorGate::supplyIfFresh);
         // T28. Wildcards, which until now matched no gated index at all: every branch of the resolver's
         // matching reads cluster state, and a gated index is absent from it by construction, so T25
         // measured tenant-* over five gated tenants returning nothing and returning it without an error.
@@ -445,6 +451,7 @@ public final class DescriptorGate {
         INSTALLED_NODES.set(0);
         // Cleared in the reverse order, so the supplier is gone before the store it reads.
         AbsentIndexDescriptorSuppliers.register(null);
+        AbsentIndexDescriptorSuppliers.registerCached(null);
         AbsentIndexDescriptorSuppliers.registerExpander(null);
         DescriptorPrefetch.register(null);
         setChangeFeed(null);

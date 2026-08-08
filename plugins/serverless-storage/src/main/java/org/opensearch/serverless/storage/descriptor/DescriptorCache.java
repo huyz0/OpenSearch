@@ -162,6 +162,16 @@ public final class DescriptorCache {
      *
      * @throws DescriptorUnavailableException if the loader could not tell whether the descriptor exists
      */
+    public IndexDescriptor getIfFresh(String name) {
+        CachedDescriptor cached = cache.get(name);
+        long now = clock.getAsLong();
+        if (cached != null && now - cached.readAtNanos() < ttlNanos) {
+            freshHits.incrementAndGet();
+            return cached.descriptor();
+        }
+        return null;
+    }
+
     public IndexDescriptor get(String name, Function<String, IndexDescriptor> loader) {
         // The guard precedes the read, which P3 and P5 both had to learn the hard way: a cache consulted
         // after the expensive call prevents nothing.

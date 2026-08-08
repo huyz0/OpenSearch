@@ -43,6 +43,7 @@ public final class AbsentIndexDescriptorSuppliers {
     private static final Logger logger = LogManager.getLogger(AbsentIndexDescriptorSuppliers.class);
 
     private static final AtomicReference<Function<String, IndexDescriptor>> SUPPLIER = new AtomicReference<>();
+    private static final AtomicReference<Function<String, IndexDescriptor>> CACHED_SUPPLIER = new AtomicReference<>();
 
     /**
      * Threads on which a supplier must not be asked to do I/O.
@@ -97,6 +98,10 @@ public final class AbsentIndexDescriptorSuppliers {
         SUPPLIER.set(supplier);
     }
 
+    public static void registerCached(Function<String, IndexDescriptor> cachedSupplier) {
+        CACHED_SUPPLIER.set(cachedSupplier);
+    }
+
     /** Whether anything is installed, so callers can skip work that would be discarded. */
     public static boolean isRegistered() {
         return SUPPLIER.get() != null;
@@ -110,15 +115,19 @@ public final class AbsentIndexDescriptorSuppliers {
      * bug into a request failure makes the absence worse than it was.
      */
     public static IndexDescriptor supply(String indexName) {
-        Function<String, IndexDescriptor> supplier = SUPPLIER.get();
-        if (supplier == null || indexName == null) {
+        if (indexName == null) {
             return null;
         }
         if (blockingIsUnsafeHere()) {
-            // Reported as absent rather than fetched. See blockingIsUnsafeHere: a supplier backed by a
-            // remote store would block a thread that has to make progress for the fetch to complete, and
-            // every caller here already handles absence because that is the seam's contract.
+            Function<String, IndexDescriptor> cached = CACHED_SUPPLIER.get();
+            if (cached != null) {
+                return cached.apply(indexName);
+            }
             logger.debug("refusing to resolve the descriptor for [{}] on {}", indexName, Thread.currentThread().getName());
+            return null;
+        }
+        Function<String, IndexDescriptor> supplier = SUPPLIER.get();
+        if (supplier == null) {
             return null;
         }
         try {

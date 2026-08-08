@@ -51,6 +51,13 @@ import java.util.concurrent.CompletableFuture;
 public interface DescriptorBackend {
 
     /**
+     * The descriptor for an exact name if present in memory cache, or null if cold or absent. Non-blocking.
+     */
+    default IndexDescriptor getIfFresh(String name) {
+        return null;
+    }
+
+    /**
      * The descriptor for an exact name, or null if there is none.
      *
      * <p>Must be read-your-writes against this backend: an index created a moment ago has to be nameable
