@@ -36,6 +36,16 @@ public final class DescriptorCheckTool {
             try {
                 var blobs = descriptorContainer.listBlobs();
                 liveCount = blobs.size();
+                for (String name : blobs.keySet()) {
+                    var reg = descriptorContainer.readRegister(name);
+                    if (reg.isPresent()) {
+                        try {
+                            BlobDescriptorBackend.decode(reg.get().value());
+                        } catch (Exception e) {
+                            corrupt.add(name + ": " + e.getMessage());
+                        }
+                    }
+                }
             } catch (IOException e) {
                 corrupt.add("descriptors-container: " + e.getMessage());
             }
@@ -45,6 +55,16 @@ public final class DescriptorCheckTool {
             try {
                 var blobs = tombstoneContainer.listBlobs();
                 tombstoneCount = blobs.size();
+                for (String name : blobs.keySet()) {
+                    var reg = tombstoneContainer.readRegister(name);
+                    if (reg.isPresent()) {
+                        try {
+                            BlobDescriptorBackend.decode(reg.get().value());
+                        } catch (Exception e) {
+                            corrupt.add("tombstone-" + name + ": " + e.getMessage());
+                        }
+                    }
+                }
             } catch (IOException e) {
                 corrupt.add("tombstones-container: " + e.getMessage());
             }
