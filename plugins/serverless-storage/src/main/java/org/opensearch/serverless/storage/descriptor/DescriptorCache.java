@@ -422,12 +422,12 @@ public final class DescriptorCache {
     }
 
     /** How many descriptors are cached, which is what the capacity bounds and what a test checks. */
-    int cachedCount() {
+    public int cachedCount() {
         return cache.size();
     }
 
     /** How much memory the cached descriptors occupy, which is the bound T4b established has to hold. */
-    long cachedBytes() {
+    public long cachedBytes() {
         return cachedBytes.get();
     }
 
