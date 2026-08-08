@@ -415,21 +415,55 @@ public class MetadataCreateIndexService {
      * service construction that admission exists to avoid, and it is paid only where something is asking.
      *
      * <p>Request settings win over template settings, which is the precedence creation itself applies.
+     *
+     * <h4>T52. Three places this used to disagree with {@link #applyCreateIndexRequest}</h4>
+     *
+     * <p>{@code applyCreateIndexRequest} does not always resolve a template at all, and when it does, not
+     * always against {@link CreateIndexClusterStateUpdateRequest#index()}. This mirrors its precedence
+     * exactly, in the same order it checks them, so the two can only drift by someone editing one and not
+     * the other:
+     * <ul>
+     * <li>a resize target ({@link CreateIndexClusterStateUpdateRequest#recoverFrom()} set) is created from
+     * source metadata via {@code applyCreateIndexRequestWithExistingMetadata}; no template is resolved at
+     * all, because "templates don't apply" to a recovery, per the comment on that branch.</li>
+     * <li>a data stream's backing index is matched against {@link CreateIndexClusterStateUpdateRequest
+     * #dataStreamName()}, not the backing index's own name, because "the backing index may have a
+     * different name or prefix than the data stream name."</li>
+     * <li>a system index (by that same name) skips templates entirely, via {@code
+     * applyCreateIndexRequestWithNoTemplates}.</li>
+     * </ul>
+     * <p>Before this, admission resolved templates against {@code request.index()} unconditionally, for
+     * every request including these three. A resize target or a system index whose name happened to match
+     * a gated template's pattern was over-admitted: sent down the off-thread road, which builds and
+     * discards a descriptor, only to be refused by {@code DescriptorOnlyCreation#skipsClusterState} once it
+     * reaches {@code clusterStateCreateIndex} -- because creation itself, correctly, never resolved that
+     * template -- and fall back to the ordinary road it should have taken directly, paying the whole
+     * creation twice.
      */
-    private Settings settingsForAdmission(final CreateIndexClusterStateUpdateRequest request) {
+    // Package-private rather than private so AdmissionTemplateResolutionTests (T52) can drive it directly,
+    // the same accommodation clusterStateCreateIndex and friends already get for the same reason.
+    Settings settingsForAdmission(final CreateIndexClusterStateUpdateRequest request) {
         if (DescriptorOnlyCreation.hasAdmissionCheck() == false) {
+            return request.settings();
+        }
+        if (request.recoverFrom() != null) {
+            // Mirrors applyCreateIndexRequest: a resize target is built from source metadata, and no
+            // template is resolved for it at all.
             return request.settings();
         }
         try {
             final Metadata metadata = clusterService.state().metadata();
+            // The backing index may have a different name or prefix than the data stream name -- the same
+            // substitution applyCreateIndexRequest makes before resolving anything.
+            final String name = request.dataStreamName() != null ? request.dataStreamName() : request.index();
+            if (systemIndices.isSystemIndex(name)) {
+                // Mirrors applyCreateIndexRequestWithNoTemplates: no template applies to a system index.
+                return request.settings();
+            }
             final Boolean hidden = IndexMetadata.INDEX_HIDDEN_SETTING.exists(request.settings())
                 ? IndexMetadata.INDEX_HIDDEN_SETTING.get(request.settings())
                 : null;
-            final String v2Template = MetadataIndexTemplateService.findV2Template(
-                metadata,
-                request.index(),
-                hidden == null ? false : hidden
-            );
+            final String v2Template = MetadataIndexTemplateService.findV2Template(metadata, name, hidden == null ? false : hidden);
             final Settings fromTemplates = v2Template != null
                 ? MetadataIndexTemplateService.resolveSettings(metadata, v2Template)
                 : MetadataIndexTemplateService.resolveSettings(
