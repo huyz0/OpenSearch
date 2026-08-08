@@ -114,6 +114,12 @@ public final class AbsentIndexDescriptorSuppliers {
      * request, for the reason Area C settled: this is a degradation path already, and turning a plugin
      * bug into a request failure makes the absence worse than it was.
      */
+    private static final java.util.concurrent.atomic.AtomicLong UNAVAILABLE_COUNT = new java.util.concurrent.atomic.AtomicLong();
+
+    public static long getUnavailableCount() {
+        return UNAVAILABLE_COUNT.get();
+    }
+
     public static IndexDescriptor supply(String indexName) {
         if (indexName == null) {
             return null;
@@ -133,13 +139,11 @@ public final class AbsentIndexDescriptorSuppliers {
         try {
             return supplier.apply(indexName);
         } catch (DescriptorUnavailableException e) {
-            // The one failure that must not become "no answer". Everything else here is a supplier bug,
-            // and Area C's reasoning holds for a bug: resolution is already a degradation path and turning
-            // a plugin defect into a request failure makes the absence worse. It does not hold when the
-            // store could not be read, because then "no answer" is indistinguishable from "no such index"
-            // and the caller's safe response to those two is opposite.
+            UNAVAILABLE_COUNT.incrementAndGet();
+            logger.warn("Descriptor unavailable for [{}] on Object Storage: {}", indexName, e.getMessage());
             throw e;
         } catch (Exception e) {
+            logger.debug("supplier threw for [{}]", indexName, e);
             return null;
         }
     }
