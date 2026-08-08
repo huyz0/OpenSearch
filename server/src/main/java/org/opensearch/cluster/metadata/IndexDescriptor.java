@@ -527,6 +527,29 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         );
     }
 
+    public IndexDescriptor withState(State newState) {
+        return new IndexDescriptor(
+            name,
+            uuid,
+            shardCount,
+            searchOnlyReplicaCount,
+            serverless,
+            newState,
+            aliases,
+            createdVersion,
+            system,
+            hidden,
+            remoteSnapshot,
+            warm,
+            mappingGeneration,
+            creationDate,
+            routingNumShards,
+            routingPartitionSize,
+            deletedAtMillis,
+            initialMapping
+        );
+    }
+
     public IndexDescriptor withMapping(long generation, Map<String, Object> newMapping) {
         return new IndexDescriptor(
             name,

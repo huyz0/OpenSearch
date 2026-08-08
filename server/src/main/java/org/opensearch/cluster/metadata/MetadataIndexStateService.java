@@ -185,11 +185,13 @@ public class MetadataIndexStateService {
         // to answer on the cluster state thread, so checking inside the update task would learn nothing.
         final List<Index> gated = AbsentIndexDescriptorSuppliers.gatedAmong(clusterService.state().metadata(), request.indices());
         if (gated.isEmpty() == false) {
+            if (gated.size() == request.indices().length) {
+                closeGatedIndices(request, gated, listener);
+                return;
+            }
             listener.onFailure(
                 new UnsupportedOperationException(
-                    "cannot close serverless "
-                        + names(gated)
-                        + ": a serverless index has no cluster state entry, and closing one is not implemented"
+                    "cannot close serverless " + names(gated) + ": mixed request with ordinary and serverless indices is not supported"
                 )
             );
             return;
@@ -956,11 +958,13 @@ public class MetadataIndexStateService {
         // resolves through a descriptor rather than through cluster state.
         final List<Index> gatedToOpen = AbsentIndexDescriptorSuppliers.gatedAmong(clusterService.state().metadata(), request.indices());
         if (gatedToOpen.isEmpty() == false) {
+            if (gatedToOpen.size() == request.indices().length) {
+                openGatedIndices(request, gatedToOpen, listener);
+                return;
+            }
             listener.onFailure(
                 new UnsupportedOperationException(
-                    "cannot open serverless "
-                        + names(gatedToOpen)
-                        + ": a serverless index has no cluster state entry, and opening one is not implemented"
+                    "cannot open serverless " + names(gatedToOpen) + ": mixed request with ordinary and serverless indices is not supported"
                 )
             );
             return;
@@ -1202,5 +1206,45 @@ public class MetadataIndexStateService {
             return "index " + indices.get(0).getName();
         }
         return "indices " + indices.stream().map(Index::getName).collect(java.util.stream.Collectors.toList());
+    }
+
+    private void closeGatedIndices(
+        final CloseIndexClusterStateUpdateRequest request,
+        final List<Index> gatedIndices,
+        final ActionListener<CloseIndexResponse> listener
+    ) {
+        threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
+            try {
+                for (Index index : gatedIndices) {
+                    IndexDescriptor descriptor = AbsentIndexDescriptorSuppliers.supply(index.getName());
+                    if (descriptor != null) {
+                        IndexDescriptorPublisher.updateGated(descriptor.withState(IndexDescriptor.State.CLOSE));
+                    }
+                }
+                listener.onResponse(new CloseIndexResponse(true, false, Collections.emptyList()));
+            } catch (Exception e) {
+                listener.onFailure(e);
+            }
+        });
+    }
+
+    private void openGatedIndices(
+        final OpenIndexClusterStateUpdateRequest request,
+        final List<Index> gatedIndices,
+        final ActionListener<OpenIndexClusterStateUpdateResponse> listener
+    ) {
+        threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
+            try {
+                for (Index index : gatedIndices) {
+                    IndexDescriptor descriptor = AbsentIndexDescriptorSuppliers.supply(index.getName());
+                    if (descriptor != null) {
+                        IndexDescriptorPublisher.updateGated(descriptor.withState(IndexDescriptor.State.OPEN));
+                    }
+                }
+                listener.onResponse(new OpenIndexClusterStateUpdateResponse(true, true));
+            } catch (Exception e) {
+                listener.onFailure(e);
+            }
+        });
     }
 }
