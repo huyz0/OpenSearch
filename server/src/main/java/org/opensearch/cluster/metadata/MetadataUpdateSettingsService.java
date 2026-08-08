@@ -160,6 +160,20 @@ public class MetadataUpdateSettingsService {
                 return;
             }
             if (gated.size() == request.indices().length) {
+                try {
+                    validateRefreshIntervalSettings(normalizedSettings, clusterService.getClusterSettings());
+                    validateTranslogDurabilitySettings(normalizedSettings, clusterService.getClusterSettings(), clusterService.getSettings());
+                    indexScopedSettings.validate(
+                        normalizedSettings.filter(s -> Regex.isSimpleMatchPattern(s) == false),
+                        false,
+                        false,
+                        true,
+                        true
+                    );
+                } catch (Exception e) {
+                    listener.onFailure(e);
+                    return;
+                }
                 updateGatedSettings(request, gated, listener);
                 return;
             }
