@@ -451,6 +451,10 @@ public class MetadataCreateIndexService {
     // Package-private rather than private so AdmissionTemplateResolutionTests (T52) can drive it directly,
     // the same accommodation clusterStateCreateIndex and friends already get for the same reason.
     public Settings settingsForAdmission(final CreateIndexClusterStateUpdateRequest request) {
+        return settingsForAdmission(request, clusterService.state().metadata());
+    }
+
+    public Settings settingsForAdmission(final CreateIndexClusterStateUpdateRequest request, final Metadata metadata) {
         if (DescriptorOnlyCreation.hasAdmissionCheck() == false) {
             return request.settings();
         }
@@ -460,7 +464,7 @@ public class MetadataCreateIndexService {
             return request.settings();
         }
         try {
-            final Metadata metadata = clusterService.state().metadata();
+            final Metadata currentMetadata = metadata != null ? metadata : clusterService.state().metadata();
             // The backing index may have a different name or prefix than the data stream name -- the same
             // substitution applyCreateIndexRequest makes before resolving anything.
             final String name = request.dataStreamName() != null ? request.dataStreamName() : request.index();
@@ -471,14 +475,14 @@ public class MetadataCreateIndexService {
             final Boolean hidden = IndexMetadata.INDEX_HIDDEN_SETTING.exists(request.settings())
                 ? IndexMetadata.INDEX_HIDDEN_SETTING.get(request.settings())
                 : null;
-            final String cacheKey = metadata.version() + ":" + name + ":" + (hidden == null ? false : hidden);
+            final String cacheKey = currentMetadata.version() + ":" + name + ":" + (hidden == null ? false : hidden);
             Settings fromTemplates = admissionTemplateCache.get(cacheKey);
             if (fromTemplates == null) {
-                final String v2Template = MetadataIndexTemplateService.findV2Template(metadata, name, hidden == null ? false : hidden);
+                final String v2Template = MetadataIndexTemplateService.findV2Template(currentMetadata, name, hidden == null ? false : hidden);
                 fromTemplates = v2Template != null
-                    ? MetadataIndexTemplateService.resolveSettings(metadata, v2Template)
+                    ? MetadataIndexTemplateService.resolveSettings(currentMetadata, v2Template)
                     : MetadataIndexTemplateService.resolveSettings(
-                        MetadataIndexTemplateService.findV1Templates(metadata, request.index(), hidden)
+                        MetadataIndexTemplateService.findV1Templates(currentMetadata, request.index(), hidden)
                     );
                 admissionTemplateCache.put(cacheKey, fromTemplates);
             }
