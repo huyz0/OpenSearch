@@ -55,14 +55,7 @@ public final class ManifestDescriptorSizeEstimate {
             IndexMetadata index = index(aliases);
             int without = size(entry(null));
             int with = size(entry(IndexDescriptor.of(index)));
-            System.out.printf(
-                Locale.ROOT,
-                "%-16d %8d B %10d B %+9.0f%%%n",
-                aliases,
-                without,
-                with,
-                ((double) with / without - 1) * 100
-            );
+            System.out.printf(Locale.ROOT, "%-16d %8d B %10d B %+9.0f%%%n", aliases, without, with, ((double) with / without - 1) * 100);
             if (aliases == 0) {
                 baseline = with - without;
             }
@@ -173,7 +166,9 @@ public final class ManifestDescriptorSizeEstimate {
         String name = String.format(Locale.ROOT, "tenant-%016x", ordinal);
         IndexMetadata.Builder builder = IndexMetadata.builder(name)
             .settings(
-                Settings.builder().put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT).put(IndexMetadata.SETTING_INDEX_UUID, name + "-uuid")
+                Settings.builder()
+                    .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+                    .put(IndexMetadata.SETTING_INDEX_UUID, name + "-uuid")
             )
             .numberOfShards(3)
             .numberOfReplicas(1);

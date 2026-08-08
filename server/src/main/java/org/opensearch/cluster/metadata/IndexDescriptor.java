@@ -18,6 +18,7 @@ import org.opensearch.core.xcontent.XContentBuilder;
 import java.io.IOException;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -135,6 +136,11 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
     private final long creationDate;
 
     /**
+     * Top-level field definitions embedded directly in the descriptor.
+     */
+    private final Map<String, Object> initialMapping;
+
+    /**
      * A descriptor with default routing geometry, which is what an index that has never been resharded and
      * sets no partition size has. Kept so the many callers that mean exactly that do not have to say so.
      */
@@ -233,6 +239,48 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         int routingPartitionSize,
         long deletedAtMillis
     ) {
+        this(
+            name,
+            uuid,
+            shardCount,
+            searchOnlyReplicaCount,
+            serverless,
+            state,
+            aliases,
+            createdVersion,
+            system,
+            hidden,
+            remoteSnapshot,
+            warm,
+            mappingGeneration,
+            creationDate,
+            routingNumShards,
+            routingPartitionSize,
+            deletedAtMillis,
+            null
+        );
+    }
+
+    public IndexDescriptor(
+        String name,
+        String uuid,
+        int shardCount,
+        int searchOnlyReplicaCount,
+        boolean serverless,
+        State state,
+        List<String> aliases,
+        long createdVersion,
+        boolean system,
+        boolean hidden,
+        boolean remoteSnapshot,
+        boolean warm,
+        long mappingGeneration,
+        long creationDate,
+        int routingNumShards,
+        int routingPartitionSize,
+        long deletedAtMillis,
+        Map<String, Object> initialMapping
+    ) {
         this.deletedAtMillis = deletedAtMillis;
         this.routingNumShards = routingNumShards;
         this.routingPartitionSize = routingPartitionSize;
@@ -250,16 +298,15 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         this.warm = warm;
         this.mappingGeneration = mappingGeneration;
         this.creationDate = creationDate;
+        this.initialMapping = initialMapping != null ? Map.copyOf(initialMapping) : Map.of();
     }
 
     /**
-     * Derives a descriptor from full metadata, which is how the dual-write phase keeps the two in step.
-     *
-     * <p>Deriving rather than constructing separately is what makes H2c's comparison meaningful: if the
-     * descriptor were built from different inputs, agreement between the two resolution paths would prove
-     * only that both were built from the same mistake.
+     * Derives a descriptor from full metadata, including initial mapping fields.
      */
     public static IndexDescriptor from(IndexMetadata indexMetadata) {
+        Map<String, Object> declaredFields = DescriptorRepresentable.fieldDefinitionsOrNull(indexMetadata);
+        long gen = (declaredFields != null && declaredFields.isEmpty() == false) ? 1L : 0L;
         return new IndexDescriptor(
             indexMetadata.getIndex().getName(),
             indexMetadata.getIndexUUID(),
@@ -273,15 +320,16 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
             indexMetadata.isHidden(),
             indexMetadata.isRemoteSnapshot(),
             indexMetadata.isWarmIndex(),
-            0L,
+            gen,
             indexMetadata.getCreationDate(),
-            // Read off the metadata rather than inferred. getRoutingNumShards() resolves the setting's own
-            // default, so this stores the resolved value and effectiveRoutingNumShards agrees with it.
             indexMetadata.getRoutingNumShards(),
-            indexMetadata.getRoutingPartitionSize()
+            indexMetadata.getRoutingPartitionSize(),
+            0L,
+            declaredFields
         );
     }
 
+    @SuppressWarnings("unchecked")
     public IndexDescriptor(StreamInput in) throws IOException {
         this.name = in.readString();
         this.uuid = in.readString();
@@ -297,12 +345,15 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         this.warm = in.readBoolean();
         this.mappingGeneration = in.readVLong();
         this.creationDate = in.readLong();
-        // Appended rather than placed beside shardCount, so a reader with the order wrong cannot silently
-        // read the shard count as the routing divisor. Those two are equal on most indices, which is
-        // exactly what would make such a transposition invisible until an index was resharded.
         this.routingNumShards = in.readVInt();
         this.routingPartitionSize = in.readVInt();
         this.deletedAtMillis = in.readLong();
+        if (in.readBoolean()) {
+            Map<String, Object> map = (Map<String, Object>) in.readGenericValue();
+            this.initialMapping = map != null ? Map.copyOf(map) : Map.of();
+        } else {
+            this.initialMapping = Map.of();
+        }
     }
 
     @Override
@@ -324,6 +375,12 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         out.writeVInt(routingNumShards);
         out.writeVInt(routingPartitionSize);
         out.writeLong(deletedAtMillis);
+        if (initialMapping == null || initialMapping.isEmpty()) {
+            out.writeBoolean(false);
+        } else {
+            out.writeBoolean(true);
+            out.writeGenericValue(initialMapping);
+        }
     }
 
     /** The index, which is what placement hashes and what every shard id is built from. */
@@ -437,6 +494,11 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         return creationDate;
     }
 
+    /** Top-level field definitions embedded directly in the descriptor. */
+    public Map<String, Object> initialMapping() {
+        return initialMapping;
+    }
+
     /** See the field's own javadoc: {@code 0} means unknown age and must never be read as old. */
     public long deletedAtMillis() {
         return deletedAtMillis;
@@ -457,7 +519,34 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
             remoteSnapshot,
             warm,
             generation,
-            creationDate
+            creationDate,
+            routingNumShards,
+            routingPartitionSize,
+            deletedAtMillis,
+            initialMapping
+        );
+    }
+
+    public IndexDescriptor withMapping(long generation, Map<String, Object> newMapping) {
+        return new IndexDescriptor(
+            name,
+            uuid,
+            shardCount,
+            searchOnlyReplicaCount,
+            serverless,
+            state,
+            aliases,
+            createdVersion,
+            system,
+            hidden,
+            remoteSnapshot,
+            warm,
+            generation,
+            creationDate,
+            routingNumShards,
+            routingPartitionSize,
+            deletedAtMillis,
+            newMapping
         );
     }
 
@@ -553,7 +642,8 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
             creationDate,
             routingNumShards,
             routingPartitionSize,
-            deletedAtMillis
+            deletedAtMillis,
+            initialMapping
         );
     }
 
@@ -572,6 +662,9 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         builder.field("hidden", hidden);
         builder.field("remote_snapshot", remoteSnapshot);
         builder.field("warm", warm);
+        if (initialMapping != null && initialMapping.isEmpty() == false) {
+            builder.field("initial_mapping", initialMapping);
+        }
         builder.endObject();
         return builder;
     }
@@ -596,7 +689,8 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
             && system == other.system
             && hidden == other.hidden
             && remoteSnapshot == other.remoteSnapshot
-            && warm == other.warm;
+            && warm == other.warm
+            && Objects.equals(initialMapping, other.initialMapping);
     }
 
     @Override
@@ -613,7 +707,8 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
             system,
             hidden,
             remoteSnapshot,
-            warm
+            warm,
+            initialMapping
         );
     }
 

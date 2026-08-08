@@ -180,6 +180,7 @@ public final class DescriptorGate {
             // so they are hard to attribute after the fact: a write that lands after a test has finished
             // shows up only as the descriptor index reappearing, with nothing saying what wrote to it.
             logger.debug("publishing descriptor for [{}], exists [{}]", descriptor.name(), descriptor.exists());
+            DescriptorBackedMappingStore.registerDescriptor(descriptor);
             if (descriptor.exists()) {
                 store.putAsync(descriptor);
             } else {
@@ -246,6 +247,7 @@ public final class DescriptorGate {
         // After the point write rather than beside it, because a name that is not uniquely ours must not
         // appear in the prefix half at all.
         IndexDescriptorPublisher.registerCreator(descriptor -> {
+            DescriptorBackedMappingStore.registerDescriptor(descriptor);
             java.util.concurrent.CompletableFuture<Boolean> created = store.createAsync(descriptor);
             if (prefixBackend instanceof DescriptorBackend == false || prefixBackend == store) {
                 return created;
@@ -272,11 +274,8 @@ public final class DescriptorGate {
                 });
             });
         });
-        // Mappings, which H4c required to leave cluster state and which have had no backing store since
-        // H6a proved the swap converges. Blocking is safe here, unlike the publish hook above: a mapping
-        // update runs on a transport thread handling a put-mapping or a dynamic field inference, not on
-        // the cluster state thread where W4 found that a blocking write deadlocks.
-        MappingGenerationStore.register(mappingStore);
+        // Mappings, stored directly inside IndexDescriptors in Object Storage without system index round trips.
+        MappingGenerationStore.register(new DescriptorBackedMappingStore(STORE::get, null));
         // Cluster stats. H19 measured that _cluster/stats reports a plausible wrong number for a gated
         // population, and H20 built a seam through which per-index iteration cannot be expressed. This is
         // the aggregate it was waiting for: one query whose cost is set by the number of field types

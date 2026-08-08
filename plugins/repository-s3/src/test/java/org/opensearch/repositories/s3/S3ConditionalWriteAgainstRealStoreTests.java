@@ -8,6 +8,8 @@
 
 package org.opensearch.repositories.s3;
 
+import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
+
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.core.sync.RequestBody;
@@ -20,8 +22,6 @@ import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.s3.model.S3Exception;
 
 import org.opensearch.test.OpenSearchTestCase;
-
-import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
 
 import java.net.URI;
 import java.nio.charset.StandardCharsets;

@@ -2357,16 +2357,9 @@ public class MetadataCreateIndexService {
             // cluster state task, where no admission check runs and none can. The refusal below is what
             // stands in for the argument, because the argument has been wrong twice.
             //
-            // T41 sends this through createMapping rather than updateMapping. The two differ by one round
-            // trip: updateMapping opens by reading the current mapping so it has something to merge onto,
-            // and this UUID came from UUIDs.randomBase64UUID in aggregateIndexSettings moments ago and has
-            // been given to nobody, so that read can only answer "absent". createMapping attempts the swap
-            // first and keeps the read-and-merge loop as its fallback for a write the store itself retried.
-            java.util.Map<String, Object> declaredFields = DescriptorRepresentable.fieldDefinitionsOrNull(indexMetadata);
-            if (declaredFields != null && declaredFields.isEmpty() == false) {
-                refuseToWriteAMappingFromTheClusterStateThread(indexMetadata);
-                MappingGenerationStore.createMapping(indexMetadata.getIndexUUID(), declaredFields);
-            }
+            // Initial creation-time mappings are carried directly in IndexDescriptor.from(indexMetadata)
+            // and written atomically to object storage by IndexDescriptorPublisher.createGated(indexMetadata),
+            // avoiding system index round-trips entirely.
             java.util.concurrent.CompletableFuture<Boolean> write = IndexDescriptorPublisher.createGated(indexMetadata);
             if (write == null) {
                 throw new IllegalStateException(
