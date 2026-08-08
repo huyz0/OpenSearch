@@ -162,10 +162,20 @@ public final class DescriptorCache {
      *
      * @throws DescriptorUnavailableException if the loader could not tell whether the descriptor exists
      */
+    /** Computes a ±10% jittered TTL based on key hash code to prevent thundering herd spikes (T104). */
+    private long jitteredTtl(String name) {
+        if (ttlNanos <= 0) {
+            return ttlNanos;
+        }
+        int hash = name.hashCode();
+        double factor = 0.9 + (Math.abs(hash % 200) / 1000.0);
+        return (long) (ttlNanos * factor);
+    }
+
     public IndexDescriptor getIfFresh(String name) {
         CachedDescriptor cached = cache.get(name);
         long now = clock.getAsLong();
-        if (cached != null && now - cached.readAtNanos() < ttlNanos) {
+        if (cached != null && now - cached.readAtNanos() < jitteredTtl(name)) {
             freshHits.incrementAndGet();
             return cached.descriptor();
         }
