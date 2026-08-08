@@ -150,6 +150,15 @@ public class MetadataUpdateSettingsService {
         // a descriptor is a remote read and the seam refuses to answer on the cluster state thread.
         final java.util.List<Index> gated = AbsentIndexDescriptorSuppliers.gatedAmong(clusterService.state().metadata(), request.indices());
         if (gated.isEmpty() == false) {
+            if (gated.size() > 50) {
+                listener.onFailure(
+                    new IllegalArgumentException(
+                        "Multi-index settings updates on serverless indices exceeding 50 targets are disabled to prevent high-cost Object Storage operations. Specified: "
+                            + gated.size()
+                    )
+                );
+                return;
+            }
             if (gated.size() == request.indices().length) {
                 updateGatedSettings(request, gated, listener);
                 return;

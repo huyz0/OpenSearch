@@ -185,6 +185,15 @@ public class MetadataIndexStateService {
         // to answer on the cluster state thread, so checking inside the update task would learn nothing.
         final List<Index> gated = AbsentIndexDescriptorSuppliers.gatedAmong(clusterService.state().metadata(), request.indices());
         if (gated.isEmpty() == false) {
+            if (gated.size() > 50) {
+                listener.onFailure(
+                    new IllegalArgumentException(
+                        "Multi-index close operations on serverless indices exceeding 50 targets are disabled to prevent high-cost Object Storage operations. Specified: "
+                            + gated.size()
+                    )
+                );
+                return;
+            }
             if (gated.size() == request.indices().length) {
                 closeGatedIndices(request, gated, listener);
                 return;
@@ -958,6 +967,15 @@ public class MetadataIndexStateService {
         // resolves through a descriptor rather than through cluster state.
         final List<Index> gatedToOpen = AbsentIndexDescriptorSuppliers.gatedAmong(clusterService.state().metadata(), request.indices());
         if (gatedToOpen.isEmpty() == false) {
+            if (gatedToOpen.size() > 50) {
+                listener.onFailure(
+                    new IllegalArgumentException(
+                        "Multi-index open operations on serverless indices exceeding 50 targets are disabled to prevent high-cost Object Storage operations. Specified: "
+                            + gatedToOpen.size()
+                    )
+                );
+                return;
+            }
             if (gatedToOpen.size() == request.indices().length) {
                 openGatedIndices(request, gatedToOpen, listener);
                 return;
