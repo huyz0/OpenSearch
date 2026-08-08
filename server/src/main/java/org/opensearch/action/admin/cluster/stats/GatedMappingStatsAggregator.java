@@ -47,12 +47,14 @@ public final class GatedMappingStatsAggregator {
 
     /** One aggregate: how many fields of each type, and how many indices use each type. */
     public static final class GatedFieldTypeCounts {
+        public static final GatedFieldTypeCounts EMPTY = new GatedFieldTypeCounts(Map.of(), Map.of());
+
         private final Map<String, Integer> fieldCounts;
         private final Map<String, Integer> indexCounts;
 
         public GatedFieldTypeCounts(Map<String, Integer> fieldCounts, Map<String, Integer> indexCounts) {
-            this.fieldCounts = fieldCounts == null ? Map.of() : Map.copyOf(fieldCounts);
-            this.indexCounts = indexCounts == null ? Map.of() : Map.copyOf(indexCounts);
+            this.fieldCounts = fieldCounts == null || fieldCounts.isEmpty() ? Map.of() : Map.copyOf(fieldCounts);
+            this.indexCounts = indexCounts == null || indexCounts.isEmpty() ? Map.of() : Map.copyOf(indexCounts);
         }
 
         public Map<String, Integer> fieldCounts() {
