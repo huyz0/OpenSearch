@@ -245,27 +245,39 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
 
     /** One read of one descriptor from the object store, with no caching of its own. */
     private IndexDescriptor readFromStore(String name) {
-        try {
-            Optional<BlobRegister> live = blobContainer.readRegister(keyFor(name));
-            if (live.isPresent()) {
-                return decode(live.get().value());
-            }
-            // Then the tombstone, because "deleted" and "never existed" are different answers and only
-            // the first one stops a partitioned node resurrecting the index from its local shard data.
-            // This costs a second round trip, but only on a name that is not live, and creation does not
-            // come through here at all: it is one conditional write that never reads.
-            Optional<BlobRegister> tombstone = blobContainer.readRegister(tombstoneKeyFor(name));
-            return tombstone.map(register -> {
-                try {
-                    return decode(register.value());
-                } catch (IOException e) {
+        int maxAttempts = 3;
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                Optional<BlobRegister> live = blobContainer.readRegister(keyFor(name));
+                if (live.isPresent()) {
+                    return decode(live.get().value());
+                }
+                // Then the tombstone, because "deleted" and "never existed" are different answers and only
+                // the first one stops a partitioned node resurrecting the index from its local shard data.
+                // This costs a second round trip, but only on a name that is not live, and creation does not
+                // come through here at all: it is one conditional write that never reads.
+                Optional<BlobRegister> tombstone = blobContainer.readRegister(tombstoneKeyFor(name));
+                return tombstone.map(register -> {
+                    try {
+                        return decode(register.value());
+                    } catch (IOException e) {
+                        throw new DescriptorUnavailableException(name, e);
+                    }
+                }).orElse(null);
+            } catch (IOException | RuntimeException e) {
+                if (attempt == maxAttempts) {
+                    logger.warn("could not read descriptor for [{}] after {} attempts; reporting unavailable", name, attempt, e);
                     throw new DescriptorUnavailableException(name, e);
                 }
-            }).orElse(null);
-        } catch (IOException | RuntimeException e) {
-            logger.warn("could not read the descriptor for [{}]; reporting unavailable rather than absent", name, e);
-            throw new DescriptorUnavailableException(name, e);
+                try {
+                    Thread.sleep(attempt * 10L);
+                } catch (InterruptedException interruptedException) {
+                    Thread.currentThread().interrupt();
+                    throw new DescriptorUnavailableException(name, e);
+                }
+            }
         }
+        return null;
     }
 
     /**
