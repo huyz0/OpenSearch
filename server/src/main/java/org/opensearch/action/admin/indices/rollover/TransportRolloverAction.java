@@ -34,6 +34,7 @@ package org.opensearch.action.admin.indices.rollover;
 
 import org.opensearch.OpenSearchException;
 import org.opensearch.action.admin.indices.create.CreateIndexAction;
+import org.opensearch.action.admin.indices.create.CreateIndexClusterStateUpdateRequest;
 import org.opensearch.action.admin.indices.stats.IndicesStatsAction;
 import org.opensearch.action.admin.indices.stats.IndicesStatsRequest;
 import org.opensearch.action.admin.indices.stats.IndicesStatsResponse;
@@ -46,10 +47,12 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.ClusterStateUpdateTask;
 import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.block.ClusterBlocks;
+import org.opensearch.cluster.metadata.DescriptorOnlyCreation;
 import org.opensearch.cluster.metadata.IndexAbstraction;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.metadata.MetadataCreateIndexService;
 import org.opensearch.cluster.metadata.ResolvedIndices;
 import org.opensearch.cluster.service.ClusterManagerTaskThrottler;
 import org.opensearch.cluster.service.ClusterService;
@@ -84,6 +87,7 @@ public class TransportRolloverAction extends TransportClusterManagerNodeAction<R
         TransportIndicesResolvingAction<RolloverRequest> {
 
     private final MetadataRolloverService rolloverService;
+    private final MetadataCreateIndexService createIndexService;
     private final ActiveShardsObserver activeShardsObserver;
     private final Client client;
     private final ClusterManagerTaskThrottler.ThrottlingKey rolloverIndexTaskKey;
@@ -96,6 +100,7 @@ public class TransportRolloverAction extends TransportClusterManagerNodeAction<R
         ActionFilters actionFilters,
         IndexNameExpressionResolver indexNameExpressionResolver,
         MetadataRolloverService rolloverService,
+        MetadataCreateIndexService createIndexService,
         Client client
     ) {
         super(
@@ -108,6 +113,7 @@ public class TransportRolloverAction extends TransportClusterManagerNodeAction<R
             indexNameExpressionResolver
         );
         this.rolloverService = rolloverService;
+        this.createIndexService = createIndexService;
         this.client = client;
         this.activeShardsObserver = new ActiveShardsObserver(clusterService, threadPool);
         // Task is onboarded for throttling, it will get retried from associated TransportClusterManagerNodeAction.
@@ -190,6 +196,42 @@ public class TransportRolloverAction extends TransportClusterManagerNodeAction<R
                     .filter(condition -> conditionResults.get(condition.toString()))
                     .collect(Collectors.toList());
                 if (conditionResults.size() == 0 || metConditions.size() > 0) {
+                    CreateIndexClusterStateUpdateRequest createIndexClusterStateRequest = MetadataRolloverService.prepareCreateIndexRequest(
+                        rolloverRequest.getNewIndexName(),
+                        rolloverIndexName,
+                        "rollover_index",
+                        rolloverRequest.getCreateIndexRequest(),
+                        null
+                    );
+                    if (DescriptorOnlyCreation.mayBypassClusterState(createIndexService.settingsForAdmission(createIndexClusterStateRequest))) {
+                        threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
+                            try {
+                                MetadataRolloverService.RolloverResult rolloverResult = rolloverService.rolloverClusterState(
+                                    clusterService.state(),
+                                    rolloverRequest.getRolloverTarget(),
+                                    rolloverRequest.getNewIndexName(),
+                                    rolloverRequest.getCreateIndexRequest(),
+                                    metConditions,
+                                    false,
+                                    false
+                                );
+                                listener.onResponse(
+                                    new RolloverResponse(
+                                        sourceIndexName,
+                                        rolloverIndexName,
+                                        conditionResults,
+                                        false,
+                                        true,
+                                        true,
+                                        true
+                                    )
+                                );
+                            } catch (Exception e) {
+                                listener.onFailure(e);
+                            }
+                        });
+                        return;
+                    }
                     clusterService.submitStateUpdateTask(
                         "rollover_index source [" + sourceIndexName + "] to target [" + rolloverIndexName + "]",
                         new ClusterStateUpdateTask() {

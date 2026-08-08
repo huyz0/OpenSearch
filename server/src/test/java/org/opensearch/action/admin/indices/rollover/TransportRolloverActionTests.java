@@ -310,6 +310,7 @@ public class TransportRolloverActionTests extends OpenSearchTestCase {
             mockActionFilters,
             mockIndexNameExpressionResolver,
             rolloverService,
+            mockCreateIndexService,
             mockClient
         );
 
@@ -383,6 +384,7 @@ public class TransportRolloverActionTests extends OpenSearchTestCase {
             mock(ActionFilters.class),
             indexNameExpressionResolver,
             metadataRolloverService,
+            createIndexService,
             mock(Client.class)
         );
 
@@ -483,9 +485,10 @@ public class TransportRolloverActionTests extends OpenSearchTestCase {
         ThreadPool threadPool = mock(ThreadPool.class);
         when(threadPool.getThreadContext()).thenReturn(new ThreadContext(Settings.EMPTY));
         IndexNameExpressionResolver resolver = new IndexNameExpressionResolver(new ThreadContext(Settings.EMPTY));
+        MetadataCreateIndexService createIndexService = mock(MetadataCreateIndexService.class);
         MetadataRolloverService rolloverService = new MetadataRolloverService(
             threadPool,
-            mock(MetadataCreateIndexService.class),
+            createIndexService,
             mock(MetadataIndexAliasesService.class),
             resolver
         );
@@ -496,6 +499,7 @@ public class TransportRolloverActionTests extends OpenSearchTestCase {
             mock(ActionFilters.class),
             resolver,
             rolloverService,
+            createIndexService,
             mock(Client.class)
         );
     }
