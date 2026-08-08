@@ -12,6 +12,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.DescriptorUnavailableException;
+import org.opensearch.cluster.metadata.IndexDescriptor;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.common.blobstore.BlobPath;
@@ -182,7 +183,10 @@ public final class DescriptorEnumerator implements DescriptorPrefixBackend {
         }
         List<AbsentIndexDescriptorSuppliers.PrefixMatch> matches = new ArrayList<>(found.size());
         for (BlobMetadata blob : found) {
-            matches.add(new AbsentIndexDescriptorSuppliers.PrefixMatch(blob.name(), true, false));
+            IndexDescriptor desc = AbsentIndexDescriptorSuppliers.supply(blob.name());
+            boolean open = desc == null || desc.state() == IndexDescriptor.State.OPEN;
+            boolean hidden = desc != null && desc.hidden();
+            matches.add(new AbsentIndexDescriptorSuppliers.PrefixMatch(blob.name(), open, hidden));
         }
         return AbsentIndexDescriptorSuppliers.PrefixExpansion.of(matches);
     }
