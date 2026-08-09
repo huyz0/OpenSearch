@@ -550,6 +550,29 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         );
     }
 
+    public IndexDescriptor withAliases(List<String> newAliases) {
+        return new IndexDescriptor(
+            name,
+            uuid,
+            shardCount,
+            searchOnlyReplicaCount,
+            serverless,
+            state,
+            newAliases != null ? List.copyOf(newAliases) : List.of(),
+            createdVersion,
+            system,
+            hidden,
+            remoteSnapshot,
+            warm,
+            mappingGeneration,
+            creationDate,
+            routingNumShards,
+            routingPartitionSize,
+            deletedAtMillis,
+            initialMapping
+        );
+    }
+
     public IndexDescriptor withMapping(long generation, Map<String, Object> newMapping) {
         return new IndexDescriptor(
             name,

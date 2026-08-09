@@ -126,7 +126,7 @@ public final class BlobDescriptorChangeLog {
             bucketContainer(bucketOf(clock.getAsLong())).writeBlob(UUIDs.randomBase64UUID(), bytes.streamInput(), bytes.length(), true);
         } catch (IOException | RuntimeException e) {
             failedAppends.incrementAndGet();
-            logger.warn("could not append a change log entry for [{}]; the feed will need a rebuild to notice", change.name(), e);
+            logger.warn("could not append a change log entry for [{}]; the feed will need a rebuild to notice: {}", change.name(), e);
         }
     }
 
@@ -199,7 +199,7 @@ public final class BlobDescriptorChangeLog {
                     bucket.getValue().delete();
                     pruned++;
                 } catch (IOException | RuntimeException e) {
-                    logger.warn("could not prune change log bucket [{}]; will retry on the next pass", bucket.getKey(), e);
+                    logger.warn("could not prune change log bucket [{}]; will retry on the next pass: {}", bucket.getKey(), e);
                 }
             }
         } catch (IOException | RuntimeException e) {
@@ -251,12 +251,12 @@ public final class BlobDescriptorChangeLog {
                         // One unreadable entry is not a reason to lose the rest of the catch-up. It is also
                         // expected transiently: an entry can be listed between its key appearing and its
                         // body being complete, on a store that does not make writes atomic.
-                        logger.debug("skipping an unreadable change log entry [{}/{}]", bucket.getKey(), entry, e);
+                        logger.debug("skipping an unreadable change log entry [{}/{}]: {}", bucket.getKey(), entry, e);
                     }
                 }
             }
         } catch (IOException e) {
-            logger.warn("could not read the change log from bucket [{}]", fromBucket, e);
+            logger.warn("could not read the change log from bucket [{}]: {}", fromBucket, e);
         }
         return changes;
     }

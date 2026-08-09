@@ -174,7 +174,7 @@ public class GatedMappedCreationCostIT extends org.opensearch.serverless.storage
      */
     @After
     public void deleteWhatWasCreated() throws Exception {
-        if (Boolean.getBoolean("tests.mappingcost") == false) {
+        if (org.opensearch.common.Booleans.parseBoolean(System.getProperty("tests.mappingcost", "false")) == false) {
             // The body was skipped, so nothing was created and sweeping would be about a hundred pointless
             // round trips. The uninstall still runs: it costs nothing, and this class used to run it
             // unconditionally, so anything that had come to depend on that would break silently here rather
@@ -299,7 +299,7 @@ public class GatedMappedCreationCostIT extends org.opensearch.serverless.storage
         assumeTrue(
             "set -Dtests.mappingcost=true to run this; it creates enough indices to disturb the tests "
                 + "around it, which is why every measurement in this package is opt-in",
-            Boolean.getBoolean("tests.mappingcost")
+            org.opensearch.common.Booleans.parseBoolean(System.getProperty("tests.mappingcost", "false"))
         );
         installBlobBackedDescriptorPlane();
         // In place of the identically-built store the gate just registered, so every index-backed arm runs

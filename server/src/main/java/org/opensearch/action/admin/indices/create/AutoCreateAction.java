@@ -134,8 +134,7 @@ public final class AutoCreateAction extends ActionType<CreateIndexResponse> {
                 request.cause(),
                 indexName,
                 request.index()
-            )
-                .ackTimeout(request.timeout())
+            ).ackTimeout(request.timeout())
                 .clusterManagerNodeTimeout(request.clusterManagerNodeTimeout())
                 .settings(request.settings())
                 .aliases(request.aliases())

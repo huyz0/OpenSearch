@@ -80,6 +80,7 @@ refiled as T40 in its plan. The rest are candidates for round 005:
 - Pre-warm before rotation. 12.4% of shards lose all warm candidates at fleet-doubling.
 - Manifest sharding aligned with the routing hash, so a coordinator warms its whole
   partition in one read.
+- **Leading wildcards (`*-logs`)**: Unsupported and explicitly restricted in the serverless API contract (removed from planned work; object storage prefix listings serve trailing `prefix*` patterns only).
 
 ## Blocked
 

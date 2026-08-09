@@ -20,7 +20,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public class RecordingTestStore implements MappingGenerationStore.Store {
 
-    public record Invocation(String method, String indexUuid, String threadName) {}
+    public record Invocation(String method, String indexUuid, String threadName) {
+    }
 
     private final MappingGenerationStore.Store delegate;
     private final List<Invocation> invocations = new ArrayList<>();
@@ -42,11 +43,7 @@ public class RecordingTestStore implements MappingGenerationStore.Store {
     }
 
     @Override
-    public boolean compareAndSwap(
-        String indexUuid,
-        long expectedGeneration,
-        MappingGenerationStore.MappingGeneration updated
-    ) {
+    public boolean compareAndSwap(String indexUuid, long expectedGeneration, MappingGenerationStore.MappingGeneration updated) {
         casCount.incrementAndGet();
         synchronized (invocations) {
             invocations.add(new Invocation("compareAndSwap", indexUuid, Thread.currentThread().getName()));

@@ -10,6 +10,8 @@ package org.opensearch.cluster.metadata;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.common.cache.Cache;
+import org.opensearch.common.cache.CacheBuilder;
 
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
@@ -143,7 +145,7 @@ public final class AbsentIndexDescriptorSuppliers {
             logger.warn("Descriptor unavailable for [{}] on Object Storage: {}", indexName, e.getMessage());
             throw e;
         } catch (Exception e) {
-            logger.debug("supplier threw for [{}]", indexName, e);
+            logger.debug("supplier threw for [{}]: {}", indexName, e);
             return null;
         }
     }
@@ -184,8 +186,17 @@ public final class AbsentIndexDescriptorSuppliers {
      * paging by sorted name with {@code search_after} at roughly 33 ms per thousand names.
      */
     public static List<IndexDescriptor> supplyAll(List<String> indexNames) {
-        if (isRegistered() == false) {
+        if (isRegistered() == false || indexNames == null || indexNames.isEmpty()) {
             return List.of();
+        }
+        if (DescriptorPrefetch.isRegistered()) {
+            java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+            DescriptorPrefetch.prefetch(indexNames, org.opensearch.core.action.ActionListener.wrap(latch::countDown));
+            try {
+                latch.await(5, java.util.concurrent.TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
         }
         return indexNames.stream().map(AbsentIndexDescriptorSuppliers::supply).filter(java.util.Objects::nonNull).toList();
     }
@@ -314,12 +325,13 @@ public final class AbsentIndexDescriptorSuppliers {
     private record SynthesisedMetadata(IndexDescriptor descriptor, IndexMetadata metadata) {
     }
 
-    private static final java.util.concurrent.ConcurrentHashMap<String, SynthesisedMetadata> SYNTHESISED =
-        new java.util.concurrent.ConcurrentHashMap<>();
+    private static final Cache<String, SynthesisedMetadata> SYNTHESISED = CacheBuilder.<String, SynthesisedMetadata>builder()
+        .setMaximumWeight(50_000)
+        .build();
 
     /** Drops every synthesised instance, which a test must do because this registry is static. */
     public static void clearSynthesised() {
-        SYNTHESISED.clear();
+        SYNTHESISED.invalidateAll();
     }
 
     /**

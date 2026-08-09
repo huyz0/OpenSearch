@@ -102,11 +102,11 @@ public final class DescriptorPrefetch {
             prefetcher.prefetch(indexNames, ActionListener.wrap(ignored -> listener.onResponse(null), e -> {
                 // Degrading to the slow path is the whole contract. A prefetch that failed leaves the
                 // synchronous sites to resolve what they need, which is what they did before this class.
-                logger.debug("descriptor prefetch failed for {}; falling back to resolving inline", indexNames.size(), e);
+                logger.debug("descriptor prefetch failed for {}; falling back to resolving inline: {}", indexNames.size(), e);
                 listener.onResponse(null);
             }));
         } catch (Exception e) {
-            logger.debug("descriptor prefetch threw for {}; falling back to resolving inline", indexNames.size(), e);
+            logger.debug("descriptor prefetch threw for {}; falling back to resolving inline: {}", indexNames.size(), e);
             listener.onResponse(null);
         }
     }

@@ -100,7 +100,7 @@ public final class TombstoneScrubber {
                     }
                 }
             } catch (IOException | RuntimeException e) {
-                logger.debug("could not reclaim tombstone [{}]; leaving it for a later pass", name, e);
+                logger.debug("could not reclaim tombstone [{}]; leaving it for a later pass: {}", name, e);
             }
         }
         if (toDeleteBatch.isEmpty() == false) {
@@ -141,7 +141,7 @@ public final class TombstoneScrubber {
             // is unknowable, so it is left alone: refusing to reclaim what cannot be dated is the same rule
             // the zero check below applies, and deleting it would be reclaiming on the strength of a parse
             // failure.
-            logger.debug("tombstone [{}] is not readable, so its age is unknown and it is kept", name, e);
+            logger.debug("tombstone [{}] is not readable, so its age is unknown and it is kept: {}", name, e);
             return false;
         }
 

@@ -177,7 +177,7 @@ public final class DescriptorEnumerator implements DescriptorPrefixBackend {
         } catch (NoSuchFileException | FileNotFoundException e) {
             return AbsentIndexDescriptorSuppliers.PrefixExpansion.of(List.of());
         } catch (IOException | RuntimeException e) {
-            throw new DescriptorUnavailableException(prefix + "*", e);
+            throw new DescriptorUnavailableException(safePrefix + "*", e);
         }
         if (found.size() > limit) {
             return AbsentIndexDescriptorSuppliers.PrefixExpansion.tooMany(limit);

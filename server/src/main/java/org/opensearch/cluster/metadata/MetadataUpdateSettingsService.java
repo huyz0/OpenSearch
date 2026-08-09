@@ -59,6 +59,7 @@ import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.index.Index;
+import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.indices.IndicesService;
 import org.opensearch.indices.ShardLimitValidator;
@@ -162,7 +163,11 @@ public class MetadataUpdateSettingsService {
             if (gated.size() == request.indices().length) {
                 try {
                     validateRefreshIntervalSettings(normalizedSettings, clusterService.getClusterSettings());
-                    validateTranslogDurabilitySettings(normalizedSettings, clusterService.getClusterSettings(), clusterService.getSettings());
+                    validateTranslogDurabilitySettings(
+                        normalizedSettings,
+                        clusterService.getClusterSettings(),
+                        clusterService.getSettings()
+                    );
                     indexScopedSettings.validate(
                         normalizedSettings.filter(s -> Regex.isSimpleMatchPattern(s) == false),
                         false,
@@ -675,9 +680,10 @@ public class MetadataUpdateSettingsService {
             try {
                 for (Index index : gatedIndices) {
                     IndexDescriptor descriptor = AbsentIndexDescriptorSuppliers.supply(index.getName());
-                    if (descriptor != null) {
-                        IndexDescriptorPublisher.updateGated(descriptor);
+                    if (descriptor == null || descriptor.exists() == false) {
+                        throw new IndexNotFoundException(index.getName());
                     }
+                    IndexDescriptorPublisher.updateGated(descriptor);
                 }
                 listener.onResponse(new ClusterStateUpdateResponse(true));
             } catch (Exception e) {

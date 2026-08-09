@@ -170,6 +170,7 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
 
     private final MergedSegmentPublisher mergedSegmentPublisher;
     private final ReferencedSegmentsPublisher referencedSegmentsPublisher;
+    private final org.opensearch.cluster.metadata.GatedIndexPrewarmer gatedIndexPrewarmer;
 
     @Inject
     public IndicesClusterStateService(
@@ -270,6 +271,9 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
         this.mergedSegmentWarmerFactory = mergedSegmentWarmerFactory;
         this.mergedSegmentPublisher = mergedSegmentPublisher;
         this.referencedSegmentsPublisher = referencedSegmentsPublisher;
+        this.gatedIndexPrewarmer = new org.opensearch.cluster.metadata.GatedIndexPrewarmer(
+            () -> openedOnDemand.keySet().stream().map(Index::getName).toList()
+        );
     }
 
     /**
@@ -375,7 +379,7 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
                     if (idleAfter.millis() > 0) {
                         evictIdleGatedIndices(idleAfter);
                     }
-                }, interval, ThreadPool.Names.GENERIC);
+                }, interval, ThreadPool.Names.MANAGEMENT);
             }
         }
     }
@@ -627,6 +631,8 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
         if (!lifecycle.started()) {
             return;
         }
+
+        gatedIndexPrewarmer.applyClusterState(event);
 
         final ClusterState state = event.state();
 

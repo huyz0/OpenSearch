@@ -214,7 +214,7 @@ public final class NodeCapacitySignalService implements Closeable {
             stale,
             org.opensearch.core.action.ActionListener.wrap(
                 response -> logger.debug("removed stale drain exclude entries: {}", stale),
-                e -> logger.warn("failed to remove stale drain exclude entries {}, will retry next tick", stale, e)
+                e -> logger.warn("failed to remove stale drain exclude entries {}, will retry next tick: {}", stale, e)
             )
         );
     }
@@ -243,7 +243,7 @@ public final class NodeCapacitySignalService implements Closeable {
             stale,
             org.opensearch.core.action.ActionListener.wrap(
                 response -> logger.debug("removed stale warming entries: {}", stale),
-                e -> logger.warn("failed to remove stale warming entries {}, will retry next tick", stale, e)
+                e -> logger.warn("failed to remove stale warming entries {}, will retry next tick: {}", stale, e)
             )
         );
     }

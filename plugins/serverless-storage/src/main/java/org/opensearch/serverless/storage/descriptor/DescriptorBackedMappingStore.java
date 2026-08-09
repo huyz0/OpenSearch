@@ -12,8 +12,9 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.cluster.metadata.IndexDescriptor;
 import org.opensearch.cluster.metadata.MappingGenerationStore;
+import org.opensearch.common.cache.Cache;
+import org.opensearch.common.cache.CacheBuilder;
 
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
 
 /**
@@ -26,7 +27,7 @@ public final class DescriptorBackedMappingStore implements MappingGenerationStor
 
     private static final Logger logger = LogManager.getLogger(DescriptorBackedMappingStore.class);
 
-    private static final ConcurrentHashMap<String, String> UUID_TO_NAME = new ConcurrentHashMap<>();
+    private static final Cache<String, String> UUID_TO_NAME = CacheBuilder.<String, String>builder().setMaximumWeight(50_000).build();
 
     private final Supplier<DescriptorBackend> backendSupplier;
     private final DescriptorCache descriptorCache;
@@ -98,7 +99,7 @@ public final class DescriptorBackedMappingStore implements MappingGenerationStor
             registerDescriptor(updatedDescriptor);
             return true;
         } catch (Exception e) {
-            logger.warn("mapping swap for [{}] failed at backend put", name, e);
+            logger.warn("mapping swap for [{}] failed at backend put: {}", name, e);
             return false;
         }
     }

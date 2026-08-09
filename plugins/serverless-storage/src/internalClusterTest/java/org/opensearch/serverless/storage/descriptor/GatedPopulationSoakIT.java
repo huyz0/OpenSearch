@@ -96,7 +96,7 @@ public class GatedPopulationSoakIT extends org.opensearch.serverless.storage.Ser
      */
     private void openProgress() throws Exception {
         try {
-            progress = new java.io.PrintWriter(new java.io.FileWriter(PROGRESS_FILE, false), true);
+            progress = new java.io.PrintWriter(new java.io.FileWriter(PROGRESS_FILE, java.nio.charset.StandardCharsets.UTF_8, false), true);
             note("soak starting, progress at " + PROGRESS_FILE);
         } catch (java.io.IOException e) {
             logger.warn("could not open the soak progress file at [{}]; the run continues without a live view", PROGRESS_FILE, e);
@@ -155,7 +155,10 @@ public class GatedPopulationSoakIT extends org.opensearch.serverless.storage.Ser
     }
 
     public void testWhatAPopulationCosts() throws Exception {
-        assumeTrue("set -Dtests.soak=true to run the soak; it is slow by design", Boolean.getBoolean("tests.soak"));
+        assumeTrue(
+            "set -Dtests.soak=true to run the soak; it is slow by design",
+            org.opensearch.common.Booleans.parseBoolean(System.getProperty("tests.soak", "false"))
+        );
         long budgetNanos = TimeUnit.SECONDS.toNanos(Integer.getInteger("tests.soak.seconds", DEFAULT_BUDGET_SECONDS));
         int population = Integer.getInteger("tests.soak.indices", MAX_INDICES);
         openProgress();

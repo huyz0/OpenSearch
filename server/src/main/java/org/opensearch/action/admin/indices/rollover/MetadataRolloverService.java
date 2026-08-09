@@ -180,8 +180,9 @@ public class MetadataRolloverService {
             return new RolloverResult(rolloverIndexName, sourceIndexName, currentState);
         }
 
-        org.opensearch.action.admin.indices.alias.Alias targetAlias = new org.opensearch.action.admin.indices.alias.Alias(aliasName)
-            .filter(aliasMetadata.getFilter() != null ? aliasMetadata.getFilter().string() : null)
+        org.opensearch.action.admin.indices.alias.Alias targetAlias = new org.opensearch.action.admin.indices.alias.Alias(aliasName).filter(
+            aliasMetadata.getFilter() != null ? aliasMetadata.getFilter().string() : null
+        )
             .indexRouting(aliasMetadata.getIndexRouting())
             .searchRouting(aliasMetadata.getSearchRouting())
             .writeIndex(explicitWriteIndex ? true : null)

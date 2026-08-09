@@ -165,6 +165,17 @@ public class MetadataIndexAliasesService {
                 if (index == null) {
                     IndexDescriptor gated = AbsentIndexDescriptorSuppliers.supply(action.getIndex());
                     if (gated != null && gated.exists()) {
+                        List<String> currentAliases = new ArrayList<>(gated.aliases());
+                        if (action instanceof AliasAction.Add addAction) {
+                            if (!currentAliases.contains(addAction.getAlias())) {
+                                currentAliases.add(addAction.getAlias());
+                                IndexDescriptorPublisher.updateGated(gated.withAliases(currentAliases));
+                            }
+                        } else if (action instanceof AliasAction.Remove removeAction) {
+                            if (currentAliases.remove(removeAction.getAlias())) {
+                                IndexDescriptorPublisher.updateGated(gated.withAliases(currentAliases));
+                            }
+                        }
                         continue;
                     }
                     throw new IndexNotFoundException(action.getIndex());

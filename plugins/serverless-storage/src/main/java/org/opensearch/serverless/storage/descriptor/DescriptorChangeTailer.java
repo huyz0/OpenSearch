@@ -122,7 +122,7 @@ public final class DescriptorChangeTailer {
         } catch (RuntimeException e) {
             // Left un-advanced on purpose, so the next pass retries the same range rather than stepping
             // over changes it never read.
-            logger.warn("could not read the descriptor change log from bucket [{}]; will retry", from, e);
+            logger.warn("could not read the descriptor change log from bucket [{}]; will retry: {}", from, e);
             return 0;
         }
         if (entries.isEmpty()) {
@@ -146,7 +146,7 @@ public final class DescriptorChangeTailer {
             try {
                 backend.invalidate(name);
             } catch (RuntimeException e) {
-                logger.debug("could not invalidate the cached descriptor for [{}]", name, e);
+                logger.debug("could not invalidate the cached descriptor for [{}]: {}", name, e);
             }
         }
 

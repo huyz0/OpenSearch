@@ -76,7 +76,7 @@ public final class GatedIndexRelease {
         try {
             releaser.accept(index);
         } catch (Exception e) {
-            logger.warn("could not release the gated index [{}]; the sweep will retry", index, e);
+            logger.warn("could not release the gated index [{}]; the sweep will retry: {}", index, e);
         }
     }
 }

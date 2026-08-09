@@ -189,7 +189,7 @@ public final class StoreBackedFieldRefresher implements UnknownFieldRefresh.Refr
             // put-mapping, which reaches MappingGenerationStore.updateMapping and the same unreadable store.
             // What this buys is that the failure surfaces once, from the path whose job is writing mappings,
             // rather than twice from a path whose job is reading one.
-            logger.debug("could not read the stored mapping for [{}]", indexUuid, e);
+            logger.debug("could not read the stored mapping for [{}]: {}", indexUuid, e);
             return false;
         }
         if (stored == null) {
@@ -217,7 +217,7 @@ public final class StoreBackedFieldRefresher implements UnknownFieldRefresh.Refr
         } catch (Exception e) {
             // A merge that fails leaves the caller to reject or infer, which is a correct outcome. Failing
             // the document instead would turn a mapping hiccup into a rejected write.
-            logger.debug("failed to merge field [{}] for index [{}]", fieldName, indexUuid, e);
+            logger.debug("failed to merge field [{}] for index [{}]: {}", fieldName, indexUuid, e);
             return false;
         }
     }

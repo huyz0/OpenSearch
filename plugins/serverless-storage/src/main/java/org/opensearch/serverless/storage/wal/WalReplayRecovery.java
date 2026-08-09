@@ -149,7 +149,7 @@ public final class WalReplayRecovery {
                 if (i == chunkSequences.size() - 1) {
                     logger.warn(
                         "WAL chunk {} (the last chunk in this replay range) is corrupt or truncated -- "
-                            + "treating it as an incomplete tail write and stopping replay there",
+                            + "treating it as an incomplete tail write and stopping replay there: {}",
                         chunkSequence,
                         e
                     );

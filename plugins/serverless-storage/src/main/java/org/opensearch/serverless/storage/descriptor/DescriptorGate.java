@@ -274,7 +274,11 @@ public final class DescriptorGate {
                 // than the index.
                 return prefixWrites.createAsync(descriptor).handle((ok, failure) -> {
                     if (failure != null) {
-                        logger.warn("could not record [{}] in the prefix half; wildcards will not match it", descriptor.name(), failure);
+                        logger.warn(
+                            "could not record [{}] in the prefix half; wildcards will not match it: {}",
+                            descriptor.name(),
+                            failure
+                        );
                     }
                     return won;
                 });
@@ -283,7 +287,10 @@ public final class DescriptorGate {
         IndexDescriptorPublisher.registerUpdater(descriptor -> {
             DescriptorBackedMappingStore.registerDescriptor(descriptor);
             java.util.concurrent.CompletableFuture<Boolean> future = new java.util.concurrent.CompletableFuture<>();
-            store.putAsync(descriptor, org.opensearch.core.action.ActionListener.wrap(ignored -> future.complete(true), future::completeExceptionally));
+            store.putAsync(
+                descriptor,
+                org.opensearch.core.action.ActionListener.wrap(ignored -> future.complete(true), future::completeExceptionally)
+            );
             return future;
         });
         // T58: Mappings for gated indices are stored directly inside IndexDescriptors in Object Storage.
@@ -411,7 +418,7 @@ public final class DescriptorGate {
                 changeLog.append(change);
             }
         } catch (RuntimeException e) {
-            logger.warn("could not record the descriptor change for [{}]; the feed will need a rebuild", descriptor.name(), e);
+            logger.warn("could not record the descriptor change for [{}]; the feed will need a rebuild: {}", descriptor.name(), e);
         }
     }
 

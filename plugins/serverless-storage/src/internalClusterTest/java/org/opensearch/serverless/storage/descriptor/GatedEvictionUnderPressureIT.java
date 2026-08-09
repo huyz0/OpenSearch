@@ -117,7 +117,10 @@ public class GatedEvictionUnderPressureIT extends org.opensearch.serverless.stor
     }
 
     public void testHowFastAQuietNodeDrains() throws Exception {
-        assumeTrue("set -Dtests.pressure=true; this test saturates the machine", Boolean.getBoolean("tests.pressure"));
+        assumeTrue(
+            "set -Dtests.pressure=true; this test saturates the machine",
+            org.opensearch.common.Booleans.parseBoolean(System.getProperty("tests.pressure", "false"))
+        );
         long millis = measureDrain(0);
         logger.warn(
             String.format(Locale.ROOT, "%nDRAIN quiet: %,d indices in %,d ms, %,.1f per second%n", POPULATION, millis, rate(millis))
@@ -125,7 +128,10 @@ public class GatedEvictionUnderPressureIT extends org.opensearch.serverless.stor
     }
 
     public void testHowFastALoadedNodeDrains() throws Exception {
-        assumeTrue("set -Dtests.pressure=true; this test saturates the machine", Boolean.getBoolean("tests.pressure"));
+        assumeTrue(
+            "set -Dtests.pressure=true; this test saturates the machine",
+            org.opensearch.common.Booleans.parseBoolean(System.getProperty("tests.pressure", "false"))
+        );
         int burners = Math.max(1, Runtime.getRuntime().availableProcessors());
         long millis = measureDrain(burners);
         logger.warn(

@@ -266,7 +266,7 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
                 }).orElse(null);
             } catch (IOException | RuntimeException e) {
                 if (attempt == maxAttempts) {
-                    logger.warn("could not read descriptor for [{}] after {} attempts; reporting unavailable", name, attempt, e);
+                    logger.warn("could not read descriptor for [{}] after {} attempts; reporting unavailable: {}", name, attempt, e);
                     throw new DescriptorUnavailableException(name, e);
                 }
                 try {
@@ -364,7 +364,7 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
                 put(descriptor);
                 listener.onResponse(null);
             } catch (RuntimeException e) {
-                logger.warn("could not write the descriptor for [{}]", descriptor.name(), e);
+                logger.warn("could not write the descriptor for [{}]: {}", descriptor.name(), e);
                 listener.onFailure(e);
             }
         });
@@ -405,14 +405,14 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
                     // Louder than the others. A lost tombstone is the one descriptor write that cannot be
                     // reconstructed: for a gated index there is no cluster state entry and no graveyard entry
                     // behind it, so the name silently stays live.
-                    logger.error("could not write the tombstone for [{}]; the index may resurrect", tombstone.name(), e);
+                    logger.error("could not write the tombstone for [{}]; the index may resurrect: {}", tombstone.name(), e);
                     whenDurable.onFailure(e);
                 }
             });
         } catch (Exception e) {
             // A rejected execution has to fail the listener too, or the deletion waits forever on a write
             // that was never going to run.
-            logger.error("could not submit the tombstone write for [{}]; the index may resurrect", tombstone.name(), e);
+            logger.error("could not submit the tombstone write for [{}]; the index may resurrect: {}", tombstone.name(), e);
             whenDurable.onFailure(e);
         }
     }
@@ -476,7 +476,7 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
                         get(name);
                     } catch (RuntimeException e) {
                         // One name failing must not abandon the rest, and must not fail the request.
-                        logger.debug("could not prefetch the descriptor for [{}]", name, e);
+                        logger.debug("could not prefetch the descriptor for [{}]: {}", name, e);
                     }
                 }
                 listener.onResponse(null);

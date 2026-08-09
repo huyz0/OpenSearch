@@ -69,6 +69,8 @@ import org.opensearch.common.Nullable;
 import org.opensearch.common.Priority;
 import org.opensearch.common.UUIDs;
 import org.opensearch.common.ValidationException;
+import org.opensearch.common.cache.Cache;
+import org.opensearch.common.cache.CacheBuilder;
 import org.opensearch.common.compress.CompressedXContent;
 import org.opensearch.common.io.PathUtils;
 import org.opensearch.common.logging.DeprecationLogger;
@@ -200,14 +202,7 @@ public class MetadataCreateIndexService {
     private final List<IndexCreationValidator> indexCreationValidators = new ArrayList<>();
     private final ClusterManagerTaskThrottler.ThrottlingKey createIndexTaskKey;
     private AwarenessReplicaBalance awarenessReplicaBalance;
-    private final java.util.Map<String, Settings> admissionTemplateCache = java.util.Collections.synchronizedMap(
-        new java.util.LinkedHashMap<>(100, 0.75f, true) {
-            @Override
-            protected boolean removeEldestEntry(java.util.Map.Entry<String, Settings> eldest) {
-                return size() > 500;
-            }
-        }
-    );
+    private final Cache<String, Settings> admissionTemplateCache = CacheBuilder.<String, Settings>builder().setMaximumWeight(500).build();
 
     @Nullable
     private final RemoteStoreCustomMetadataResolver remoteStoreCustomMetadataResolver;
@@ -478,7 +473,11 @@ public class MetadataCreateIndexService {
             final String cacheKey = currentMetadata.version() + ":" + name + ":" + (hidden == null ? false : hidden);
             Settings fromTemplates = admissionTemplateCache.get(cacheKey);
             if (fromTemplates == null) {
-                final String v2Template = MetadataIndexTemplateService.findV2Template(currentMetadata, name, hidden == null ? false : hidden);
+                final String v2Template = MetadataIndexTemplateService.findV2Template(
+                    currentMetadata,
+                    name,
+                    hidden == null ? false : hidden
+                );
                 fromTemplates = v2Template != null
                     ? MetadataIndexTemplateService.resolveSettings(currentMetadata, v2Template)
                     : MetadataIndexTemplateService.resolveSettings(

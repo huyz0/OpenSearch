@@ -8,7 +8,6 @@
 
 package org.opensearch.serverless.storage.descriptor;
 
-import org.opensearch.cluster.metadata.IndexDescriptor;
 import org.opensearch.common.blobstore.BlobContainer;
 
 import java.io.IOException;
@@ -20,7 +19,8 @@ import java.util.List;
  */
 public final class DescriptorCheckTool {
 
-    public record Report(int totalLiveDescriptors, int totalTombstones, List<String> corruptBlobs) {}
+    public record Report(int totalLiveDescriptors, int totalTombstones, List<String> corruptBlobs) {
+    }
 
     private DescriptorCheckTool() {}
 

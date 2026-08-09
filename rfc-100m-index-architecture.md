@@ -290,8 +290,7 @@ no such constraint, which is exactly why top-K applies to them and where the cac
   batching. Estimated at 50-200 ms; not measured.
 - Whether ARS's latency signal is a good enough proxy for cache warmth, or whether it oscillates and
   needs the direct signal from `ReaderCacheAffinityRecorder` blended in.
-- Leading wildcards (`*-logs`) cannot be served by a prefix listing and need either a reversed keyspace
-  or an explicit restriction.
+- Leading wildcards (`*-logs`) are explicitly unsupported and restricted in the API contract (cannot be served by prefix listings).
 - Alias resolution fan-out, unmeasured. A gated index may carry no alias at all today.
 - Hot-tenant skew. A hash cannot know one tenant takes a thousand times the traffic. K=3 gives room to
   choose rather than solving it.

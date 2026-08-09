@@ -1235,9 +1235,10 @@ public class MetadataIndexStateService {
             try {
                 for (Index index : gatedIndices) {
                     IndexDescriptor descriptor = AbsentIndexDescriptorSuppliers.supply(index.getName());
-                    if (descriptor != null) {
-                        IndexDescriptorPublisher.updateGated(descriptor.withState(IndexDescriptor.State.CLOSE));
+                    if (descriptor == null || descriptor.exists() == false) {
+                        throw new IndexNotFoundException(index.getName());
                     }
+                    IndexDescriptorPublisher.updateGated(descriptor.withState(IndexDescriptor.State.CLOSE));
                 }
                 listener.onResponse(new CloseIndexResponse(true, false, Collections.emptyList()));
             } catch (Exception e) {
@@ -1255,9 +1256,10 @@ public class MetadataIndexStateService {
             try {
                 for (Index index : gatedIndices) {
                     IndexDescriptor descriptor = AbsentIndexDescriptorSuppliers.supply(index.getName());
-                    if (descriptor != null) {
-                        IndexDescriptorPublisher.updateGated(descriptor.withState(IndexDescriptor.State.OPEN));
+                    if (descriptor == null || descriptor.exists() == false) {
+                        throw new IndexNotFoundException(index.getName());
                     }
+                    IndexDescriptorPublisher.updateGated(descriptor.withState(IndexDescriptor.State.OPEN));
                 }
                 listener.onResponse(new OpenIndexClusterStateUpdateResponse(true, true));
             } catch (Exception e) {

@@ -160,7 +160,10 @@ public class GatedResidencySoakIT extends org.opensearch.serverless.storage.Serv
     }
 
     public void testHowManyGatedIndicesANodeHoldsOpen() throws Exception {
-        assumeTrue("set -Dtests.residency=true to run the residency soak; it is slow by design", Boolean.getBoolean("tests.residency"));
+        assumeTrue(
+            "set -Dtests.residency=true to run the residency soak; it is slow by design",
+            org.opensearch.common.Booleans.parseBoolean(System.getProperty("tests.residency", "false"))
+        );
         long budgetNanos = TimeUnit.SECONDS.toNanos(Integer.getInteger("tests.residency.seconds", DEFAULT_BUDGET_SECONDS));
         int population = Integer.getInteger("tests.residency.indices", MAX_INDICES);
         openProgress();
@@ -389,9 +392,13 @@ public class GatedResidencySoakIT extends org.opensearch.serverless.storage.Serv
      */
     private static String fileDescriptorLimit() throws Exception {
         java.lang.management.OperatingSystemMXBean bean = java.lang.management.ManagementFactory.getOperatingSystemMXBean();
-        if (bean instanceof com.sun.management.UnixOperatingSystemMXBean unix) {
-            return String.format(Locale.ROOT, "%,d", unix.getMaxFileDescriptorCount());
-        }
+        try {
+            java.lang.reflect.Method method = bean.getClass().getMethod("getMaxFileDescriptorCount");
+            Object result = method.invoke(bean);
+            if (result instanceof Number max) {
+                return String.format(Locale.ROOT, "%,d", max.longValue());
+            }
+        } catch (Exception ignored) {}
         return "unknown";
     }
 
@@ -424,7 +431,7 @@ public class GatedResidencySoakIT extends org.opensearch.serverless.storage.Serv
 
     private void openProgress() throws Exception {
         try {
-            progress = new java.io.PrintWriter(new java.io.FileWriter(PROGRESS_FILE, false), true);
+            progress = new java.io.PrintWriter(new java.io.FileWriter(PROGRESS_FILE, java.nio.charset.StandardCharsets.UTF_8, false), true);
             note("residency soak starting, progress at " + PROGRESS_FILE);
         } catch (java.io.IOException e) {
             logger.warn("could not open the residency progress file at [{}]; the run continues without a live view", PROGRESS_FILE, e);

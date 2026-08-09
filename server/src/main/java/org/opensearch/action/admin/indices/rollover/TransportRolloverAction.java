@@ -203,7 +203,9 @@ public class TransportRolloverAction extends TransportClusterManagerNodeAction<R
                         rolloverRequest.getCreateIndexRequest(),
                         null
                     );
-                    if (DescriptorOnlyCreation.mayBypassClusterState(createIndexService.settingsForAdmission(createIndexClusterStateRequest))) {
+                    if (DescriptorOnlyCreation.mayBypassClusterState(
+                        createIndexService.settingsForAdmission(createIndexClusterStateRequest)
+                    )) {
                         threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
                             try {
                                 MetadataRolloverService.RolloverResult rolloverResult = rolloverService.rolloverClusterState(
@@ -216,15 +218,7 @@ public class TransportRolloverAction extends TransportClusterManagerNodeAction<R
                                     false
                                 );
                                 listener.onResponse(
-                                    new RolloverResponse(
-                                        sourceIndexName,
-                                        rolloverIndexName,
-                                        conditionResults,
-                                        false,
-                                        true,
-                                        true,
-                                        true
-                                    )
+                                    new RolloverResponse(sourceIndexName, rolloverIndexName, conditionResults, false, true, true, true)
                                 );
                             } catch (Exception e) {
                                 listener.onFailure(e);

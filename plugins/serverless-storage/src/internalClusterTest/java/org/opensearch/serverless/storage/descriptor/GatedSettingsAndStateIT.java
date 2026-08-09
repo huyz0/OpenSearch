@@ -134,20 +134,43 @@ public class GatedSettingsAndStateIT extends org.opensearch.serverless.storage.S
             assertTrue(settingsResp.isAcknowledged());
 
             // Close gated index off-thread
-            CloseIndexResponse closeResp = client().admin()
-                .indices()
-                .prepareClose("gated-settings-1")
-                .get();
+            CloseIndexResponse closeResp = client().admin().indices().prepareClose("gated-settings-1").get();
             assertTrue(closeResp.isAcknowledged());
 
             // Open gated index off-thread
-            OpenIndexResponse openResp = client().admin()
-                .indices()
-                .prepareOpen("gated-settings-1")
-                .get();
+            OpenIndexResponse openResp = client().admin().indices().prepareOpen("gated-settings-1").get();
             assertTrue(openResp.isAcknowledged());
         } finally {
             release.countDown();
         }
+    }
+
+    public void testNonExistentGatedIndexOperationsThrowIndexNotFoundException() throws Exception {
+        installGate();
+
+        // Install gated template for matching gated-*
+        client().admin().indices().preparePutTemplate("gated-template").setPatterns(List.of("gated-*")).setSettings(gatedSettings()).get();
+
+        // Non-existent gated index update settings throws IndexNotFoundException
+        assertThrows(
+            org.opensearch.index.IndexNotFoundException.class,
+            () -> client().admin()
+                .indices()
+                .prepareUpdateSettings("gated-nonexistent")
+                .setSettings(Settings.builder().put("index.refresh_interval", "5s"))
+                .get()
+        );
+
+        // Non-existent gated index close throws IndexNotFoundException
+        assertThrows(
+            org.opensearch.index.IndexNotFoundException.class,
+            () -> client().admin().indices().prepareClose("gated-nonexistent").get()
+        );
+
+        // Non-existent gated index open throws IndexNotFoundException
+        assertThrows(
+            org.opensearch.index.IndexNotFoundException.class,
+            () -> client().admin().indices().prepareOpen("gated-nonexistent").get()
+        );
     }
 }

@@ -67,21 +67,19 @@ public class ComputedPlacementRecoveryProbeIT extends OpenSearchIntegTestCase {
             computed.shard(0).primaryShard().started()
         );
 
-        // Give any asynchronous shard creation a chance to happen. Asserting immediately would pass whether
-        // placement is lazy or merely slow, which is the difference the whole probe exists to detect.
-        Thread.sleep(2_000);
+        assertBusy(() -> {
+            IndicesService indicesService = internalCluster().getInstance(IndicesService.class, node);
+            IndexService indexService = indicesService.indexService(new Index(GATED, GATED_UUID));
 
-        IndicesService indicesService = internalCluster().getInstance(IndicesService.class, node);
-        IndexService indexService = indicesService.indexService(new Index(GATED, GATED_UUID));
-
-        assertNull(
-            "computed placement must open no engine before a request arrives. If this fails, a restart at a "
-                + "hundred million indices materializes every sleeping shard before the first scale-to-zero "
-                + "tick can suspend it, and suspension must be persisted durably on the descriptor (H13). "
-                + "If it passes, placement is lazy and the descriptor's suspended-shard field is dead weight",
-            indexService
-        );
-        assertEquals("and no shards at all on this node for that index", 0, shardCountFor(indicesService));
+            assertNull(
+                "computed placement must open no engine before a request arrives. If this fails, a restart at a "
+                    + "hundred million indices materializes every sleeping shard before the first scale-to-zero "
+                    + "tick can suspend it, and suspension must be persisted durably on the descriptor (H13). "
+                    + "If it passes, placement is lazy and the descriptor's suspended-shard field is dead weight",
+                indexService
+            );
+            assertEquals("and no shards at all on this node for that index", 0, shardCountFor(indicesService));
+        });
     }
 
     // ---------------------------------------------------------------- helpers

@@ -370,7 +370,7 @@ public class InPlaceMergeTriggerCoordinatorTests extends OpenSearchTestCase {
         verify(client, times(1)).execute(eq(InPlaceMergeShardAction.INSTANCE), any(InPlaceMergeShardAction.Request.class), any());
     }
 
-    public void testCooldownFailsOpenWhenNoCommitTimestampRecorded() {
+    public void testCooldownFailsOpenWhenNoSplitCommitTimestampRecorded() {
         // committedSplitIndex records no timestamp (NO_SPLIT_COMMIT_TIMESTAMP) -- e.g. an old cluster-state.
         // With the gate enabled, such a pair must fail open (no floor) and still be mergeable.
         IndexMetadata index = committedSplitIndex("uuid-1", "my-index", 1, 0, 2);

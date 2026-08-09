@@ -108,12 +108,7 @@ public class GatedAutoCreateAndRolloverIT extends org.opensearch.serverless.stor
         installGate();
 
         // Install gated index template for auto-creation matching gated-*
-        client().admin()
-            .indices()
-            .preparePutTemplate("gated-template")
-            .setPatterns(List.of("gated-*"))
-            .setSettings(gatedSettings())
-            .get();
+        client().admin().indices().preparePutTemplate("gated-template").setPatterns(List.of("gated-*")).setSettings(gatedSettings()).get();
 
         // Warmup gated creation
         CreateIndexResponse warmup = client().admin()
@@ -126,8 +121,7 @@ public class GatedAutoCreateAndRolloverIT extends org.opensearch.serverless.stor
         CreateIndexResponse init = client().admin()
             .indices()
             .create(
-                new CreateIndexRequest("gated-roll-000001")
-                    .settings(gatedSettings())
+                new CreateIndexRequest("gated-roll-000001").settings(gatedSettings())
                     .alias(new org.opensearch.action.admin.indices.alias.Alias("gated-alias"))
             )
             .actionGet();
@@ -140,10 +134,7 @@ public class GatedAutoCreateAndRolloverIT extends org.opensearch.serverless.stor
 
         try {
             // Auto-create off-thread
-            IndexResponse autoResp = client().prepareIndex("gated-autocreate-1")
-                .setId("1")
-                .setSource("field1", "val1")
-                .get();
+            IndexResponse autoResp = client().prepareIndex("gated-autocreate-1").setId("1").setSource("field1", "val1").get();
             assertNotNull(autoResp.getId());
 
             // Rollover off-thread

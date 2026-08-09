@@ -168,7 +168,7 @@ public final class DescriptorCache {
             return ttlNanos;
         }
         int hash = name.hashCode();
-        double factor = 0.9 + (Math.abs(hash % 200) / 1000.0);
+        double factor = 0.9 + ((hash & Integer.MAX_VALUE) % 200 / 1000.0);
         return (long) (ttlNanos * factor);
     }
 
@@ -255,7 +255,7 @@ public final class DescriptorCache {
             if (e.getCause() instanceof DescriptorUnavailableException unavailable) {
                 throw unavailable;
             }
-            logger.debug("in-flight descriptor read for [{}] failed", name, e);
+            logger.debug("in-flight descriptor read for [{}] failed: {}", name, e);
             return null;
         }
     }
