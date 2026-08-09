@@ -738,11 +738,18 @@ public class TransportScaleIndexActionTests extends OpenSearchTestCase {
         boolean hasBlockWithCorrectId = indexBlocks.stream().anyMatch(block -> block.id() == INDEX_SEARCH_ONLY_BLOCK_ID);
         assertTrue("Should find a block with ID " + INDEX_SEARCH_ONLY_BLOCK_ID, hasBlockWithCorrectId);
 
-        // Test execution with missing index
-        initialState = ClusterState.builder(new ClusterName("test")).metadata(Metadata.builder().build()).build();
+        // Test execution with missing index triggers validation failure and does not complete onResponse
+        ActionListener<AcknowledgedResponse> failListener = mock(ActionListener.class);
+        TransportScaleIndexAction.AddBlockClusterStateUpdateTask failTask = action.new AddBlockClusterStateUpdateTask(
+            indexName, blockedIndices, failListener
+        );
+        ClusterState missingIndexState = ClusterState.builder(new ClusterName("test")).metadata(Metadata.builder().build()).build();
+        ClusterState resultState = failTask.execute(missingIndexState);
+        assertEquals(missingIndexState, resultState);
+        verify(failListener).onFailure(any(IllegalArgumentException.class));
 
-        ClusterState resultState = task.execute(initialState);
-        assertEquals(initialState, resultState);
+        failTask.clusterStateProcessed("test", missingIndexState, missingIndexState);
+        verify(failListener, times(0)).onResponse(any());
 
         // Test onFailure
         Exception testException = new Exception("Test failure");

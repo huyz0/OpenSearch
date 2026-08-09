@@ -340,6 +340,7 @@ public class TransportScaleIndexAction extends TransportClusterManagerNodeAction
         private final String index;
         private final Map<Index, ClusterBlock> blockedIndices;
         private final ActionListener<AcknowledgedResponse> listener;
+        private boolean validationFailed;
 
         AddBlockClusterStateUpdateTask(
             String index,
@@ -355,16 +356,19 @@ public class TransportScaleIndexAction extends TransportClusterManagerNodeAction
         @Override
         public ClusterState execute(final ClusterState currentState) {
             IndexMetadata indexMetadata = currentState.metadata().index(index);
-            try {
-                validator.validateScalePrerequisites(indexMetadata, index, listener, true);
-                return scaleIndexClusterStateBuilder.buildScaleDownState(currentState, index, blockedIndices);
-            } catch (Exception e) {
+            if (validator.validateScalePrerequisites(indexMetadata, index, listener, true) == false) {
+                this.validationFailed = true;
                 return currentState;
             }
+            return scaleIndexClusterStateBuilder.buildScaleDownState(currentState, index, blockedIndices);
         }
 
         @Override
         public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {
+            if (validationFailed) {
+                return;
+            }
+
             if (oldState == newState) {
                 listener.onResponse(new AcknowledgedResponse(true));
                 return;
