@@ -44,7 +44,7 @@ import java.util.Set;
  * carrying at least unassigned shards, so this condition would mean something else entirely, and a guard
  * written for this feature has no business failing requests on clusters that do not use it.
  */
-final class BroadcastEmptiness {
+public final class BroadcastEmptiness {
 
     private static final Logger logger = LogManager.getLogger(BroadcastEmptiness.class);
 
@@ -54,7 +54,12 @@ final class BroadcastEmptiness {
      * @param indicesWithShards the index names that actually contributed at least one shard
      * @return the open indices that contributed nothing, empty when all is well, for testing
      */
-    static List<String> check(String actionName, ClusterState clusterState, String[] concreteIndices, Set<String> indicesWithShards) {
+    public static List<String> check(
+        String actionName,
+        ClusterState clusterState,
+        String[] concreteIndices,
+        Set<String> indicesWithShards
+    ) {
         if (AbsentIndexRoutingSuppliers.isRegistered() == false) {
             return List.of();
         }
@@ -81,7 +86,7 @@ final class BroadcastEmptiness {
     }
 
     /** Same check, with the assertion that makes it fail a test rather than only log. */
-    static void assertEveryOpenIndexContributedShards(
+    public static void assertEveryOpenIndexContributedShards(
         String actionName,
         ClusterState clusterState,
         String[] concreteIndices,
