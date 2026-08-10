@@ -243,6 +243,40 @@ public class GatedShardSuspensionTests extends OpenSearchTestCase {
         );
     }
 
+    public void testConcurrentEvictionStressUnderPressure() throws Exception {
+        int capacity = 100;
+        GatedShardSuspensionRegistry bounded = new GatedShardSuspensionRegistry(capacity);
+        int threadCount = 8;
+        int operationsPerThread = 5000;
+        java.util.concurrent.ExecutorService executor = java.util.concurrent.Executors.newFixedThreadPool(threadCount);
+        java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(threadCount);
+        java.util.concurrent.atomic.AtomicReference<Throwable> failure = new java.util.concurrent.atomic.AtomicReference<>();
+
+        for (int t = 0; t < threadCount; t++) {
+            final int threadId = t;
+            executor.execute(() -> {
+                try {
+                    for (int i = 0; i < operationsPerThread; i++) {
+                        String uuid = "stress-" + threadId + "-" + i;
+                        bounded.suspend(uuid, 0);
+                        bounded.isSuspended(uuid, 0);
+                    }
+                } catch (Throwable e) {
+                    failure.set(e);
+                } finally {
+                    latch.countDown();
+                }
+            });
+        }
+
+        assertTrue("Stress threads should complete within timeout", latch.await(30, java.util.concurrent.TimeUnit.SECONDS));
+        executor.shutdown();
+        assertNull("Concurrent eviction under pressure must not throw exceptions: " + failure.get(), failure.get());
+
+        assertTrue("Tracked index count must remain bounded by capacity", bounded.trackedIndexCount() <= capacity);
+        assertTrue("Eviction count must be positive under heavy load", bounded.evictionCount() > 0);
+    }
+
     // ---------------------------------------------------------------- helpers
 
     private static ClusterService clusterServiceFor(ClusterState state) {
