@@ -3,15 +3,34 @@
 Read this first, every time. It is the only source of truth for where work stands, and it
 is written to survive context loss: nothing here depends on remembering a previous session.
 
-Updated: 2026-08-08
+Updated: 2026-08-12 (correction below; body past this point not re-verified line by line)
 
 ## Position
 
+**Correction found by grounding this file against the real tree (2026-08-12): everything below
+this notice was accurate as of 2026-08-08 but the tree has moved on without this file being kept
+in sync.** `git grep -hoE '\bT[0-9]{1,3}\b' -- server/src plugins/serverless-storage/src | sort -u
+-V | tail -3` now returns **T104**, not T59 — the commit log shows task-numbered commits through
+**T106** (`git log --oneline --all | grep -E '^[a-f0-9]+ T[0-9]+:'`), most landed in a burst on
+2026-08-08/09 after this file's own "Updated" timestamp. T50 through T59 (this round's own plan)
+are now: T50 done (third firing, commit 66f116a2c72), T51 blocked as B2 (unchanged, see below),
+**T52 has no matching commit and appears still open**, T53–T58 done (commits 37bba504936,
+6e848375d94, 803c6086100, 71f9c2da732, b6c2787d055, 3109191f655 and neighbors), T59 done as
+recorded below. **T60 through T106 have no round directory under `docs/rounds/` at all** — only
+`004-mapping-write-path/` and `005-store-failure-modes/` exist on disk, so whatever plan drove
+T60–T106 (topically: `DescriptorCache`, `MappingGenerationStore`/`IndexBackedMappingStore`,
+`TombstoneScrubber`, `DescriptorCheckTool`, `DescriptorEnumerator`, `IndexDescriptor` — all Area-H
+descriptor/mapping-store work, consistent with round 005's own theme) was never committed as a
+round plan/log/retro the way rounds 004–005 were. Before trusting the "Position" table below,
+re-run the `git grep` above and read `git log --oneline -80` yourself — do not propagate this
+table's numbers forward again without checking, which is the exact failure this correction is
+fixing.
+
 | | |
 |---|---|
-| Active round | 005, the doors into the mapping store ([plan](005-store-failure-modes/plan.md)) |
-| Next action | `/round-next`, T51 through T58 are open and unblocked (no declared dependencies among them; pick the first by plan order) |
-| Last task | T59, a missing mapping reading as an index with no fields, refused at the read path (commit 66a38381239) |
+| Active round | 005, the doors into the mapping store ([plan](005-store-failure-modes/plan.md)) — as of 2026-08-08; stale per the correction above, T60+ is unaccounted for by this round's own plan |
+| Next action | *(stale, see correction above)* was: `/round-next`, T51 through T58 open and unblocked; T53–T58 are now done, T52 appears still open, T51 is blocked (B2) |
+| Last task | *(stale, see correction above)* was T59 (commit 66a38381239); the tree's actual last task-numbered commit is **T106** (`2a623d36cf4`, "Add safePrefix null check in DescriptorEnumerator.expandPrefix") — but see the note above that T60–T106 have no corresponding round plan on disk to check off against |
 | T51 attempt | Two firings, neither committed. First: refuted (disabled T49's tripwire instead of fixing it). Second: investigated, stopped deliberately without writing code — the acceptance criteria as expanded require a *gated* rollover/data-stream target's alias or backing-index membership to be recorded correctly, which traces to genuinely new machinery (alias mutation and data-stream resolution for indices with no cluster-state entry), not a bounded fix. Blocked as B2. Full write-up in [log.md](005-store-failure-modes/log.md#t51--second-firing-investigated-stopped-without-committing). |
 | Branch | `feature/serverless` |
 

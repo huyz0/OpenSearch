@@ -809,9 +809,9 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      * each child carries roughly half the parent's former (>10_000/min) rate, a combined sum still an
      * order of magnitude above this ceiling. Only once the pair's real, sustained combined write rate
      * has fallen to a small fraction of what triggered the split does merging back make sense. This
-     * margin, together with the sustained-tick hysteresis below, is this feature's anti-flap defense
-     * -- see {@code InPlaceMergeTriggerCoordinator}'s own javadoc, and the known-limitation note there
-     * about the absence of a split-commit-time cool-down.
+     * margin, together with the sustained-tick hysteresis and the split-commit-time cool-down (see
+     * {@link #SERVERLESS_STORAGE_RESHARDING_AUTO_MERGE_MIN_COOLDOWN_SETTING}), is this feature's
+     * anti-flap defense -- see {@code InPlaceMergeTriggerCoordinator}'s own javadoc for all three.
      */
     public static final Setting<Long> SERVERLESS_STORAGE_RESHARDING_MERGE_CANDIDATE_COMBINED_WPM_THRESHOLD_SETTING = Setting.longSetting(
         "serverless_storage.resharding.merge_candidate_combined_writes_per_minute_threshold",

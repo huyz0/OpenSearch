@@ -2374,10 +2374,18 @@ across repeated runs. `plugins/serverless-storage/build.gradle` gained two new
 durability-driven local-disk retention, and crash recovery via WAL replay all done).** WAL chunk
 format (`WalChunkWriter`/`WalChunkReader`/`WalRecord`, &sect;6.4) is implemented and tested,
 including a multi-shard group-commit/per-shard-replay-filter test. The WAL-backed translog adapter
-(`WalMirroringTranslogFactory`/`WalMirroringTranslog`) plugs into the existing
-`translogFactorySupplier` seam, keeps `LocalTranslog`'s on-disk recovery untouched, mirrors every
-appended operation into a node-level `WalChunkService` that group-commits buffered records into WAL
-chunk blobs, and retries a transient mirror failure before failing the write. `ObjectStoreCommitPublisher`
+(`WalMirroringTranslogFactory`/`WalMirroringTranslog`) is **not** wired through
+`IndicesService`'s `translogFactorySupplier` -- that supplier is hardcoded to two core translog
+types with no per-shard plugin override point, confirmed by reading the real call site
+(`IndicesService.java`, `EngineConfig#getTranslogFactory()`). Instead `ObjectStoreWriterEngine`
+overrides `createTranslogManager()` directly and hand-constructs an `InternalTranslogManager` with
+`WalMirroringTranslogFactory` injected, duplicating (deliberately, not accidentally) the
+construction `InternalEngine` would otherwise do itself. This keeps `LocalTranslog`'s on-disk
+recovery untouched, mirrors every appended operation into a node-level `WalChunkService` that
+group-commits buffered records into WAL chunk blobs, and retries a transient mirror failure before
+failing the write. A genuine, generic `translogFactorySupplier` plugin seam remains a real gap this
+mechanism works around rather than uses -- worth building if a second engine ever needs the same
+override. `ObjectStoreCommitPublisher`
 packs one local Lucene commit's `SegmentInfos` into a `SegmentBundle` and writes the corresponding
 `CommitManifest`, idempotently under retry. `ObjectStoreCommitHeadPublisher` makes the term-fencing
 decision `ObjectStoreCommitPublisher` deliberately doesn't: it CASes the packaged manifest onto the

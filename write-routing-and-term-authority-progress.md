@@ -398,11 +398,20 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done (reviewed before
       floated `EnginePlugin` SPI (a new per-plugin extension point resolved at engine-factory-selection
       time), the actual seam landed directly on the existing `Engine` abstract class (`server/src/main/java/org/opensearch/index/engine/Engine.java`):
       a new `public void onPrimaryTermBumped(long newPrimaryTerm) {}`, no-op by default, so every
-      classic engine is completely unaffected. Mirrored on the `Indexer` interface (`server/src/main/java/org/opensearch/index/engine/exec/Indexer.java`,
-      this fork's own pluggable-engine-per-shard-role abstraction) as a matching `default` no-op,
-      with `EngineBackedIndexer` delegating straight through to the wrapped `Engine`. `IndexShard#bumpPrimaryTerm`'s
-      live-promotion `onResponse` callback now calls `getIndexerOrNull().onPrimaryTermBumped(newPrimaryTerm)`
-      immediately after `replicationTracker.setOperationPrimaryTerm(newPrimaryTerm)` and strictly
+      classic engine is completely unaffected. **Correction (grounded against the real code,
+      2026-08-12): this was NOT mirrored onto the `Indexer` interface** -- `Indexer.java`
+      (`server/src/main/java/org/opensearch/index/engine/exec/Indexer.java`, this fork's own
+      pluggable-engine-per-shard-role abstraction) has no `onPrimaryTermBumped` method at all, and
+      `EngineBackedIndexer` has no delegating override of one. The real call site
+      (`IndexShard.java`, inside `bumpPrimaryTerm`'s live-promotion `onResponse` callback) instead
+      checks `currentIndexer instanceof EngineBackedIndexer` and, if so, casts and calls
+      `((EngineBackedIndexer) currentIndexer).getEngine().onPrimaryTermBumped(newPrimaryTerm)` --
+      bypassing `Indexer` entirely rather than going through a method declared on it. The
+      atomicity/ordering guarantee below (strictly after the primary-term update, strictly before
+      `onBlocked.run()`) is real and verified against the actual call site; only the "mirrored on
+      the `Indexer` interface" wiring description was wrong. `IndexShard#bumpPrimaryTerm`'s
+      live-promotion `onResponse` callback now calls this immediately after
+      `replicationTracker.setOperationPrimaryTerm(newPrimaryTerm)` and strictly
       before `onBlocked.run()` -- inside the exact same operations-blocked window B6/B7's
       formal-verification tracing already proved atomic with respect to the term bump itself, so no
       new TLC re-check was needed; the atomicity property `AcquireLease` assumed already covers
