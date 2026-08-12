@@ -63,6 +63,7 @@ import org.opensearch.cluster.SnapshotsInProgress.ShardState;
 import org.opensearch.cluster.SnapshotsInProgress.State;
 import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.coordination.FailedToCommitClusterStateException;
+import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.DataStream;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
@@ -70,6 +71,7 @@ import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.metadata.RepositoriesMetadata;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodes;
+import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.RoutingTable;
@@ -338,6 +340,59 @@ public class SnapshotsService extends AbstractLifecycleComponent implements Clus
         // retries
         final SnapshotId snapshotId = new SnapshotId(snapshotName, UUIDs.randomBase64UUID()); // new UUID for the snapshot
         Repository repository = repositoriesService.repository(request.repository());
+
+        // Refused here, on the calling transport thread, before repository.executeConsistentStateUpdate
+        // ever submits the real cluster-state-update task -- not inside that task's own execute(), where
+        // this check first lived. AbsentIndexDescriptorSuppliers' own resolvers (gatedAmong,
+        // metadataOrDescriptor when it has to synthesise) do a remote read and explicitly refuse to run on
+        // the cluster-state-update thread, matching the discipline this whole project already established
+        // for MetadataCreateIndexService#createGatedIndex and MetadataDeleteIndexService: every current
+        // caller resolves off that thread and passes the result in.
+        //
+        // Two distinct absences get refused here, for the same underlying reason
+        // ScaleIndexOperationValidator refuses a computed index before its own downstream checks: shards()
+        // resolves a requested index's primary shards by reading metadata.index(name) paired with
+        // routingTable.index(name), and reports every shard MISSING (surfacing as the misleading
+        // "Indices don't have primary shards [name]") whenever either lookup comes back null -- which
+        // happens for two structurally different, both genuinely-alive index shapes this plugin can
+        // produce, not just one:
+        //   - a gated index: absent from metadata.indices() entirely (Area H -- metadata lives off cluster
+        //     state), so metadata.index(name) itself returns null;
+        //   - a computed-placement index: present in metadata.indices() but never publishes a routing
+        //     table entry (Area C -- routingTable.index(name) returns null), so routingTable is what's
+        //     missing instead.
+        // Both have primary shards serving live traffic; "don't have primary shards" is false for either.
+        {
+            ClusterState stateForGatedCheck = clusterService.state();
+            List<String> namesForGatedCheck = Arrays.asList(
+                indexNameExpressionResolver.concreteIndexNames(stateForGatedCheck, request)
+            );
+            List<String> gatedIndices = new ArrayList<>();
+            List<String> computedPlacementIndices = new ArrayList<>();
+            for (String indexName : namesForGatedCheck) {
+                IndexMetadata published = stateForGatedCheck.metadata().index(indexName);
+                if (published == null) {
+                    if (AbsentIndexDescriptorSuppliers.metadataOrDescriptor(stateForGatedCheck.metadata(), indexName) != null) {
+                        gatedIndices.add(indexName);
+                    }
+                } else if (AbsentIndexRoutingSuppliers.shouldPublishRouting(published) == false) {
+                    computedPlacementIndices.add(indexName);
+                }
+            }
+            if (gatedIndices.isEmpty() == false || computedPlacementIndices.isEmpty() == false) {
+                StringBuilder message = new StringBuilder("Cannot snapshot: ");
+                if (gatedIndices.isEmpty() == false) {
+                    message.append(gatedIndices).append(" -- metadata is not stored in cluster state for these indices. ");
+                }
+                if (computedPlacementIndices.isEmpty() == false) {
+                    message.append(computedPlacementIndices)
+                        .append(" -- shard placement is computed rather than published for these indices. ");
+                }
+                message.append("Snapshotting resolves primary shards from the published cluster-state routing table, "
+                    + "which neither of these index shapes has.");
+                throw new SnapshotException(new Snapshot(repositoryName, snapshotId), message.toString());
+            }
+        }
 
         if (repository.isReadOnly()) {
             listener.onFailure(new RepositoryException(repository.getMetadata().name(), "cannot create snapshot in a readonly repository"));
