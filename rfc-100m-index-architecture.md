@@ -300,6 +300,15 @@ no such constraint, which is exactly why top-K applies to them and where the cac
 1. **Bound eviction under load.** The residency ceiling is the whole argument for reaching ten billion
    shards, and it currently weakens exactly when a node is busiest. Decide between a dedicated thread, a
    work budget per pass, and eviction driven by memory pressure rather than a timer.
+   **First real measurement (2026-08-12/13, `GatedEvictionUnderPressureIT`, `docs/rounds/STATE.md` has
+   the full numbers): at a 100-index population, synthetic CPU pressure (20 burner threads) produced no
+   measurable eviction-throughput degradation across two runs (~17-19 indices/s drain, loaded and quiet
+   alike).** This narrows but does not close the item -- the residency-peak finding this item is grounded
+   in (148 of 200 resident under an *unrelated build*) is a different kind of pressure than a pure-CPU
+   burner (a real build competes for I/O and memory too, and a build's contention pattern is bursty rather
+   than sustained), and 100 indices is far short of the scale this item is ultimately about. The design
+   decision (dedicated thread vs. work budget vs. memory-pressure-driven eviction) is still open; what
+   changed is that "still unmeasured" is no longer true.
 2. **Cut what the index-backed mapping store costs a creation.** Attribution is done and the cheap half
    is taken: T40 measured the store at least about 80% of what a declared mapping costs, and T41 removed
    the read a creation issues for a UUID that cannot yet have one. T42 could only establish a direction

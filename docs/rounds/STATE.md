@@ -68,7 +68,7 @@ Measured, with controls:
 | creates per second, no declared mapping | 10,505 |
 | creates per second, with a declared mapping | 2x to 10x slower, by warm-up; at least ~80% of it the mapping store. T41 removed one of its two round trips; T42 could not size that cleanly |
 | deletes per second | 646 |
-| eviction under CPU pressure | 19.6 to 1.5 per second |
+| eviction under CPU pressure (2026-08-12/13, see note) | quiet 17.2-17.5/s, loaded (20 burner threads) 18.5-19.2/s |
 
 Two cycles running, most of the value came from defects found while doing something else rather
 than from work that was planned. Round 004's planned work was one measurement and one wasted round
@@ -85,9 +85,41 @@ All of it is planned as round 005, T50 to T58. The two that matter most: a docum
 name matching a gated template still reaches the mapping write on the cluster state thread (T51), and
 a lost mapping index is refused by reads and quietly rebuilt at cluster defaults by writes (T54).
 
-**Eviction under load is deferred a second time.** It is still the RFC's first order-of-work item and
-still unmeasured. Round 005 took live defects over a ceiling measurement; round 006 should not make
-that trade a third time without saying why.
+**Eviction under load: now measured for real (2026-08-12/13), not deferred a third time.**
+`GatedEvictionUnderPressureIT` existed but had never actually been run -- both its tests are gated
+behind `-Dtests.pressure=true`, which nothing had ever set. Ran it twice with a real JDK:
+
+```
+./gradlew :plugins:serverless-storage:internalClusterTest \
+    --tests '*GatedEvictionUnderPressureIT*' -Dtests.pressure=true
+```
+
+| run | quiet drain (100 indices) | loaded drain (20 burner threads) |
+|---|---|---|
+| 1 | 5,809 ms, 17.2/s | 5,206 ms, 19.2/s |
+| 2 | 5,712 ms, 17.5/s | 5,413 ms, 18.5/s |
+
+**The finding: at this population (100) the eviction sweep itself shows no measurable slowdown
+under synthetic CPU pressure** -- loaded and quiet drain rates are within noise of each other
+across both runs, not the order-of-magnitude collapse `GatedIdleEvictionIT`'s own residency-peak
+finding (20/200 quiet vs 148/200 "under an unrelated build") made plausible. This directly answers
+the RFC's first order-of-work item for the first time with real numbers rather than carrying
+"unmeasured" forward a third time.
+
+**Two things this does not settle, so the item is measured, not closed:** (1) `GatedIdleEvictionIT`'s
+own finding was about resident *peak* under real incidental contention (an unrelated build sharing
+the box), a different signal from this test's synthetic burner-thread *drain rate* -- the two
+should not be read as confirming or contradicting each other. (2) Run 2's `testHowFastAQuietNodeDrains`
+took 2,768 s of total JUnit wall time for a 5.7 s measured drain -- the fill phase (creating and
+populating 100 indices before the timed drain starts) is not what this test times, but something
+outside the measured window varied by roughly 40x between runs on this shared, documented-as-noisy
+box (see the Environment section below). Almost certainly host contention rather than a code
+regression, given the actual timed metric stayed consistent across both runs, but not confirmed --
+worth a controlled re-run on a quiet box before ruling out a real fill-phase issue. Also note the
+table above's now-superseded "eviction under CPU pressure | 19.6 to 1.5 per second" row predates
+this section calling the item "still unmeasured," which was already an internal inconsistency in
+this file before this correction -- left visible in the table's history rather than silently
+erased, but do not trust the 1.5/s figure's provenance without finding where it actually came from.
 
 ## Open, not blocked
 
