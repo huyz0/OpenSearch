@@ -145,6 +145,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     private final org.opensearch.serverless.storage.resharding.WritePartitionRoutingActionFilter writePartitionRoutingActionFilter =
         new org.opensearch.serverless.storage.resharding.WritePartitionRoutingActionFilter();
 
+    /** Constructed eagerly for the same reason as {@link #shardReactivationActionFilter}. */
+    private final org.opensearch.serverless.storage.resharding.AffinityForwardingActionFilter affinityForwardingActionFilter =
+        new org.opensearch.serverless.storage.resharding.AffinityForwardingActionFilter();
+
     /**
      * Constructed eagerly for the same reason as {@link #serverlessStorageExistingShardsAllocator}:
      * {@link #getAdditionalIndexSettingProviders()} is called before {@link #createComponents} runs.
@@ -1345,6 +1349,36 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * Plan item B4-B6 (plan-100m-index-implementation.md, Area B): whether
+     * {@link org.opensearch.serverless.storage.resharding.AffinityForwardingActionFilter} forwards a
+     * multi-index/wildcard/{@code _bulk}/{@code _msearch} request to its shared affinity coordinator.
+     *
+     * <p>Off by default -- see that class's own javadoc for the real, measured-nowhere-yet cost: every
+     * request the filter is asked to look at pays one {@code GENERIC} thread-pool hop, even when it
+     * never ends up forwarding, since determining "is this index gated" cannot safely run on the
+     * calling transport thread.
+     */
+    public static final Setting<Boolean> SERVERLESS_STORAGE_AFFINITY_FORWARDING_ENABLED_SETTING = Setting.boolSetting(
+        "serverless_storage.affinity_forwarding.enabled",
+        false,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
+     * B6: what happens when the resolved affine coordinator can't be reached. Defaults strict --
+     * fail rather than silently execute locally -- because a fallback that breaks affinity does so
+     * exactly when the system is least able to absorb the cache-locality loss (the plan's own
+     * reasoning, not invented here).
+     */
+    public static final Setting<Boolean> SERVERLESS_STORAGE_AFFINITY_FORWARDING_STRICT_SETTING = Setting.boolSetting(
+        "serverless_storage.affinity_forwarding.strict",
+        true,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
      * How often a node reads the descriptor change log to learn what other nodes wrote.
      *
      * <p>This is the staleness bound for cross-node visibility of a descriptor write: how long another
@@ -1441,6 +1475,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             DESCRIPTOR_CHANGE_TAIL_INTERVAL_SETTING,
             DESCRIPTOR_CACHE_FRESHNESS_SETTING,
             DESCRIPTOR_CHANGE_LOG_RETENTION_SETTING,
+            SERVERLESS_STORAGE_AFFINITY_FORWARDING_ENABLED_SETTING,
+            SERVERLESS_STORAGE_AFFINITY_FORWARDING_STRICT_SETTING,
             TOMBSTONE_RETENTION_SETTING,
             TOMBSTONE_SCRUB_INTERVAL_SETTING,
             COMPUTED_PLACEMENT_ENABLED_SETTING,
@@ -1573,6 +1609,17 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_SCALE_TO_ZERO_SEARCH_REACTIVATION_WAIT_SETTING.get(environment.settings())
         );
         writePartitionRoutingActionFilter.setDependencies(clusterService, threadPool);
+        affinityForwardingActionFilter.setDependencies(
+            clusterService,
+            threadPool,
+            indexNameExpressionResolver,
+            this::getTransportService,
+            clusterService.getClusterSettings(),
+            SERVERLESS_STORAGE_AFFINITY_FORWARDING_ENABLED_SETTING,
+            SERVERLESS_STORAGE_AFFINITY_FORWARDING_STRICT_SETTING,
+            SERVERLESS_STORAGE_AFFINITY_FORWARDING_ENABLED_SETTING.get(environment.settings()),
+            SERVERLESS_STORAGE_AFFINITY_FORWARDING_STRICT_SETTING.get(environment.settings())
+        );
         serverlessStorageIndexSettingProvider.setDependencies(dataStreamShardCountAdvisorCache);
         serverlessStorageExistingShardsAllocator.setDependencies(
             clusterService,
@@ -2596,7 +2643,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      */
     @Override
     public List<org.opensearch.action.support.ActionFilter> getActionFilters() {
-        return List.of(shardReactivationActionFilter, writePartitionRoutingActionFilter);
+        return List.of(shardReactivationActionFilter, writePartitionRoutingActionFilter, affinityForwardingActionFilter);
     }
 
     /**
@@ -3007,6 +3054,17 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      */
     public void setTransportService(TransportService transportService) {
         this.transportService = transportService;
+    }
+
+    /**
+     * Reads back what {@link #setTransportService} captured, or {@code null} before that has run --
+     * for {@link org.opensearch.serverless.storage.resharding.AffinityForwardingActionFilter}, the
+     * second consumer of this capture. Returns the live value on every call rather than snapshotting
+     * once, since a caller wired before {@link #setTransportService} runs (every {@code ActionFilter}
+     * is) needs to see it become non-null once node startup finishes populating it.
+     */
+    public TransportService getTransportService() {
+        return transportService;
     }
 
     /**
