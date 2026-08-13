@@ -53,6 +53,23 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
                                           // descriptor, so a node can build Metadata's derived arrays and
                                           // indicesLookup without fetching every index blob first.
     public static final int[] CODEC_VERSIONS = { CODEC_V0, CODEC_V1, CODEC_V2, CODEC_V3, CODEC_V4, CODEC_V5 };
+
+    /**
+     * Plan item E1 (plan-100m-index-implementation.md, Area E): the floor for any codec version this
+     * fork adds beyond {@link #CODEC_V5}, reserved now so a future one never collides with a real
+     * upstream codec number reached by a normal merge/rebase. {@code CODEC_V5} itself already carries
+     * fork-specific behaviour (the descriptor-carrying index entry, not an upstream V5), a risk already
+     * taken before this reservation existed -- this only protects codecs added from here on.
+     *
+     * <p>Verified safe by the dispatch this reservation depends on:
+     * {@code RemoteClusterMetadataManifest#getClusterMetadataManifestBlobStoreFormat} is an exact-match
+     * lookup that throws on an unrecognised codec version rather than falling through to the nearest
+     * known one, so an upstream node reading a manifest written under {@code FORK_CODEC_BASE} (or
+     * higher) fails cleanly before deserialising anything, rather than misreading it as, say, a cluster
+     * with zero indices. No codec at or above this value exists yet -- it is a reservation, not a
+     * codec E5 (the sharded-manifest write path) has not yet claimed.
+     */
+    public static final int FORK_CODEC_BASE = 10_000;
     private static final ParseField CLUSTER_TERM_FIELD = new ParseField("cluster_term");
     private static final ParseField STATE_VERSION_FIELD = new ParseField("state_version");
     private static final ParseField CLUSTER_UUID_FIELD = new ParseField("cluster_uuid");
@@ -276,6 +293,14 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
         declareParser(PARSER_V4, CODEC_V4);
         declareParser(PARSER_V5, CODEC_V5);
 
+        // Plan item E3 (plan-100m-index-implementation.md, Area E): this assertion means adding a new
+        // codec to CODEC_VERSIONS and pointing MANIFEST_CURRENT_CODEC_VERSION at it flips every node to
+        // writing that codec immediately -- for a fork, this is correct and deliberately simpler than
+        // upstream's own two-release rollout: no dormant landing, no setting to flip, no gap where some
+        // nodes write the old format and some write the new one. The direct, intended consequence: once
+        // any node has written a manifest under a fork-only codec (see FORK_CODEC_BASE), that
+        // repository is no longer readable by stock OpenSearch -- a one-way door, taken deliberately,
+        // not a bug to guard against.
         assert Arrays.stream(CODEC_VERSIONS).max().getAsInt() == MANIFEST_CURRENT_CODEC_VERSION;
         Map<Version, Integer> versionToCodecMapping = new HashMap<>();
         for (Version version : Version.getDeclaredVersions(Version.class)) {
@@ -910,6 +935,21 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
         return Strings.toString(MediaTypeRegistry.JSON, this);
     }
 
+    /**
+     * Whether this manifest's codec is at or after {@code codecVersion}, in the direct sense the name
+     * says: a plain {@code >=}.
+     *
+     * <p>Plan item E2 (plan-100m-index-implementation.md, Area E): a real, deliberate consequence of
+     * that plain comparison is worth stating rather than leaving accidental. Any future fork-only
+     * codec (see {@link #FORK_CODEC_BASE}) is numerically far larger than every {@code CODEC_V0}
+     * through {@link #CODEC_V5}, so {@code onOrAfterCodecVersion(CODEC_V1)} through
+     * {@code onOrAfterCodecVersion(CODEC_V5)} all evaluate true for it -- a fork codec is a superset of
+     * every upstream codec's own {@code toXContent} branches, never a fresh format that has to repeat
+     * fields those branches already write. That is the intended shape (the fork format only ever adds
+     * fields on top of the highest upstream codec it forked from), pinned here and by
+     * {@code ClusterMetadataManifestTests#testOnOrAfterCodecVersionTreatsAnyForkCodecAsASupersetOfEveryUpstreamOne}
+     * so it does not silently stop holding on a future merge.
+     */
     public boolean onOrAfterCodecVersion(int codecVersion) {
         return this.codecVersion >= codecVersion;
     }

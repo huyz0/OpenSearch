@@ -173,7 +173,21 @@ public class RemoteClusterMetadataManifest extends AbstractClusterMetadataWritea
         } else if (codecVersion == ClusterMetadataManifest.CODEC_V0) {
             return CLUSTER_METADATA_MANIFEST_FORMAT_V0;
         }
-        throw new IllegalArgumentException("Cluster metadata manifest file is corrupted, don't have valid codec version");
+        // Plan item E4 (plan-100m-index-implementation.md, Area E): "corrupted" asserted a single cause
+        // for two genuinely different ones this dispatch cannot tell apart -- a truncated/garbled codec
+        // field, or a codec this reading node's own build has simply never heard of (a fork-only codec
+        // at or above ClusterMetadataManifest#FORK_CODEC_BASE written by a newer or fork build, or an
+        // upstream codec from a release this node predates). Naming only the first possibility as fact
+        // is misleading for the second, which is not corruption at all. This exact-match dispatch
+        // failing cleanly, before deserialising anything, is the safety property either way (see
+        // FORK_CODEC_BASE's own javadoc) -- only the wording claimed more than the dispatch actually
+        // knows.
+        throw new IllegalArgumentException(
+            "Cluster metadata manifest file has codec version ["
+                + codecVersion
+                + "], which this node does not recognize -- either the file is corrupted, or it was "
+                + "written by a build (fork or newer upstream release) this node does not understand"
+        );
     }
 
 }
