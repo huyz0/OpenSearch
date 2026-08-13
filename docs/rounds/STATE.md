@@ -129,8 +129,19 @@ refiled as T40 in its plan. The rest are candidates for round 005:
 - **Eviction under load**, the RFC's first order-of-work item. Since it was written the
   ceiling gained `indices.gated.max_open` and an eviction on the open path, which may have
   answered it. Whether it did is unmeasured.
-- **T14**: cluster-state publication latency against cluster size, which decides whether
-  wake and sleep need batching. Estimated at 50 to 200 ms and never measured.
+- **T14: now measured at small scale (2026-08-13), not fully closed.** New
+  `server/src/internalClusterTest/java/org/opensearch/cluster/service/PublicationLatencyVsClusterSizeIT`
+  grows one real cluster (1, 3, 6 data nodes plus a dedicated cluster-manager) and times a single
+  unbatched publication at each size, the same "guard against measuring nothing" discipline G1's own
+  `PublicationLatencyMeasurementIT` established (asserts the task executed, the version advanced by
+  exactly one, elapsed time is non-zero). Two runs: [21.79, 17.32, 25.00] ms and
+  [20.19, 17.36, 16.42] ms for 1/3/6 data nodes respectively -- **flat within noise across this
+  range, well under the 50-200 ms estimate, no scaling trend visible.** This narrows but does not
+  close the item: 1-6 nodes is far short of the fleet sizes where fan-out cost would plausibly
+  dominate over fixed per-publication overhead (serialization, local apply), so "flat at small N"
+  is a real data point, not proof the same holds at hundreds of nodes. The original question --
+  does wake/sleep need the same batching G1 already proved matters for publication *count* -- is
+  still open; this only answers the latency-per-publication half, and only at small scale.
 - **T16**: computed placement under hot-tenant skew. A hash cannot know one tenant takes a
   thousand times the traffic, and K=3 gives room to choose rather than solving it.
 - Pre-warm before rotation. 12.4% of shards lose all warm candidates at fleet-doubling.
