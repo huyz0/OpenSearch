@@ -1379,6 +1379,32 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * Plan item D1 (plan-100m-index-implementation.md, Area D): whether
+     * {@link org.opensearch.serverless.storage.placement.ReaderShardPreWarmCoordinator} proactively
+     * polls a newly rendezvous-eligible node for a shard it just became a candidate for, ahead of any
+     * real request landing there. Off by default -- the real cost of this against a real object store
+     * has not been measured, same discipline as {@link #SERVERLESS_STORAGE_AFFINITY_FORWARDING_ENABLED_SETTING}.
+     */
+    public static final Setting<Boolean> SERVERLESS_STORAGE_READER_PRE_WARM_ENABLED_SETTING = Setting.boolSetting(
+        "serverless_storage.reader_pre_warm.enabled",
+        false,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    /**
+     * The most {@code PollNowRequest}s one cluster-state event dispatches -- see that coordinator's
+     * own "per-invocation budget" javadoc for why this exists at all. Illustrative, untuned against a
+     * real workload, same caveat every other per-tick budget in this plugin already carries.
+     */
+    public static final Setting<Integer> SERVERLESS_STORAGE_READER_PRE_WARM_MAX_PER_EVENT_SETTING = Setting.intSetting(
+        "serverless_storage.reader_pre_warm.max_per_event",
+        50,
+        0,
+        Setting.Property.NodeScope
+    );
+
+    /**
      * How often a node reads the descriptor change log to learn what other nodes wrote.
      *
      * <p>This is the staleness bound for cross-node visibility of a descriptor write: how long another
@@ -1477,6 +1503,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             DESCRIPTOR_CHANGE_LOG_RETENTION_SETTING,
             SERVERLESS_STORAGE_AFFINITY_FORWARDING_ENABLED_SETTING,
             SERVERLESS_STORAGE_AFFINITY_FORWARDING_STRICT_SETTING,
+            SERVERLESS_STORAGE_READER_PRE_WARM_ENABLED_SETTING,
+            SERVERLESS_STORAGE_READER_PRE_WARM_MAX_PER_EVENT_SETTING,
             TOMBSTONE_RETENTION_SETTING,
             TOMBSTONE_SCRUB_INTERVAL_SETTING,
             COMPUTED_PLACEMENT_ENABLED_SETTING,
@@ -1620,6 +1648,18 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_AFFINITY_FORWARDING_ENABLED_SETTING.get(environment.settings()),
             SERVERLESS_STORAGE_AFFINITY_FORWARDING_STRICT_SETTING.get(environment.settings())
         );
+        // D1: constructed and registered here, not eagerly, since addStateApplier only needs to run
+        // once createComponents has a real ClusterService -- unlike the ActionFilters above, nothing
+        // calls this coordinator before createComponents runs.
+        org.opensearch.serverless.storage.placement.ReaderShardPreWarmCoordinator readerShardPreWarmCoordinator =
+            new org.opensearch.serverless.storage.placement.ReaderShardPreWarmCoordinator(
+                this::getTransportService,
+                SERVERLESS_STORAGE_READER_PRE_WARM_MAX_PER_EVENT_SETTING.get(environment.settings()),
+                SERVERLESS_STORAGE_READER_PRE_WARM_ENABLED_SETTING.get(environment.settings())
+            );
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(SERVERLESS_STORAGE_READER_PRE_WARM_ENABLED_SETTING, readerShardPreWarmCoordinator::setEnabled);
+        clusterService.addStateApplier(readerShardPreWarmCoordinator);
         serverlessStorageIndexSettingProvider.setDependencies(dataStreamShardCountAdvisorCache);
         serverlessStorageExistingShardsAllocator.setDependencies(
             clusterService,
