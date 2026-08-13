@@ -512,6 +512,21 @@ already handles reasonably on its own.
 **D5. Incremental scaling policy.** Prefer adding one node at a time over large jumps, given the measured
 difference (0% against 12.4%). Encode this as policy, not as documentation.
 
+**Investigated (2026-08-13): this plugin has nothing to encode the policy into.** `NodeCapacitySignalService`
+is a signal emitter, not an actuator -- `latestSignal()` reports capacity state for an external operator
+or autoscaler to read, the same "signal exists, no auto action" boundary this project already draws
+deliberately elsewhere (e.g. `ShardSplitCandidatesAction`; the auto-split-controller work explicitly refused
+to build target-index auto-provisioning without human sign-off for the same reason). This plugin does not
+provision cloud nodes and has no seam that would decide *how many* nodes to add at once -- that decision is
+made entirely outside this codebase. "Encode this as policy" would mean encoding it into whatever external
+system actually adds nodes, which is out of this repository's reach. What this codebase *can* and does do is
+make the consequence of a large jump bounded rather than unbounded: `ReaderShardPreWarmCoordinator` (D1,
+built this session) caps how many shards it pre-warms per cluster-state event
+(`serverless_storage.reader_pre_warm.max_per_event`), so even an operator ignoring this recommendation and
+adding many nodes at once degrades to "some shards pay an ordinary cold read" rather than an object-store
+request storm. The recommendation itself belongs in deployment documentation for whoever operates the
+autoscaler, not in code this plugin owns.
+
 ### D.4 Acceptance criteria
 
 - A single node join causes no measurable increase in object-store reads.
