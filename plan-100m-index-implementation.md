@@ -487,6 +487,28 @@ an actual one.
 the reasoning that a cold node reads as a slow node. Test it. If it oscillates, blend in
 `ReaderCacheAffinityRecorder`'s direct signal.
 
+**Tested (2026-08-13), and the real finding differs from what the plan predicted.**
+`AdaptiveReplicaSelectionCacheWarmthProxyTests` exercises core's own real `ResponseCollectorService`
+(the actual mechanism `IndexShardRoutingTable`'s candidate ranking uses -- traced directly:
+`NodeRankComparator` sorts ascending on `ComputedNodeStats#rank`, lower wins) with illustrative
+warm/cold response-time magnitudes (5 ms vs. 50 ms, a 10x separation meant to represent a local
+cache hit vs. an object-store re-fetch, not measured against a real workload).
+
+- **Oscillation under noise, the plan's own named concern, does not reproduce at this magnitude.** A
+  single anomalous sample on an otherwise-warm node (representing a GC pause or network blip, not a
+  real cache-state change) does not flip the ranking against a consistently cold node -- core's
+  existing EWMA smoothing (alpha 0.3) absorbs it.
+- **The real gap is a blind spot, not oscillation: a node ARS has never received a sample for has no
+  statistics at all**, not a "cold" ranking -- `getNodeStatistics` returns empty. A shard just
+  reallocated onto a previously-untouched-by-it node (exactly D1's pre-warm scenario: a scale-up or
+  rebalance) is indistinguishable, to ARS alone, from a node that has always been warm for it, because
+  there is no signal yet, not a bad one.
+
+This still supports the plan's own conditional -- blend in `ReaderCacheAffinityRecorder`'s direct
+signal -- but for a different, more specific reason than "oscillation": ARS needs to be seeded (or
+supplemented) at the exact cold-start moment D1 cares about, not corrected for noisy disagreement it
+already handles reasonably on its own.
+
 **D5. Incremental scaling policy.** Prefer adding one node at a time over large jumps, given the measured
 difference (0% against 12.4%). Encode this as policy, not as documentation.
 
