@@ -36,6 +36,7 @@ import org.opensearch.action.explain.ExplainRequest;
 import org.opensearch.core.common.Strings;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.rest.BaseRestHandler;
+import org.opensearch.rest.RestHandler.ServerlessScope;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.rest.action.RestActions;
 import org.opensearch.rest.action.RestStatusToXContentListener;
@@ -99,5 +100,11 @@ public class RestExplainAction extends BaseRestHandler {
         explainRequest.fetchSourceContext(FetchSourceContext.parseFromRestRequest(request));
 
         return channel -> client.explain(explainRequest, new RestStatusToXContentListener<>(channel));
+    }
+
+    /** Phase 5 REST gating audit: read-only diagnostic, no different from a search under this storage model. */
+    @Override
+    public ServerlessScope serverlessScope() {
+        return ServerlessScope.AVAILABLE;
     }
 }
