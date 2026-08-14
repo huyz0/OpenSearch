@@ -16,6 +16,7 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.Priority;
+import org.opensearch.serverless.storage.util.IndexMetadataUuidIndex;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -53,6 +54,10 @@ public final class ReaderCacheAffinityRecorder {
     private static final Logger logger = LogManager.getLogger(ReaderCacheAffinityRecorder.class);
 
     private final ClusterService clusterService;
+    // H1d: this recorder is a single long-lived instance (see ServerlessStoragePlugin#createComponents),
+    // called repeatedly against whatever Metadata instance is current at each call -- exactly the
+    // "one instance per caller" shape IndexMetadataUuidIndex's own javadoc asks for.
+    private final IndexMetadataUuidIndex uuidIndex = new IndexMetadataUuidIndex();
 
     /**
      * Creates a recorder.
@@ -112,7 +117,7 @@ public final class ReaderCacheAffinityRecorder {
 
                 Metadata.Builder metadataBuilder = null;
                 for (Map.Entry<String, List<ShardStartRecord>> entry : byIndexUuid.entrySet()) {
-                    IndexMetadata indexMetadata = findByUuid(currentState.metadata(), entry.getKey());
+                    IndexMetadata indexMetadata = uuidIndex.findByUuid(currentState.metadata(), entry.getKey());
                     if (indexMetadata == null) {
                         continue;
                     }
@@ -139,14 +144,5 @@ public final class ReaderCacheAffinityRecorder {
                 logger.debug("failed to record serverless-storage reader cache affinity for " + records.size() + " shard(s)", e);
             }
         });
-    }
-
-    private static IndexMetadata findByUuid(Metadata metadata, String indexUuid) {
-        for (IndexMetadata indexMetadata : metadata.indices().values()) {
-            if (indexUuid.equals(indexMetadata.getIndexUUID())) {
-                return indexMetadata;
-            }
-        }
-        return null;
     }
 }

@@ -14,7 +14,6 @@ import org.apache.lucene.store.Directory;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
 import org.opensearch.cluster.metadata.IndexMetadata;
-import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.concurrent.GatedCloseable;
@@ -30,6 +29,7 @@ import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.migration.ClassicIndexMigrator;
 import org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore;
 import org.opensearch.serverless.storage.shardstate.ShardStateStore;
+import org.opensearch.serverless.storage.util.IndexMetadataUuidIndex;
 import org.opensearch.serverless.storage.writerengine.ObjectStoreCommitPublisher;
 import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
@@ -75,6 +75,10 @@ public class TransportMigrateShardAction extends HandledTransportAction<MigrateS
     private final ClusterService clusterService;
     private final IndicesService indicesService;
     private final ThreadPool threadPool;
+    // H1d: a real Guice singleton (see this constructor's own @Inject), so doExecute can run this
+    // concurrently across different in-flight requests -- IndexMetadataUuidIndex's own volatile-field
+    // cache is documented safe under exactly that access pattern.
+    private final IndexMetadataUuidIndex uuidIndex = new IndexMetadataUuidIndex();
 
     /**
      * Creates the transport action.
@@ -111,7 +115,7 @@ public class TransportMigrateShardAction extends HandledTransportAction<MigrateS
     protected void doExecute(Task task, MigrateShardRequest request, ActionListener<MigrateShardResponse> listener) {
         threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
             try {
-                IndexMetadata indexMetadata = findByUuid(clusterService.state().metadata(), request.indexUuid());
+                IndexMetadata indexMetadata = uuidIndex.findByUuid(clusterService.state().metadata(), request.indexUuid());
                 if (indexMetadata == null) {
                     throw new IllegalArgumentException("index [" + request.indexUuid() + "] does not exist");
                 }
@@ -212,14 +216,5 @@ public class TransportMigrateShardAction extends HandledTransportAction<MigrateS
                 listener.onFailure(e);
             }
         });
-    }
-
-    private static IndexMetadata findByUuid(Metadata metadata, String indexUuid) {
-        for (IndexMetadata indexMetadata : metadata.indices().values()) {
-            if (indexUuid.equals(indexMetadata.getIndexUUID())) {
-                return indexMetadata;
-            }
-        }
-        return null;
     }
 }

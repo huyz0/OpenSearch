@@ -545,6 +545,49 @@ not require distinguishing absence from unavailability.
 
 Recorded as a closed question rather than an open task. What replaces it is W16.
 
+## H.10k H1d's lookup half, closed for four of the five sites it named
+
+H.10a named two distinct costs under H1d: periodic full-population enumeration on a scheduler tick, and
+`ShardSuspensionCoordinator.findByUuid`'s own full scan, "called from six places including two that run on
+the cluster manager's state update thread." This closes the second half only, and only where it is the same
+shape of problem.
+
+**`ShardSuspensionCoordinator` had already fixed its own copy** (S25, measured earlier in this cycle): two
+`volatile` fields caching the uuid-to-`IndexMetadata` map against the `Metadata` instance it was built from,
+rebuilding only when that instance changes rather than on every call. 20.4 ms for the first resolution
+against 50,000 indices, about 0.07 ms for every one after against the same instance. Safe under concurrent
+callers because `Metadata` is immutable, so instance identity is a sound cache key and a race just means a
+redundant rebuild, never a wrong answer.
+
+**A sweep for the same unmemoised shape elsewhere found four more, all in `plugins/serverless-storage`:
+`ReaderCacheAffinityRecorder`, `TransportMigrateShardAction`, `TransportShardSplitAction`, and
+`WriterPublicationNotifier`**, each with its own private `findByUuid` scanning `metadata.indices().values()`
+per call. Rather than copy the fix four times, it was lifted into a shared
+`org.opensearch.serverless.storage.util.IndexMetadataUuidIndex`, and each site now holds one instance as a
+field and delegates to it — `TransportMigrateShardAction` and `TransportShardSplitAction` are real Guice
+singletons whose `doExecute` can run concurrently across requests, so the same "immutable `Metadata`, sound
+identity key" reasoning that made `ShardSuspensionCoordinator`'s version safe applies unchanged. Covered by
+a dedicated `IndexMetadataUuidIndexTests` plus the existing internal-cluster-test coverage for all four call
+sites (`ServerlessStorageMigrateShardActionIT`, `ServerlessStorageShardSplitActionIT`,
+`ServerlessStorageOrchestrateShardSplitActionIT`, `ServerlessStoragePublicationNotificationIT`), all green
+before and after.
+
+**A fifth site, `InPlaceMergeTriggerCoordinator.findEligiblePairs`, was found and deliberately left alone.**
+It is not a keyed lookup with a cold path worth caching — it is a genuine full-population pairing scan run
+per tick, closer in shape to H.10a's *first* cost (periodic full-population enumeration) than to
+`findByUuid`'s second one. Memoizing a single lookup does nothing for a method whose job is to consider
+every candidate against every other candidate. Fixing it needs the same kind of shape change H9b/H9c/H9d
+gave suspension — turning a scan into a targeted read — not a cache in front of the scan it already does,
+and that is a separate, bigger piece of work than this pass scoped in.
+
+**H1d's first half — the periodic full-population enumeration itself — is still open.** Of the three classes
+H.10a named for it, only `InPlaceMergeTriggerCoordinator` was confirmed still doing it on this pass;
+`ReaderCacheAffinityRecorder`'s only caller is `ServerlessStorageExistingShardsAllocator#applyStartedShards`,
+an event-driven allocator callback fired per shard start rather than a scheduler tick, so it does not carry
+that cost (it does still carry, and now no longer pays twice for, the per-call lookup half). Whether
+`ShardSuspensionCoordinator`'s own tick still walks the full population wasn't re-audited here and is not
+claimed closed.
+
 ## H.11 Phasing, each phase falsifiable
 
 **H1. Audit.** Classify all 41 direct enumerations as convertible, refusable, or blocking. F1's precedent:

@@ -13,7 +13,6 @@ import org.apache.logging.log4j.Logger;
 import org.opensearch.action.TransportActionNodeProxy;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
-import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
@@ -24,6 +23,7 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.serverless.storage.readerengine.action.PollNowAction;
 import org.opensearch.serverless.storage.readerengine.action.PollNowRequest;
 import org.opensearch.serverless.storage.readerengine.action.PollNowResponse;
+import org.opensearch.serverless.storage.util.IndexMetadataUuidIndex;
 import org.opensearch.transport.TransportService;
 
 /**
@@ -58,6 +58,11 @@ public final class WriterPublicationNotifier {
 
     private final ClusterService clusterService;
     private final TransportActionNodeProxy<PollNowRequest, PollNowResponse> pollNowProxy;
+    // H1d: ServerlessStoragePlugin#writerPublicationNotifierForWriterEngine builds one of these per
+    // writer engine (one per writer shard), so this instance sees a steady stream of calls scoped to
+    // that one shard's own publishes -- the same "one instance per caller" shape as the other three
+    // call sites this session wired up, just at per-shard rather than per-node/per-cluster scope.
+    private final IndexMetadataUuidIndex uuidIndex = new IndexMetadataUuidIndex();
 
     /**
      * Creates a notifier.
@@ -81,7 +86,7 @@ public final class WriterPublicationNotifier {
      */
     public void notifyReaders(String indexUuid, int shardId) {
         ClusterState state = clusterService.state();
-        IndexMetadata indexMetadata = findByUuid(state.metadata(), indexUuid);
+        IndexMetadata indexMetadata = uuidIndex.findByUuid(state.metadata(), indexUuid);
         if (indexMetadata == null) {
             return;
         }
@@ -120,14 +125,5 @@ public final class WriterPublicationNotifier {
                 )
             );
         }
-    }
-
-    private static IndexMetadata findByUuid(Metadata metadata, String indexUuid) {
-        for (IndexMetadata indexMetadata : metadata.indices().values()) {
-            if (indexUuid.equals(indexMetadata.getIndexUUID())) {
-                return indexMetadata;
-            }
-        }
-        return null;
     }
 }

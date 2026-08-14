@@ -26,6 +26,7 @@ import org.opensearch.serverless.storage.retention.DurablePinRegistry;
 import org.opensearch.serverless.storage.security.RestrictingBlobContainer;
 import org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore;
 import org.opensearch.serverless.storage.shardstate.ShardStateStore;
+import org.opensearch.serverless.storage.util.IndexMetadataUuidIndex;
 import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
@@ -65,6 +66,9 @@ public class TransportShardSplitAction extends HandledTransportAction<ShardSplit
     private final ServerlessStoragePlugin plugin;
     private final ThreadPool threadPool;
     private final ClusterService clusterService;
+    // H1d: a real Guice singleton, same concurrent-access reasoning as TransportMigrateShardAction's
+    // own copy of this field.
+    private final IndexMetadataUuidIndex uuidIndex = new IndexMetadataUuidIndex();
 
     /**
      * Creates the transport action.
@@ -150,8 +154,8 @@ public class TransportShardSplitAction extends HandledTransportAction<ShardSplit
      * @throws IllegalArgumentException if {@code indexUuid} doesn't resolve to a real, currently-existing
      *                                   index, or {@code shardId} is out of bounds for it.
      */
-    private static void requireRealShard(Metadata metadata, String role, String indexUuid, int shardId) {
-        IndexMetadata indexMetadata = findByUuid(metadata, indexUuid);
+    private void requireRealShard(Metadata metadata, String role, String indexUuid, int shardId) {
+        IndexMetadata indexMetadata = uuidIndex.findByUuid(metadata, indexUuid);
         if (indexMetadata == null) {
             throw new IllegalArgumentException(role + " index [" + indexUuid + "] does not exist");
         }
@@ -169,14 +173,5 @@ public class TransportShardSplitAction extends HandledTransportAction<ShardSplit
                     + " shard(s)"
             );
         }
-    }
-
-    private static IndexMetadata findByUuid(Metadata metadata, String indexUuid) {
-        for (IndexMetadata indexMetadata : metadata.indices().values()) {
-            if (indexUuid.equals(indexMetadata.getIndexUUID())) {
-                return indexMetadata;
-            }
-        }
-        return null;
     }
 }
