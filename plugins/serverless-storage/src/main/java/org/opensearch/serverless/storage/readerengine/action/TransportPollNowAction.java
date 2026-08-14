@@ -12,6 +12,7 @@ import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.indices.cluster.IndicesClusterStateService;
 import org.opensearch.serverless.storage.ServerlessStoragePlugin;
 import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
@@ -38,6 +39,11 @@ import org.opensearch.transport.TransportService;
  * that way), so this constructor is guaranteed to run during node startup, well before any shard --
  * and therefore {@code ObjectStoreWriterEngine}, the actual consumer via {@link
  * org.opensearch.serverless.storage.writerengine.WriterPublicationNotifier} -- is ever constructed.
+ *
+ * <p>{@link IndicesClusterStateService} reaches the plugin the identical way and for the identical
+ * reason: {@code createComponents} has no parameter for it either, and this constructor is the same
+ * guaranteed-early Guice singleton. {@code ReaderShardPreWarmCoordinator} (D1) is the consumer -- see
+ * {@link IndicesClusterStateService#onDemandOpenIndices()}'s own javadoc for why it needs this.
  */
 public class TransportPollNowAction extends HandledTransportAction<PollNowRequest, PollNowResponse> {
 
@@ -51,18 +57,22 @@ public class TransportPollNowAction extends HandledTransportAction<PollNowReques
      * @param actionFilters applied by {@link HandledTransportAction} around every request.
      * @param plugin resolves this node's {@link ServerlessStoragePlugin#readerShardActivityRegistry()}.
      * @param threadPool dispatches the actual poll off the transport thread.
+     * @param indicesClusterStateService pushed into the plugin so {@code ReaderShardPreWarmCoordinator}
+     *                                   can find this node's own on-demand-opened gated indices.
      */
     @Inject
     public TransportPollNowAction(
         TransportService transportService,
         ActionFilters actionFilters,
         ServerlessStoragePlugin plugin,
-        ThreadPool threadPool
+        ThreadPool threadPool,
+        IndicesClusterStateService indicesClusterStateService
     ) {
         super(PollNowAction.NAME, transportService, actionFilters, PollNowRequest::new);
         this.plugin = plugin;
         this.threadPool = threadPool;
         plugin.setTransportService(transportService);
+        plugin.setIndicesClusterStateService(indicesClusterStateService);
     }
 
     /**

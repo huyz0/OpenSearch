@@ -975,6 +975,38 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
         return openedOnDemand.containsKey(index) && AbsentIndexDescriptorSuppliers.isRegistered();
     }
 
+    /** One gated index this node currently holds shards for, opened via {@link #openedOnDemand} rather than by cluster state's own diff. */
+    public record OnDemandOpenIndex(String indexUuid, int numberOfShards) {}
+
+    /**
+     * Every gated index this node currently holds shards for -- the same bounded, per-node working set
+     * {@link #openedOnDemand} already tracks for {@link #openComputedShardsOnDemand}'s own use, exposed
+     * here for a second consumer with the identical reason to want it: a gated index has no cluster
+     * state entry to enumerate from (that is what gating means), so anything that needs to know "which
+     * gated indices are relevant to this node right now" has nowhere else to ask that is not a
+     * population-proportional read of the descriptor store. {@code ReaderShardPreWarmCoordinator} (D1)
+     * is that second consumer -- see its own javadoc on why its original cluster-state enumeration never
+     * saw a gated index at all.
+     *
+     * <p>A snapshot, not a live view: computed fresh from {@link #openedOnDemand} on each call, safe to
+     * iterate without synchronizing against concurrent opens or closes racing after it returns.
+     *
+     * @return each on-demand-opened index's UUID and its real, currently-open shard count. An index that
+     * closed between the map read and the {@code indexService} lookup below is simply omitted, the same
+     * "best-effort, not authoritative" contract every other consumer of this best-effort registry
+     * already has.
+     */
+    public List<OnDemandOpenIndex> onDemandOpenIndices() {
+        List<OnDemandOpenIndex> result = new ArrayList<>();
+        for (Index index : openedOnDemand.keySet()) {
+            AllocatedIndex<? extends Shard> indexService = indicesService.indexService(index);
+            if (indexService != null) {
+                result.add(new OnDemandOpenIndex(index.getUUID(), indexService.getIndexSettings().getNumberOfShards()));
+            }
+        }
+        return result;
+    }
+
     /**
      * The second trigger: open a gated index's shards here because a request arrived for one, not because
      * a cluster state said to.

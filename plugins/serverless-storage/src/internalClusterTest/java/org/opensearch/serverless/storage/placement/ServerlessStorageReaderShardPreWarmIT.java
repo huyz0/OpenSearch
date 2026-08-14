@@ -8,11 +8,14 @@
 
 package org.opensearch.serverless.storage.placement;
 
+import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.serverless.storage.ServerlessStoragePlugin;
+import org.opensearch.serverless.storage.descriptor.DescriptorGate;
 import org.opensearch.test.OpenSearchIntegTestCase;
+import org.junit.After;
 import org.junit.Before;
 
 import java.util.Collection;
@@ -57,6 +60,11 @@ public class ServerlessStorageReaderShardPreWarmIT extends org.opensearch.server
             .build();
     }
 
+    @After
+    public void clearDescriptorGate() throws Exception {
+        DescriptorGate.uninstall();
+    }
+
     @Before
     public void resetPreWarmCount() {
         ReaderShardPreWarmCoordinator.resetPreWarmCountForTesting();
@@ -99,6 +107,52 @@ public class ServerlessStorageReaderShardPreWarmIT extends org.opensearch.server
                 "a 30-shard index and a genuinely new node joining a 3-node computed-placement "
                     + "fleet must make at least one shard newly eligible for it, dispatching a real "
                     + "pre-warm poll -- got "
+                    + ReaderShardPreWarmCoordinator.preWarmCountForTesting(),
+                ReaderShardPreWarmCoordinator.preWarmCountForTesting() > 0
+            );
+        }, 30, TimeUnit.SECONDS);
+    }
+
+    /**
+     * The regression this whole fix exists for: the same property as the test above, for a genuinely
+     * <em>gated</em> index (Area H, off cluster state entirely) rather than a merely computed-placement
+     * one. Before this fix, {@link ReaderShardPreWarmCoordinator} enumerated only {@code
+     * event.state().metadata().indices()}, which a gated index is never in by definition -- so this
+     * exact scenario dispatched zero pre-warms, silently, for the entire target population this
+     * project exists to serve.
+     */
+    public void testAGatedIndexsShardIsAlsoPreWarmed() throws Exception {
+        internalCluster().startClusterManagerOnlyNode();
+        internalCluster().startDataOnlyNode();
+        internalCluster().startDataOnlyNode();
+        ensureStableCluster(3);
+        installBlobBackedDescriptorPlane();
+
+        Settings gated = Settings.builder()
+            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, SHARD_COUNT)
+            .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+            .put("index.serverless_storage.enabled", true)
+            .build();
+        client().admin().indices().create(new CreateIndexRequest("gated-prewarm-target").settings(gated)).actionGet();
+        // Creating a gated index touches no node at all -- the descriptor is written and nothing is
+        // told to build anything, which is the whole point of gating (see GatedResidencySoakIT's own
+        // comment on this exact line). The write is what actually opens the shard on a node (T39),
+        // which is what makes it appear in that node's own on-demand-open working set -- the thing
+        // this fix's gated pass now consults instead of cluster state.
+        client().prepareIndex("gated-prewarm-target").setId("1").setSource("f", "v").get();
+
+        // Let the three-node epoch settle for real before adding the fourth, same reasoning as the
+        // ordinary-index test above.
+        assertBusy(() -> assertNotNull(ReaderShardPreWarmCoordinator.preWarmCountForTesting()), 10, TimeUnit.SECONDS);
+        ReaderShardPreWarmCoordinator.resetPreWarmCountForTesting();
+
+        internalCluster().startDataOnlyNode();
+        ensureStableCluster(4);
+
+        assertBusy(() -> {
+            assertTrue(
+                "a 30-shard gated index and a genuinely new node joining a 3-node fleet must make at "
+                    + "least one shard newly eligible for it, dispatching a real pre-warm poll -- got "
                     + ReaderShardPreWarmCoordinator.preWarmCountForTesting(),
                 ReaderShardPreWarmCoordinator.preWarmCountForTesting() > 0
             );

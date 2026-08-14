@@ -63,6 +63,56 @@ public class ReaderShardPreWarmCoordinatorTests extends OpenSearchTestCase {
         // hashing gives no guarantee about any one shard.
     }
 
+    public void testTheCurrentPrimaryCandidateIsRecognizedAsSuch() {
+        // The gated pass's dedup mechanism (see ReaderShardPreWarmCoordinator's own "gated indices
+        // needed a second, differently-shaped pass" javadoc): only the node rendezvous currently names
+        // candidate zero for a shard should ever dispatch a pre-warm for it.
+        List<String> nodes = List.of("node-a", "node-b", "node-c", "node-d", "node-e");
+        ComputedPlacementMembership membership = ComputedPlacementMembership.of(nodes, nodes, 2L);
+        String primary = RendezvousShardPlacement.candidates(nodes, INDEX_UUID, SHARD_ID).get(0);
+
+        assertTrue(
+            "the real current primary candidate must be recognized as the primary",
+            ReaderShardPreWarmCoordinator.isLocalNodePrimaryCandidate(membership, INDEX_UUID, SHARD_ID, primary)
+        );
+    }
+
+    public void testANonPrimaryCandidateIsNotTheDispatcher() {
+        List<String> nodes = List.of("node-a", "node-b", "node-c", "node-d", "node-e");
+        ComputedPlacementMembership membership = ComputedPlacementMembership.of(nodes, nodes, 2L);
+        List<String> candidates = RendezvousShardPlacement.candidates(nodes, INDEX_UUID, SHARD_ID, 3);
+        // A node that is a candidate (so it plausibly has the shard open) but not the primary -- the
+        // exact case this check exists to reject, so at most one of the candidates ever dispatches.
+        String secondCandidate = candidates.get(1);
+
+        assertFalse(
+            "a non-primary candidate must not be recognized as the dispatcher",
+            ReaderShardPreWarmCoordinator.isLocalNodePrimaryCandidate(membership, INDEX_UUID, SHARD_ID, secondCandidate)
+        );
+    }
+
+    public void testANodeThatIsNotACandidateAtAllIsNotThePrimary() {
+        List<String> nodes = List.of("node-a", "node-b", "node-c", "node-d", "node-e");
+        ComputedPlacementMembership membership = ComputedPlacementMembership.of(nodes, nodes, 2L);
+
+        assertFalse(
+            "a node absent from the candidate list entirely must not be recognized as the primary",
+            ReaderShardPreWarmCoordinator.isLocalNodePrimaryCandidate(membership, INDEX_UUID, SHARD_ID, "not-a-cluster-member")
+        );
+    }
+
+    public void testANullLocalNodeIdIsNeverThePrimary() {
+        // getLocalNodeId() can be null in principle (see applyClusterState's own call site); the check
+        // must degrade to "not the dispatcher" rather than throwing.
+        List<String> nodes = List.of("node-a", "node-b", "node-c");
+        ComputedPlacementMembership membership = ComputedPlacementMembership.of(nodes, nodes, 2L);
+
+        assertFalse(
+            "a null local node id must never be recognized as the primary",
+            ReaderShardPreWarmCoordinator.isLocalNodePrimaryCandidate(membership, INDEX_UUID, SHARD_ID, null)
+        );
+    }
+
     public void testEmptyPreviousEpochProducesNoNewlyEligibleNodes() {
         // No previous epoch to diff against -- the coordinator itself short-circuits this case before
         // calling newlyEligibleCandidates at all (see applyClusterState's own early return), but the

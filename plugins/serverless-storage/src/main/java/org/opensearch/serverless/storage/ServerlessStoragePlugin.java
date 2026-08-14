@@ -1286,6 +1286,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     // that class's javadoc for why it's the seam that captures this instead).
     private volatile ClusterService clusterService;
     private volatile TransportService transportService;
+    // Same seam and same reason as transportService immediately above: createComponents has no
+    // IndicesClusterStateService parameter either, so this stays null until TransportPollNowAction's
+    // constructor sets it. ReaderShardPreWarmCoordinator (D1) is the consumer.
+    private volatile org.opensearch.indices.cluster.IndicesClusterStateService indicesClusterStateService;
     // Resolved once in createComponents, same "read the NodeScope setting where Environment is
     // actually available" reasoning as every other field in this group -- TransportScaleToZeroCandidatesAction
     // reads these as its per-request defaults, overridable per ScaleToZeroCandidatesRequest.
@@ -1654,6 +1658,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         org.opensearch.serverless.storage.placement.ReaderShardPreWarmCoordinator readerShardPreWarmCoordinator =
             new org.opensearch.serverless.storage.placement.ReaderShardPreWarmCoordinator(
                 this::getTransportService,
+                this::onDemandOpenGatedIndices,
                 SERVERLESS_STORAGE_READER_PRE_WARM_MAX_PER_EVENT_SETTING.get(environment.settings()),
                 SERVERLESS_STORAGE_READER_PRE_WARM_ENABLED_SETTING.get(environment.settings())
             );
@@ -3105,6 +3110,28 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      */
     public TransportService getTransportService() {
         return transportService;
+    }
+
+    /**
+     * Captures this node's {@link org.opensearch.indices.cluster.IndicesClusterStateService} -- same
+     * seam as {@link #setTransportService}, called from the same constructor, for the same reason: no
+     * parameter for it on {@link #createComponents}.
+     *
+     * @param indicesClusterStateService this node's indices cluster state service.
+     */
+    public void setIndicesClusterStateService(org.opensearch.indices.cluster.IndicesClusterStateService indicesClusterStateService) {
+        this.indicesClusterStateService = indicesClusterStateService;
+    }
+
+    /**
+     * Every gated index this node currently holds shards for, or empty before {@link
+     * #setIndicesClusterStateService} has run (mirrors {@link #getTransportService}'s own "empty/null
+     * until real node bootstrap reaches this seam" contract). {@link
+     * org.opensearch.serverless.storage.placement.ReaderShardPreWarmCoordinator}'s only caller.
+     */
+    public List<org.opensearch.indices.cluster.IndicesClusterStateService.OnDemandOpenIndex> onDemandOpenGatedIndices() {
+        org.opensearch.indices.cluster.IndicesClusterStateService service = indicesClusterStateService;
+        return service == null ? List.of() : service.onDemandOpenIndices();
     }
 
     /**

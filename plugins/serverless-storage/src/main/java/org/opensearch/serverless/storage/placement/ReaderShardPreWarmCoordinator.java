@@ -17,6 +17,7 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.routing.ComputedPlacementMembership;
 import org.opensearch.cluster.routing.ComputedPlacementMembershipService;
 import org.opensearch.core.transport.TransportResponse;
+import org.opensearch.indices.cluster.IndicesClusterStateService;
 import org.opensearch.serverless.storage.readerengine.action.PollNowAction;
 import org.opensearch.serverless.storage.readerengine.action.PollNowRequest;
 import org.opensearch.serverless.storage.readerengine.action.PollNowResponse;
@@ -70,12 +71,37 @@ import java.util.function.Supplier;
  * anything past the cap is simply not pre-warmed for this event and pays the ordinary cold-read cost
  * on first real access instead, which is the safe degrade this whole mechanism already tolerates
  * (see {@link PollNowRequest}'s own "best-effort" framing).
+ *
+ * <h2>Gated indices needed a second, differently-shaped pass</h2>
+ *
+ * The original version of this class enumerated only {@code event.state().metadata().indices()} --
+ * every ordinary, cluster-state-visible index. A gated index has no entry there at all; that is what
+ * gating means. So every gated index -- the target population this whole project exists for -- was
+ * silently pre-warmed for never, at zero cost and zero benefit, which is a correctness gap wearing
+ * the shape of "working fine" until someone measures it. Enumerating cluster state cannot be fixed by
+ * looking harder at cluster state: there is nothing there to find, by design, and reading the
+ * descriptor store to reconstruct the missing list on every membership change would be exactly the
+ * population-proportional cost gating exists to avoid paying on this path.
+ *
+ * <p>{@link IndicesClusterStateService#onDemandOpenIndices()} is the bounded answer: every gated index
+ * this node itself currently holds shards for, the identical per-node working set {@link
+ * GatedIndexPrewarmer} already established as the right scope for a gated-index signal (that class
+ * bounds to indices already locally open for the same reason). Because that set is inherently local
+ * and small -- bounded by however many gated indices actually landed on this node, not by cluster
+ * population -- the gated pass below runs on <em>every</em> node, not only the cluster manager, and
+ * for the same reason does not need the manager's storm-avoidance restriction the ordinary pass
+ * above still does. What it needs instead, since more than one node can hold the same gated shard: a
+ * different node acting for the same shard would each independently compute the identical
+ * newly-eligible target and each dispatch to it. Restricting to "only the node rendezvous currently
+ * names the shard's primary candidate" ({@link #isLocalNodePrimaryCandidate}) makes that exactly one
+ * dispatcher per shard, deterministically, rather than merely bounding the duplication.
  */
 public final class ReaderShardPreWarmCoordinator implements ClusterStateApplier {
 
     private static final Logger logger = LogManager.getLogger(ReaderShardPreWarmCoordinator.class);
 
     private final Supplier<TransportService> transportServiceSupplier;
+    private final Supplier<List<IndicesClusterStateService.OnDemandOpenIndex>> onDemandOpenGatedIndicesSupplier;
     private final int maxPreWarmsPerEvent;
     private volatile boolean enabled;
 
@@ -104,6 +130,9 @@ public final class ReaderShardPreWarmCoordinator implements ClusterStateApplier 
      * for why {@code transportServiceSupplier} is a supplier rather than a direct reference.
      *
      * @param transportServiceSupplier resolves this node's {@link TransportService} lazily.
+     * @param onDemandOpenGatedIndicesSupplier resolves this node's own currently-open gated indices
+     *                                         lazily -- see this class's own "gated indices needed a
+     *                                         second pass" javadoc for why.
      * @param maxPreWarmsPerEvent the most {@link PollNowRequest}s dispatched per cluster-state event
      *                            this coordinator reacts to -- see this class's own "per-invocation
      *                            budget" javadoc. Values {@code <= 0} mean unlimited.
@@ -112,8 +141,14 @@ public final class ReaderShardPreWarmCoordinator implements ClusterStateApplier 
      *                object store has not been measured (the same discipline WAL batching's own
      *                Phase 3 default is still waiting on).
      */
-    public ReaderShardPreWarmCoordinator(Supplier<TransportService> transportServiceSupplier, int maxPreWarmsPerEvent, boolean enabled) {
+    public ReaderShardPreWarmCoordinator(
+        Supplier<TransportService> transportServiceSupplier,
+        Supplier<List<IndicesClusterStateService.OnDemandOpenIndex>> onDemandOpenGatedIndicesSupplier,
+        int maxPreWarmsPerEvent,
+        boolean enabled
+    ) {
         this.transportServiceSupplier = transportServiceSupplier;
+        this.onDemandOpenGatedIndicesSupplier = onDemandOpenGatedIndicesSupplier;
         this.maxPreWarmsPerEvent = maxPreWarmsPerEvent;
         this.enabled = enabled;
     }
@@ -123,9 +158,16 @@ public final class ReaderShardPreWarmCoordinator implements ClusterStateApplier 
         this.enabled = enabled;
     }
 
+    /**
+     * One index this coordinator will check, from either pass -- see this class's own "gated indices
+     * needed a second, differently-shaped pass" javadoc for what {@code requirePrimaryDispatcher}
+     * means and why only the gated pass sets it.
+     */
+    private record IndexToConsider(String indexUuid, int numberOfShards, boolean requirePrimaryDispatcher) {}
+
     @Override
     public void applyClusterState(ClusterChangedEvent event) {
-        if (enabled == false || event.state().nodes().isLocalNodeElectedClusterManager() == false) {
+        if (enabled == false) {
             return;
         }
 
@@ -147,14 +189,28 @@ public final class ReaderShardPreWarmCoordinator implements ClusterStateApplier 
             return;
         }
 
-        int dispatched = 0;
-        for (IndexMetadata indexMetadata : event.state().metadata().indices().values()) {
-            if (ComputedPlacementGate.ownsIndex(indexMetadata) == false) {
-                continue;
+        List<IndexToConsider> toConsider = new ArrayList<>();
+        // Ordinary indices: only from the cluster manager, and only that node contributes them to
+        // this list -- see this class's own "why only the elected cluster-manager acts" javadoc.
+        // Every other node's list simply omits these, rather than filtering dispatch after the fact.
+        if (event.state().nodes().isLocalNodeElectedClusterManager()) {
+            for (IndexMetadata indexMetadata : event.state().metadata().indices().values()) {
+                if (ComputedPlacementGate.ownsIndex(indexMetadata) == false) {
+                    continue;
+                }
+                toConsider.add(new IndexToConsider(indexMetadata.getIndexUUID(), indexMetadata.getNumberOfShards(), false));
             }
-            String indexUuid = indexMetadata.getIndexUUID();
-            int numberOfShards = indexMetadata.getNumberOfShards();
-            for (int shardId = 0; shardId < numberOfShards; shardId++) {
+        }
+        // Gated indices: every node contributes its own on-demand-opened set -- see this class's own
+        // "gated indices needed a second, differently-shaped pass" javadoc.
+        for (IndicesClusterStateService.OnDemandOpenIndex openIndex : onDemandOpenGatedIndicesSupplier.get()) {
+            toConsider.add(new IndexToConsider(openIndex.indexUuid(), openIndex.numberOfShards(), true));
+        }
+
+        String localNodeId = event.state().nodes().getLocalNodeId();
+        int dispatched = 0;
+        for (IndexToConsider index : toConsider) {
+            for (int shardId = 0; shardId < index.numberOfShards(); shardId++) {
                 if (maxPreWarmsPerEvent > 0 && dispatched >= maxPreWarmsPerEvent) {
                     logger.debug(
                         "reader shard pre-warm budget ({}) exhausted for this cluster-state event; "
@@ -163,11 +219,32 @@ public final class ReaderShardPreWarmCoordinator implements ClusterStateApplier 
                     );
                     return;
                 }
-                for (String newlyEligibleNodeId : newlyEligibleCandidates(membership, indexUuid, shardId)) {
+                if (index.requirePrimaryDispatcher()
+                    && isLocalNodePrimaryCandidate(membership, index.indexUuid(), shardId, localNodeId) == false) {
+                    // Some other current candidate for this shard owns dispatching for it this epoch --
+                    // see this class's own javadoc on why the gated pass needs exactly one dispatcher.
+                    continue;
+                }
+                for (String newlyEligibleNodeId : newlyEligibleCandidates(membership, index.indexUuid(), shardId)) {
+                    if (newlyEligibleNodeId.equals(localNodeId)) {
+                        // The dispatcher itself, newly eligible for its own shard -- only reachable
+                        // from the gated pass (the ordinary pass's dispatcher, the cluster manager, is
+                        // never also its own target in any topology this plugin runs in production or
+                        // test, but the gated pass's dispatcher is whichever node holds the shard, and
+                        // a node opening a shard for the first time is simultaneously the primary
+                        // candidate and newly eligible for it). Sending a request to yourself here
+                        // would take TransportService's local fast path, which runs the receiving
+                        // handler synchronously on this same thread -- still inside
+                        // ClusterApplierService's own callback -- and that handler's own ActionFilters
+                        // call clusterService.state(), which asserts it is never reentered from an
+                        // applier callback. It is also simply unnecessary: a node that just opened this
+                        // shard itself has nothing to warm from a poll to itself.
+                        continue;
+                    }
                     if (maxPreWarmsPerEvent > 0 && dispatched >= maxPreWarmsPerEvent) {
                         break;
                     }
-                    dispatchPreWarm(transportService, event, newlyEligibleNodeId, indexUuid, shardId);
+                    dispatchPreWarm(transportService, event, newlyEligibleNodeId, index.indexUuid(), shardId);
                     dispatched++;
                 }
             }
@@ -190,6 +267,25 @@ public final class ReaderShardPreWarmCoordinator implements ClusterStateApplier 
             }
         }
         return newlyEligible;
+    }
+
+    /**
+     * Whether {@code localNodeId} is this epoch's rendezvous-chosen primary for {@code (indexUuid,
+     * shardId)} -- {@link ComputedRoutingTable}'s own definition of primary (candidate index zero,
+     * never reordered by warmth). Only the gated pass consults this; the ordinary pass already has a
+     * single dispatcher by construction (the cluster manager) and does not need a second restriction.
+     */
+    static boolean isLocalNodePrimaryCandidate(
+        ComputedPlacementMembership membership,
+        String indexUuid,
+        int shardId,
+        String localNodeId
+    ) {
+        if (localNodeId == null) {
+            return false;
+        }
+        List<String> current = RendezvousShardPlacement.candidates(membership.nodeIds(), indexUuid, shardId);
+        return current.isEmpty() == false && localNodeId.equals(current.get(0));
     }
 
     private static void dispatchPreWarm(
