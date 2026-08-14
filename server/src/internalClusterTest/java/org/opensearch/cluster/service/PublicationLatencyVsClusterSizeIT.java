@@ -53,9 +53,7 @@ public class PublicationLatencyVsClusterSizeIT extends OpenSearchIntegTestCase {
             ensureStableCluster(currentDataNodes + 1); // +1 for the cluster-manager-only node
 
             double millis = measureOnePublication();
-            table.append(
-                String.format(java.util.Locale.ROOT, "  dataNodes=%2d  latency=%7.2f ms%n", targetDataNodes, millis)
-            );
+            table.append(String.format(java.util.Locale.ROOT, "  dataNodes=%2d  latency=%7.2f ms%n", targetDataNodes, millis));
         }
         logger.warn(table.toString());
     }
@@ -100,11 +98,7 @@ public class PublicationLatencyVsClusterSizeIT extends OpenSearchIntegTestCase {
 
         assertEquals("the task must have executed, or the timing covers work that did not happen", 1, executed.get());
         assertTrue("time must have passed, or the harness measured nothing", elapsedNanos > 0);
-        assertEquals(
-            "a single unbatched task must publish exactly once",
-            startingVersion + 1,
-            clusterService.state().version()
-        );
+        assertEquals("a single unbatched task must publish exactly once", startingVersion + 1, clusterService.state().version());
 
         client().admin()
             .cluster()

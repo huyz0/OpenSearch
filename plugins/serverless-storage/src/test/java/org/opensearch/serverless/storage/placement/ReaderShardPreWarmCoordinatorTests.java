@@ -36,10 +36,7 @@ public class ReaderShardPreWarmCoordinatorTests extends OpenSearchTestCase {
         List<String> current = RendezvousShardPlacement.candidates(nodes, INDEX_UUID, SHARD_ID);
         List<String> newlyEligible = ReaderShardPreWarmCoordinator.newlyEligibleCandidates(membership, INDEX_UUID, SHARD_ID);
 
-        assertTrue(
-            "every newly-eligible node must actually be a current candidate",
-            current.containsAll(newlyEligible)
-        );
+        assertTrue("every newly-eligible node must actually be a current candidate", current.containsAll(newlyEligible));
         assertTrue("an unchanged member list must produce no newly-eligible nodes at all", newlyEligible.isEmpty());
     }
 

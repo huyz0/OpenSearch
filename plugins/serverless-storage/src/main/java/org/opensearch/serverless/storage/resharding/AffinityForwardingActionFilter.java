@@ -12,7 +12,6 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.DocWriteRequest;
-import org.opensearch.action.support.ServerlessAffinityRouting;
 import org.opensearch.action.bulk.BulkAction;
 import org.opensearch.action.bulk.BulkRequest;
 import org.opensearch.action.bulk.BulkResponse;
@@ -25,6 +24,7 @@ import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.support.ActionFilter;
 import org.opensearch.action.support.ActionFilterChain;
 import org.opensearch.action.support.ActionRequestMetadata;
+import org.opensearch.action.support.ServerlessAffinityRouting;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.IndexMetadata;
@@ -276,7 +276,9 @@ public final class AffinityForwardingActionFilter implements ActionFilter {
 
     /** A {@link org.opensearch.core.common.io.stream.Writeable.Reader}, named so the cast above reads clearly. */
     @FunctionalInterface
-    private interface TransportResponseReader<T extends TransportResponse> extends org.opensearch.core.common.io.stream.Writeable.Reader<T> {}
+    private interface TransportResponseReader<T extends TransportResponse>
+        extends
+            org.opensearch.core.common.io.stream.Writeable.Reader<T> {}
 
     private static TransportResponseReader<? extends TransportResponse> readerForAction(String action) {
         if (SearchAction.NAME.equals(action)) {

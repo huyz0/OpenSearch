@@ -679,9 +679,7 @@ public class ClusterMetadataManifest implements Writeable, ToXContentFragment {
         );
         this.clusterStateChecksum = clusterStateChecksum;
         this.manifestShardCount = manifestShardCount;
-        this.indexMetadataShards = Collections.unmodifiableList(
-            indexMetadataShards != null ? indexMetadataShards : new ArrayList<>()
-        );
+        this.indexMetadataShards = Collections.unmodifiableList(indexMetadataShards != null ? indexMetadataShards : new ArrayList<>());
     }
 
     public ClusterMetadataManifest(StreamInput in) throws IOException {

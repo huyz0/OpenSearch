@@ -189,9 +189,7 @@ public class RemoteManifestManager {
                 List<UploadedManifestShard> previousShards = previousManifestForSharding != null
                     ? previousManifestForSharding.getIndexMetadataShards()
                     : Collections.emptyList();
-                int previousShardCount = previousManifestForSharding != null
-                    ? previousManifestForSharding.getManifestShardCount()
-                    : 0;
+                int previousShardCount = previousManifestForSharding != null ? previousManifestForSharding.getManifestShardCount() : 0;
                 IndexMetadataManifestSharder.Plan plan = IndexMetadataManifestSharder.plan(
                     inlineIndices,
                     changedOrDeletedIndexUUIDs,
@@ -202,13 +200,7 @@ public class RemoteManifestManager {
                 List<UploadedManifestShard> written = new ArrayList<>(plan.getCarriedForward());
                 for (Map.Entry<Integer, List<UploadedIndexMetadata>> entry : plan.getShardsToWrite().entrySet()) {
                     written.add(
-                        writeManifestShard(
-                            clusterUUID,
-                            entry.getKey(),
-                            clusterState.term(),
-                            clusterState.getVersion(),
-                            entry.getValue()
-                        )
+                        writeManifestShard(clusterUUID, entry.getKey(), clusterState.term(), clusterState.getVersion(), entry.getValue())
                     );
                 }
                 indexMetadataShards = written;

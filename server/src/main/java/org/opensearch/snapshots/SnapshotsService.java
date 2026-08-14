@@ -356,17 +356,15 @@ public class SnapshotsService extends AbstractLifecycleComponent implements Clus
         // "Indices don't have primary shards [name]") whenever either lookup comes back null -- which
         // happens for two structurally different, both genuinely-alive index shapes this plugin can
         // produce, not just one:
-        //   - a gated index: absent from metadata.indices() entirely (Area H -- metadata lives off cluster
-        //     state), so metadata.index(name) itself returns null;
-        //   - a computed-placement index: present in metadata.indices() but never publishes a routing
-        //     table entry (Area C -- routingTable.index(name) returns null), so routingTable is what's
-        //     missing instead.
+        // - a gated index: absent from metadata.indices() entirely (Area H -- metadata lives off cluster
+        // state), so metadata.index(name) itself returns null;
+        // - a computed-placement index: present in metadata.indices() but never publishes a routing
+        // table entry (Area C -- routingTable.index(name) returns null), so routingTable is what's
+        // missing instead.
         // Both have primary shards serving live traffic; "don't have primary shards" is false for either.
         {
             ClusterState stateForGatedCheck = clusterService.state();
-            List<String> namesForGatedCheck = Arrays.asList(
-                indexNameExpressionResolver.concreteIndexNames(stateForGatedCheck, request)
-            );
+            List<String> namesForGatedCheck = Arrays.asList(indexNameExpressionResolver.concreteIndexNames(stateForGatedCheck, request));
             List<String> gatedIndices = new ArrayList<>();
             List<String> computedPlacementIndices = new ArrayList<>();
             for (String indexName : namesForGatedCheck) {
@@ -388,8 +386,10 @@ public class SnapshotsService extends AbstractLifecycleComponent implements Clus
                     message.append(computedPlacementIndices)
                         .append(" -- shard placement is computed rather than published for these indices. ");
                 }
-                message.append("Snapshotting resolves primary shards from the published cluster-state routing table, "
-                    + "which neither of these index shapes has.");
+                message.append(
+                    "Snapshotting resolves primary shards from the published cluster-state routing table, "
+                        + "which neither of these index shapes has."
+                );
                 throw new SnapshotException(new Snapshot(repositoryName, snapshotId), message.toString());
             }
         }

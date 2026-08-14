@@ -74,7 +74,10 @@ public class AdaptiveReplicaSelectionCacheWarmthProxyTests extends OpenSearchTes
 
         assertTrue(
             "a consistently faster (warm) node must rank better (lower) than a consistently slower "
-                + "(cold) one -- warm=" + warmRank + " cold=" + coldRank,
+                + "(cold) one -- warm="
+                + warmRank
+                + " cold="
+                + coldRank,
             warmRank < coldRank
         );
     }
@@ -103,7 +106,10 @@ public class AdaptiveReplicaSelectionCacheWarmthProxyTests extends OpenSearchTes
 
         assertTrue(
             "a single transient anomaly on an otherwise-warm node must not flip it to ranking worse "
-                + "than a consistently cold node -- warm=" + warmRank + " cold=" + coldRank
+                + "than a consistently cold node -- warm="
+                + warmRank
+                + " cold="
+                + coldRank
                 + " -- if this fails, ARS's own EWMA smoothing is not sufficient protection against noise "
                 + "at this alpha, and ReaderCacheAffinityRecorder's direct signal genuinely needs blending in",
             warmRank < coldRank
@@ -124,10 +130,7 @@ public class AdaptiveReplicaSelectionCacheWarmthProxyTests extends OpenSearchTes
     public void testANeverQueriedNodeHasNoStatisticsAtAllNotAColdRanking() {
         collector.addNodeStatistics("warm-node", 0, WARM_RESPONSE_NANOS, SERVICE_TIME_NANOS);
 
-        assertTrue(
-            "the warm node must have real statistics once queried",
-            collector.getNodeStatistics("warm-node").isPresent()
-        );
+        assertTrue("the warm node must have real statistics once queried", collector.getNodeStatistics("warm-node").isPresent());
         assertFalse(
             "a node ARS has never received a response-time sample for must have no statistics at "
                 + "all -- confirming there is no signal here to distinguish 'genuinely warm' from "

@@ -224,18 +224,21 @@ public class ServerlessStoragePreWarmChaosIT extends org.opensearch.serverless.s
         // property this assertion actually needs.
         SearchResponse search = client().prepareSearch("chaos-gated-target").setQuery(QueryBuilders.matchAllQuery()).setSize(0).get();
         assertTrue(
-            "documents written before the chaos must remain searchable after surviving a node death "
-                + "mid pre-warm dispatch",
+            "documents written before the chaos must remain searchable after surviving a node death " + "mid pre-warm dispatch",
             search.getHits().getTotalHits().value() > 0
         );
 
         ReaderShardPreWarmCoordinator.resetPreWarmCountForTesting();
         internalCluster().startDataOnlyNode();
-        assertBusy(() -> assertTrue(
-            "the pre-warm coordinator must still dispatch after surviving a node death, not merely "
-                + "leave the cluster itself healthy -- got "
-                + ReaderShardPreWarmCoordinator.preWarmCountForTesting(),
-            ReaderShardPreWarmCoordinator.preWarmCountForTesting() > 0
-        ), 30, TimeUnit.SECONDS);
+        assertBusy(
+            () -> assertTrue(
+                "the pre-warm coordinator must still dispatch after surviving a node death, not merely "
+                    + "leave the cluster itself healthy -- got "
+                    + ReaderShardPreWarmCoordinator.preWarmCountForTesting(),
+                ReaderShardPreWarmCoordinator.preWarmCountForTesting() > 0
+            ),
+            30,
+            TimeUnit.SECONDS
+        );
     }
 }

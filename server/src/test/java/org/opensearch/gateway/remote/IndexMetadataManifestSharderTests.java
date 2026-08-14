@@ -82,7 +82,10 @@ public class IndexMetadataManifestSharderTests extends OpenSearchTestCase {
                 break;
             }
         }
-        assumeTrue("fixture needs a colliding UUID within the search budget", ManifestShardFunction.shardFor(deletedInSameShard, shardCount) == targetShard);
+        assumeTrue(
+            "fixture needs a colliding UUID within the search budget",
+            ManifestShardFunction.shardFor(deletedInSameShard, shardCount) == targetShard
+        );
 
         UploadedManifestShard previousShard = new UploadedManifestShard(targetShard, "blob-v1", 2);
         // Deleted index no longer appears in currentIndices, but its UUID is in changedOrDeletedIndexUUIDs.
@@ -141,10 +144,7 @@ public class IndexMetadataManifestSharderTests extends OpenSearchTestCase {
     }
 
     public void testRejectsNonPositiveShardCount() {
-        expectThrows(
-            IllegalArgumentException.class,
-            () -> IndexMetadataManifestSharder.plan(emptyList(), emptySet(), emptyList(), 0, 0)
-        );
+        expectThrows(IllegalArgumentException.class, () -> IndexMetadataManifestSharder.plan(emptyList(), emptySet(), emptyList(), 0, 0));
     }
 
     public void testEveryCurrentIndexIsAccountedForExactlyOnce() {

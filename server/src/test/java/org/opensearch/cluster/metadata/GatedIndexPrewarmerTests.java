@@ -87,12 +87,7 @@ public class GatedIndexPrewarmerTests extends OpenSearchTestCase {
 
         ClusterState currentState = ClusterState.builder(new ClusterName("test"))
             .nodes(
-                DiscoveryNodes.builder()
-                    .add(master)
-                    .add(oldDataNode)
-                    .add(newDataNode)
-                    .clusterManagerNodeId("master")
-                    .localNodeId("data2")
+                DiscoveryNodes.builder().add(master).add(oldDataNode).add(newDataNode).clusterManagerNodeId("master").localNodeId("data2")
             )
             .build();
 
@@ -125,12 +120,7 @@ public class GatedIndexPrewarmerTests extends OpenSearchTestCase {
 
         ClusterState currentState = ClusterState.builder(new ClusterName("test"))
             .nodes(
-                DiscoveryNodes.builder()
-                    .add(master)
-                    .add(oldDataNode)
-                    .add(newDataNode)
-                    .clusterManagerNodeId("master")
-                    .localNodeId("data2")
+                DiscoveryNodes.builder().add(master).add(oldDataNode).add(newDataNode).clusterManagerNodeId("master").localNodeId("data2")
             )
             .build();
 

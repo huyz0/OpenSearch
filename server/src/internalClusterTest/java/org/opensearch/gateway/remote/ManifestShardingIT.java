@@ -68,7 +68,8 @@ public class ManifestShardingIT extends RemoteStoreBaseIntegTestCase {
     }
 
     private List<String> indexNames() {
-        return IntStream.range(0, INDEX_COUNT).mapToObj(i -> String.format(Locale.ROOT, "sharded-manifest-index-%d", i))
+        return IntStream.range(0, INDEX_COUNT)
+            .mapToObj(i -> String.format(Locale.ROOT, "sharded-manifest-index-%d", i))
             .collect(Collectors.toList());
     }
 
@@ -131,7 +132,11 @@ public class ManifestShardingIT extends RemoteStoreBaseIntegTestCase {
         // A settings update on one index only -- this is what exercises the "only the dirty shard is
         // rewritten, the rest are carried forward by reference" half of the write path, not just the
         // simpler "everything is new" first-write case above.
-        client().admin().indices().prepareUpdateSettings(indexNames().get(0)).setSettings(Settings.builder().put("index.refresh_interval", "2s")).get();
+        client().admin()
+            .indices()
+            .prepareUpdateSettings(indexNames().get(0))
+            .setSettings(Settings.builder().put("index.refresh_interval", "2s"))
+            .get();
         // A deletion -- exercises the "an index leaving its shard also dirties that shard" case.
         String deletedIndex = indexNames().get(indexNames().size() - 1);
         client().admin().indices().prepareDelete(deletedIndex).get();
@@ -145,7 +150,10 @@ public class ManifestShardingIT extends RemoteStoreBaseIntegTestCase {
             ClusterState state = getClusterState();
             assertEquals(expectedIndices.size(), state.metadata().indices().size());
             for (String indexName : expectedIndices) {
-                assertTrue("index [" + indexName + "] must survive a full restart of a sharded manifest", state.metadata().hasIndex(indexName));
+                assertTrue(
+                    "index [" + indexName + "] must survive a full restart of a sharded manifest",
+                    state.metadata().hasIndex(indexName)
+                );
             }
             assertFalse("the deleted index must not reappear after restart", state.metadata().hasIndex(deletedIndex));
         }, 30, TimeUnit.SECONDS);
@@ -165,7 +173,11 @@ public class ManifestShardingIT extends RemoteStoreBaseIntegTestCase {
         // that a real sweep, retaining only the newest few, has real stale manifests -- and therefore
         // real stale-vs-referenced shard/index blob decisions -- to make.
         for (int i = 0; i < 15; i++) {
-            client().admin().indices().prepareUpdateSettings(indexNames().get(0)).setSettings(Settings.builder().put("index.refresh_interval", (2 + i) + "s")).get();
+            client().admin()
+                .indices()
+                .prepareUpdateSettings(indexNames().get(0))
+                .setSettings(Settings.builder().put("index.refresh_interval", (2 + i) + "s"))
+                .get();
         }
 
         RemoteClusterStateService remoteClusterStateService = internalCluster().getInstance(

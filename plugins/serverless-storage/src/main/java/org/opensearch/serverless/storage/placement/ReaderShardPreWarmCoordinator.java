@@ -16,15 +16,14 @@ import org.opensearch.cluster.metadata.GatedIndexPrewarmer;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.routing.ComputedPlacementMembership;
 import org.opensearch.cluster.routing.ComputedPlacementMembershipService;
-import org.opensearch.core.transport.TransportResponse;
 import org.opensearch.indices.cluster.IndicesClusterStateService;
 import org.opensearch.serverless.storage.readerengine.action.PollNowAction;
 import org.opensearch.serverless.storage.readerengine.action.PollNowRequest;
 import org.opensearch.serverless.storage.readerengine.action.PollNowResponse;
+import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportException;
 import org.opensearch.transport.TransportResponseHandler;
 import org.opensearch.transport.TransportService;
-import org.opensearch.threadpool.ThreadPool;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -163,7 +162,8 @@ public final class ReaderShardPreWarmCoordinator implements ClusterStateApplier 
      * needed a second, differently-shaped pass" javadoc for what {@code requirePrimaryDispatcher}
      * means and why only the gated pass sets it.
      */
-    private record IndexToConsider(String indexUuid, int numberOfShards, boolean requirePrimaryDispatcher) {}
+    private record IndexToConsider(String indexUuid, int numberOfShards, boolean requirePrimaryDispatcher) {
+    }
 
     @Override
     public void applyClusterState(ClusterChangedEvent event) {
@@ -275,12 +275,7 @@ public final class ReaderShardPreWarmCoordinator implements ClusterStateApplier 
      * never reordered by warmth). Only the gated pass consults this; the ordinary pass already has a
      * single dispatcher by construction (the cluster manager) and does not need a second restriction.
      */
-    static boolean isLocalNodePrimaryCandidate(
-        ComputedPlacementMembership membership,
-        String indexUuid,
-        int shardId,
-        String localNodeId
-    ) {
+    static boolean isLocalNodePrimaryCandidate(ComputedPlacementMembership membership, String indexUuid, int shardId, String localNodeId) {
         if (localNodeId == null) {
             return false;
         }

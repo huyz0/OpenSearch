@@ -8,8 +8,8 @@
 
 package org.opensearch.serverless.storage.placement;
 
-import org.opensearch.common.Priority;
 import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.common.Priority;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.serverless.storage.ServerlessStoragePlugin;
@@ -162,12 +162,16 @@ public class ServerlessStorageClusterManagerFailoverChaosIT extends org.opensear
         // itself dispatches before asking anything about failover, the same known-good shape
         // ServerlessStorageReaderShardPreWarmIT's own single-manager test already establishes.
         internalCluster().startDataOnlyNode();
-        assertBusy(() -> assertTrue(
-            "the original cluster-manager must dispatch at least one pre-warm poll before this test "
-                + "asks anything about failover -- got "
-                + ReaderShardPreWarmCoordinator.preWarmCountForTesting(),
-            ReaderShardPreWarmCoordinator.preWarmCountForTesting() > 0
-        ), 30, TimeUnit.SECONDS);
+        assertBusy(
+            () -> assertTrue(
+                "the original cluster-manager must dispatch at least one pre-warm poll before this test "
+                    + "asks anything about failover -- got "
+                    + ReaderShardPreWarmCoordinator.preWarmCountForTesting(),
+                ReaderShardPreWarmCoordinator.preWarmCountForTesting() > 0
+            ),
+            30,
+            TimeUnit.SECONDS
+        );
 
         // Only now add failover redundancy -- two more cluster-manager-eligible nodes, so killing the
         // current one still leaves a majority (2 of 3) to elect a real replacement.
@@ -184,11 +188,15 @@ public class ServerlessStorageClusterManagerFailoverChaosIT extends org.opensear
         // cluster is stable again, one more growth round must still produce a real dispatch.
         ReaderShardPreWarmCoordinator.resetPreWarmCountForTesting();
         internalCluster().startDataOnlyNode();
-        assertBusy(() -> assertTrue(
-            "the new cluster-manager elected after failover must resume pre-warm dispatch with no "
-                + "special hand-off -- got "
-                + ReaderShardPreWarmCoordinator.preWarmCountForTesting(),
-            ReaderShardPreWarmCoordinator.preWarmCountForTesting() > 0
-        ), 30, TimeUnit.SECONDS);
+        assertBusy(
+            () -> assertTrue(
+                "the new cluster-manager elected after failover must resume pre-warm dispatch with no "
+                    + "special hand-off -- got "
+                    + ReaderShardPreWarmCoordinator.preWarmCountForTesting(),
+                ReaderShardPreWarmCoordinator.preWarmCountForTesting() > 0
+            ),
+            30,
+            TimeUnit.SECONDS
+        );
     }
 }

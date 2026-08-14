@@ -65,10 +65,7 @@ public class ManifestShardingWriteAmplificationIT extends RemoteStoreBaseIntegTe
 
     @Override
     protected Settings nodeSettings(int nodeOrdinal) {
-        return Settings.builder()
-            .put(super.nodeSettings(nodeOrdinal))
-            .put(REMOTE_CLUSTER_STATE_ENABLED_SETTING.getKey(), true)
-            .build();
+        return Settings.builder().put(super.nodeSettings(nodeOrdinal)).put(REMOTE_CLUSTER_STATE_ENABLED_SETTING.getKey(), true).build();
     }
 
     private String indexName(int i) {

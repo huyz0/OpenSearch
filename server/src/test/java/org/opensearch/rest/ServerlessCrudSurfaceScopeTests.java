@@ -78,7 +78,8 @@ public class ServerlessCrudSurfaceScopeTests extends OpenSearchTestCase {
 
     private static void assertAvailable(RestHandler handler) {
         assertEquals(
-            handler.getClass().getSimpleName() + " must be AVAILABLE under serverless mode, or a gated "
+            handler.getClass().getSimpleName()
+                + " must be AVAILABLE under serverless mode, or a gated "
                 + "deployment loses this operation entirely -- the default is UNAVAILABLE, so this is an "
                 + "explicit opt-in a future change could silently drop",
             RestHandler.ServerlessScope.AVAILABLE,
