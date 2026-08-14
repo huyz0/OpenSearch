@@ -475,6 +475,36 @@ optional. Under computed placement every large scale event triggers this, which 
 onto their new candidates before shifting traffic. Bound the concurrency so pre-warm does not itself
 cause an object-store storm.
 
+**A real correctness gap found and fixed (2026-08-14), after D1 itself had already shipped.** A
+multi-agent survey of the whole plan, run to pick the next task once Area E landed, ranked this the top
+candidate for a reason worth stating plainly: `ReaderShardPreWarmCoordinator` enumerated only
+`event.state().metadata().indices()`, and a gated index (Area H) has no entry there at all -- that is
+what gating means. So the entire gated population, which is the actual target this whole project exists
+to serve, was silently pre-warmed for never. No error, no log line, nothing to notice -- the mechanism
+looked wired (D1's own IT already proved it dispatches for an *ordinary* computed-placement index) and
+did nothing for the population the plan's own Part 0 names as the point of Area H.
+
+Fixed by giving gated indices a second, differently-shaped pass rather than trying to make the first one
+see them: `IndicesClusterStateService#onDemandOpenIndices()`, a new small accessor over the same
+`openedOnDemand` registry T39 already maintains, exposes each node's own bounded, currently-open gated
+indices -- the identical "per-node working set, not a population scan" scope `GatedIndexPrewarmer`
+already established for the same reason. That pass runs on every node (not only the cluster manager,
+since the working set is inherently node-local and small), with dispatch restricted to whichever node
+rendezvous currently names the shard's primary candidate, so exactly one node ever sends the request
+for a given shard.
+
+One more real bug surfaced building the actual IT: a node simultaneously the primary dispatcher and
+newly eligible for its own shard would dispatch a request to itself, which takes a local fast path that
+re-enters `clusterService.state()` from inside the very cluster-state-applier callback that is running
+it -- an assertion failure. Fixed by skipping the local node id in the newly-eligible set before
+dispatching.
+
+Verified with a real break-the-fix cycle on the new gated pass specifically (commenting it out
+reproduced "got 0" in the new `testAGatedIndexsShardIsAlsoPreWarmed`, restoring it went green again),
+plus a broader regression sweep (`IndicesClusterStateServiceRandomUpdatesTests`,
+`GatedIndexPrewarmerTests`, and every class under `org.opensearch.serverless.storage.placement.*` and
+`...readerengine.*` -- 20 classes, 0 failures). Full write-up in the commit itself.
+
 **D2. Scale hysteresis.** Reuse `SustainedCandidateTracker` rather than inventing a third scaling policy.
 A brief traffic spike must not reshuffle affinity. Set the sustained window from the measured pre-warm
 duration, not from a guess.
