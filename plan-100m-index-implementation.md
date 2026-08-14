@@ -750,6 +750,26 @@ the per-index costs known to be flat so extrapolation is defensible.
 found cold allocation superlinear and it was the figure that should size a cell; under computed placement
 it should become flat, and that claim needs a number.
 
+**Measured (2026-08-14), real end-to-end, and the claim holds at this scale.**
+`ComputedPlacementColdStartIT` times a real `client().admin().indices().create` acknowledgement -- the
+same shape of measurement S6 made for the allocator this replaces -- against a real, growing background
+population, at checkpoints [0, 300, 1,200]. Deliberately smaller than S6's 40,000-shard scale or the
+plan's 100M-index target: real creation is a real cluster-state publication, not S14/C11's now-deleted
+`ComputedPlacementCostTests`' free in-memory routing computation, so an integration test reaches a much
+smaller population in reasonable time -- a real number here is a genuine data point, not proof flatness
+holds all the way to 100M. Two runs, same shape both times: population 0 costs far more than 300 or
+1,200 (190ms/148ms, JIT and first-request warmup -- S6 itself notes the identical distortion at its own
+smallest tier), then flat rather than growing across the 4x population increase from there (84ms then
+85ms; 29ms then 37ms). Deliberately asserts nothing about the numbers themselves -- see T40's own "a
+test asserting on elapsed time is deleted, a test asserting on a count is kept" rule -- only that each
+timed create completed and took non-zero time; the numbers above are read from `logger.warn` output, not
+from a threshold the test enforces.
+
+Narrower than this item's own "cluster start to serving" framing in one respect, stated in the test's
+own javadoc: it times the create acknowledgement -- the point `ComputedRoutingTable` has already marked
+the new shard started as part of that same computation, matching what S6 measured for the allocator --
+not a first real search or write against the index afterward, which remains unmeasured.
+
 **G4. Chaos.** Node loss during pre-warm, LB and coordinator disagreement about the node set, and a
 partitioned name index tier. N3 claims graceful degradation and that claim needs evidence.
 
