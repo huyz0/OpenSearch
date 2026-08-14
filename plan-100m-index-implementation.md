@@ -634,10 +634,26 @@ its own recommendation into. Left open rather than force-built.
 **E8. Re-measure.** C3a's 256-shard figure came from a simulation, not the implementation. Re-run against
 the real write path.
 
-**Not yet done (2026-08-14).** E5/E6 built the real write path this figure needs to be re-measured
-against; the simulation in `ManifestShardingWriteAmplificationEstimate` (C3a) has not yet been superseded
-by a benchmark against the genuine implementation. Should happen before repeating the 125x claim as
-anything other than the simulation's own number.
+**Measured (2026-08-14) against the real write path, and the real number is a lot smaller than the
+simulation's headline figure -- for a reason the simulation's own text already flagged.**
+`ManifestShardingWriteAmplificationIT` calls the genuine `RemoteManifestManager#uploadManifest` against a
+real FS-backed repository (not the simulation's arithmetic), diffs real blob listings before and after one
+settings update, and sums real, real-compressor bytes. At 1,000 real indices and 256 shards -- two orders
+of magnitude below the RFC's 100,000-index scale, since creating 100,000 real indices is not something an
+integration test can do in reasonable time -- one changed index wrote **656,322 bytes unsharded vs.
+134,617 bytes sharded, a 4.9x reduction**, not 125x.
+
+The gap is not a bug in either number, it is scale: C3a's 125x figure is for N=100,000, S=256 (~390 real
+index entries per shard); this measurement's N=1,000 at the same S=256 has only ~4 entries per shard.
+Unsharded bytes scale with total index count; sharded bytes for one changed index scale with entries per
+shard plus a small constant per-shard-reference overhead in the top-level manifest -- so the achievable
+ratio is bounded above by roughly S itself, and a shard holding only ~4 entries has far less to save than
+one holding ~390, on top of C3a's own noted penalty that small blobs compress worse per entry than large
+ones. **This is not evidence the RFC's 100,000-index figure is wrong** -- it is a different point on the
+same curve, consistent with the mechanism, not a contradiction of it -- but it is also not confirmation of
+125x, and the 125x number should not be repeated as validated against the real implementation without a
+run at closer to the RFC's own scale. `ManifestShardingWriteAmplificationIT`'s own javadoc documents this
+scale gap so it is not lost the next time this number is cited.
 
 ### E.4 Acceptance criteria
 
