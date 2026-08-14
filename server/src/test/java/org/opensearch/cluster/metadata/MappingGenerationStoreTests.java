@@ -307,6 +307,43 @@ public class MappingGenerationStoreTests extends OpenSearchTestCase {
         assertEquals("long", MappingGenerationStore.typeOf(current.fields().get("age")));
     }
 
+    /**
+     * The shape T58 introduced, and the reason the guard is stated over the generation rather than over the
+     * reference. A descriptor-backed store answers for every index that resolves, so an index whose mapping
+     * is missing comes back as generation 0 with no fields rather than as null -- the identical wrong answer
+     * the null check was written to refuse, arriving as a value.
+     */
+    public void testAMappingBehindTheGenerationTheDescriptorClaimsFails() {
+        InMemoryStore store = new InMemoryStore();
+        MappingGenerationStore.register(store);
+        MappingGenerationStore.updateMapping("idx", Map.of("age", "long"));
+
+        MappingGenerationStore.MissingMappingException thrown = expectThrows(
+            MappingGenerationStore.MissingMappingException.class,
+            () -> MappingGenerationStore.currentMapping("idx", 4L)
+        );
+        assertTrue("the message must name what was claimed: " + thrown.getMessage(), thrown.getMessage().contains("[4]"));
+        assertTrue("and what the store actually had: " + thrown.getMessage(), thrown.getMessage().contains("[1]"));
+    }
+
+    /**
+     * The other direction is not an inconsistency and must not fail. A node whose descriptor resolution is
+     * behind the store is the ordinary case this whole seam is built on -- mappings move without anything
+     * broadcasting them -- and the mapping it gets back contains everything its stale generation declared.
+     */
+    public void testAMappingAheadOfTheGenerationTheDescriptorClaimsIsReturned() {
+        InMemoryStore store = new InMemoryStore();
+        MappingGenerationStore.register(store);
+        MappingGenerationStore.updateMapping("idx", Map.of("age", "long"));
+        MappingGenerationStore.updateMapping("idx", Map.of("region", "keyword"));
+
+        MappingGenerationStore.MappingGeneration current = MappingGenerationStore.currentMapping("idx", 1L);
+
+        assertNotNull(current);
+        assertEquals(2L, current.generation());
+        assertEquals("keyword", MappingGenerationStore.typeOf(current.fields().get("region")));
+    }
+
     /** With no store installed, the generation-aware overload degrades the same way the plain one does. */
     public void testWithNoStoreInstalledTheGenerationAwareOverloadAnswersNull() {
         assertNull(MappingGenerationStore.currentMapping("idx", 5L));

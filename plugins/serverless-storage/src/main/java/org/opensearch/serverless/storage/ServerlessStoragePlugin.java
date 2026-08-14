@@ -1986,13 +1986,28 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             org.opensearch.serverless.storage.descriptor.MappingIndexWatcher mappingIndexWatcher =
                 new org.opensearch.serverless.storage.descriptor.MappingIndexWatcher();
             clusterService.addListener(mappingIndexWatcher);
+            // The mapping store is two things composed, and the composition is spelled out here because
+            // getting it wrong is invisible. The descriptor owns the mapping (T58). The mapping index is a
+            // write-behind projection whose only reader is IndexBackedMappingStatsAggregator below, which is
+            // how the gated population's field type counts stay one search rather than a walk over every
+            // descriptor. Registering the descriptor store alone -- which is what T58 left behind -- leaves
+            // that aggregator reading an index with no writer, and cluster stats silently omits every gated
+            // index.
+            final org.opensearch.serverless.storage.descriptor.DescriptorBackend descriptorsForMappings = descriptorBackend;
             org.opensearch.serverless.storage.descriptor.DescriptorGate.install(
                 descriptorBackend,
                 descriptorPrefixes,
-                new org.opensearch.serverless.storage.descriptor.IndexBackedMappingStore(
-                    client,
-                    SERVERLESS_STORAGE_MAPPING_INDEX_SHARDS_SETTING.get(environment.settings()),
-                    mappingIndexWatcher
+                new org.opensearch.serverless.storage.descriptor.StatsProjectingMappingStore(
+                    new org.opensearch.serverless.storage.descriptor.DescriptorBackedMappingStore(() -> descriptorsForMappings, null),
+                    new org.opensearch.serverless.storage.descriptor.IndexBackedMappingStore(
+                        client,
+                        SERVERLESS_STORAGE_MAPPING_INDEX_SHARDS_SETTING.get(environment.settings()),
+                        mappingIndexWatcher
+                    ),
+                    // GENERIC for the same reason the descriptor backend uses it: a projection write is an
+                    // indexing request, and the mapping write that triggers it can be running anywhere,
+                    // including a thread that must not do I/O.
+                    threadPool.executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC)
                 ),
                 new org.opensearch.serverless.storage.descriptor.IndexBackedMappingStatsAggregator(client),
                 new org.opensearch.serverless.storage.descriptor.StoreBackedFieldRefresher(),

@@ -8,16 +8,20 @@
 
 package org.opensearch.serverless.storage;
 
+import org.opensearch.cluster.metadata.MappingGenerationStore;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.gateway.remote.RemoteClusterStateService;
 import org.opensearch.serverless.storage.descriptor.BlobDescriptorBackend;
+import org.opensearch.serverless.storage.descriptor.DescriptorBackedMappingStore;
+import org.opensearch.serverless.storage.descriptor.DescriptorBackend;
 import org.opensearch.serverless.storage.descriptor.DescriptorEnumerator;
 import org.opensearch.serverless.storage.descriptor.DescriptorGate;
 import org.opensearch.serverless.storage.descriptor.FailableDescriptorContainer;
 import org.opensearch.serverless.storage.descriptor.IndexBackedMappingStatsAggregator;
 import org.opensearch.serverless.storage.descriptor.IndexBackedMappingStore;
+import org.opensearch.serverless.storage.descriptor.StatsProjectingMappingStore;
 import org.opensearch.serverless.storage.descriptor.StoreBackedFieldRefresher;
 import org.opensearch.test.OpenSearchIntegTestCase;
 import org.opensearch.threadpool.ThreadPool;
@@ -45,6 +49,27 @@ public abstract class ServerlessStorageIntegTestCase extends OpenSearchIntegTest
             .put(super.nodeSettings(nodeOrdinal))
             .put(RemoteClusterStateService.REMOTE_CLUSTER_STATE_ENABLED_SETTING.getKey(), true)
             .build();
+    }
+
+    /**
+     * Never the framework's mock engine, because this plugin supplies an engine factory of its own.
+     *
+     * <p>{@code IndicesService.getEngineFactory} refuses outright when two plugins claim one index --
+     * "multiple engine factories provided" -- so on the seeds where the randomizer installs
+     * {@code MockEngineFactoryPlugin}, opening a serverless index is impossible. For a gated index that is
+     * not a failed test so much as a hung one: the index has no cluster state entry, so nothing tells the
+     * write it will never be servable, and it retries against a shard that cannot open until the suite
+     * times out twenty minutes later.
+     *
+     * <p>Seventy-one subclasses had already worked this out and overridden it individually. Three had not,
+     * and one of those, {@code ServerlessStorageAffinityForwardingIT}, was carried on the round's flaky list
+     * for exactly this -- failing about one run in three, which is how often that seed comes up, and being
+     * read as an intermittent property of the system rather than a missing line in one file. Declared here
+     * so the next test to be written cannot omit it.
+     */
+    @Override
+    protected boolean addMockInternalEngine() {
+        return false;
     }
 
     /**
@@ -80,14 +105,29 @@ public abstract class ServerlessStorageIntegTestCase extends OpenSearchIntegTest
      * registers nothing at all.
      */
     protected InstalledDescriptorPlane installBlobBackedDescriptorPlane(boolean enabled) throws IOException {
+        return installBlobBackedDescriptorPlane(enabled, java.util.function.UnaryOperator.identity());
+    }
+
+    /**
+     * The same, with the backend the gate is given passed through {@code wrapForGate} first.
+     *
+     * <p>For tests that need to see what the gate's own hooks do to the descriptor plane -- which thread they
+     * call from, or how often -- now that a creation's mapping rides its descriptor rather than going through
+     * {@code MappingGenerationStore}. Only the gate's copy is wrapped: the mapping store keeps the raw
+     * backend, so a test can tell a descriptor write made by a creation from one made by a mapping update.
+     */
+    protected InstalledDescriptorPlane installBlobBackedDescriptorPlane(
+        boolean enabled,
+        java.util.function.UnaryOperator<DescriptorBackend> wrapForGate
+    ) throws IOException {
         FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
         Executor generic = internalCluster().getInstance(ThreadPool.class).executor(ThreadPool.Names.GENERIC);
         BlobDescriptorBackend points = new BlobDescriptorBackend(blobStore.blobContainer(BlobPath.cleanPath()), generic);
         DescriptorEnumerator prefixes = new DescriptorEnumerator(blobStore::blobContainer, BlobPath.cleanPath());
         DescriptorGate.install(
-            points,
+            wrapForGate.apply(points),
             prefixes,
-            new IndexBackedMappingStore(client()),
+            mappingStoreAsProductionBuildsIt(points, generic),
             new IndexBackedMappingStatsAggregator(client()),
             new StoreBackedFieldRefresher(),
             enabled
@@ -105,19 +145,65 @@ public abstract class ServerlessStorageIntegTestCase extends OpenSearchIntegTest
      */
     protected InstalledDescriptorPlane installOverFailableContainer(FailableDescriptorContainer container) throws Exception {
         DescriptorEnumerator prefixes = new DescriptorEnumerator(path -> container, BlobPath.cleanPath());
-        BlobDescriptorBackend points = new BlobDescriptorBackend(
-            container,
-            internalCluster().getInstance(ThreadPool.class).executor(ThreadPool.Names.GENERIC)
-        );
+        Executor generic = internalCluster().getInstance(ThreadPool.class).executor(ThreadPool.Names.GENERIC);
+        BlobDescriptorBackend points = new BlobDescriptorBackend(container, generic);
         DescriptorGate.install(
             points,
             prefixes,
-            new IndexBackedMappingStore(client()),
+            mappingStoreAsProductionBuildsIt(points, generic),
             new IndexBackedMappingStatsAggregator(client()),
             new StoreBackedFieldRefresher(),
             true
         );
         return new InstalledDescriptorPlane(points, prefixes);
+    }
+
+    /**
+     * The mapping store exactly as {@code ServerlessStoragePlugin} composes it.
+     *
+     * <p>This fixture used to hand the gate a bare {@link IndexBackedMappingStore}, and for a while that did
+     * not matter because the gate ignored the argument and built its own descriptor-backed store. So the
+     * suite was exercising a store production did not register, which is the same shape of defect as a
+     * mechanism that is tested and unreachable -- and it is what let the mapping stats projection go missing
+     * without a test noticing. Building it here the way the plugin builds it is the only version of this
+     * fixture that can catch the next one.
+     */
+    private MappingGenerationStore.Store mappingStoreAsProductionBuildsIt(BlobDescriptorBackend points, Executor generic) {
+        StatsProjectingMappingStore store = new StatsProjectingMappingStore(
+            new DescriptorBackedMappingStore(() -> points, null),
+            new IndexBackedMappingStore(client()),
+            generic
+        );
+        installedMappingStore = store;
+        return store;
+    }
+
+    private volatile StatsProjectingMappingStore installedMappingStore;
+
+    /**
+     * Lets the projection finish before the cluster is torn down.
+     *
+     * <p>The projection is asynchronous in production and the fixture keeps it that way, so a test can end
+     * with a write still in flight against {@code .opensearch-index-mappings}. The cluster then shuts down
+     * underneath it and the framework reports "shard is still locked", which points at the mapping index
+     * rather than at the test that left work running. Draining here is not making the test synchronous --
+     * the write still ran on {@code GENERIC} -- it is waiting for it before pulling the cluster away.
+     */
+    @org.junit.After
+    public void drainMappingStatsProjection() {
+        StatsProjectingMappingStore store = installedMappingStore;
+        installedMappingStore = null;
+        if (store != null) {
+            store.awaitQuiescence(30_000);
+        }
+        // And the one the plugin installed, for the classes that let the node wire itself rather than
+        // installing a plane by hand. Those were the ones this drain missed: it only knew about stores this
+        // fixture built, so a projection left running by a plugin-installed store still tore the cluster
+        // down underneath itself and surfaced as "shard is still locked" in a class that had nothing to do
+        // with mappings.
+        if (DescriptorGate.installedMappingStore() instanceof StatsProjectingMappingStore installed) {
+            installed.awaitQuiescence(30_000);
+        }
     }
 
     /** A failable container over a fresh temporary directory, for the caller to hold and flip. */

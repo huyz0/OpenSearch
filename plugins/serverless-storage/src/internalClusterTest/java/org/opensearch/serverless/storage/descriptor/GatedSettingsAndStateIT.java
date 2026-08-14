@@ -12,7 +12,6 @@ import org.opensearch.action.admin.indices.close.CloseIndexResponse;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.action.admin.indices.create.CreateIndexResponse;
 import org.opensearch.action.admin.indices.open.OpenIndexResponse;
-import org.opensearch.action.support.clustermanager.AcknowledgedResponse;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.ClusterStateUpdateTask;
 import org.opensearch.cluster.metadata.IndexMetadata;
@@ -125,13 +124,29 @@ public class GatedSettingsAndStateIT extends org.opensearch.serverless.storage.S
         assertTrue("update thread block failed", held.await(30, TimeUnit.SECONDS));
 
         try {
-            // Update settings off-thread
-            AcknowledgedResponse settingsResp = client().admin()
-                .indices()
-                .prepareUpdateSettings("gated-settings-1")
-                .setSettings(Settings.builder().put("index.refresh_interval", "5s"))
-                .get();
-            assertTrue(settingsResp.isAcknowledged());
+            // Settings are refused, and the refusal still has to arrive while the cluster state thread is
+            // blocked, which is what this test is actually about: none of these three may need that thread.
+            //
+            // This arm used to assert `isAcknowledged()`. It passed against an implementation that resolved
+            // the descriptor, republished it unchanged and answered true without ever reading
+            // request.settings(), so the assertion was true of the response and false of the system. A
+            // serverless index keeps no settings in cluster state and its descriptor has nowhere to record
+            // arbitrary ones, so no is the only answer this operation has -- the same answer
+            // BlobBackedDescriptorIT#testOperationsAGatedIndexCannotSupportFailClearly has always demanded,
+            // and which that implementation broke without either test noticing at the time.
+            Exception settings = expectThrows(
+                Exception.class,
+                () -> client().admin()
+                    .indices()
+                    .prepareUpdateSettings("gated-settings-1")
+                    .setSettings(Settings.builder().put("index.refresh_interval", "5s"))
+                    .get()
+            );
+            assertThat(
+                "an operator must be told the operation is unsupported, not that the index is missing",
+                settings.getMessage() + String.valueOf(settings.getCause()),
+                org.hamcrest.Matchers.containsString("serverless")
+            );
 
             // Close gated index off-thread
             CloseIndexResponse closeResp = client().admin().indices().prepareClose("gated-settings-1").get();

@@ -821,6 +821,26 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
                 // this index's lifecycle, and the next pass reconciles it.
                 continue;
             }
+            if (indicesService.indexService(index) == null) {
+                // Already closed by something else while this loop was walking its snapshot. Iterating
+                // indicesService takes the index map as it was when the loop started, and a gated index can
+                // be closed concurrently by the idle sweep or the ceiling eviction, neither of which holds
+                // this instance's monitor -- deliberately, because closing is slow and holding it would
+                // stall cluster state application behind a request.
+                //
+                // The close removes the index from the map first and clears its openedOnDemand entry after,
+                // so an eviction that lands mid-iteration leaves exactly this state: an entry in this
+                // loop's stale snapshot, no longer held on demand, and no longer there to remove. Every
+                // check below then reads that as "the cluster manager took this index away" and the
+                // assertion demands it have been deleted or the cluster be new, neither of which is true of
+                // one that was never published in the first place.
+                //
+                // The gated guard above catches most of this, but it asks DescriptorOnlyCreation, and that
+                // registration goes away when the node's gate uninstalls -- while the indices it opened are
+                // still resident. This one cannot: an index that is not in the map is not this loop's to
+                // reason about, whoever closed it and whatever is registered.
+                continue;
+            }
             final IndexMetadata indexMetadata = state.metadata().index(index);
             final IndexMetadata existingMetadata = indexService.getIndexSettings().getIndexMetadata();
 
@@ -976,7 +996,8 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
     }
 
     /** One gated index this node currently holds shards for, opened via {@link #openedOnDemand} rather than by cluster state's own diff. */
-    public record OnDemandOpenIndex(String indexUuid, int numberOfShards) {}
+    public record OnDemandOpenIndex(String indexUuid, int numberOfShards) {
+    }
 
     /**
      * Every gated index this node currently holds shards for -- the same bounded, per-node working set

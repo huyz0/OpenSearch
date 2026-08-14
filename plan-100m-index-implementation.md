@@ -1,7 +1,17 @@
 # Implementation plan: 100M indices with index/search and compute/storage separation
 
-Status: in progress. Evidence recorded in `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.md` (S1 to S19) and
+Status: in progress. Evidence recorded in `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.md` (S1 to S55) and
 `rfc-100m-index-architecture.md`.
+
+> **Read the seventh review at the end of this file before quoting any number from it.** The descriptor
+> system index this plan reasons about was deleted on 2026-08-05 and replaced by object storage, and the
+> creation-throughput figure quoted throughout has been corrected four times since it was written. Parts 0
+> through 6 and the first six reviews are preserved as written, superseded reasoning included, which is this
+> project's practice -- but the ceiling tables in them are stale in ways their own text cannot show you.
+>
+> Ground this file against the tree before extending it. `docs/rounds/STATE.md` carries a correction of the
+> same shape about its own task numbers, and the instruction it ends with applies here: re-run the check
+> yourself rather than propagating a table forward again.
 
 ---
 
@@ -1157,4 +1167,306 @@ What remains is a run at a hundred million on real hardware, and the serverless-
 a product decision rather than a measurement. Neither is closable by more work of this kind, and this time
 that statement is made with every seam connected rather than with a set of unreachable mechanisms behind
 it.
+
+## Seventh review: the substrate under all six reviews was replaced, and none of them says so
+
+Written 2026-08-15 by grounding this document against the tree rather than against its own task list, which
+is the check the first six reviews did not do. Every one of them is internally sound and reasons about
+machinery that has since been deleted. **Nothing below revises a conclusion by argument. It records that the
+thing the conclusion was measured against no longer exists.**
+
+The reviews are left standing as written, because this project's practice is to preserve superseded
+reasoning rather than erase it. What follows is what a reader has to know before quoting any of it.
+
+### The descriptor system index was deleted, and it is what S24 through S30 measured
+
+`46cfb963519` (2026-08-05) removed the descriptor system index. The descriptor plane is now object storage
+on both halves: a point read is a GET on `descriptors/`, a create is a conditional PUT, and a prefix is one
+bounded `listBlobsByPrefixInSortedOrder` capped at 100 (`DescriptorGate.DEFAULT_WILDCARD_EXPANSION_LIMIT`),
+over which `UnsupportedWildcardException` refuses rather than truncating. `BlobDescriptorBackend` and
+`DescriptorEnumerator` are the implementations; `DescriptorStore` and the `descriptor.backend` setting are
+gone, so an object store is a hard requirement of the plugin rather than an option.
+
+Everything the fifth and sixth reviews rest on was measured against the index that was removed:
+
+| figure | quoted above as | what it measured |
+|---|---|---|
+| lookup 0.35 to 0.48 ms projected at 100M (S30) | the load-bearing extrapolation | a term-dictionary lookup in an OpenSearch index |
+| 1.05x per decade at bounded segment count (S29) | the reason lookup is "cleared conditionally" | merge policy on that index |
+| paging by sorted name, ~33 ms/thousand (S24) | what settled pagination | `search_after` on that index |
+| wildcards refresh-bound (H18) | one of two load-bearing operational parameters | get-vs-search on that index |
+
+**So both "operational parameters that are now load-bearing" are no longer parameters of the shipped
+system.** Merge policy bounds nothing here: there is no descriptor index to merge. Refresh interval bounds
+nothing here: a wildcard is a LIST, not a search. `DescriptorFreshnessContractIT` still passes, and reading
+it shows why that is not reassurance -- it creates an ordinary index literally named `descriptors` and
+measures OpenSearch's own get-versus-search semantics. It is a true statement about an index, and no longer
+a statement about this design.
+
+What replaces them is not measured. Object-store list consistency is now what bounds wildcard freshness, and
+nothing in this repository has measured it, because nothing in this repository has run against a real object
+store over a network (`ServerlessStorageS3FixtureIT` uses the in-process fixture; `LatencyProfile` is a
+simulation).
+
+### The creation figure has been corrected four times, and this document quotes the first one
+
+The sixth review says "creation flat at ~26,500/sec". That number, and S26's 20,577/sec, were both refuted
+inside `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.md` before the review that quotes them was a week old.
+The chain, all of it recorded there:
+
+| | figure | what was wrong with it |
+|---|---|---|
+| S26 / S30 | 20,577 to 26,500/sec | never called `prepareCreate`; measured descriptor document writes, not creation (S31) |
+| S31 | 235/sec | right operation, unstated conditions -- fixed at five requests in flight (S34) |
+| S34 | ~550/sec asymptote | measured under jacoco and the security manager, neither of which ships (S35) |
+| S35 | 859/sec, agents off | the last of this lineage, and the first on a JVM resembling production |
+
+**And S35 is not the current answer either, because a second lineage overtook it.** S26 through S35 all
+measured the descriptor-index era. `rfc-100m-index-architecture.md` carries a later set taken after the blob
+switch, and its finding is sharper than a throughput number:
+
+| | figure |
+|---|---|
+| gated creation, **no** declared mapping | 6,011 to 10,505/sec |
+| gated creation, **with** a declared mapping | **275/sec** |
+
+The gap is a `synchronized` block. The fast path that produces the headline rate skips building a throwaway
+`IndexService` inside `IndicesService.createIndexService`, and it declines on any non-empty mapping. Once
+T11/T13/T15 made a mapped gated index the ordinary kind, the fast path and the ordinary case became mutually
+exclusive. **So the figure that describes the population anyone would actually create is 275 per second, and
+100M of them is about four days.** Filed as T21; the direction of the fix is validating against a mapper
+service built outside the lock, since the lock cannot move without changing concurrency for ordinary indices
+and R1 forbids that.
+
+The honest summary is not "creation is X". It is that creation throughput has been measured six times, the
+answer has moved by two orders of magnitude in both directions, and the two things that decide it are whether
+a mapping is declared and whether the profiler's own agents are loaded. Any number quoted without both
+conditions attached will be wrong again within a cycle. What this document says -- flat, 70 minutes, no
+ceiling -- is wrong on all three counts.
+
+S35 also leaves an open contradiction worth carrying: S32 found removing the cluster state queue changed
+nothing, while S35's profile finds the single cluster-manager task thread is the busiest thing in the system.
+Both can hold if S32's null result was taken below the knee S34 found near fifty in flight. Retesting that at
+saturation is the next experiment, and it decides whether batching creations is worth building.
+
+### H17's pagination merge was reverted, deliberately
+
+The second review reports pagination closed by folding gated indices in as a merge of two sorted runs.
+`b178ef673aa` (2026-08-05) removed it, with reasons worth reading in the commit: honouring
+`(creationDate, name)` in both directions from a bucket needs two more keyspaces kept consistent on every
+create and delete, to support a cursor walk of a hundred million that nobody completes. `IndexPaginationStrategy`
+is byte-identical to upstream again, which removes a modified core file rather than adding one.
+
+The consequence is that **gated indices are not in paginated listings and are not meant to be**. Inventory at
+this scale belongs in `DescriptorEnumerator`'s parallel prefix listing or an object-store inventory report,
+not on a request path. This is a good decision recorded in the right place and contradicted by this document.
+
+### Area A is dead, not pending
+
+`c8cf356c2b9` (2026-08-03, S5) deleted the name index. There is no `nameindex` package. Part 0 already reads
+Area A as "H's substrate", and that is now literally true: the descriptor keyspace is the whole of it.
+`plan-area-a-name-index.md` describes work that will not be done and now says so at the top.
+
+### One thing the reviews claimed as closed that had come undone again
+
+H20's mapping stats aggregate stopped working on 2026-08-08 and nobody noticed until this pass.
+`894ac942432` moved mappings into the descriptor -- correctly -- and registered `DescriptorBackedMappingStore`
+in place of the store the plugin builds, leaving `IndexBackedMappingStatsAggregator` reading
+`.opensearch-index-mappings`, an index whose only writer had just been unregistered. The aggregation failed,
+was swallowed at debug, and `_cluster/stats` reported the ordinary population's field types as the whole
+cluster's. Eleventh instance of this area's signature failure and, again, the least visible kind.
+
+Two things about how it survived are the useful part. `DescriptorGate.install` kept accepting the mapping
+store as a parameter and stopped reading it, so the plugin assembled a store and a cluster-state listener and
+discarded both -- detectable by asking which arguments a method never reads, which is now how it was found.
+And every test of the aggregate hand-built its own `IndexBackedMappingStore`, so the whole suite stayed green
+against a store production did not register. That is the same defect the descriptor-index deletion commit
+called out in the descriptor tests three days earlier, repeated in the mapping tests.
+
+Fixed by `StatsProjectingMappingStore`: the descriptor stays authoritative and the mapping index becomes a
+write-behind projection that exists only to keep the aggregate one search. The shared IT fixture now composes
+the store the way the plugin does, and `GatedMappingStatsIT` writes through `MappingGenerationStore` rather
+than around it, so the next version of this fails red.
+
+### What the same sweep found next door, pinned rather than fixed
+
+Asking "which arguments does this method never read?" over every production file this branch changed returns
+21 hits once record constructors and subclass hooks are excluded, and most of the rest are upstream base-class
+signatures. One is not.
+
+**`MetadataUpdateSettingsService.updateGatedSettings` never reads its request.** The caller validates the
+submitted settings -- refresh interval, translog durability, the scoped-settings pass -- and then calls a
+method that resolves each gated index's descriptor, re-publishes it unchanged via
+`IndexDescriptorPublisher.updateGated`, and answers `acknowledged: true`. `request.settings()` is never
+touched. So `PUT /gated-index/_settings` validates the caller's settings, applies none of them, and reports
+success.
+
+The commit that added it (`d90641f1f61`, 2026-08-08) is titled "Support dynamic settings updates off cluster
+state thread for gated indices". It moved the work off the cluster state thread, which it did do, and did not
+implement the update.
+
+**Why it cannot simply be fixed here.** `IndexDescriptor`'s own javadoc says settings are deliberately absent
+-- they were to live in the object store under a convention. Mappings were later moved into the descriptor
+(T58) and settings were not, so there is currently nowhere to put them. That makes this a design question
+rather than a patch, with two honest answers:
+
+- **Refuse.** Reject a settings update on a gated index with a clear error, the way C14 and C28 refuse
+  resharding and scaling and the way `DescriptorRepresentable` refuses to gate an aliased index. Cheap,
+  immediate, and strictly better than acknowledging a no-op.
+- **Carry settings on the descriptor**, as mappings now are, with the same CAS-on-generation shape.
+
+The first is the right immediate move regardless, because the current behaviour is the one thing neither
+answer wants: a silent success. It is deliberately not changed here, because turning a success into a failure
+is a user-visible contract change and belongs to whoever owns the contract, not to the sweep that found it.
+
+### The suites are not green, and that was not known
+
+The full plugin integration suite has now been run end to end, which does not appear to have happened before
+in this project's records. `:plugins:serverless-storage:internalClusterTest`, 28 minutes:
+
+```
+87 classes, 219 tests, 5 skipped, 8 failures
+```
+
+Every one of the eight was checked against an unmodified tree rather than assumed, because the run was made
+with the mapping-stats fix in place and a failure list is worthless without that separation.
+
+**Six are pre-existing and deterministic**, and several are the T43/T44/T48 guards written specifically to
+keep the mapping path honest:
+
+```
+BlobBackedDescriptorIT              > testTheConfiguredMappingIndexShardCountIsUsed
+BlobBackedDescriptorIT              > testOperationsAGatedIndexCannotSupportFailClearly
+GatedCreateTimeMappingIT            > testAGatedCreationDoesNotReadAMappingThatCannotExist
+GatedMappingIndexLossIT             > testAMappingWriteAfterTheMappingIndexIsDeletedFailsRatherThanRewriting
+GatedMappingMissingWindowIT         > testAReadFailsInTheWindowAndSucceedsOnceResolutionCatchesUp
+GatedMappingOffClusterStateThreadIT > testNeitherCreationNorPutMappingTouchesTheStoreFromAClusterStateThread
+```
+
+They cluster in one place, and the place is the one T58 changed: these are the tests of what a mapping store
+must do when it cannot read, when its index is lost, and when it must stay off the cluster state thread.
+Moving mappings into the descriptor moved the behaviour those guards describe without moving the guards.
+That is the same root as the stats regression, seen from a third side.
+
+**Two are flaky rather than broken**, and both were confirmed by repetition rather than by argument:
+
+- `ServerlessStorageAffinityForwardingIT` fails on an unmodified tree too, and worse there --
+  `testMixedGatedAndOrdinaryIndicesNeverForwards` and `testRequestAlreadyOnTheAffinityNodeIsNotForwarded`
+  both fail on baseline against one of them with the fix in place.
+- `ServerlessStoragePreWarmChaosIT#testClusterSurvivesANodeDyingDuringGatedPreWarmDispatch`, G4's own chaos
+  test, fails about two runs in five in isolation. It kills a randomly chosen data node, so which shards go
+  with it varies by seed, and G4's own text already records that a gated shard's primary can take minutes to
+  be re-derived after its host dies. This is that finding surfacing as an intermittent test rather than a new
+  defect.
+
+`GatedIdleEvictionIT#testResidencyIsBoundedByArrivalRateRatherThanByPopulation` is flaky too, at about one
+run in two in isolation, on a leftover-index assertion at teardown rather than in its own body.
+
+The unit suites are green -- `:plugins:serverless-storage:test` at 236 classes / 1,275 tests and the core
+seam tests at 50 classes / 2,416 tests, both zero failures -- which is what has kept this looking healthy.
+The per-change discipline the recent commits describe is real, and it is per-change: it does not catch a test
+that a different change broke three commits ago.
+
+`spotlessCheck` also fails on an unmodified tree, on six files from the last week's commits.
+
+**Triaging the six is the highest-value validation work available**, ahead of any new measurement, because
+until they pass a green run proves nothing about what they cover -- and what they cover is the mapping path
+that has now produced two silent defects in eight days.
+
+### The six, triaged and fixed the same day
+
+Five were tests still demanding the contract T58 replaced. Rewriting a failing test to match the code is
+usually how a suite stops meaning anything, so each one was re-pointed at the property the old assertion was
+protecting rather than deleted: a creation that must not read a mapping it cannot have now asserts it does
+not touch the store at all; a lost mapping index now asserts the mapping survives it, because since T58 that
+index is a stats projection and losing it costs a statistic; the threading proof now records the descriptor
+backend, because the creation path stopped reaching the mapping store and a phase that records nothing
+passes every thread check there is.
+
+The sixth was not a test problem. `MappingGenerationStore.currentMapping(uuid, expected)` -- T59's guard
+against reporting an index with declared fields as one with none -- checked only for a **null** answer. That
+was exhaustive against the index-backed store, which either had a document or did not. A descriptor-backed
+store answers for every index that resolves, so a missing mapping comes back as generation 0 with no fields:
+the same wrong answer as a value instead of a null, past a guard written for the reference. Stated over the
+generation now. **This is the fourth mechanism in this area found correct, tested, and unreachable**, and the
+first one where the unreachability was introduced by a change (T58) rather than by never having been wired.
+That is worth naming as its own failure mode: a guard does not have to be deleted to stop guarding -- it only
+has to keep checking a condition the system no longer produces.
+
+A seventh failure appeared once those six were fixed, and it was the fixture: the drain that waits for
+write-behind projections only knew about stores the fixture itself built, so the classes that let the plugin
+wire itself tore their cluster down with a projection still running ("shard is still locked", in a class with
+nothing to do with mappings). `DescriptorGate` keeps the installed store so it can be drained -- in
+`uninstall()` for the node-close case its own javadoc had claimed and never wired, and from the fixture for
+the test one.
+
+The three flaky classes all passed in that run, which is what intermittent failures do and settles nothing.
+A second full run put two of them back, and both had been mislabelled:
+
+**`GatedIdleEvictionIT` was a real race in core.** `removeIndices` walks the index map as it stood when the
+loop began; idle eviction closes gated indices from a thread that deliberately does not hold the applier's
+monitor, removing the index from the map first and clearing its `openedOnDemand` entry after. An eviction
+landing mid-iteration therefore leaves an index that the loop can still see, that nothing claims, and that is
+already gone -- and the loop's remaining checks read "absent from cluster state" as "the cluster manager
+deleted it", ending at an assertion an unpublished index can never satisfy. The guard meant to catch this
+asks `DescriptorOnlyCreation`, a registration that disappears when a node's gate uninstalls while the indices
+it opened are still resident, which is why it surfaced at teardown and looked like a test artefact. The loop
+now skips an index that is no longer in the map. Six consecutive green runs against one failure in three
+before.
+
+**The affinity one was one missing line.** Its symptom -- a write to a freshly created gated index never
+becoming servable within sixty seconds -- reads like a deep property of on-demand shard opening, and was
+`ServerlessStorageAffinityForwardingIT` failing to disable the framework's mock engine. This plugin supplies
+an engine factory, `IndicesService.getEngineFactory` refuses when two plugins claim one index, and on the
+seeds where the randomizer installs the mock one -- about one run in three -- no gated index can open on
+that node. Gating turns that from a failure into a hang: there is no cluster state entry to tell the write
+it will never be servable, so it retries until the suite times out. Seventy-one classes had the override and
+three did not; it is on the shared base class now.
+
+The third, G4's chaos test, stopped reproducing without being touched -- five green runs against two
+failures in five before -- and is not claimed as fixed. It kills nodes while gated indices are open on
+demand, which is the same window the eviction race lives in, so the fix above could account for it; nothing
+here shows that it does.
+
+**Worth noting as a pattern rather than as three fixes.** Two of the three were labelled flaky and neither
+was: each had a single deterministic cause reached by a seed-dependent path. "Flaky" was the label that
+stopped the investigation, and in both cases it was hiding a real defect -- one of them in core.
+
+**The suite is green end to end for the first time**: 87 classes, 219 tests, 5 skipped, 0 failures, 7m 39s,
+alongside `:plugins:serverless-storage:test` at 237/1,277 and the core seam tests at 85/1,069, with
+`spotlessCheck` passing.
+
+### Where the goal actually stands, seventh pass
+
+| ceiling | state |
+|---|---|
+| placement | cleared by Area C. Unaffected by any of the above. |
+| residency | cleared. Gated creations leave zero cluster state bytes, measured in bytes rather than versions (`GatedCreationClusterStateFootprintIT`), and that claim does not depend on the descriptor's storage medium. |
+| throughput, creation | **275/sec for a mapped index**, the ordinary case, so about four days for 100M. 6,011 to 10,505/sec only for the unmapped population nobody creates. Bounded by a `synchronized` block the fast path avoids by declining mappings (T21). |
+| throughput, lookup | **unmeasured on the shipped path.** Every figure quoted for it measured the deleted index. |
+
+### What is actually left
+
+1. **Re-measure lookup against the blob descriptor plane.** This is the load-bearing extrapolation for the
+   whole design and it currently has no measurement behind it at all. Highest value item on this list by a
+   wide margin.
+2. **Measure against a real object store over a network.** Named as open since the delivery gap analysis was
+   written and still open. Every latency claim depends on it, and the design's answer to "the descriptor
+   index got slower" is now "the cache hides the object store", which is precisely what is unmeasured.
+3. **Settle the wildcard freshness contract for a LIST rather than for a search.** H18's answer was correct
+   for the index and does not transfer.
+4. **The S32 retest at saturation**, which decides whether creation batching is worth building.
+5. **A run at a hundred million**, still, and still a fleet exercise.
+6. **The serverless-only precondition**, still the one genuine product decision.
+
+### The lesson, which is the same one this project keeps finding one level up
+
+The sixth review's own closing paragraph says every cycle's real output was a corrected assumption rather
+than code, and lists four. It could not list the largest one, which was running underneath it: the reviews
+were auditing the task list against the plan, and the plan against itself. Grounding either against the tree
+is a different operation, and it is the one that finds a document arguing from deleted machinery.
+
+`docs/rounds/STATE.md` already carries a correction of exactly this shape, dated 2026-08-12, about its own
+task numbers. It ends with an instruction that generalises: re-run the check yourself and do not propagate
+the table forward again without it. That instruction belongs at the top of this document too.
 

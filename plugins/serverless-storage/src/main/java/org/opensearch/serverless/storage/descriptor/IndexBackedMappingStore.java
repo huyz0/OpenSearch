@@ -189,6 +189,14 @@ public final class IndexBackedMappingStore implements MappingGenerationStore.Sto
         if (expectedGeneration < 0) {
             throw new IllegalArgumentException("expectedGeneration must be non-negative: " + expectedGeneration);
         }
+        // A write must re-check when the index has been lost, because the "it exists" latch outlives the
+        // index it describes. Without this the first creation on a node wins the flag permanently and every
+        // write after the index is deleted addresses a name with nothing behind it -- auto-created at
+        // cluster defaults if auto-creation is on, which silently discards the configured geometry, and
+        // rejected if it is not.
+        if (mappingIndexWasDeleted.getAsBoolean()) {
+            indexKnownToExist.set(false);
+        }
         ensureIndexExists();
         try {
             Map<String, Object> source = new HashMap<>();
@@ -267,6 +275,12 @@ public final class IndexBackedMappingStore implements MappingGenerationStore.Sto
         if (indexKnownToExist.get()) {
             return;
         }
+        // Falls through to the create below when the index is genuinely absent, which is the only correct
+        // reading of a latch that has never been set. What this must not do is skip creation because the
+        // index existed once: the flag is per-node and lives as long as the node, so an index deleted
+        // underneath it leaves every later write addressing something that is not there. The watcher exists
+        // to notice exactly that, and until now only the read path consulted it -- reads failed honestly
+        // while writes carried on into the void.
         try {
             client.admin()
                 .indices()
@@ -304,10 +318,12 @@ public final class IndexBackedMappingStore implements MappingGenerationStore.Sto
                         )
                 )
                 .actionGet();
+            waitUntilRoutable();
             indexKnownToExist.set(true);
         } catch (Exception e) {
             if (e instanceof org.opensearch.ResourceAlreadyExistsException
                 || e.getCause() instanceof org.opensearch.ResourceAlreadyExistsException) {
+                waitUntilRoutable();
                 indexKnownToExist.set(true);
                 // Logged because this is the one moment a configured shard count is silently discarded. An
                 // index's geometry is fixed at creation, so a node that starts after this index exists reads
@@ -317,6 +333,37 @@ public final class IndexBackedMappingStore implements MappingGenerationStore.Sto
                 return;
             }
             throw e instanceof RuntimeException runtime ? runtime : new RuntimeException(e);
+        }
+    }
+
+    /**
+     * Waits until the mapping index can actually be routed to, which is not what an acknowledged creation
+     * means.
+     *
+     * <p>A create returns once the cluster manager has committed the metadata. The write that follows it
+     * resolves shards through the routing table on whichever node handles the request, and that node can
+     * still be a state behind -- {@code OperationRouting.indexShards} then raises {@code
+     * IndexNotFoundException} for an index that demonstrably exists. The window is small enough that a
+     * single caller creating and then writing almost never sees it, which is why it survived until two
+     * projections ran concurrently and one of them lost a mapping's field counts permanently.
+     *
+     * <p>Yellow rather than green: one active copy of each shard is all an index or a search needs, and
+     * waiting for replicas would block on a single-node cluster forever.
+     *
+     * <p>Failure here is not fatal. The flag stays unset, so the next write retries the whole of this, and
+     * the write about to be attempted either succeeds anyway or fails with its own error rather than one
+     * manufactured here.
+     */
+    private void waitUntilRoutable() {
+        try {
+            client.admin()
+                .cluster()
+                .prepareHealth(MAPPING_INDEX)
+                .setWaitForYellowStatus()
+                .setTimeout(org.opensearch.common.unit.TimeValue.timeValueSeconds(30))
+                .get();
+        } catch (Exception e) {
+            logger.debug("[{}] did not become routable before the timeout; the write will find out", MAPPING_INDEX, e);
         }
     }
 }

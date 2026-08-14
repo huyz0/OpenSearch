@@ -12,6 +12,8 @@ import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.action.bulk.BulkRequestBuilder;
 import org.opensearch.action.bulk.BulkResponse;
 import org.opensearch.action.search.SearchResponse;
+import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
+import org.opensearch.cluster.metadata.IndexDescriptor;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.index.query.QueryBuilders;
@@ -353,11 +355,32 @@ public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.Se
             containsString("serverless")
         );
 
-        Exception close = expectThrows(Exception.class, () -> client().admin().indices().prepareClose("tenant-unsupported").get());
-        assertThat(close.getMessage() + String.valueOf(close.getCause()), containsString("serverless"));
+        // Close and open are no longer in this list, and the reason is the point of the test rather than an
+        // exception to it. They stopped being unsupported when they became expressible: IndexDescriptor
+        // carries State, so MetadataIndexStateService's gated paths write descriptor.withState(CLOSE) and
+        // withState(OPEN) and mean it. Settings has no such home, which is why it is still refused above.
+        //
+        // "Unsupported" therefore has to mean "cannot be represented", not "has no cluster state entry", or
+        // this test would freeze the feature set at whatever existed the day it was written -- which is what
+        // it had been doing: both of these were implemented and the assertion that they fail was left
+        // standing, so the suite has been red here rather than telling anyone the capability arrived.
+        assertTrue(client().admin().indices().prepareClose("tenant-unsupported").get().isAcknowledged());
+        assertBusy(() -> assertEquals(IndexDescriptor.State.CLOSE, descriptorOf("tenant-unsupported").state()), 30, TimeUnit.SECONDS);
 
-        Exception open = expectThrows(Exception.class, () -> client().admin().indices().prepareOpen("tenant-unsupported").get());
-        assertThat(open.getMessage() + String.valueOf(open.getCause()), containsString("serverless"));
+        assertTrue(client().admin().indices().prepareOpen("tenant-unsupported").get().isAcknowledged());
+        assertBusy(() -> assertEquals(IndexDescriptor.State.OPEN, descriptorOf("tenant-unsupported").state()), 30, TimeUnit.SECONDS);
+    }
+
+    /**
+     * The descriptor as it currently stands in the object store.
+     *
+     * <p>Read through the resolution seam rather than from a cached copy, so a state change that was written
+     * but never became visible fails this rather than passing on a stale read.
+     */
+    private IndexDescriptor descriptorOf(String name) {
+        IndexDescriptor descriptor = AbsentIndexDescriptorSuppliers.supply(name);
+        assertNotNull("[" + name + "] no longer resolves through the descriptor seam", descriptor);
+        return descriptor;
     }
 
     /**
@@ -433,34 +456,41 @@ public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.Se
      * reverting the plugin to `new IndexBackedMappingStore(client)` left the entire suite green. That is the
      * "configured, registered, and never consulted" shape this area has shipped before.
      */
+    /**
+     * The node setting decides the mapping index's geometry rather than the literal it replaced (T45).
+     *
+     * <p><b>Driven through the store rather than through a gated creation, and that changed for a reason.</b>
+     * This used to create a gated index with a declared mapping and then read the geometry, which worked
+     * while a creation wrote its mapping through {@code MappingGenerationStore}. Since T58 it does not: the
+     * mapping travels inside the descriptor, and the mapping index is written behind the creation, off-thread,
+     * only so the gated population stays aggregatable. Asserting geometry through that path measures a race
+     * between an asynchronous projection and the test framework's own index wipe, not the setting.
+     *
+     * <p>So the store is asked to create it directly, which is exactly the code path the setting feeds.
+     */
     public void testTheConfiguredMappingIndexShardCountIsUsed() throws Exception {
-        client().admin()
-            .indices()
-            .create(
-                new org.opensearch.action.admin.indices.create.CreateIndexRequest("gated-geometry").settings(
-                    Settings.builder()
-                        .put(org.opensearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
-                        .put(org.opensearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
-                        .put("index.serverless_storage.enabled", true)
-                        .build()
-                ).mapping(java.util.Map.of("properties", java.util.Map.of("tenant", java.util.Map.of("type", "keyword"))))
-            )
-            .actionGet();
-
-        assertBusy(() -> {
-            var settings = client().admin()
-                .indices()
-                .prepareGetSettings(org.opensearch.serverless.storage.descriptor.IndexBackedMappingStore.MAPPING_INDEX)
-                .get();
-            assertEquals(
-                "the node setting must decide the mapping index's geometry, not the literal it replaced",
-                "3",
-                settings.getSetting(
-                    org.opensearch.serverless.storage.descriptor.IndexBackedMappingStore.MAPPING_INDEX,
-                    org.opensearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_SHARDS
+        new IndexBackedMappingStore(client(), ServerlessStoragePlugin.SERVERLESS_STORAGE_MAPPING_INDEX_SHARDS_SETTING.get(nodeSettings(0)))
+            .compareAndSwap(
+                "geometry-uuid",
+                0L,
+                new org.opensearch.cluster.metadata.MappingGenerationStore.MappingGeneration(
+                    1L,
+                    java.util.Map.of("tenant", java.util.Map.of("type", "keyword"))
                 )
             );
-        });
+
+        var settings = client().admin()
+            .indices()
+            .prepareGetSettings(org.opensearch.serverless.storage.descriptor.IndexBackedMappingStore.MAPPING_INDEX)
+            .get();
+        assertEquals(
+            "the node setting must decide the mapping index's geometry, not the literal it replaced",
+            "3",
+            settings.getSetting(
+                org.opensearch.serverless.storage.descriptor.IndexBackedMappingStore.MAPPING_INDEX,
+                org.opensearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_SHARDS
+            )
+        );
     }
 
 }

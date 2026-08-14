@@ -1,5 +1,28 @@
 # Area A task plan: name index tier
 
+> **Retired 2026-08-03. None of this will be built, and the part of it that was built has been deleted.**
+>
+> `c8cf356c2b9` (S5) removed the name index. Nothing in the tree implements any task below; there is no
+> `org.opensearch.serverless.storage.nameindex` package. The reason is not that the design was wrong -- S13's
+> sizing held -- but that the problem went away. A wildcard is answerable from one bounded
+> `listBlobsByPrefixInSortedOrder` against the `descriptors/` prefix, capped at 100 matches, which is a single
+> request whose cost is set by the cap rather than by the population. That is what the tier existed to
+> provide, and it needs no second copy of the name set to keep consistent with the first.
+>
+> What survives from this document, and why it is kept rather than deleted:
+>
+> - **S13's measurements are true** and record what the alternative would have cost: 45.0 B/name compact
+>   against 145.5 B as a `HashMap`, so 4.2 GiB against 13.6 GiB at 100M.
+> - **A4's leading-wildcard question was answered by the API contract, not by a structure.** `*-logs` is
+>   explicitly unsupported and refused, because an object-store prefix listing serves trailing `prefix*` only.
+> - **A3's alias question was answered somewhere else and differently.** S44 (T29) found an alias on a gated
+>   index silently dead and concluded the fix is not to resolve it: `DescriptorRepresentable` refuses to gate
+>   an index carrying an alias, so it keeps its cluster state entry. Whether that refusal is permanent is
+>   `docs/rounds/STATE.md`'s blocked item B2 and is a live question -- but it is a question about gating, not
+>   about a name index tier.
+>
+> Read the seventh review in `plan-100m-index-implementation.md` for how this fits the rest of the plan.
+
 Parent: `plan-100m-index-implementation.md` Part 5, Area A. Evidence: S13 in
 `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.md`.
 

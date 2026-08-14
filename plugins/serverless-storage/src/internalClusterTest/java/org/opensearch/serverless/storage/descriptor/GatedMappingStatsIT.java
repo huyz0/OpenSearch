@@ -8,10 +8,14 @@
 
 package org.opensearch.serverless.storage.descriptor;
 
+import org.opensearch.Version;
 import org.opensearch.action.admin.cluster.stats.GatedMappingStatsAggregator;
+import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
+import org.opensearch.cluster.metadata.IndexDescriptor;
 import org.opensearch.cluster.metadata.MappingGenerationStore;
 import org.junit.After;
 
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -29,6 +33,9 @@ public class GatedMappingStatsIT extends org.opensearch.serverless.storage.Serve
 
     @After
     public void clearRegistrations() {
+        // The registries are static and outlive the cluster, so a test that installs the gate and does not
+        // remove it leaves a dead client answering for whatever suite runs next in this JVM.
+        DescriptorGate.uninstall();
         GatedMappingStatsAggregator.register(null);
         MappingGenerationStore.register(null);
     }
@@ -96,6 +103,74 @@ public class GatedMappingStatsIT extends org.opensearch.serverless.storage.Serve
         assertNull(
             "an unavailable store must degrade to no gated counts, not to a failed stats request",
             new IndexBackedMappingStatsAggregator(client()).aggregate()
+        );
+    }
+
+    /**
+     * The test the regression got past, written the way it should have been in the first place.
+     *
+     * <p>Every other test in this class writes through a hand-built {@link IndexBackedMappingStore}, so all
+     * of them keep passing no matter what the gate actually registers. That is how the mapping store could
+     * move into the descriptor -- correctly, and for good reasons -- while leaving the aggregator reading an
+     * index with no writer, and nothing went red. This one writes through {@link MappingGenerationStore},
+     * the seam production registers, so it fails if the registered store stops feeding the projection.
+     *
+     * <p>The projection is asynchronous by design, so this waits for it rather than asserting immediately.
+     * Waiting is not a weaker assertion here: the counts are eventually consistent on purpose, and a test
+     * demanding them synchronously would be asserting a property the design deliberately does not have.
+     */
+    public void testMappingsWrittenThroughTheRegisteredSeamReachTheAggregate() throws Exception {
+        InstalledDescriptorPlane plane = installBlobBackedDescriptorPlane();
+
+        // A descriptor for each index, because a descriptor is what the registered store writes the mapping
+        // onto, and it is keyed by name while a mapping swap carries a uuid.
+        plane.points().put(descriptor("seam-a"));
+        plane.points().put(descriptor("seam-b"));
+
+        // Resolve both by name first, the way any request touching a gated index does before it reaches the
+        // mapping path. That is not test scaffolding: descriptors are keyed by name and a mapping swap
+        // carries only a uuid, so resolution is where the store learns the uuid-to-name entry it needs.
+        // Writing the descriptor without resolving it is a state no request can produce.
+        assertNotNull(AbsentIndexDescriptorSuppliers.supply("seam-a"));
+        assertNotNull(AbsentIndexDescriptorSuppliers.supply("seam-b"));
+
+        assertEquals(1L, MappingGenerationStore.createMapping("seam-a-uuid", Map.of("a1", "keyword", "a2", "keyword")));
+        assertEquals(1L, MappingGenerationStore.createMapping("seam-b-uuid", Map.of("b1", "keyword", "b2", "long")));
+
+        assertBusy(() -> {
+            // The projection creates the index on its first write, so early rounds can find it absent. That
+            // is the asynchrony under test, not a failure, so it retries rather than throwing.
+            try {
+                client().admin().indices().prepareRefresh(IndexBackedMappingStore.MAPPING_INDEX).get();
+            } catch (org.opensearch.index.IndexNotFoundException e) {
+                fail("the projection has not created the mapping index yet");
+            }
+            var counts = new IndexBackedMappingStatsAggregator(client()).aggregate();
+            assertNotNull("a mapping written through the registered store must reach the aggregate", counts);
+            assertEquals("three keyword fields across both indices", Integer.valueOf(3), counts.fieldCounts().get("keyword"));
+            assertEquals(Integer.valueOf(1), counts.fieldCounts().get("long"));
+            assertEquals(Integer.valueOf(2), counts.indexCounts().get("keyword"));
+            assertEquals(Integer.valueOf(1), counts.indexCounts().get("long"));
+        }, 30, java.util.concurrent.TimeUnit.SECONDS);
+    }
+
+    /** A descriptor for the registered store to resolve and write a mapping onto. */
+    private static IndexDescriptor descriptor(String name) {
+        return new IndexDescriptor(
+            name,
+            name + "-uuid",
+            1,
+            0,
+            true,
+            IndexDescriptor.State.OPEN,
+            List.of(),
+            Version.CURRENT.id,
+            false,
+            false,
+            false,
+            false,
+            0L,
+            1_700_000_000_000L
         );
     }
 

@@ -308,10 +308,25 @@ public final class MappingGenerationStore {
      * the two apart -- the store itself cannot, which is why this lives here rather than in {@code
      * Store.read}.
      *
+     * <p><b>Why a null answer is not the only shape of this.</b> T59 checked only for null, which was
+     * exhaustive while the registered store was the index-backed one: it had a document or it did not. T58
+     * made the descriptor itself the store, and a descriptor that resolves always answers -- with its own
+     * generation and its own fields, which for an index whose mapping is missing is generation 0 and no
+     * fields. That is the identical wrong answer arriving as a value rather than as a null, so the guard has
+     * to be stated over the generation rather than over the reference; written the narrow way it survived
+     * T58 as one more mechanism that is correct, tested, and no longer reachable by the path it was built
+     * for. A store *behind* what the caller's descriptor claims is the same inconsistency for the same
+     * reason: the caller resolved a descriptor at generation N, and a mapping at anything below N cannot
+     * contain what generation N declared.
+     *
+     * <p>Only {@code StoreBackedFieldRefresher} passes a non-zero generation, and its alternative on a wrong
+     * answer is to report the field absent and let the caller infer it fresh -- which is precisely the
+     * silent overwrite this exists to prevent, so failing the read is the better of the two.
+     *
      * @param expectedGeneration the calling descriptor's {@code mappingGeneration}, or 0 when there is none
      *                           to check against, in which case this behaves exactly like {@link
      *                           #currentMapping(String)}
-     * @throws MissingMappingException when the store answers absent but the descriptor says otherwise
+     * @throws MissingMappingException when the store cannot answer at the generation the descriptor claims
      */
     public static MappingGeneration currentMapping(String indexUuid, long expectedGeneration) {
         if (STORE.get() == null) {
@@ -321,8 +336,8 @@ public final class MappingGenerationStore {
             return null;
         }
         MappingGeneration current = currentMapping(indexUuid);
-        if (current == null && expectedGeneration > 0) {
-            throw new MissingMappingException(indexUuid, expectedGeneration);
+        if (expectedGeneration > 0 && (current == null || current.generation() < expectedGeneration)) {
+            throw new MissingMappingException(indexUuid, expectedGeneration, current == null ? -1L : current.generation());
         }
         return current;
     }
@@ -336,15 +351,18 @@ public final class MappingGenerationStore {
      * it caught this and returned null or false.
      */
     public static final class MissingMappingException extends IllegalStateException {
-        public MissingMappingException(String indexUuid, long expectedGeneration) {
+
+        /** @param storedGeneration what the store answered with, or -1 when it answered nothing at all. */
+        public MissingMappingException(String indexUuid, long expectedGeneration, long storedGeneration) {
             super(
                 "index ["
                     + indexUuid
                     + "]'s descriptor claims mapping generation ["
                     + expectedGeneration
-                    + "] but the mapping store holds no document for it, so the mapping is missing rather "
-                    + "than empty; answering null here would report an index with declared fields as one "
-                    + "with none"
+                    + "] but the mapping store "
+                    + (storedGeneration < 0 ? "holds no document for it" : "is at generation [" + storedGeneration + "]")
+                    + ", so the mapping is missing rather than empty; answering here would report an index "
+                    + "with declared fields as one with none"
             );
         }
     }

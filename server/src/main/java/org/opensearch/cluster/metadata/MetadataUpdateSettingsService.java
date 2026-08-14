@@ -149,44 +149,38 @@ public class MetadataUpdateSettingsService {
         //
         // Checked on this thread, which is the transport thread that received the request, because resolving
         // a descriptor is a remote read and the seam refuses to answer on the cluster state thread.
+        //
+        // This refusal was briefly replaced by an "off the cluster state thread" implementation that resolved
+        // each descriptor, republished it unchanged, and answered acknowledged. It moved the work off the
+        // thread, which it set out to do, and did not apply the settings: request.settings() was never read.
+        // So a caller's update was validated, discarded, and reported as successful -- the silent-success
+        // failure this area keeps producing, with the paragraph above still sitting over it explaining why it
+        // could not work. Restored, because the alternative is not "implement it here": settings have to have
+        // somewhere to live on the descriptor first, the way mappings were given somewhere to live, and until
+        // they do the honest answer to this request is no.
+        //
+        // Close and open are deliberately not refused alongside it. Those are expressible -- IndexDescriptor
+        // carries State, and their gated paths really do write descriptor.withState(...) -- which is the
+        // difference between an operation that is unsupported and one that merely has no cluster state entry.
         final java.util.List<Index> gated = AbsentIndexDescriptorSuppliers.gatedAmong(clusterService.state().metadata(), request.indices());
         if (gated.isEmpty() == false) {
-            if (gated.size() > 50) {
-                listener.onFailure(
-                    new IllegalArgumentException(
-                        "Multi-index settings updates on serverless indices exceeding 50 targets are disabled to prevent high-cost Object Storage operations. Specified: "
-                            + gated.size()
-                    )
-                );
-                return;
-            }
-            if (gated.size() == request.indices().length) {
-                try {
-                    validateRefreshIntervalSettings(normalizedSettings, clusterService.getClusterSettings());
-                    validateTranslogDurabilitySettings(
-                        normalizedSettings,
-                        clusterService.getClusterSettings(),
-                        clusterService.getSettings()
-                    );
-                    indexScopedSettings.validate(
-                        normalizedSettings.filter(s -> Regex.isSimpleMatchPattern(s) == false),
-                        false,
-                        false,
-                        true,
-                        true
-                    );
-                } catch (Exception e) {
-                    listener.onFailure(e);
+            // The index must still exist, and saying so first matters: an operator who mistyped a name needs
+            // "no such index", not "unsupported", or they will go looking for a feature gap instead of a typo.
+            for (Index index : gated) {
+                IndexDescriptor descriptor = AbsentIndexDescriptorSuppliers.supply(index.getName());
+                if (descriptor == null || descriptor.exists() == false) {
+                    listener.onFailure(new IndexNotFoundException(index.getName()));
                     return;
                 }
-                updateGatedSettings(request, gated, listener);
-                return;
             }
             listener.onFailure(
                 new UnsupportedOperationException(
                     "cannot update settings on serverless "
                         + (gated.size() == 1 ? "index " + gated.get(0).getName() : "indices " + gated)
-                        + ": mixed request with ordinary and serverless indices is not supported"
+                        + (gated.size() == request.indices().length
+                            ? ": a serverless index keeps no settings in cluster state and its descriptor has "
+                                + "nowhere to record arbitrary ones"
+                            : ": mixed request with ordinary and serverless indices is not supported")
                 )
             );
             return;
@@ -671,24 +665,4 @@ public class MetadataUpdateSettingsService {
         }
     }
 
-    private void updateGatedSettings(
-        final UpdateSettingsClusterStateUpdateRequest request,
-        final java.util.List<Index> gatedIndices,
-        final ActionListener<ClusterStateUpdateResponse> listener
-    ) {
-        threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
-            try {
-                for (Index index : gatedIndices) {
-                    IndexDescriptor descriptor = AbsentIndexDescriptorSuppliers.supply(index.getName());
-                    if (descriptor == null || descriptor.exists() == false) {
-                        throw new IndexNotFoundException(index.getName());
-                    }
-                    IndexDescriptorPublisher.updateGated(descriptor);
-                }
-                listener.onResponse(new ClusterStateUpdateResponse(true));
-            } catch (Exception e) {
-                listener.onFailure(e);
-            }
-        });
-    }
 }

@@ -52,7 +52,7 @@ import java.util.List;
  *
  * That a read for a field this shard has never merged fails outright while the descriptor plane claims a
  * generation the store cannot back, through the real registered {@link StoreBackedFieldRefresher} against a
- * live shard's real {@link MapperService} and the real {@link IndexBackedMappingStore} -- rather than the
+ * live shard's real {@link MapperService} and the real store the plugin registers -- rather than the
  * field being silently reported absent, which is what {@link StoreBackedFieldRefresher#refresh} did before
  * T59, and which would have sent a caller to infer the field fresh, replacing whatever the descriptor
  * claims with whatever it happened to see. Once the descriptor plane is consistent again -- the second half
@@ -129,9 +129,12 @@ public class GatedMappingMissingWindowIT extends org.opensearch.serverless.stora
         String uuid = resolveIndex(INDEX).getUUID();
         MapperService mapperService = mapperServiceFor(INDEX);
 
-        // What the store holds: nothing. An ordinary, freshly created index has never had anything written
-        // to .opensearch-index-mappings for its uuid, matching T47's prune -- the document is gone for the
-        // same reason, whether by never having existed or by having been removed.
+        // What the store holds for this index: nothing declared, which since T58 means its descriptor at
+        // generation 0 with no fields rather than an absent document. That is the same state T47's prune
+        // leaves behind, and the shape that made this test fail after T58 rather than the test being wrong:
+        // the guard it drives checked for a null answer, and the descriptor-backed store answers for every
+        // index that resolves. The check is stated over the generation now, so this window is reachable
+        // again by the path production actually takes.
         //
         // What a stale-cache node's descriptor plane still says: generation 1, exactly what a node that
         // resolved this name moments before a still-in-flight prune, or that has simply never been told

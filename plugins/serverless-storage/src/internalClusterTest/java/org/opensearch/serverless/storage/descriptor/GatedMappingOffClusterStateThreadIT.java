@@ -58,6 +58,14 @@ import java.util.concurrent.ConcurrentHashMap;
  * <p>It can also record only the phase that was already safe. Creation and put-mapping are separate callers
  * that were fixed at different times for different reasons, so they are counted separately rather than
  * summed.
+ *
+ * <p><b>T58 turned the first of those into a live failure rather than a hypothetical.</b> A creation's
+ * mapping rides its descriptor now and never reaches {@code MappingGenerationStore}, so the creation phases
+ * recorded nothing at all and passed on the strength of it. Both planes are watched since: the mapping store,
+ * and the descriptor backend the gate's hooks write through. The backend's blocking calls answer the thread
+ * question; its asynchronous ones answer only "this phase reached the plane", because handing a descriptor
+ * write to an executor from the cluster state thread is this design working rather than the defect it was
+ * built to prevent.
  */
 public class GatedMappingOffClusterStateThreadIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
 
@@ -131,12 +139,28 @@ public class GatedMappingOffClusterStateThreadIT extends org.opensearch.serverle
     }
 
     public void testNeitherCreationNorPutMappingTouchesTheStoreFromAClusterStateThread() throws Exception {
-        installBlobBackedDescriptorPlane();
-        RecordingStore store = new RecordingStore(new IndexBackedMappingStore(client()));
+        // Two recorders, because since T58 the two phases write to different places. A put-mapping goes
+        // through MappingGenerationStore; a creation's mapping rides the descriptor its creation writes, so
+        // it never reaches that store at all -- which is why the premise guard below reads both. Watching
+        // only the mapping store leaves the creation phases proving nothing, and a phase that records
+        // nothing passes every thread check there is.
+        java.util.concurrent.atomic.AtomicReference<RecordingBackend> recorded = new java.util.concurrent.atomic.AtomicReference<>();
+        var plane = installBlobBackedDescriptorPlane(true, delegate -> {
+            RecordingBackend recording = new RecordingBackend(delegate);
+            recorded.set(recording);
+            return recording;
+        });
+        RecordingBackend backend = recorded.get();
+        // Descriptor-backed rather than index-backed, because that is the half of the registered store a
+        // mapping write actually goes through since T58. An index-backed one here also raced the stats
+        // projection for the creation of .opensearch-index-mappings and failed the put-mapping on a shard
+        // that was still recovering -- a fight between two stores that production does not have.
+        RecordingStore store = new RecordingStore(new DescriptorBackedMappingStore(plane::points, null));
         MappingGenerationStore.register(store);
 
         checkPhase(
             store,
+            backend,
             "gated creation",
             () -> client().admin()
                 .indices()
@@ -153,6 +177,7 @@ public class GatedMappingOffClusterStateThreadIT extends org.opensearch.serverle
 
         checkPhase(
             store,
+            backend,
             "template-gated creation",
             () -> client().admin()
                 .indices()
@@ -171,6 +196,7 @@ public class GatedMappingOffClusterStateThreadIT extends org.opensearch.serverle
 
         checkPhase(
             store,
+            backend,
             "put-mapping",
             () -> client().admin()
                 .indices()
@@ -196,7 +222,7 @@ public class GatedMappingOffClusterStateThreadIT extends org.opensearch.serverle
      * entered, because the thread is recorded before the call is delegated, so the check runs in a finally
      * and names the offending thread even when the request never comes back.
      */
-    private void checkPhase(RecordingStore store, String phase, Runnable request) {
+    private void checkPhase(RecordingStore store, RecordingBackend backend, String phase, Runnable request) {
         Throwable failure = null;
         try {
             request.run();
@@ -206,7 +232,13 @@ public class GatedMappingOffClusterStateThreadIT extends org.opensearch.serverle
             // Rethrown below, after the evidence has been read.
             failure = e;
         }
-        Set<String> threads = store.takeThreads();
+        // Only calls that block are held to the thread rule. A descriptor write handed to an executor from
+        // the cluster state thread is the design working, not a violation of it, so recording those here
+        // would fail the very shape T58 introduced -- while a phase that reached the plane only that way
+        // still counts as evidence for the premise below.
+        Set<String> threads = new java.util.HashSet<>(store.takeThreads());
+        threads.addAll(backend.takeBlockingThreads());
+        Set<String> touched = backend.takeAnyThreads();
         assertNoneForbidden(phase, threads);
         // The request's own failure goes into this message rather than replacing it. With the tripwire in
         // place a regression presents as a refused creation rather than a blocked thread, so the store is
@@ -214,9 +246,9 @@ public class GatedMappingOffClusterStateThreadIT extends org.opensearch.serverle
         // place. The reason is right here.
         assertFalse(
             phase
-                + " never reached the mapping store, so this proves nothing about it"
+                + " reached neither the mapping store nor the descriptor backend, so this proves nothing"
                 + (failure == null ? "" : ", and it failed with: " + failure),
-            threads.isEmpty()
+            threads.isEmpty() && touched.isEmpty()
         );
         if (failure instanceof RuntimeException runtime) {
             throw runtime;
@@ -237,6 +269,128 @@ public class GatedMappingOffClusterStateThreadIT extends org.opensearch.serverle
                     thread.contains(forbidden)
                 );
             }
+        }
+    }
+
+    /**
+     * The same for the descriptor plane, recording only the calls that block.
+     *
+     * <p>The asynchronous ones are safe from this class's question by construction -- they hand the work to
+     * an executor and return -- and recording them would put GENERIC in the evidence for a call that never
+     * touched it. What matters here is {@code get}, {@code create} and {@code put}: they do the I/O on the
+     * caller's thread, which is exactly the property that made the pre-T19 put-mapping fatal.
+     */
+    private static final class RecordingBackend implements DescriptorBackend {
+
+        private final DescriptorBackend delegate;
+        private final Set<String> blocking = ConcurrentHashMap.newKeySet();
+        private final Set<String> any = ConcurrentHashMap.newKeySet();
+
+        RecordingBackend(DescriptorBackend delegate) {
+            this.delegate = delegate;
+        }
+
+        /** A call that does its I/O on this thread, and so is subject to the question this class asks. */
+        private void record() {
+            blocking.add(Thread.currentThread().getName());
+            touch();
+        }
+
+        /** A call that only hands work to an executor. Evidence the phase reached the plane, nothing more. */
+        private void touch() {
+            any.add(Thread.currentThread().getName());
+        }
+
+        @Override
+        public org.opensearch.cluster.metadata.IndexDescriptor get(String name) {
+            record();
+            return delegate.get(name);
+        }
+
+        @Override
+        public org.opensearch.cluster.metadata.IndexDescriptor getIfFresh(String name) {
+            touch();
+            return delegate.getIfFresh(name);
+        }
+
+        @Override
+        public boolean create(org.opensearch.cluster.metadata.IndexDescriptor descriptor) {
+            record();
+            return delegate.create(descriptor);
+        }
+
+        @Override
+        public java.util.concurrent.CompletableFuture<Boolean> createAsync(org.opensearch.cluster.metadata.IndexDescriptor descriptor) {
+            touch();
+            return delegate.createAsync(descriptor);
+        }
+
+        @Override
+        public void put(org.opensearch.cluster.metadata.IndexDescriptor descriptor) {
+            record();
+            delegate.put(descriptor);
+        }
+
+        @Override
+        public void putAsync(org.opensearch.cluster.metadata.IndexDescriptor descriptor) {
+            touch();
+            delegate.putAsync(descriptor);
+        }
+
+        @Override
+        public void putAsync(
+            org.opensearch.cluster.metadata.IndexDescriptor descriptor,
+            org.opensearch.core.action.ActionListener<Void> listener
+        ) {
+            touch();
+            delegate.putAsync(descriptor, listener);
+        }
+
+        @Override
+        public void putTombstoneAsync(org.opensearch.cluster.metadata.IndexDescriptor tombstone) {
+            touch();
+            delegate.putTombstoneAsync(tombstone);
+        }
+
+        @Override
+        public void putTombstoneAsync(
+            org.opensearch.cluster.metadata.IndexDescriptor tombstone,
+            org.opensearch.core.action.ActionListener<Void> whenDurable
+        ) {
+            touch();
+            delegate.putTombstoneAsync(tombstone, whenDurable);
+        }
+
+        @Override
+        public boolean available() {
+            return delegate.available();
+        }
+
+        @Override
+        public void warmAsync(java.util.Collection<String> names, org.opensearch.core.action.ActionListener<Void> listener) {
+            delegate.warmAsync(names, listener);
+        }
+
+        @Override
+        public void invalidate(String name) {
+            delegate.invalidate(name);
+        }
+
+        Set<String> takeBlockingThreads() {
+            return drain(blocking);
+        }
+
+        Set<String> takeAnyThreads() {
+            return drain(any);
+        }
+
+        private static Set<String> drain(Set<String> from) {
+            Set<String> taken = new java.util.HashSet<>();
+            for (java.util.Iterator<String> each = from.iterator(); each.hasNext();) {
+                taken.add(each.next());
+                each.remove();
+            }
+            return taken;
         }
     }
 

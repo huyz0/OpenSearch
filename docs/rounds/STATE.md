@@ -3,7 +3,160 @@
 Read this first, every time. It is the only source of truth for where work stands, and it
 is written to survive context loss: nothing here depends on remembering a previous session.
 
-Updated: 2026-08-12 (correction below; body past this point not re-verified line by line)
+Updated: 2026-08-15 (second correction below; the 2026-08-12 one and the body past it are unchanged)
+
+## Correction, 2026-08-15: the suites were not green, and the plan argued from deleted machinery
+
+**Both are now fixed** -- `internalClusterTest` is green end to end, and the plan carries its correction.
+The section below is kept in the order it was found, because what it found is worth more than its
+conclusion: the suite had eight failures, six of them deterministic, and three of the eight turned out to be
+defects in the product rather than in the tests.
+
+Two things found by grounding the documents against the tree rather than against each other. The full
+write-up is the **seventh review** at the end of `plan-100m-index-implementation.md`; this is the part a
+reader needs before picking up any task.
+
+**1. `internalClusterTest` was red before anyone changed anything.** The full plugin suite has now been run
+end to end -- 87 classes, 219 tests, 5 skipped, **8 failures**, 28 minutes -- which does not appear to have
+happened before. Each failure was checked against an unmodified tree rather than assumed.
+
+**Six are pre-existing and deterministic**, and they cluster in exactly the place T58 changed: the guards for
+what a mapping store does when it cannot read, when its index is lost, and when it must stay off the cluster
+state thread.
+
+```
+BlobBackedDescriptorIT              > testTheConfiguredMappingIndexShardCountIsUsed
+BlobBackedDescriptorIT              > testOperationsAGatedIndexCannotSupportFailClearly
+GatedCreateTimeMappingIT            > testAGatedCreationDoesNotReadAMappingThatCannotExist
+GatedMappingIndexLossIT             > testAMappingWriteAfterTheMappingIndexIsDeletedFailsRatherThanRewriting
+GatedMappingMissingWindowIT         > testAReadFailsInTheWindowAndSucceedsOnceResolutionCatchesUp
+GatedMappingOffClusterStateThreadIT > testNeitherCreationNorPutMappingTouchesTheStoreFromAClusterStateThread
+```
+
+**Three looked flaky**, all confirmed by repetition rather than argument -- and two of the three turned out
+not to be flaky at all, only intermittent, which is not the same thing. Both had a single deterministic
+cause reached by a seed-dependent path, and both are fixed below.
+`ServerlessStorageAffinityForwardingIT` (fails on an unmodified tree too, and worse there -- two of its tests
+rather than one); `ServerlessStoragePreWarmChaosIT#testClusterSurvivesANodeDyingDuringGatedPreWarmDispatch`,
+G4's own chaos test, about two runs in five, which is G4's own recorded "a gated shard's primary can take
+minutes to be re-derived after its host dies" surfacing as an intermittent test; and
+`GatedIdleEvictionIT#testResidencyIsBoundedByArrivalRateRatherThanByPopulation`, about one run in two, on a
+leftover-index assertion at teardown rather than in its own body.
+
+**The eviction one was a real race in core, and it is fixed.** Not a flaky test: `removeIndices` iterates
+`indicesService`, which hands out the index map as it was when the loop started, and idle eviction closes
+gated indices from another thread that deliberately does not hold the applier's monitor. The close removes
+the index from the map first and clears its `openedOnDemand` entry after, so an eviction landing
+mid-iteration leaves an index in the loop's stale snapshot that is no longer held on demand and no longer
+there to remove -- and every check below reads that as "the cluster manager took this away", ending at an
+assertion that it must have been deleted or the cluster be new. Neither is true of an index that was never
+published. The gated guard that should have caught it asks `DescriptorOnlyCreation`, whose registration goes
+away when a node's gate uninstalls while the indices it opened are still resident, which is why this
+surfaced at teardown. `IndicesClusterStateService` now skips an index that is no longer in the map at all:
+it is not that loop's to reason about, whoever closed it. **Six consecutive green runs against one failure
+in three before it.**
+
+**The affinity one was a missing line in one file.** `ServerlessStorageAffinityForwardingIT` never disabled
+the framework's mock engine, and this plugin supplies an engine factory of its own:
+`IndicesService.getEngineFactory` refuses when two plugins claim one index, so on the seeds where the
+randomizer installs `MockEngineFactoryPlugin` -- about one run in three -- no gated index can open on that
+node at all. For a gated index that is a hang rather than a failure: it has no cluster state entry, so
+nothing tells the write it will never be servable, and it retries until the suite times out twenty minutes
+later. Read as "a write to a freshly created gated index sometimes never becomes servable", which sounds
+like a deep property of on-demand shard opening and was one line of test wiring. Seventy-one other classes
+had the override; three did not. It is declared on `ServerlessStorageIntegTestCase` now, so the next test
+cannot omit it.
+
+**The chaos one stopped reproducing and is not claimed as fixed.** Five consecutive green runs against two
+failures in five before, with no change made to it. The eviction race above could account for it -- that
+test kills nodes while gated indices are open on demand, which is the same window -- but nothing here
+demonstrates that, and the alternative explanation is that the box was quieter. Left on this list, with the
+rate re-measured rather than the label repeated.
+
+`DescriptorLifecycleIT#testAGatedIndexLivesItsWholeLifeOutsideClusterState` failed on the unmodified tree and
+passes now, fixed incidentally: `DescriptorGate.supply` never recorded the uuid-to-name entry
+`DescriptorBackedMappingStore` needs, so a node that had only *resolved* an index -- the ordinary case for the
+node handling a write -- read a null mapping and then failed its swap sixteen times before reporting
+"sustained contention" for what was a missing lookup.
+
+The unit suites are green -- `:plugins:serverless-storage:test` at 236 classes / 1,275 tests / 0 failures, and
+the core seam tests at 50 classes / 2,416 tests / 0 failures -- which is what has kept this from being
+visible.
+
+### All eight are now fixed, and three of them were production
+
+Same day, same pass. **`internalClusterTest` is green end to end for the first time: 87 classes, 219 tests,
+5 skipped, 0 failures, 7m 39s.** Alongside it `:plugins:serverless-storage:test` at 237/1,277 and the core
+seam tests at 85/1,069, both zero, and `spotlessCheck` passes.
+
+Five of the six deterministic failures were tests still demanding the contract T58 replaced. The sixth was a
+*guard* T58 made unreachable, and the two remaining "flaky" classes were a race in core and a missing line
+of test wiring -- neither of them flaky, both intermittent for a deterministic reason.
+
+- **`GatedMappingMissingWindowIT` -- a production fix.** T59's check in
+  `MappingGenerationStore.currentMapping(uuid, expected)` refused only a **null** answer, which was
+  exhaustive while the index-backed store was registered: it had a document or it did not. T58 made the
+  descriptor the store, and a descriptor that resolves always answers -- for an index with no mapping, with
+  generation 0 and no fields. The identical wrong answer, arriving as a value rather than as a null, walked
+  straight past the guard. It is stated over the generation now: the store must be able to answer at the
+  generation the caller's descriptor claims, or it refuses. Two unit tests cover behind-the-descriptor and
+  ahead-of-it (ahead is the ordinary stale-resolver case and must **not** fail).
+- **`GatedMappingIndexLossIT`** asserted T48's contract, that losing `.opensearch-index-mappings` fails the
+  next write. That index holds no mapping since T58; it is a stats projection. The assertion inverts --
+  fields survive, writes succeed, the projection rebuilds itself from the next mapping change -- which makes
+  it the live test of the watcher clearing `IndexBackedMappingStore`'s "the index exists" latch.
+- **`GatedCreateTimeMappingIT`** asserted T41's "one swap through the store"; the mapping now rides the
+  descriptor the creation was already writing, so the criterion is zero touches.
+- **`GatedMappingOffClusterStateThreadIT`** watched only the mapping store, which creations no longer reach,
+  so both creation phases recorded nothing -- and a phase that records nothing passes every thread check
+  there is. It records the descriptor backend too, splitting blocking calls (held to the thread rule) from
+  asynchronous ones (evidence the phase reached the plane at all).
+- **`BlobBackedDescriptorIT`** (both) -- one demanded a refusal that close/open have genuinely supported
+  since; the other raced the framework's index wipe.
+
+The one failure left in that run was `GatedMappingMissingWindowIT` failing in *teardown* --
+"shard is still locked" -- with its body green: the fixture's projection drain only knew about stores the
+fixture itself built, so classes that let the plugin wire itself left a write running into a cluster being
+torn down. `DescriptorGate` now keeps the installed store so it can be drained, in `uninstall()` for the
+node-close case and from the fixture for the test one. That drain had been written with a javadoc naming two
+callers and wired to one.
+
+Two practical notes for whoever picks this up. Run the suite with `-Dtests.jvms=2 --max-workers=2`: at the
+default fork count on this box the test workers crash outright ("Could not stop all services"), which is the
+environment rather than the code. And `spotlessCheck` fails on an unmodified tree, on six files from the last
+week's commits -- `./gradlew :plugins:serverless-storage:spotlessApply` fixes it.
+
+**2. The 100M plan reasons about a descriptor system index that was deleted on 2026-08-05**
+(`46cfb963519`), and quotes a creation-throughput figure that has been corrected repeatedly since
+(20,577 -> 235 -> ~550 -> 859/sec across S26-S35, and then overtaken entirely by the post-blob measurements
+in `rfc-100m-index-architecture.md`: **275/sec for a mapped index**, the ordinary case, against 6,011-10,505
+for the unmapped population nobody creates. 100M is about four days of writing, not 70 minutes, and the gap
+is a `synchronized` block the fast path avoids by declining any mapping -- filed as T21). Its
+lookup-latency projection, the load-bearing number
+for the whole design, measured the deleted index and has **no replacement measurement on the shipped blob
+path**. Its two "load-bearing operational parameters", merge policy and refresh interval, are parameters of
+that index and not of what ships.
+
+Nothing about ceiling 1 or ceiling 2 changed. Placement is still cleared, and residency is still zero cluster
+state bytes per gated creation, measured in bytes.
+
+**Fixed in the same pass**: `_cluster/stats` had been silently omitting the gated population's field types
+since 2026-08-08, because `894ac942432` registered `DescriptorBackedMappingStore` in place of the store the
+plugin builds and left `IndexBackedMappingStatsAggregator` reading an index whose writer had just been
+unregistered. `StatsProjectingMappingStore` restores it: descriptor authoritative, mapping index a
+write-behind projection kept only so the aggregate stays one search.
+
+**Two detectors worth reusing, both of which found real defects in one pass:**
+
+- *Which arguments does a method never read?* `DescriptorGate.install` had been accepting the mapping store
+  and ignoring it since T58. The same sweep found
+  `MetadataUpdateSettingsService.updateGatedSettings` never reads its request either -- a settings update on
+  a gated index validates the caller's settings, applies none of them, and answers `acknowledged: true`.
+  Pinned, not fixed: `IndexDescriptor` has nowhere to put settings, so the fix is either to refuse the request
+  or to carry settings on the descriptor as mappings now are, and that is a contract decision.
+- *Does the test fixture build what the plugin builds?* Every mapping-stats test hand-built its own
+  `IndexBackedMappingStore`, so the suite stayed green against a store production did not register. The shared
+  fixture now composes the store the way `ServerlessStoragePlugin` does.
 
 ## Position
 

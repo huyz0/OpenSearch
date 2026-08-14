@@ -112,12 +112,48 @@ public final class DescriptorGate {
      */
     private static IndexDescriptor supply(String name) {
         DescriptorBackend store = STORE.get();
-        return store == null ? null : store.get(name);
+        return remember(store == null ? null : store.get(name));
     }
 
     private static IndexDescriptor supplyIfFresh(String name) {
         DescriptorBackend store = STORE.get();
-        return store == null ? null : store.getIfFresh(name);
+        return remember(store == null ? null : store.getIfFresh(name));
+    }
+
+    /**
+     * Records the descriptor's uuid-to-name entry, which is the only way back from a uuid to a descriptor.
+     *
+     * <p>Descriptors are keyed by name and a mapping update carries a uuid, so {@link
+     * DescriptorBackedMappingStore} keeps a uuid-to-name map and can answer nothing without it. It was
+     * populated on the creation and update paths only, so a node that had merely *resolved* an index -- the
+     * ordinary case for the node handling a write, which resolves the name to route the request -- would
+     * find the map empty, read a null mapping, and then fail its swap sixteen times before reporting
+     * "sustained contention" for what is actually a missing lookup.
+     *
+     * <p>Resolution is the one place that holds a descriptor and its uuid together on every node that will
+     * need them, so it is where the entry belongs.
+     */
+    private static IndexDescriptor remember(IndexDescriptor descriptor) {
+        DescriptorBackedMappingStore.registerDescriptor(descriptor);
+        return descriptor;
+    }
+
+    /**
+     * Feeds a descriptor's own mapping to the stats projection, for the path that never touches the store.
+     *
+     * <p>A gated creation writes its declared mapping inside the descriptor rather than through
+     * {@code MappingGenerationStore}, so {@code StatsProjectingMappingStore} would only ever observe dynamic
+     * field updates and cluster stats would omit every index that declared its fields up front. Called from
+     * both descriptor write hooks for that reason.
+     *
+     * <p>Type-checked rather than added to the {@code Store} interface deliberately: projecting for the
+     * aggregate is not something a mapping store must be able to do, and widening the interface would oblige
+     * every future implementation to have an opinion about cluster stats.
+     */
+    private static void projectMappingForStats(MappingGenerationStore.Store mappingStore, IndexDescriptor descriptor) {
+        if (mappingStore instanceof StatsProjectingMappingStore projecting && descriptor != null) {
+            projecting.projectDescriptorMapping(descriptor.uuid(), descriptor.mappingGeneration(), descriptor.initialMapping());
+        }
     }
 
     public static void install(
@@ -254,6 +290,7 @@ public final class DescriptorGate {
         // appear in the prefix half at all.
         IndexDescriptorPublisher.registerCreator(descriptor -> {
             DescriptorBackedMappingStore.registerDescriptor(descriptor);
+            projectMappingForStats(mappingStore, descriptor);
             java.util.concurrent.CompletableFuture<Boolean> created = store.createAsync(descriptor);
             if (prefixBackend instanceof DescriptorBackend == false || prefixBackend == store) {
                 return created;
@@ -286,6 +323,10 @@ public final class DescriptorGate {
         });
         IndexDescriptorPublisher.registerUpdater(descriptor -> {
             DescriptorBackedMappingStore.registerDescriptor(descriptor);
+            // Also here, not only on creation: a descriptor republished for any other reason carries the
+            // current mapping with it, and projecting it is idempotent under external versioning. Cheaper
+            // than reasoning about which republish paths can and cannot have changed the fields.
+            projectMappingForStats(mappingStore, descriptor);
             java.util.concurrent.CompletableFuture<Boolean> future = new java.util.concurrent.CompletableFuture<>();
             store.putAsync(
                 descriptor,
@@ -294,8 +335,16 @@ public final class DescriptorGate {
             return future;
         });
         // T58: Mappings for gated indices are stored directly inside IndexDescriptors in Object Storage.
-        // Registered for DescriptorBackedMappingStore, IndexBackedMappingStore, and MetadataMappingService callers.
-        MappingGenerationStore.register(new DescriptorBackedMappingStore(STORE::get, null));
+        //
+        // Registered from the caller rather than constructed here, and that is a correction. T58 replaced
+        // the registration of this parameter with a locally constructed DescriptorBackedMappingStore and
+        // left the parameter itself declared and unread, so the store the plugin builds -- and the
+        // MappingIndexWatcher it registers a cluster state listener for -- was assembled and discarded. The
+        // composition of "authoritative descriptor plus stats projection" belongs at the wiring site where
+        // both halves are visible, not hidden behind an ignored argument. See StatsProjectingMappingStore
+        // for what the discarded half turned out to be load-bearing for.
+        MappingGenerationStore.register(mappingStore);
+        INSTALLED_MAPPING_STORE.set(mappingStore);
         // Cluster stats. H19 measured that _cluster/stats reports a plausible wrong number for a gated
         // population, and H20 built a seam through which per-index iteration cannot be expressed. This is
         // the aggregate it was waiting for: one query whose cost is set by the number of field types
@@ -389,6 +438,20 @@ public final class DescriptorGate {
      */
     private static final AtomicReference<BlobDescriptorChangeLog> CHANGE_LOG = new AtomicReference<>();
 
+    /**
+     * The mapping store this node installed, kept only so it can be drained.
+     *
+     * <p>{@link MappingGenerationStore} deliberately exposes no getter -- it is a registration seam, not a
+     * registry to read back -- and the one thing a caller genuinely needs from the installed store is to wait
+     * for its write-behind projections before the node underneath them goes away.
+     */
+    private static final AtomicReference<MappingGenerationStore.Store> INSTALLED_MAPPING_STORE = new AtomicReference<>();
+
+    /** The installed mapping store, for tests that need to wait for its projections. Null when nothing is installed. */
+    public static MappingGenerationStore.Store installedMappingStore() {
+        return INSTALLED_MAPPING_STORE.get();
+    }
+
     /** Installs the change log. Passing null clears it, matching every other registration here. */
     public static void setChangeFeed(BlobDescriptorChangeLog changeLog) {
         CHANGE_LOG.set(changeLog);
@@ -476,6 +539,14 @@ public final class DescriptorGate {
         DurableTombstones.register(null);
         IndexDescriptorPublisher.registerCreator(null);
         IndexDescriptorPublisher.registerUpdater(null);
+        // Before the registration is cleared, and before the node this belongs to finishes closing: a
+        // projection still on the executor has a client that is about to be shut under it, and abandoning it
+        // leaves the field type counts for whatever it was writing under-reporting until that index's next
+        // mapping change. The wait is bounded because a close must finish either way.
+        MappingGenerationStore.Store draining = INSTALLED_MAPPING_STORE.getAndSet(null);
+        if (draining instanceof StatsProjectingMappingStore projecting && projecting.awaitQuiescence(10_000) == false) {
+            logger.warn("mapping stats projections were still running at shutdown; gated field type counts may under-report");
+        }
         MappingGenerationStore.register(null);
         GatedMappingStatsAggregator.register(null);
         DescriptorOnlyCreation.registerAdmissionCheck(null);

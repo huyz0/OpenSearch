@@ -117,8 +117,11 @@ public class GatedCreateTimeMappingIT extends org.opensearch.serverless.storage.
      * that put the measurement class behind a flag in the first place.
      */
     public void testAGatedCreationDoesNotReadAMappingThatCannotExist() throws Exception {
-        installBlobBackedDescriptorPlane();
-        ReadCountingStore counting = new ReadCountingStore(new IndexBackedMappingStore(client()));
+        var plane = installBlobBackedDescriptorPlane();
+        // The descriptor store alone rather than the composition production registers: this counts round
+        // trips, and the write-behind stats projection is neither one of them nor something a count taken on
+        // the calling thread could see.
+        ReadCountingStore counting = new ReadCountingStore(new DescriptorBackedMappingStore(plane::points, null));
         MappingGenerationStore.register(counting);
 
         client().admin()
@@ -130,10 +133,16 @@ public class GatedCreateTimeMappingIT extends org.opensearch.serverless.storage.
             .actionGet();
 
         assertEquals("a creation's mapping read can only answer absent, so it must not be issued", 0L, counting.reads());
-        assertEquals("the mapping still has to be written", 1L, counting.swaps());
-        // And it landed, so this cannot pass by the creation having skipped the store altogether.
+        // This asserted one swap until T58. The write is not gone -- it moved into the descriptor the
+        // creation was already writing, so the declared fields land in the same operation that makes the
+        // index exist, and the round trip T41 removed from the creation path became no round trip at all.
+        // The criterion still has teeth in the direction that matters: routing a creation's mapping back
+        // through this store, by either verb, fails here.
+        assertEquals("a creation's mapping rides its descriptor, so the store must not be touched", 0L, counting.swaps());
+        // And they landed, so this cannot pass by the mapping having been dropped on the way. Read after the
+        // counts, since this read is one.
         var generation = MappingGenerationStore.currentMapping(descriptorUuid("gated-unread"));
-        assertNotNull("the declared fields must still reach the store", generation);
+        assertNotNull("the declared fields must still be readable through the registered store", generation);
         assertEquals("keyword", MappingGenerationStore.typeOf(generation.fields().get("tenant")));
     }
 
