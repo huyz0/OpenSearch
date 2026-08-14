@@ -586,12 +586,58 @@ manifests and a sharded manifest changes what "referenced" means.
 
 **E6. C4 read path.** Read the sharded manifest, fetching only the shards needed.
 
+**Built (2026-08-14), E5 and E6 together with the cleanup resolution E5 calls for.** Both had to land as
+one slice: a write path with no read path is unreadable to every existing caller, and a write/read path
+with no cleanup fix is unsafe to ever turn on. `ManifestShardFunction` (murmurhash3(indexUUID) mod
+shardCount) plus `IndexMetadataManifestSharder` (the carry-forward/rewrite/drop-empty planning step) do
+C3b's partitioning; `ManifestShardContent`/`RemoteManifestShard` are the shard blob's own read/write
+entity, reusing `UploadedManifestShard` as the reference type it was already built to be. `ClusterMetadataManifest`
+gained `CODEC_V6` (`manifestShardCount`, `indexMetadataShards`), with `CODEC_V5` kept readable so existing
+unsharded manifests are not orphaned by the bump -- consistent with E3's "no dormant landing" policy:
+every node flips to writing V6 immediately once this lands.
+`RemoteManifestManager#resolveIndices` is the one seam that decides inline-vs-sharded; off by default
+(`cluster.remote_store.state.manifest.shard_count = 0`), matching the rest of this plan's default-off
+discipline for unmeasured mechanisms.
+
+The cleanup resolution turned out to have more call sites than E5's own text anticipated: not just the GC
+sweep, but `RemoteClusterStateService` (`writeIncrementalMetadata`'s own diff against the previous
+manifest, `markLastStateAsCommitted`, `getClusterStateForManifest`, `getClusterStateUsingDiff`, checksum
+validation, `isMetadataEqual`) and `GatewayMetaState#verifyManifestAndClusterState` all called
+`manifest.getIndices()` directly and would each have silently computed an empty index list against a
+sharded manifest -- found by a repo-wide grep, not by re-reading the RFC's own list of call sites, which
+did not enumerate all of them. All fixed to route through `resolveIndices`.
+
+**The E.5 risk below ("Cleanup correctness... deserves the fuzzing treatment") got exactly that, and the
+first attempt at it produced a false negative worth recording.** Reintroducing the bug
+(`clusterMetadataManifest.getIndices()` in the GC sweep's active-manifest loop) did not fail
+`ManifestShardingIT#testCleanupSweepDoesNotDeleteLiveDataUnderSharding`'s original restart-based
+assertion, even with the fix genuinely absent -- `internalCluster().fullRestart()` does not reliably force
+every index's metadata to be freshly re-read from the remote repository in that test's topology, so the
+check was not actually exercising the failure it was meant to catch. Strengthened it with a direct,
+no-round-trip check instead: capture the blob name of an index the test's own write traffic never
+touches, and assert with `BlobContainer#blobExists` that it still exists immediately after the sweep, not
+after a restart. Re-run against the reintroduced bug with that check in place failed exactly as predicted;
+restoring the fix went green again. This is the version now in the tree -- the acceptance criterion below
+("The GC sweep does not delete blobs referenced by a sharded manifest") is verified against a real
+repository, not assumed from the subtraction logic reading correctly.
+
 **E7. Align shard function with the routing hash.** If the manifest shard function matches the coordinator
 hash, a coordinator warms its entire partition in one read. This is a free win from two independent
 designs lining up, and needs to be built deliberately rather than discovered.
 
+**Deferred, not built (2026-08-14).** `ManifestShardFunction`'s own javadoc documents why: the two hashes
+solve different problems over different domains (a fixed shard count vs. `RendezvousShardPlacement`'s
+dynamic node-count rendezvous hashing), so forcing them to align would be inventing a design decision
+this plan does not actually specify, the same discipline D5 applied when it found no actuator to encode
+its own recommendation into. Left open rather than force-built.
+
 **E8. Re-measure.** C3a's 256-shard figure came from a simulation, not the implementation. Re-run against
 the real write path.
+
+**Not yet done (2026-08-14).** E5/E6 built the real write path this figure needs to be re-measured
+against; the simulation in `ManifestShardingWriteAmplificationEstimate` (C3a) has not yet been superseded
+by a benchmark against the genuine implementation. Should happen before repeating the 125x claim as
+anything other than the simulation's own number.
 
 ### E.4 Acceptance criteria
 
