@@ -265,6 +265,11 @@ public class RemoteClusterStateCleanupManager implements Closeable {
             Set<String> staleEphemeralAttributePaths = new HashSet<>();
             Set<String> staleIndexRoutingPaths = new HashSet<>();
             Set<String> staleIndexRoutingDiffPaths = new HashSet<>();
+            // Plan item E5: the manifest shard blobs themselves (manifest/shards/...), as distinct from
+            // the index metadata blobs they name -- a shard blob that no retained manifest references
+            // any more is exactly as stale as a global-metadata or index-routing blob nothing keeps, and
+            // needs the same keep/delete treatment or it simply accumulates forever.
+            Set<String> staleManifestShardPaths = new HashSet<>();
 
             // todo: Avoid repetitive fetch of manifestsToRetain across batches if they were fetched earlier and are the same
             // (for example the first 10 if not new manifests are uploaded in between)
@@ -275,7 +280,14 @@ public class RemoteClusterStateCleanupManager implements Closeable {
                     blobMetadata.name()
                 );
                 unreadableCodec.accumulateAndGet(clusterMetadataManifest.getCodecVersion(), Math::max);
-                clusterMetadataManifest.getIndices()
+                // Plan item E5's own "transitive cleanup" fix: resolveIndices, not getIndices()
+                // directly. A sharded manifest's index list lives behind UploadedManifestShard
+                // references -- calling getIndices() here would compute an empty keep-set for every
+                // index the manifest actually references, and the very next thing this method does is
+                // delete everything not in that set. The C1 codec guard above already stops a node that
+                // cannot parse a future codec at all; this is the half that makes a node that *can*
+                // parse CODEC_V6 compute a correct keep-set rather than an empty one.
+                remoteManifestManager.resolveIndices(clusterMetadataManifest)
                     .forEach(
                         uploadedIndexMetadata -> filesToKeep.add(
                             RemoteClusterStateUtils.getFormattedIndexFileName(uploadedIndexMetadata.getUploadedFilename())
@@ -316,6 +328,8 @@ public class RemoteClusterStateCleanupManager implements Closeable {
                     && clusterMetadataManifest.getDiffManifest().getIndicesRoutingDiffPath() != null) {
                     filesToKeep.add(clusterMetadataManifest.getDiffManifest().getIndicesRoutingDiffPath());
                 }
+                clusterMetadataManifest.getIndexMetadataShards()
+                    .forEach(uploadedManifestShard -> filesToKeep.add(uploadedManifestShard.getBlobName()));
             });
             staleManifestBlobMetadata.forEach(blobMetadata -> {
                 ClusterMetadataManifest clusterMetadataManifest = remoteManifestManager.fetchRemoteClusterMetadataManifest(
@@ -372,10 +386,19 @@ public class RemoteClusterStateCleanupManager implements Closeable {
                     }
                 }
 
-                clusterMetadataManifest.getIndices().forEach(uploadedIndexMetadata -> {
+                // resolveIndices, same reasoning as the active-manifest loop above: a stale manifest's
+                // own index list may live behind shard references too, and those references have to be
+                // followed to find out which index blobs it actually named before deciding any of them
+                // are stale.
+                remoteManifestManager.resolveIndices(clusterMetadataManifest).forEach(uploadedIndexMetadata -> {
                     String fileName = RemoteClusterStateUtils.getFormattedIndexFileName(uploadedIndexMetadata.getUploadedFilename());
                     if (filesToKeep.contains(fileName) == false) {
                         staleIndexMetadataPaths.add(fileName);
+                    }
+                });
+                clusterMetadataManifest.getIndexMetadataShards().forEach(uploadedManifestShard -> {
+                    if (filesToKeep.contains(uploadedManifestShard.getBlobName()) == false) {
+                        staleManifestShardPaths.add(uploadedManifestShard.getBlobName());
                     }
                 });
 
@@ -425,18 +448,27 @@ public class RemoteClusterStateCleanupManager implements Closeable {
             logger.info(
                 "Processed [{}] manifests, Deleting [{}] stale Global Metadata files, "
                     + "[{}] stale Index Metadata files, [{}] stale Ephemeral Metadata files, "
-                    + "[{}] stale Index Routing files and [{}] stale Index routing diff files",
+                    + "[{}] stale Index Routing files, [{}] stale Index routing diff files and "
+                    + "[{}] stale manifest shard files",
                 staleManifestPaths.size(),
                 staleGlobalMetadataPaths.size(),
                 staleIndexMetadataPaths.size(),
                 staleEphemeralAttributePaths.size(),
                 staleIndexRoutingPaths.size(),
-                staleIndexRoutingDiffPaths.size()
+                staleIndexRoutingDiffPaths.size(),
+                staleManifestShardPaths.size()
             );
 
             deleteStalePaths(new ArrayList<>(staleGlobalMetadataPaths));
             deleteStalePaths(new ArrayList<>(staleIndexMetadataPaths));
             deleteStalePaths(new ArrayList<>(staleEphemeralAttributePaths));
+            if (staleManifestShardPaths.isEmpty() == false) {
+                // Guarded, unlike the three calls above: sharding is off by default (see
+                // RemoteManifestManager#CLUSTER_REMOTE_STORE_STATE_MANIFEST_SHARD_COUNT_SETTING), so
+                // this set is empty on every cleanup sweep for a cluster that has never turned it on --
+                // no reason to make a blob-store round trip to delete nothing on every single sweep.
+                deleteStalePaths(new ArrayList<>(staleManifestShardPaths));
+            }
 
             try {
                 remoteRoutingTableService.deleteStaleIndexRoutingPaths(new ArrayList<>(staleIndexRoutingPaths));

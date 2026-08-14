@@ -64,6 +64,15 @@ public class RemoteClusterMetadataManifest extends AbstractClusterMetadataWritea
         new ChecksumBlobStoreFormat<>("cluster-metadata-manifest", METADATA_MANIFEST_NAME_FORMAT, ClusterMetadataManifest::fromXContentV4);
 
     /**
+     * Manifest format compatible with codec v5, i.e. before the index list could live behind manifest
+     * shard references (plan item E5, Area E). Manifests already in a repository at v5 are read through
+     * this rather than falling through to {@link #getClusterMetadataManifestBlobStoreFormat()}'s
+     * "unrecognised codec" branch -- the same reason {@link #CLUSTER_METADATA_MANIFEST_FORMAT_V4} exists.
+     */
+    public static final ChecksumBlobStoreFormat<ClusterMetadataManifest> CLUSTER_METADATA_MANIFEST_FORMAT_V5 =
+        new ChecksumBlobStoreFormat<>("cluster-metadata-manifest", METADATA_MANIFEST_NAME_FORMAT, ClusterMetadataManifest::fromXContentV5);
+
+    /**
      * Manifest format compatible with codec v2, where we introduced codec versions/global metadata.
      */
     public static final ChecksumBlobStoreFormat<ClusterMetadataManifest> CLUSTER_METADATA_MANIFEST_FORMAT = new ChecksumBlobStoreFormat<>(
@@ -162,6 +171,8 @@ public class RemoteClusterMetadataManifest extends AbstractClusterMetadataWritea
         long codecVersion = getManifestCodecVersion();
         if (codecVersion == ClusterMetadataManifest.MANIFEST_CURRENT_CODEC_VERSION) {
             return CLUSTER_METADATA_MANIFEST_FORMAT;
+        } else if (codecVersion == ClusterMetadataManifest.CODEC_V5) {
+            return CLUSTER_METADATA_MANIFEST_FORMAT_V5;
         } else if (codecVersion == ClusterMetadataManifest.CODEC_V4) {
             return CLUSTER_METADATA_MANIFEST_FORMAT_V4;
         } else if (codecVersion == ClusterMetadataManifest.CODEC_V3) {

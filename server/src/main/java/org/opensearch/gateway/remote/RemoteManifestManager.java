@@ -24,14 +24,18 @@ import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.compress.Compressor;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
+import org.opensearch.gateway.remote.ClusterMetadataManifest.UploadedIndexMetadata;
 import org.opensearch.gateway.remote.model.RemoteClusterMetadataManifest;
 import org.opensearch.gateway.remote.model.RemoteClusterStateManifestInfo;
+import org.opensearch.gateway.remote.model.RemoteManifestShard;
 import org.opensearch.index.remote.RemoteStoreUtils;
 import org.opensearch.index.translog.transfer.BlobStoreTransferService;
 import org.opensearch.repositories.blobstore.BlobStoreRepository;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
@@ -59,11 +63,38 @@ public class RemoteManifestManager {
         Setting.Property.Dynamic,
         Setting.Property.NodeScope
     );
+
+    /**
+     * Plan item E5 (plan-100m-index-implementation.md, Area E; C3b in rfc-manifest-sharding-design.md):
+     * how many shards the manifest's index list is partitioned into. {@code 0} (the default) means
+     * unsharded -- every manifest continues to carry its full index list inline in {@code indices},
+     * exactly as before this setting existed. A positive value turns sharding on for every manifest
+     * written from that point forward; see {@link ClusterMetadataManifest#CODEC_V6}'s own doc for what
+     * changes on the wire, and {@code rfc-manifest-sharding-design.md}'s "Shard count" section for why
+     * this is read fresh from configuration only when *writing* a manifest -- a reader always uses the
+     * count found in the manifest it is reading, not this setting's current value.
+     *
+     * <p>Dynamic rather than fixed at startup: changing it mid-cluster-life is handled safely (see
+     * {@link IndexMetadataManifestSharder#plan}'s {@code previousShardCount} parameter) by treating a
+     * shard-count change as "nothing can be carried forward, rewrite every shard once" rather than
+     * something that must be prevented -- correct, if not free, so there is no correctness reason to
+     * forbid it.
+     */
+    public static final Setting<Integer> CLUSTER_REMOTE_STORE_STATE_MANIFEST_SHARD_COUNT_SETTING = Setting.intSetting(
+        "cluster.remote_store.state.manifest.shard_count",
+        0,
+        0,
+        Setting.Property.Dynamic,
+        Setting.Property.NodeScope
+    );
+
     private static final Logger logger = LogManager.getLogger(RemoteManifestManager.class);
 
     private volatile TimeValue metadataManifestUploadTimeout;
+    private volatile int manifestShardCount;
     private final String nodeId;
     private final RemoteWriteableEntityBlobStore<ClusterMetadataManifest, RemoteClusterMetadataManifest> manifestBlobStore;
+    private final RemoteWriteableEntityBlobStore<ManifestShardContent, RemoteManifestShard> manifestShardBlobStore;
     private final Compressor compressor;
     private final NamedXContentRegistry namedXContentRegistry;
     // todo remove blobStorerepo from here
@@ -78,6 +109,7 @@ public class RemoteManifestManager {
         ThreadPool threadpool
     ) {
         this.metadataManifestUploadTimeout = clusterSettings.get(METADATA_MANIFEST_UPLOAD_TIMEOUT_SETTING);
+        this.manifestShardCount = clusterSettings.get(CLUSTER_REMOTE_STORE_STATE_MANIFEST_SHARD_COUNT_SETTING);
         this.nodeId = nodeId;
         this.manifestBlobStore = new RemoteWriteableEntityBlobStore<>(
             blobStoreTransferService,
@@ -87,11 +119,23 @@ public class RemoteManifestManager {
             ThreadPool.Names.REMOTE_STATE_READ,
             RemoteClusterStateUtils.CLUSTER_STATE_PATH_TOKEN
         );
-        ;
+        this.manifestShardBlobStore = new RemoteWriteableEntityBlobStore<>(
+            blobStoreTransferService,
+            blobStoreRepository,
+            clusterName,
+            threadpool,
+            ThreadPool.Names.REMOTE_STATE_READ,
+            RemoteClusterStateUtils.CLUSTER_STATE_PATH_TOKEN
+        );
         clusterSettings.addSettingsUpdateConsumer(METADATA_MANIFEST_UPLOAD_TIMEOUT_SETTING, this::setMetadataManifestUploadTimeout);
+        clusterSettings.addSettingsUpdateConsumer(CLUSTER_REMOTE_STORE_STATE_MANIFEST_SHARD_COUNT_SETTING, this::setManifestShardCount);
         this.compressor = blobStoreRepository.getCompressor();
         this.namedXContentRegistry = blobStoreRepository.getNamedXContentRegistry();
         this.blobStoreRepository = blobStoreRepository;
+    }
+
+    private void setManifestShardCount(int manifestShardCount) {
+        this.manifestShardCount = manifestShardCount;
     }
 
     RemoteClusterStateManifestInfo uploadManifest(
@@ -102,17 +146,88 @@ public class RemoteManifestManager {
         ClusterStateChecksum clusterStateChecksum,
         boolean committed
     ) {
+        return uploadManifest(
+            clusterState,
+            uploadedMetadataResult,
+            previousClusterUUID,
+            clusterDiffManifest,
+            clusterStateChecksum,
+            committed,
+            null,
+            Collections.emptySet()
+        );
+    }
+
+    /**
+     * @param previousManifestForSharding the previous version's manifest, used only to carry forward
+     *                                     unchanged shard blob references (see {@link
+     *                                     IndexMetadataManifestSharder#plan}) -- {@code null} when there
+     *                                     is none (a fresh cluster, or a full/cold write). Ignored
+     *                                     entirely when sharding is disabled ({@link
+     *                                     #manifestShardCount} is {@code 0}).
+     * @param changedOrDeletedIndexUUIDs indices newly uploaded, updated, or deleted this version -- see
+     *                                   {@link IndexMetadataManifestSharder#plan}'s own doc on why a
+     *                                   deleted index's UUID belongs here even though it is absent from
+     *                                   {@code uploadedMetadataResult.uploadedIndexMetadata}.
+     */
+    RemoteClusterStateManifestInfo uploadManifest(
+        ClusterState clusterState,
+        RemoteClusterStateUtils.UploadedMetadataResults uploadedMetadataResult,
+        String previousClusterUUID,
+        ClusterStateDiffManifest clusterDiffManifest,
+        ClusterStateChecksum clusterStateChecksum,
+        boolean committed,
+        ClusterMetadataManifest previousManifestForSharding,
+        Set<String> changedOrDeletedIndexUUIDs
+    ) {
         synchronized (this) {
+            String clusterUUID = clusterState.metadata().clusterUUID();
+            int shardCountForThisManifest = manifestShardCount;
+            List<UploadedIndexMetadata> inlineIndices = uploadedMetadataResult.uploadedIndexMetadata;
+            List<UploadedManifestShard> indexMetadataShards = Collections.emptyList();
+            if (shardCountForThisManifest > 0) {
+                List<UploadedManifestShard> previousShards = previousManifestForSharding != null
+                    ? previousManifestForSharding.getIndexMetadataShards()
+                    : Collections.emptyList();
+                int previousShardCount = previousManifestForSharding != null
+                    ? previousManifestForSharding.getManifestShardCount()
+                    : 0;
+                IndexMetadataManifestSharder.Plan plan = IndexMetadataManifestSharder.plan(
+                    inlineIndices,
+                    changedOrDeletedIndexUUIDs,
+                    previousShards,
+                    previousShardCount,
+                    shardCountForThisManifest
+                );
+                List<UploadedManifestShard> written = new ArrayList<>(plan.getCarriedForward());
+                for (Map.Entry<Integer, List<UploadedIndexMetadata>> entry : plan.getShardsToWrite().entrySet()) {
+                    written.add(
+                        writeManifestShard(
+                            clusterUUID,
+                            entry.getKey(),
+                            clusterState.term(),
+                            clusterState.getVersion(),
+                            entry.getValue()
+                        )
+                    );
+                }
+                indexMetadataShards = written;
+                // The index list now lives entirely behind the shard references above -- an inline copy
+                // would defeat the entire point (this is the write amplification C3a measured) and give
+                // every reader two disagreeing sources of truth for the same data.
+                inlineIndices = Collections.emptyList();
+            }
+
             ClusterMetadataManifest.Builder manifestBuilder = ClusterMetadataManifest.builder();
             manifestBuilder.clusterTerm(clusterState.term())
                 .stateVersion(clusterState.getVersion())
-                .clusterUUID(clusterState.metadata().clusterUUID())
+                .clusterUUID(clusterUUID)
                 .stateUUID(clusterState.stateUUID())
                 .opensearchVersion(Version.CURRENT)
                 .nodeId(nodeId)
                 .committed(committed)
                 .codecVersion(ClusterMetadataManifest.MANIFEST_CURRENT_CODEC_VERSION)
-                .indices(uploadedMetadataResult.uploadedIndexMetadata)
+                .indices(inlineIndices)
                 .previousClusterUUID(previousClusterUUID)
                 .clusterUUIDCommitted(clusterState.metadata().clusterUUIDCommitted())
                 .coordinationMetadata(uploadedMetadataResult.uploadedCoordinationMetadata)
@@ -128,11 +243,110 @@ public class RemoteManifestManager {
                 .transientSettingsMetadata(uploadedMetadataResult.uploadedTransientSettingsMetadata)
                 .clusterStateCustomMetadataMap(uploadedMetadataResult.uploadedClusterStateCustomMetadataMap)
                 .hashesOfConsistentSettings(uploadedMetadataResult.uploadedHashesOfConsistentSettings)
-                .checksum(clusterStateChecksum);
+                .checksum(clusterStateChecksum)
+                .manifestShardCount(shardCountForThisManifest)
+                .indexMetadataShards(indexMetadataShards);
             final ClusterMetadataManifest manifest = manifestBuilder.build();
             logger.trace(() -> new ParameterizedMessage("[{}] uploading manifest", manifest));
-            String manifestFileName = writeMetadataManifest(clusterState.metadata().clusterUUID(), manifest);
+            String manifestFileName = writeMetadataManifest(clusterUUID, manifest);
             return new RemoteClusterStateManifestInfo(manifest, manifestFileName);
+        }
+    }
+
+    /**
+     * Every current {@link UploadedIndexMetadata} a manifest's index list actually holds, transparently
+     * resolving through {@link UploadedManifestShard} references when the manifest is sharded -- the
+     * one place that decision should be made, so every caller that used to say {@code
+     * manifest.getIndices()} can say {@code remoteManifestManager.resolveIndices(manifest)} instead and
+     * not otherwise change.
+     */
+    public List<UploadedIndexMetadata> resolveIndices(ClusterMetadataManifest manifest) {
+        if (manifest.getManifestShardCount() <= 0) {
+            return manifest.getIndices();
+        }
+        List<UploadedIndexMetadata> resolved = new ArrayList<>();
+        for (UploadedManifestShard shardRef : manifest.getIndexMetadataShards()) {
+            resolved.addAll(readManifestShard(manifest.getClusterUUID(), shardRef));
+        }
+        return resolved;
+    }
+
+    private UploadedManifestShard writeManifestShard(
+        String clusterUUID,
+        int shardId,
+        long clusterTerm,
+        long stateVersion,
+        List<UploadedIndexMetadata> entries
+    ) {
+        AtomicReference<Exception> exceptionReference = new AtomicReference<>();
+        CountDownLatch latch = new CountDownLatch(1);
+        LatchedActionListener completionListener = new LatchedActionListener<>(
+            ActionListener.wrap(resp -> {}, exceptionReference::set),
+            latch
+        );
+
+        RemoteManifestShard remoteManifestShard = new RemoteManifestShard(
+            new ManifestShardContent(entries),
+            shardId,
+            clusterTerm,
+            stateVersion,
+            clusterUUID,
+            compressor,
+            namedXContentRegistry
+        );
+        manifestShardBlobStore.writeAsync(remoteManifestShard, completionListener);
+
+        try {
+            if (latch.await(getMetadataManifestUploadTimeout().millis(), TimeUnit.MILLISECONDS) == false) {
+                throw new RemoteStateTransferException(
+                    String.format(Locale.ROOT, "Timed out waiting for transfer of manifest shard [%d] to complete", shardId)
+                );
+            }
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            throw new RemoteStateTransferException(
+                String.format(Locale.ROOT, "Timed out waiting for transfer of manifest shard [%d] to complete", shardId),
+                ex
+            );
+        }
+        if (exceptionReference.get() != null) {
+            throw new RemoteStateTransferException(exceptionReference.get().getMessage(), exceptionReference.get());
+        }
+        return new UploadedManifestShard(shardId, remoteManifestShard.getUploadedMetadata().getUploadedFilename(), entries.size());
+    }
+
+    private List<UploadedIndexMetadata> readManifestShard(String clusterUUID, UploadedManifestShard shardRef) {
+        try {
+            RemoteManifestShard remoteManifestShard = new RemoteManifestShard(
+                shardRef.getBlobName(),
+                clusterUUID,
+                compressor,
+                namedXContentRegistry
+            );
+            ManifestShardContent content = manifestShardBlobStore.read(remoteManifestShard);
+            // See UploadedManifestShard's own javadoc on why this exists: a shard read that returned
+            // fewer entries than the reference declares is a truncated read, not an empty partition, and
+            // must not be treated as if the missing entries simply do not exist -- that is exactly the
+            // shape of bug that turns into deleting still-referenced index metadata (see
+            // RemoteClusterStateCleanupManager, this method's most safety-sensitive caller).
+            if (content.getIndices().size() != shardRef.getEntryCount()) {
+                throw new IllegalStateException(
+                    String.format(
+                        Locale.ROOT,
+                        "manifest shard [%d] blob [%s] returned [%d] entries but the manifest reference declared [%d]",
+                        shardRef.getShardId(),
+                        shardRef.getBlobName(),
+                        content.getIndices().size(),
+                        shardRef.getEntryCount()
+                    )
+                );
+            }
+            return content.getIndices();
+        } catch (IOException e) {
+            throw new IllegalStateException(
+                String.format(Locale.ROOT, "Error while downloading manifest shard - %s", shardRef.getBlobName()),
+                e
+            );
         }
     }
 

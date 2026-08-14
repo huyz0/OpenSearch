@@ -158,6 +158,13 @@ public class RemoteClusterStateCleanupManagerTests extends OpenSearchTestCase {
         when(repositoriesService.repository("remote_store_repository")).thenReturn(blobStoreRepository);
 
         remoteManifestManager = mock(RemoteManifestManager.class);
+        // Every fixture manifest in this suite is unsharded (manifestShardCount defaults to 0), so
+        // resolveIndices must behave exactly like the real passthrough implementation -- an unstubbed
+        // mock would return an empty list unconditionally, which would make every "keep" and "stale"
+        // computation over indices silently see nothing, not matching production behaviour at all.
+        when(remoteManifestManager.resolveIndices(any(ClusterMetadataManifest.class))).thenAnswer(
+            invocation -> ((ClusterMetadataManifest) invocation.getArgument(0)).getIndices()
+        );
         remoteClusterStateService = mock(RemoteClusterStateService.class);
         when(remoteClusterStateService.getRemoteManifestManager()).thenReturn(remoteManifestManager);
         when(remoteClusterStateService.getRemoteStateStats()).thenReturn(new RemotePersistenceStats());
