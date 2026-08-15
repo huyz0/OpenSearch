@@ -284,6 +284,35 @@ write-behind projection kept only so the aggregate stays one search.
   `IndexBackedMappingStore`, so the suite stayed green against a store production did not register. The shared
   fixture now composes the store the way `ServerlessStoragePlugin` does.
 
+### Snapshot does not cover the gated fleet, and the way it does not is silent
+
+Asked whether snapshot works, measured rather than read. Two behaviours, and the second is the one that
+matters:
+
+- **By name**, a snapshot of a gated index is **refused** with an honest error ("metadata is not stored in
+  cluster state for these indices"). That refusal was deliberate, and it replaced a false message
+  ("Indices don't have primary shards") -- the index does have primary shards serving live traffic.
+- **A snapshot of everything succeeds and silently omits them.** Measured across all four spellings an
+  operator would use -- no indices set, `*`, `_all`, and a matching prefix wildcard -- every one reported
+  `SUCCESS` with only the ordinary index in `SnapshotInfo.indices()`. The by-name refusal is never reached,
+  because the expansion snapshot performs resolves against cluster state, where a gated index is not.
+
+**The consequence, stated at the mission's scale.** One ordinary index and a hundred million gated ones give
+a green nightly backup covering one index. Nothing in the response reports how many were skipped; the
+omission is visible only to someone who counts `SnapshotInfo.indices()` against what they believe they have.
+A backup that reports success while covering nothing is worse than one that fails, because only the second
+gets investigated.
+
+`ServerlessStorageGatedIndexSnapshotIT` pins all of it, including the four spellings together, so a fix that
+closed one of them would not look like a fix for the rest.
+
+**Not fixed, and the two options are different sizes.** Actually capturing a gated index means teaching the
+snapshot and repository pipeline to read shard state through `AbsentIndexDescriptorSuppliers` and
+`AbsentIndexRoutingSuppliers` instead of `Metadata` and `RoutingTable` -- the materially larger change that
+file already declines. Making the silence audible -- reporting the count of skipped gated indices on the
+response -- is cheap and is a product decision, not a test's to make. **A question for a human, and the first
+one on this list that is about data protection rather than throughput.**
+
 ### Two of the four document operations had never been run against a gated index
 
 Asked whether a gated index can be indexed, updated, deleted and searched like a normal one, the suite could

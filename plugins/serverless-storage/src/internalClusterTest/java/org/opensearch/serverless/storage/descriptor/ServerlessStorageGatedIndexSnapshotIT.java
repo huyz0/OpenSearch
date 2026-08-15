@@ -149,4 +149,92 @@ public class ServerlessStorageGatedIndexSnapshotIT extends org.opensearch.server
             response.getSnapshotInfo().state()
         );
     }
+
+    /**
+     * The case an operator actually runs, and the one the by-name test above does not cover: a snapshot of
+     * everything, taken nightly, with a gated fleet present.
+     *
+     * <h4>What it does</h4>
+     *
+     * It succeeds, and the gated indices are not in it. Measured across all four spellings an operator might
+     * use -- no indices set, {@code *}, a matching prefix wildcard, and {@code _all} -- every one reported
+     * {@code SUCCESS} with only the ordinary index in {@code SnapshotInfo.indices()}. The refusal that the
+     * by-name case gets is never reached, because the wildcard expansion snapshot uses resolves against
+     * cluster state, where a gated index is not.
+     *
+     * <h4>Why that is worth a test rather than a shrug</h4>
+     *
+     * The failure mode is silence at scale. One ordinary index and a hundred million gated ones produce a
+     * green backup job covering one index, and nothing in the response says how many were skipped -- the
+     * absence is only visible to someone who counts {@code SnapshotInfo.indices()} against what they believe
+     * they have. A backup that reports success while covering almost nothing is worse than one that fails,
+     * because only the second one gets investigated.
+     *
+     * <p>Pinned rather than fixed. Capturing a gated index would mean teaching the snapshot and repository
+     * pipeline to read shard state through {@code AbsentIndexDescriptorSuppliers} and {@code
+     * AbsentIndexRoutingSuppliers} instead of {@code Metadata} and {@code RoutingTable} directly, which is
+     * the materially larger change this file's header already declines. What is cheap and not done here,
+     * because it is a product decision rather than a test's to make: reporting the count of skipped gated
+     * indices on the response, so the silence is at least audible.
+     */
+    public void testASnapshotOfEverythingSilentlyExcludesTheGatedFleet() throws Exception {
+        internalCluster().startClusterManagerOnlyNode();
+        internalCluster().startDataOnlyNode();
+        ensureStableCluster(2);
+        installBlobBackedDescriptorPlane();
+
+        client().admin()
+            .cluster()
+            .preparePutRepository("everything-repo")
+            .setType(FsRepository.TYPE)
+            .setSettings(Settings.builder().put("location", randomRepoPath().resolve("repo")))
+            .get();
+
+        Settings gated = Settings.builder()
+            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+            .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+            .put("index.serverless_storage.enabled", true)
+            .build();
+        client().admin().indices().prepareCreate("serverless_everything-gated").setSettings(gated).get();
+        client().admin().indices().prepareCreate("everything-ordinary").get();
+        client().prepareIndex("everything-ordinary").setId("1").setSource("f", "v").get();
+        // Alive and serving, so "not captured" cannot be read as "there was nothing to capture".
+        assertBusy(() -> {
+            try {
+                client().prepareIndex("serverless_everything-gated").setId("1").setSource("f", "v").get();
+            } catch (Exception e) {
+                throw new AssertionError("write not yet servable: " + e.getMessage(), e);
+            }
+        });
+
+        // Every spelling an operator might reach for. All four behave identically, which is worth asserting
+        // together: a fix that closed only one of them would leave the others silently excluding.
+        String[][] arms = new String[][] { {}, { "*" }, { "_all" }, { "everything-*" } };
+        for (int i = 0; i < arms.length; i++) {
+            CreateSnapshotResponse response = client().admin()
+                .cluster()
+                .prepareCreateSnapshot("everything-repo", "snapshot-" + i)
+                .setIndices(arms[i])
+                .setWaitForCompletion(true)
+                .get();
+            String label = arms[i].length == 0 ? "(no indices set)" : java.util.Arrays.toString(arms[i]);
+
+            assertEquals(
+                "the snapshot reports success for " + label + ", which is the whole problem",
+                org.opensearch.snapshots.SnapshotState.SUCCESS,
+                response.getSnapshotInfo().state()
+            );
+            assertTrue(
+                "the ordinary index must be captured for " + label,
+                response.getSnapshotInfo().indices().contains("everything-ordinary")
+            );
+            assertFalse(
+                "the gated index is not captured, and nothing in this response says so: "
+                    + label
+                    + " -> "
+                    + response.getSnapshotInfo().indices(),
+                response.getSnapshotInfo().indices().contains("serverless_everything-gated")
+            );
+        }
+    }
 }
