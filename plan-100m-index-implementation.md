@@ -1488,13 +1488,15 @@ is the same trade this class already made for a projection that fails.
 
 ### The two ceilings under "creation is single-node", one of them now removed
 
-Creation runs on the elected cluster manager because `TransportCreateIndexAction` is a
-`TransportClusterManagerNodeAction` and never overrides `localExecute`. For a gated creation nothing needs
+Creation ran on the elected cluster manager because `TransportCreateIndexAction` is a
+`TransportClusterManagerNodeAction` and never overrode `localExecute`. For a gated creation nothing needs
 that node: uniqueness comes from the descriptor's register compare-and-swap, and what creation reads from
 cluster state -- templates, scoped settings, the name collision check against ordinary indices -- is a
-snapshot every node already has. The path's own javadoc says so. **Distributing it is a small change and it
-is not made here**, because it is worth deciding deliberately rather than as a side effect of a throughput
-fix.
+snapshot every node already has. **It now overrides it**, for the case that is certainly gated: an admitted
+creation the real gate might still decline keeps going to the cluster manager, because the road it declines
+onto submits a cluster state update task and only the cluster manager can publish one. A template's alias is
+the interesting condition there -- it makes the index non-representable, it is not in the request, and it is
+the commonest tenant-per-index configuration.
 
 What that arithmetic looks like: 100M in two hours is 13,889 creations per second. One node already sustains
 1,348 to 2,639 depending on mapping shape, so compute needs roughly six to ten nodes, and at a hundred it is

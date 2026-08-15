@@ -8,6 +8,7 @@
 
 package org.opensearch.cluster.metadata;
 
+import org.opensearch.action.admin.indices.alias.Alias;
 import org.opensearch.action.admin.indices.create.CreateIndexClusterStateUpdateRequest;
 import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.ClusterState;
@@ -69,6 +70,7 @@ public class AdmissionTemplateResolutionTests extends OpenSearchTestCase {
 
         final ClusterService clusterService = mock(ClusterService.class);
         when(clusterService.state()).thenReturn(clusterState);
+        lastState = clusterState;
 
         final SystemIndices systemIndices = systemIndex
             ? new SystemIndices(
@@ -95,6 +97,136 @@ public class AdmissionTemplateResolutionTests extends OpenSearchTestCase {
             null,
             null,
             null
+        );
+    }
+
+    private MetadataCreateIndexService serviceWithAliasCarryingTemplate(String pattern) {
+        final Metadata.Builder metadataBuilder = Metadata.builder()
+            .put(
+                IndexTemplateMetadata.builder("gated-by-template-with-alias")
+                    .patterns(singletonList(pattern))
+                    .settings(GATED_TEMPLATE)
+                    .putAlias(AliasMetadata.builder("an-alias"))
+                    .build()
+            );
+        final ClusterState clusterState = ClusterState.builder(ClusterName.CLUSTER_NAME_SETTING.getDefault(Settings.EMPTY))
+            .metadata(metadataBuilder)
+            .build();
+        final ClusterService clusterService = mock(ClusterService.class);
+        when(clusterService.state()).thenReturn(clusterState);
+        lastState = clusterState;
+        return new MetadataCreateIndexService(
+            Settings.EMPTY,
+            clusterService,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            new SystemIndices(Collections.emptyMap()),
+            true,
+            null,
+            null,
+            null
+        );
+    }
+
+    /** The state the last service was built over, which is what {@code localExecute} passes in. */
+    private ClusterState lastState;
+
+    private ClusterState stateOf(MetadataCreateIndexService ignored) {
+        return lastState;
+    }
+
+    /**
+     * The condition that lets a creation run on the node that received it rather than the cluster manager.
+     *
+     * <p>Certain rather than probable, and the tests below are all one property: an admitted creation that
+     * the real gate may still decline must not be routed away from the cluster manager, because the road it
+     * declines onto submits a cluster state update task and only the cluster manager can publish one.
+     */
+    public void testAnAdmittedCreationWithNothingToDeclineOnRunsLocally() {
+        registerGatedOnTheSetting();
+        final MetadataCreateIndexService service = serviceWithTemplate("gated-*", false);
+
+        final CreateIndexClusterStateUpdateRequest request = new CreateIndexClusterStateUpdateRequest("cause", "gated-index", "gated-index")
+            .settings(Settings.EMPTY);
+
+        assertTrue(
+            "a gated creation needs nothing the cluster manager has -- uniqueness is the descriptor "
+                + "store's compare-and-swap and the cluster state need is a snapshot read",
+            service.certainlyGated(request, stateOf(service))
+        );
+    }
+
+    public void testAnAliasOnTheRequestKeepsItOnTheClusterManager() {
+        registerGatedOnTheSetting();
+        final MetadataCreateIndexService service = serviceWithTemplate("gated-*", false);
+
+        final CreateIndexClusterStateUpdateRequest request = new CreateIndexClusterStateUpdateRequest("cause", "gated-index", "gated-index")
+            .settings(Settings.EMPTY)
+            .aliases(java.util.Set.of(new Alias("an-alias")));
+
+        assertFalse(
+            "DescriptorRepresentable refuses an index with an alias, so the gate declines what admission "
+                + "accepted, and the fallback that handles it only works on the cluster manager",
+            service.certainlyGated(request, stateOf(service))
+        );
+    }
+
+    /**
+     * The one a request cannot see, which is why this is not simply a check on the request.
+     *
+     * <p>A template's alias reaches the finished metadata and makes the index non-representable exactly as
+     * the request's own would, and nothing in the request says so. Reading only the request here would
+     * route the commonest template-configured deployment to the wrong node.
+     */
+    public void testATemplatesAliasKeepsItOnTheClusterManagerToo() {
+        registerGatedOnTheSetting();
+        final MetadataCreateIndexService service = serviceWithAliasCarryingTemplate("gated-*");
+
+        final CreateIndexClusterStateUpdateRequest request = new CreateIndexClusterStateUpdateRequest("cause", "gated-index", "gated-index")
+            .settings(Settings.EMPTY);
+
+        assertTrue(
+            "the template must still gate it, or this passes for the wrong reason",
+            DescriptorOnlyCreation.mayBypassClusterState(service.settingsForAdmission(request))
+        );
+        assertFalse(
+            "an alias the template contributes is as good a reason to decline as one the request carries",
+            service.certainlyGated(request, stateOf(service))
+        );
+    }
+
+    public void testAnOrdinaryCreationIsNeverRunLocally() {
+        registerGatedOnTheSetting();
+        final MetadataCreateIndexService service = serviceWithTemplate("gated-*", false);
+
+        final CreateIndexClusterStateUpdateRequest request = new CreateIndexClusterStateUpdateRequest(
+            "cause",
+            "ordinary-index",
+            "ordinary-index"
+        ).settings(Settings.EMPTY);
+
+        assertFalse(
+            "an ordinary index needs a cluster state update, and creating one anywhere else loses it",
+            service.certainlyGated(request, stateOf(service))
+        );
+    }
+
+    public void testWithNoGateInstalledNothingRunsLocally() {
+        // No registerGatedOnTheSetting(), so this is an ordinary cluster.
+        final MetadataCreateIndexService service = serviceWithTemplate("gated-*", false);
+
+        final CreateIndexClusterStateUpdateRequest request = new CreateIndexClusterStateUpdateRequest("cause", "gated-index", "gated-index")
+            .settings(GATED_TEMPLATE);
+
+        assertFalse(
+            "a cluster that never installed the gate must be untouched by this, whatever its settings say",
+            service.certainlyGated(request, stateOf(service))
         );
     }
 

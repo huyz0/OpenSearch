@@ -185,11 +185,30 @@ the count, and the pre-sharding layout is still read. Nothing about the old vers
 never contended, and a prefix rate is invisible to every test in this repository because none of them runs
 against an object store.
 
-**Creation is still single-node, deliberately.** `TransportCreateIndexAction` never overrides
-`localExecute`, so every creation redirects to the elected cluster manager. Nothing about a gated creation
-needs that node -- uniqueness is the register CAS, and the cluster state need is a snapshot read -- so this
-is a small change, left unmade because it should be a decision rather than a side effect. With it, compute
-needs roughly six to ten nodes for 13,889 creations per second, not a hundred.
+**Creation is distributed now.** `TransportCreateIndexAction.localExecute` returns true for a creation that
+is *certainly* gated, so it runs on the node that received it instead of redirecting to the elected cluster
+manager. Nothing about a gated creation needs that node: uniqueness is the register CAS, and the cluster
+state need is a snapshot read every node has.
+
+Certainly, not probably, and that is the whole of the design. Admission is allowed to be wrong -- the real
+gate can still decline, and the fallback that handles it submits a cluster state update task, which only the
+cluster manager can publish. So `certainlyGated` declines on anything that could make the gate refuse: an
+alias on the request, a context, a data stream, a resize source, **and a template's alias**, which the
+request does not carry and which is the commonest configuration in a tenant-per-index deployment. Anything
+short of certain keeps today's behaviour.
+
+**One consequence stated rather than discovered:** a gated creation checks the name against the cluster state
+snapshot it can see, so off the cluster manager the window in which an ordinary index of the same name is not
+yet visible grows from thread-scheduling lag to publication lag. The race is not new -- gated creation has
+run off the state thread since T49, so the manager never serialised against its own publications either --
+and the reverse direction is closed, because ordinary creation consults the descriptor store. Closing this
+direction needs a commit across both stores.
+
+**What it is worth cannot be measured here.** Every node in an internal cluster test shares one JVM on one
+box, so distributing the work adds no CPU: the harness shows no regression and an improvement consistent
+with removing a network hop, on a round whose own drift control says it had not settled. The effect this is
+for -- a creation rate per node rather than per cluster -- needs a real multi-machine cluster, which is the
+same measurement gap as everything else here.
 
 **2. The 100M plan reasons about a descriptor system index that was deleted on 2026-08-05**
 (`46cfb963519`), and quotes a creation-throughput figure that has been corrected repeatedly since

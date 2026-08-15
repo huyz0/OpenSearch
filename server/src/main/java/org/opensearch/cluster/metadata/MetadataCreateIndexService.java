@@ -445,6 +445,79 @@ public class MetadataCreateIndexService {
      */
     // Package-private rather than private so AdmissionTemplateResolutionTests (T52) can drive it directly,
     // the same accommodation clusterStateCreateIndex and friends already get for the same reason.
+    /**
+     * Whether this request will certainly be gated, and can therefore be executed on whatever node received
+     * it rather than on the elected cluster manager.
+     *
+     * <h4>Why "certainly" and not "probably"</h4>
+     *
+     * Admission is deliberately allowed to be wrong: {@link #createGatedIndex} discovers that the real gate
+     * declined by finding no descriptor write handed over, and falls back to {@link #onlyCreateIndex},
+     * which submits a cluster state update task. That fallback works on the cluster manager and nowhere
+     * else -- a task submitted on any other node runs its executor and then fails to publish. So a request
+     * routed away from the cluster manager on a maybe is a request whose failure mode is "the fallback
+     * cannot run", and the answer to that is not to make the fallback cleverer but to route only what
+     * cannot need it.
+     *
+     * <p>Everything below is a condition under which the gate declines an admitted request. They are the
+     * same conditions the creation path itself already knows about, read from the request and the local
+     * cluster state, and each one answers "not certain" rather than "not gated" -- an index with an alias
+     * may well end up gated on the cluster manager, and this simply declines to decide that from here.
+     *
+     * <h4>What this does to the same-name race, stated rather than discovered</h4>
+     *
+     * A gated creation checks the name against the cluster state snapshot it can see. On the cluster
+     * manager that snapshot is as fresh as anything gets; on another node it can be one publication behind,
+     * so the window in which an ordinary index of the same name is created and not yet visible here grows
+     * from thread-scheduling lag to publication lag. The race is not new -- gated creation has run off the
+     * cluster state thread since T49, so the manager never serialised against its own publications either
+     * -- and the reverse direction is closed, because an ordinary creation consults the descriptor store
+     * through {@code AbsentIndexDescriptorSuppliers#exists}. Closing this direction needs a commit across
+     * both stores, which is not this change.
+     */
+    public boolean certainlyGated(final CreateIndexClusterStateUpdateRequest request, final ClusterState state) {
+        if (DescriptorOnlyCreation.hasAdmissionCheck() == false) {
+            return false;
+        }
+        if (request.aliases().isEmpty() == false || request.context() != null || request.dataStreamName() != null) {
+            // Each of these is a reason DescriptorRepresentable refuses an index, or a reason the finished
+            // metadata is not yet knowable from the request.
+            return false;
+        }
+        if (request.recoverFrom() != null) {
+            return false;
+        }
+        final Metadata metadata = state.metadata();
+        if (DescriptorOnlyCreation.mayBypassClusterState(settingsForAdmission(request, metadata)) == false) {
+            return false;
+        }
+        // A template's aliases are the gate's most common reason to decline something admission accepted,
+        // and they are not in the request. Resolved the same way settingsForAdmission resolves a template's
+        // settings, so the two answers cannot come from different templates.
+        try {
+            final String name = request.index();
+            final Boolean hidden = IndexMetadata.INDEX_HIDDEN_SETTING.exists(request.settings())
+                ? IndexMetadata.INDEX_HIDDEN_SETTING.get(request.settings())
+                : null;
+            final String v2Template = MetadataIndexTemplateService.findV2Template(metadata, name, hidden == null ? false : hidden);
+            if (v2Template != null) {
+                return MetadataIndexTemplateService.resolveAliases(metadata, v2Template).isEmpty();
+            }
+            for (Map<String, AliasMetadata> fromOneTemplate : MetadataIndexTemplateService.resolveAliases(
+                MetadataIndexTemplateService.findV1Templates(metadata, name, hidden)
+            )) {
+                if (fromOneTemplate.isEmpty() == false) {
+                    return false;
+                }
+            }
+            return true;
+        } catch (Exception e) {
+            // The road that has always worked, for the same reason settingsForAdmission falls back that way.
+            logger.debug("[{}] could not decide locally whether the creation is gated: {}", request.index(), e);
+            return false;
+        }
+    }
+
     public Settings settingsForAdmission(final CreateIndexClusterStateUpdateRequest request) {
         return settingsForAdmission(request, clusterService.state().metadata());
     }
