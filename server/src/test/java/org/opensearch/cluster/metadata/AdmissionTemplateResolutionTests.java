@@ -150,29 +150,35 @@ public class AdmissionTemplateResolutionTests extends OpenSearchTestCase {
      */
     public void testAnAdmittedCreationWithNothingToDeclineOnRunsLocally() {
         registerGatedOnTheSetting();
-        final MetadataCreateIndexService service = serviceWithTemplate("gated-*", false);
+        final MetadataCreateIndexService service = serviceWithTemplate("serverless_gated-*", false);
 
-        final CreateIndexClusterStateUpdateRequest request = new CreateIndexClusterStateUpdateRequest("cause", "gated-index", "gated-index")
-            .settings(Settings.EMPTY);
+        final CreateIndexClusterStateUpdateRequest request = new CreateIndexClusterStateUpdateRequest(
+            "cause",
+            "serverless_gated-index",
+            "serverless_gated-index"
+        ).settings(Settings.EMPTY);
 
         assertTrue(
-            "a gated creation needs nothing the cluster manager has -- uniqueness is the descriptor "
-                + "store's compare-and-swap and the cluster state need is a snapshot read",
+            "a name in the serverless namespace says which plane the index belongs in, with no template to "
+                + "resolve and no road to fall back from",
             service.certainlyGated(request, stateOf(service))
         );
     }
 
     public void testAnAliasOnTheRequestKeepsItOnTheClusterManager() {
         registerGatedOnTheSetting();
-        final MetadataCreateIndexService service = serviceWithTemplate("gated-*", false);
+        final MetadataCreateIndexService service = serviceWithTemplate("serverless_gated-*", false);
 
-        final CreateIndexClusterStateUpdateRequest request = new CreateIndexClusterStateUpdateRequest("cause", "gated-index", "gated-index")
-            .settings(Settings.EMPTY)
-            .aliases(java.util.Set.of(new Alias("an-alias")));
+        final CreateIndexClusterStateUpdateRequest request = new CreateIndexClusterStateUpdateRequest(
+            "cause",
+            "serverless_gated-index",
+            "serverless_gated-index"
+        ).settings(Settings.EMPTY).aliases(java.util.Set.of(new Alias("an-alias")));
 
         assertFalse(
-            "DescriptorRepresentable refuses an index with an alias, so the gate declines what admission "
-                + "accepted, and the fallback that handles it only works on the cluster manager",
+            "an index in the namespace cannot have an alias -- validate refuses this creation outright now, "
+                + "and this is the second line of defence: were it ever admitted, the road it declines onto "
+                + "only works on the cluster manager",
             service.certainlyGated(request, stateOf(service))
         );
     }
@@ -186,10 +192,13 @@ public class AdmissionTemplateResolutionTests extends OpenSearchTestCase {
      */
     public void testATemplatesAliasKeepsItOnTheClusterManagerToo() {
         registerGatedOnTheSetting();
-        final MetadataCreateIndexService service = serviceWithAliasCarryingTemplate("gated-*");
+        final MetadataCreateIndexService service = serviceWithAliasCarryingTemplate("serverless_gated-*");
 
-        final CreateIndexClusterStateUpdateRequest request = new CreateIndexClusterStateUpdateRequest("cause", "gated-index", "gated-index")
-            .settings(Settings.EMPTY);
+        final CreateIndexClusterStateUpdateRequest request = new CreateIndexClusterStateUpdateRequest(
+            "cause",
+            "serverless_gated-index",
+            "serverless_gated-index"
+        ).settings(Settings.EMPTY);
 
         assertTrue(
             "the template must still gate it, or this passes for the wrong reason",
@@ -203,7 +212,7 @@ public class AdmissionTemplateResolutionTests extends OpenSearchTestCase {
 
     public void testAnOrdinaryCreationIsNeverRunLocally() {
         registerGatedOnTheSetting();
-        final MetadataCreateIndexService service = serviceWithTemplate("gated-*", false);
+        final MetadataCreateIndexService service = serviceWithTemplate("serverless_gated-*", false);
 
         final CreateIndexClusterStateUpdateRequest request = new CreateIndexClusterStateUpdateRequest(
             "cause",
@@ -219,13 +228,16 @@ public class AdmissionTemplateResolutionTests extends OpenSearchTestCase {
 
     public void testWithNoGateInstalledNothingRunsLocally() {
         // No registerGatedOnTheSetting(), so this is an ordinary cluster.
-        final MetadataCreateIndexService service = serviceWithTemplate("gated-*", false);
+        final MetadataCreateIndexService service = serviceWithTemplate("serverless_gated-*", false);
 
-        final CreateIndexClusterStateUpdateRequest request = new CreateIndexClusterStateUpdateRequest("cause", "gated-index", "gated-index")
-            .settings(GATED_TEMPLATE);
+        final CreateIndexClusterStateUpdateRequest request = new CreateIndexClusterStateUpdateRequest(
+            "cause",
+            "serverless_gated-index",
+            "serverless_gated-index"
+        ).settings(GATED_TEMPLATE);
 
         assertFalse(
-            "a cluster that never installed the gate must be untouched by this, whatever its settings say",
+            "a cluster that never installed the gate must be untouched by this, whatever the name says",
             service.certainlyGated(request, stateOf(service))
         );
     }

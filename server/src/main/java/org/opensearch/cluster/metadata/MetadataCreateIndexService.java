@@ -375,7 +375,9 @@ public class MetadataCreateIndexService {
         // DescriptorOnlyCreation#mayBypassClusterState for why the decision has to be made from the request's
         // own settings rather than from the finished metadata, and why being wrong in either direction is
         // safe. Unregistered answers false, so an ordinary cluster never reaches the branch below.
-        if (DescriptorOnlyCreation.mayBypassClusterState(settingsForAdmission(request))) {
+        if (DescriptorOnlyCreation.hasAdmissionCheck() && DescriptorOnlyCreation.namesAServerlessIndex(request.index())) {
+            // Exact rather than admitted-on-a-guess: the name says which plane this belongs in, so there is
+            // no road to fall back from and no template to resolve first.
             createGatedIndex(request, listener);
             return;
         }
@@ -481,7 +483,7 @@ public class MetadataCreateIndexService {
      * the cluster state thread, where a blocking descriptor read is the deadlock W4 already paid for.
      */
     public boolean certainlyGated(final CreateIndexClusterStateUpdateRequest request, final ClusterState state) {
-        if (DescriptorOnlyCreation.hasAdmissionCheck() == false) {
+        if (DescriptorOnlyCreation.hasAdmissionCheck() == false || DescriptorOnlyCreation.namesAServerlessIndex(request.index()) == false) {
             return false;
         }
         if (request.aliases().isEmpty() == false || request.context() != null || request.dataStreamName() != null) {
@@ -2760,9 +2762,52 @@ public class MetadataCreateIndexService {
 
     private void validate(CreateIndexClusterStateUpdateRequest request, ClusterState state) {
         validateIndexName(request.index(), state);
+        validateServerlessNamespace(request);
         validateIndexSettings(request.index(), request.settings(), forbidPrivateIndexSettings);
         validateContext(request);
         validateIngestionSourceSettings(request.settings(), state);
+    }
+
+    /**
+     * Refuses a creation in the serverless namespace that asks for something a serverless index cannot be.
+     *
+     * <p>The name decides the plane, so these can no longer be answered by quietly making the index an
+     * ordinary one -- that is the ambiguity the namespace exists to remove, and it is how a name came to be
+     * claimable in both planes. Each of these is a condition {@code DescriptorRepresentable} refuses, said
+     * at the point the client can still do something about it.
+     *
+     * <p>Only what the request itself carries. A template that contributes an alias to a name in this
+     * namespace is not caught here, and is still decided the old way -- the gate declines and the index
+     * keeps a cluster state entry. That is a hole in the contract rather than a correctness one (nothing is
+     * written to two places), and closing it means resolving templates during validation, which is a larger
+     * change than this.
+     */
+    private void validateServerlessNamespace(CreateIndexClusterStateUpdateRequest request) {
+        if (DescriptorOnlyCreation.hasAdmissionCheck() == false || DescriptorOnlyCreation.namesAServerlessIndex(request.index()) == false) {
+            return;
+        }
+        final String unsupported;
+        if (request.aliases().isEmpty() == false) {
+            unsupported = "aliases " + request.aliases().stream().map(alias -> alias.name()).collect(toList());
+        } else if (request.context() != null) {
+            unsupported = "a context";
+        } else if (request.dataStreamName() != null) {
+            unsupported = "membership of data stream [" + request.dataStreamName() + "]";
+        } else if (request.recoverFrom() != null) {
+            unsupported = "being built from [" + request.recoverFrom().getName() + "]";
+        } else {
+            return;
+        }
+        throw new IllegalArgumentException(
+            "index ["
+                + request.index()
+                + "] is in the serverless namespace ["
+                + DescriptorOnlyCreation.SERVERLESS_NAME_PREFIX
+                + "], whose indices keep no cluster state entry, and it requests "
+                + unsupported
+                + ", which such an index cannot have. Create it outside the namespace, or drop what it "
+                + "cannot support."
+        );
     }
 
     public void validateIndexSettings(String indexName, final Settings settings, final boolean forbidPrivateIndexSettings)

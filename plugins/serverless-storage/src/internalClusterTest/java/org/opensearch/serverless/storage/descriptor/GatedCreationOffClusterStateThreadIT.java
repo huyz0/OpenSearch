@@ -116,7 +116,7 @@ public class GatedCreationOffClusterStateThreadIT extends org.opensearch.serverl
         // blocked, keeps the test measuring the steady state rather than the bootstrap -- otherwise the
         // first gated creation would be waiting on an index creation that genuinely does need the thread,
         // and would fail for a reason that has nothing to do with what this is asserting.
-        createGated("gated-warmup");
+        createGated("serverless_gated-warmup");
 
         CountDownLatch release = new CountDownLatch(1);
         CountDownLatch held = new CountDownLatch(1);
@@ -137,7 +137,7 @@ public class GatedCreationOffClusterStateThreadIT extends org.opensearch.serverl
             // The measurement.
             long started = System.nanoTime();
             PlainActionFuture<CreateIndexResponse> gated = PlainActionFuture.newFuture();
-            client().admin().indices().create(new CreateIndexRequest("gated-blocked").settings(gatedSettings()), gated);
+            client().admin().indices().create(new CreateIndexRequest("serverless_gated-blocked").settings(gatedSettings()), gated);
             CreateIndexResponse response = gated.actionGet(GATED_DEADLINE_SECONDS, TimeUnit.SECONDS);
             long elapsedMillis = (System.nanoTime() - started) / 1_000_000;
 
@@ -151,7 +151,7 @@ public class GatedCreationOffClusterStateThreadIT extends org.opensearch.serverl
         // the descriptor being readable rather than a metadata entry existing.
         assertTrue(
             "the gated index created off the cluster state thread must exist afterwards, or it was fast " + "because it did nothing",
-            store.get("gated-blocked") != null
+            store.get("serverless_gated-blocked") != null
         );
     }
 

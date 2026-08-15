@@ -113,7 +113,7 @@ public class GatedCreationOnAnyNodeIT extends org.opensearch.serverless.storage.
             internalCluster().client(dataNode)
                 .admin()
                 .indices()
-                .create(new CreateIndexRequest("gated-here").settings(gated()))
+                .create(new CreateIndexRequest("serverless_gated-here").settings(gated()))
                 .actionGet()
                 .isAcknowledged()
         );
@@ -124,10 +124,10 @@ public class GatedCreationOnAnyNodeIT extends org.opensearch.serverless.storage.
             forwardedToClusterManager.get()
         );
         // Created, and gated, so this cannot pass by the request having quietly done nothing.
-        assertNotNull("the index must exist as a descriptor", AbsentIndexDescriptorSuppliers.supply("gated-here"));
+        assertNotNull("the index must exist as a descriptor", AbsentIndexDescriptorSuppliers.supply("serverless_gated-here"));
         assertNull(
             "and must not have a cluster state entry, or it took the ordinary road after all",
-            client().admin().cluster().prepareState().get().getState().metadata().index("gated-here")
+            client().admin().cluster().prepareState().get().getState().metadata().index("serverless_gated-here")
         );
 
         assertTrue(

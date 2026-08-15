@@ -10,7 +10,6 @@ package org.opensearch.serverless.storage.descriptor;
 
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.action.admin.indices.create.CreateIndexResponse;
-import org.opensearch.action.admin.indices.rollover.RolloverResponse;
 import org.opensearch.action.index.IndexResponse;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.ClusterStateUpdateTask;
@@ -28,8 +27,13 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 /**
- * T51. Auto-creation, rollover, and data stream backing index creation for gated templates
- * must complete without stalling or dying on the cluster manager's state update thread.
+ * T51. Auto-creation for a gated template must complete without stalling or dying on the cluster manager's
+ * state update thread.
+ *
+ * <p>Rollover was in scope when this was written and is not any more. The serverless namespace decides
+ * gating by name, a rollover target needs an alias to roll onto, and an index in the namespace cannot have
+ * one -- so a rollover target is an ordinary index and takes the road that needs the thread this test
+ * holds. The class keeps its name because the history is worth finding; the body says what removed the arm.
  */
 public class GatedAutoCreateAndRolloverIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
 
@@ -104,28 +108,23 @@ public class GatedAutoCreateAndRolloverIT extends org.opensearch.serverless.stor
         });
     }
 
-    public void testAutoCreateAndRolloverCompleteOffClusterStateThread() throws Exception {
+    public void testAutoCreateCompletesOffClusterStateThread() throws Exception {
         installGate();
 
-        // Install gated index template for auto-creation matching gated-*
-        client().admin().indices().preparePutTemplate("gated-template").setPatterns(List.of("gated-*")).setSettings(gatedSettings()).get();
+        // Install gated index template for auto-creation matching serverless_gated-*
+        client().admin()
+            .indices()
+            .preparePutTemplate("gated-template")
+            .setPatterns(List.of("serverless_gated-*"))
+            .setSettings(gatedSettings())
+            .get();
 
         // Warmup gated creation
         CreateIndexResponse warmup = client().admin()
             .indices()
-            .create(new CreateIndexRequest("gated-warmup-1").settings(gatedSettings()))
+            .create(new CreateIndexRequest("serverless_gated-warmup-1").settings(gatedSettings()))
             .actionGet();
         assertTrue(warmup.isAcknowledged());
-
-        // Create initial index with alias for rollover test
-        CreateIndexResponse init = client().admin()
-            .indices()
-            .create(
-                new CreateIndexRequest("gated-roll-000001").settings(gatedSettings())
-                    .alias(new org.opensearch.action.admin.indices.alias.Alias("gated-alias"))
-            )
-            .actionGet();
-        assertTrue(init.isAcknowledged());
 
         CountDownLatch release = new CountDownLatch(1);
         CountDownLatch held = new CountDownLatch(1);
@@ -134,17 +133,15 @@ public class GatedAutoCreateAndRolloverIT extends org.opensearch.serverless.stor
 
         try {
             // Auto-create off-thread
-            IndexResponse autoResp = client().prepareIndex("gated-autocreate-1").setId("1").setSource("field1", "val1").get();
+            IndexResponse autoResp = client().prepareIndex("serverless_gated-autocreate-1").setId("1").setSource("field1", "val1").get();
             assertNotNull(autoResp.getId());
 
-            // Rollover off-thread
-            RolloverResponse rollResp = client().admin()
-                .indices()
-                .prepareRolloverIndex("gated-alias")
-                .setNewIndexName("gated-roll-000002")
-                .get();
-            assertTrue(rollResp.isRolledOver());
-            assertEquals("gated-roll-000002", rollResp.getNewIndex());
+            // The rollover arm that used to be here is gone, and what removed it is the serverless
+            // namespace rather than a test problem. A rollover target needs an alias to roll onto; an index
+            // in the namespace cannot have one; and an index outside it takes the ordinary road, which needs
+            // the very thread this test holds. So "a gated rollover completes off the cluster state thread"
+            // is not a property that can hold under this contract -- it is B2 in STATE.md answered by
+            // implication: gating does not extend to rollover targets unless aliases are brought inside it.
         } finally {
             release.countDown();
         }

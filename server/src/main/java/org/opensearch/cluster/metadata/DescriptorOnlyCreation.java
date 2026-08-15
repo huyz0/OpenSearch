@@ -40,6 +40,43 @@ import java.util.function.Predicate;
  */
 public final class DescriptorOnlyCreation {
 
+    /**
+     * The namespace a serverless index's name lives in, and the whole of what decides gating.
+     *
+     * <h4>Why a name and not a setting</h4>
+     *
+     * Gating used to be inferred: from the request's settings, and since T49 from the settings a template
+     * resolves too. Inference has three costs this removes. It cannot be exact -- a creation was admitted on
+     * a guess and had to carry a fallback for the times the real gate disagreed, which is why a gated
+     * creation could only be distributed for the cases that were *certainly* gated. It made the same index
+     * name mean either plane, so a gated index and an ordinary index could both claim it: neither creation
+     * path consults the other's authority, and {@code GatedAndOrdinaryNameCollisionIT} measured both being
+     * granted, sequentially, with no concurrency involved. And it put the answer somewhere a caller holding
+     * only a name could not see it.
+     *
+     * <p>A name settles all three at once, and settles the collision by construction rather than by
+     * agreement: the two namespaces are disjoint, so there is no window in which both could be claimed and
+     * nothing for two authorities to race over. The check is a string comparison, which is why it can live
+     * wherever it is needed -- including inside the cluster state update task, where a descriptor read is
+     * the deadlock W4 paid for.
+     *
+     * <p><b>The setting keeps its old meaning</b> and stops being the decider. It still turns on serverless
+     * storage and computed placement, and the plugin's setting provider derives it for a name in this
+     * namespace, so everything downstream of gating is untouched by this.
+     */
+    public static final String SERVERLESS_NAME_PREFIX = "serverless_";
+
+    /**
+     * Whether this name is in the serverless namespace.
+     *
+     * <p>Total on the name alone: no cluster state, no templates, no store. That is the property every
+     * caller here relies on, and the reason this is a constant and a string comparison rather than a
+     * registry.
+     */
+    public static boolean namesAServerlessIndex(String indexName) {
+        return indexName != null && indexName.startsWith(SERVERLESS_NAME_PREFIX);
+    }
+
     private static final AtomicReference<Predicate<IndexMetadata>> GATE = new AtomicReference<>();
 
     private static final AtomicReference<Predicate<Settings>> ADMISSION = new AtomicReference<>();

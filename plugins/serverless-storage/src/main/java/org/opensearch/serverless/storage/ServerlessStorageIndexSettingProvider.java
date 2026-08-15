@@ -106,7 +106,16 @@ public final class ServerlessStorageIndexSettingProvider implements IndexSetting
                 }
             }
         }
-        if (ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.get(templateAndRequestSettings) == false) {
+        // The name is what decides serverless-ness since the namespace was introduced, so an index in it
+        // carries the setting whether or not the request or a template said so. Derived here rather than
+        // asserted at the gate because everything downstream -- storage, computed placement, the engine --
+        // already keys off the setting, and rewriting all of that to ask about the name would be a much
+        // larger change for the same answer. See DescriptorOnlyCreation#SERVERLESS_NAME_PREFIX.
+        final boolean namespaced = org.opensearch.cluster.metadata.DescriptorOnlyCreation.namesAServerlessIndex(indexName);
+        if (namespaced) {
+            dataStreamSettings.put(ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey(), true);
+        }
+        if (namespaced == false && ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.get(templateAndRequestSettings) == false) {
             return dataStreamSettings.build();
         }
         int numberOfWriterReplicas = IndexMetadata.INDEX_NUMBER_OF_REPLICAS_SETTING.get(templateAndRequestSettings);

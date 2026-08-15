@@ -229,8 +229,10 @@ short of certain keeps today's behaviour.
 snapshot it can see, so off the cluster manager the window in which an ordinary index of the same name is not
 yet visible grows from thread-scheduling lag to publication lag. The race is not new -- gated creation has
 run off the state thread since T49, so the manager never serialised against its own publications either --
-and the reverse direction is closed, because ordinary creation consults the descriptor store. Closing this
-direction needs a commit across both stores.
+and the reverse direction is closed for a different reason than I first wrote here: not because ordinary
+creation consults the descriptor store -- it does not, as the section above measures -- but because a gated
+creation validates its name against cluster state like any other. Closing this direction needs a commit
+across both stores.
 
 **What it is worth cannot be measured here.** Every node in an internal cluster test shares one JVM on one
 box, so distributing the work adds no CPU: the harness shows no regression and an improvement consistent
@@ -269,6 +271,43 @@ write-behind projection kept only so the aggregate stays one search.
 - *Does the test fixture build what the plugin builds?* Every mapping-stats test hand-built its own
   `IndexBackedMappingStore`, so the suite stayed green against a store production did not register. The shared
   fixture now composes the store the way `ServerlessStoragePlugin` does.
+
+### The name decides: `serverless_`
+
+An index whose name begins with `serverless_` is a serverless index. The prefix is the declaration, and
+`DescriptorOnlyCreation.namesAServerlessIndex` is the whole of the rule.
+
+**Why a name and not a path.** The alternative on the table was a distinct REST path (`/serverless/{index}/...`)
+for the index and search roads. A path is a bigger change to a bigger surface -- every client, every SDK, every
+`_bulk` body line addressing an index by name, and the internal callers that build requests without going
+through REST at all -- and it moves the declaration to the *request* when the property being declared belongs
+to the *index*. A name travels with the index through every API that already exists, costs nothing at runtime,
+and is visible in a log line.
+
+**What it buys, in order of how much it matters:**
+
+- *Admission stops depending on template resolution.* `certainlyGated` previously had to resolve templates on
+  the request path to find out whether the gated setting would be contributed, and then resolve them again to
+  find out whether a template's alias would make the finished index non-representable. The name answers the
+  first question before anything is read.
+- *The refusals become knowable to the caller.* An index in the namespace may not carry an alias, a context, a
+  data-stream name, or a resize source. `validateServerlessNamespace` refuses those at `validate`, with a
+  message naming the conflict, instead of the creation being quietly admitted and then declined onto a road
+  that only works on the cluster manager.
+- **B2 is answered by implication.** The blocked question was whether a gated index could carry a
+  post-creation-mutable alias or data-stream membership. Under the namespace it cannot, by construction and
+  visibly: the creation is refused rather than half-supported. `GatedAutoCreateAndRolloverIT` lost its rollover
+  arm for exactly this reason -- a rollover target needs an alias -- and kept the auto-creation arm, which
+  needs neither. That is the "gating stays permanently scoped" branch of B2, chosen and now enforced at the
+  door rather than discovered at the wall.
+
+**What it does not yet do, stated plainly.** `DescriptorGate::gatable` still accepts the *setting*, so an index
+outside the namespace that carries `index.serverless_storage.enabled` is still gated. The namespace is exact
+for admission and for distribution; it is not yet the only way in. Measured rather than assumed: making the
+name authoritative for admission moved **3 of 222** integration tests, not the ~66 that would have moved had
+the bottom gate required it too. So the name collision documented above stays open -- closing it by
+construction means requiring the namespace at `gatable`, migrating 74 index names across roughly 63 test
+files, and retiring the settings road. That is a decision, not a follow-up.
 
 ## Position
 
@@ -427,7 +466,14 @@ a distinct blob codec name, is downstream of this and straightforward either way
 
 Nothing in the current task list depends on the answer, so the loop can run without it.
 
-### B2. Can a gated index carry a post-creation-mutable alias or data-stream membership at all
+### B2. Can a gated index carry a post-creation-mutable alias or data-stream membership at all — ANSWERED
+
+**Answered 2026-08-15 by the `serverless_` namespace: no, and now visibly rather than by wall.** The second
+branch below was taken. An index in the namespace may not carry an alias, a context, a data-stream name or a
+resize source, and `validateServerlessNamespace` refuses such a creation at `validate` with a message naming
+the conflict. `GatedAutoCreateAndRolloverIT` lost its rollover arm and kept its auto-creation arm, which is
+exactly the shape the second branch predicted. The analysis below stands as the reason the answer is no; it is
+kept because it is the argument, not because the question is still open.
 
 T51 needs a gated rollover target's alias, and a gated data-stream target's backing-index
 membership, recorded correctly, not just its mapping write made safe. Both traced to the same wall:
