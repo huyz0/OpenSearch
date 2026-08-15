@@ -187,11 +187,19 @@ It also runs without the writer: the lazy directory needs only the object store 
 execute on a node holding no shard of the index — off the serving path entirely, which classic snapshot
 cannot do.
 
+**The spike passed, so the rest of this is wiring.** `BundleBackedCommitIsCopyableTests` builds a
+`LazyBundleDirectory` over a published manifest with no live shard, engine or local directory anywhere,
+takes its `IndexCommit`, and reads every file end to end with `CodecUtil.checksumEntireFile` -- the same
+call `BlobStoreRepository` makes when deciding whether a file can be reused or must be uploaded. Twenty
+files and 12,953 bytes, matching the local commit exactly in both byte count and file set: nothing copied
+that the commit does not name, nothing it names missed, and no whole-bundle over-read. This is the opposite
+access pattern to the one the lazy directory was built for -- searches read the blocks a query touches, a
+snapshot reads all of every file -- and nothing else exercised it.
+
 **The three things that are real work rather than wiring**, and the order to find out about them:
 
-- *Does a `Store` over a lazy directory yield a commit whose files can be read end to end?* This is the
-  load-bearing assumption and it is cheap to test on its own. **Do this first, as a spike, before building
-  anything on top of it.** If it fails, the rest of item 5 does not exist in this form.
+- ~~*Does a `Store` over a lazy directory yield a commit whose files can be read end to end?*~~ **Answered:
+  yes.** The design above exists.
 - *Orchestration.* `snapshotShard` is normally driven by `SnapshotsService`, which also creates the
   repository-side bookkeeping and calls `finalizeSnapshot`. Driving it from a plugin action means owning
   that sequence. This is the part most likely to be larger than it looks.
@@ -208,7 +216,7 @@ cannot do.
 | 2b | **a restore must survive reopening** (new, found by 2) | reopened index still reads as restored | unknown until the cause is established |
 | 3 | audible omission | a wildcard snapshot on a gated cluster warns; asserted | small |
 | 4 | posture written down | one design page, linked from the snapshot page | small |
-| 5 | independent copy | spike proves the commit is readable; then orchestration | spike small, rest medium |
+| 5 | independent copy | **spike done: the commit is readable and correctly sized.** Orchestration next | rest medium |
 
 Items 1–4 are each independently shippable and none depends on 5. Item 5's spike is the gate on whether the
 rest of it is a days-long piece or a different design entirely, so the spike is the deliverable that
