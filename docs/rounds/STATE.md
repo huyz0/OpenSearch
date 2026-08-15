@@ -284,6 +284,45 @@ write-behind projection kept only so the aggregate stays one search.
   `IndexBackedMappingStore`, so the suite stayed green against a store production did not register. The shared
   fixture now composes the store the way `ServerlessStoragePlugin` does.
 
+### Shallow snapshot exists and works; it just cannot name a gated index
+
+Asked whether a shallow snapshot or an Aurora-style time machine is possible, the answer turned out to be
+mostly built already, which is worth writing down before anyone designs it again.
+
+**What is there.** `_snapshot_pin` writes a durable pin naming a manifest generation and copies nothing --
+the bundles that generation refers to are already in the object store, which is exactly what "shallow"
+means. `_snapshot_restore` compare-and-swaps the shard head back to a pinned generation and refuses while a
+writer lease is active. `_snapshot_release` drops the pin so GC can reclaim. Index-level wrappers fan all
+three across every shard, all-or-nothing, and roll back partial pins. `PitrRetentionPolicy` decides *when* a
+pin is required: every manifest created inside the window, plus the last one before it, so any instant in
+the window has something to resolve to. Five integration tests cover it.
+
+**Gap 1, measured.** None of it reaches a gated index. `TransportIndexSnapshotPinAction` and its restore and
+release siblings resolve the index name through `clusterService.state().metadata().index(name)`, which is
+null for a gated index, so the call fails `IndexNotFoundException[no such index [serverless_pin-me]]` for an
+index that exists, is serving traffic, and has manifests to pin. The shard-level actions underneath take a
+uuid and a shard id and never consult cluster state, so the mechanism is indifferent to gating -- only the
+name-to-uuid step is not. `GatedShallowSnapshotIT` pins both halves: the gated failure and the identical
+call succeeding against an ungated serverless index.
+
+**Gap 2.** `serverless_storage.pitr_window` defaults to `-1`, which disables PITR entirely. The machinery
+runs only when someone turns it on.
+
+**Gap 3, the one that is actually missing rather than misrouted.** Nothing resolves a *timestamp* to a
+manifest. `CommitManifest.createdAtMillis` exists and is read only by retention policies deciding what to
+keep; the restore request carries a pin id and no time, and picks the highest generation carrying that id.
+So the data for any instant in the window survives, and there is no way to ask for an instant. Sub-commit
+precision is a further step: `WalRecord` carries `(indexUuid, shardId, primaryTerm, seqNo)` and no
+timestamp, so replay can stop at a sequence number but not at a wall-clock second without a time-to-seqNo
+index.
+
+**Shape of the work, smallest first**: teach the three index-level actions to resolve through
+`AbsentIndexDescriptorSuppliers` (afternoon); add `restore_to` resolving a timestamp to the newest manifest
+at or before it (small, the inputs are all present); restore into a *new* index rather than in place, which
+is the Aurora clone shape and can compose the existing `ShardCloner` (medium); per-record WAL timestamps or
+a periodic time-to-seqNo index for second-granularity (medium). **A question for a human: which of these,
+and in what order.**
+
 ### Snapshot does not cover the gated fleet, and the way it does not is silent
 
 Asked whether snapshot works, measured rather than read. Two behaviours, and the second is the one that
