@@ -55,13 +55,29 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class GatedCreationWithoutTemporaryIndexServiceIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
 
     /**
-     * What the last validation saw: null means the bypass ran, an instance means an index service was built.
+     * What the validation for an index saw: false means no mapper service was built for it at all.
      *
      * <p>Static because the plugin is constructed by the node, not by the test, so there is no instance to
      * reach through. Cleared in {@link #forgetWhatWasValidated} so one case cannot read another's result --
      * which would be the difference between asserting the bypass ran and asserting it ran at some point.
+     *
+     * <p><b>This used to be read as "an index service was built", and T60 made that inference false.</b>
+     * A mapping richer than a bare type name is now validated against a mapper service built on its own,
+     * without the {@code IndexService} around it, so a non-null mapper service here no longer distinguishes
+     * the two roads -- and the test that asserted a parameterised field "still builds one" went on passing
+     * while the thing it named stopped happening. {@link #INDEX_SERVICE_BUILT} is the discriminator now.
      */
-    private static final java.util.Map<String, Boolean> BUILT_AN_INDEX_SERVICE = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final java.util.Map<String, Boolean> MAPPER_SERVICE_BUILT = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Every index a full {@code IndexService} was built for, which is the thing the bypass exists to avoid.
+     *
+     * <p>Recorded from {@code beforeIndexAddedToCluster}, because that hook belongs to the index service's
+     * own listener chain: the full path calls it and neither of the two cheaper roads has one to call. That
+     * is the same behavioural difference both of those roads document, used here as the signal for which
+     * road ran.
+     */
+    private static final java.util.Set<String> INDEX_SERVICE_BUILT = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     private static final AtomicInteger VALIDATIONS = new AtomicInteger();
 
@@ -73,10 +89,16 @@ public class GatedCreationWithoutTemporaryIndexServiceIT extends org.opensearch.
      * own index, which is ordinary and does build one -- so a last-wins record reports that second creation
      * and attributes it to the first. The fast path looked broken for a day because of it.
      */
-    private static boolean builtAnIndexServiceFor(String index) {
-        Boolean built = BUILT_AN_INDEX_SERVICE.get(index);
+    private static boolean builtAMapperServiceFor(String index) {
+        Boolean built = MAPPER_SERVICE_BUILT.get(index);
         assertNotNull("no validation was recorded for [" + index + "], so this asserts nothing", built);
         return built;
+    }
+
+    /** Whether the full index-service road ran for {@code index}, rather than either road that avoids it. */
+    private static boolean builtAnIndexServiceFor(String index) {
+        assertNotNull("no validation was recorded for [" + index + "], so this asserts nothing", MAPPER_SERVICE_BUILT.get(index));
+        return INDEX_SERVICE_BUILT.contains(index);
     }
 
     /**
@@ -94,7 +116,7 @@ public class GatedCreationWithoutTemporaryIndexServiceIT extends org.opensearch.
 
         @Override
         public void validate(MapperService mapperService, IndexSettings indexSettings) {
-            BUILT_AN_INDEX_SERVICE.put(indexSettings.getIndex().getName(), mapperService != null);
+            MAPPER_SERVICE_BUILT.put(indexSettings.getIndex().getName(), mapperService != null);
             VALIDATIONS.incrementAndGet();
         }
     }
@@ -104,6 +126,23 @@ public class GatedCreationWithoutTemporaryIndexServiceIT extends org.opensearch.
         @Override
         public Collection<IndexCreationValidator> getIndexCreationValidators() {
             return List.of(new RecordingValidator());
+        }
+
+        /**
+         * Registers the listener whose call marks the full road.
+         *
+         * <p>{@code onIndexModule} itself runs on all three roads, so being called here says nothing about
+         * which one this is. What separates them is that only the full one has an {@code IndexService} to
+         * invoke the chain through.
+         */
+        @Override
+        public void onIndexModule(org.opensearch.index.IndexModule indexModule) {
+            indexModule.addIndexEventListener(new org.opensearch.index.shard.IndexEventListener() {
+                @Override
+                public void beforeIndexAddedToCluster(org.opensearch.core.index.Index index, Settings indexSettings) {
+                    INDEX_SERVICE_BUILT.add(index.getName());
+                }
+            });
         }
     }
 
@@ -144,7 +183,8 @@ public class GatedCreationWithoutTemporaryIndexServiceIT extends org.opensearch.
 
     @Before
     public void forgetWhatWasValidated() throws Exception {
-        BUILT_AN_INDEX_SERVICE.clear();
+        MAPPER_SERVICE_BUILT.clear();
+        INDEX_SERVICE_BUILT.clear();
         VALIDATIONS.set(0);
     }
 
@@ -177,6 +217,7 @@ public class GatedCreationWithoutTemporaryIndexServiceIT extends org.opensearch.
                 + "index service, and one built here means it was built anyway",
             builtAnIndexServiceFor("gated-plain")
         );
+        assertFalse("and with nothing to validate, without a mapper service either", builtAMapperServiceFor("gated-plain"));
     }
 
     /**
@@ -233,6 +274,11 @@ public class GatedCreationWithoutTemporaryIndexServiceIT extends org.opensearch.
                 + "service should have been built to validate it",
             builtAnIndexServiceFor("gated-mapped")
         );
+        assertFalse(
+            "nor a mapper service: the registry answers the whole question for a bare type name, which is "
+                + "the difference between this road and the one a parameter takes",
+            builtAMapperServiceFor("gated-mapped")
+        );
 
         var descriptor = org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.supply("gated-mapped");
         assertNotNull("the index must still be gated", descriptor);
@@ -246,15 +292,26 @@ public class GatedCreationWithoutTemporaryIndexServiceIT extends org.opensearch.
     }
 
     /**
-     * A field carrying a parameter still builds one, because there is more than a type name to check.
+     * A field carrying a parameter is validated against a real mapper service -- and still builds no index
+     * service.
      *
-     * <p>The boundary of what T21 admits, and the reason it is drawn here. {@code ignore_above} sits beside
-     * a perfectly good {@code keyword}, so the registry check would pass and say nothing about the
-     * parameter. An analyzer has to resolve against the index's analysis configuration and a date format has
-     * to parse; neither is a registry lookup. Admitting these on the strength of the type name would be a
-     * mapping accepted and not really checked.
+     * <p>The boundary of what the registry check admits is unchanged, and the reason it is drawn here is
+     * unchanged: {@code ignore_above} sits beside a perfectly good {@code keyword}, so the registry check
+     * would pass and say nothing about the parameter. An analyzer has to resolve against the index's
+     * analysis configuration and a date format has to parse; neither is a registry lookup. Admitting these
+     * on the strength of the type name would be a mapping accepted and not really checked.
+     *
+     * <p><b>What changed in T60 is the price of not admitting it.</b> This used to mean building a whole
+     * {@code IndexService} -- and measuring it found 315 creations per second against 2,259 unmapped,
+     * because every concurrent creation on the node queued behind {@code IndicesService}'s monitor. The
+     * mapping is validated against a mapper service built on its own now, so this case is checked exactly
+     * as thoroughly and no longer pays for an index service to do it.
+     *
+     * <p>Both halves are asserted, and the second is why the first means anything: this method asserted
+     * "still builds one" until T60 and went on passing afterwards, because it inferred an index service from
+     * a non-null mapper service and the new road hands it one too.
      */
-    public void testAFieldCarryingAParameterStillBuildsOne() throws Exception {
+    public void testAFieldCarryingAParameterIsValidatedWithoutAnIndexService() throws Exception {
         installBlobBackedDescriptorPlane();
 
         client().admin()
@@ -267,8 +324,27 @@ public class GatedCreationWithoutTemporaryIndexServiceIT extends org.opensearch.
 
         assertTrue(
             "a definition with more than a type in it has more to validate than the registry can answer, "
-                + "so it must still be validated through a real index service",
+                + "so it must be merged into a real mapper service",
+            builtAMapperServiceFor("gated-parameterised")
+        );
+        assertFalse(
+            "but validating a mapping needs a mapper service, not an index service, and building the "
+                + "latter is what serialises every concurrent creation on the node",
             builtAnIndexServiceFor("gated-parameterised")
+        );
+
+        // And the parameter survived, which is what the validation was for. A road that dropped it would
+        // satisfy both assertions above and be exactly the loss T13 and T15 were spent removing.
+        var descriptor = org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.supply("gated-parameterised");
+        assertNotNull("the index must still be gated", descriptor);
+        var generation = org.opensearch.cluster.metadata.MappingGenerationStore.currentMapping(descriptor.uuid());
+        assertNotNull("the declared field must reach the store", generation);
+        Object code = generation.fields().get("code");
+        assertEquals("keyword", org.opensearch.cluster.metadata.MappingGenerationStore.typeOf(code));
+        assertEquals(
+            "the parameter itself must round-trip, not just the type beside it",
+            256,
+            ((Map<?, ?>) org.opensearch.cluster.metadata.MappingGenerationStore.definition(code)).get("ignore_above")
         );
     }
 

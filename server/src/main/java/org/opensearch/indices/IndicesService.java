@@ -1368,6 +1368,66 @@ public class IndicesService extends AbstractLifecycleComponent
     }
 
     /**
+     * A mapper service for validating a mapping, built without holding this object's monitor for the whole
+     * of it.
+     *
+     * <h4>Why this exists</h4>
+     *
+     * Validating a declared mapping means building one of these, and every existing route to one --
+     * {@link #createIndexMapperService}, {@link #withTempIndexService} -- is {@code synchronized} on this
+     * object, so every concurrent index creation on the node queues behind one monitor. T60 measured what
+     * that costs: a gated creation whose mapping is nothing but field types runs at 2,095 per second, and
+     * the same creation with one parameter added -- which is what sends it down this road -- runs at 315.
+     * Per creation that is about 21.6 ms of service time at concurrency 8, against 276 us for everything
+     * else a declared mapping costs. The store is not the bottleneck and neither is the blob write; this
+     * monitor is.
+     *
+     * <h4>What is still inside the monitor, and why that is the right line</h4>
+     *
+     * {@code pluginsService.onIndexModule} runs third-party code, and nothing about a plugin's
+     * {@code onIndexModule} promises to tolerate being called concurrently. That keeps the monitor. What
+     * moves out is the work either side of it: constructing the settings and the module, and -- the
+     * expensive half -- {@code analysisRegistry.build}, which builds this index's analyzers, plus the
+     * mapper service itself. Those read node-level registries fixed at construction and write nothing
+     * shared.
+     *
+     * <h4>What this must not be used for</h4>
+     *
+     * A mapper service that is going to be *kept*. This one is built, merged into, read once and closed, and
+     * it is never registered in {@link #indices}, so it cannot race the creation and removal paths that the
+     * monitor also serialises. {@link #createIndexMapperService} is unchanged and remains the method for
+     * anything that outlives its own validation -- narrowing the monitor there would change concurrency for
+     * ordinary indices, which is not this change's to make.
+     *
+     * <p>Note: the returned {@link MapperService} should be closed when unneeded.
+     */
+    public MapperService createMapperServiceForValidation(IndexMetadata indexMetadata) throws IOException {
+        final IndexSettings idxSettings = new IndexSettings(indexMetadata, this.settings, indexScopedSettings);
+        final IndexModule indexModule = new IndexModule(
+            idxSettings,
+            analysisRegistry,
+            getIndexerFactory(idxSettings),
+            null,
+            getEngineConfigFactory(idxSettings),
+            directoryFactories,
+            compositeDirectoryFactories,
+            () -> allowExpensiveQueries,
+            indexNameExpressionResolver,
+            recoveryStateFactories,
+            storeFactories,
+            nodeCacheService,
+            compositeIndexSettings,
+            dataFormatAwareStoreDirectoryFactories
+        );
+        synchronized (this) {
+            // The one part that runs code this class does not own. Held for the callback and released
+            // before the analyzers are built, which is where the time actually goes.
+            pluginsService.onIndexModule(indexModule);
+        }
+        return indexModule.newIndexMapperService(xContentRegistry, mapperRegistry, scriptService);
+    }
+
+    /**
      * creates a new mapper service for the given index, in order to do administrative work like mapping updates.
      * This *should not* be used for document parsing. Doing so will result in an exception.
      * <p>

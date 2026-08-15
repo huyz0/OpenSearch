@@ -1479,6 +1479,38 @@ of 132 threads parked inside it and an arm of 300 mapped creations that never fi
 stopped the thing it measures. Projections are bounded at four in flight now and dropped beyond that, which
 is the same trade this class already made for a projection that fails.
 
+### The two ceilings under "creation is single-node", one of them now removed
+
+Creation runs on the elected cluster manager because `TransportCreateIndexAction` is a
+`TransportClusterManagerNodeAction` and never overrides `localExecute`. For a gated creation nothing needs
+that node: uniqueness comes from the descriptor's register compare-and-swap, and what creation reads from
+cluster state -- templates, scoped settings, the name collision check against ordinary indices -- is a
+snapshot every node already has. The path's own javadoc says so. **Distributing it is a small change and it
+is not made here**, because it is worth deciding deliberately rather than as a side effect of a throughput
+fix.
+
+What that arithmetic looks like: 100M in two hours is 13,889 creations per second. One node already sustains
+1,348 to 2,639 depending on mapping shape, so compute needs roughly six to ten nodes, and at a hundred it is
+139 each -- a tenth of what one does now. Compute stops being the constraint well before the fleet does.
+
+**Then the object store becomes it, and one prefix in particular.** Each gated creation writes twice: the
+descriptor's register CAS, whose keys are name-derived and spread across the keyspace, and one change log
+entry. The change log put every entry for a minute under that minute's bucket -- **one prefix**, against
+S3's documented 3,500 writes per second per prefix, which is about a quarter of the 13,889 target and a
+ceiling on the whole cluster regardless of how many nodes are creating. Worse for the mitigation S3 does
+have: it partitions a prefix that stays hot, and a new bucket every minute is a cold prefix every minute.
+
+Appends are spread over sixteen prefixes within a bucket now, which puts that ceiling near 56,000 per
+second. Readers discover shards by listing a bucket's children rather than knowing the count, so it can
+change without a migration, and entries written under the bucket itself -- the layout before this -- are
+still read. **Nothing about the previous version looked wrong**: appends never contended, no test could see
+a prefix rate, and the ceiling only existed on a store none of this has ever run against.
+
+What is left before "100M in two hours" is a claim rather than an arithmetic exercise: the redirect above,
+a measurement against a real object store, and the fact that at that rate the mapping stats projection --
+bounded at four in flight per node -- would under-report by orders of magnitude, which reopens what cluster
+stats should answer for a population this size.
+
 ### Where the goal actually stands, seventh pass
 
 | ceiling | state |

@@ -85,6 +85,28 @@ public final class BlobDescriptorChangeLog {
      */
     static final long BUCKET_MILLIS = TimeUnit.MINUTES.toMillis(1);
 
+    /**
+     * How many prefixes one bucket's appends are spread over.
+     *
+     * <p><b>Why a bucket cannot be one prefix.</b> Appends never contend with each other -- each writes its
+     * own blob under its own name -- so this was written as though the append rate were unbounded. It is
+     * not: an object store rate-limits by key prefix, and S3's documented figure is 3,500 writes per second
+     * per prefix. Every append in a minute landing under one bucket makes that bucket the ceiling on how
+     * fast the whole cluster can create indices, at about a quarter of the rate 100M indices in two hours
+     * needs -- and it is the worst shape for the mitigation S3 does have, which is to partition a prefix
+     * that stays hot, because a new bucket every minute is a cold prefix every minute.
+     *
+     * <p>Sixteen puts the ceiling at about 56,000 appends per second, which is four times that target. It
+     * is not a tuned number and does not need to be: the cost of raising it is paid by readers, in one
+     * extra listing per shard that actually has entries, and the cost of it being too low is a ceiling
+     * nobody can see until they hit it.
+     *
+     * <p><b>Readers do not know this number and must not.</b> They discover shards by listing the bucket's
+     * children, so this can change in either direction without a migration and without a mixed-version
+     * cluster disagreeing about where to look.
+     */
+    static final int APPEND_SHARDS = 16;
+
     private final Function<BlobPath, BlobContainer> containers;
     private final BlobPath basePath;
     private final LongSupplier clock;
@@ -123,7 +145,11 @@ public final class BlobDescriptorChangeLog {
     public void append(DescriptorChange change) {
         try {
             BytesReference bytes = encode(change);
-            bucketContainer(bucketOf(clock.getAsLong())).writeBlob(UUIDs.randomBase64UUID(), bytes.streamInput(), bytes.length(), true);
+            // The name decides the shard, so the spread is the UUID's and there is no second source of
+            // randomness to reason about. Entry names stay unique across shards within a bucket, which is
+            // what a tailer's already-consumed set is keyed on.
+            String name = UUIDs.randomBase64UUID();
+            shardContainer(bucketOf(clock.getAsLong()), shardOf(name)).writeBlob(name, bytes.streamInput(), bytes.length(), true);
         } catch (IOException | RuntimeException e) {
             failedAppends.incrementAndGet();
             logger.warn("could not append a change log entry for [{}]; the feed will need a rebuild to notice: {}", change.name(), e);
@@ -241,18 +267,15 @@ public final class BlobDescriptorChangeLog {
                     continue;
                 }
                 boolean revisiting = bucket.getKey().equals(fromBucket);
-                for (String entry : bucket.getValue().listBlobs().keySet()) {
-                    if (revisiting && alreadyConsumed.contains(entry)) {
-                        continue;
-                    }
-                    try (InputStream stream = bucket.getValue().readBlob(entry); StreamInput in = StreamInput.wrap(stream.readAllBytes())) {
-                        changes.add(new LoggedChange(bucket.getKey(), entry, new DescriptorChange(in)));
-                    } catch (IOException e) {
-                        // One unreadable entry is not a reason to lose the rest of the catch-up. It is also
-                        // expected transiently: an entry can be listed between its key appearing and its
-                        // body being complete, on a store that does not make writes atomic.
-                        logger.debug("skipping an unreadable change log entry [{}/{}]: {}", bucket.getKey(), entry, e);
-                    }
+                // Directly under the bucket first, which is where appends landed before they were sharded.
+                // Costs one listing that is empty on anything written since, and means a log written by an
+                // older node is not silently skipped by a newer one.
+                readEntriesInto(changes, bucket.getKey(), bucket.getValue(), revisiting, alreadyConsumed);
+                // Then each shard that exists. Discovered rather than enumerated, so a reader never needs
+                // to know APPEND_SHARDS, an empty shard costs nothing, and changing the count is not a
+                // migration.
+                for (BlobContainer shard : new TreeMap<>(bucket.getValue().children()).values()) {
+                    readEntriesInto(changes, bucket.getKey(), shard, revisiting, alreadyConsumed);
                 }
             }
         } catch (IOException e) {
@@ -279,6 +302,44 @@ public final class BlobDescriptorChangeLog {
 
     private BlobPath changelogPath() {
         return basePath.add(CHANGELOG_PREFIX.substring(0, CHANGELOG_PREFIX.length() - 1));
+    }
+
+    /**
+     * Reads every entry in one container into {@code changes}, skipping what a revisiting reader already had.
+     *
+     * <p>Entries are identified by name alone rather than by shard and name, because the names are UUIDs
+     * and a tailer's cursor was keyed that way before sharding existed. Qualifying them now would make
+     * every cursor written by a running node stop matching.
+     */
+    private void readEntriesInto(
+        List<LoggedChange> changes,
+        String bucket,
+        BlobContainer container,
+        boolean revisiting,
+        java.util.Set<String> alreadyConsumed
+    ) throws IOException {
+        for (String entry : container.listBlobs().keySet()) {
+            if (revisiting && alreadyConsumed.contains(entry)) {
+                continue;
+            }
+            try (InputStream stream = container.readBlob(entry); StreamInput in = StreamInput.wrap(stream.readAllBytes())) {
+                changes.add(new LoggedChange(bucket, entry, new DescriptorChange(in)));
+            } catch (IOException e) {
+                // One unreadable entry is not a reason to lose the rest of the catch-up. It is also
+                // expected transiently: an entry can be listed between its key appearing and its body
+                // being complete, on a store that does not make writes atomic.
+                logger.debug("skipping an unreadable change log entry [{}/{}]: {}", bucket, entry, e);
+            }
+        }
+    }
+
+    /** Which of a bucket's prefixes an entry belongs in, derived from its own name. */
+    static String shardOf(String entryName) {
+        return String.format(java.util.Locale.ROOT, "%02d", Math.floorMod(entryName.hashCode(), APPEND_SHARDS));
+    }
+
+    private BlobContainer shardContainer(String bucket, String shard) {
+        return containers.apply(changelogPath().add(bucket).add(shard));
     }
 
     private BlobContainer bucketContainer(String bucket) {

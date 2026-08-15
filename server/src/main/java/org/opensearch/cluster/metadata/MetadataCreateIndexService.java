@@ -910,7 +910,29 @@ public class MetadataCreateIndexService {
             templatesApplied,
             templateAliases
         )) {
-            return applyCreateIndexWithoutTemporaryService(currentState, request, temporaryIndexMeta, mappings, metadataTransformer);
+            String needsAMapperService = whyTheseMappingsNeedAMapperService(mappings);
+            if (needsAMapperService == null) {
+                return applyCreateIndexWithoutTemporaryService(currentState, request, temporaryIndexMeta, mappings, metadataTransformer);
+            }
+            // Everything except the mapping is satisfied, so what is missing is a mapper service and not an
+            // index service. T60 measured the difference: building the whole thing serialises every
+            // concurrent creation on the node behind one monitor and costs about 21.6 ms of service time
+            // each, which is seven times what the creation itself costs.
+            logger.debug("[{}] validating with a mapper service alone: {}", request.index(), needsAMapperService);
+            ClusterState withAMapperService = applyCreateIndexWithOnlyAMapperService(
+                currentState,
+                request,
+                temporaryIndexMeta,
+                mappings,
+                metadataTransformer,
+                silent
+            );
+            if (withAMapperService != null) {
+                return withAMapperService;
+            }
+            // A composite index, which is the one thing a mapper service cannot finish validating on its
+            // own. Nothing was published and the merge happened in a throwaway service, so falling through
+            // to the full path below repeats the work rather than continuing from half-done state.
         }
         // create the index here (on the master) to validate it can be created, as well as adding the mapping
         return indicesService.<ClusterState, Exception>withTempIndexService(temporaryIndexMeta, indexService -> {
@@ -1094,29 +1116,12 @@ public class MetadataCreateIndexService {
                 return "templates " + templatesApplied + " contribute alias(es) " + fromOneTemplate.keySet();
             }
         }
-        // A mapping used to end the matter, and T18 measured what that cost once mappings became the common
-        // case: 275 gated creations per second against 6,011, because merging and validating one means
-        // building a throwaway IndexService inside a synchronized block.
-        //
-        // The lock is not what validates. For a field whose definition is nothing but {"type": X}, the only
-        // thing validation establishes is that X is a field type this node can build, and IndicesService
-        // answers that from an immutable registry with no lock and no IndexModule. So a mapping made
-        // entirely of such fields is fully validated here, and nothing is traded away. Anything richer -- a
-        // parameter, an object field, a shorthand -- has more to check than a type name and still goes the
-        // long way.
-        List<Map<String, Object>> declared = mappings.stream().filter(mapping -> mapping.isEmpty() == false).collect(toList());
-        if (declared.size() > 1) {
-            // Two sources of mapping, so there is a merge with precedence rules to get right, and the
-            // temporary index service is what implements them. Declining is cheaper than reimplementing
-            // them here and being subtly wrong about which one wins.
-            return "it has " + declared.size() + " mappings to merge, whose precedence the index service resolves";
-        }
-        if (declared.isEmpty() == false) {
-            String unbuildable = whyThisMappingNeedsAMapperService(declared.get(0));
-            if (unbuildable != null) {
-                return unbuildable;
-            }
-        }
+        // The mapping is deliberately not one of these conditions. It used to be: a declared mapping meant a
+        // throwaway IndexService, and T18 measured what that cost once mapped indices became the common
+        // kind. What a mapping needs is a *mapper service*, which T60 separated from an index service --
+        // see whyTheseMappingsNeedAMapperService and applyCreateIndexWithOnlyAMapperService. What the
+        // conditions here have in common is that each one needs something a mapper service does not have:
+        // a query shard context, a sort supplier, an existing index's metadata.
         if (org.opensearch.index.IndexSortConfig.INDEX_SORT_FIELD_SETTING.exists(temporaryIndexMeta.getSettings())) {
             return "it configures an index sort, which resolves against the merged mappings";
         }
@@ -1183,6 +1188,100 @@ public class MetadataCreateIndexService {
             }
         }
         return null;
+    }
+
+    /**
+     * Why these mappings cannot be validated from the mapper registry alone, or null when they can.
+     *
+     * <p>Two sources of mapping -- a template's and the request's -- used to send a creation down the full
+     * path, on the reasoning that their precedence is what the index service implements. It is not: the
+     * merge is {@code mapperService.merge} once per mapping in order, which is a mapper service's job and
+     * nothing an {@code IndexService} contributes to. So more than one mapping needs a mapper service,
+     * which is what this answers, rather than needing an index service, which is what it used to be read as.
+     */
+    private String whyTheseMappingsNeedAMapperService(List<Map<String, Object>> mappings) {
+        List<Map<String, Object>> declared = mappings.stream().filter(mapping -> mapping.isEmpty() == false).collect(toList());
+        if (declared.isEmpty()) {
+            return null;
+        }
+        if (declared.size() > 1) {
+            return "it has " + declared.size() + " mappings to merge in order";
+        }
+        return whyThisMappingNeedsAMapperService(declared.get(0));
+    }
+
+    /**
+     * The same creation, validated against a mapper service rather than a whole {@link IndexService}.
+     *
+     * <p>Reachable only when every condition in {@link #whyATemporaryIndexServiceIsStillNeeded} holds and
+     * the mapping is the one thing left, so what this omits is what those conditions already established is
+     * not needed: no aliases to resolve against a query shard context, no index sort to build, no source
+     * index, no context rewriting the settings, and no validator that reads mappings beyond the ones run
+     * here. {@code beforeIndexAddedToCluster} is not called, for the same reason and with the same
+     * consequence the fast path documents: the listener chain belongs to the index service that is not
+     * built, nothing in this repository implements the hook, and a third-party plugin that does would not
+     * see it for a gated creation.
+     *
+     * @return the new cluster state, or null when the merged mapping turns out to declare a composite index
+     *         -- the one thing whose validation needs settings a mapper service does not carry, and rare
+     *         enough to be worth paying the full path for rather than reimplementing here.
+     */
+    private ClusterState applyCreateIndexWithOnlyAMapperService(
+        final ClusterState currentState,
+        final CreateIndexClusterStateUpdateRequest request,
+        final IndexMetadata temporaryIndexMeta,
+        final List<Map<String, Object>> mappings,
+        final BiConsumer<Metadata.Builder, IndexMetadata> metadataTransformer,
+        final boolean silent
+    ) throws Exception {
+        try (MapperService mapperService = indicesService.createMapperServiceForValidation(temporaryIndexMeta)) {
+            for (Map<String, Object> mapping : mappings) {
+                if (mapping.isEmpty() == false) {
+                    // In order and with the same merge reason as the full path, because this is the whole of
+                    // what that path did with the mappings.
+                    mapperService.merge(MapperService.SINGLE_MAPPING_NAME, mapping, MergeReason.INDEX_TEMPLATE);
+                }
+            }
+            if (mapperService.isCompositeIndexPresent()) {
+                return null;
+            }
+            for (IndexCreationValidator validator : indexCreationValidators) {
+                // A real mapper service, unlike the fast path's null one, so a validator that reads mappings
+                // is no longer a reason to decline this road -- it is served here exactly as it would have
+                // been through the index service.
+                validator.validate(mapperService, mapperService.getIndexSettings());
+            }
+
+            IndexMetadata indexMetadata = buildIndexMetadata(
+                request.index(),
+                List.of(),
+                mapperService::documentMapper,
+                temporaryIndexMeta.getSettings(),
+                temporaryIndexMeta.getRoutingNumShards(),
+                null,
+                temporaryIndexMeta.isSystem(),
+                temporaryIndexMeta.getCustomData(),
+                temporaryIndexMeta.context()
+            );
+
+            logger.log(
+                silent ? Level.DEBUG : Level.INFO,
+                "[{}] creating index, cause [{}], shards [{}]/[{}]",
+                request.index(),
+                request.cause(),
+                indexMetadata.getNumberOfShards(),
+                indexMetadata.getNumberOfReplicas()
+            );
+
+            return clusterStateCreateIndex(
+                currentState,
+                request.blocks(),
+                indexMetadata,
+                allocationService::reroute,
+                metadataTransformer,
+                request::descriptorWrite
+            );
+        }
     }
 
     /**

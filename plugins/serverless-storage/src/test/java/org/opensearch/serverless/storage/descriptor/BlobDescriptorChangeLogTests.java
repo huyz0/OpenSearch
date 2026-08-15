@@ -8,12 +8,16 @@
 
 package org.opensearch.serverless.storage.descriptor;
 
+import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
+import org.opensearch.common.io.stream.BytesStreamOutput;
+import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -35,6 +39,71 @@ public class BlobDescriptorChangeLogTests extends OpenSearchTestCase {
 
     private static DescriptorChange change(String name, DescriptorChange.Kind kind) {
         return new DescriptorChange(name, java.util.UUID.randomUUID().toString(), kind, 0L);
+    }
+
+    /**
+     * The ceiling this component had, and did not look like it had.
+     *
+     * <p>Appends never contend, so the rate was assumed unbounded. An object store rate-limits by key
+     * prefix instead, and every append in a minute went under that minute's bucket -- one prefix, about
+     * 3,500 writes per second on S3, which is roughly a quarter of what 100M indices in two hours needs and
+     * the whole cluster's creation ceiling regardless of how many nodes are creating. Nothing about a
+     * passing test would have shown it: a single prefix is exactly as correct as sixteen, and only slower
+     * somewhere no test runs.
+     *
+     * <p>Asserted on the layout rather than on a rate, because the rate belongs to the store rather than to
+     * this code. What this owns is that appends land under more than one prefix.
+     */
+    public void testAppendsAreSpreadOverPrefixesRatherThanOneBucketWideOne() throws Exception {
+        Path directory = createTempDir();
+        BlobDescriptorChangeLog log = logOver(directory);
+        for (int i = 0; i < 200; i++) {
+            log.append(change("tenant-" + i, DescriptorChange.Kind.CREATED));
+        }
+        assertEquals("no append may have failed silently", 0, log.failedAppendCount());
+
+        BlobContainer changelog = storeOver(directory).blobContainer(BlobPath.cleanPath().add("changelog"));
+        Map<String, BlobContainer> buckets = changelog.children();
+        assertFalse("the appends have to be somewhere", buckets.isEmpty());
+        int prefixes = 0;
+        int entriesDirectlyInABucket = 0;
+        for (BlobContainer bucket : buckets.values()) {
+            prefixes += bucket.children().size();
+            entriesDirectlyInABucket += bucket.listBlobs().size();
+        }
+        assertEquals("an append under the bucket itself is the layout that had the ceiling", 0, entriesDirectlyInABucket);
+        assertThat(
+            "200 appends over one prefix is the ceiling; they must be spread over several",
+            prefixes,
+            org.hamcrest.Matchers.greaterThan(1)
+        );
+        assertEquals("and every one of them must still be readable", 200, log.since(null).size());
+    }
+
+    /**
+     * An entry written before the appends were sharded is still read.
+     *
+     * <p>A running node's log has entries directly under the bucket, and a node that upgraded and stopped
+     * looking there would skip every one of them -- silently, since a change log that reads short is
+     * indistinguishable from a quiet one.
+     */
+    public void testEntriesWrittenBeforeShardingAreStillRead() throws Exception {
+        Path directory = createTempDir();
+        BlobDescriptorChangeLog log = logOver(directory);
+        log.append(change("sharded", DescriptorChange.Kind.CREATED));
+
+        // The pre-sharding layout, written by hand into the bucket the append just created.
+        BlobContainer changelog = storeOver(directory).blobContainer(BlobPath.cleanPath().add("changelog"));
+        String bucket = changelog.children().keySet().iterator().next();
+        BytesStreamOutput out = new BytesStreamOutput();
+        change("written-the-old-way", DescriptorChange.Kind.CREATED).writeTo(out);
+        BytesReference bytes = out.bytes();
+        changelog.children().get(bucket).writeBlob("an-entry-from-before-sharding", bytes.streamInput(), bytes.length(), true);
+
+        assertEquals(
+            Set.of("sharded", "written-the-old-way"),
+            log.since(null).stream().map(DescriptorChange::name).collect(Collectors.toSet())
+        );
     }
 
     public void testAnUnwrittenLogReadsEmptyRatherThanFailing() throws Exception {

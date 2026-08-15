@@ -154,6 +154,43 @@ that never finished. Projections are bounded at four in flight now. **Nothing in
 gated indices concurrently at any scale**, which is the population this product exists for, and that gap is
 what let a regression of this shape through a green run.
 
+### The mapper-service lock, and the change log's one prefix
+
+Both found by asking why creation is slow now that the descriptor system index is gone, and both fixed.
+
+**The lock.** Validating any mapping richer than a bare type name meant building a throwaway `IndexService`
+inside `IndicesService`'s monitor, so every concurrent creation on the node queued behind it. A mapping
+needs a *mapper service*, not an index service, and it needs the monitor only across
+`pluginsService.onIndexModule`, which is the one part that runs code this repository does not own.
+`createMapperServiceForValidation` builds one that way and `MetadataCreateIndexService` gained a third road
+between the fast path and the full one. `createIndexMapperService` is untouched, so ordinary-index
+concurrency is unchanged. Measured, second of two rounds at concurrency 8:
+
+| arm | before | after |
+|---|---|---|
+| unmapped (control) | 2,259/sec | 3,060/sec |
+| plainly typed mapping | 2,095/sec | 2,639/sec |
+| one field parameter | **315/sec** | **1,348/sec** |
+| the lock, per creation | 21,618 us | 2,903 us |
+
+Also gone as a reason to take the slow road: two mappings to merge. That was justified as "precedence is
+what the index service implements", and it is not -- the merge is `mapperService.merge` once per mapping in
+order. Template plus request, a very common shape, stops paying.
+
+**The change log's prefix.** An object store rate-limits by key prefix, and every append in a minute went
+under that minute's bucket: about 3,500 writes per second on S3, which is a quarter of what 100M in two
+hours needs and a ceiling on the whole cluster however many nodes are creating. Appends are spread over
+sixteen prefixes within a bucket now (~56,000/sec), readers discover shards by listing rather than knowing
+the count, and the pre-sharding layout is still read. Nothing about the old version looked wrong: appends
+never contended, and a prefix rate is invisible to every test in this repository because none of them runs
+against an object store.
+
+**Creation is still single-node, deliberately.** `TransportCreateIndexAction` never overrides
+`localExecute`, so every creation redirects to the elected cluster manager. Nothing about a gated creation
+needs that node -- uniqueness is the register CAS, and the cluster state need is a snapshot read -- so this
+is a small change, left unmade because it should be a decision rather than a side effect. With it, compute
+needs roughly six to ten nodes for 13,889 creations per second, not a hundred.
+
 **2. The 100M plan reasons about a descriptor system index that was deleted on 2026-08-05**
 (`46cfb963519`), and quotes a creation-throughput figure that has been corrected repeatedly since
 (20,577 -> 235 -> ~550 -> 859/sec across S26-S35, and then overtaken entirely by the post-blob measurements
