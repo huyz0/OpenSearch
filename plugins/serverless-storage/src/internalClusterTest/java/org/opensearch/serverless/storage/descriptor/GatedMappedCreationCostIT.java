@@ -62,34 +62,37 @@ import java.util.concurrent.atomic.AtomicInteger;
  * from arms measured together is worth more than any of the absolute figures: throughput on a shared build
  * machine says as much about the machine as the code, and this box has been running at load average 45.
  *
- * <h2>T40: where the surviving cost actually is</h2>
+ * <h2>T40, and why its arms are gone</h2>
  *
- * T20 removed the index-service lock and the ratio moved from about 14x to about 10x, leaving most of the
- * cost somewhere else -- and the somewhere else was named rather than measured: the mapping store's
- * blocking get-and-index per creation, against a shared five-shard index the unmapped arm never touches.
- * A named suspect is not a finding, and this is the third time in this area that the obvious candidate was
- * only part of the answer. (The "about a quarter" once attributed to the lock came from subtracting two
- * single-run ratios, and the repeat arm below shows that subtraction is worth less than it looks.)
+ * T20 removed the index-service lock for plainly typed mappings and the ratio moved from about 14x to about
+ * 10x, leaving most of the cost somewhere else. T40 named the suspect and built an arm for it: the mapping
+ * store's blocking get-and-index per creation, against a shared index the unmapped arm never touches,
+ * isolated by running the same creations against an in-memory {@code MappingGenerationStore.Store}.
  *
- * <p>So a third arm runs the same mapped creations with an in-memory {@code MappingGenerationStore.Store}
- * registered in place of the index-backed one. Everything upstream of the store is identical -- the same
- * declared mapping, the same parsing, the same descriptor write, the same read-then-swap protocol in
- * {@code MappingGenerationStore.updateMapping} -- so the differences are additive and each one names a
- * cause:
+ * <p><b>T58 removed that suspect from the creation path entirely.</b> A gated creation no longer calls
+ * {@code MappingGenerationStore} at all -- the declared mapping rides the {@code IndexDescriptor} the
+ * creation was already writing, in the same operation. So the two store arms became the same arm, and the
+ * assertions that each had swapped once per creation could no longer hold: this harness has been unable to
+ * run against the code it measures since T58, and being opt-in is why nothing noticed. Every creation figure
+ * quoted for a mapped index dates from before that change.
+ *
+ * <h2>What the arms are now</h2>
+ *
+ * The difference between a mapped and an unmapped gated creation is no longer a store round trip. What is
+ * left is mapping validation, a slightly larger descriptor blob, and -- for a mapped index only -- the
+ * write-behind stats projection, which runs on GENERIC rather than on the creating thread. So the arms
+ * split validation by mapping *shape*, which is what decides whether the index-service lock is taken:
  *
  * <ul>
- *   <li>index-backed minus in-memory is what the index-backed store costs</li>
- *   <li>in-memory minus unmapped is everything else a declared mapping costs</li>
+ *   <li>plainly typed minus unmapped is what carrying a mapping costs when the registry can validate it</li>
+ *   <li>one parameter added minus plainly typed is what the index-service lock costs, and nothing else
+ *       differs between those two arms</li>
  * </ul>
  *
- * <p><b>"What the store costs" is the honest name for the first term, not "what the network costs".</b>
- * The in-memory double skips the two round trips, and it also skips building the indexing request, deriving
- * the field type counts, and checking that the mapping index exists. Those are small next to a round trip
- * and they are not zero, and nothing here separates them. The term is what removing the index-backed
- * implementation is worth, which is what a decision about it needs.
- *
- * <p>Both mapped arms assert that they swapped once per creation, because an arm that quietly stopped
- * reaching the store would price it at zero from one end or the other.
+ * <p><b>What is deliberately not separated:</b> the stats projection rides along with every mapped arm. It
+ * is asynchronous, so it does not sit in the creating thread's service time, but it is work on the same box
+ * and at this concurrency that is not free. Separating it needs a fifth arm with the gate installed over a
+ * non-projecting store, which is a fixture change rather than a knob this class has.
  *
  * <h2>What it asserts, and what it only reports</h2>
  *
@@ -112,7 +115,7 @@ public class GatedMappedCreationCostIT extends org.opensearch.serverless.storage
      * -- so 300 is defensible as "long enough to amortise the fixed costs" and the 13.6-against-8.5
      * comparison should not be read as a finding about population.
      */
-    private static final int INDICES_PER_ARM = 300;
+    private static final int INDICES_PER_ARM = Integer.getInteger("tests.mappingcost.perarm", 300);
 
     private static final int CONCURRENCY = 8;
 
@@ -198,11 +201,11 @@ public class GatedMappedCreationCostIT extends org.opensearch.serverless.storage
     /** Every prefix an arm creates under, so cleanup does not have to be kept in step with the rounds. */
     private static final List<String> ARM_PREFIXES = List.of(
         "mapped1",
-        "memory1",
+        "rich1",
         "plain1",
         "repeat1",
         "mapped2",
-        "memory2",
+        "rich2",
         "plain2",
         "repeat2"
     );
@@ -243,8 +246,25 @@ public class GatedMappedCreationCostIT extends org.opensearch.serverless.storage
         return survivors;
     }
 
-    /** The one mapping every mapped arm declares, so the arms differ in the store and nothing else. */
+    /**
+     * The plainly typed mapping: every field's definition is exactly a type, so validation is a lookup in
+     * an immutable registry and the creation keeps the bypass.
+     */
     private static final Map<String, Object> DECLARED = Map.of("properties", Map.of("tenant", Map.of("type", "keyword")));
+
+    /**
+     * The same mapping with one parameter added, which is the whole difference between the arms.
+     *
+     * <p>{@code ignore_above} cannot be checked by a registry lookup -- the fast path's rule is that a
+     * one-key definition has nothing else that could be wrong, and this has two -- so the creation builds a
+     * throwaway {@code IndexService} inside {@code IndicesService}'s monitor. One parameter is the smallest
+     * possible difference that crosses that boundary, which is what makes the subtraction between these two
+     * arms a measurement of the lock rather than of mapping complexity.
+     */
+    private static final Map<String, Object> DECLARED_RICH = Map.of(
+        "properties",
+        Map.of("tenant", Map.of("type", "keyword", "ignore_above", 256))
+    );
 
     /**
      * One round's four arms, as creations per second.
@@ -253,22 +273,26 @@ public class GatedMappedCreationCostIT extends org.opensearch.serverless.storage
      * it exists because the two disagreeing is the only way to see that the round had not settled. Where the
      * two disagree, the attribution is quoted as the range they bracket rather than as a figure.
      */
-    private record Round(double indexBacked, double inMemory, double unmapped, double indexBackedRepeat) {
+    private record Round(double plainlyTyped, double richlyTyped, double unmapped, double plainlyTypedRepeat) {
 
         /** Per-creation service time. At concurrency C, an aggregate rate of R means C/R seconds each. */
         static double microsPer(double rate) {
             return CONCURRENCY * 1e6 / rate;
         }
 
-        /** The store's share of what a declared mapping costs, taking the index-backed arm from one end. */
-        double storeShare(double indexBackedRate) {
-            double total = microsPer(indexBackedRate) - microsPer(unmapped);
-            return total <= 0 ? Double.NaN : 100 * (microsPer(indexBackedRate) - microsPer(inMemory)) / total;
+        /** What the index-service lock costs a creation, in microseconds: the only difference between the two mapped arms. */
+        double lockMicros() {
+            return microsPer(richlyTyped) - microsPer(plainlyTyped);
+        }
+
+        /** What carrying a plainly typed mapping costs a creation once the lock is out of the way. */
+        double mappingMicros(double plainlyTypedRate) {
+            return microsPer(plainlyTypedRate) - microsPer(unmapped);
         }
 
         /** How far the round drifted, measured on the one arm that ran at both ends of it. */
         double drift() {
-            return indexBackedRepeat / indexBacked;
+            return plainlyTypedRepeat / plainlyTyped;
         }
     }
 
@@ -302,248 +326,91 @@ public class GatedMappedCreationCostIT extends org.opensearch.serverless.storage
             org.opensearch.common.Booleans.parseBoolean(System.getProperty("tests.mappingcost", "false"))
         );
         installBlobBackedDescriptorPlane();
-        // In place of the identically-built store the gate just registered, so every index-backed arm runs
-        // through the counter rather than only the ones this test re-registers.
-        MappingGenerationStore.register(productionStore());
 
         createConcurrently("warmup", DECLARED, 1);
-        // After the warm-up, because that is the write that creates the mapping index, and before any arm,
-        // because a run against the wrong geometry should cost seconds rather than a full measurement.
-        assertMappingIndexGeometry();
 
-        InMemoryMappingStore inMemory = new InMemoryMappingStore();
-        Round warmUp = measureRound("1", inMemory);
-        Round measured = measureRound("2", inMemory);
+        Round warmUp = measureRound("1");
+        Round measured = measureRound("2");
 
         logger.warn(
             String.format(
                 Locale.ROOT,
-                "%nT40 gated creation, %d indices per arm at concurrency %d, two rounds, "
-                    + "mapping index at %d shards%n"
+                "%nT60 gated creation, %d indices per arm at concurrency %d, two rounds%n"
                     + "                                round 1 (warm-up)   round 2 (measured)%n"
-                    + "  mapped, index-backed store  : %,10.0f per second  %,10.0f per second%n"
-                    + "  mapped, in-memory store     : %,10.0f per second  %,10.0f per second%n"
+                    + "  mapped, plainly typed       : %,10.0f per second  %,10.0f per second%n"
+                    + "  mapped, one parameter added : %,10.0f per second  %,10.0f per second%n"
                     + "  unmapped (control)          : %,10.0f per second  %,10.0f per second%n"
-                    + "  mapped, index-backed, again : %,10.0f per second  %,10.0f per second%n"
-                    + "  ratio, index-backed         : %9.2fx           %9.2fx%n"
-                    + "  ratio, in-memory            : %9.2fx           %9.2fx%n"
+                    + "  mapped, plainly typed, again: %,10.0f per second  %,10.0f per second%n"
+                    + "  ratio, plainly typed        : %9.2fx           %9.2fx%n"
+                    + "  ratio, one parameter added  : %9.2fx           %9.2fx%n"
                     + "  drift, first arm to repeat  : %9.2fx           %9.2fx%n"
                     + "%n"
-                    + "  from round 2, the store's share of what a declared mapping costs a creation:%n"
-                    + "    taking the index-backed arm from the front of the round : %.0f%%%n"
-                    + "    taking its repeat from the end of the round             : %.0f%%%n",
+                    + "  from round 2, per creation at concurrency %d:%n"
+                    + "    unmapped                                        : %,10.0f us%n"
+                    + "    carrying a plainly typed mapping adds           : %,10.0f us  (repeat: %,.0f us)%n"
+                    + "    needing the index-service lock adds on top      : %,10.0f us%n",
                 INDICES_PER_ARM,
                 CONCURRENCY,
-                mappingIndexShards(),
-                warmUp.indexBacked(),
-                measured.indexBacked(),
-                warmUp.inMemory(),
-                measured.inMemory(),
+                warmUp.plainlyTyped(),
+                measured.plainlyTyped(),
+                warmUp.richlyTyped(),
+                measured.richlyTyped(),
                 warmUp.unmapped(),
                 measured.unmapped(),
-                warmUp.indexBackedRepeat(),
-                measured.indexBackedRepeat(),
-                warmUp.unmapped() / warmUp.indexBacked(),
-                measured.unmapped() / measured.indexBacked(),
-                warmUp.unmapped() / warmUp.inMemory(),
-                measured.unmapped() / measured.inMemory(),
+                warmUp.plainlyTypedRepeat(),
+                measured.plainlyTypedRepeat(),
+                warmUp.unmapped() / warmUp.plainlyTyped(),
+                measured.unmapped() / measured.plainlyTyped(),
+                warmUp.unmapped() / warmUp.richlyTyped(),
+                measured.unmapped() / measured.richlyTyped(),
                 warmUp.drift(),
                 measured.drift(),
-                measured.storeShare(measured.indexBacked()),
-                measured.storeShare(measured.indexBackedRepeat())
+                CONCURRENCY,
+                Round.microsPer(measured.unmapped()),
+                measured.mappingMicros(measured.plainlyTyped()),
+                measured.mappingMicros(measured.plainlyTypedRepeat()),
+                measured.lockMicros()
             )
         );
 
         assertTrue(
             "every arm must have made progress, or this measured nothing",
-            measured.indexBacked() > 0 && measured.inMemory() > 0 && measured.unmapped() > 0 && measured.indexBackedRepeat() > 0
-        );
-        // T41, asserted here rather than only in MappingGenerationStoreTests because this project has twice
-        // shipped a fix that passed its own tests while never entering the path it claimed to fix. Nothing
-        // in this test does anything but create, and a creation now swaps without reading first, so any read
-        // at all means the creation path is still going through updateMapping.
-        assertEquals(
-            "a gated creation read a mapping that cannot exist, so it is not taking the create path",
-            0L,
-            productionStore().reads()
+            measured.plainlyTyped() > 0 && measured.richlyTyped() > 0 && measured.unmapped() > 0 && measured.plainlyTypedRepeat() > 0
         );
     }
 
     /**
-     * One round: index-backed, then in-memory, then the unmapped control, then index-backed again.
+     * One round: plainly typed, richly typed, the unmapped control, then plainly typed again.
      *
-     * <p>Each mapped arm is checked for having swapped exactly once per creation, and the two checks fail
-     * for opposite reasons. The in-memory arm attributes the store's cost by not paying it, so a mapping
-     * that stopped reaching {@code MappingGenerationStore} -- the exact defect T13 found -- would report the
-     * store as free. The index-backed arm carries the cost being attributed, so the same silence there would
-     * price an arm that never touched the store.
+     * <p>Each mapped arm is checked for having carried its fields into the descriptor, sampled at one index
+     * per arm. That check replaces the swap counting this class did until T58, and it is the same guard
+     * against the same failure: an arm whose mapping quietly stopped being carried would do less work than
+     * the arm it is being compared with, and report the difference as the cost of something else.
      */
-    private Round measureRound(String round, InMemoryMappingStore inMemory) throws Exception {
-        long storeSwapsBefore = productionStore().swaps();
-        double indexBacked = createConcurrently("mapped" + round, DECLARED, INDICES_PER_ARM);
-        assertEquals(
-            "the index-backed arm of round " + round + " did not swap once per creation",
-            INDICES_PER_ARM,
-            productionStore().swaps() - storeSwapsBefore
-        );
+    private Round measureRound(String round) throws Exception {
+        double plainlyTyped = createConcurrently("mapped" + round, DECLARED, INDICES_PER_ARM);
+        assertFieldsReachedTheDescriptor("mapped" + round + "-0");
 
-        double withoutStoreTraffic;
-        long inMemorySwapsBefore = inMemory.swaps();
-        MappingGenerationStore.register(inMemory);
-        try {
-            withoutStoreTraffic = createConcurrently("memory" + round, DECLARED, INDICES_PER_ARM);
-        } finally {
-            // Restored before the control arm runs, so the control is measured against the production
-            // wiring rather than against a cluster still holding the test's double.
-            MappingGenerationStore.register(productionStore());
-        }
-        assertEquals(
-            "the in-memory arm of round " + round + " did not swap once per creation",
-            INDICES_PER_ARM,
-            inMemory.swaps() - inMemorySwapsBefore
-        );
+        double richlyTyped = createConcurrently("rich" + round, DECLARED_RICH, INDICES_PER_ARM);
+        assertFieldsReachedTheDescriptor("rich" + round + "-0");
 
         double unmapped = createConcurrently("plain" + round, null, INDICES_PER_ARM);
 
-        long repeatSwapsBefore = productionStore().swaps();
-        double indexBackedAgain = createConcurrently("repeat" + round, DECLARED, INDICES_PER_ARM);
-        assertEquals(
-            "the repeat arm of round " + round + " did not swap once per creation",
-            INDICES_PER_ARM,
-            productionStore().swaps() - repeatSwapsBefore
+        double plainlyTypedAgain = createConcurrently("repeat" + round, DECLARED, INDICES_PER_ARM);
+        assertFieldsReachedTheDescriptor("repeat" + round + "-0");
+
+        return new Round(plainlyTyped, richlyTyped, unmapped, plainlyTypedAgain);
+    }
+
+    /** The declared field is readable through the registered store, which since T58 means the descriptor. */
+    private void assertFieldsReachedTheDescriptor(String index) {
+        org.opensearch.cluster.metadata.IndexDescriptor descriptor = org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.supply(
+            index
         );
-        return new Round(indexBacked, withoutStoreTraffic, unmapped, indexBackedAgain);
-    }
-
-    /**
-     * The index-backed store, built once for the whole test.
-     *
-     * <p>Once, because {@code IndexBackedMappingStore} remembers per instance whether the mapping index
-     * exists. A fresh instance per round would put up to {@code CONCURRENCY} blocking creates of
-     * {@code .opensearch-index-mappings} at the head of the arm being measured, each one a cluster manager
-     * round trip that fails with "already exists", charged to the store as if it were per-creation cost.
-     */
-    private synchronized CountingStore productionStore() {
-        if (productionStore == null) {
-            productionStore = new CountingStore(new IndexBackedMappingStore(client(), mappingIndexShards()));
-        }
-        return productionStore;
-    }
-
-    /**
-     * The geometry this run gives the mapping index, from {@code -Dtests.mappingshards}.
-     *
-     * <p>T46 needs three geometries and cannot have them in one cluster: the index is created lazily by the
-     * first write and never deleted, so a second store with a different count is told the index already
-     * exists and then runs against the first one's geometry while the report claims the second. One run of
-     * this class per count, each with its own cluster, is the only arrangement that measures what it says.
-     */
-    private static int mappingIndexShards() {
-        return Integer.getInteger("tests.mappingshards", IndexBackedMappingStore.DEFAULT_SHARDS);
-    }
-
-    /**
-     * Fails unless the mapping index really has the geometry this run asked for.
-     *
-     * <p>Every way of getting a second geometry wrong reports success: the create loses to an existing
-     * index and returns normally, and a delete between arms leaves the store believing the index exists, so
-     * the next write auto-creates it at the cluster default of one shard. Without this the harness would
-     * print three numbers for one geometry and nothing would say so.
-     */
-    private void assertMappingIndexGeometry() {
-        String actual = client().admin()
-            .indices()
-            .prepareGetSettings(IndexBackedMappingStore.MAPPING_INDEX)
-            .get()
-            .getSetting(IndexBackedMappingStore.MAPPING_INDEX, IndexMetadata.SETTING_NUMBER_OF_SHARDS);
-        assertEquals(
-            "this run asked for a mapping index of "
-                + mappingIndexShards()
-                + " shards and got "
-                + actual
-                + ", so it is about to measure a geometry it did not configure",
-            String.valueOf(mappingIndexShards()),
-            actual
-        );
-    }
-
-    private volatile CountingStore productionStore;
-
-    /** The index-backed store with a swap counter, so an arm that stopped reaching it cannot pass quietly. */
-    private static final class CountingStore implements MappingGenerationStore.Store {
-
-        private final MappingGenerationStore.Store delegate;
-        private final java.util.concurrent.atomic.AtomicLong swaps = new java.util.concurrent.atomic.AtomicLong();
-        private final java.util.concurrent.atomic.AtomicLong reads = new java.util.concurrent.atomic.AtomicLong();
-
-        CountingStore(MappingGenerationStore.Store delegate) {
-            this.delegate = delegate;
-        }
-
-        @Override
-        public MappingGenerationStore.MappingGeneration read(String indexUuid) {
-            reads.incrementAndGet();
-            return delegate.read(indexUuid);
-        }
-
-        @Override
-        public void delete(String indexUuid) {
-            delegate.delete(indexUuid);
-        }
-
-        @Override
-        public boolean compareAndSwap(String indexUuid, long expectedGeneration, MappingGenerationStore.MappingGeneration updated) {
-            swaps.incrementAndGet();
-            return delegate.compareAndSwap(indexUuid, expectedGeneration, updated);
-        }
-
-        long swaps() {
-            return swaps.get();
-        }
-
-        long reads() {
-            return reads.get();
-        }
-    }
-
-    /**
-     * The same protocol as {@link IndexBackedMappingStore} with the network taken out.
-     *
-     * <p>Compare-and-swap on the generation, so a caller cannot tell it apart from the real store except by
-     * how long it takes -- which is the whole measurement.
-     */
-    private static final class InMemoryMappingStore implements MappingGenerationStore.Store {
-
-        private final java.util.concurrent.ConcurrentMap<String, MappingGenerationStore.MappingGeneration> byUuid =
-            new java.util.concurrent.ConcurrentHashMap<>();
-        private final AtomicInteger swaps = new AtomicInteger();
-
-        @Override
-        public MappingGenerationStore.MappingGeneration read(String indexUuid) {
-            return byUuid.get(indexUuid);
-        }
-
-        @Override
-        public void delete(String indexUuid) {
-            byUuid.remove(indexUuid);
-        }
-
-        @Override
-        public boolean compareAndSwap(String indexUuid, long expectedGeneration, MappingGenerationStore.MappingGeneration updated) {
-            swaps.incrementAndGet();
-            if (expectedGeneration == 0) {
-                return byUuid.putIfAbsent(indexUuid, updated) == null;
-            }
-            MappingGenerationStore.MappingGeneration current = byUuid.get(indexUuid);
-            if (current == null || current.generation() != expectedGeneration) {
-                return false;
-            }
-            return byUuid.replace(indexUuid, current, updated);
-        }
-
-        long swaps() {
-            return swaps.get();
-        }
+        assertNotNull("[" + index + "] has no descriptor, so its arm did not create what it claims", descriptor);
+        MappingGenerationStore.MappingGeneration mapping = MappingGenerationStore.currentMapping(descriptor.uuid());
+        assertNotNull("[" + index + "] carried no mapping, so its arm was not doing the work being priced", mapping);
+        assertEquals("keyword", MappingGenerationStore.typeOf(mapping.fields().get("tenant")));
     }
 
     /** Creates {@code count} gated indices concurrently, returning creations per second. */

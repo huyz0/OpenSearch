@@ -1436,13 +1436,56 @@ stopped the investigation, and in both cases it was hiding a real defect -- one 
 alongside `:plugins:serverless-storage:test` at 237/1,277 and the core seam tests at 85/1,069, with
 `spotlessCheck` passing.
 
+### The creation figure, measured a seventh time -- and it is a cliff, not a number
+
+The four-times-corrected 275/sec was quoted here as "the ordinary case". It is now the wrong shape of
+answer, because two things moved under it and neither was re-measured: T18 taught the creation bypass to
+validate a plainly typed mapping from the mapper registry instead of declining it, and T58 took
+`MappingGenerationStore` off the creation path entirely -- the mapping rides the descriptor the creation was
+already writing.
+
+Re-measured on 2026-08-15, 100 indices per arm at concurrency 8, second of two rounds, with the arms
+differing only in mapping shape:
+
+| arm | rate | against the control |
+|---|---|---|
+| unmapped (control) | 2,259/sec | -- |
+| mapped, plainly typed (`{"type": "keyword"}`) | 2,095/sec | **1.08x** |
+| mapped, one parameter added (`ignore_above`) | 315/sec | **7.18x** |
+
+Per creation at that concurrency: an unmapped creation is 3,542 us, carrying a plainly typed mapping adds
+276 us (352 us on the repeat arm), and needing the index-service lock adds **21,618 us** on top.
+
+**So the store was never the answer.** Not the descriptor system index, which is gone; not the blob CAS;
+not the cluster state thread, which gated creation left in T49. What is left is one `synchronized` method,
+`IndicesService.createIndexService`, entered to build a throwaway `IndexService` for any mapping richer than
+a bare type name -- a parameter, an object field, a shorthand, or two mappings to merge. Everything else a
+declared mapping costs is under ten percent.
+
+100M plainly typed is about thirteen hours at this rate; 100M with one parameter each is about three and a
+half days. **Both figures are from a JVM running the jacoco agent**, which S34 and S35 established depresses
+absolute throughput, so the ratio is the finding and the absolute rates are a floor.
+
+The direction of the fix is unchanged and now has a price tag: validate against a mapper service built
+outside that monitor. The lock cannot simply be removed, because it also guards creation for ordinary
+indices and R1 forbids changing their concurrency.
+
+**Two things about how this was found are worth more than the numbers.** The harness that produces them,
+`GatedMappedCreationCostIT`, had been unable to run since T58 -- it asserts one mapping-store swap per
+creation, which T58 ended -- and being opt-in behind `-Dtests.mappingcost=true` is why a green suite never
+said so. And the first run after repairing it did not produce a number at all: it exposed a live regression
+in which the mapping stats projection saturated `GENERIC`, the pool gated creation itself runs on, with 127
+of 132 threads parked inside it and an arm of 300 mapped creations that never finished. A statistic had
+stopped the thing it measures. Projections are bounded at four in flight now and dropped beyond that, which
+is the same trade this class already made for a projection that fails.
+
 ### Where the goal actually stands, seventh pass
 
 | ceiling | state |
 |---|---|
 | placement | cleared by Area C. Unaffected by any of the above. |
 | residency | cleared. Gated creations leave zero cluster state bytes, measured in bytes rather than versions (`GatedCreationClusterStateFootprintIT`), and that claim does not depend on the descriptor's storage medium. |
-| throughput, creation | **275/sec for a mapped index**, the ordinary case, so about four days for 100M. 6,011 to 10,505/sec only for the unmapped population nobody creates. Bounded by a `synchronized` block the fast path avoids by declining mappings (T21). |
+| throughput, creation | **re-measured 2026-08-15, and the 275/sec figure no longer describes a mapped index.** It depends entirely on mapping *shape*: a plainly typed mapping now costs 1.08x an unmapped creation (2,095/sec against a 2,259/sec control), while one field parameter costs 7.18x (315/sec). The bound is `IndicesService.createIndexService`'s `synchronized`, at about 21.6 ms of serialized time per creation, and nothing else on the path comes close. See "the creation figure, measured a seventh time" below. |
 | throughput, lookup | **unmeasured on the shipped path.** Every figure quoted for it measured the deleted index. |
 
 ### What is actually left

@@ -163,6 +163,73 @@ public class StatsProjectingMappingStoreTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * The bound that keeps a statistic from stopping the thing it measures.
+     *
+     * <p>Measuring creation throughput found 127 of 132 {@code GENERIC} threads parked inside this class,
+     * each blocked on a projection's indexing round trip -- and gated creation runs on that same pool, so an
+     * arm of 300 mapped creations never finished. Every projection here blocks, so without the bound this
+     * asserts what that run found: as many threads occupied as there were mapping writes.
+     */
+    public void testProjectionsCannotOccupyMoreThanTheirShareOfThePool() throws Exception {
+        RecordingStore authoritative = new RecordingStore();
+        RecordingStore projection = new RecordingStore();
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newCachedThreadPool();
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicInteger occupied = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.atomic.AtomicInteger peak = new java.util.concurrent.atomic.AtomicInteger();
+        try {
+            StatsProjectingMappingStore store = new StatsProjectingMappingStore(authoritative, projection, task -> pool.execute(() -> {
+                peak.accumulateAndGet(occupied.incrementAndGet(), Math::max);
+                try {
+                    release.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    occupied.decrementAndGet();
+                }
+                task.run();
+            }));
+
+            for (int i = 0; i < 50; i++) {
+                assertTrue("the mapping write itself must never be refused", store.compareAndSwap("uuid-" + i, 0L, generation(1L)));
+            }
+            assertBusy(() -> assertEquals("every permitted projection should have started", 4, occupied.get()));
+            assertEquals("a statistic must not be able to take the pool its own creations run on", 4, peak.get());
+        } finally {
+            release.countDown();
+            pool.shutdownNow();
+        }
+    }
+
+    /** A dropped projection must not leave the drain waiting for work nobody is doing. */
+    public void testTheDrainDoesNotWaitForProjectionsThatWereNeverSubmitted() throws Exception {
+        RecordingStore authoritative = new RecordingStore();
+        RecordingStore projection = new RecordingStore();
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newCachedThreadPool();
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        try {
+            StatsProjectingMappingStore store = new StatsProjectingMappingStore(authoritative, projection, task -> pool.execute(() -> {
+                try {
+                    release.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                task.run();
+            }));
+            for (int i = 0; i < 20; i++) {
+                store.compareAndSwap("uuid-" + i, 0L, generation(1L));
+            }
+
+            release.countDown();
+            assertTrue("only the four that were admitted are outstanding, so the drain must return", store.awaitQuiescence(10_000));
+            assertEquals("and exactly those four reached the projection", 4, projection.calls.size());
+        } finally {
+            release.countDown();
+            pool.shutdownNow();
+        }
+    }
+
     public void testDeleteRemovesBothAndTheAuthoritativeFailurePropagates() {
         RecordingStore authoritative = new RecordingStore();
         RecordingStore projection = new RecordingStore();

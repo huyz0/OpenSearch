@@ -71,6 +71,24 @@ public final class StatsProjectingMappingStore implements MappingGenerationStore
     private final java.util.concurrent.atomic.AtomicInteger inFlight = new java.util.concurrent.atomic.AtomicInteger();
 
     /**
+     * How many projection writes may be in flight at once, and why there is a limit at all.
+     *
+     * <p>The executor this is given is {@code GENERIC}, which is also where a gated creation runs and where
+     * the descriptor write that acknowledges it runs. A projection is a blocking indexing round trip, so
+     * without a bound, N concurrent mapped creations put N blocked threads into that pool -- and measuring
+     * creation throughput found exactly that: 127 of 132 {@code GENERIC} threads parked inside this class,
+     * creations unable to get a thread at all, and an arm of 300 mapped creations that never finished. A
+     * statistic had stopped the thing it is a statistic about.
+     *
+     * <p>Small on purpose. The projection exists so cluster stats can answer in one search; it is not on
+     * any request's critical path, and the work it does is one document per mapping change. Four threads
+     * absorb an ordinary rate of mapping changes and cannot crowd out anything, which is the trade this
+     * class already made in the other direction when it chose to drop failed projections rather than fail
+     * the mapping write.
+     */
+    private static final int MAX_IN_FLIGHT = 4;
+
+    /**
      * @param authoritative the store that owns the mapping. Its answer is the caller's answer.
      * @param projection    the store whose only purpose is to make the aggregate cheap. Never read from.
      * @param executor      where projection writes run, off the caller's thread.
@@ -151,7 +169,19 @@ public final class StatsProjectingMappingStore implements MappingGenerationStore
      * projection failure that was invisible, and a silent aggregate is the exact symptom to make loud.
      */
     private void project(java.util.function.BooleanSupplier write, String what, String indexUuid) {
-        inFlight.incrementAndGet();
+        if (reserve() == false) {
+            // Dropped rather than queued, which is the same answer this class gives a projection that
+            // fails: the counts under-report for this index until its next mapping change, and nothing the
+            // caller is doing is affected. Queueing instead would only move the starvation into the queue,
+            // since what is scarce is threads to block in and every queued projection eventually wants one.
+            logger.debug(
+                "not projecting the mapping stats for [{}]: {} projections already in flight; gated field "
+                    + "type counts for it will under-report until its next mapping change",
+                indexUuid,
+                MAX_IN_FLIGHT
+            );
+            return;
+        }
         try {
             executor.execute(() -> {
                 try {
@@ -180,6 +210,26 @@ public final class StatsProjectingMappingStore implements MappingGenerationStore
             // timeout on a task that will never run, which is a hang dressed as a slow shutdown.
             settle();
             logger.warn("mapping stats projection for [{}] could not be submitted; counts will under-report", indexUuid, e);
+        }
+    }
+
+    /**
+     * Claims one of the in-flight slots, or refuses.
+     *
+     * <p>A compare-and-set loop rather than {@code incrementAndGet} followed by a check, because the latter
+     * has a window where the count reads above the bound: two callers can both increment past it and both
+     * see a number they then have to undo, and a concurrent {@link #awaitQuiescence} would meanwhile be
+     * waiting on a count that describes work nobody is doing.
+     */
+    private boolean reserve() {
+        while (true) {
+            int current = inFlight.get();
+            if (current >= MAX_IN_FLIGHT) {
+                return false;
+            }
+            if (inFlight.compareAndSet(current, current + 1)) {
+                return true;
+            }
         }
     }
 

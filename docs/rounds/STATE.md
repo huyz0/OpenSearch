@@ -126,6 +126,34 @@ default fork count on this box the test workers crash outright ("Could not stop 
 environment rather than the code. And `spotlessCheck` fails on an unmodified tree, on six files from the last
 week's commits -- `./gradlew :plugins:serverless-storage:spotlessApply` fixes it.
 
+### Creation throughput, re-measured 2026-08-15: it is a cliff, not a number
+
+The 275/sec figure below is superseded. Two changes had moved under it without a re-measurement -- T18
+taught the creation bypass to validate a plainly typed mapping from the mapper registry, and T58 took
+`MappingGenerationStore` off the creation path entirely -- so what a declared mapping costs now depends on
+its *shape*, not on whether it exists:
+
+| arm (100 per arm, concurrency 8, second of two rounds) | rate | vs control |
+|---|---|---|
+| unmapped (control) | 2,259/sec | -- |
+| plainly typed mapping | 2,095/sec | 1.08x |
+| one field parameter added | 315/sec | 7.18x |
+
+**The store was never the answer.** Not the deleted system index, not the blob CAS, not the cluster state
+thread. It is `IndicesService.createIndexService`'s `synchronized`, entered to build a throwaway
+`IndexService` for any mapping richer than a bare type name, at about 21.6 ms of serialized time per
+creation. Everything else a mapping costs is under ten percent. Absolute rates are from a jacoco-loaded JVM
+and are a floor; the ratio is the finding.
+
+**The harness could not run, and its first repaired run found a regression rather than a number.**
+`GatedMappedCreationCostIT` asserts one mapping-store swap per creation, which T58 ended, so it had been
+broken since -- opt-in behind `-Dtests.mappingcost=true`, which is why a green suite never said so. Repaired
+and re-armed by mapping shape, its first run stalled: the mapping stats projection saturated `GENERIC`, the
+pool gated creation itself runs on, 127 of 132 threads parked inside it, and an arm of 300 mapped creations
+that never finished. Projections are bounded at four in flight now. **Nothing in the suite creates mapped
+gated indices concurrently at any scale**, which is the population this product exists for, and that gap is
+what let a regression of this shape through a green run.
+
 **2. The 100M plan reasons about a descriptor system index that was deleted on 2026-08-05**
 (`46cfb963519`), and quotes a creation-throughput figure that has been corrected repeatedly since
 (20,577 -> 235 -> ~550 -> 859/sec across S26-S35, and then overtaken entirely by the post-blob measurements
