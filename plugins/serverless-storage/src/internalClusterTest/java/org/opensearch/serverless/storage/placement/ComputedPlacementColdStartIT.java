@@ -91,11 +91,11 @@ public class ComputedPlacementColdStartIT extends org.opensearch.serverless.stor
     }
 
     private static String backgroundName(int i) {
-        return String.format(Locale.ROOT, "cold-start-background-%06d", i);
+        return String.format(Locale.ROOT, "serverless_cold-start-background-%06d", i);
     }
 
     private static String probeName(int i) {
-        return String.format(Locale.ROOT, "cold-start-probe-%02d", i);
+        return String.format(Locale.ROOT, "serverless_cold-start-probe-%02d", i);
     }
 
     public void testColdStartLatencyAgainstBackgroundPopulation() throws Exception {

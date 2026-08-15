@@ -366,6 +366,22 @@ public class IndexNameExpressionResolver {
                 // a lookup it did not pay before.
                 IndexDescriptor descriptor = AbsentIndexDescriptorSuppliers.supply(expression);
                 if (descriptor != null && descriptor.exists()) {
+                    // The same rule shouldTrackConcreteIndex applies to a published index, applied here
+                    // because this branch continues past it. Omitting it made "closed" mean nothing for a
+                    // gated index: MetadataIndexStateService wrote descriptor.withState(CLOSE) and
+                    // acknowledged, and a search against that index went on answering, because the one
+                    // place that refuses a closed index was never reached.
+                    if (descriptor.state() == IndexDescriptor.State.CLOSE) {
+                        if (options.forbidClosedIndices() && options.ignoreUnavailable() == false) {
+                            throw new IndexClosedException(new Index(expression, descriptor.uuid()));
+                        }
+                        if (options.forbidClosedIndices()) {
+                            // Tolerated rather than refused, and excluded rather than searched -- which is
+                            // what ignore_unavailable asks for.
+                            acceptedExpressions.add(expression);
+                            continue;
+                        }
+                    }
                     acceptedExpressions.add(expression);
                     concreteIndices.add(new Index(expression, descriptor.uuid()));
                     continue;

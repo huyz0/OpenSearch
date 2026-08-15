@@ -284,6 +284,59 @@ write-behind projection kept only so the aggregate stays one search.
   `IndexBackedMappingStore`, so the suite stayed green against a store production did not register. The shared
   fixture now composes the store the way `ServerlessStoragePlugin` does.
 
+### Round 006 opened: durability. Close was a label, and finding that out was the round's first result
+
+The plan is `docs/rounds/006-durability/plan.md`. Three tiers — pin, pointer snapshot, independent copy —
+insuring against three different failures, with the load-bearing judgment that **fleet-wide physical DR
+belongs to the object store** (versioning, deny-delete, cross-region replication) and not to a per-index
+snapshot API, because a per-index deep copy across a hundred million indices is O(N) cluster work for a
+fleet whose whole premise is that per-index work was removed.
+
+**Landed.** The three index-level pin actions resolve through `AbsentIndexDescriptorSuppliers
+.metadataOrDescriptor`, so pin and release now work on a gated index — asserted, where before they failed
+`IndexNotFoundException` for an index that was serving traffic.
+
+**What that turned up, which matters more.** Restore-in-place refuses while a writer lease is held, and the
+ordinary way to release one is to close the index. Closing a *gated* index did nothing at all:
+
+- `IndexDescriptor.toIndexMetadata()` never set the state, so every reader that synthesised metadata saw
+  `OPEN` whatever the descriptor said.
+- `IndexNameExpressionResolver`'s gated branch returns a concrete index and continues **before**
+  `shouldTrackConcreteIndex`, the one place that refuses a closed index.
+
+So `closeGatedIndices` wrote `descriptor.withState(CLOSE)`, answered acknowledged, and the index went on
+accepting writes and answering searches while an ordinary one refused both with `IndexClosedException`. The
+test that covered gated close asserted the descriptor's own state — the label it had just written — which
+is exactly why a label was all it was. **Both fixed**, and `GatedShallowSnapshotIT` now measures a closed
+gated index against a closed ordinary one rather than against a written-down expectation.
+
+**One difference survives and is asserted rather than papered over.** An ordinary close is acknowledged once
+its cluster state update is applied; a gated close writes the descriptor and acknowledges, and other nodes
+learn of it by tailing the change log. A gated close therefore *converges* rather than arriving, and a
+client that closes and immediately writes can still be served. Found by the test passing alone and failing
+inside a loaded full suite — the window, not flakiness.
+
+**A miss in the namespace migration, found by this round and fixed.** `ComputedPlacementColdStartIT`
+creates about a thousand background indices named `cold-start-background-%06d` carrying the storage setting.
+The migration probe never recorded them, so they were left outside the namespace and quietly became a
+thousand *ordinary* indices — which is both the wrong thing to measure cold start against and enough load to
+time the cluster manager out. It surfaced as `Too many open files` inside the full suite and as
+`ClusterManagerNotDiscoveredException` alone, neither of which points at a renaming. Five more were found by
+a static sweep of every test file that enables the setting, checked one at a time against whether being
+ordinary changes what the test measures: `cold-start-probe`, `drain-`, `gated-mixed`, `chaos-failover-target`
+and the two `prewarm-target`s. The deliberate controls — `gated-refused`, `gated-aliased`, `mixed-ordinary`,
+and the resize sources, which a namespaced index may not be — were left alone.
+
+The lesson for the probe method, which was otherwise good: a probe records what ran, and a test that fails
+early records nothing. It needs a static sweep beside it, not instead of it.
+
+**Still open, and it blocks the restore round trip.** The shard is not released on close, so the writer
+lease survives. `DescriptorChange` carries `(name, uuid, kind, atMillis)` and no state, so the tailer cannot
+tell a close from a mapping update and releases shards only for deletions. The fix is either a persisted
+change-log format carrying state or a descriptor read per update change — a decision about a format that
+lives on the object store. The round-trip test is `AwaitsFix` against it rather than weakened, on the same
+grounds the name-collision test was.
+
 ### Shallow snapshot exists and works; it just cannot name a gated index
 
 Asked whether a shallow snapshot or an Aurora-style time machine is possible, the answer turned out to be

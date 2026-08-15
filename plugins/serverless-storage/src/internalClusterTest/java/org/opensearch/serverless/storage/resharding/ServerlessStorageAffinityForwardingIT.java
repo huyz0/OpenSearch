@@ -208,16 +208,16 @@ public class ServerlessStorageAffinityForwardingIT extends org.opensearch.server
         installBlobBackedDescriptorPlane();
 
         client().admin().indices().prepareCreate("ordinary-mixed").get();
-        client().admin().indices().prepareCreate("gated-mixed").setSettings(gated()).get();
+        client().admin().indices().prepareCreate("serverless_gated-mixed").setSettings(gated()).get();
         client().prepareIndex("ordinary-mixed").setId("1").setSource("f", "v").get();
-        indexOneDocTolerant("gated-mixed");
-        client().admin().indices().prepareRefresh("ordinary-mixed", "gated-mixed").get();
+        indexOneDocTolerant("serverless_gated-mixed");
+        client().admin().indices().prepareRefresh("ordinary-mixed", "serverless_gated-mixed").get();
 
         // Reset here, not just in @Before -- setup above (indexing into gated indices) can
         // itself be forwarded by this same filter, and that must not be counted as part of
         // what this assertion measures.
         AffinityForwardingActionFilter.resetForwardCountForTesting();
-        SearchResponse response = client().prepareSearch("ordinary-mixed", "gated-mixed").get();
+        SearchResponse response = client().prepareSearch("ordinary-mixed", "serverless_gated-mixed").get();
 
         assertEquals(2, response.getHits().getTotalHits().value());
         assertEquals(

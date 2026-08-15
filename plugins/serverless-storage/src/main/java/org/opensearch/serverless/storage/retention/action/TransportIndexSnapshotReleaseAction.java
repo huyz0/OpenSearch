@@ -10,6 +10,7 @@ package org.opensearch.serverless.storage.retention.action;
 
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
+import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
@@ -58,7 +59,17 @@ public class TransportIndexSnapshotReleaseAction extends HandledTransportAction<
      */
     @Override
     protected void doExecute(Task task, IndexSnapshotReleaseRequest request, ActionListener<IndexSnapshotReleaseResponse> listener) {
-        IndexMetadata indexMetadata = clusterService.state().metadata().index(request.indexName());
+        // Resolved through the descriptor supplier as well as cluster state, because a gated index has no
+        // cluster state entry and metadata.index(name) answers null for one -- which reported
+        // IndexNotFoundException for an index that exists, is serving traffic, and has manifests to pin.
+        // The shard-level action underneath takes a uuid and a shard id and never consults cluster state,
+        // so only this resolution had to learn about gating. Safe here because this runs on a transport or
+        // GENERIC thread; AbsentIndexDescriptorSuppliers forbids a blocking descriptor read only on the
+        // cluster state applier threads, where W4's deadlock lives.
+        IndexMetadata indexMetadata = AbsentIndexDescriptorSuppliers.metadataOrDescriptor(
+            clusterService.state().metadata(),
+            request.indexName()
+        );
         if (indexMetadata == null) {
             listener.onFailure(new IndexNotFoundException(request.indexName()));
             return;

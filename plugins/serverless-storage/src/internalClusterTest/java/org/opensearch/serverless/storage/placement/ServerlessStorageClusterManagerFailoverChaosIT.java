@@ -153,7 +153,7 @@ public class ServerlessStorageClusterManagerFailoverChaosIT extends org.opensear
             .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
             .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey(), true)
             .build();
-        client().admin().indices().prepareCreate("chaos-failover-target").setSettings(computed).get();
+        client().admin().indices().prepareCreate("serverless_chaos-failover-target").setSettings(computed).get();
 
         drainClusterStateQueue();
         ReaderShardPreWarmCoordinator.resetPreWarmCountForTesting();

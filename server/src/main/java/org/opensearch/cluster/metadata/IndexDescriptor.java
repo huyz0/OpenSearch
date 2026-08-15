@@ -623,7 +623,15 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
                     .build()
             )
             .numberOfShards(shards)
-            .numberOfReplicas(0);
+            .numberOfReplicas(0)
+            // The state, which this dropped until 2026-08-15 -- and dropping it made close a label rather
+            // than an operation. MetadataIndexStateService's gated path writes descriptor.withState(CLOSE)
+            // and answers acknowledged; every reader then synthesised metadata that said OPEN, because a
+            // builder left alone defaults to it. A closed gated index went on accepting writes and searches
+            // while an ordinary one refused both with IndexClosedException, and the test that covered close
+            // asserted the descriptor's own state rather than what the index did afterwards, so nothing saw
+            // it. An index that reports closed and keeps taking writes is worse than one that cannot close.
+            .state(state == State.CLOSE ? IndexMetadata.State.CLOSE : IndexMetadata.State.OPEN);
         // The divisor a document's routing hash is taken against. Left unset, IndexMetadata uses the shard
         // count, which is right for an index that has never been resharded and wrong, silently, for one
         // that has: routingFactor comes out as 1 and every document routes to the wrong shard.

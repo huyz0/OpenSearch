@@ -86,7 +86,7 @@ public class ServerlessStorageReaderShardPreWarmIT extends org.opensearch.server
             .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
             .put("index.serverless_storage.enabled", true)
             .build();
-        client().admin().indices().prepareCreate("prewarm-target").setSettings(computed).get();
+        client().admin().indices().prepareCreate("serverless_prewarm-target").setSettings(computed).get();
 
         // Let the two-data-node epoch settle for real before adding the third -- otherwise the very
         // first membership publication (empty previous epoch) could be what a race attributes the
@@ -177,7 +177,7 @@ public class ServerlessStorageReaderShardPreWarmIT extends org.opensearch.server
             .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
             .put("index.serverless_storage.enabled", true)
             .build();
-        client().admin().indices().prepareCreate("prewarm-disabled-target").setSettings(computed).get();
+        client().admin().indices().prepareCreate("serverless_prewarm-disabled-target").setSettings(computed).get();
 
         ReaderShardPreWarmCoordinator.resetPreWarmCountForTesting();
         internalCluster().startDataOnlyNode();

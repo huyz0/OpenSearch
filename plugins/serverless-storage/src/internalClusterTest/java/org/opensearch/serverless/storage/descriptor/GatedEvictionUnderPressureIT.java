@@ -165,7 +165,7 @@ public class GatedEvictionUnderPressureIT extends org.opensearch.serverless.stor
         IndicesService indices = internalCluster().getInstance(IndicesService.class, dataNode);
 
         for (int i = 0; i < POPULATION; i++) {
-            String name = String.format(Locale.ROOT, "drain-%04d", i);
+            String name = String.format(Locale.ROOT, "serverless_drain-%04d", i);
             client().admin().indices().create(new CreateIndexRequest(name).settings(gated())).actionGet();
             client().prepareIndex(name).setId("1").setSource("tenant", name).get();
         }
