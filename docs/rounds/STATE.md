@@ -284,6 +284,25 @@ write-behind projection kept only so the aggregate stays one search.
   `IndexBackedMappingStore`, so the suite stayed green against a store production did not register. The shared
   fixture now composes the store the way `ServerlessStoragePlugin` does.
 
+### Two of the four document operations had never been run against a gated index
+
+Asked whether a gated index can be indexed, updated, deleted and searched like a normal one, the suite could
+not answer. A survey of every integration test found **no test had ever issued a document update or a
+document delete against a gated index**: every `prepareUpdate` in the suite was `prepareUpdateSettings`, and
+every `prepareDelete` was `admin().indices().prepareDelete`, which deletes the index. Both looked covered
+from a file listing, which is why the survey had to read the call and not the name.
+
+`GatedDocumentLifecycleIT` runs the whole lifecycle -- index, realtime get, partial-document update, upsert,
+optimistic-concurrency conflict, a bulk mixing index/update/delete, document delete, delete-missing, refresh,
+search, and a phrase query proving the updated value was reindexed rather than merely stored -- against a
+gated index **and an ordinary index in the same cluster**, and asserts the two observation lists are equal
+step for step. "Like a normal index" is a comparison, so the test makes the comparison rather than encoding
+what normal is believed to be.
+
+All sixteen observations match. Nothing was broken; what was missing was the ability to say so. The one
+assertion that had to be tightened was in the test itself: a `match` query on an analysed field answered 2
+on both planes, passing while asserting nothing, because `second-updated` and `third-updated` share a token.
+
 ### The name decides: `serverless_`
 
 An index whose name begins with `serverless_` is a serverless index. The prefix is the declaration, and
