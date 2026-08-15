@@ -209,15 +209,15 @@ public class GatedCreationWithoutTemporaryIndexServiceIT extends org.opensearch.
     public void testAGatedCreationWithNothingToValidateBuildsNoIndexService() throws Exception {
         installBlobBackedDescriptorPlane();
 
-        client().admin().indices().create(new CreateIndexRequest("gated-plain").settings(gated())).actionGet();
+        client().admin().indices().create(new CreateIndexRequest("serverless_gated-plain").settings(gated())).actionGet();
 
         assertEquals("the validator must still have run; skipping it is not what this change does", 1, VALIDATIONS.get());
         assertFalse(
             "a gated creation with no mappings, aliases, templates or sort must be validated without an "
                 + "index service, and one built here means it was built anyway",
-            builtAnIndexServiceFor("gated-plain")
+            builtAnIndexServiceFor("serverless_gated-plain")
         );
-        assertFalse("and with nothing to validate, without a mapper service either", builtAMapperServiceFor("gated-plain"));
+        assertFalse("and with nothing to validate, without a mapper service either", builtAMapperServiceFor("serverless_gated-plain"));
     }
 
     /**
@@ -264,7 +264,7 @@ public class GatedCreationWithoutTemporaryIndexServiceIT extends org.opensearch.
         client().admin()
             .indices()
             .create(
-                new CreateIndexRequest("gated-mapped").settings(gated())
+                new CreateIndexRequest("serverless_gated-mapped").settings(gated())
                     .mapping(Map.of("properties", Map.of("tenant", Map.of("type", "keyword"))))
             )
             .actionGet();
@@ -272,15 +272,15 @@ public class GatedCreationWithoutTemporaryIndexServiceIT extends org.opensearch.
         assertFalse(
             "a mapping of plainly typed fields can be validated against the type registry, so no index "
                 + "service should have been built to validate it",
-            builtAnIndexServiceFor("gated-mapped")
+            builtAnIndexServiceFor("serverless_gated-mapped")
         );
         assertFalse(
             "nor a mapper service: the registry answers the whole question for a bare type name, which is "
                 + "the difference between this road and the one a parameter takes",
-            builtAMapperServiceFor("gated-mapped")
+            builtAMapperServiceFor("serverless_gated-mapped")
         );
 
-        var descriptor = org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.supply("gated-mapped");
+        var descriptor = org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.supply("serverless_gated-mapped");
         assertNotNull("the index must still be gated", descriptor);
         var generation = org.opensearch.cluster.metadata.MappingGenerationStore.currentMapping(descriptor.uuid());
         assertNotNull(
@@ -317,7 +317,7 @@ public class GatedCreationWithoutTemporaryIndexServiceIT extends org.opensearch.
         client().admin()
             .indices()
             .create(
-                new CreateIndexRequest("gated-parameterised").settings(gated())
+                new CreateIndexRequest("serverless_gated-parameterised").settings(gated())
                     .mapping(Map.of("properties", Map.of("code", Map.of("type", "keyword", "ignore_above", 256))))
             )
             .actionGet();
@@ -325,17 +325,17 @@ public class GatedCreationWithoutTemporaryIndexServiceIT extends org.opensearch.
         assertTrue(
             "a definition with more than a type in it has more to validate than the registry can answer, "
                 + "so it must be merged into a real mapper service",
-            builtAMapperServiceFor("gated-parameterised")
+            builtAMapperServiceFor("serverless_gated-parameterised")
         );
         assertFalse(
             "but validating a mapping needs a mapper service, not an index service, and building the "
                 + "latter is what serialises every concurrent creation on the node",
-            builtAnIndexServiceFor("gated-parameterised")
+            builtAnIndexServiceFor("serverless_gated-parameterised")
         );
 
         // And the parameter survived, which is what the validation was for. A road that dropped it would
         // satisfy both assertions above and be exactly the loss T13 and T15 were spent removing.
-        var descriptor = org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.supply("gated-parameterised");
+        var descriptor = org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.supply("serverless_gated-parameterised");
         assertNotNull("the index must still be gated", descriptor);
         var generation = org.opensearch.cluster.metadata.MappingGenerationStore.currentMapping(descriptor.uuid());
         assertNotNull("the declared field must reach the store", generation);

@@ -488,7 +488,7 @@ public class GatedPopulationSoakIT extends org.opensearch.serverless.storage.Ser
     }
 
     private static String tenant(int i) throws Exception {
-        return String.format(Locale.ROOT, "tenant-%08d", i);
+        return String.format(Locale.ROOT, "serverless_tenant-%08d", i);
     }
 
     private long clusterVersion() throws Exception {

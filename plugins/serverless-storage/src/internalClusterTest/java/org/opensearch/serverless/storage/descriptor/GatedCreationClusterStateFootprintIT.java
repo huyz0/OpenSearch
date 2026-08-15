@@ -97,7 +97,7 @@ public class GatedCreationClusterStateFootprintIT extends org.opensearch.serverl
         installBlobBackedDescriptorPlane();
 
         long ordinaryGrowth = createAndMeasureGrowth("plain-footprint", false);
-        long gatedGrowth = createAndMeasureGrowth("gated-footprint", true);
+        long gatedGrowth = createAndMeasureGrowth("serverless_gated-footprint", true);
 
         long perOrdinaryIndex = ordinaryGrowth / INDICES;
 

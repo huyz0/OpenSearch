@@ -54,6 +54,28 @@ PUT /my-index
 }
 ```
 
+### The `serverless_` namespace
+
+An index whose name begins with `serverless_` is a **gated** index: it gets no cluster
+state entry at all. Its record is a descriptor in the object store, its placement is
+computed rather than published, and creating one costs the cluster nothing that grows
+with how many indices already exist — which is what makes an index-per-tenant fleet of
+that size possible.
+
+```
+PUT /serverless_tenant-4711
+```
+
+No setting is needed; the name is the declaration, and the engine settings above are
+derived from it. The namespace is also a limit, and the creation is refused rather than
+quietly downgraded if you cross it: an index in it may not carry an alias, an index
+context, a data stream name, or be the target of a shrink/split/clone. Those all need
+cluster state entries the index does not have.
+
+An index *outside* the namespace can still use the object-store engine with the setting
+above. It keeps its cluster state entry — which is exactly what a data stream backing
+index or an alias-bearing index needs.
+
 Other index-level opt-ins:
 
 - `index.serverless_storage.lazy_directory.enabled` — searchable-snapshot-style

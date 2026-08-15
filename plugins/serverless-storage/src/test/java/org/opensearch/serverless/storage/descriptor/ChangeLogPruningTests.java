@@ -61,17 +61,17 @@ public class ChangeLogPruningTests extends OpenSearchTestCase {
 
     /** Buckets past the window go; buckets inside it stay. */
     public void testOldBucketsArePrunedAndRecentOnesAreNot() {
-        log().append(change("tenant-ancient"));
+        log().append(change("serverless_tenant-ancient"));
 
         now += 30 * MINUTE;
-        log().append(change("tenant-recent"));
+        log().append(change("serverless_tenant-recent"));
 
         now += MINUTE;
         assertEquals("only the bucket past the window", 1, log().pruneOlderThan(20 * MINUTE));
 
         List<DescriptorChange> left = log().since(null);
         assertEquals(1, left.size());
-        assertEquals("the recent one survives", "tenant-recent", left.get(0).name());
+        assertEquals("the recent one survives", "serverless_tenant-recent", left.get(0).name());
     }
 
     /**
@@ -87,7 +87,7 @@ public class ChangeLogPruningTests extends OpenSearchTestCase {
      * The clock is read once so that stays true across a backwards jump.
      */
     public void testTheCurrentBucketIsNeverPruned() {
-        log().append(change("tenant-now"));
+        log().append(change("serverless_tenant-now"));
 
         assertEquals("a zero window must still not touch the live bucket", 0, log().pruneOlderThan(0));
         assertEquals(1, log().since(null).size());
@@ -95,7 +95,7 @@ public class ChangeLogPruningTests extends OpenSearchTestCase {
 
     /** Pruning is idempotent, because a poll that runs twice must not be a different thing from one that runs once. */
     public void testPruningTwiceIsTheSameAsOnce() {
-        log().append(change("tenant-old"));
+        log().append(change("serverless_tenant-old"));
         now += 30 * MINUTE;
 
         assertEquals(1, log().pruneOlderThan(5 * MINUTE));
@@ -110,7 +110,7 @@ public class ChangeLogPruningTests extends OpenSearchTestCase {
      * of claim that is true until someone adds a reader.
      */
     public void testATailerIsUnaffectedByPrunedHistory() throws Exception {
-        log().append(change("tenant-history"));
+        log().append(change("serverless_tenant-history"));
         now += 30 * MINUTE;
 
         Path backing = createTempDir();
@@ -122,7 +122,7 @@ public class ChangeLogPruningTests extends OpenSearchTestCase {
         log().pruneOlderThan(5 * MINUTE);
 
         assertEquals("history is not this tailer's concern either way", 0, tailer.tailOnce());
-        log().append(change("tenant-new"));
+        log().append(change("serverless_tenant-new"));
         assertEquals("and it still sees what arrives after it started", 1, tailer.tailOnce());
     }
 }

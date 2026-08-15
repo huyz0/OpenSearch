@@ -108,13 +108,13 @@ public class GatedSettingsAndStateIT extends org.opensearch.serverless.storage.S
         // Create gated indices
         CreateIndexResponse create1 = client().admin()
             .indices()
-            .create(new CreateIndexRequest("gated-settings-1").settings(gatedSettings()))
+            .create(new CreateIndexRequest("serverless_gated-settings-1").settings(gatedSettings()))
             .actionGet();
         assertTrue(create1.isAcknowledged());
 
         CreateIndexResponse create2 = client().admin()
             .indices()
-            .create(new CreateIndexRequest("gated-settings-2").settings(gatedSettings()))
+            .create(new CreateIndexRequest("serverless_gated-settings-2").settings(gatedSettings()))
             .actionGet();
         assertTrue(create2.isAcknowledged());
 
@@ -138,7 +138,7 @@ public class GatedSettingsAndStateIT extends org.opensearch.serverless.storage.S
                 Exception.class,
                 () -> client().admin()
                     .indices()
-                    .prepareUpdateSettings("gated-settings-1")
+                    .prepareUpdateSettings("serverless_gated-settings-1")
                     .setSettings(Settings.builder().put("index.refresh_interval", "5s"))
                     .get()
             );
@@ -149,11 +149,11 @@ public class GatedSettingsAndStateIT extends org.opensearch.serverless.storage.S
             );
 
             // Close gated index off-thread
-            CloseIndexResponse closeResp = client().admin().indices().prepareClose("gated-settings-1").get();
+            CloseIndexResponse closeResp = client().admin().indices().prepareClose("serverless_gated-settings-1").get();
             assertTrue(closeResp.isAcknowledged());
 
             // Open gated index off-thread
-            OpenIndexResponse openResp = client().admin().indices().prepareOpen("gated-settings-1").get();
+            OpenIndexResponse openResp = client().admin().indices().prepareOpen("serverless_gated-settings-1").get();
             assertTrue(openResp.isAcknowledged());
         } finally {
             release.countDown();
@@ -163,8 +163,13 @@ public class GatedSettingsAndStateIT extends org.opensearch.serverless.storage.S
     public void testNonExistentGatedIndexOperationsThrowIndexNotFoundException() throws Exception {
         installGate();
 
-        // Install gated template for matching gated-*
-        client().admin().indices().preparePutTemplate("gated-template").setPatterns(List.of("gated-*")).setSettings(gatedSettings()).get();
+        // Install gated template for matching serverless_gated-*
+        client().admin()
+            .indices()
+            .preparePutTemplate("gated-template")
+            .setPatterns(List.of("serverless_gated-*"))
+            .setSettings(gatedSettings())
+            .get();
 
         // Non-existent gated index update settings throws IndexNotFoundException
         assertThrows(

@@ -70,11 +70,11 @@ public class BlobDescriptorBackendTests extends OpenSearchTestCase {
 
     public void testCreatedDescriptorRoundTripsThroughTheRegister() throws Exception {
         BlobDescriptorBackend backend = backendOver(createTempDir());
-        IndexDescriptor written = descriptor("tenant-a");
+        IndexDescriptor written = descriptor("serverless_tenant-a");
 
         assertTrue(backend.create(written));
 
-        IndexDescriptor read = backend.get("tenant-a");
+        IndexDescriptor read = backend.get("serverless_tenant-a");
         assertNotNull(read);
         assertEquals(written.name(), read.name());
         assertEquals(written.uuid(), read.uuid());
@@ -83,13 +83,13 @@ public class BlobDescriptorBackendTests extends OpenSearchTestCase {
 
     public void testSecondCreateOfTheSameNameLoses() throws Exception {
         BlobDescriptorBackend backend = backendOver(createTempDir());
-        assertTrue(backend.create(descriptor("tenant-a")));
+        assertTrue(backend.create(descriptor("serverless_tenant-a")));
 
-        IndexDescriptor loser = descriptor("tenant-a");
+        IndexDescriptor loser = descriptor("serverless_tenant-a");
         assertFalse("losing a create race is an answer, not an error", backend.create(loser));
 
         // And the winner's value is what survives, rather than the loser having overwritten it.
-        assertNotEquals(loser.uuid(), backend.get("tenant-a").uuid());
+        assertNotEquals(loser.uuid(), backend.get("serverless_tenant-a").uuid());
     }
 
     /**
@@ -132,12 +132,12 @@ public class BlobDescriptorBackendTests extends OpenSearchTestCase {
 
     public void testPutOverwritesWhereCreateWouldHaveLost() throws Exception {
         BlobDescriptorBackend backend = backendOver(createTempDir());
-        assertTrue(backend.create(descriptor("tenant-a")));
+        assertTrue(backend.create(descriptor("serverless_tenant-a")));
 
-        IndexDescriptor replacement = descriptor("tenant-a");
+        IndexDescriptor replacement = descriptor("serverless_tenant-a");
         backend.put(replacement);
 
-        assertEquals(replacement.uuid(), backend.get("tenant-a").uuid());
+        assertEquals(replacement.uuid(), backend.get("serverless_tenant-a").uuid());
     }
 
     /**
@@ -173,7 +173,7 @@ public class BlobDescriptorBackendTests extends OpenSearchTestCase {
      */
     public void testRetryingTheSameCreationRecognisesItsOwnWork() throws Exception {
         BlobDescriptorBackend backend = backendOver(createTempDir());
-        IndexDescriptor mine = descriptor("tenant-a");
+        IndexDescriptor mine = descriptor("serverless_tenant-a");
 
         assertEquals(DescriptorBackend.CreateOutcome.CREATED, backend.createIdempotently(mine));
         assertEquals(DescriptorBackend.CreateOutcome.ALREADY_MINE, backend.createIdempotently(mine));
@@ -183,9 +183,9 @@ public class BlobDescriptorBackendTests extends OpenSearchTestCase {
     /** And a genuinely different creator is still told the name is taken. */
     public void testADifferentCreatorIsToldTheNameIsTaken() throws Exception {
         BlobDescriptorBackend backend = backendOver(createTempDir());
-        assertEquals(DescriptorBackend.CreateOutcome.CREATED, backend.createIdempotently(descriptor("tenant-a")));
+        assertEquals(DescriptorBackend.CreateOutcome.CREATED, backend.createIdempotently(descriptor("serverless_tenant-a")));
 
-        DescriptorBackend.CreateOutcome outcome = backend.createIdempotently(descriptor("tenant-a"));
+        DescriptorBackend.CreateOutcome outcome = backend.createIdempotently(descriptor("serverless_tenant-a"));
         assertEquals(DescriptorBackend.CreateOutcome.TAKEN, outcome);
         assertFalse(outcome.owned());
     }
@@ -198,12 +198,12 @@ public class BlobDescriptorBackendTests extends OpenSearchTestCase {
      */
     public void testADeletedNameResolvesToItsTombstoneRatherThanToNothing() throws Exception {
         BlobDescriptorBackend backend = backendOver(createTempDir());
-        IndexDescriptor live = descriptor("tenant-a");
+        IndexDescriptor live = descriptor("serverless_tenant-a");
         assertTrue(backend.create(live));
 
         backend.putTombstoneAsync(live.tombstoned());
 
-        IndexDescriptor read = backend.get("tenant-a");
+        IndexDescriptor read = backend.get("serverless_tenant-a");
         assertNotNull("a deleted name must not read as never-existed", read);
         assertFalse("and it must report itself as gone", read.exists());
         assertEquals(live.uuid(), read.uuid());
@@ -212,10 +212,10 @@ public class BlobDescriptorBackendTests extends OpenSearchTestCase {
     /** A name that was never used stays genuinely absent, so the two cases remain distinguishable. */
     public void testANameThatNeverExistedIsStillAbsentAfterTombstonesExist() throws Exception {
         BlobDescriptorBackend backend = backendOver(createTempDir());
-        backend.create(descriptor("tenant-a"));
-        backend.putTombstoneAsync(backend.get("tenant-a").tombstoned());
+        backend.create(descriptor("serverless_tenant-a"));
+        backend.putTombstoneAsync(backend.get("serverless_tenant-a").tombstoned());
 
-        assertNull(backend.get("tenant-b"));
+        assertNull(backend.get("serverless_tenant-b"));
     }
 
     /**
@@ -238,25 +238,25 @@ public class BlobDescriptorBackendTests extends OpenSearchTestCase {
     /** Deleting twice has to converge rather than fail, including after a partially applied delete. */
     public void testDeletingTwiceIsIdempotent() throws Exception {
         BlobDescriptorBackend backend = backendOver(createTempDir());
-        backend.create(descriptor("tenant-a"));
-        IndexDescriptor tombstone = backend.get("tenant-a").tombstoned();
+        backend.create(descriptor("serverless_tenant-a"));
+        IndexDescriptor tombstone = backend.get("serverless_tenant-a").tombstoned();
 
         backend.putTombstoneAsync(tombstone);
         backend.putTombstoneAsync(tombstone);
 
-        assertFalse(backend.get("tenant-a").exists());
+        assertFalse(backend.get("serverless_tenant-a").exists());
     }
 
     /** A recreated name is live again, and the stale tombstone does not shadow it. */
     public void testANameCanBeRecreatedAfterDeletion() throws Exception {
         BlobDescriptorBackend backend = backendOver(createTempDir());
-        backend.create(descriptor("tenant-a"));
-        backend.putTombstoneAsync(backend.get("tenant-a").tombstoned());
+        backend.create(descriptor("serverless_tenant-a"));
+        backend.putTombstoneAsync(backend.get("serverless_tenant-a").tombstoned());
 
-        IndexDescriptor recreated = descriptor("tenant-a");
+        IndexDescriptor recreated = descriptor("serverless_tenant-a");
         assertTrue("the name is free once tombstoned", backend.create(recreated));
 
-        IndexDescriptor read = backend.get("tenant-a");
+        IndexDescriptor read = backend.get("serverless_tenant-a");
         assertTrue(read.exists());
         assertEquals(recreated.uuid(), read.uuid());
     }

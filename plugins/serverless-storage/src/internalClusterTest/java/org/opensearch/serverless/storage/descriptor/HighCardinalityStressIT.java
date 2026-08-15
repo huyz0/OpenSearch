@@ -85,7 +85,7 @@ public class HighCardinalityStressIT extends org.opensearch.serverless.storage.S
         for (int i = 0; i < numIndices; i++) {
             CreateIndexResponse resp = client().admin()
                 .indices()
-                .create(new CreateIndexRequest("stress-gated-" + i).settings(gatedSettings()))
+                .create(new CreateIndexRequest("serverless_stress-gated-" + i).settings(gatedSettings()))
                 .actionGet();
             assertTrue(resp.isAcknowledged());
         }

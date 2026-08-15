@@ -69,11 +69,11 @@ public class DescriptorReadRoundTripTests extends OpenSearchTestCase {
      */
     public void testRepeatedReadsOfOneTenantCostOneRoundTrip() throws Exception {
         BlobDescriptorBackend backend = countingBackend();
-        backend.create(descriptor("tenant-hot"));
+        backend.create(descriptor("serverless_tenant-hot"));
         long afterCreate = counter.getCount();
 
         for (int i = 0; i < 12; i++) {
-            assertNotNull(backend.get("tenant-hot"));
+            assertNotNull(backend.get("serverless_tenant-hot"));
         }
 
         assertEquals("twelve resolutions of one name must cost one read, not twelve", 1, counter.getCount() - afterCreate);
@@ -89,7 +89,7 @@ public class DescriptorReadRoundTripTests extends OpenSearchTestCase {
         BlobDescriptorBackend backend = countingBackend();
         long before = counter.getCount();
 
-        assertNull(backend.get("tenant-that-never-existed"));
+        assertNull(backend.get("serverless_tenant-that-never-existed"));
 
         assertEquals("the live prefix, then the tombstone prefix", 2, counter.getCount() - before);
     }
@@ -97,28 +97,28 @@ public class DescriptorReadRoundTripTests extends OpenSearchTestCase {
     /** A miss is never cached, so an index created just after a failed lookup resolves at once. */
     public void testAMissIsNotCached() throws Exception {
         BlobDescriptorBackend backend = countingBackend();
-        assertNull(backend.get("tenant-later"));
+        assertNull(backend.get("serverless_tenant-later"));
 
-        backend.create(descriptor("tenant-later"));
+        backend.create(descriptor("serverless_tenant-later"));
 
-        assertNotNull("caching absence would hide a just-created index for a freshness window", backend.get("tenant-later"));
+        assertNotNull("caching absence would hide a just-created index for a freshness window", backend.get("serverless_tenant-later"));
     }
 
     /** Distinct tenants each pay their own read, so the cache is not answering for names it never saw. */
     public void testEachTenantPaysItsOwnRead() throws Exception {
         BlobDescriptorBackend backend = countingBackend();
-        for (String name : new String[] { "tenant-a", "tenant-b", "tenant-c" }) {
+        for (String name : new String[] { "serverless_tenant-a", "serverless_tenant-b", "serverless_tenant-c" }) {
             backend.create(descriptor(name));
         }
         long afterCreates = counter.getCount();
 
-        for (String name : new String[] { "tenant-a", "tenant-b", "tenant-c" }) {
+        for (String name : new String[] { "serverless_tenant-a", "serverless_tenant-b", "serverless_tenant-c" }) {
             assertNotNull(backend.get(name));
         }
         assertEquals("three cold tenants, three reads", 3, counter.getCount() - afterCreates);
 
         long afterCold = counter.getCount();
-        for (String name : new String[] { "tenant-a", "tenant-b", "tenant-c" }) {
+        for (String name : new String[] { "serverless_tenant-a", "serverless_tenant-b", "serverless_tenant-c" }) {
             assertNotNull(backend.get(name));
         }
         assertEquals("and none the second time", 0, counter.getCount() - afterCold);
@@ -127,12 +127,12 @@ public class DescriptorReadRoundTripTests extends OpenSearchTestCase {
     /** A deleted tenant must stop resolving at once rather than after the freshness window. */
     public void testDeletionInvalidatesTheCachedDescriptor() throws Exception {
         BlobDescriptorBackend backend = countingBackend();
-        backend.create(descriptor("tenant-doomed"));
-        assertNotNull(backend.get("tenant-doomed"));
+        backend.create(descriptor("serverless_tenant-doomed"));
+        assertNotNull(backend.get("serverless_tenant-doomed"));
 
-        backend.putTombstoneAsync(descriptor("tenant-doomed").tombstoned());
+        backend.putTombstoneAsync(descriptor("serverless_tenant-doomed").tombstoned());
 
-        IndexDescriptor after = backend.get("tenant-doomed");
+        IndexDescriptor after = backend.get("serverless_tenant-doomed");
         assertTrue(
             "a deleted index still resolving as live would accept a write against a shard the cluster no " + "longer believes in",
             after == null || after.exists() == false

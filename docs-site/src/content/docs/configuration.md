@@ -7,9 +7,18 @@ All node settings are defined in `ServerlessStoragePlugin.java`. Most background
 
 ## Enabling the engine
 
+Two separate things, and the distinction matters: the **setting** below opts an index into the
+object-store engine, and the **name** decides whether the index has a cluster state entry at all. An index
+called `serverless_something` is gated — no metadata entry, no routing entry, its record is a descriptor in
+the object store — and carries the engine settings derived from its name. An index named anything else can
+still use the engine via the setting, and keeps its cluster state entry.
+
+A gated index may not have an alias, an index context, a data stream name, or be a resize target; such a
+creation is refused rather than silently created as an ordinary index.
+
 | Setting | Level | Purpose |
 |---|---|---|
-| `index.serverless_storage.enabled` | index | Opts an index into this engine instead of the classic one. |
+| `index.serverless_storage.enabled` | index | Opts an index into this engine instead of the classic one. Derived automatically for a `serverless_*` name. |
 | `index.serverless_storage.lazy_directory.enabled` | index | Reader engine fetches only the files a query touches, instead of downloading full bundles eagerly. |
 | `index.serverless_storage.wal.dedicated_stream` | index | Gives the shard its own WAL stream instead of sharing a node-level one — higher cost, used when a shard needs isolation from noisy neighbors. |
 

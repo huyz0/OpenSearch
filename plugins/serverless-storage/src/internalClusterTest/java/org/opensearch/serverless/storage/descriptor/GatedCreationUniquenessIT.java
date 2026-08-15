@@ -45,7 +45,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public class GatedCreationUniquenessIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
 
-    private static final String CONTESTED = "contested-idx";
+    private static final String CONTESTED = "serverless_contested-idx";
 
     private static final int CLIENTS = 8;
 

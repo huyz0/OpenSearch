@@ -96,11 +96,11 @@ public class GatedMappingIndexLossIT extends org.opensearch.serverless.storage.S
         client().admin()
             .indices()
             .create(
-                new CreateIndexRequest("gated-lost-mappings").settings(gated())
+                new CreateIndexRequest("serverless_gated-lost-mappings").settings(gated())
                     .mapping(Map.of("properties", Map.of("tenant", Map.of("type", "keyword"))))
             )
             .actionGet();
-        String uuid = AbsentIndexDescriptorSuppliers.supply("gated-lost-mappings").uuid();
+        String uuid = AbsentIndexDescriptorSuppliers.supply("serverless_gated-lost-mappings").uuid();
 
         // The projection is written behind the creation rather than inside it, so it has to have landed
         // before deleting it can prove anything -- and this wait is itself the assertion that a creation's
@@ -130,7 +130,12 @@ public class GatedMappingIndexLossIT extends org.opensearch.serverless.storage.S
 
         // And the next write goes through rather than failing on a store that no longer owns the mapping.
         assertTrue(
-            client().admin().indices().preparePutMapping("gated-lost-mappings").setSource("amount", "type=double").get().isAcknowledged()
+            client().admin()
+                .indices()
+                .preparePutMapping("serverless_gated-lost-mappings")
+                .setSource("amount", "type=double")
+                .get()
+                .isAcknowledged()
         );
         MappingGenerationStore.MappingGeneration afterWrite = MappingGenerationStore.currentMapping(uuid);
         assertEquals("keyword", MappingGenerationStore.typeOf(afterWrite.fields().get("tenant")));
@@ -147,7 +152,12 @@ public class GatedMappingIndexLossIT extends org.opensearch.serverless.storage.S
         // arrives on a cluster state update, so a projection issued in the same moment as the delete can
         // still find the stale latch, fail, and be dropped by design.
         assertTrue(
-            client().admin().indices().preparePutMapping("gated-lost-mappings").setSource("region", "type=keyword").get().isAcknowledged()
+            client().admin()
+                .indices()
+                .preparePutMapping("serverless_gated-lost-mappings")
+                .setSource("region", "type=keyword")
+                .get()
+                .isAcknowledged()
         );
         assertBusy(
             () -> assertProjectionHolds(uuid, "the projection must rebuild itself from a later mapping change"),

@@ -76,7 +76,7 @@ public class DescriptorEnumeratorTests extends OpenSearchTestCase {
 
     public void testEveryCreatedNameIsFound() throws Exception {
         setUpOver(createTempDir());
-        List<String> created = IntStream.range(0, 50).mapToObj(i -> "tenant-" + i).collect(Collectors.toList());
+        List<String> created = IntStream.range(0, 50).mapToObj(i -> "serverless_tenant-" + i).collect(Collectors.toList());
         created.forEach(name -> backend.create(descriptor(name)));
 
         assertEquals(created.stream().sorted().collect(Collectors.toList()), known(enumerator.allNames(), created));
@@ -157,15 +157,19 @@ public class DescriptorEnumeratorTests extends OpenSearchTestCase {
      */
     public void testAWildcardExpandsOnAFilesystemStore() throws Exception {
         setUpOver(createTempDir());
-        backend.create(descriptor("tenant-a"));
-        backend.create(descriptor("tenant-b"));
+        backend.create(descriptor("serverless_tenant-a"));
+        backend.create(descriptor("serverless_tenant-b"));
         backend.create(descriptor("other-c"));
 
-        var expansion = enumerator.expandPrefix("tenant-", 10);
+        var expansion = enumerator.expandPrefix("serverless_tenant-", 10);
 
         assertFalse("under the cap, so this is a list of matches rather than a refusal", expansion.exceeded());
         List<String> names = expansion.matches().stream().map(match -> match.name()).sorted().collect(Collectors.toList());
-        assertEquals("zero here would mean the descriptor space is invisible rather than empty", List.of("tenant-a", "tenant-b"), names);
+        assertEquals(
+            "zero here would mean the descriptor space is invisible rather than empty",
+            List.of("serverless_tenant-a", "serverless_tenant-b"),
+            names
+        );
     }
 
     /**
@@ -208,7 +212,7 @@ public class DescriptorEnumeratorTests extends OpenSearchTestCase {
     public void testAnExpansionBeforeAnyDescriptorExistsIsEmpty() throws Exception {
         setUpOver(createTempDir());
 
-        var expansion = enumerator.expandPrefix("tenant-", 10);
+        var expansion = enumerator.expandPrefix("serverless_tenant-", 10);
 
         assertFalse(expansion.exceeded());
         assertTrue("no gated index has ever been created, which is a complete answer", expansion.matches().isEmpty());

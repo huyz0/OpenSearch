@@ -63,7 +63,7 @@ public class GatedAliasResolutionIT extends org.opensearch.serverless.storage.Se
 
     private static final String INDEX = "aliased-tenant";
 
-    private static final String ALIAS = "tenant-alias";
+    private static final String ALIAS = "serverless_tenant-alias";
 
     @After
     public void clearGate() throws Exception {

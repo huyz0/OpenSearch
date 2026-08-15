@@ -419,7 +419,7 @@ public class GatedResidencySoakIT extends org.opensearch.serverless.storage.Serv
     }
 
     private static String tenant(int i) throws Exception {
-        return String.format(Locale.ROOT, "tenant-%08d", i);
+        return String.format(Locale.ROOT, "serverless_tenant-%08d", i);
     }
 
     /** Used heap after a requested collection. Crude in the same way, and for the same reason, as the population soak's. */

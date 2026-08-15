@@ -58,7 +58,7 @@ public class BlobDescriptorChangeLogTests extends OpenSearchTestCase {
         Path directory = createTempDir();
         BlobDescriptorChangeLog log = logOver(directory);
         for (int i = 0; i < 200; i++) {
-            log.append(change("tenant-" + i, DescriptorChange.Kind.CREATED));
+            log.append(change("serverless_tenant-" + i, DescriptorChange.Kind.CREATED));
         }
         assertEquals("no append may have failed silently", 0, log.failedAppendCount());
 
@@ -112,14 +112,17 @@ public class BlobDescriptorChangeLogTests extends OpenSearchTestCase {
 
     public void testAppendedChangesComeBack() throws Exception {
         BlobDescriptorChangeLog log = logOver(createTempDir());
-        log.append(change("tenant-a", DescriptorChange.Kind.CREATED));
-        log.append(change("tenant-b", DescriptorChange.Kind.CREATED));
-        log.append(change("tenant-a", DescriptorChange.Kind.DELETED));
+        log.append(change("serverless_tenant-a", DescriptorChange.Kind.CREATED));
+        log.append(change("serverless_tenant-b", DescriptorChange.Kind.CREATED));
+        log.append(change("serverless_tenant-a", DescriptorChange.Kind.DELETED));
 
         List<DescriptorChange> read = log.since(null);
         assertEquals("no append may have failed silently", 0, log.failedAppendCount());
         assertEquals(3, read.size());
-        assertEquals(Set.of("tenant-a", "tenant-b"), read.stream().map(DescriptorChange::name).collect(Collectors.toSet()));
+        assertEquals(
+            Set.of("serverless_tenant-a", "serverless_tenant-b"),
+            read.stream().map(DescriptorChange::name).collect(Collectors.toSet())
+        );
         assertEquals(1, read.stream().filter(c -> c.live() == false).count());
     }
 
@@ -143,7 +146,7 @@ public class BlobDescriptorChangeLogTests extends OpenSearchTestCase {
                     try {
                         startLine.await();
                         for (int j = 0; j < each; j++) {
-                            log.append(change("tenant-" + appender + "-" + j, DescriptorChange.Kind.CREATED));
+                            log.append(change("serverless_tenant-" + appender + "-" + j, DescriptorChange.Kind.CREATED));
                         }
                     } catch (Exception e) {
                         throw new RuntimeException(e);
@@ -198,8 +201,8 @@ public class BlobDescriptorChangeLogTests extends OpenSearchTestCase {
      */
     public void testAChangeCarriesTheUuidItAppliedTo() throws Exception {
         BlobDescriptorChangeLog log = logOver(createTempDir());
-        DescriptorChange deleted = change("tenant-a", DescriptorChange.Kind.DELETED);
-        DescriptorChange recreated = change("tenant-a", DescriptorChange.Kind.CREATED);
+        DescriptorChange deleted = change("serverless_tenant-a", DescriptorChange.Kind.DELETED);
+        DescriptorChange recreated = change("serverless_tenant-a", DescriptorChange.Kind.CREATED);
         log.append(deleted);
         log.append(recreated);
 

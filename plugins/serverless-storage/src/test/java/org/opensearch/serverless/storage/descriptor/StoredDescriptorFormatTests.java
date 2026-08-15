@@ -44,11 +44,11 @@ public class StoredDescriptorFormatTests extends OpenSearchTestCase {
 
     private static IndexDescriptor descriptor() {
         return IndexDescriptor.from(
-            IndexMetadata.builder("tenant-a")
+            IndexMetadata.builder("serverless_tenant-a")
                 .settings(
                     Settings.builder()
                         .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
-                        .put(IndexMetadata.SETTING_INDEX_UUID, "tenant-a-uuid")
+                        .put(IndexMetadata.SETTING_INDEX_UUID, "serverless_tenant-a-uuid")
                         .build()
                 )
                 .numberOfShards(3)

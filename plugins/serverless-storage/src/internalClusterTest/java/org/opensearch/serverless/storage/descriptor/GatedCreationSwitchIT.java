@@ -76,7 +76,7 @@ public class GatedCreationSwitchIT extends org.opensearch.serverless.storage.Ser
      */
     public void testGatingAgreesWithComputedPlacement() throws Exception {
         install(true);
-        IndexMetadata serverless = serverlessIndex("gated-candidate");
+        IndexMetadata serverless = serverlessIndex("serverless_gated-candidate");
         IndexMetadata ordinary = ordinaryIndex("plain-candidate");
 
         assertEquals(

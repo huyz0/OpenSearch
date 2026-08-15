@@ -45,7 +45,7 @@ public final class ComputedPlacementGate {
         // Without this the supplier is installed and never invoked. Index creation publishes a routing
         // entry for every index, and a supplier only runs when there is none, so the mechanism looks
         // wired and is dead. Registering both together is what makes it reachable.
-        AbsentIndexRoutingSuppliers.registerUnpublished(ComputedPlacementGate::ownsIndex);
+        AbsentIndexRoutingSuppliers.registerUnpublished(ComputedPlacementGate::placementIsComputed);
         INSTALLED_NODES.incrementAndGet();
     }
 
@@ -87,10 +87,37 @@ public final class ComputedPlacementGate {
      * available, exactly as it did before this hook existed.
      */
     static IndexRoutingTable supply(ClusterState state, IndexMetadata indexMetadata) {
-        if (ownsIndex(indexMetadata) == false) {
+        if (placementIsComputed(indexMetadata) == false) {
             return null;
         }
         return ComputedRoutingTable.build(indexMetadata, state);
+    }
+
+    /**
+     * Whether this index's placement is computed rather than published, which is the same question as
+     * whether it is gated.
+     *
+     * <p><b>The two must agree, and this is where that is enforced.</b> An index is gated exactly when its
+     * placement is computed: a gated index has no cluster state entry and therefore can have no published
+     * routing table, and an index whose routing is unpublished has nothing else to place it. Deciding them
+     * independently permits the two unserviceable shapes this file's header names -- published routing with
+     * no metadata, and metadata with no way to place it.
+     *
+     * <p>The second of those was reachable until the {@code serverless_} namespace was finished, and it
+     * failed in the worst available way. An index carrying the storage setting but declined by the gate --
+     * one with an alias, say, or a data stream backing index -- got a cluster state entry *and* unpublished
+     * routing, so the ordinary allocator never assigned its shards and the on-demand opening path, which
+     * only runs for gated indices, never opened them either. A write to it did not fail; it retried until
+     * something above it timed out, because nothing tells a write that its shard is never coming.
+     *
+     * <p>So this reads the name, exactly as {@code DescriptorGate#gatable} does. An index outside the
+     * namespace publishes routing and is allocated the ordinary way, which is what serverless storage did
+     * before computed placement existed and is what an alias-bearing or data-stream index needs.
+     */
+    public static boolean placementIsComputed(IndexMetadata indexMetadata) {
+        return indexMetadata != null
+            && org.opensearch.cluster.metadata.DescriptorOnlyCreation.namesAServerlessIndex(indexMetadata.getIndex().getName())
+            && ownsIndex(indexMetadata);
     }
 
     /**

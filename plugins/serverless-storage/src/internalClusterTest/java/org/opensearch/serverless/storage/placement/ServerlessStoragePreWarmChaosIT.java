@@ -190,13 +190,13 @@ public class ServerlessStoragePreWarmChaosIT extends org.opensearch.serverless.s
             .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
             .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey(), true)
             .build();
-        client().admin().indices().create(new CreateIndexRequest("chaos-gated-target").settings(gated)).actionGet();
+        client().admin().indices().create(new CreateIndexRequest("serverless_chaos-gated-target").settings(gated)).actionGet();
         // One bulk request, not many sequential single-document round trips -- spreads writes across
         // shards (so several open on-demand across the three original data nodes, T39) without the
         // concurrent shard-open storm many separate blocking calls produced.
         BulkRequestBuilder bulk = client().prepareBulk();
         for (int i = 0; i < 24; i++) {
-            bulk.add(client().prepareIndex("chaos-gated-target").setId("doc-" + i).setSource("v", i));
+            bulk.add(client().prepareIndex("serverless_chaos-gated-target").setId("doc-" + i).setSource("v", i));
         }
         BulkResponse bulkResponse = bulk.get();
         assertFalse(bulkResponse.buildFailureMessage(), bulkResponse.hasFailures());
@@ -222,7 +222,10 @@ public class ServerlessStoragePreWarmChaosIT extends org.opensearch.serverless.s
         // shards have (it does not throw the way a write to one specific unavailable shard does), so
         // this remains a real, meaningful check of "the index still serves what it already held," the
         // property this assertion actually needs.
-        SearchResponse search = client().prepareSearch("chaos-gated-target").setQuery(QueryBuilders.matchAllQuery()).setSize(0).get();
+        SearchResponse search = client().prepareSearch("serverless_chaos-gated-target")
+            .setQuery(QueryBuilders.matchAllQuery())
+            .setSize(0)
+            .get();
         assertTrue(
             "documents written before the chaos must remain searchable after surviving a node death " + "mid pre-warm dispatch",
             search.getHits().getTotalHits().value() > 0

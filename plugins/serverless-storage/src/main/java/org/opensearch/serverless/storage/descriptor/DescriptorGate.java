@@ -372,11 +372,6 @@ public final class DescriptorGate {
         UnknownFieldRefresh.register(fieldRefresher);
 
         DescriptorOnlyCreation.register(DescriptorGate::gatable);
-        // And the road that reaches it. Registered after the gate rather than before, for the same reason the
-        // gate is registered last: this only chooses which path a creation takes, and a path installed ahead
-        // of the gate it is meant to reach would pull requests off the cluster state thread only to have them
-        // find nothing gating them and fall back.
-        DescriptorOnlyCreation.registerAdmissionCheck(DescriptorGate::worthAdmittingOffThread);
         nodeInstalled();
         logger.info("descriptor resolution installed against the object store");
     }
@@ -384,15 +379,33 @@ public final class DescriptorGate {
     /**
      * Whether this index may skip its cluster state entry.
      *
-     * <p>Two conditions, and they are separate questions. The plugin has to own the index at all, and the
-     * descriptor has to be able to carry everything the index declares. Before T7 only the first was asked,
-     * so an index with a filtered alias was gated and its filter went nowhere.
+     * <p>Three conditions, and they are separate questions. The name has to be in the serverless namespace,
+     * the plugin has to own the index at all, and the descriptor has to be able to carry everything the index
+     * declares. Before T7 only the second was asked, so an index with a filtered alias was gated and its
+     * filter went nowhere.
+     *
+     * <p><b>The name is first and it is the one that closes the collision.</b> Gating used to follow the
+     * setting, which meant a name could be claimed in either plane -- {@code GatedAndOrdinaryNameCollisionIT}
+     * measured a gated {@code x} and an ordinary {@code x} both being granted, sequentially, because neither
+     * creation path consults the other's authority. Requiring the namespace here makes it impossible for a
+     * name outside it to be held by a descriptor *alone*, and {@code MetadataCreateIndexService#
+     * clusterStateCreateIndex} makes a cluster state entry impossible for a name inside it. (An ordinary
+     * index still has a descriptor -- {@code Metadata.Builder} publishes one on every incremental change --
+     * but it is a projection of an index cluster state holds, and resolution reads metadata first.) The two claims cannot meet, so there is nothing
+     * left to reconcile and no window to reconcile it in.
+     *
+     * <p>The setting keeps its other meaning. It still selects serverless storage, the lazy directory and
+     * computed placement, for a data stream backing index or an alias-bearing index that wants those and
+     * cannot be gated anyway. What it no longer does is decide whether an index has a cluster state entry.
      *
      * <p>Logged at info rather than silently declined, because an operator who asked for a gated index and
      * got a cluster state entry needs to know which feature kept it there. A silent decline here would be
      * the same failure this whole area is about, one layer up.
      */
     private static boolean gatable(org.opensearch.cluster.metadata.IndexMetadata indexMetadata) {
+        if (DescriptorOnlyCreation.namesAServerlessIndex(indexMetadata.getIndex().getName()) == false) {
+            return false;
+        }
         if (ComputedPlacementGate.ownsIndex(indexMetadata) == false) {
             return false;
         }
@@ -404,27 +417,7 @@ public final class DescriptorGate {
         return true;
     }
 
-    /**
-     * Whether a creation request is worth admitting off the cluster state update thread.
-     *
-     * <p>Only the first of {@link #gatable}'s two conditions, and only the part of it that can be read from
-     * the request itself. {@code ownsIndex} reads exactly this setting off the finished metadata, so a request
-     * that carries it will almost always turn out gatable; the second condition needs resolved aliases, which
-     * do not exist yet here, and is left to the real gate.
-     *
-     * <p><b>This reads whatever settings it is given, and since T49 those have templates merged into them.</b>
-     * It used to be handed the request's own settings only, on the reasoning that an index gated by a template
-     * takes the ordinary path and is gated at the bottom exactly as before: correct, and no faster. That was
-     * wrong. Being gated at the bottom means writing the declared mapping to a store whose writes block, from
-     * the state update thread, by a path that had already concluded the index was not gated. The resolution
-     * happens in {@code MetadataCreateIndexService} rather than here, so this predicate and the gate at the
-     * bottom read the same settings rather than two computations of the same idea.
-     */
-    private static boolean worthAdmittingOffThread(org.opensearch.common.settings.Settings requestSettings) {
-        return requestSettings.getAsBoolean("index.serverless_storage.enabled", false);
-    }
-
-    /** Clears both registrations, which a node shutting down must do. */
+    /** Clears the registration, which a node shutting down must do. */
     /**
      * The change log, which had nowhere to be called from until the publisher above called it.
      *
@@ -549,7 +542,6 @@ public final class DescriptorGate {
         }
         MappingGenerationStore.register(null);
         GatedMappingStatsAggregator.register(null);
-        DescriptorOnlyCreation.registerAdmissionCheck(null);
         DescriptorOnlyCreation.register(null);
         UnknownFieldRefresh.register(null);
         STORE.set(null);

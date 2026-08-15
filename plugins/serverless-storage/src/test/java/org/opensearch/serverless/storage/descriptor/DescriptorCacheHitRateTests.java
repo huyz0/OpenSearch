@@ -133,7 +133,7 @@ public class DescriptorCacheHitRateTests extends OpenSearchTestCase {
         Zipf zipf = new Zipf(population, exponent, 42L);
 
         for (int i = 0; i < lookups; i++) {
-            String name = "tenant-" + zipf.next();
+            String name = "serverless_tenant-" + zipf.next();
             cache.get(name, DescriptorCacheHitRateTests::descriptor);
         }
         return new Result(cache.hitRate(), cache.readCount(), cache.evictionCount());

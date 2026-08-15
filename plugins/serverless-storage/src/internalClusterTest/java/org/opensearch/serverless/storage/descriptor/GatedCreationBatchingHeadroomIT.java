@@ -93,7 +93,7 @@ public class GatedCreationBatchingHeadroomIT extends org.opensearch.serverless.s
         installBlobBackedDescriptorPlane();
 
         long ordinaryVersions = createAndCountVersions("plain-batch", false);
-        long gatedVersions = createAndCountVersions("gated-batch", true);
+        long gatedVersions = createAndCountVersions("serverless_gated-batch", true);
 
         logger.warn(
             String.format(

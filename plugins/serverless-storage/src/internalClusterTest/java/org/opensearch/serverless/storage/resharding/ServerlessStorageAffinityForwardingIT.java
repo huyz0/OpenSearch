@@ -64,7 +64,7 @@ public class ServerlessStorageAffinityForwardingIT extends org.opensearch.server
      */
     private static String nameWithAffinityFor(String wantNodeId, List<String> allNodeIds, Set<String> exclude) {
         for (int i = 0; i < 10_000; i++) {
-            String candidate = "affinity-forward-probe-" + i;
+            String candidate = "serverless_affinity-forward-probe-" + i;
             if (exclude.contains(candidate)) {
                 continue;
             }

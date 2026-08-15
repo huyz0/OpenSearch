@@ -21,41 +21,34 @@ import java.util.Collection;
 import java.util.List;
 
 /**
- * What happens when one name is claimed in both planes.
+ * One name, one plane, and no agreement needed between the two authorities to keep it that way.
  *
- * <p>A gated index's name is held by a register compare-and-swap in the descriptor store; an ordinary
- * index's is held by cluster state. Neither authority consults the other at creation time, which raises a
- * question this test answers by measurement rather than by reading: can the same name end up claimed twice,
- * and if so, what does a client see?
+ * <h2>What this used to be</h2>
  *
- * <p>Asserted rather than argued because the reasoning had already been written down wrong once -- as "the
- * ordinary path consults the descriptor store", which {@code MetadataCreateIndexService#validate} does not
- * do: it checks the routing table, the metadata and the aliases, all of which are cluster state.
+ * An {@code AwaitsFix} recording a defect. A gated index's name was held by a register compare-and-swap in
+ * the descriptor store and an ordinary index's by cluster state, gating was decided by a *setting*, so the
+ * same name could be claimed in both planes -- and was, sequentially, with no concurrency involved at all.
+ * Creating a gated {@code x} and then an ordinary {@code x} succeeded twice. Resolution consults metadata
+ * before the descriptor supplier, so the ordinary index shadowed the gated one from that moment: the client
+ * that created the gated index was told it existed and could no longer address it. Nothing reconciled the
+ * two, so it did not converge; deleting the ordinary index brought the name back as a different index with a
+ * different uuid and no data.
  *
- * <h2>What it found</h2>
+ * <p>The fix that was obvious then was to have {@code validateIndexName} ask the descriptor store, and it
+ * could not go where the check is: that runs inside the cluster state update task, where a blocking
+ * descriptor read is the deadlock W4 paid for.
  *
- * Both claims are granted. Creating a gated {@code collide-me} and then an ordinary {@code collide-me}
- * succeeds twice, sequentially, with no concurrency involved at all -- the descriptor stays live and cluster
- * state gains an index of the same name with a different uuid. Resolution consults metadata before the
- * supplier, so the ordinary index shadows the gated one from that moment: the client that created the gated
- * index was told it exists and can no longer address it. Deleting the ordinary index unshadows the
- * descriptor, so the name comes back as a different index with a different uuid and no data.
+ * <h2>What closed it</h2>
  *
- * <h2>Why it is not fixed here</h2>
+ * Neither authority asks the other, and neither needs to. The {@code serverless_} namespace partitions the
+ * names: {@code DescriptorGate#gatable} refuses a name outside it, so no descriptor can exist for one, and
+ * {@code MetadataCreateIndexService#clusterStateCreateIndex} refuses a name inside it, so no cluster state
+ * entry can exist for one. Both checks are string comparisons on the name, which is why they can run where
+ * the descriptor read could not.
  *
- * The obvious fix -- have {@code validateIndexName} ask the descriptor store -- cannot go where the check
- * is. That runs inside the cluster state update task, and {@code AbsentIndexDescriptorSuppliers} refuses to
- * resolve on that thread by design, because a blocking descriptor read there is the deadlock W4 already
- * paid for. The check has to move to the request path, before the task is submitted, which is a change to
- * how ordinary creation is sequenced and costs every ordinary creation in a gated cluster one descriptor
- * read. That is a decision about the ordinary path, which R1 protects, rather than something to append to a
- * throughput change.
- *
- * <p>Marked {@code AwaitsFix} rather than deleted or weakened, the same way {@code
- * GatedCreationDurabilityIT} keeps T17 visible: a test that asserted the current behaviour would turn this
- * into a specification.
+ * <p>This asserts both directions, because a partition that holds in one direction is the defect this file
+ * was opened for.
  */
-@org.apache.lucene.tests.util.LuceneTestCase.AwaitsFix(bugUrl = "one name can be claimed in both planes: neither creation path consults the other's authority")
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
 public class GatedAndOrdinaryNameCollisionIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
 
@@ -91,64 +84,118 @@ public class GatedAndOrdinaryNameCollisionIT extends org.opensearch.serverless.s
         DescriptorGate.uninstall();
     }
 
-    public void testCreatingAnOrdinaryIndexOverAGatedName() throws Exception {
-        internalCluster().startClusterManagerOnlyNode();
-        internalCluster().startDataOnlyNode();
-        ensureStableCluster(2);
-        installBlobBackedDescriptorPlane();
-
-        assertTrue(client().admin().indices().create(new CreateIndexRequest("collide-me").settings(gated())).actionGet().isAcknowledged());
-        assertNotNull("the gated index must exist before this asserts anything", AbsentIndexDescriptorSuppliers.supply("collide-me"));
-
-        Exception refused = null;
-        try {
-            client().admin().indices().create(new CreateIndexRequest("collide-me").settings(ordinary())).actionGet();
-        } catch (Exception e) {
-            refused = e;
-        }
-
-        boolean inClusterState = client().admin().cluster().prepareState().get().getState().metadata().hasIndex("collide-me");
-        var descriptor = AbsentIndexDescriptorSuppliers.supply("collide-me");
-        logger.warn(
-            "COLLISION: ordinary creation over a gated name -> refused={}, in cluster state={}, descriptor still live={}",
-            refused == null ? "no" : refused.getClass().getSimpleName(),
-            inClusterState,
-            descriptor != null && descriptor.exists()
-        );
-
-        assertNotNull(
-            "one name must not be claimable in both planes: the descriptor store holds [collide-me] and "
-                + "cluster state was allowed to claim it as well, so the name now resolves to whichever "
-                + "plane the resolver consults first and the other claim is invisible until it is not",
-            refused
-        );
-    }
-
     /**
-     * The other order, which is refused, and which is what makes the case above a finding rather than a
-     * property of the design.
+     * The direction that was open: a gated name, then an ordinary creation of it.
      *
-     * <p>A gated creation validates its name against cluster state like any other, so an existing ordinary
-     * index of that name stops it. Only one of the two orders is open, and it is the one where the
-     * authority that already holds the name is the one nobody asks.
+     * <p>It is not merely refused now -- it is unaskable. The second creation carries no serverless setting
+     * and asks for an ordinary index, and it is still routed into the descriptor plane, because the name is
+     * what decides. So it meets the register compare-and-swap that already holds the name and comes back
+     * {@link org.opensearch.ResourceAlreadyExistsException}, which is what a duplicate has always been told.
      */
-    public void testCreatingAGatedIndexOverAnOrdinaryNameIsRefused() throws Exception {
+    public void testAnOrdinaryCreationCannotTakeAGatedName() throws Exception {
         internalCluster().startClusterManagerOnlyNode();
         internalCluster().startDataOnlyNode();
         ensureStableCluster(2);
         installBlobBackedDescriptorPlane();
 
         assertTrue(
-            client().admin().indices().create(new CreateIndexRequest("ordinary-first").settings(ordinary())).actionGet().isAcknowledged()
+            client().admin()
+                .indices()
+                .create(new CreateIndexRequest("serverless_collide-me").settings(gated()))
+                .actionGet()
+                .isAcknowledged()
+        );
+        assertNotNull(
+            "the gated index must exist before this asserts anything",
+            AbsentIndexDescriptorSuppliers.supply("serverless_collide-me")
         );
 
         expectThrows(
             org.opensearch.ResourceAlreadyExistsException.class,
+            () -> client().admin().indices().create(new CreateIndexRequest("serverless_collide-me").settings(ordinary())).actionGet()
+        );
+
+        assertFalse(
+            "and nothing may have reached cluster state under that name, which is what shadowed the "
+                + "descriptor and made the name change identity under whoever was writing to it",
+            client().admin().cluster().prepareState().get().getState().metadata().hasIndex("serverless_collide-me")
+        );
+        assertNotNull(
+            "the descriptor is still the one thing holding the name",
+            AbsentIndexDescriptorSuppliers.supply("serverless_collide-me")
+        );
+    }
+
+    /**
+     * The direction that was already closed, kept because a partition needs both halves and because the
+     * reason this one closes has changed.
+     *
+     * <p>It used to close incidentally: a gated creation validated its name against cluster state like any
+     * other, so an existing ordinary index stopped it. Now it cannot arise at all -- an ordinary index can
+     * never hold a name in the namespace to begin with, which is what the first assertion here checks.
+     */
+    public void testAGatedNameCanNeverHaveBeenClaimedByAnOrdinaryIndex() throws Exception {
+        internalCluster().startClusterManagerOnlyNode();
+        internalCluster().startDataOnlyNode();
+        ensureStableCluster(2);
+        installBlobBackedDescriptorPlane();
+
+        // An ordinary index outside the namespace, which is the only kind there is.
+        assertTrue(
+            client().admin().indices().create(new CreateIndexRequest("ordinary-first").settings(ordinary())).actionGet().isAcknowledged()
+        );
+        assertTrue(
+            "an index outside the namespace must not be gated however it was created, and being in cluster "
+                + "state is what not being gated means",
+            client().admin().cluster().prepareState().get().getState().metadata().hasIndex("ordinary-first")
+        );
+
+        // And a gated creation of that same ordinary name is refused, because the name is not in the
+        // namespace and so the descriptor plane will not take it either -- it is an ordinary duplicate.
+        expectThrows(
+            org.opensearch.ResourceAlreadyExistsException.class,
             () -> client().admin().indices().create(new CreateIndexRequest("ordinary-first").settings(gated())).actionGet()
         );
+        assertTrue(
+            "and the refused creation must not have disturbed the index that already held the name",
+            client().admin().cluster().prepareState().get().getState().metadata().hasIndex("ordinary-first")
+        );
+    }
+
+    /**
+     * The remaining way a namespaced name could have reached cluster state, which is the one the fallback
+     * used to take: an index the gate declines. A filtered alias is the original reason
+     * {@code DescriptorRepresentable} refuses to gate an index, so it is the case to drive.
+     *
+     * <p>Refused rather than created ordinary. This is the assertion that makes the partition a partition
+     * rather than a convention -- without it, any index the gate declines walks straight into the other
+     * plane under a name a descriptor may already hold.
+     */
+    public void testANamespacedIndexTheGateWouldDeclineIsRefusedOutright() throws Exception {
+        internalCluster().startClusterManagerOnlyNode();
+        internalCluster().startDataOnlyNode();
+        ensureStableCluster(2);
+        installBlobBackedDescriptorPlane();
+
+        Exception refused = expectThrows(
+            Exception.class,
+            () -> client().admin()
+                .indices()
+                .create(
+                    new CreateIndexRequest("serverless_wants-an-alias").settings(gated())
+                        .alias(new org.opensearch.action.admin.indices.alias.Alias("an-alias"))
+                )
+                .actionGet()
+        );
+        logger.info("namespaced index with an alias refused with: {}", refused.toString());
+
+        assertFalse(
+            "an index in the namespace that cannot be gated must not be created ordinary instead",
+            client().admin().cluster().prepareState().get().getState().metadata().hasIndex("serverless_wants-an-alias")
+        );
         assertNull(
-            "and nothing may have been recorded in the descriptor store for a creation that was refused",
-            AbsentIndexDescriptorSuppliers.supply("ordinary-first")
+            "and it must not exist as a descriptor either -- refused means refused in both planes",
+            AbsentIndexDescriptorSuppliers.supply("serverless_wants-an-alias")
         );
     }
 

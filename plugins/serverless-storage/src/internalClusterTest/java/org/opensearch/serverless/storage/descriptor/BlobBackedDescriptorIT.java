@@ -286,19 +286,19 @@ public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.Se
     }
 
     public void testAGatedIndexCanBeCreatedResolvedAndSearchedOnTheBlobBackend() throws Exception {
-        createGated("tenant-alpha");
-        assertGated("tenant-alpha");
-        awaitDescriptor("tenant-alpha");
+        createGated("serverless_tenant-alpha");
+        assertGated("serverless_tenant-alpha");
+        awaitDescriptor("serverless_tenant-alpha");
 
         BulkRequestBuilder bulk = client().prepareBulk();
         for (int i = 0; i < 25; i++) {
-            bulk.add(client().prepareIndex("tenant-alpha").setId("doc-" + i).setSource("value", i));
+            bulk.add(client().prepareIndex("serverless_tenant-alpha").setId("doc-" + i).setSource("value", i));
         }
         BulkResponse response = bulk.get();
         assertFalse(response.buildFailureMessage(), response.hasFailures());
 
-        client().admin().indices().prepareRefresh("tenant-alpha").get();
-        SearchResponse search = client().prepareSearch("tenant-alpha").setQuery(QueryBuilders.matchAllQuery()).setSize(0).get();
+        client().admin().indices().prepareRefresh("serverless_tenant-alpha").get();
+        SearchResponse search = client().prepareSearch("serverless_tenant-alpha").setQuery(QueryBuilders.matchAllQuery()).setSize(0).get();
         assertEquals(25, search.getHits().getTotalHits().value());
     }
 
@@ -312,14 +312,14 @@ public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.Se
      * survived: the failure needs a get by id specifically.
      */
     public void testAGatedIndexCanBeReadByIdAndNotJustSearched() throws Exception {
-        createGated("tenant-getbyid");
-        assertGated("tenant-getbyid");
-        awaitDescriptor("tenant-getbyid");
+        createGated("serverless_tenant-getbyid");
+        assertGated("serverless_tenant-getbyid");
+        awaitDescriptor("serverless_tenant-getbyid");
 
-        client().prepareIndex("tenant-getbyid").setId("doc-1").setSource("value", 7).get();
-        client().admin().indices().prepareRefresh("tenant-getbyid").get();
+        client().prepareIndex("serverless_tenant-getbyid").setId("doc-1").setSource("value", 7).get();
+        client().admin().indices().prepareRefresh("serverless_tenant-getbyid").get();
 
-        org.opensearch.action.get.GetResponse response = client().prepareGet("tenant-getbyid", "doc-1").get();
+        org.opensearch.action.get.GetResponse response = client().prepareGet("serverless_tenant-getbyid", "doc-1").get();
         assertTrue("a document written to a gated index must be readable by id", response.isExists());
         assertEquals(7, response.getSourceAsMap().get("value"));
     }
@@ -337,15 +337,15 @@ public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.Se
      * since {@code IndexDescriptor.State} can represent CLOSE.
      */
     public void testOperationsAGatedIndexCannotSupportFailClearly() throws Exception {
-        createGated("tenant-unsupported");
-        assertGated("tenant-unsupported");
-        awaitDescriptor("tenant-unsupported");
+        createGated("serverless_tenant-unsupported");
+        assertGated("serverless_tenant-unsupported");
+        awaitDescriptor("serverless_tenant-unsupported");
 
         Exception settings = expectThrows(
             Exception.class,
             () -> client().admin()
                 .indices()
-                .prepareUpdateSettings("tenant-unsupported")
+                .prepareUpdateSettings("serverless_tenant-unsupported")
                 .setSettings(Settings.builder().put("index.number_of_replicas", 1))
                 .get()
         );
@@ -364,11 +364,19 @@ public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.Se
         // this test would freeze the feature set at whatever existed the day it was written -- which is what
         // it had been doing: both of these were implemented and the assertion that they fail was left
         // standing, so the suite has been red here rather than telling anyone the capability arrived.
-        assertTrue(client().admin().indices().prepareClose("tenant-unsupported").get().isAcknowledged());
-        assertBusy(() -> assertEquals(IndexDescriptor.State.CLOSE, descriptorOf("tenant-unsupported").state()), 30, TimeUnit.SECONDS);
+        assertTrue(client().admin().indices().prepareClose("serverless_tenant-unsupported").get().isAcknowledged());
+        assertBusy(
+            () -> assertEquals(IndexDescriptor.State.CLOSE, descriptorOf("serverless_tenant-unsupported").state()),
+            30,
+            TimeUnit.SECONDS
+        );
 
-        assertTrue(client().admin().indices().prepareOpen("tenant-unsupported").get().isAcknowledged());
-        assertBusy(() -> assertEquals(IndexDescriptor.State.OPEN, descriptorOf("tenant-unsupported").state()), 30, TimeUnit.SECONDS);
+        assertTrue(client().admin().indices().prepareOpen("serverless_tenant-unsupported").get().isAcknowledged());
+        assertBusy(
+            () -> assertEquals(IndexDescriptor.State.OPEN, descriptorOf("serverless_tenant-unsupported").state()),
+            30,
+            TimeUnit.SECONDS
+        );
     }
 
     /**
@@ -389,8 +397,8 @@ public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.Se
      * have served it too.
      */
     public void testTheDescriptorReallyLivesInTheObjectStore() throws Exception {
-        createGated("tenant-bravo");
-        assertGated("tenant-bravo");
+        createGated("serverless_tenant-bravo");
+        assertGated("serverless_tenant-bravo");
 
         org.opensearch.common.blobstore.fs.FsBlobStore store = new org.opensearch.common.blobstore.fs.FsBlobStore(1024, basePath(), false);
         DescriptorEnumerator enumerator = new DescriptorEnumerator(
@@ -400,7 +408,7 @@ public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.Se
 
         assertTrue(
             "the descriptor must be readable from the object store alone, which is invariant I2",
-            enumerator.allNames().contains("tenant-bravo")
+            enumerator.allNames().contains("serverless_tenant-bravo")
         );
     }
 
@@ -410,13 +418,13 @@ public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.Se
      * had simply replaced the store, this would return nothing and would do so without an error.
      */
     public void testWildcardsStillResolveWithPointReadsOnTheObjectStore() throws Exception {
-        createGated("logs-one");
-        createGated("logs-two");
-        createGated("metrics-one");
-        assertGated("logs-one");
-        awaitDescriptor("logs-one");
-        awaitDescriptor("logs-two");
-        awaitDescriptor("metrics-one");
+        createGated("serverless_logs-one");
+        createGated("serverless_logs-two");
+        createGated("serverless_metrics-one");
+        assertGated("serverless_logs-one");
+        awaitDescriptor("serverless_logs-one");
+        awaitDescriptor("serverless_logs-two");
+        awaitDescriptor("serverless_metrics-one");
 
         // Retried rather than read once, because what a wildcard can see lags what a point read can. H18
         // reasoned about that as an index's refresh interval; since descriptors became blobs it is the
@@ -424,17 +432,17 @@ public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.Se
         // assert in one read. awaitDescriptor above waits on the point half, and a single read here would
         // be asserting that a listing has already caught up, which nothing promises.
         assertBusy(() -> {
-            SearchResponse search = client().prepareSearch("logs-*").setQuery(QueryBuilders.matchAllQuery()).setSize(0).get();
+            SearchResponse search = client().prepareSearch("serverless_logs-*").setQuery(QueryBuilders.matchAllQuery()).setSize(0).get();
             assertEquals("a wildcard must reach both gated tenants and neither more nor fewer", 2, search.getTotalShards());
         }, 30, TimeUnit.SECONDS);
     }
 
     /** Deletion has to remove the name from the object store's live prefix, not merely from a request's view. */
     public void testDeletionRemovesTheNameFromTheObjectStore() throws Exception {
-        createGated("tenant-doomed");
-        assertGated("tenant-doomed");
+        createGated("serverless_tenant-doomed");
+        assertGated("serverless_tenant-doomed");
 
-        assertTrue(client().admin().indices().prepareDelete("tenant-doomed").get().isAcknowledged());
+        assertTrue(client().admin().indices().prepareDelete("serverless_tenant-doomed").get().isAcknowledged());
 
         org.opensearch.common.blobstore.fs.FsBlobStore store = new org.opensearch.common.blobstore.fs.FsBlobStore(1024, basePath(), false);
         DescriptorEnumerator enumerator = new DescriptorEnumerator(
@@ -444,7 +452,7 @@ public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.Se
 
         assertFalse(
             "a deleted name must leave the live prefix, or a rebuild resurrects it",
-            enumerator.allNames().contains("tenant-doomed")
+            enumerator.allNames().contains("serverless_tenant-doomed")
         );
     }
 

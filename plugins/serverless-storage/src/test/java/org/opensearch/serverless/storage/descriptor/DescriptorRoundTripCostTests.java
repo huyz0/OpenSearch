@@ -199,7 +199,7 @@ public class DescriptorRoundTripCostTests extends OpenSearchTestCase {
     /** T22's claim, checked through the descriptor layer rather than at the container. */
     public void testCreatingAnIndexCostsOneRequest() {
         counting.reset();
-        assertTrue(backend.create(descriptor("tenant-a")));
+        assertTrue(backend.create(descriptor("serverless_tenant-a")));
 
         assertEquals("creation must not read before it writes", 0, counting.readRegister.get());
         assertEquals(1, counting.createIfAbsent.get());
@@ -208,10 +208,10 @@ public class DescriptorRoundTripCostTests extends OpenSearchTestCase {
 
     /** A live descriptor is one read, which is the common path and the one that must stay cheapest. */
     public void testReadingALiveDescriptorCostsOneRequest() {
-        backend.create(descriptor("tenant-a"));
+        backend.create(descriptor("serverless_tenant-a"));
         counting.reset();
 
-        assertNotNull(backend.get("tenant-a"));
+        assertNotNull(backend.get("serverless_tenant-a"));
         assertEquals(1, counting.requests());
     }
 
@@ -225,18 +225,18 @@ public class DescriptorRoundTripCostTests extends OpenSearchTestCase {
         assertNull(backend.get("never-created"));
         assertEquals("a miss checks descriptors then tombstones", 2, counting.requests());
 
-        backend.create(descriptor("tenant-a"));
-        backend.putTombstoneAsync(backend.get("tenant-a").tombstoned());
+        backend.create(descriptor("serverless_tenant-a"));
+        backend.putTombstoneAsync(backend.get("serverless_tenant-a").tombstoned());
         counting.reset();
 
-        assertFalse(backend.get("tenant-a").exists());
+        assertFalse(backend.get("serverless_tenant-a").exists());
         assertEquals("and a deleted name pays the same two", 2, counting.requests());
     }
 
     /** Deletion is a tombstone CAS plus removing the live object. */
     public void testDeletingAnIndexCostsFourRequests() {
-        backend.create(descriptor("tenant-a"));
-        IndexDescriptor tombstone = backend.get("tenant-a").tombstoned();
+        backend.create(descriptor("serverless_tenant-a"));
+        IndexDescriptor tombstone = backend.get("serverless_tenant-a").tombstoned();
         counting.reset();
 
         backend.putTombstoneAsync(tombstone);

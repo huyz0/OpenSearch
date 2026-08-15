@@ -133,13 +133,13 @@ public class ServerlessStorageReaderShardPreWarmIT extends org.opensearch.server
             .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
             .put("index.serverless_storage.enabled", true)
             .build();
-        client().admin().indices().create(new CreateIndexRequest("gated-prewarm-target").settings(gated)).actionGet();
+        client().admin().indices().create(new CreateIndexRequest("serverless_gated-prewarm-target").settings(gated)).actionGet();
         // Creating a gated index touches no node at all -- the descriptor is written and nothing is
         // told to build anything, which is the whole point of gating (see GatedResidencySoakIT's own
         // comment on this exact line). The write is what actually opens the shard on a node (T39),
         // which is what makes it appear in that node's own on-demand-open working set -- the thing
         // this fix's gated pass now consults instead of cluster state.
-        client().prepareIndex("gated-prewarm-target").setId("1").setSource("f", "v").get();
+        client().prepareIndex("serverless_gated-prewarm-target").setId("1").setSource("f", "v").get();
 
         // Let the three-node epoch settle for real before adding the fourth, same reasoning as the
         // ordinary-index test above.

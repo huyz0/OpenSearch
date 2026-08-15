@@ -90,7 +90,7 @@ public class GatedSettingsLookupIT extends org.opensearch.serverless.storage.Ser
         client().admin()
             .indices()
             .create(
-                new CreateIndexRequest("gated-settings").settings(
+                new CreateIndexRequest("serverless_gated-settings").settings(
                     Settings.builder()
                         .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 3)
                         .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
@@ -100,14 +100,14 @@ public class GatedSettingsLookupIT extends org.opensearch.serverless.storage.Ser
             )
             .actionGet();
 
-        var response = client().admin().indices().prepareGetSettings("gated-settings").get();
+        var response = client().admin().indices().prepareGetSettings("serverless_gated-settings").get();
 
         assertFalse(
             "a gated index asked for its settings by name must appear in the response; an empty map here is "
                 + "the silent drop that made the population soak report 0 of 50,000 resolved with 0 failures",
             response.getIndexToSettings().isEmpty()
         );
-        Settings settings = response.getIndexToSettings().get("gated-settings");
+        Settings settings = response.getIndexToSettings().get("serverless_gated-settings");
         assertNotNull("the index asked for must be the one that came back", settings);
         assertEquals(
             "and its settings must be its own, not an empty placeholder that merely proves the name existed",
@@ -136,7 +136,7 @@ public class GatedSettingsLookupIT extends org.opensearch.serverless.storage.Ser
         client().admin()
             .indices()
             .create(
-                new CreateIndexRequest("gated-getindex").settings(
+                new CreateIndexRequest("serverless_gated-getindex").settings(
                     Settings.builder()
                         .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 2)
                         .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
@@ -146,9 +146,9 @@ public class GatedSettingsLookupIT extends org.opensearch.serverless.storage.Ser
             )
             .actionGet();
 
-        var response = client().admin().indices().prepareGetIndex().setIndices("gated-getindex").get();
+        var response = client().admin().indices().prepareGetIndex().setIndices("serverless_gated-getindex").get();
 
-        Settings settings = response.getSettings().get("gated-getindex");
+        Settings settings = response.getSettings().get("serverless_gated-getindex");
         assertNotNull("GET /index on a gated index must return its settings rather than throwing", settings);
         assertEquals("2", settings.get(IndexMetadata.SETTING_NUMBER_OF_SHARDS));
     }

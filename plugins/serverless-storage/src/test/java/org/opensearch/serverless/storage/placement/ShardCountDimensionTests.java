@@ -74,7 +74,7 @@ public class ShardCountDimensionTests extends OpenSearchTestCase {
     public void testEveryShardOfAHundredIsPlaced() {
         List<String> eligible = nodes(12);
 
-        IndexRoutingTable table = ComputedRoutingTable.build(index("tenant-wide", MAX_SHARDS), eligible, CANDIDATES);
+        IndexRoutingTable table = ComputedRoutingTable.build(index("serverless_tenant-wide", MAX_SHARDS), eligible, CANDIDATES);
 
         assertEquals("one routing entry per shard", MAX_SHARDS, table.shards().size());
         Set<Integer> seen = new HashSet<>();
@@ -96,7 +96,7 @@ public class ShardCountDimensionTests extends OpenSearchTestCase {
      */
     public void testPlacingAHundredShardsIsDeterministic() {
         List<String> eligible = nodes(12);
-        IndexMetadata metadata = index("tenant-wide", MAX_SHARDS);
+        IndexMetadata metadata = index("serverless_tenant-wide", MAX_SHARDS);
 
         IndexRoutingTable first = ComputedRoutingTable.build(metadata, eligible, CANDIDATES);
         IndexRoutingTable second = ComputedRoutingTable.build(metadata, eligible, CANDIDATES);
@@ -121,7 +121,7 @@ public class ShardCountDimensionTests extends OpenSearchTestCase {
     public void testAHundredShardsDoNotAllLandOnOneNode() {
         List<String> eligible = nodes(10);
 
-        IndexRoutingTable table = ComputedRoutingTable.build(index("tenant-wide", MAX_SHARDS), eligible, CANDIDATES);
+        IndexRoutingTable table = ComputedRoutingTable.build(index("serverless_tenant-wide", MAX_SHARDS), eligible, CANDIDATES);
 
         Map<String, Integer> perNode = new HashMap<>();
         for (IndexShardRoutingTable shard : table) {
@@ -148,8 +148,8 @@ public class ShardCountDimensionTests extends OpenSearchTestCase {
      * computed.
      */
     public void testTheStoredRecordDoesNotGrowWithShardCount() throws java.io.IOException {
-        int oneShard = serialisedSize(index("tenant-narrow", 1));
-        int hundredShards = serialisedSize(index("tenant-narrow", MAX_SHARDS));
+        int oneShard = serialisedSize(index("serverless_tenant-narrow", 1));
+        int hundredShards = serialisedSize(index("serverless_tenant-narrow", MAX_SHARDS));
 
         assertEquals(
             "a hundred shards must cost the same stored bytes as one, or per-index cost is really per-shard " + "cost wearing a disguise",

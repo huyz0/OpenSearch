@@ -47,7 +47,6 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.ClusterStateUpdateTask;
 import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.block.ClusterBlocks;
-import org.opensearch.cluster.metadata.DescriptorOnlyCreation;
 import org.opensearch.cluster.metadata.IndexAbstraction;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
@@ -203,29 +202,17 @@ public class TransportRolloverAction extends TransportClusterManagerNodeAction<R
                         rolloverRequest.getCreateIndexRequest(),
                         null
                     );
-                    if (DescriptorOnlyCreation.mayBypassClusterState(
-                        createIndexService.settingsForAdmission(createIndexClusterStateRequest)
-                    )) {
-                        threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
-                            try {
-                                MetadataRolloverService.RolloverResult rolloverResult = rolloverService.rolloverClusterState(
-                                    clusterService.state(),
-                                    rolloverRequest.getRolloverTarget(),
-                                    rolloverRequest.getNewIndexName(),
-                                    rolloverRequest.getCreateIndexRequest(),
-                                    metConditions,
-                                    false,
-                                    false
-                                );
-                                listener.onResponse(
-                                    new RolloverResponse(sourceIndexName, rolloverIndexName, conditionResults, false, true, true, true)
-                                );
-                            } catch (Exception e) {
-                                listener.onFailure(e);
-                            }
-                        });
-                        return;
-                    }
+                    // A gated rollover target used to be computed off the state update thread here, on the
+                    // grounds that a gated creation has no cluster state to publish. The serverless namespace
+                    // ended that: a rollover target needs the alias it is rolled over by, and an index in the
+                    // namespace may not carry one, so no rollover target can be gated. B2, answered.
+                    //
+                    // Worth stating what went with it, because it was not only dead. The condition read the
+                    // gating *setting*, which an index can carry without being gated -- a data stream backing
+                    // index, or any alias-bearing index using serverless storage. For those this branch ran
+                    // the rollover, discarded the cluster state it computed, and answered acknowledged: a
+                    // rollover that silently did nothing. Nothing measured it, because the tests that
+                    // exercised this path used indices that really were gated.
                     clusterService.submitStateUpdateTask(
                         "rollover_index source [" + sourceIndexName + "] to target [" + rolloverIndexName + "]",
                         new ClusterStateUpdateTask() {

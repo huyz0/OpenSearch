@@ -82,7 +82,7 @@ public class ServerlessStorageGatedIndexSnapshotIT extends org.opensearch.server
             .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
             .put("index.serverless_storage.enabled", true)
             .build();
-        client().admin().indices().prepareCreate("gated-snapshot-target").setSettings(gated).get();
+        client().admin().indices().prepareCreate("serverless_gated-snapshot-target").setSettings(gated).get();
         // Prove the index is genuinely alive and serving writes before asserting the snapshot refusal --
         // the whole point is that this is not a dead or nonexistent index the old message would have been
         // an honest description of. assertBusy because a gated creation acknowledges before every node has
@@ -92,7 +92,7 @@ public class ServerlessStorageGatedIndexSnapshotIT extends org.opensearch.server
         // (HANDOFF.md's own documented trap: a retry that compiles is not a retry that runs).
         assertBusy(() -> {
             try {
-                client().prepareIndex("gated-snapshot-target").setId("1").setSource("f", "v").get();
+                client().prepareIndex("serverless_gated-snapshot-target").setId("1").setSource("f", "v").get();
             } catch (Exception e) {
                 throw new AssertionError("write not yet servable: " + e.getMessage(), e);
             }
@@ -103,7 +103,7 @@ public class ServerlessStorageGatedIndexSnapshotIT extends org.opensearch.server
             () -> client().admin()
                 .cluster()
                 .prepareCreateSnapshot("gated-snapshot-repo", "gated-snapshot")
-                .setIndices("gated-snapshot-target")
+                .setIndices("serverless_gated-snapshot-target")
                 .setWaitForCompletion(true)
                 .get()
         );

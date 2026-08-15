@@ -97,7 +97,7 @@ public class GatedMultiIndexRequestIT extends org.opensearch.serverless.storage.
 
         List<String> names = new ArrayList<>();
         for (int i = 0; i < TENANTS; i++) {
-            String name = "multi-tenant-" + i;
+            String name = "serverless_multi-tenant-" + i;
             assertTrue(client().admin().indices().create(new CreateIndexRequest(name).settings(gated())).actionGet().isAcknowledged());
             client().prepareIndex(name).setId("0").setSource("tenant", name).get();
             names.add(name);
@@ -129,7 +129,13 @@ public class GatedMultiIndexRequestIT extends org.opensearch.serverless.storage.
     public void testAMixOfGatedAndOrdinaryIndicesIsReached() throws Exception {
         installBlobBackedDescriptorPlane();
 
-        assertTrue(client().admin().indices().create(new CreateIndexRequest("mixed-gated").settings(gated())).actionGet().isAcknowledged());
+        assertTrue(
+            client().admin()
+                .indices()
+                .create(new CreateIndexRequest("serverless_mixed-gated").settings(gated()))
+                .actionGet()
+                .isAcknowledged()
+        );
         assertTrue(
             client().admin()
                 .indices()
@@ -145,11 +151,11 @@ public class GatedMultiIndexRequestIT extends org.opensearch.serverless.storage.
                 .isAcknowledged()
         );
 
-        client().prepareIndex("mixed-gated").setId("0").setSource("which", "gated").get();
+        client().prepareIndex("serverless_mixed-gated").setId("0").setSource("which", "gated").get();
         client().prepareIndex("mixed-ordinary").setId("0").setSource("which", "ordinary").get();
-        client().admin().indices().prepareRefresh("mixed-gated", "mixed-ordinary").get();
+        client().admin().indices().prepareRefresh("serverless_mixed-gated", "mixed-ordinary").get();
 
-        SearchResponse response = client().prepareSearch("mixed-gated", "mixed-ordinary")
+        SearchResponse response = client().prepareSearch("serverless_mixed-gated", "mixed-ordinary")
             .setQuery(QueryBuilders.matchAllQuery())
             .setSize(0)
             .get();
@@ -175,14 +181,21 @@ public class GatedMultiIndexRequestIT extends org.opensearch.serverless.storage.
         installBlobBackedDescriptorPlane();
 
         assertTrue(
-            client().admin().indices().create(new CreateIndexRequest("present-gated").settings(gated())).actionGet().isAcknowledged()
+            client().admin()
+                .indices()
+                .create(new CreateIndexRequest("serverless_present-gated").settings(gated()))
+                .actionGet()
+                .isAcknowledged()
         );
-        client().prepareIndex("present-gated").setId("0").setSource("which", "gated").get();
-        client().admin().indices().prepareRefresh("present-gated").get();
+        client().prepareIndex("serverless_present-gated").setId("0").setSource("which", "gated").get();
+        client().admin().indices().prepareRefresh("serverless_present-gated").get();
 
         expectThrows(
             Exception.class,
-            () -> client().prepareSearch("present-gated", "absent-tenant").setQuery(QueryBuilders.matchAllQuery()).setSize(0).get()
+            () -> client().prepareSearch("serverless_present-gated", "absent-tenant")
+                .setQuery(QueryBuilders.matchAllQuery())
+                .setSize(0)
+                .get()
         );
     }
 

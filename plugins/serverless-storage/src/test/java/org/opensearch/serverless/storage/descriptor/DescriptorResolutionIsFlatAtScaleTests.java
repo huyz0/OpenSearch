@@ -99,7 +99,7 @@ public class DescriptorResolutionIsFlatAtScaleTests extends OpenSearchTestCase {
     }
 
     private static String tenant(int i) {
-        return String.format(Locale.ROOT, "tenant-%08d", i);
+        return String.format(Locale.ROOT, "serverless_tenant-%08d", i);
     }
 
     /**
@@ -140,7 +140,7 @@ public class DescriptorResolutionIsFlatAtScaleTests extends OpenSearchTestCase {
         BlobDescriptorBackend coldReader = new BlobDescriptorBackend(container);
         long before = counter.getCount();
         long listsBefore = counter.listCount();
-        assertNull(coldReader.get("tenant-absent"));
+        assertNull(coldReader.get("serverless_tenant-absent"));
         assertEquals("confirming absence must not enumerate the tombstone space either", 0, counter.listCount() - listsBefore);
         return counter.getCount() - before;
     }
@@ -208,7 +208,7 @@ public class DescriptorResolutionIsFlatAtScaleTests extends OpenSearchTestCase {
 
         long before = counter.getCount();
         long listsBefore = counter.listCount();
-        assertTrue(backend.create(descriptor("tenant-brand-new")));
+        assertTrue(backend.create(descriptor("serverless_tenant-brand-new")));
         assertEquals("taking a name must not enumerate the names already taken", 0, counter.listCount() - listsBefore);
         return counter.getCount() - before;
     }

@@ -61,10 +61,10 @@ public class TombstoneListabilityTests extends OpenSearchTestCase {
         BlobContainer container = new FsBlobStore(1024, createTempDir(), false).blobContainer(BlobPath.cleanPath());
         BlobDescriptorBackend backend = new BlobDescriptorBackend(container);
 
-        backend.create(descriptor("tenant-doomed"));
-        backend.putTombstoneAsync(descriptor("tenant-doomed").tombstoned(1_000L));
+        backend.create(descriptor("serverless_tenant-doomed"));
+        backend.putTombstoneAsync(descriptor("serverless_tenant-doomed").tombstoned(1_000L));
 
-        IndexDescriptor byName = backend.get("tenant-doomed");
+        IndexDescriptor byName = backend.get("serverless_tenant-doomed");
         assertNotNull("the tombstone has to exist for this test to be about listing", byName);
         assertFalse(byName.exists());
 
@@ -88,7 +88,7 @@ public class TombstoneListabilityTests extends OpenSearchTestCase {
         FsBlobStore store = new FsBlobStore(1024, createTempDir(), false);
         BlobDescriptorChangeLog log = new BlobDescriptorChangeLog(store::blobContainer, BlobPath.cleanPath());
 
-        log.append(new DescriptorChange("tenant-a", "tenant-a-uuid", DescriptorChange.Kind.UPDATED, 0L));
+        log.append(new DescriptorChange("serverless_tenant-a", "serverless_tenant-a-uuid", DescriptorChange.Kind.UPDATED, 0L));
 
         assertEquals("nesting through BlobPath is what makes a keyspace walkable on every store", 1, log.since(null).size());
     }

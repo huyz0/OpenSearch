@@ -69,8 +69,6 @@ import org.opensearch.common.Nullable;
 import org.opensearch.common.Priority;
 import org.opensearch.common.UUIDs;
 import org.opensearch.common.ValidationException;
-import org.opensearch.common.cache.Cache;
-import org.opensearch.common.cache.CacheBuilder;
 import org.opensearch.common.compress.CompressedXContent;
 import org.opensearch.common.io.PathUtils;
 import org.opensearch.common.logging.DeprecationLogger;
@@ -202,7 +200,6 @@ public class MetadataCreateIndexService {
     private final List<IndexCreationValidator> indexCreationValidators = new ArrayList<>();
     private final ClusterManagerTaskThrottler.ThrottlingKey createIndexTaskKey;
     private AwarenessReplicaBalance awarenessReplicaBalance;
-    private final Cache<String, Settings> admissionTemplateCache = CacheBuilder.<String, Settings>builder().setMaximumWeight(500).build();
 
     @Nullable
     private final RemoteStoreCustomMetadataResolver remoteStoreCustomMetadataResolver;
@@ -371,11 +368,9 @@ public class MetadataCreateIndexService {
         final CreateIndexClusterStateUpdateRequest request,
         final ActionListener<CreateIndexClusterStateUpdateResponse> listener
     ) {
-        // The road, chosen before any of the work that would tell us which road we needed. See
-        // DescriptorOnlyCreation#mayBypassClusterState for why the decision has to be made from the request's
-        // own settings rather than from the finished metadata, and why being wrong in either direction is
-        // safe. Unregistered answers false, so an ordinary cluster never reaches the branch below.
-        if (DescriptorOnlyCreation.hasAdmissionCheck() && DescriptorOnlyCreation.namesAServerlessIndex(request.index())) {
+        // The road, chosen from the name before any of the work that would once have been needed to choose
+        // it. Unregistered answers false, so an ordinary cluster never reaches the branch below.
+        if (DescriptorOnlyCreation.isRegistered() && DescriptorOnlyCreation.namesAServerlessIndex(request.index())) {
             // Exact rather than admitted-on-a-guess: the name says which plane this belongs in, so there is
             // no road to fall back from and no template to resolve first.
             createGatedIndex(request, listener);
@@ -405,183 +400,35 @@ public class MetadataCreateIndexService {
     }
 
     /**
-     * The settings the admission decision is made from: the request's own, with matching templates merged
-     * underneath them.
-     *
-     * <p>T49. It used to be the request's settings alone, and that missed the case where a template is what
-     * makes an index gated. Such a request said nothing about gating, was sent down the ordinary road, and
-     * met the gate at the bottom on the state update thread -- where being gated means a blocking write of
-     * the declared mapping to the mapping store, from the one thread that must not block, and where that
-     * write can submit a cluster state update of its own and wait for the thread it is occupying.
-     *
-     * <p>Resolving templates here rather than in the plugin's predicate is deliberate. It means admission
-     * and the gate at the bottom are looking at the same settings rather than at two computations of the
-     * same idea, and two such computations drift. The cost is a metadata lookup, not the throwaway index
-     * service construction that admission exists to avoid, and it is paid only where something is asking.
-     *
-     * <p>Request settings win over template settings, which is the precedence creation itself applies.
-     *
-     * <h4>T52. Three places this used to disagree with {@link #applyCreateIndexRequest}</h4>
-     *
-     * <p>{@code applyCreateIndexRequest} does not always resolve a template at all, and when it does, not
-     * always against {@link CreateIndexClusterStateUpdateRequest#index()}. This mirrors its precedence
-     * exactly, in the same order it checks them, so the two can only drift by someone editing one and not
-     * the other:
-     * <ul>
-     * <li>a resize target ({@link CreateIndexClusterStateUpdateRequest#recoverFrom()} set) is created from
-     * source metadata via {@code applyCreateIndexRequestWithExistingMetadata}; no template is resolved at
-     * all, because "templates don't apply" to a recovery, per the comment on that branch.</li>
-     * <li>a data stream's backing index is matched against {@link CreateIndexClusterStateUpdateRequest
-     * #dataStreamName()}, not the backing index's own name, because "the backing index may have a
-     * different name or prefix than the data stream name."</li>
-     * <li>a system index (by that same name) skips templates entirely, via {@code
-     * applyCreateIndexRequestWithNoTemplates}.</li>
-     * </ul>
-     * <p>Before this, admission resolved templates against {@code request.index()} unconditionally, for
-     * every request including these three. A resize target or a system index whose name happened to match
-     * a gated template's pattern was over-admitted: sent down the off-thread road, which builds and
-     * discards a descriptor, only to be refused by {@code DescriptorOnlyCreation#skipsClusterState} once it
-     * reaches {@code clusterStateCreateIndex} -- because creation itself, correctly, never resolved that
-     * template -- and fall back to the ordinary road it should have taken directly, paying the whole
-     * creation twice.
-     */
-    // Package-private rather than private so AdmissionTemplateResolutionTests (T52) can drive it directly,
-    // the same accommodation clusterStateCreateIndex and friends already get for the same reason.
-    /**
      * Whether this request will certainly be gated, and can therefore be executed on whatever node received
      * it rather than on the elected cluster manager.
      *
-     * <h4>Why "certainly" and not "probably"</h4>
+     * <h4>What this used to have to do, and why it no longer does</h4>
      *
-     * Admission is deliberately allowed to be wrong: {@link #createGatedIndex} discovers that the real gate
-     * declined by finding no descriptor write handed over, and falls back to {@link #onlyCreateIndex},
-     * which submits a cluster state update task. That fallback works on the cluster manager and nowhere
-     * else -- a task submitted on any other node runs its executor and then fails to publish. So a request
-     * routed away from the cluster manager on a maybe is a request whose failure mode is "the fallback
-     * cannot run", and the answer to that is not to make the fallback cleverer but to route only what
-     * cannot need it.
+     * Gating followed the settings, so this could not know the answer. It resolved the request's templates to
+     * find out whether the gating setting would be contributed, resolved them a second time to find out
+     * whether a template's aliases would make the finished index unrepresentable, and still only reached
+     * <em>probably</em>: the real gate ran later, on finished metadata, and could decline. Declining meant
+     * falling back to a cluster state update task, which only the cluster manager can publish, so a request
+     * routed away on a maybe was a request whose failure mode was "the fallback cannot run". Hence the list
+     * of conditions that each answered "not certain" rather than "not gated".
      *
-     * <p>Everything below is a condition under which the gate declines an admitted request. They are the
-     * same conditions the creation path itself already knows about, read from the request and the local
-     * cluster state, and each one answers "not certain" rather than "not gated" -- an index with an alias
-     * may well end up gated on the cluster manager, and this simply declines to decide that from here.
+     * <p>The namespace removes the question. A name in it is gated or the creation fails -- {@code
+     * clusterStateCreateIndex} refuses it a cluster state entry, so there is no ordinary road to fall back
+     * onto and nothing that needs the cluster manager. The conditions that used to decline here are refused
+     * outright by {@link #validateServerlessNamespace}, and they are refused identically on every node,
+     * because the check reads the request rather than the cluster.
      *
-     * <h4>What this does to the same-name race, stated rather than discovered</h4>
+     * <h4>The same-name race, which the namespace also settles</h4>
      *
-     * A gated creation checks the name against the cluster state snapshot it can see. On the cluster
-     * manager that snapshot is as fresh as anything gets; on another node it can be one publication behind,
-     * so the window in which an ordinary index of the same name is created and not yet visible here grows
-     * from thread-scheduling lag to publication lag. The race is not new: gated creation has run off the
-     * cluster state thread since T49, so the manager never serialised against its own publications either.
-     *
-     * <p><b>The reverse direction is not closed, and this change neither opens nor widens it.</b> An
-     * earlier version of this paragraph claimed an ordinary creation consults the descriptor store. It does
-     * not -- {@link #validate} checks the routing table, the metadata and the aliases, all of which are
-     * cluster state -- so an ordinary index can take a name a live descriptor already holds, sequentially,
-     * with no concurrency involved at all. {@code GatedAndOrdinaryNameCollisionIT} demonstrates that and
-     * carries what a fix would cost: the check cannot live where the validation is, because that runs on
-     * the cluster state thread, where a blocking descriptor read is the deadlock W4 already paid for.
+     * A gated creation off the cluster manager sees a cluster state snapshot that can be a publication
+     * behind, which used to widen the window for an ordinary index of the same name. There is no such index
+     * now: no cluster state entry may bear a name in this namespace, so the only competitor for the name is
+     * another gated creation, and those are resolved by the descriptor store's register compare-and-swap
+     * rather than by whichever snapshot either node happened to hold.
      */
     public boolean certainlyGated(final CreateIndexClusterStateUpdateRequest request, final ClusterState state) {
-        if (DescriptorOnlyCreation.hasAdmissionCheck() == false || DescriptorOnlyCreation.namesAServerlessIndex(request.index()) == false) {
-            return false;
-        }
-        if (request.aliases().isEmpty() == false || request.context() != null || request.dataStreamName() != null) {
-            // Each of these is a reason DescriptorRepresentable refuses an index, or a reason the finished
-            // metadata is not yet knowable from the request.
-            return false;
-        }
-        if (request.recoverFrom() != null) {
-            return false;
-        }
-        final Metadata metadata = state.metadata();
-        if (DescriptorOnlyCreation.mayBypassClusterState(settingsForAdmission(request, metadata)) == false) {
-            return false;
-        }
-        // A template's aliases are the gate's most common reason to decline something admission accepted,
-        // and they are not in the request. Resolved the same way settingsForAdmission resolves a template's
-        // settings, so the two answers cannot come from different templates.
-        try {
-            final String name = request.index();
-            final Boolean hidden = IndexMetadata.INDEX_HIDDEN_SETTING.exists(request.settings())
-                ? IndexMetadata.INDEX_HIDDEN_SETTING.get(request.settings())
-                : null;
-            final String v2Template = MetadataIndexTemplateService.findV2Template(metadata, name, hidden == null ? false : hidden);
-            if (v2Template != null) {
-                return MetadataIndexTemplateService.resolveAliases(metadata, v2Template).isEmpty();
-            }
-            for (Map<String, AliasMetadata> fromOneTemplate : MetadataIndexTemplateService.resolveAliases(
-                MetadataIndexTemplateService.findV1Templates(metadata, name, hidden)
-            )) {
-                if (fromOneTemplate.isEmpty() == false) {
-                    return false;
-                }
-            }
-            return true;
-        } catch (Exception e) {
-            // The road that has always worked, for the same reason settingsForAdmission falls back that way.
-            logger.debug("[{}] could not decide locally whether the creation is gated: {}", request.index(), e);
-            return false;
-        }
-    }
-
-    public Settings settingsForAdmission(final CreateIndexClusterStateUpdateRequest request) {
-        return settingsForAdmission(request, clusterService.state().metadata());
-    }
-
-    public Settings settingsForAdmission(final CreateIndexClusterStateUpdateRequest request, final Metadata metadata) {
-        if (DescriptorOnlyCreation.hasAdmissionCheck() == false) {
-            return request.settings();
-        }
-        if (request.recoverFrom() != null) {
-            // Mirrors applyCreateIndexRequest: a resize target is built from source metadata, and no
-            // template is resolved for it at all.
-            return request.settings();
-        }
-        try {
-            final Metadata currentMetadata = metadata != null ? metadata : clusterService.state().metadata();
-            // The backing index may have a different name or prefix than the data stream name -- the same
-            // substitution applyCreateIndexRequest makes before resolving anything.
-            final String name = request.dataStreamName() != null ? request.dataStreamName() : request.index();
-            if (systemIndices.isSystemIndex(name)) {
-                // Mirrors applyCreateIndexRequestWithNoTemplates: no template applies to a system index.
-                return request.settings();
-            }
-            final Boolean hidden = IndexMetadata.INDEX_HIDDEN_SETTING.exists(request.settings())
-                ? IndexMetadata.INDEX_HIDDEN_SETTING.get(request.settings())
-                : null;
-            final String cacheKey = currentMetadata.version() + ":" + name + ":" + (hidden == null ? false : hidden);
-            Settings fromTemplates = admissionTemplateCache.get(cacheKey);
-            if (fromTemplates == null) {
-                final String v2Template = MetadataIndexTemplateService.findV2Template(
-                    currentMetadata,
-                    name,
-                    hidden == null ? false : hidden
-                );
-                fromTemplates = v2Template != null
-                    ? MetadataIndexTemplateService.resolveSettings(currentMetadata, v2Template)
-                    : MetadataIndexTemplateService.resolveSettings(
-                        MetadataIndexTemplateService.findV1Templates(currentMetadata, request.index(), hidden)
-                    );
-                admissionTemplateCache.put(cacheKey, fromTemplates);
-            }
-            // Normalised, because normalizeRequestSetting runs after this decision and the predicate looks
-            // for the prefixed key. Without this, a request writing "serverless_storage.enabled" beside
-            // "number_of_shards" -- the ordinary REST form -- is not admitted, is gated at the bottom
-            // anyway, and now meets the refusal there. Under-admission used to cost speed; it costs the
-            // request now, which raises the price of every remaining source of it.
-            return Settings.builder()
-                .put(fromTemplates)
-                .put(request.settings())
-                .normalizePrefix(IndexMetadata.INDEX_SETTING_PREFIX)
-                .build();
-        } catch (Exception e) {
-            // The road that has always worked, for the same reason the predicate itself falls back that way.
-            // A template that cannot be resolved here will be resolved again by creation proper, which is
-            // where its failure belongs.
-            logger.debug(() -> new ParameterizedMessage("could not resolve templates for [{}] before admission", request.index()), e);
-            return request.settings();
-        }
+        return DescriptorOnlyCreation.isRegistered() && DescriptorOnlyCreation.namesAServerlessIndex(request.index());
     }
 
     /**
@@ -656,29 +503,21 @@ public class MetadataCreateIndexService {
 
                 final java.util.concurrent.CompletableFuture<Boolean> write = request.descriptorWrite();
                 if (write == null) {
-                    // Admitted as gated, decided otherwise by the gate that actually decides. Nothing has
-                    // been written anywhere -- clusterStateCreateIndex only hands over a descriptor write for
-                    // an index it gated -- so the ordinary path can start from the beginning.
-                    logger.debug(
-                        "index [{}] was admitted off the cluster state thread but needs a cluster state entry; "
-                            + "retrying it on the ordinary path",
-                        request.index()
+                    // Unreachable by construction, and kept because "unreachable by construction" is a claim
+                    // this branch has had to withdraw before. applyCreateIndexRequest above either gated the
+                    // index -- which is what hands a descriptor write over -- or refused it a cluster state
+                    // entry and threw, which the catch has already turned into a failure. Reaching here means
+                    // one of those two stopped being true, and the request must fail rather than take a road
+                    // that would claim this name in the other plane.
+                    listener.onFailure(
+                        new IllegalStateException(
+                            "index ["
+                                + request.index()
+                                + "] is in the serverless namespace and was neither gated nor refused, which "
+                                + "should not be possible; creating it anywhere now would claim the name in "
+                                + "both planes"
+                        )
                     );
-                    onlyCreateIndex(request, ActionListener.wrap(response -> {
-                        if (response.isAcknowledged()) {
-                            activeShardsObserver.waitForActiveShards(
-                                new String[] { request.index() },
-                                request.waitForActiveShards(),
-                                request.ackTimeout(),
-                                shardsAcknowledged -> listener.onResponse(
-                                    new CreateIndexClusterStateUpdateResponse(true, shardsAcknowledged)
-                                ),
-                                listener::onFailure
-                            );
-                        } else {
-                            listener.onResponse(new CreateIndexClusterStateUpdateResponse(false, false));
-                        }
-                    }, listener::onFailure));
                     return;
                 }
 
@@ -1168,12 +1007,13 @@ public class MetadataCreateIndexService {
         final List<String> templatesApplied,
         final List<Map<String, AliasMetadata>> templateAliases
     ) {
-        // The same question admission asked, asked the same way. It read the request's own settings until
-        // T49, which meant a template-gated creation was admitted off-thread and then denied the fast path
-        // here, paying for the throwaway IndexService that admission exists to avoid. Three readers of one
-        // idea is two too many; this is the second, and it now shares the first's computation.
-        if (DescriptorOnlyCreation.mayBypassClusterState(settingsForAdmission(request)) == false) {
-            return "the index was not admitted as gated";
+        // The same question the road above asked, asked the same way, and since the namespace it is a
+        // string comparison rather than a template resolution. It used to read the request's own settings,
+        // which missed a template-gated creation and made it pay for the throwaway IndexService this exists
+        // to avoid; then it read template-merged settings, which cost a resolution here and another there.
+        // A name costs neither and cannot disagree with the gate, because the gate reads the same name.
+        if (DescriptorOnlyCreation.isRegistered() == false || DescriptorOnlyCreation.namesAServerlessIndex(request.index()) == false) {
+            return "the index is not in the serverless namespace";
         }
         if (sourceMetadata != null) {
             return "it is being built from an existing index";
@@ -2573,13 +2413,42 @@ public class MetadataCreateIndexService {
             return currentState;
         }
 
+        String indexName = indexMetadata.getIndex().getName();
+
+        // The other half of closing the two-plane name collision, and the half that has to live here.
+        //
+        // DescriptorGate#gatable refuses to gate a name outside the serverless namespace, so no name out
+        // there can be held by a descriptor alone. This refuses a name inside it a cluster state entry, so
+        // no name in here can be held by cluster state. Each name has exactly one authority. Neither
+        // authority has to consult the other -- which is what made the collision unfixable where it was
+        // found, because the consulting would have to be a blocking descriptor read on this very thread, the
+        // deadlock W4 paid for. A string comparison is total, needs no store, and is safe anywhere.
+        //
+        // A refusal rather than the fallback that used to be here. An admitted creation the gate declines
+        // once had an ordinary road to take, and taking it is exactly how an ordinary index came to hold a
+        // name a live descriptor already held. In the namespace there is no such road: an index that cannot
+        // be gated cannot exist under this name, and the caller is told which feature stopped it rather than
+        // being handed a differently-shaped index than it asked for.
+        if (DescriptorOnlyCreation.isRegistered() && DescriptorOnlyCreation.namesAServerlessIndex(indexName)) {
+            String reason = DescriptorRepresentable.whyNotRepresentable(indexMetadata);
+            throw new IllegalArgumentException(
+                "index ["
+                    + indexName
+                    + "] is in the serverless namespace ["
+                    + DescriptorOnlyCreation.SERVERLESS_NAME_PREFIX
+                    + "] and so may not have a cluster state entry, but it could not be gated"
+                    + (reason == null ? "" : ": " + reason)
+                    + ". Create it under a name outside that namespace, or drop what makes it "
+                    + "unrepresentable as a descriptor."
+            );
+        }
+
         Metadata.Builder builder = Metadata.builder(currentState.metadata()).put(indexMetadata, false);
         if (metadataTransformer != null) {
             metadataTransformer.accept(builder, indexMetadata);
         }
         Metadata newMetadata = builder.build();
 
-        String indexName = indexMetadata.getIndex().getName();
         ClusterBlocks.Builder blocks = createClusterBlocksBuilder(currentState, indexName, clusterBlocks);
         blocks.updateBlocks(indexMetadata);
 
@@ -2783,7 +2652,7 @@ public class MetadataCreateIndexService {
      * change than this.
      */
     private void validateServerlessNamespace(CreateIndexClusterStateUpdateRequest request) {
-        if (DescriptorOnlyCreation.hasAdmissionCheck() == false || DescriptorOnlyCreation.namesAServerlessIndex(request.index()) == false) {
+        if (DescriptorOnlyCreation.isRegistered() == false || DescriptorOnlyCreation.namesAServerlessIndex(request.index()) == false) {
             return;
         }
         final String unsupported;

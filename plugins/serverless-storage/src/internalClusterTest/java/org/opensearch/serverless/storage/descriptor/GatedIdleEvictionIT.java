@@ -314,7 +314,7 @@ public class GatedIdleEvictionIT extends org.opensearch.serverless.storage.Serve
 
         int peak = 0;
         for (int i = 0; i < CEILING * 3; i++) {
-            String name = String.format(Locale.ROOT, "ceiling-%04d", i);
+            String name = String.format(Locale.ROOT, "serverless_ceiling-%04d", i);
             client().admin().indices().create(new CreateIndexRequest(name).settings(gated())).actionGet();
             client().prepareIndex(name).setId("1").setSource("tenant", name).get();
             peak = Math.max(peak, gatedOpenCount(indices));
@@ -348,12 +348,12 @@ public class GatedIdleEvictionIT extends org.opensearch.serverless.storage.Serve
     }
 
     private static String tenant(int i) throws Exception {
-        return String.format(Locale.ROOT, "tenant-%04d", i);
+        return String.format(Locale.ROOT, "serverless_tenant-%04d", i);
     }
 
     /** A separate name space, so a plateau run cannot resolve a name an earlier test left behind. */
     private static String plateauTenant(int i) throws Exception {
-        return String.format(Locale.ROOT, "plateau-%04d", i);
+        return String.format(Locale.ROOT, "serverless_plateau-%04d", i);
     }
 
     private static Settings gated() throws Exception {

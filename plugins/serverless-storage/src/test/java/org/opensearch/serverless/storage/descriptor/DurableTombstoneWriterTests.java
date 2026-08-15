@@ -155,7 +155,10 @@ public class DurableTombstoneWriterTests extends OpenSearchTestCase {
         ControllableBackend backend = install();
         AtomicBoolean acknowledged = new AtomicBoolean();
 
-        DurableTombstones.whenDurable(List.of(metadataFor("tenant-a")), ActionListener.wrap(ignored -> acknowledged.set(true), e -> {}));
+        DurableTombstones.whenDurable(
+            List.of(metadataFor("serverless_tenant-a")),
+            ActionListener.wrap(ignored -> acknowledged.set(true), e -> {})
+        );
 
         assertEquals("the writer must have been asked for a tombstone", 1, backend.tombstones.size());
         assertFalse(
@@ -172,14 +175,14 @@ public class DurableTombstoneWriterTests extends OpenSearchTestCase {
     public void testWhatIsWrittenIsATombstoneCarryingTheIdentity() {
         ControllableBackend backend = install();
 
-        DurableTombstones.whenDurable(List.of(metadataFor("tenant-b")), ActionListener.wrap(() -> {}));
+        DurableTombstones.whenDurable(List.of(metadataFor("serverless_tenant-b")), ActionListener.wrap(() -> {}));
 
         IndexDescriptor written = backend.tombstones.get(0);
-        assertEquals("tenant-b", written.name());
+        assertEquals("serverless_tenant-b", written.name());
         assertFalse("a tombstone must not report the index as existing", written.exists());
         // The uuid and shard count survive deliberately: they identify the dangling data to reclaim, so a
         // tombstone carrying only the name would say an index is gone without saying what to delete.
-        assertEquals("tenant-b-uuid", written.uuid());
+        assertEquals("serverless_tenant-b-uuid", written.uuid());
         assertEquals(1, written.shardCount());
     }
 
@@ -192,7 +195,7 @@ public class DurableTombstoneWriterTests extends OpenSearchTestCase {
         AtomicBoolean acknowledged = new AtomicBoolean();
 
         DurableTombstones.whenDurable(
-            List.of(metadataFor("tenant-c"), metadataFor("tenant-d"), metadataFor("tenant-e")),
+            List.of(metadataFor("serverless_tenant-c"), metadataFor("serverless_tenant-d"), metadataFor("serverless_tenant-e")),
             ActionListener.wrap(ignored -> acknowledged.set(true), e -> {})
         );
 
@@ -212,7 +215,7 @@ public class DurableTombstoneWriterTests extends OpenSearchTestCase {
         ControllableBackend backend = install();
         AtomicReference<Exception> failure = new AtomicReference<>();
 
-        DurableTombstones.whenDurable(List.of(metadataFor("tenant-f")), ActionListener.wrap(ignored -> {}, failure::set));
+        DurableTombstones.whenDurable(List.of(metadataFor("serverless_tenant-f")), ActionListener.wrap(ignored -> {}, failure::set));
 
         assertNull(failure.get());
         backend.failAll(new IllegalStateException("the store is unreachable"));

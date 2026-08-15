@@ -57,7 +57,7 @@ public class GatedPlacementOwnershipTests extends OpenSearchTestCase {
     /** The property P6 pinned as broken and P7 closes: a gated index is placed. */
     public void testAGatedIndexIsPlacedFromItsDescriptor() {
         org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.register(
-            name -> "gated-index".equals(name)
+            name -> "serverless_gated-index".equals(name)
                 ? new org.opensearch.cluster.metadata.IndexDescriptor(
                     name,
                     name + "-uuid",
@@ -94,7 +94,7 @@ public class GatedPlacementOwnershipTests extends OpenSearchTestCase {
             )
             .build();
 
-        org.opensearch.cluster.routing.IndexRoutingTable placed = AbsentIndexRoutingSuppliers.resolve(gated, "gated-index");
+        org.opensearch.cluster.routing.IndexRoutingTable placed = AbsentIndexRoutingSuppliers.resolve(gated, "serverless_gated-index");
 
         assertNotNull(
             "a gated index must have somewhere to place its shards. Before P7 this was null: nameable "

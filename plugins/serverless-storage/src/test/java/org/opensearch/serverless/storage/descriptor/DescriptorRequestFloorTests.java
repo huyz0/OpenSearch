@@ -63,7 +63,7 @@ public class DescriptorRequestFloorTests extends OpenSearchTestCase {
     }
 
     private static String tenant(int i) {
-        return String.format(Locale.ROOT, "tenant-%04d", i);
+        return String.format(Locale.ROOT, "serverless_tenant-%04d", i);
     }
 
     /**

@@ -83,18 +83,18 @@ public class DescriptorChangeTailerTests extends OpenSearchTestCase {
         BlobDescriptorBackend readerBackend = backendOver(sharedStore);
         BlobDescriptorBackend writerBackend = backendOver(sharedStore);
 
-        writerBackend.create(descriptor("tenant-x"));
-        assertNotNull("the reader caches it", readerBackend.get("tenant-x"));
+        writerBackend.create(descriptor("serverless_tenant-x"));
+        assertNotNull("the reader caches it", readerBackend.get("serverless_tenant-x"));
 
         // Deleted by the other node, which this node's cache knows nothing about.
-        writerBackend.putTombstoneAsync(descriptor("tenant-x").tombstoned());
+        writerBackend.putTombstoneAsync(descriptor("serverless_tenant-x").tombstoned());
         BlobDescriptorChangeLog writerLog = logOver(sharedLog);
-        writerLog.append(deleted("tenant-x"));
+        writerLog.append(deleted("serverless_tenant-x"));
 
         DescriptorChangeTailer tailer = new DescriptorChangeTailer(logOver(sharedLog), readerBackend);
         tailer.tailOnce();
 
-        IndexDescriptor after = readerBackend.get("tenant-x");
+        IndexDescriptor after = readerBackend.get("serverless_tenant-x");
         assertTrue(
             "after tailing the delete, the cached live descriptor must be gone rather than served until the " + "freshness window expires",
             after == null || after.exists() == false
@@ -120,8 +120,8 @@ public class DescriptorChangeTailerTests extends OpenSearchTestCase {
     public void testAConsumedChangeIsNotDeliveredAgain() throws Exception {
         Path shared = createTempDir();
         BlobDescriptorChangeLog writerLog = logOver(shared);
-        writerLog.append(created("tenant-a"));
-        writerLog.append(created("tenant-b"));
+        writerLog.append(created("serverless_tenant-a"));
+        writerLog.append(created("serverless_tenant-b"));
 
         List<String> invalidated = new ArrayList<>();
         DescriptorChangeTailer tailer = new DescriptorChangeTailer(logOver(shared), new RecordingBackend(invalidated));
@@ -131,14 +131,14 @@ public class DescriptorChangeTailerTests extends OpenSearchTestCase {
         assertEquals(0, tailer.tailOnce());
 
         assertEquals("two changes, two invalidations, three passes", 2, invalidated.size());
-        assertEquals(java.util.Set.of("tenant-a", "tenant-b"), new java.util.HashSet<>(invalidated));
+        assertEquals(java.util.Set.of("serverless_tenant-a", "serverless_tenant-b"), new java.util.HashSet<>(invalidated));
     }
 
     /** A change appended after a pass still arrives, which is what the revisit exists to guarantee. */
     public void testAChangeAppendedAfterAPassIsStillDelivered() throws Exception {
         Path shared = createTempDir();
         BlobDescriptorChangeLog writerLog = logOver(shared);
-        writerLog.append(created("tenant-early"));
+        writerLog.append(created("serverless_tenant-early"));
 
         List<String> invalidated = new ArrayList<>();
         DescriptorChangeTailer tailer = new DescriptorChangeTailer(logOver(shared), new RecordingBackend(invalidated));
@@ -146,10 +146,10 @@ public class DescriptorChangeTailerTests extends OpenSearchTestCase {
 
         // Same bucket, after the cursor already pointed at it. Skipping consumed keys must not turn into
         // skipping the whole bucket, which is the way this fix could have broken the thing it optimises.
-        writerLog.append(created("tenant-late"));
+        writerLog.append(created("serverless_tenant-late"));
         assertEquals("an entry added to the revisited bucket must still arrive", 1, tailer.tailOnce());
 
-        assertEquals(List.of("tenant-early", "tenant-late"), invalidated);
+        assertEquals(List.of("serverless_tenant-early", "serverless_tenant-late"), invalidated);
     }
 
     /**
@@ -171,8 +171,8 @@ public class DescriptorChangeTailerTests extends OpenSearchTestCase {
         // cannot be told apart inside one bucket and reading them is the safe direction.
         final long[] now = { java.util.concurrent.TimeUnit.HOURS.toMillis(1000) };
         BlobDescriptorChangeLog writerLog = new BlobDescriptorChangeLog(store::blobContainer, BlobPath.cleanPath(), () -> now[0]);
-        writerLog.append(created("tenant-ancient"));
-        writerLog.append(created("tenant-older-still"));
+        writerLog.append(created("serverless_tenant-ancient"));
+        writerLog.append(created("serverless_tenant-older-still"));
 
         now[0] += java.util.concurrent.TimeUnit.HOURS.toMillis(1);
         List<String> invalidated = new ArrayList<>();
@@ -210,7 +210,7 @@ public class DescriptorChangeTailerTests extends OpenSearchTestCase {
     /** Invalidation is the tailer's reason to exist, so it is asserted on its own rather than only in passing. */
     public void testTailingInvalidatesEveryTouchedName() throws Exception {
         Path shared = createTempDir();
-        logOver(shared).append(created("tenant-a"));
+        logOver(shared).append(created("serverless_tenant-a"));
 
         List<String> invalidated = new ArrayList<>();
         DescriptorBackend recording = new RecordingBackend(invalidated);
@@ -218,7 +218,7 @@ public class DescriptorChangeTailerTests extends OpenSearchTestCase {
         DescriptorChangeTailer tailer = new DescriptorChangeTailer(logOver(shared), recording);
         tailer.tailOnce();
 
-        assertEquals(List.of("tenant-a"), invalidated);
+        assertEquals(List.of("serverless_tenant-a"), invalidated);
     }
 
     /**
@@ -233,16 +233,16 @@ public class DescriptorChangeTailerTests extends OpenSearchTestCase {
         List<org.opensearch.core.index.Index> released = new ArrayList<>();
         org.opensearch.cluster.metadata.GatedIndexRelease.register(released::add);
         try {
-            logOver(shared).append(created("tenant-live"));
-            logOver(shared).append(deleted("tenant-gone"));
+            logOver(shared).append(created("serverless_tenant-live"));
+            logOver(shared).append(deleted("serverless_tenant-gone"));
 
             new DescriptorChangeTailer(logOver(shared), backendOver(createTempDir())).tailOnce();
 
             assertEquals("only the deleted name may be released", 1, released.size());
-            assertEquals("tenant-gone", released.get(0).getName());
+            assertEquals("serverless_tenant-gone", released.get(0).getName());
             assertEquals(
                 "released by uuid as well as name, or a name reused moments later would close a live shard",
-                "tenant-gone-uuid",
+                "serverless_tenant-gone-uuid",
                 released.get(0).getUUID()
             );
         } finally {
@@ -253,7 +253,7 @@ public class DescriptorChangeTailerTests extends OpenSearchTestCase {
     /** With nothing registered, which is a stock node, tailing must not attempt to close anything. */
     public void testNoReleaserMeansNoRelease() throws Exception {
         Path shared = createTempDir();
-        logOver(shared).append(deleted("tenant-gone"));
+        logOver(shared).append(deleted("serverless_tenant-gone"));
         org.opensearch.cluster.metadata.GatedIndexRelease.register(null);
 
         // The assertion is that this does not throw: an unregistered seam is a no-op, not a failure.

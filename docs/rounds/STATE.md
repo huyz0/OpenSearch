@@ -154,7 +154,19 @@ that never finished. Projections are bounded at four in flight now. **Nothing in
 gated indices concurrently at any scale**, which is the population this product exists for, and that gap is
 what let a regression of this shape through a green run.
 
-### One name can be claimed in both planes, and it is not a race
+### One name can be claimed in both planes, and it is not a race — CLOSED
+
+**Closed 2026-08-15 by partitioning the names, not by making the authorities agree.** `DescriptorGate::gatable`
+refuses a name outside the `serverless_` namespace, so no descriptor can exist for one;
+`clusterStateCreateIndex` refuses a name inside it, so no cluster state entry can exist for one. Neither
+authority consults the other — which is what made this unfixable where it was found, because the consulting
+would have been a blocking descriptor read on the cluster state thread — and both checks are string
+comparisons, which are safe anywhere. `GatedAndOrdinaryNameCollisionIT` lost its `AwaitsFix` and now asserts
+both directions plus the third one that stayed open longest: a namespaced index the gate declines is refused
+outright rather than created ordinary, which is the road the collision actually travelled. The finding as
+first written follows.
+
+
 
 Found while checking a claim I had just written into `MetadataCreateIndexService` -- that an ordinary
 creation consults the descriptor store. It does not. `validate` checks the routing table, the metadata and
@@ -301,13 +313,50 @@ and is visible in a log line.
   needs neither. That is the "gating stays permanently scoped" branch of B2, chosen and now enforced at the
   door rather than discovered at the wall.
 
-**What it does not yet do, stated plainly.** `DescriptorGate::gatable` still accepts the *setting*, so an index
-outside the namespace that carries `index.serverless_storage.enabled` is still gated. The namespace is exact
-for admission and for distribution; it is not yet the only way in. Measured rather than assumed: making the
-name authoritative for admission moved **3 of 222** integration tests, not the ~66 that would have moved had
-the bottom gate required it too. So the name collision documented above stays open -- closing it by
-construction means requiring the namespace at `gatable`, migrating 74 index names across roughly 63 test
-files, and retiring the settings road. That is a decision, not a follow-up.
+**Finished on 2026-08-15: the name is now the only way in.** `DescriptorGate::gatable` requires the namespace,
+`clusterStateCreateIndex` refuses a namespaced name a cluster state entry, and the settings-based admission
+road is gone -- both predicates, the template-merged settings computation, the admission template cache, the
+fallback onto the ordinary path, and the two test classes that covered them. What replaced roughly two hundred
+lines of inference is a string comparison.
+
+**The setting keeps its other meaning and only that one.** It still selects serverless storage, the lazy
+directory and computed placement, which is what a data stream backing index or an alias-bearing index needs
+and can have without being gated. What it no longer does is decide whether an index has a cluster state entry.
+
+**What the migration cost, measured rather than estimated.** A temporary probe in the gate recorded every
+index that would have been gated under the old rule across a full integration run: **128 names in 40 files**,
+against an estimate of 74 across 63. Guessing the list from naming conventions would have missed the
+generated families (`gated-batch-NNN`, `e2e-tenant-NNN`) and over-renamed the deliberate controls
+(`gated-refused`, `gated-aliased`), which are indices that carry the setting and must *not* be gated.
+
+**The finding: gating and placement had drifted apart, and the shape they made was a hang.** An index is
+gated exactly when its placement is computed — a gated index has no cluster state entry and so can have no
+published routing table, and an index whose routing is unpublished has nothing else to place it.
+`DescriptorGate`'s header has said so since C5. Moving gating to the name and leaving computed placement on
+the setting broke that agreement: an index carrying `index.serverless_storage.enabled` outside the namespace
+got a cluster state entry **and** unpublished routing. The ordinary allocator skipped it, having no routing
+entry to allocate; the on-demand opening path skipped it, not being gated. Its shards were placed by nobody.
+
+A write to such an index does not fail. It retries — correctly, because a shard that has not opened yet and a
+shard that never will look identical to a write — so this surfaced as one unrelated test taking twenty
+minutes and reporting `no such index`, which reads as a test being flaky. `ComputedPlacementGate.
+placementIsComputed` now reads the name exactly as `gatable` does, so the two cannot drift again, and
+`ServerlessStorageWithoutGatingIT` asserts the pair: an ungated serverless index is placed and servable
+within a bounded time, a gated one still has neither entry nor published routing. Verified by reverting the
+one line and watching the test fail on the routing assertion.
+
+Worth noting the direction: this was **latent before the namespace**, not created by it. Any index that
+carried the setting and was refused by `DescriptorRepresentable` — an alias-bearing index, a data stream
+backing index — already landed in that shape. No test wrote to one, so nothing saw it.
+
+**A second defect fell out of the deletion.** `TransportRolloverAction` had a branch that computed a rollover off
+the cluster state thread when the create request's settings said gated, and discarded the cluster state it
+computed -- correct for a gated target, which publishes nothing. But the condition read the *setting*, which
+an index can carry without being gated: a data stream backing index, or any alias-bearing index on serverless
+storage. For those, the rollover ran, threw away its result, and answered acknowledged. A rollover that
+silently did nothing. Nothing measured it because every test exercising that path used indices that really
+were gated. The branch is now deleted rather than fixed: a rollover target needs the alias it is rolled over
+by, an index in the namespace may not carry one, so no rollover target can be gated. B2, applied.
 
 ## Position
 

@@ -165,7 +165,7 @@ public class GatedMappingOffClusterStateThreadIT extends org.opensearch.serverle
             () -> client().admin()
                 .indices()
                 .create(
-                    new CreateIndexRequest("gated-threading").settings(gated())
+                    new CreateIndexRequest("serverless_gated-threading").settings(gated())
                         .mapping(Map.of("properties", Map.of("tenant", Map.of("type", "keyword"))))
                 )
                 .actionGet(REQUEST_DEADLINE)
@@ -173,7 +173,12 @@ public class GatedMappingOffClusterStateThreadIT extends org.opensearch.serverle
 
         // The shape T44 could not cover and T49 closed. Nothing in this request says the index is gated;
         // the template does, and admission now resolves templates rather than reading the request alone.
-        client().admin().indices().preparePutTemplate("gated-by-template").setPatterns(List.of("templated-*")).setSettings(gated()).get();
+        client().admin()
+            .indices()
+            .preparePutTemplate("gated-by-template")
+            .setPatterns(List.of("serverless_templated-*"))
+            .setSettings(gated())
+            .get();
 
         checkPhase(
             store,
@@ -182,7 +187,9 @@ public class GatedMappingOffClusterStateThreadIT extends org.opensearch.serverle
             () -> client().admin()
                 .indices()
                 .create(
-                    new CreateIndexRequest("templated-threading").mapping(Map.of("properties", Map.of("tenant", Map.of("type", "keyword"))))
+                    new CreateIndexRequest("serverless_templated-threading").mapping(
+                        Map.of("properties", Map.of("tenant", Map.of("type", "keyword")))
+                    )
                 )
                 .actionGet(REQUEST_DEADLINE)
         );
@@ -191,7 +198,7 @@ public class GatedMappingOffClusterStateThreadIT extends org.opensearch.serverle
         // the ordinary path would still have reached the store once, off-thread, during the attempt.
         assertNull(
             "the template must be what gates this index, or the phase above proves nothing about the " + "template path",
-            client().admin().cluster().prepareState().get().getState().metadata().index("templated-threading")
+            client().admin().cluster().prepareState().get().getState().metadata().index("serverless_templated-threading")
         );
 
         checkPhase(
@@ -200,7 +207,7 @@ public class GatedMappingOffClusterStateThreadIT extends org.opensearch.serverle
             "put-mapping",
             () -> client().admin()
                 .indices()
-                .preparePutMapping("gated-threading")
+                .preparePutMapping("serverless_gated-threading")
                 .setSource("amount", "type=double")
                 .execute()
                 .actionGet(REQUEST_DEADLINE)

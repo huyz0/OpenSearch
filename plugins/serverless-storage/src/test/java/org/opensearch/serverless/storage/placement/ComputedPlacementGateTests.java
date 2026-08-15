@@ -59,7 +59,7 @@ public class ComputedPlacementGateTests extends OpenSearchTestCase {
     public void testServerlessIndexGetsAComputedEntry() {
         ComputedPlacementGate.install(true);
 
-        IndexRoutingTable routing = AbsentIndexRoutingSuppliers.supply(stateWithNodes(), serverlessIndex("idx", 4));
+        IndexRoutingTable routing = AbsentIndexRoutingSuppliers.supply(stateWithNodes(), serverlessIndex("serverless_idx", 4));
 
         assertNotNull(routing);
         assertEquals(4, routing.shards().size());
@@ -79,7 +79,7 @@ public class ComputedPlacementGateTests extends OpenSearchTestCase {
     }
 
     public void testOwnershipIsReadFromIndexSettings() {
-        assertTrue(ComputedPlacementGate.ownsIndex(serverlessIndex("idx", 1)));
+        assertTrue(ComputedPlacementGate.ownsIndex(serverlessIndex("serverless_idx", 1)));
         assertFalse(ComputedPlacementGate.ownsIndex(plainIndex("idx", 1)));
         assertFalse(ComputedPlacementGate.ownsIndex(null));
     }
@@ -91,7 +91,7 @@ public class ComputedPlacementGateTests extends OpenSearchTestCase {
         ComputedPlacementGate.uninstall();
 
         assertFalse(AbsentIndexRoutingSuppliers.isRegistered());
-        assertNull(AbsentIndexRoutingSuppliers.supply(stateWithNodes(), serverlessIndex("idx", 1)));
+        assertNull(AbsentIndexRoutingSuppliers.supply(stateWithNodes(), serverlessIndex("serverless_idx", 1)));
     }
 
     public void testInstallingTwiceReplacesRatherThanAccumulates() {
@@ -99,7 +99,7 @@ public class ComputedPlacementGateTests extends OpenSearchTestCase {
         ComputedPlacementGate.install(true);
 
         assertTrue(AbsentIndexRoutingSuppliers.isRegistered());
-        assertNotNull(AbsentIndexRoutingSuppliers.supply(stateWithNodes(), serverlessIndex("idx", 1)));
+        assertNotNull(AbsentIndexRoutingSuppliers.supply(stateWithNodes(), serverlessIndex("serverless_idx", 1)));
     }
 
     // ---------------------------------------------------------------- helpers

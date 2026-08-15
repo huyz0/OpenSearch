@@ -114,12 +114,12 @@ public class GatedMappingFidelityIT extends org.opensearch.serverless.storage.Se
         client().admin()
             .indices()
             .create(
-                new CreateIndexRequest("fidelity-date").settings(gated())
+                new CreateIndexRequest("serverless_fidelity-date").settings(gated())
                     .mapping(Map.of("properties", Map.of("when", Map.of("type", "date", "format", "dd/MM/yyyy"))))
             )
             .actionGet();
 
-        assertMappingIsNotSilentlyReduced("fidelity-date", "when", "format");
+        assertMappingIsNotSilentlyReduced("serverless_fidelity-date", "when", "format");
     }
 
     /**
@@ -140,12 +140,12 @@ public class GatedMappingFidelityIT extends org.opensearch.serverless.storage.Se
         client().admin()
             .indices()
             .create(
-                new CreateIndexRequest("fidelity-limit").settings(gated())
+                new CreateIndexRequest("serverless_fidelity-limit").settings(gated())
                     .mapping(Map.of("properties", Map.of("code", Map.of("type", "keyword", "ignore_above", 256))))
             )
             .actionGet();
 
-        assertMappingIsNotSilentlyReduced("fidelity-limit", "code", "ignore_above");
+        assertMappingIsNotSilentlyReduced("serverless_fidelity-limit", "code", "ignore_above");
     }
 
     /**
@@ -162,15 +162,15 @@ public class GatedMappingFidelityIT extends org.opensearch.serverless.storage.Se
         client().admin()
             .indices()
             .create(
-                new CreateIndexRequest("fidelity-plain").settings(gated())
+                new CreateIndexRequest("serverless_fidelity-plain").settings(gated())
                     .mapping(Map.of("properties", Map.of("tenant", Map.of("type", "keyword"))))
             )
             .actionGet();
 
         ClusterState state = client().admin().cluster().prepareState().get().getState();
-        assertNull("a mapping that round-trips completely must still be gated", state.metadata().index("fidelity-plain"));
+        assertNull("a mapping that round-trips completely must still be gated", state.metadata().index("serverless_fidelity-plain"));
 
-        String uuid = descriptorUuid("fidelity-plain");
+        String uuid = descriptorUuid("serverless_fidelity-plain");
         MappingGenerationStore.MappingGeneration generation = MappingGenerationStore.currentMapping(uuid);
         assertNotNull("and its fields must be in the store", generation);
         assertEquals("keyword", MappingGenerationStore.typeOf(generation.fields().get("tenant")));
@@ -235,15 +235,18 @@ public class GatedMappingFidelityIT extends org.opensearch.serverless.storage.Se
     public void testAPutMappingTheStoreCannotCarryFailsRatherThanSucceeding() throws Exception {
         installBlobBackedDescriptorPlane();
 
-        client().admin().indices().create(new CreateIndexRequest("fidelity-put").settings(gated())).actionGet();
+        client().admin().indices().create(new CreateIndexRequest("serverless_fidelity-put").settings(gated())).actionGet();
         ClusterState state = client().admin().cluster().prepareState().get().getState();
-        assertNull("the premise: the index is gated, so a put-mapping takes the store path", state.metadata().index("fidelity-put"));
+        assertNull(
+            "the premise: the index is gated, so a put-mapping takes the store path",
+            state.metadata().index("serverless_fidelity-put")
+        );
 
         Exception failure = expectThrows(
             Exception.class,
             () -> client().admin()
                 .indices()
-                .preparePutMapping("fidelity-put")
+                .preparePutMapping("serverless_fidelity-put")
                 .setSource(Map.of("properties", Map.of("profile", "keyword")))
                 .get()
         );
@@ -256,7 +259,9 @@ public class GatedMappingFidelityIT extends org.opensearch.serverless.storage.Se
         );
 
         // And nothing was recorded, because a partial record is the loss this refuses.
-        MappingGenerationStore.MappingGeneration generation = MappingGenerationStore.currentMapping(descriptorUuid("fidelity-put"));
+        MappingGenerationStore.MappingGeneration generation = MappingGenerationStore.currentMapping(
+            descriptorUuid("serverless_fidelity-put")
+        );
         assertTrue(
             "a refused put-mapping must leave the store untouched, not half-applied: "
                 + (generation == null ? "nothing" : generation.fields()),
@@ -280,14 +285,16 @@ public class GatedMappingFidelityIT extends org.opensearch.serverless.storage.Se
     public void testAPutMappingOfPlainFieldsStillSucceeds() throws Exception {
         installBlobBackedDescriptorPlane();
 
-        client().admin().indices().create(new CreateIndexRequest("fidelity-put-ok").settings(gated())).actionGet();
+        client().admin().indices().create(new CreateIndexRequest("serverless_fidelity-put-ok").settings(gated())).actionGet();
         client().admin()
             .indices()
-            .preparePutMapping("fidelity-put-ok")
+            .preparePutMapping("serverless_fidelity-put-ok")
             .setSource(Map.of("properties", Map.of("level", Map.of("type", "keyword"))))
             .get();
 
-        MappingGenerationStore.MappingGeneration generation = MappingGenerationStore.currentMapping(descriptorUuid("fidelity-put-ok"));
+        MappingGenerationStore.MappingGeneration generation = MappingGenerationStore.currentMapping(
+            descriptorUuid("serverless_fidelity-put-ok")
+        );
         assertNotNull("a put-mapping that round-trips must reach the store", generation);
         assertEquals("keyword", MappingGenerationStore.typeOf(generation.fields().get("level")));
     }

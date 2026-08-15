@@ -93,9 +93,11 @@ public class GatedCreationDurabilityIT extends org.opensearch.serverless.storage
     public void testAnAcknowledgedCreationNormallyExists() throws Exception {
         BlobDescriptorBackend store = install();
 
-        assertTrue(client().admin().indices().create(gated("healthy-idx")).actionGet().isAcknowledged());
+        assertTrue(client().admin().indices().create(gated("serverless_healthy-idx")).actionGet().isAcknowledged());
 
-        assertBusy(() -> assertNotNull("an acknowledged gated creation must be resolvable", readWhenAvailable(store, "healthy-idx")));
+        assertBusy(
+            () -> assertNotNull("an acknowledged gated creation must be resolvable", readWhenAvailable(store, "serverless_healthy-idx"))
+        );
     }
 
     /**
@@ -127,13 +129,13 @@ public class GatedCreationDurabilityIT extends org.opensearch.serverless.storage
 
         // One creation that must succeed first, so the container is failing rather than merely untouched
         // when the creation under test runs.
-        assertTrue(client().admin().indices().create(gated("seed-idx")).actionGet().isAcknowledged());
-        assertBusy(() -> assertNotNull(readWhenAvailable(store, "seed-idx")));
+        assertTrue(client().admin().indices().create(gated("serverless_seed-idx")).actionGet().isAcknowledged());
+        assertBusy(() -> assertNotNull(readWhenAvailable(store, "serverless_seed-idx")));
         container.failing = true;
 
         boolean acknowledged;
         try {
-            acknowledged = client().admin().indices().create(gated("doomed-idx")).actionGet().isAcknowledged();
+            acknowledged = client().admin().indices().create(gated("serverless_doomed-idx")).actionGet().isAcknowledged();
         } catch (Exception e) {
             // The safe outcome: the client is told the creation failed.
             logger.info("creation failed rather than acknowledging, which is the safe answer", e);
@@ -148,13 +150,13 @@ public class GatedCreationDurabilityIT extends org.opensearch.serverless.storage
 
         // Reopen so the store can be asked what actually exists.
         container.failing = false;
-        store.invalidate("doomed-idx");
+        store.invalidate("serverless_doomed-idx");
 
         assertFalse(
             "an acknowledged creation whose descriptor never landed is an index the client believes exists "
                 + "and which exists nowhere. The descriptor write is the creation for a gated index, so "
                 + "acknowledging before it lands acknowledges something that did not happen",
-            acknowledged && store.get("doomed-idx") == null
+            acknowledged && store.get("serverless_doomed-idx") == null
         );
     }
 

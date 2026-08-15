@@ -141,7 +141,10 @@ public final class AutoCreateAction extends ActionType<CreateIndexResponse> {
                 .waitForActiveShards(request.waitForActiveShards())
                 .mappings(request.mappings());
 
-            if (DescriptorOnlyCreation.mayBypassClusterState(createIndexService.settingsForAdmission(updateRequest))) {
+            // Auto-creation is the door index-per-tenant actually arrives through, and the name is enough to
+            // know which plane it belongs in -- no template to resolve, and no chance of disagreeing with the
+            // gate, which reads the same name.
+            if (DescriptorOnlyCreation.isRegistered() && DescriptorOnlyCreation.namesAServerlessIndex(indexName)) {
                 createIndexService.createIndex(
                     updateRequest,
                     ActionListener.map(

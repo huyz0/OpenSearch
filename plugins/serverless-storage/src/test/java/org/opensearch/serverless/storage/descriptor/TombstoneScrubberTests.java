@@ -71,18 +71,18 @@ public class TombstoneScrubberTests extends OpenSearchTestCase {
     }
 
     public void testATombstonePastTheWindowIsReclaimed() {
-        tombstone("tenant-old", now - 10 * DAY);
+        tombstone("serverless_tenant-old", now - 10 * DAY);
 
         assertEquals(1, scrubber.scrubOnce(7 * DAY));
-        assertNull("reclaimed means the name resolves as never having existed", backend.get("tenant-old"));
+        assertNull("reclaimed means the name resolves as never having existed", backend.get("serverless_tenant-old"));
     }
 
     public void testATombstoneInsideTheWindowIsKept() {
-        tombstone("tenant-recent", now - DAY);
+        tombstone("serverless_tenant-recent", now - DAY);
 
         assertEquals(0, scrubber.scrubOnce(7 * DAY));
 
-        IndexDescriptor still = backend.get("tenant-recent");
+        IndexDescriptor still = backend.get("serverless_tenant-recent");
         assertNotNull(still);
         assertFalse("and it still reads as deleted rather than absent", still.exists());
     }
@@ -95,18 +95,18 @@ public class TombstoneScrubberTests extends OpenSearchTestCase {
      * population.
      */
     public void testAnUndatedTombstoneIsNeverReclaimed() {
-        tombstone("tenant-undated", 0L);
+        tombstone("serverless_tenant-undated", 0L);
 
         assertEquals("unknown age is young, not ancient", 0, scrubber.scrubOnce(1));
 
-        IndexDescriptor still = backend.get("tenant-undated");
+        IndexDescriptor still = backend.get("serverless_tenant-undated");
         assertNotNull(still);
         assertFalse(still.exists());
     }
 
     /** Scrubbing is idempotent, since it runs on a timer and a pass that runs twice must not differ. */
     public void testScrubbingTwiceIsTheSameAsOnce() {
-        tombstone("tenant-old", now - 10 * DAY);
+        tombstone("serverless_tenant-old", now - 10 * DAY);
 
         assertEquals(1, scrubber.scrubOnce(7 * DAY));
         assertEquals("nothing left the second time", 0, scrubber.scrubOnce(7 * DAY));
@@ -125,15 +125,15 @@ public class TombstoneScrubberTests extends OpenSearchTestCase {
      * reads as existing regardless of where it found it.
      */
     public void testOnlyThePastWindowTombstoneGoes() {
-        tombstone("tenant-old", now - 10 * DAY);
-        tombstone("tenant-recent", now - DAY);
-        backend.create(descriptor("tenant-live"));
+        tombstone("serverless_tenant-old", now - 10 * DAY);
+        tombstone("serverless_tenant-recent", now - DAY);
+        backend.create(descriptor("serverless_tenant-live"));
 
         assertEquals(1, scrubber.scrubOnce(7 * DAY));
 
-        assertNull(backend.get("tenant-old"));
-        assertNotNull(backend.get("tenant-recent"));
-        IndexDescriptor live = backend.get("tenant-live");
+        assertNull(backend.get("serverless_tenant-old"));
+        assertNotNull(backend.get("serverless_tenant-recent"));
+        IndexDescriptor live = backend.get("serverless_tenant-live");
         assertNotNull(live);
         assertTrue("a live index must be untouched by tombstone reclamation", live.exists());
     }
@@ -153,14 +153,14 @@ public class TombstoneScrubberTests extends OpenSearchTestCase {
      * node stale shard data rather than an index returning.
      */
     public void testATombstoneRefreshedDuringThePassIsKept() {
-        tombstone("tenant-churn", now - 10 * DAY);
+        tombstone("serverless_tenant-churn", now - 10 * DAY);
 
         // The same name deleted again, a moment before the scrubber would have reached the old record.
-        backend.putTombstoneAsync(descriptor("tenant-churn").tombstoned(now - 1));
+        backend.putTombstoneAsync(descriptor("serverless_tenant-churn").tombstoned(now - 1));
 
         assertEquals("the record that matters now is the recent one, and it is inside the window", 0, scrubber.scrubOnce(7 * DAY));
 
-        IndexDescriptor still = backend.get("tenant-churn");
+        IndexDescriptor still = backend.get("serverless_tenant-churn");
         assertNotNull("deleting it would lose the record for the deletion that just happened", still);
         assertFalse(still.exists());
     }
@@ -175,7 +175,7 @@ public class TombstoneScrubberTests extends OpenSearchTestCase {
      * evidence that counts: something was actually reclaimed here.
      */
     public void testTheScrubberCanSeeTombstonesOnAFilesystemStore() {
-        tombstone("tenant-old", now - 10 * DAY);
+        tombstone("serverless_tenant-old", now - 10 * DAY);
 
         assertEquals("zero here would mean the keyspace is invisible rather than empty", 1, scrubber.scrubOnce(7 * DAY));
     }

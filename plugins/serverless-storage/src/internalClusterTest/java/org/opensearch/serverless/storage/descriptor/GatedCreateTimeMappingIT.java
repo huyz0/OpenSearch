@@ -127,7 +127,7 @@ public class GatedCreateTimeMappingIT extends org.opensearch.serverless.storage.
         client().admin()
             .indices()
             .create(
-                new CreateIndexRequest("gated-unread").settings(gated())
+                new CreateIndexRequest("serverless_gated-unread").settings(gated())
                     .mapping(Map.of("properties", Map.of("tenant", Map.of("type", "keyword"))))
             )
             .actionGet();
@@ -141,7 +141,7 @@ public class GatedCreateTimeMappingIT extends org.opensearch.serverless.storage.
         assertEquals("a creation's mapping rides its descriptor, so the store must not be touched", 0L, counting.swaps());
         // And they landed, so this cannot pass by the mapping having been dropped on the way. Read after the
         // counts, since this read is one.
-        var generation = MappingGenerationStore.currentMapping(descriptorUuid("gated-unread"));
+        var generation = MappingGenerationStore.currentMapping(descriptorUuid("serverless_gated-unread"));
         assertNotNull("the declared fields must still be readable through the registered store", generation);
         assertEquals("keyword", MappingGenerationStore.typeOf(generation.fields().get("tenant")));
     }
@@ -160,14 +160,14 @@ public class GatedCreateTimeMappingIT extends org.opensearch.serverless.storage.
         client().admin()
             .indices()
             .create(
-                new CreateIndexRequest("gated-deleted").settings(gated())
+                new CreateIndexRequest("serverless_gated-deleted").settings(gated())
                     .mapping(Map.of("properties", Map.of("tenant", Map.of("type", "keyword"))))
             )
             .actionGet();
-        String uuid = descriptorUuid("gated-deleted");
+        String uuid = descriptorUuid("serverless_gated-deleted");
         assertNotNull("the mapping must be there before the delete, or this asserts nothing", MappingGenerationStore.currentMapping(uuid));
 
-        client().admin().indices().prepareDelete("gated-deleted").get();
+        client().admin().indices().prepareDelete("serverless_gated-deleted").get();
 
         assertBusy(
             () -> assertNull(
@@ -191,14 +191,14 @@ public class GatedCreateTimeMappingIT extends org.opensearch.serverless.storage.
         client().admin()
             .indices()
             .create(
-                new CreateIndexRequest("gated-unprunable").settings(gated())
+                new CreateIndexRequest("serverless_gated-unprunable").settings(gated())
                     .mapping(Map.of("properties", Map.of("tenant", Map.of("type", "keyword"))))
             )
             .actionGet();
 
         assertTrue(
             "a mapping that could not be removed must not turn its index's deletion into a failure",
-            client().admin().indices().prepareDelete("gated-unprunable").get().isAcknowledged()
+            client().admin().indices().prepareDelete("serverless_gated-unprunable").get().isAcknowledged()
         );
     }
 
@@ -214,7 +214,7 @@ public class GatedCreateTimeMappingIT extends org.opensearch.serverless.storage.
         client().admin()
             .indices()
             .create(
-                new CreateIndexRequest("mixed-gated").settings(gated())
+                new CreateIndexRequest("serverless_mixed-gated").settings(gated())
                     .mapping(Map.of("properties", Map.of("tenant", Map.of("type", "keyword"))))
             )
             .actionGet();
@@ -229,9 +229,9 @@ public class GatedCreateTimeMappingIT extends org.opensearch.serverless.storage.
                 )
             )
             .actionGet();
-        String uuid = descriptorUuid("mixed-gated");
+        String uuid = descriptorUuid("serverless_mixed-gated");
 
-        client().admin().indices().prepareDelete("mixed-gated", "mixed-ordinary").get();
+        client().admin().indices().prepareDelete("serverless_mixed-gated", "mixed-ordinary").get();
 
         assertBusy(
             () -> assertNull(
@@ -270,11 +270,11 @@ public class GatedCreateTimeMappingIT extends org.opensearch.serverless.storage.
     public void testDeletingAGatedIndexWithNoMappingSucceeds() throws Exception {
         installBlobBackedDescriptorPlane();
 
-        client().admin().indices().create(new CreateIndexRequest("gated-plain").settings(gated())).actionGet();
+        client().admin().indices().create(new CreateIndexRequest("serverless_gated-plain").settings(gated())).actionGet();
 
         assertTrue(
             "a mapping that was never written must not turn its index's deletion into a failure",
-            client().admin().indices().prepareDelete("gated-plain").get().isAcknowledged()
+            client().admin().indices().prepareDelete("serverless_gated-plain").get().isAcknowledged()
         );
     }
 
@@ -332,7 +332,7 @@ public class GatedCreateTimeMappingIT extends org.opensearch.serverless.storage.
         client().admin()
             .indices()
             .create(
-                new CreateIndexRequest("gated-mapped").settings(gated())
+                new CreateIndexRequest("serverless_gated-mapped").settings(gated())
                     .mapping(Map.of("properties", Map.of("tenant", Map.of("type", "keyword"), "amount", Map.of("type", "double"))))
             )
             .actionGet();
@@ -340,13 +340,13 @@ public class GatedCreateTimeMappingIT extends org.opensearch.serverless.storage.
         ClusterState state = client().admin().cluster().prepareState().get().getState();
         assertNull(
             "an index whose mapping can be carried field by field must still be gated, or carrying it " + "bought nothing",
-            state.metadata().index("gated-mapped")
+            state.metadata().index("serverless_gated-mapped")
         );
 
         // The fields themselves, from the store that now holds them. Asserting the index is gated proves
         // only that it took the fast path; asserting the types proves the mapping was not lost on the way,
         // which is the whole question.
-        String uuid = descriptorUuid("gated-mapped");
+        String uuid = descriptorUuid("serverless_gated-mapped");
         var generation = org.opensearch.cluster.metadata.MappingGenerationStore.currentMapping(uuid);
         assertNotNull("the declared fields must be in the mapping store after a gated creation", generation);
         assertEquals("keyword", org.opensearch.cluster.metadata.MappingGenerationStore.typeOf(generation.fields().get("tenant")));
@@ -371,15 +371,18 @@ public class GatedCreateTimeMappingIT extends org.opensearch.serverless.storage.
         client().admin()
             .indices()
             .create(
-                new CreateIndexRequest("gated-object").settings(gated())
+                new CreateIndexRequest("serverless_gated-object").settings(gated())
                     .mapping(Map.of("properties", Map.of("nested", Map.of("properties", Map.of("inner", Map.of("type", "keyword"))))))
             )
             .actionGet();
 
         ClusterState state = client().admin().cluster().prepareState().get().getState();
-        assertNull("an index with an object field must now be gated rather than kept resident", state.metadata().index("gated-object"));
+        assertNull(
+            "an index with an object field must now be gated rather than kept resident",
+            state.metadata().index("serverless_gated-object")
+        );
 
-        var generation = org.opensearch.cluster.metadata.MappingGenerationStore.currentMapping(descriptorUuid("gated-object"));
+        var generation = org.opensearch.cluster.metadata.MappingGenerationStore.currentMapping(descriptorUuid("serverless_gated-object"));
         assertNotNull("its declared fields must be in the mapping store", generation);
         Map<String, Object> nested = generation.definitionOf("nested");
         assertNotNull("the object field must be in the store: " + generation.fields(), nested);
@@ -405,13 +408,13 @@ public class GatedCreateTimeMappingIT extends org.opensearch.serverless.storage.
     public void testAnIndexWithNoMappingIsStillGated() throws Exception {
         installBlobBackedDescriptorPlane();
 
-        client().admin().indices().create(new CreateIndexRequest("gated-plain").settings(gated())).actionGet();
+        client().admin().indices().create(new CreateIndexRequest("serverless_gated-plain").settings(gated())).actionGet();
 
         ClusterState state = client().admin().cluster().prepareState().get().getState();
         assertNull(
             "an index with nothing a descriptor cannot represent must still be gated, or the refusal above "
                 + "has switched the whole feature off",
-            state.metadata().index("gated-plain")
+            state.metadata().index("serverless_gated-plain")
         );
     }
 

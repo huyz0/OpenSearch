@@ -108,7 +108,7 @@ public class GatedDeletionOffClusterStateThreadIT extends org.opensearch.serverl
         installBlobBackedDescriptorPlane();
 
         // Created before the thread is blocked, since creating them is what this test is not about.
-        client().admin().indices().create(new CreateIndexRequest("gated-doomed").settings(gated())).actionGet();
+        client().admin().indices().create(new CreateIndexRequest("serverless_gated-doomed").settings(gated())).actionGet();
         client().admin().indices().create(new CreateIndexRequest("plain-doomed").settings(ordinary())).actionGet();
 
         CountDownLatch release = new CountDownLatch(1);
@@ -129,7 +129,7 @@ public class GatedDeletionOffClusterStateThreadIT extends org.opensearch.serverl
             // The measurement.
             long started = System.nanoTime();
             PlainActionFuture<AcknowledgedResponse> gated = PlainActionFuture.newFuture();
-            client().admin().indices().delete(new DeleteIndexRequest("gated-doomed"), gated);
+            client().admin().indices().delete(new DeleteIndexRequest("serverless_gated-doomed"), gated);
             AcknowledgedResponse response = gated.actionGet(GATED_DEADLINE_SECONDS, TimeUnit.SECONDS);
             long elapsedMillis = (System.nanoTime() - started) / 1_000_000;
 
@@ -150,10 +150,10 @@ public class GatedDeletionOffClusterStateThreadIT extends org.opensearch.serverl
     public void testAMixedDeletionStillRemovesBoth() throws Exception {
         installBlobBackedDescriptorPlane();
 
-        client().admin().indices().create(new CreateIndexRequest("mixed-gated").settings(gated())).actionGet();
+        client().admin().indices().create(new CreateIndexRequest("serverless_mixed-gated").settings(gated())).actionGet();
         client().admin().indices().create(new CreateIndexRequest("mixed-plain").settings(ordinary())).actionGet();
 
-        client().admin().indices().delete(new DeleteIndexRequest("mixed-gated", "mixed-plain")).actionGet();
+        client().admin().indices().delete(new DeleteIndexRequest("serverless_mixed-gated", "mixed-plain")).actionGet();
 
         ClusterState state = client().admin().cluster().prepareState().get().getState();
         assertNull("the ordinary half of a mixed deletion must actually be deleted", state.metadata().index("mixed-plain"));
@@ -162,7 +162,7 @@ public class GatedDeletionOffClusterStateThreadIT extends org.opensearch.serverl
         // partitioned during the delete cannot tell "never existed" from "have not looked yet", and would
         // adopt its dangling shard data on rejoin. Asserting the record is gone would have been asserting
         // for the resurrection bug rather than against it.
-        org.opensearch.cluster.metadata.IndexDescriptor gated = store().get("mixed-gated");
+        org.opensearch.cluster.metadata.IndexDescriptor gated = store().get("serverless_mixed-gated");
         assertNotNull("a deleted gated index must leave a durable tombstone behind", gated);
         assertFalse("and that tombstone must say the index no longer exists", gated.exists());
     }

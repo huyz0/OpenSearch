@@ -262,7 +262,10 @@ public class GatedEndToEndIT extends org.opensearch.serverless.storage.Serverles
         // read can by a bound this design has not measured.
 
         long start = System.nanoTime();
-        SearchResponse response = client().prepareSearch("e2e-tenant-*").setQuery(QueryBuilders.matchAllQuery()).setSize(0).get();
+        SearchResponse response = client().prepareSearch("serverless_e2e-tenant-*")
+            .setQuery(QueryBuilders.matchAllQuery())
+            .setSize(0)
+            .get();
         long nanos = System.nanoTime() - start;
 
         logger.warn(
@@ -302,7 +305,7 @@ public class GatedEndToEndIT extends org.opensearch.serverless.storage.Serverles
     public void testHowManyShardsAGatedIndexActuallyGets() throws Exception {
         BlobDescriptorBackend store = installBlobBackedDescriptorPlane().points();
 
-        String name = "shardcount-probe";
+        String name = "serverless_shardcount-probe";
         Settings gated = Settings.builder()
             .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
             .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
@@ -388,7 +391,7 @@ public class GatedEndToEndIT extends org.opensearch.serverless.storage.Serverles
 
         StringBuilder report = new StringBuilder("\nT31 requested vs recorded shard count\n");
         for (int asked : new int[] { 1, 2, 4, 7 }) {
-            String name = "shards-asked-" + asked;
+            String name = "serverless_shards-asked-" + asked;
             assertTrue(
                 client().admin()
                     .indices()
@@ -441,7 +444,7 @@ public class GatedEndToEndIT extends org.opensearch.serverless.storage.Serverles
     public void testWhetherTheDisagreeingIndexIsEvenGated() throws Exception {
         BlobDescriptorBackend store = installBlobBackedDescriptorPlane().points();
 
-        String name = "gatedness-probe";
+        String name = "serverless_gatedness-probe";
         assertTrue(
             client().admin()
                 .indices()
@@ -504,7 +507,7 @@ public class GatedEndToEndIT extends org.opensearch.serverless.storage.Serverles
     public void testWhetherComputedPlacementAssignsAGatedPrimary() throws Exception {
         BlobDescriptorBackend store = installBlobBackedDescriptorPlane().points();
 
-        String name = "placement-probe";
+        String name = "serverless_placement-probe";
         assertTrue(
             client().admin()
                 .indices()
@@ -573,6 +576,6 @@ public class GatedEndToEndIT extends org.opensearch.serverless.storage.Serverles
     }
 
     private static String tenant(int i) throws Exception {
-        return String.format(Locale.ROOT, "e2e-tenant-%03d", i);
+        return String.format(Locale.ROOT, "serverless_e2e-tenant-%03d", i);
     }
 }

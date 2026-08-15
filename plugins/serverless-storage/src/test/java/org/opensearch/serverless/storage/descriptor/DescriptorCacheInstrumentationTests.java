@@ -65,11 +65,11 @@ public class DescriptorCacheInstrumentationTests extends OpenSearchTestCase {
         DescriptorCache cache = new DescriptorCache(clock::get, 1_000_000L, 3_000, 100, 1 << 20);
         AtomicLong loaderCalls = new AtomicLong();
 
-        cache.get("tenant-a", name -> {
+        cache.get("serverless_tenant-a", name -> {
             loaderCalls.incrementAndGet();
             return descriptor(name);
         });
-        cache.get("tenant-a", name -> {
+        cache.get("serverless_tenant-a", name -> {
             loaderCalls.incrementAndGet();
             return descriptor(name);
         });
@@ -86,9 +86,9 @@ public class DescriptorCacheInstrumentationTests extends OpenSearchTestCase {
         long ttl = 1_000L;
         DescriptorCache cache = new DescriptorCache(clock::get, ttl, 3_000, 100, 1 << 20);
 
-        cache.get("tenant-a", DescriptorCacheInstrumentationTests::descriptor);
+        cache.get("serverless_tenant-a", DescriptorCacheInstrumentationTests::descriptor);
         clock.advance(ttl + 1);
-        cache.get("tenant-a", DescriptorCacheInstrumentationTests::descriptor);
+        cache.get("serverless_tenant-a", DescriptorCacheInstrumentationTests::descriptor);
 
         assertEquals(2, cache.readCount());
         assertEquals(0, cache.freshHitCount());
@@ -118,9 +118,9 @@ public class DescriptorCacheInstrumentationTests extends OpenSearchTestCase {
      */
     public void testGivingUpOnAnInFlightReadIsCountedAsAFallbackNotAHit() {
         DescriptorCache cache = new DescriptorCache(System::nanoTime, DescriptorCache.DEFAULT_TTL_NANOS, 1, 100, 1 << 20);
-        cache.pretendReadIsInFlight("tenant-a");
+        cache.pretendReadIsInFlight("serverless_tenant-a");
 
-        IndexDescriptor read = cache.get("tenant-a", DescriptorCacheInstrumentationTests::descriptor);
+        IndexDescriptor read = cache.get("serverless_tenant-a", DescriptorCacheInstrumentationTests::descriptor);
 
         assertNotNull("the fallback must still answer", read);
         assertEquals(1, cache.collapseFallbackCount());
@@ -134,9 +134,9 @@ public class DescriptorCacheInstrumentationTests extends OpenSearchTestCase {
         ManualClock clock = new ManualClock();
         DescriptorCache cache = new DescriptorCache(clock::get, 1_000_000L, 3_000, 100, 1 << 20);
 
-        cache.get("tenant-a", DescriptorCacheInstrumentationTests::descriptor);
-        cache.invalidate("tenant-a");
-        cache.get("tenant-a", DescriptorCacheInstrumentationTests::descriptor);
+        cache.get("serverless_tenant-a", DescriptorCacheInstrumentationTests::descriptor);
+        cache.invalidate("serverless_tenant-a");
+        cache.get("serverless_tenant-a", DescriptorCacheInstrumentationTests::descriptor);
 
         assertEquals(2, cache.readCount());
         assertEquals(0, cache.freshHitCount());

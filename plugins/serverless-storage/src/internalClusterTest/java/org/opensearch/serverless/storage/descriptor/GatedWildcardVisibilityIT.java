@@ -95,7 +95,7 @@ public class GatedWildcardVisibilityIT extends org.opensearch.serverless.storage
         installWithTenants();
 
         ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
-        String[] resolved = report("tenant-*", empty, IndicesOptions.lenientExpandOpen());
+        String[] resolved = report("serverless_tenant-*", empty, IndicesOptions.lenientExpandOpen());
 
         assertEquals(
             "a prefix wildcard must find the gated tenants it names, or a tenant searching tenant-* is told "
@@ -145,7 +145,7 @@ public class GatedWildcardVisibilityIT extends org.opensearch.serverless.storage
 
         String outcome;
         try {
-            String[] resolved = resolver().concreteIndexNames(empty, strict, "tenant-*");
+            String[] resolved = resolver().concreteIndexNames(empty, strict, "serverless_tenant-*");
             outcome = resolved.length + " names, no error";
         } catch (Exception e) {
             outcome = e.getClass().getSimpleName();
@@ -206,7 +206,7 @@ public class GatedWildcardVisibilityIT extends org.opensearch.serverless.storage
         ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
         UnsupportedWildcardException refused = expectThrows(
             UnsupportedWildcardException.class,
-            () -> resolver().concreteIndexNames(empty, IndicesOptions.lenientExpandOpen(), "tenant-*")
+            () -> resolver().concreteIndexNames(empty, IndicesOptions.lenientExpandOpen(), "serverless_tenant-*")
         );
         logger.warn("T28: over-cap expansion reported [{}]", refused.getMessage());
         assertTrue(
@@ -221,7 +221,7 @@ public class GatedWildcardVisibilityIT extends org.opensearch.serverless.storage
         DescriptorGate.setWildcardExpansionLimit(TENANTS);
 
         ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
-        String[] resolved = resolver().concreteIndexNames(empty, IndicesOptions.lenientExpandOpen(), "tenant-*");
+        String[] resolved = resolver().concreteIndexNames(empty, IndicesOptions.lenientExpandOpen(), "serverless_tenant-*");
 
         assertEquals("a pattern matching exactly the cap is within it", TENANTS, resolved.length);
     }
@@ -239,7 +239,7 @@ public class GatedWildcardVisibilityIT extends org.opensearch.serverless.storage
         ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
         expectThrows(
             UnsupportedWildcardException.class,
-            () -> resolver().concreteIndexNames(empty, IndicesOptions.lenientExpandOpen(), "tenant-*")
+            () -> resolver().concreteIndexNames(empty, IndicesOptions.lenientExpandOpen(), "serverless_tenant-*")
         );
     }
 
@@ -264,7 +264,7 @@ public class GatedWildcardVisibilityIT extends org.opensearch.serverless.storage
         store.put(descriptorWithState(tenant(0), IndexDescriptor.State.DELETED));
 
         ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
-        String[] resolved = resolver().concreteIndexNames(empty, IndicesOptions.lenientExpandOpen(), "tenant-*");
+        String[] resolved = resolver().concreteIndexNames(empty, IndicesOptions.lenientExpandOpen(), "serverless_tenant-*");
 
         assertEquals("a deleted index must not match", TENANTS - 1, resolved.length);
         for (String name : resolved) {
@@ -377,7 +377,7 @@ public class GatedWildcardVisibilityIT extends org.opensearch.serverless.storage
         }
 
         ClusterState state = client().admin().cluster().prepareState().get().getState();
-        String[] resolved = resolver().concreteIndexNames(state, IndicesOptions.lenientExpandOpen(), "tenant-*");
+        String[] resolved = resolver().concreteIndexNames(state, IndicesOptions.lenientExpandOpen(), "serverless_tenant-*");
 
         assertEquals("the control: the same pattern over ordinary indices finds all of them", TENANTS, resolved.length);
     }
@@ -389,7 +389,7 @@ public class GatedWildcardVisibilityIT extends org.opensearch.serverless.storage
     }
 
     private static String tenant(int i) throws Exception {
-        return String.format(Locale.ROOT, "tenant-%03d", i);
+        return String.format(Locale.ROOT, "serverless_tenant-%03d", i);
     }
 
     private static IndexDescriptor descriptorWithState(String name, IndexDescriptor.State state) throws Exception {
