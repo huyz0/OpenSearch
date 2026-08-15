@@ -284,6 +284,31 @@ write-behind projection kept only so the aggregate stays one search.
   `IndexBackedMappingStore`, so the suite stayed green against a store production did not register. The shared
   fixture now composes the store the way `ServerlessStoragePlugin` does.
 
+### Restore to a time works, and a restore does not survive reopening
+
+Round 006 item 2. `PitrRestoreResolution` answers which generation was current at an instant -- the newest
+manifest created at or before it -- and `restore_to` carries an instant through both REST routes and both
+request levels. The retention half already kept the data for any instant in the window alive; nothing could
+ask for one, so the state at 14:32 was on disk and unreachable. Both refusals are wired and tested: an
+instant older than every surviving generation is refused naming how far back the index *can* go, rather than
+rounded up to the oldest; and a generation nothing pins is refused, because pointing the head at blobs GC
+may reclaim is a corruption with a delay on it. The index-level path resolves per shard, twice, because
+shards have their own commit histories -- one instant is one generation per shard, not one across the index.
+
+**Proven**: after a restore to an instant between two commits, the durable head sits at the generation that
+answers for that instant, asserted against the manifest list rather than a number written into the test.
+
+**Found**: a restore does not survive reopening the index. The writes past the restore point come back. The
+likelier cause is WAL replay, which exists to reapply writes a manifest does not yet carry and cannot tell
+"not yet published" from "deliberately rolled back"; the alternative is that opening resolves the newest
+manifest rather than the head. The distinguishing measurement is whether the reopened shard's first new
+manifest descends from the restored generation or the latest one. `AwaitsFix` rather than explained, because
+which of the two it is changes the fix entirely.
+
+The existing restore coverage could not have caught this: `ServerlessStorageIndexSnapshotActionIT` asserts
+the head record and never reopens the index, so a restore undone by recovery looks exactly like one that
+holds. **This now outranks the rest of the round** -- a restore that recovery undoes is not a restore.
+
 ### Round 006 opened: durability. Close was a label, and finding that out was the round's first result
 
 The plan is `docs/rounds/006-durability/plan.md`. Three tiers — pin, pointer snapshot, independent copy —

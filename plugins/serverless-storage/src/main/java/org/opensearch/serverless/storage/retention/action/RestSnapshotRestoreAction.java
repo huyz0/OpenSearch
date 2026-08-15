@@ -71,16 +71,32 @@ public class RestSnapshotRestoreAction extends BaseRestHandler {
         Object indexUuid = body.get("index_uuid");
         Object shardId = body.get("shard_id");
         Object snapshotId = body.get("snapshot_id");
-        if (!(indexUuid instanceof String) || !(shardId instanceof Number) || !(snapshotId instanceof String)) {
+        Object restoreTo = body.get("restore_to");
+        if (!(indexUuid instanceof String) || !(shardId instanceof Number)) {
+            throw new IllegalArgumentException("request body must contain a string \"index_uuid\" and a numeric \"shard_id\"");
+        }
+        if (snapshotId != null && restoreTo != null) {
             throw new IllegalArgumentException(
-                "request body must contain a string \"index_uuid\", a numeric \"shard_id\", and a string \"snapshot_id\""
+                "request body must contain \"snapshot_id\" or \"restore_to\", not both: a pin and an instant "
+                    + "can resolve to different generations"
             );
         }
-        SnapshotRestoreRequest restoreRequest = new SnapshotRestoreRequest(
-            (String) indexUuid,
-            ((Number) shardId).intValue(),
-            (String) snapshotId
-        );
+        final SnapshotRestoreRequest restoreRequest;
+        if (restoreTo != null) {
+            if (!(restoreTo instanceof Number)) {
+                throw new IllegalArgumentException("\"restore_to\" must be a number of epoch milliseconds");
+            }
+            restoreRequest = SnapshotRestoreRequest.toInstant(
+                (String) indexUuid,
+                ((Number) shardId).intValue(),
+                ((Number) restoreTo).longValue()
+            );
+        } else {
+            if (!(snapshotId instanceof String)) {
+                throw new IllegalArgumentException("request body must contain a string \"snapshot_id\" or a numeric \"restore_to\"");
+            }
+            restoreRequest = new SnapshotRestoreRequest((String) indexUuid, ((Number) shardId).intValue(), (String) snapshotId);
+        }
         return channel -> client.executeLocally(SnapshotRestoreAction.INSTANCE, restoreRequest, new RestToXContentListener<>(channel));
     }
 }

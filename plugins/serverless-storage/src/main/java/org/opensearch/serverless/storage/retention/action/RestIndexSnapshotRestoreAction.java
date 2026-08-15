@@ -68,10 +68,25 @@ public class RestIndexSnapshotRestoreAction extends BaseRestHandler {
             body = parser.map();
         }
         Object snapshotId = body.get("snapshot_id");
-        if (!(snapshotId instanceof String)) {
-            throw new IllegalArgumentException("request body must contain a string \"snapshot_id\"");
+        Object restoreTo = body.get("restore_to");
+        if (snapshotId != null && restoreTo != null) {
+            throw new IllegalArgumentException(
+                "request body must contain \"snapshot_id\" or \"restore_to\", not both: a pin and an instant "
+                    + "can resolve to different generations"
+            );
         }
-        IndexSnapshotRestoreRequest restoreRequest = new IndexSnapshotRestoreRequest(indexName, (String) snapshotId);
+        final IndexSnapshotRestoreRequest restoreRequest;
+        if (restoreTo != null) {
+            if (!(restoreTo instanceof Number)) {
+                throw new IllegalArgumentException("\"restore_to\" must be a number of epoch milliseconds");
+            }
+            restoreRequest = IndexSnapshotRestoreRequest.toInstant(indexName, ((Number) restoreTo).longValue());
+        } else {
+            if (!(snapshotId instanceof String)) {
+                throw new IllegalArgumentException("request body must contain a string \"snapshot_id\" or a numeric \"restore_to\"");
+            }
+            restoreRequest = new IndexSnapshotRestoreRequest(indexName, (String) snapshotId);
+        }
         return channel -> client.executeLocally(IndexSnapshotRestoreAction.INSTANCE, restoreRequest, new RestToXContentListener<>(channel));
     }
 }

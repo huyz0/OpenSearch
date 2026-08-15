@@ -96,7 +96,7 @@ a decision about a format that lives on the object store, and it is the next thi
 The round-trip test is `AwaitsFix` against it rather than weakened to assert the refusal, which would turn
 a defect into a specification.
 
-### 2. Restore to a time
+### 2. Restore to a time — DONE, with one thing it found
 
 Add `restoreToMillis` to the shard-level restore request and `restore_to` to the REST surface. When set,
 the target generation is resolved by time rather than by pin id: **the newest manifest whose
@@ -111,6 +111,29 @@ Two refusals matter more than the happy path, and both get tests:
 - **The resolved generation is no longer pinned** — it fell out of the PITR window between resolution and
   restore, or PITR was never enabled. Refuse naming the generation, rather than restoring to something that
   GC may be about to reclaim.
+
+**What landed.** `PitrRestoreResolution` (pure, unit-tested: boundary inclusivity, ties by term then
+generation, order-independence, and the two empty cases), `restoreToMillis` on both the shard and index
+requests, `restore_to` on both REST routes, and both refusals wired with the messages the plan asked for.
+The index-level resolution runs per shard, twice — once to validate every shard before any head moves, once
+inside the shard action that moves it — because shards have their own commit histories and one instant is
+one generation *per shard*, not one across the index.
+
+**Proven end to end**: after a restore to an instant between two commits, the durable head sits at the
+generation that answers for that instant, asserted against the manifest list itself rather than against a
+number written into the test.
+
+**What it found.** A restore does not survive reopening the index: the writes past the restore point come
+back. The likelier cause is WAL replay, which is designed to reapply writes a manifest does not yet carry
+and cannot tell "not yet published" from "deliberately rolled back"; the alternative is that opening
+resolves the newest manifest rather than the head. The distinguishing measurement is whether the reopened
+shard's first new manifest descends from the restored generation or the latest one. `AwaitsFix`, because
+this is the assertion the existing restore coverage could not have made —
+`ServerlessStorageIndexSnapshotActionIT` checks the head record and never reopens the index, so a restore
+undone by recovery looks identical to one that holds.
+
+**This is now the gating question for the whole time machine**, and it outranks the remaining plan items: a
+restore that recovery undoes is not a restore, whichever of the two causes it turns out to be.
 
 *Granularity, stated so nobody expects otherwise*: this lands on the last commit at or before the instant,
 not on the instant. Sub-commit precision needs WAL replay to a timestamp, and `WalRecord` carries
@@ -181,7 +204,8 @@ cannot do.
 |---|---|---|---|
 | 1 | pin surface reaches gated indices | pin and release: **done**. Restore: blocked on close releasing the shard | small → medium |
 | 1b | **close releases a gated shard** (new, found by 1) | closing a gated index releases its writer lease | medium — persisted format decision |
-| 2 | restore to a time | resolution unit-tested, both refusals tested, round trip in an IT | small |
+| 2 | restore to a time | **done**: resolution unit-tested, both refusals tested, head lands correctly | small |
+| 2b | **a restore must survive reopening** (new, found by 2) | reopened index still reads as restored | unknown until the cause is established |
 | 3 | audible omission | a wildcard snapshot on a gated cluster warns; asserted | small |
 | 4 | posture written down | one design page, linked from the snapshot page | small |
 | 5 | independent copy | spike proves the commit is readable; then orchestration | spike small, rest medium |

@@ -111,6 +111,47 @@ public class TransportIndexSnapshotRestoreAction extends HandledTransportAction<
                         false
                     );
                     Set<PinRecord> pins = new BlobContainerDurablePinRegistry(container).getPins(indexUuid, shardId);
+                    if (request.restoresToInstant()) {
+                        // A point-in-time restore resolves per shard, and the shards can disagree: each has
+                        // its own commit history, so one may have a generation at or before the instant and
+                        // another may not. The all-or-nothing guarantee this action exists for means finding
+                        // that out for every shard before moving any head, so the resolution runs twice --
+                        // here to validate, and again inside the shard action that performs it. Reading a
+                        // manifest list twice is the price of not half-restoring an index.
+                        java.util.Optional<org.opensearch.serverless.storage.manifest.CommitManifest> resolved =
+                            org.opensearch.serverless.storage.retention.PitrRestoreResolution.newestAtOrBefore(
+                                new org.opensearch.serverless.storage.manifest.BlobContainerManifestStore(container).listManifests(),
+                                request.restoreToMillis()
+                            );
+                        boolean pinnedAtInstant = resolved.isPresent()
+                            && pins.stream()
+                                .anyMatch(
+                                    pin -> pin.generation() == resolved.get().generation()
+                                        && pin.primaryTerm() == resolved.get().primaryTerm()
+                                );
+                        if (pinnedAtInstant == false) {
+                            listener.onFailure(
+                                new IllegalStateException(
+                                    "shard ["
+                                        + indexUuid
+                                        + "/"
+                                        + shardId
+                                        + "] cannot be restored to ["
+                                        + request.restoreToMillis()
+                                        + "]: "
+                                        + (resolved.isEmpty()
+                                            ? "it has no generation at or before that instant"
+                                            : "the generation that answers for it is not pinned, so garbage "
+                                                + "collection may reclaim what it refers to")
+                                        + "; refusing to restore any shard of ["
+                                        + request.indexName()
+                                        + "] until every shard can be restored to the same instant"
+                                )
+                            );
+                            return;
+                        }
+                        continue;
+                    }
                     boolean pinned = pins.stream().anyMatch(pin -> pin.pinId().equals(request.snapshotId()));
                     if (pinned == false) {
                         listener.onFailure(
@@ -129,7 +170,7 @@ public class TransportIndexSnapshotRestoreAction extends HandledTransportAction<
                         return;
                     }
                 }
-                restoreShard(indexUuid, numberOfShards, 0, request.snapshotId(), listener);
+                restoreShard(indexUuid, numberOfShards, 0, request, listener);
             } catch (Exception e) {
                 listener.onFailure(e);
             }
@@ -140,17 +181,24 @@ public class TransportIndexSnapshotRestoreAction extends HandledTransportAction<
         String indexUuid,
         int numberOfShards,
         int shardId,
-        String snapshotId,
+        IndexSnapshotRestoreRequest request,
         ActionListener<IndexSnapshotRestoreResponse> listener
     ) {
         if (shardId == numberOfShards) {
             listener.onResponse(new IndexSnapshotRestoreResponse(numberOfShards));
             return;
         }
+        // The instant travels to each shard rather than a generation resolved here, deliberately. Shards
+        // have their own commit histories, so one instant is one generation per shard and not one across
+        // the index; resolving centrally would restore every shard to whichever shard happened to be asked
+        // first.
+        SnapshotRestoreRequest shardRequest = request.restoresToInstant()
+            ? SnapshotRestoreRequest.toInstant(indexUuid, shardId, request.restoreToMillis())
+            : new SnapshotRestoreRequest(indexUuid, shardId, request.snapshotId());
         client.execute(
             SnapshotRestoreAction.INSTANCE,
-            new SnapshotRestoreRequest(indexUuid, shardId, snapshotId),
-            ActionListener.wrap(response -> restoreShard(indexUuid, numberOfShards, shardId + 1, snapshotId, listener), listener::onFailure)
+            shardRequest,
+            ActionListener.wrap(response -> restoreShard(indexUuid, numberOfShards, shardId + 1, request, listener), listener::onFailure)
         );
     }
 }
