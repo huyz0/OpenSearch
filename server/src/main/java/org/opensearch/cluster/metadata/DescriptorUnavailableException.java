@@ -16,7 +16,7 @@ import org.opensearch.core.rest.RestStatus;
  *
  * <p><b>Why this type exists.</b> A gated index has no cluster state entry, so the descriptor store is the
  * only thing that can answer whether its name is taken. That store swallowed every failure and returned
- * null, and null already meant "no such index". So a node that could not reach the descriptor index
+ * null, and null already meant "no such index". So a node that could not reach the descriptor store
  * reported every gated index in the cluster as non-existent, with nothing in the response to say otherwise.
  * A client acting on that answer could reasonably create an index that already exists.
  *

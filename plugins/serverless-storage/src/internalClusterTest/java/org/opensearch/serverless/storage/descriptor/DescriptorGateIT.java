@@ -116,11 +116,12 @@ public class DescriptorGateIT extends org.opensearch.serverless.storage.Serverle
         createIndex("recorded-index");
 
         // assertBusy rather than a bare read: the publish hook runs on the cluster state thread, so the
-        // write is asynchronous by necessity (see DescriptorStore.putAsync) and a bare read would race it.
+        // write is asynchronous by necessity (see BlobDescriptorBackend.putAsync) and a bare read would
+        // race it.
         assertBusy(() -> {
             IndexDescriptor recorded = readWhenAvailable(store, "recorded-index");
             assertNotNull(
-                "creating an index must record a descriptor, or the descriptor index is a write-only "
+                "creating an index must record a descriptor, or the descriptor store is a write-only "
                     + "fixture that resolution can never find anything in",
                 recorded
             );
@@ -133,8 +134,8 @@ public class DescriptorGateIT extends org.opensearch.serverless.storage.Serverle
      * Reads inside a polling loop, treating "cannot tell yet" as "not yet" rather than as a failure.
      *
      * <p>T12 made the store distinguish a descriptor that is absent from one it could not read, because
-     * conflating the two reported every gated index as non-existent whenever the descriptor index was
-     * unreachable. A descriptor index created moments ago is briefly unreadable while its shard allocates,
+     * conflating the two reported every gated index as non-existent whenever the store was
+     * unreachable. A descriptor written moments ago can briefly be unreadable,
      * and that is a genuine "cannot tell", so the store is right to say so.
      *
      * <p>A loop waiting for a write to land is then right to keep waiting rather than to fail, which is
@@ -145,7 +146,7 @@ public class DescriptorGateIT extends org.opensearch.serverless.storage.Serverle
         try {
             return store.get(name);
         } catch (org.opensearch.cluster.metadata.DescriptorUnavailableException e) {
-            throw new AssertionError("descriptor index not readable yet for [" + name + "]", e);
+            throw new AssertionError("descriptor not readable yet for [" + name + "]", e);
         }
     }
 

@@ -18,7 +18,7 @@ import org.opensearch.core.rest.RestStatus;
  * even though they share a type.
  *
  * <p><b>A pattern that is not a prefix</b> ({@code *-logs}, {@code a*b}) has no range to scan. The
- * descriptor index is sorted by name, so {@code tenant-42-*} is a range and anything with a leading or
+ * descriptor store lists by name, so {@code tenant-42-*} is a bounded listing and anything with a leading or
  * embedded star is a scan of every name in the population. At a hundred million indices that is not a slow
  * answer, it is no answer, and supporting it needs a second global structure keyed on reversed names.
  *

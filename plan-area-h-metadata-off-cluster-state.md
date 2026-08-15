@@ -1,5 +1,33 @@
 # Area H: take index metadata out of cluster state entirely
 
+> **Correction, 2026-08-15: the storage medium in this document was replaced, and several sections argue
+> from it.** Area H shipped, and the ceiling it targets is cleared -- a gated creation leaves zero cluster
+> state bytes, measured in bytes. What changed is *where* a descriptor lives. This document designs it as a
+> **system index** (H2, and everything downstream that reasons about refresh intervals, searches,
+> aggregations and `DescriptorStore`); that index was removed on 2026-08-05 and descriptors are blobs in
+> object storage, addressed by name, created with a register compare-and-swap.
+>
+> What that invalidates, section by section, rather than in general:
+>
+> - **H2's resolution mechanism.** A point read is a `GET` on an object, not a document fetch; wildcard
+>   expansion is a bounded `ListObjectsV2`, not a search.
+> - **H18's freshness contract** (the exact-versus-wildcard split at "different freshness because they read
+>   the descriptor index by different means"). That difference was a property of an index's translog versus
+>   its segments. Object store list consistency replaces it and **has never been measured** -- the open item
+>   is carried in `plan-100m-index-implementation.md`.
+> - **The refresh interval as an API-visible parameter.** There is no index to refresh. Nothing replaces it
+>   yet, which is the same open item.
+> - **Field type statistics as a terms aggregation over the descriptor index.** They come from a write-behind
+>   projection into `.opensearch-index-mappings` now, which is the only surviving index in this design and is
+>   a derived copy rather than a source of truth.
+> - **`DescriptorStore` and its swallow-and-return-null read.** The class is gone. `BlobDescriptorBackend`
+>   distinguishes absent from unreadable, which is the opposite of what the paragraph here describes and was
+>   a deliberate later correction.
+>
+> The measurements and the reasoning about *why* metadata had to leave cluster state are unaffected: they are
+> about `Metadata.Builder.build()` and per-index cluster state cost, neither of which depends on where the
+> record was put instead. Left in place rather than rewritten, so the design's actual history stays legible.
+
 ## H.0 Goal
 
 Index creation costs the same at 100 million indices as at zero, and no node holds a structure with one
@@ -455,8 +483,12 @@ than an internal tuning knob, since it is exactly the staleness bound for wildca
 off, which S27 and H18 both do for measurement reasons, would make wildcards permanently stale in
 production.
 
-Pinned by `DescriptorFreshnessContractIT`, with refresh disabled outright rather than left at its default,
-so neither arm can pass by being slower than a one second interval.
+Pinned at the time by `DescriptorFreshnessContractIT`, with refresh disabled outright so neither arm could
+pass by being slower than a one second interval. That test was deleted on 2026-08-15: with descriptors in
+object storage it created an ordinary index named `descriptors` and measured OpenSearch's get-versus-search
+semantics, which is a true statement about an index and no statement at all about this design. **The
+contract this section states is therefore unowned**, and what replaces it -- the object store's list
+consistency -- is unmeasured. See the header correction at the top of this document.
 
 ## H.10h Cluster stats, the same pair of problems and the least visible instance
 

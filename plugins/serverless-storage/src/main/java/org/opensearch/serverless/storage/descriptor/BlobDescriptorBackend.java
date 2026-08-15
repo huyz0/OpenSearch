@@ -87,7 +87,7 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
     private final Executor executor;
 
     /**
-     * The same read path {@code DescriptorStore} uses, which is the reuse T7 extracted it for.
+     * The read path the index-backed store used, which is the reuse T7 extracted it for.
      *
      * <p>T7 moved the freshness window, eviction and in-flight collapsing out of the store so "the blob
      * backend reuses it rather than growing a second copy", and then the blob backend never took it. Every
@@ -159,9 +159,10 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
      * The form that names its own clock and capacity, so the cache's behaviour can be exercised without
      * sleeping or admitting fifty thousand descriptors to reach the bound.
      *
-     * <p>These were seams on {@code DescriptorStore} and nowhere else, which is why the tests that use them
-     * were the tests still pinned to the system index. Both backends wrap the same {@link DescriptorCache},
+     * <p>These were seams on the index-backed store and nowhere else, which is why the tests that use them
+     * were the tests still pinned to the system index. Both backends wrapped the same {@link DescriptorCache},
      * so the behaviour under test was never index-specific -- only the constructor that could reach it was.
+     * The index-backed store is gone; these seams are why its tests did not go with it.
      */
     public BlobDescriptorBackend(
         BlobContainer blobContainer,

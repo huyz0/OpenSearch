@@ -29,10 +29,11 @@ import java.util.function.LongSupplier;
  *
  * <h2>Why this is its own class</h2>
  *
- * It was inside {@code DescriptorStore}, which was fine while there was one backend. There are about to be
- * two, and every property below was paid for by a measurement that a second copy would have to re-derive.
- * T3's audit put it plainly: duplicating this per backend is two chances to get it subtly different, on
- * the path where being subtly different is invisible.
+ * It lived inside the index-backed descriptor store, which was fine while that was the only backend. It
+ * was extracted when a second one arrived, and every property below was paid for by a measurement a second
+ * copy would have had to re-derive. T3's audit put it plainly: duplicating this per backend is two chances
+ * to get it subtly different, on the path where being subtly different is invisible. The index-backed store
+ * was removed on 2026-08-05 and this outlived it, which is the outcome the extraction was for.
  *
  * <p>It also matters much more against an object store than it did against a system index. A miss went
  * from about half a millisecond to a network round trip, so collapsing stopped being an optimisation:

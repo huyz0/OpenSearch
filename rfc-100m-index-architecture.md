@@ -271,7 +271,9 @@ no such constraint, which is exactly why top-K applies to them and where the cac
   moved by at most 6 points. Over the 36 runs T42 added, the ratio in a settled round ran 1.4x to
   4.1x, and 4.3x to 10.6x in an unwarmed one, at concurrency 8. The share is the finding; the multiple depends on how
   warm the mapping index is.
-- `.opensearch-index-mappings` is a second system index, one shared index rather than one per tenant.
+- `.opensearch-index-mappings` is the one index this design still uses, shared rather than one per tenant --
+  and since mappings moved into the descriptor it is a write-behind projection kept so field type counts
+  stay one search, not a source of truth. Losing it costs a statistic, not a mapping.
   It was described here as a fixed-geometry funnel on the mapping write path. **T46 measured that and
   found nothing.** Three shard counts, 1, 5 and 20, one cluster each because the geometry cannot be
   varied within a cluster, three runs apiece, decision rule fixed before the runs: condition medians

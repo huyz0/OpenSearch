@@ -24,14 +24,16 @@ import java.util.concurrent.atomic.AtomicReference;
  * is the same reasoning behind {@code MappingGenerationStore.updateMapping} taking fields to add rather
  * than a replacement map.
  *
- * <p>In production this is backed by a terms aggregation over the descriptor index, which costs one search
- * regardless of how many indices it summarises. With nothing registered, stats behave exactly as before,
- * so a cluster that has never gated an index is untouched.
+ * <p>In production this is backed by a terms aggregation over {@code .opensearch-index-mappings}, which
+ * costs one search regardless of how many indices it summarises. That index was where gated mappings lived
+ * when this was written; since they moved into the descriptor it is a write-behind projection kept for
+ * exactly this query, which is the only reason it still exists. With nothing registered, stats behave
+ * exactly as before, so a cluster that has never gated an index is untouched.
  *
- * <p>The counts are inherently as fresh as the descriptor index's last refresh, for the reason H18
- * established: an aggregation is a search. A statistic bounded by the refresh interval is the right
- * trade here, since the alternative is a statistic bounded by nothing because it was too expensive to
- * compute.
+ * <p>The counts are inherently as fresh as that projection's last refresh, because an aggregation is a
+ * search -- and, since the projection is written behind the mapping rather than with it, as fresh as
+ * whatever has been projected. Both bounds are the right trade here: the alternative is a statistic bounded
+ * by nothing because it was too expensive to compute.
  */
 public final class GatedMappingStatsAggregator {
 

@@ -86,7 +86,7 @@ public abstract class ServerlessStorageIntegTestCase extends OpenSearchIntegTest
     /**
      * Installs the descriptor plane the plugin actually runs, backed by an object store.
      *
-     * <p>Every test here used to install an index-backed {@code DescriptorStore} instead, so the suite
+     * <p>Every test here used to install an index-backed descriptor store, since removed, so the suite
      * exercised a backend production does not use. That is the defect this branch keeps finding elsewhere --
      * a mechanism tested and unreachable, or reached and untested -- so the fixture is now the wiring itself
      * rather than something adjacent to it.

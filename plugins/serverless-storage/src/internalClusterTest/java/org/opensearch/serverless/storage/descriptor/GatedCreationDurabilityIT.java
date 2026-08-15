@@ -26,17 +26,19 @@ import java.util.List;
  *
  * <p>It then calls {@code IndexDescriptorPublisher.publish}, which returns whether a publisher was
  * <em>invoked</em>, not whether the write <em>landed</em>. The publisher registered by {@code DescriptorGate}
- * routes a live descriptor to {@code DescriptorStore.putAsync}, which submits and returns, logging failures
- * at warn.
+ * routes a live descriptor to {@code BlobDescriptorBackend.putAsync}, which submits and returns, logging
+ * failures at warn.
  *
  * <p>So on the reading of the code, an acknowledged creation means the write was submitted. This test exists
  * because that reading has been wrong repeatedly in this area: the temporary {@code IndexService} looked
  * like the cost of creation and was not, and the cluster state queue looked like its ceiling and was not.
  * The question is settled by making the descriptor write fail and seeing what the client is told.
  *
- * <p>The failure is arranged by closing the descriptor index, which is a real condition rather than an
- * injected fault: a closed or unavailable descriptor index is what a node sees during a restart or when the
- * index is red.
+ * <p>The failure is arranged by making the descriptor container refuse writes, which is a real condition
+ * rather than an injected fault: an object store that is unreachable, throttling or returning errors is what
+ * a node sees often enough to design for. It used to be arranged by closing the descriptor system index,
+ * which is where the wording of the assertions below comes from; that index was removed on 2026-08-05 and a
+ * bucket cannot be closed, so the injection moved to the container.
  */
 public class GatedCreationDurabilityIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
 
@@ -87,7 +89,7 @@ public class GatedCreationDurabilityIT extends org.opensearch.serverless.storage
         return installOverFailableContainer(container).points();
     }
 
-    /** The control: with a healthy descriptor index, an acknowledged creation is a real index. */
+    /** The control: with a healthy descriptor store, an acknowledged creation is a real index. */
     public void testAnAcknowledgedCreationNormallyExists() throws Exception {
         BlobDescriptorBackend store = install();
 
@@ -97,11 +99,11 @@ public class GatedCreationDurabilityIT extends org.opensearch.serverless.storage
     }
 
     /**
-     * The question. With the descriptor index closed, the descriptor write cannot land. Does the client
+     * The question. With the container refusing writes, the descriptor write cannot land. Does the client
      * still get an acknowledgement for an index that does not exist anywhere?
      *
      * <p><b>It does. This test fails, and it is committed failing on purpose.</b> Measured:
-     * {@code acknowledged=true} with the descriptor index closed, and the descriptor absent afterwards. So
+     * {@code acknowledged=true} with the store unwritable, and the descriptor absent afterwards. So
      * a gated creation reports success for an index that exists in no cluster state entry and no
      * descriptor, which is the one outcome the design says must not happen.
      *
@@ -123,7 +125,8 @@ public class GatedCreationDurabilityIT extends org.opensearch.serverless.storage
     public void testAcknowledgementWhenTheDescriptorWriteCannotLand() throws Exception {
         BlobDescriptorBackend store = install();
 
-        // Force the descriptor index into existence, then close it so writes to it fail.
+        // One creation that must succeed first, so the container is failing rather than merely untouched
+        // when the creation under test runs.
         assertTrue(client().admin().indices().create(gated("seed-idx")).actionGet().isAcknowledged());
         assertBusy(() -> assertNotNull(readWhenAvailable(store, "seed-idx")));
         container.failing = true;
@@ -138,7 +141,7 @@ public class GatedCreationDurabilityIT extends org.opensearch.serverless.storage
         }
 
         logger.warn(
-            "T17: gated creation of [doomed-idx] returned acknowledged={} while the descriptor index was "
+            "T17: gated creation of [doomed-idx] returned acknowledged={} while the descriptor store was "
                 + "closed, so the descriptor write could not have landed",
             acknowledged
         );
@@ -157,7 +160,7 @@ public class GatedCreationDurabilityIT extends org.opensearch.serverless.storage
 
     /**
      * Reads inside a polling loop, treating "cannot tell yet" as "not yet". T12 made the store distinguish
-     * an absent descriptor from an unreadable one, and a descriptor index whose shard is still recovering
+     * an absent descriptor from an unreadable one, and a store that is briefly unreachable
      * is genuinely unreadable, so a loop waiting for a write to land should keep waiting.
      */
     private static org.opensearch.cluster.metadata.IndexDescriptor readWhenAvailable(BlobDescriptorBackend store, String name)
@@ -165,7 +168,7 @@ public class GatedCreationDurabilityIT extends org.opensearch.serverless.storage
         try {
             return store.get(name);
         } catch (org.opensearch.cluster.metadata.DescriptorUnavailableException e) {
-            throw new AssertionError("descriptor index not readable yet for [" + name + "]", e);
+            throw new AssertionError("descriptor not readable yet for [" + name + "]", e);
         }
     }
 

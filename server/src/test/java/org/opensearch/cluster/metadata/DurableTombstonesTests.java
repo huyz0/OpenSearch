@@ -95,7 +95,7 @@ public class DurableTombstonesTests extends OpenSearchTestCase {
      * resurrect the index later.
      */
     public void testAFailedWriteFailsTheDelete() {
-        DurableTombstones.register((deleted, whenStored) -> whenStored.onFailure(new IllegalStateException("descriptor index down")));
+        DurableTombstones.register((deleted, whenStored) -> whenStored.onFailure(new IllegalStateException("descriptor store down")));
 
         AtomicBoolean acknowledged = new AtomicBoolean();
         AtomicReference<Exception> failure = new AtomicReference<>();

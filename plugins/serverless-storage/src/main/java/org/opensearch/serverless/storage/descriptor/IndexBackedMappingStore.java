@@ -65,7 +65,13 @@ public final class IndexBackedMappingStore implements MappingGenerationStore.Sto
 
     private static final Logger logger = LogManager.getLogger(IndexBackedMappingStore.class);
 
-    /** Where gated mappings live. Separate from the descriptor index because they change independently. */
+    /**
+     * Where the field type counts for gated mappings are projected.
+     *
+     * <p>Named for what it was: the place gated mappings lived, separate from the descriptors because they
+     * changed independently. T58 moved them into the descriptor and left this as a derived copy whose only
+     * reader is the stats aggregator.
+     */
     public static final String MAPPING_INDEX = ".opensearch-index-mappings";
 
     /**

@@ -76,7 +76,7 @@ public final class StoreBackedFieldRefresher implements UnknownFieldRefresh.Refr
      * What this node merged for an index, when it last asked the store, and when it was written.
      *
      * <p>{@code checkedAtNanos} answers the recheck window and {@code stamp} orders eviction. They are
-     * separate for the reason T4 found in {@code DescriptorStore}: entries written within one clock tick
+     * separate for the reason T4 found in the descriptor cache: entries written within one clock tick
      * share a timestamp, and an eviction threshold taken from equal stamps evicts nothing.
      */
     private record Checked(long generation, long checkedAtNanos, long stamp) {
@@ -143,7 +143,7 @@ public final class StoreBackedFieldRefresher implements UnknownFieldRefresh.Refr
             return;
         }
         // A threshold from one pass rather than a sorted eviction list, matching what
-        // GatedShardSuspensionRegistry and DescriptorStore both do, so there is one eviction shape here
+        // GatedShardSuspensionRegistry and DescriptorCache both do, so there is one eviction shape here
         // rather than three.
         long threshold = ordered[Math.min(toEvict, ordered.length - 1)];
         mergedGeneration.entrySet().removeIf(entry -> entry.getValue().stamp() < threshold);

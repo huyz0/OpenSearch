@@ -258,7 +258,8 @@ public class GatedEndToEndIT extends org.opensearch.serverless.storage.Serverles
             client().prepareIndex(name).setId("0").setSource("tenant", name).get();
         }
         client().admin().indices().prepareRefresh(created.toArray(new String[0])).get();
-        // The expansion is a search over the descriptor index, which is refresh-bound by H18.
+        // The expansion is a listing over object storage, and what a listing can see lags what a point
+        // read can by a bound this design has not measured.
 
         long start = System.nanoTime();
         SearchResponse response = client().prepareSearch("e2e-tenant-*").setQuery(QueryBuilders.matchAllQuery()).setSize(0).get();

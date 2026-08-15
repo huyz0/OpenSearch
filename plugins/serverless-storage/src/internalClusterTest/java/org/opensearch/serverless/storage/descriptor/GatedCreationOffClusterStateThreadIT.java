@@ -111,11 +111,11 @@ public class GatedCreationOffClusterStateThreadIT extends org.opensearch.serverl
     public void testAGatedCreationCompletesWhileTheClusterStateThreadIsHeld() throws Exception {
         installGate();
 
-        // The descriptor index is created by the first gated write, and creating it is itself an ordinary
-        // cluster state update. Doing that here, before the thread is blocked, keeps the test measuring the
-        // steady state rather than the bootstrap -- otherwise the first gated creation would be waiting on an
-        // index creation that genuinely does need the thread, and would fail for a reason that has nothing to
-        // do with what this is asserting.
+        // The mapping projection index is created by the first gated creation that carries a mapping, and
+        // creating it is itself an ordinary cluster state update. Doing that here, before the thread is
+        // blocked, keeps the test measuring the steady state rather than the bootstrap -- otherwise the
+        // first gated creation would be waiting on an index creation that genuinely does need the thread,
+        // and would fail for a reason that has nothing to do with what this is asserting.
         createGated("gated-warmup");
 
         CountDownLatch release = new CountDownLatch(1);

@@ -15,7 +15,7 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * P8. How many times resolving a name goes to the descriptor index.
+ * P8. How many times resolving a name goes to the descriptor store.
  *
  * <p>{@code AbsentIndexDescriptorSuppliers} states that a supplier is expected to answer from a cache. This
  * one had none: every call issued a real get. Resolution consults it per unresolved name per request, and

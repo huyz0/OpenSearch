@@ -89,11 +89,12 @@ public class DescriptorLifecycleIT extends org.opensearch.serverless.storage.Ser
 
         // 3. Findable by wildcard once refreshed.
         //
-        // Deliberately only the positive half. The negative half, that a wildcard cannot see it *before* a
-        // refresh, is real but timing-dependent here: W8 gives the descriptor index a one second refresh
-        // interval, so an automatic refresh can land between the write and the check. Asserting it here
-        // would be asserting a race, which is what DescriptorFreshnessContractIT avoids by disabling
-        // refresh outright. That test owns the contract; this one owns the lifecycle.
+        // Deliberately only the positive half. The negative half -- that a wildcard cannot see a name
+        // *before* it is visible to a listing -- is real and this is not the place to assert it. It used to
+        // be a refresh interval on the descriptor system index, with a companion test that disabled refresh
+        // to pin the contract down; that index is gone, wildcard expansion is a listing over object storage,
+        // and what bounds its freshness is the store's list consistency. Nothing here measures that, and
+        // the open item is carried in plan-100m-index-implementation.md rather than asserted as a race.
         //
         // Recorded rather than quietly dropped because the first version of this test did assert the race,
         // and it passed until W12's run happened to be slow enough to expose it.

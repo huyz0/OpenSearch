@@ -1031,6 +1031,12 @@ was merge policy. The term dictionary contributes about five percent per decade,
 So the descriptor index does not become the new ceiling, and 100M lookup is a design parameter rather than
 a fact to be accepted.
 
+> **Superseded.** Every number in this section -- the segment counts, the term dictionary growth, the merge
+> policy conclusion -- is a measurement of the descriptor system index, which was removed on 2026-08-05. A
+> blob store has no segments and no term dictionary, so the finding does not carry over in either direction:
+> it is neither reassurance nor a warning about what ships. Lookup on the blob plane is unmeasured, and that
+> is the first open item in the seventh review at the end of this document.
+
 ### The ceilings, fourth pass
 
 | ceiling | state |
@@ -1198,10 +1204,11 @@ Everything the fifth and sixth reviews rest on was measured against the index th
 
 **So both "operational parameters that are now load-bearing" are no longer parameters of the shipped
 system.** Merge policy bounds nothing here: there is no descriptor index to merge. Refresh interval bounds
-nothing here: a wildcard is a LIST, not a search. `DescriptorFreshnessContractIT` still passes, and reading
-it shows why that is not reassurance -- it creates an ordinary index literally named `descriptors` and
-measures OpenSearch's own get-versus-search semantics. It is a true statement about an index, and no longer
-a statement about this design.
+nothing here: a wildcard is a LIST, not a search. `DescriptorFreshnessContractIT` still passed, and reading
+it showed why that was not reassurance -- it created an ordinary index literally named `descriptors` and
+measured OpenSearch's own get-versus-search semantics. A true statement about an index, and no longer a
+statement about this design, so it was deleted on 2026-08-15 rather than left to be read as coverage of a
+contract it no longer touches. The contract itself is unowned and is item 3 below.
 
 What replaces them is not measured. Object-store list consistency is now what bounds wildcard freshness, and
 nothing in this repository has measured it, because nothing in this repository has run against a real object

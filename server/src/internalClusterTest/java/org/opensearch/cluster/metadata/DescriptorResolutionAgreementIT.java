@@ -40,7 +40,7 @@ import static org.opensearch.test.hamcrest.OpenSearchAssertions.assertAcked;
  */
 public class DescriptorResolutionAgreementIT extends OpenSearchIntegTestCase {
 
-    /** Descriptors recorded by the dual write, keyed by name, standing in for the descriptor index. */
+    /** Descriptors recorded by the dual write, keyed by name, standing in for the descriptor store. */
     private final Map<String, IndexDescriptor> published = new ConcurrentHashMap<>();
 
     @After

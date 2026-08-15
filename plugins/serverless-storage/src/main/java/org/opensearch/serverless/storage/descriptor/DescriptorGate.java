@@ -220,7 +220,7 @@ public final class DescriptorGate {
         IndexDescriptorPublisher.register(descriptor -> {
             // Which name is being written and whether it is a tombstone. Descriptor writes are asynchronous,
             // so they are hard to attribute after the fact: a write that lands after a test has finished
-            // shows up only as the descriptor index reappearing, with nothing saying what wrote to it.
+            // shows up only as a descriptor reappearing, with nothing saying what wrote it.
             logger.debug("publishing descriptor for [{}], exists [{}]", descriptor.name(), descriptor.exists());
             DescriptorBackedMappingStore.registerDescriptor(descriptor);
             if (descriptor.exists()) {
@@ -431,7 +431,7 @@ public final class DescriptorGate {
      * <p>What the log carries is cache invalidation and shard release on other nodes, applied by
      * {@code DescriptorChangeTailer}. It once also fed an in-memory name index on every node; that index
      * was removed because no request path read it and wildcards are answered by a prefix search over the
-     * descriptor index instead, which is one sharded structure rather than a copy per node.
+     * descriptor store instead, which is one shared structure rather than a copy per node.
      *
      * <p>Optional on purpose. A deployment with no object store configured still publishes descriptors,
      * and a null log simply means nothing is recorded, which is what the setter's absence already meant.

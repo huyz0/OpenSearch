@@ -121,7 +121,7 @@ public class GatedMappingStatsGapTests extends OpenSearchTestCase {
 
     /** A failing aggregate leaves ordinary stats intact rather than failing the whole stats call. */
     public void testAFailingAggregateLeavesOrdinaryStatsIntact() throws Exception {
-        GatedMappingStatsAggregator.register(() -> { throw new IllegalStateException("descriptor index down"); });
+        GatedMappingStatsAggregator.register(() -> { throw new IllegalStateException("descriptor store down"); });
         ClusterState state = ClusterState.builder(ClusterName.DEFAULT)
             .metadata(Metadata.builder().put(ordinaryIndexWithKeywordField("ordinary"), false).build())
             .build();

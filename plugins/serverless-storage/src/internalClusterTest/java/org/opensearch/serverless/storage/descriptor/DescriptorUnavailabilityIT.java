@@ -46,26 +46,27 @@ public class DescriptorUnavailabilityIT extends org.opensearch.serverless.storag
         AbsentIndexDescriptorSuppliers.register(null);
     }
 
-    /** Before the first gated creation there is no descriptor index, and absent is the true answer. */
+    /** Before the first gated creation the store holds nothing, and absent is the true answer. */
     public void testNoDescriptorIndexMeansGenuinelyAbsent() throws Exception {
         container = newFailableDescriptorContainer();
         BlobDescriptorBackend store = installOverFailableContainer(container).points();
 
         assertNull(
-            "with no descriptor index at all, nothing has ever been gated, so a name is genuinely free. "
+            "with nothing in the store at all, nothing has ever been gated, so a name is genuinely free. "
                 + "This is the case the original blanket catch was written for and it must keep working",
             store.get("never-created")
         );
     }
 
-    /** A descriptor index that exists but cannot be read must not answer absent. */
+    /** A store that exists but cannot be read must not answer absent. */
     public void testAnUnreadableDescriptorIndexIsNotAnAbsentIndex() throws Exception {
         container = newFailableDescriptorContainer();
         BlobDescriptorBackend store = installOverFailableContainer(container).points();
         store.create(descriptor("real-idx"));
         assertNotNull("the premise: this index exists and resolves", store.get("real-idx"));
 
-        // Close the descriptor index. It still exists, so this is "cannot read" rather than "never
+        // Make the container refuse reads. The descriptors are still there, so this is "cannot read"
+        // rather than "never
         // created", which is exactly the pair the old blanket catch could not tell apart.
         container.failing = true;
         store.invalidate("real-idx");

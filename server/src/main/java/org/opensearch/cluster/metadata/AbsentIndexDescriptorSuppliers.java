@@ -182,8 +182,9 @@ public final class AbsentIndexDescriptorSuppliers {
      * <p>The whole point is the {@code size} argument. H16 measured that pagination sorts the entire
      * population to produce one page, so making gated indices visible by folding them into that sort would
      * have made the cost problem worse while appearing to fix the correctness one. A pager is asked for a
-     * page and returns a page, which is what the descriptor index can actually do cheaply: S24 measured
-     * paging by sorted name with {@code search_after} at roughly 33 ms per thousand names.
+     * page and returns a page, which is what a store keyed by name can actually do cheaply: S24 measured
+     * paging by sorted name at roughly 33 ms per thousand names, against the descriptor system index of the
+     * time; object storage lists keys in the same order, so the shape of the answer outlived the medium.
      */
     public static List<IndexDescriptor> supplyAll(List<String> indexNames) {
         if (isRegistered() == false || indexNames == null || indexNames.isEmpty()) {
@@ -242,8 +243,8 @@ public final class AbsentIndexDescriptorSuppliers {
      * Expands a prefix over gated indices.
      *
      * <p>Prefix rather than pattern, and that is the contract rather than an implementation detail. The
-     * descriptor index is sorted by name, so a prefix is a range scan and anything else is a scan of the
-     * whole population. An expander is never asked to answer {@code *-logs}, because at a hundred million
+     * descriptor store is keyed by name and lists in that order, so a prefix is a bounded listing and
+     * anything else is a scan of the whole population. An expander is never asked to answer {@code *-logs}, because at a hundred million
      * indices there is no answer to give.
      *
      * <p>The cap lives in the implementation rather than here, so the policy stays with the component that

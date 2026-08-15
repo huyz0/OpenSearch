@@ -418,10 +418,11 @@ public class BlobBackedDescriptorIT extends org.opensearch.serverless.storage.Se
         awaitDescriptor("logs-two");
         awaitDescriptor("metrics-one");
 
-        // Retried rather than read once, because a wildcard is refresh-bound by design. H18 made the
-        // descriptor index's refresh_interval an explicit 1s so that staleness is a stated bound instead of
-        // an accident, and awaitDescriptor above waits on the object store, which is the point half. A
-        // single read here asserts that the prefix half has already refreshed, which nothing promises.
+        // Retried rather than read once, because what a wildcard can see lags what a point read can. H18
+        // reasoned about that as an index's refresh interval; since descriptors became blobs it is the
+        // object store's list consistency instead, which is unmeasured and therefore not something to
+        // assert in one read. awaitDescriptor above waits on the point half, and a single read here would
+        // be asserting that a listing has already caught up, which nothing promises.
         assertBusy(() -> {
             SearchResponse search = client().prepareSearch("logs-*").setQuery(QueryBuilders.matchAllQuery()).setSize(0).get();
             assertEquals("a wildcard must reach both gated tenants and neither more nor fewer", 2, search.getTotalShards());

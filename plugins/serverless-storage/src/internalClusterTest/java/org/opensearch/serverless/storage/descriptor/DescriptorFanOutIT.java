@@ -44,7 +44,7 @@ import java.util.concurrent.TimeUnit;
  *
  * <p>Note what the wall clock says and does not say. Sixty-four reads took 19.4 ms rather than 64 x 2.7 ms
  * because they run in parallel, so collapsing them is not primarily a latency fix for one caller. It is a
- * load fix: at 100M indices the descriptor index is a shared resource, and multiplying every resolution by
+ * load fix: at 100M indices the descriptor store is a shared resource, and multiplying every resolution by
  * the shard count is how a shared resource becomes the ceiling.
  *
  * <p>This counts reads rather than asserting a collapser exists, following the P8 lesson that the failure
@@ -66,7 +66,7 @@ public class DescriptorFanOutIT extends org.opensearch.serverless.storage.Server
         BlobDescriptorBackend store = installBlobBackedDescriptorPlane().points();
         store.create(descriptor(NAME));
 
-        // Warm once, so the measurement is not paying for the descriptor index's first ever read.
+        // Warm once, so the measurement is not paying for the store's first ever read.
         assertNotNull(store.get(NAME));
 
         StringBuilder table = new StringBuilder("\nT1 concurrent resolution of one name\n");
