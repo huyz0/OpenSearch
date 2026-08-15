@@ -159,7 +159,7 @@ versioning, deny-delete and replication to be configured; and that the pin prote
 GC. This is the piece that prevents the next person from reading "snapshot" and believing they have a
 backup — which is exactly what the current documentation would let them believe.
 
-### 5. An independent copy, with OpenSearch as the compute
+### 5. An independent copy, with OpenSearch as the compute — PROVEN END TO END
 
 The one that changes what is possible rather than fixing what is misrouted. The design doc previously
 declined this on the grounds that `BlobContainer` has no `copyBlob` and no repository plugin uses
@@ -200,11 +200,30 @@ snapshot reads all of every file -- and nothing else exercised it.
 
 - ~~*Does a `Store` over a lazy directory yield a commit whose files can be read end to end?*~~ **Answered:
   yes.** The design above exists.
-- *Orchestration.* `snapshotShard` is normally driven by `SnapshotsService`, which also creates the
-  repository-side bookkeeping and calls `finalizeSnapshot`. Driving it from a plugin action means owning
-  that sequence. This is the part most likely to be larger than it looks.
+- ~~*Orchestration.*~~ **Answered.** `DeepSnapshotOrchestrationIT` copies a serverless index's bytes into an
+  `fs` repository from a data node, finalizes the snapshot, and then **restores it through core's ordinary
+  `_restore` API** under a new name, with every document coming back. Not "the files are there" — core
+  restores it, so what was written is a snapshot rather than something shaped like one.
+
+  Two things the doing taught, both of which shape the feature:
+
+  * **`Store#getMetadata` asserts the commit's directory is identity-equal to the store's own**, so the
+    commit has to be listed from `store.directory()` rather than from the lazy directory underneath it.
+    That is a good assertion — it is what stops a snapshot copying files from one directory while
+    describing another — and it is the kind of thing only building it finds.
+  * **The copy distributes; the finalization does not.** `finalizeSnapshot` submits a cluster state update
+    ("set pending repository generation"), so on any other node it fails `NotClusterManagerException`. The
+    copy itself has no such constraint: it ran on a data node, reading the object store and writing the
+    repository. So a deep snapshot is *one cluster-manager operation per snapshot* with all of the byte
+    movement off it — which is the right shape for this branch, since per-index cluster-manager work is
+    exactly what it spent the year removing.
 - *The opt-in.* `attemptEngineNativeSnapshot` returns a pointer unconditionally today; deep versus shallow
   has to become a choice, mirroring `remote_store_index_shallow_copy`'s shape.
+
+**What is left to ship it**, now that nothing about it is uncertain: a transport action that pins the
+generation, drives the copy per shard (parallelisable across nodes), finalizes on the cluster manager, and
+releases the pin on both paths; the deep-versus-shallow setting; and gated-index resolution, which item 1
+already built.
 
 ## Sequencing, and what "done" means for each
 
@@ -216,7 +235,7 @@ snapshot reads all of every file -- and nothing else exercised it.
 | 2b | **a restore must survive reopening** (new, found by 2) | reopened index still reads as restored | unknown until the cause is established |
 | 3 | audible omission | a wildcard snapshot on a gated cluster warns; asserted | small |
 | 4 | posture written down | one design page, linked from the snapshot page | small |
-| 5 | independent copy | **spike done: the commit is readable and correctly sized.** Orchestration next | rest medium |
+| 5 | independent copy | **proven: copied, finalized, and restored by core.** What remains is a shipped action, not a question | small–medium |
 
 Items 1–4 are each independently shippable and none depends on 5. Item 5's spike is the gate on whether the
 rest of it is a days-long piece or a different design entirely, so the spike is the deliverable that

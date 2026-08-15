@@ -284,6 +284,39 @@ write-behind projection kept only so the aggregate stays one search.
   `IndexBackedMappingStore`, so the suite stayed green against a store production did not register. The shared
   fixture now composes the store the way `ServerlessStoragePlugin` does.
 
+### A standard snapshot of a serverless index works: copied, finalized, restored by core
+
+The headline question of round 006, answered by building it. `DeepSnapshotOrchestrationIT` takes a
+serverless index's published manifest, opens a `LazyBundleDirectory` over it -- no live shard, no engine, no
+local Lucene directory -- wraps it in a `Store`, hands the commit to core's existing
+`Repository#snapshotShard`, finalizes, and then **restores the result through the ordinary `_restore` API**
+under a new name. All 25 documents come back, built from the repository's own copy of the bytes.
+
+That is an independent copy, in the standard repository format, restorable by a cluster that has never heard
+of this plugin -- with no new `BlobContainer` SPI, no repack format, no new restore path and no temporary
+disk. The design writeup had declined this as "new infrastructure from scratch" on the grounds that
+`BlobContainer` has no `copyBlob` and no plugin uses server-side copy; that objection is about an
+optimization, and once the node moves the bytes it does not apply.
+
+Two things the building taught:
+
+- **`Store#getMetadata` asserts the commit's directory is identity-equal to the store's own.** The commit
+  has to be listed from `store.directory()`, not from the lazy directory underneath. A good assertion: it is
+  what stops a snapshot copying files from one directory while describing another.
+- **The copy distributes; the finalization does not.** `finalizeSnapshot` submits a cluster state update, so
+  it fails `NotClusterManagerException` anywhere else, while the copy ran happily on a data node. A deep
+  snapshot is therefore one cluster-manager operation per snapshot with all the byte movement off it --
+  the right shape for a branch whose whole project was removing per-index cluster-manager work.
+
+Preceded by `BundleBackedCommitIsCopyableTests`, which proved the assumption everything rested on: a commit
+opened over bundles reads end to end, file by file, checksums verified -- 20 files and 12,953 bytes matching
+the local commit exactly, so nothing is copied that the commit does not name and nothing it names is missed.
+That is the opposite access pattern to the one the lazy directory was built for, and nothing else exercised
+it.
+
+**What is left is a shipped action rather than a question**: pin, copy per shard, finalize on the cluster
+manager, release; plus the deep-versus-shallow setting.
+
 ### Restore to a time works, and a restore does not survive reopening
 
 Round 006 item 2. `PitrRestoreResolution` answers which generation was current at an instant -- the newest
