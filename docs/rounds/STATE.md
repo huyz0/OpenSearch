@@ -154,6 +154,34 @@ that never finished. Projections are bounded at four in flight now. **Nothing in
 gated indices concurrently at any scale**, which is the population this product exists for, and that gap is
 what let a regression of this shape through a green run.
 
+### One name can be claimed in both planes, and it is not a race
+
+Found while checking a claim I had just written into `MetadataCreateIndexService` -- that an ordinary
+creation consults the descriptor store. It does not. `validate` checks the routing table, the metadata and
+the aliases, all of which are cluster state, and nothing on that path asks the descriptor store anything.
+
+Measured rather than argued (`GatedAndOrdinaryNameCollisionIT`):
+
+- **gated `x`, then ordinary `x`: both granted.** Sequentially, no concurrency. The descriptor stays live
+  and cluster state gains an index of the same name with a different uuid.
+- **ordinary `x`, then gated `x`: refused**, because a gated creation validates its name against cluster
+  state like any other. Only one of the two orders is open, and it is the one where the authority holding
+  the name is the one nobody asks.
+
+**What it costs.** Resolution consults metadata before the supplier, so the ordinary index shadows the gated
+one: the client that created the gated index was told it exists and can no longer address it. Nothing
+reconciles the two, so this does not converge -- it is not eventual consistency. Delete the ordinary index
+and the descriptor unshadows, so the name comes back as a different index with a different uuid and no data.
+No documents are destroyed at any point, but a name silently changing identity is indistinguishable from
+loss to whoever was writing to it.
+
+**Why the obvious fix does not fit.** Teaching `validateIndexName` to ask the descriptor store puts a
+blocking object-store read inside the cluster state update task, which is the deadlock W4 already paid for.
+The check has to move to the request path, before the task is submitted.
+
+Left failing-but-visible with `AwaitsFix` rather than weakened, the same way `GatedCreationDurabilityIT`
+keeps T17. Nothing about the distribution change opened this and nothing about it widens this direction.
+
 ### The mapper-service lock, and the change log's one prefix
 
 Both found by asking why creation is slow now that the descriptor system index is gone, and both fixed.

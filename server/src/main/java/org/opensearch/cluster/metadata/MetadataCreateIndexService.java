@@ -469,11 +469,16 @@ public class MetadataCreateIndexService {
      * A gated creation checks the name against the cluster state snapshot it can see. On the cluster
      * manager that snapshot is as fresh as anything gets; on another node it can be one publication behind,
      * so the window in which an ordinary index of the same name is created and not yet visible here grows
-     * from thread-scheduling lag to publication lag. The race is not new -- gated creation has run off the
-     * cluster state thread since T49, so the manager never serialised against its own publications either
-     * -- and the reverse direction is closed, because an ordinary creation consults the descriptor store
-     * through {@code AbsentIndexDescriptorSuppliers#exists}. Closing this direction needs a commit across
-     * both stores, which is not this change.
+     * from thread-scheduling lag to publication lag. The race is not new: gated creation has run off the
+     * cluster state thread since T49, so the manager never serialised against its own publications either.
+     *
+     * <p><b>The reverse direction is not closed, and this change neither opens nor widens it.</b> An
+     * earlier version of this paragraph claimed an ordinary creation consults the descriptor store. It does
+     * not -- {@link #validate} checks the routing table, the metadata and the aliases, all of which are
+     * cluster state -- so an ordinary index can take a name a live descriptor already holds, sequentially,
+     * with no concurrency involved at all. {@code GatedAndOrdinaryNameCollisionIT} demonstrates that and
+     * carries what a fix would cost: the check cannot live where the validation is, because that runs on
+     * the cluster state thread, where a blocking descriptor read is the deadlock W4 already paid for.
      */
     public boolean certainlyGated(final CreateIndexClusterStateUpdateRequest request, final ClusterState state) {
         if (DescriptorOnlyCreation.hasAdmissionCheck() == false) {
