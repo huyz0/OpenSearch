@@ -45,17 +45,43 @@ public final class ObjectStoreCommitHeadPublisher {
 
     private final ObjectStoreCommitPublisher commitPublisher;
     private final ShardStateStore shardStateStore;
+    private final org.opensearch.serverless.storage.gc.BlobGcCandidateLog gcCandidateLog;
 
     /**
      * Creates a publisher that packages commits via {@code commitPublisher} and races to install
-     * them as the shard's new head via CAS on {@code shardStateStore}.
+     * them as the shard's new head via CAS on {@code shardStateStore}. Equivalent to the
+     * three-argument constructor with {@code gcCandidateLog} {@code null} -- see that constructor's
+     * own javadoc for what supplying one buys.
      *
      * @param commitPublisher packages a local Lucene commit into a bundle/manifest pair
      * @param shardStateStore the CAS-backed store holding this shard's published head
      */
     public ObjectStoreCommitHeadPublisher(ObjectStoreCommitPublisher commitPublisher, ShardStateStore shardStateStore) {
+        this(commitPublisher, shardStateStore, null);
+    }
+
+    /**
+     * Creates a publisher that also records every supersession it causes, for {@code GcCandidateTailer} to
+     * discover instead of {@code GcSchedulerTask} relisting this shard's own container to rediscover it
+     * later. See {@code GcCandidate}'s own javadoc for the fuller reasoning.
+     *
+     * @param commitPublisher packages a local Lucene commit into a bundle/manifest pair
+     * @param shardStateStore the CAS-backed store holding this shard's published head
+     * @param gcCandidateLog where a successful publish's superseded generation is recorded, or {@code null}
+     *                       to skip recording entirely -- the same "feature is off" shape every other
+     *                       optional collaborator in this engine already uses, and safe to be null: nothing
+     *                       here depends on the log existing, only on {@code GcSchedulerTask}'s own sweep,
+     *                       which keeps running regardless and would simply take longer to find what a
+     *                       missing log entry would otherwise have surfaced sooner.
+     */
+    public ObjectStoreCommitHeadPublisher(
+        ObjectStoreCommitPublisher commitPublisher,
+        ShardStateStore shardStateStore,
+        org.opensearch.serverless.storage.gc.BlobGcCandidateLog gcCandidateLog
+    ) {
         this.commitPublisher = commitPublisher;
         this.shardStateStore = shardStateStore;
+        this.gcCandidateLog = gcCandidateLog;
     }
 
     /**
@@ -152,6 +178,31 @@ public final class ObjectStoreCommitHeadPublisher {
                 ? new ShardHead(primaryTerm, null, 0L, manifest.generation())
                 : currentHead.withPublishedGeneration(primaryTerm, manifest.generation());
             if (shardStateStore.compareAndSet(indexUuid, shardId, currentVersion, newHead) == CasResult.SUCCESS) {
+                // currentHead is exactly what this publish just superseded -- known precisely, for free,
+                // right here, which is the whole point of GcCandidate existing: nothing downstream has to
+                // relist this shard's container to rediscover what this call already knows. Recorded only
+                // on the winning attempt, not a losing CAS retry's currentHead reread above -- a retry's
+                // manifest never became head at all, which is a different kind of garbage GcSchedulerTask's
+                // own sweep remains responsible for (see GcCandidate's own javadoc).
+                //
+                // currentGeneration > 0, not merely currentHead != null: acquireOrRenewLease can
+                // put-if-absent a lease-only head at generation 0 ahead of any real publish (see that
+                // method's own javadoc, and readLatestManifest's identical "generation 0 means nothing
+                // published yet" check). currentHead != null alone would append a candidate naming a
+                // manifest that was never written -- deleting it is harmless (readManifest below simply
+                // finds nothing), but it is not what this publish actually superseded, and polluting the
+                // queue with an entry for a manifest that never existed is not "the queue is a little
+                // noisier," it is wrong.
+                if (gcCandidateLog != null && currentHead != null && currentGeneration > 0) {
+                    gcCandidateLog.append(
+                        new org.opensearch.serverless.storage.gc.GcCandidate(
+                            indexUuid,
+                            shardId,
+                            currentHead.primaryTerm(),
+                            currentGeneration
+                        )
+                    );
+                }
                 return true;
             }
             // Lost the race (another compaction or another publish attempt winning first) -- reread

@@ -54,6 +54,8 @@ import org.opensearch.serverless.storage.format.BundleFileReader;
 import org.opensearch.serverless.storage.format.CachingBundleFileReader;
 import org.opensearch.serverless.storage.format.InMemoryPlaintextBundleCache;
 import org.opensearch.serverless.storage.format.LocalDiskCachingBundleStore;
+import org.opensearch.serverless.storage.gc.BlobGcCandidateLog;
+import org.opensearch.serverless.storage.gc.GcCandidateTailer;
 import org.opensearch.serverless.storage.gc.GcSchedulerConfig;
 import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.readerengine.ObjectStoreCommitMaterializer;
@@ -476,6 +478,45 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         TimeValue.timeValueMillis(
             org.opensearch.serverless.storage.retention.PitrRetentionSchedulerTask.DEFAULT_RECONCILE_INTERVAL.millis() * 2
         ),
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * How often the fleet-wide {@code GcCandidateTailer} pass runs, on the elected cluster manager alone --
+     * see {@code GcCandidate}'s own class javadoc for why this exists at all: it is what lets a warm shard
+     * that has not superseded anything since the last pass cost nothing, instead of paying {@code
+     * GcSchedulerTask}'s two guaranteed {@code listBlobsByPrefix} calls every tick regardless of whether
+     * anything changed. {@code GcSchedulerTask} itself is untouched and keeps running per warm reader shard
+     * as the backstop -- this is a cheaper, faster-to-notice front door onto the same eventual outcome, not
+     * a replacement for it.
+     *
+     * <p>Non-positive (the default) disables the tailer entirely, matching {@link
+     * #SERVERLESS_STORAGE_GC_INTERVAL_SETTING}'s own off-by-default shape: nothing correctness-bearing
+     * depends on this running, since {@code GcSchedulerTask} reaches the same manifests eventually on its
+     * own regardless of whether this is on.
+     */
+    public static final Setting<TimeValue> SERVERLESS_STORAGE_GC_CANDIDATE_TAIL_INTERVAL_SETTING = Setting.timeSetting(
+        "serverless_storage.gc.candidate_tail_interval",
+        TimeValue.MINUS_ONE,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * How far back one {@code GcCandidateTailer} pass looks, and how long {@code BlobGcCandidateLog}
+     * retains an entry before its bucket is eligible for pruning.
+     *
+     * <p>Deliberately a separate knob from {@link #SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING} rather
+     * than derived from it -- see {@code GcCandidateTailer}'s own constructor javadoc for exactly why: if a
+     * pass only ever looked back one retention window, any tailer downtime longer than that (a
+     * cluster-manager failover, a rolling restart) would silently and permanently age a genuinely
+     * still-pending candidate out of every future pass' reach. The default here (2 hours) is chosen the
+     * same way the retention window's own default is -- comfortably longer than realistic downtime, not a
+     * tuned value -- and the constructor enforces this can never be configured shorter than the retention
+     * window itself, which would defeat the margin entirely rather than merely shrink it.
+     */
+    public static final Setting<TimeValue> SERVERLESS_STORAGE_GC_CANDIDATE_LOOKBACK_SETTING = Setting.timeSetting(
+        "serverless_storage.gc.candidate_lookback",
+        TimeValue.timeValueHours(2),
         Setting.Property.NodeScope
     );
 
@@ -1274,6 +1315,12 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     // (the default) disables both the shared sweep (existing behavior) and any dedicated one.
     private volatile TimeValue walGcInterval;
     private volatile long gcRetentionWindowMillis;
+    // Non-null iff GcCandidateTailer is configured on -- read by getEngineFactory to decide whether a
+    // writer's ObjectStoreCommitHeadPublisher gets a BlobGcCandidateLog to append to at all. See
+    // GcCandidate's own javadoc for why a null log (the default) is a fully supported, zero-cost
+    // configuration: GcSchedulerTask's own per-shard sweep reaches the same manifests regardless.
+    private volatile TimeValue gcCandidateTailInterval;
+    private volatile long gcCandidateLookbackMillis;
     // Resolved once in createComponents, same "read the NodeScope setting where Environment is
     // actually available" reasoning as every other field in this group -- getEngineFactory reads
     // this to configure each produced WriterEngineFactory's own rate limiter.
@@ -1529,6 +1576,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_PARTITION_REWRITE_INTERVAL_SETTING,
             SERVERLESS_STORAGE_GC_INTERVAL_SETTING,
             SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING,
+            SERVERLESS_STORAGE_GC_CANDIDATE_TAIL_INTERVAL_SETTING,
+            SERVERLESS_STORAGE_GC_CANDIDATE_LOOKBACK_SETTING,
             SERVERLESS_STORAGE_WAL_GC_INTERVAL_SETTING,
             SERVERLESS_STORAGE_WAL_PER_SHARD_BUDGET_SETTING,
             SERVERLESS_STORAGE_WAL_FLUSH_BATCHING_ENABLED_SETTING,
@@ -1858,6 +1907,9 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         TimeValue configuredGcInterval = SERVERLESS_STORAGE_GC_INTERVAL_SETTING.get(environment.settings());
         gcInterval = configuredGcInterval.millis() > 0 ? configuredGcInterval : null;
         gcRetentionWindowMillis = SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING.get(environment.settings()).millis();
+        TimeValue configuredGcCandidateTailInterval = SERVERLESS_STORAGE_GC_CANDIDATE_TAIL_INTERVAL_SETTING.get(environment.settings());
+        gcCandidateTailInterval = configuredGcCandidateTailInterval.millis() > 0 ? configuredGcCandidateTailInterval : null;
+        gcCandidateLookbackMillis = SERVERLESS_STORAGE_GC_CANDIDATE_LOOKBACK_SETTING.get(environment.settings()).millis();
         publicationRateLimitMillis = SERVERLESS_STORAGE_PUBLICATION_RATE_LIMIT_SETTING.get(environment.settings()).millis();
         long lazyDirectoryCacheSizeBytes = SERVERLESS_STORAGE_LAZY_DIRECTORY_CACHE_SIZE_SETTING.get(environment.settings()).getBytes();
         lazyDirectoryFileCache = lazyDirectoryCacheSizeBytes > 0
@@ -2078,9 +2130,43 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                         }
                     }, scrubInterval, ThreadPool.Names.GENERIC);
                 }
+
+                // GcCandidateTailer, off unless asked for, and on the elected cluster manager alone -- same
+                // reasoning as pruning and tombstone reclamation just above: one pass here is one bounded
+                // listing over the candidate log, not a per-shard operation, so every node running it would
+                // pay for the same bounded work N times over rather than sharing it. See GcCandidate's own
+                // class javadoc for what this buys over GcSchedulerTask's unconditional per-shard sweep,
+                // which keeps running underneath this unchanged either way.
+                if (gcCandidateTailInterval != null) {
+                    BlobGcCandidateLog gcCandidateLog = gcCandidateLogOrNull();
+                    GcCandidateTailer gcCandidateTailer = new GcCandidateTailer(
+                        gcCandidateLog,
+                        this::blobContainerForDirectoryFactory,
+                        gcRetentionWindowMillis,
+                        gcCandidateLookbackMillis
+                    );
+                    threadPool.scheduleWithFixedDelay(() -> {
+                        if (clusterService.state().nodes().isLocalNodeElectedClusterManager()) {
+                            gcCandidateTailer.tailOnce();
+                        }
+                    }, gcCandidateTailInterval, ThreadPool.Names.GENERIC);
+
+                    // Same backstop reasoning as the descriptor log's own pruning: a healthy candidate is
+                    // always resolved by the tailer itself long before this would ever reach it, so this is
+                    // hygiene for the abandoned case (a permanently pinned generation whose release does not
+                    // currently re-trigger anything here), not the normal retirement path.
+                    threadPool.scheduleWithFixedDelay(() -> {
+                        if (clusterService.state().nodes().isLocalNodeElectedClusterManager()) {
+                            gcCandidateLog.pruneOlderThan(gcCandidateLookbackMillis);
+                        }
+                    }, TimeValue.timeValueMillis(gcCandidateLookbackMillis), ThreadPool.Names.GENERIC);
+                }
             } catch (Exception e) {
                 // A cluster with no object store configured still publishes descriptors and still resolves
                 // them; it simply has no cross-node feed, which is the state it was in before this existed.
+                // Also covers GcCandidateTailer's own setup just above, which shares this try block: no
+                // object store configured means no bounded location for that log either, and GcSchedulerTask
+                // remains fully able to reach every manifest on its own regardless.
                 logger.warn("no descriptor change feed; other nodes will learn of changes only by rebuild", e);
             }
         }
@@ -2357,7 +2443,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
 
             return Optional.of(
                 new WriterEngineFactory(
-                    new ObjectStoreCommitHeadPublisher(commitPublisher, shardStateStore),
+                    new ObjectStoreCommitHeadPublisher(commitPublisher, shardStateStore, gcCandidateLogOrNull()),
                     shardDirectory,
                     localNodeId,
                     pitrRetentionConfig,
@@ -2451,6 +2537,33 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     /** {@link #resolveContainer} under a name that says why the descriptor plane needs its own. */
     private BlobContainer resolveContainerForDescriptors(BlobPath relativePath, String missingContainerErrorMessage) throws IOException {
         return resolveContainer(relativePath, missingContainerErrorMessage);
+    }
+
+    /** {@link #resolveContainer} under a name that says why {@link BlobGcCandidateLog} needs its own. */
+    private BlobContainer resolveContainerForGcCandidates(BlobPath relativePath, String missingContainerErrorMessage) throws IOException {
+        return resolveContainer(relativePath, missingContainerErrorMessage);
+    }
+
+    /**
+     * Builds a {@link BlobGcCandidateLog} pointed at this node's shared {@code gc-candidates-root}, or
+     * {@code null} if {@link #gcCandidateTailInterval} says the feature is off.
+     *
+     * <p>Cheap and stateless to construct (a function reference, a path, a clock) -- called fresh both here
+     * and from {@link #createComponents} rather than threaded through as a single shared instance, the same
+     * way {@code resolveContainerForDescriptors} itself is called fresh from more than one place rather than
+     * cached. Every instance resolves to the same durable location, so there is nothing to keep in sync.
+     */
+    private BlobGcCandidateLog gcCandidateLogOrNull() {
+        if (gcCandidateTailInterval == null) {
+            return null;
+        }
+        return new BlobGcCandidateLog(path -> {
+            try {
+                return resolveContainerForGcCandidates(path, "no blob store for the GC candidate log");
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        }, BlobPath.cleanPath().add("gc-candidates-root"));
     }
 
     private BlobContainer resolveContainer(BlobPath relativePath, String missingContainerErrorMessage) throws IOException {

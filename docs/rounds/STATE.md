@@ -3,7 +3,62 @@
 Read this first, every time. It is the only source of truth for where work stands, and it
 is written to survive context loss: nothing here depends on remembering a previous session.
 
-Updated: 2026-08-15 (second correction below; the 2026-08-12 one and the body past it are unchanged)
+Updated: 2026-08-16 (GC candidate queue below; everything past it is unchanged)
+
+## 2026-08-16: manifest GC gets an event-driven front door, so a warm-but-idle shard costs nothing
+
+Not part of round 006 -- this came out of a cost conversation about `GcSchedulerTask`'s own shape: a real
+`listBlobsByPrefix` call is priced in S3's write tier, not its read tier, and that task issues **two** of
+them (manifest listing, bundle listing) on a fixed clock, on every warm reader shard, whether or not
+anything changed since the last tick. At this branch's target population that is a real, recurring cost
+driven by idle time on a fixed schedule, which is the worst possible pairing.
+
+**What shipped**: `GcCandidate`/`BlobGcCandidateLog`/`GcCandidateTailer` (package `gc`) -- a fleet-wide,
+S3-backed append log in the same bucketed-and-sharded shape `BlobDescriptorChangeLog` already proved (see
+that class's own javadoc for the per-prefix write-throttling reasoning this reuses verbatim), except entries
+retire by deletion rather than by a cursor, because a GC candidate has to be revisitable until its retention
+window elapses, which a forward-only cursor cannot do. `ObjectStoreCommitHeadPublisher` appends one entry at
+the exact moment a publish supersedes a prior head -- the one place that fact is known for free, without
+relisting anything. `GcCandidateTailer` runs on the elected cluster manager alone (same reasoning as
+descriptor-changelog pruning: one bounded listing, not paid for N times over), deletes what is past
+retention and unpinned, drops the queue entry for what turns out to be durably pinned, and leaves the rest
+for the next pass. `GcSchedulerTask` is completely unchanged and keeps running as the backstop; nothing here
+replaces it, only front-runs it. Off by default (`serverless_storage.gc.candidate_tail_interval = -1`),
+matching every other GC-adjacent setting's own shape.
+
+**Two real bugs found during the doing, both caught by tests before they shipped**:
+
+- **The lookback cannot equal the retention window.** If a pass only ever looked back one retention window,
+  any tailer downtime longer than that (a cluster-manager failover, a rolling restart) would age a
+  genuinely still-pending candidate's bucket out of every future pass' reach, silently and permanently.
+  `GcCandidateTailer` takes `lookbackMillis` as a separate, larger, validated-at-construction knob
+  (`serverless_storage.gc.candidate_lookback`, default 2 hours) rather than deriving it from the retention
+  window.
+- **A lease-only head is not a superseded manifest.** `acquireOrRenewLease` can put a placeholder `ShardHead`
+  at generation 0 in place before any commit is ever published (the same sentinel `readLatestManifest`
+  already treats as "nothing published yet"). The append condition originally read `currentHead != null`,
+  which is true for that placeholder too -- appending a candidate naming a manifest that was never written.
+  Harmless (the tailer's `NoSuchFileException` handling absorbs it as "already gone") but wrong, and found
+  by `GcCandidateQueueIT` before it was found any other way: two writes were producing two candidates
+  instead of one until this was fixed. The condition is `currentHead != null && currentGeneration > 0` now,
+  with a unit regression test (`testAFirstPublicationAfterOnlyALeaseAcquisitionAppendsNoCandidate`) reproducing
+  the lease-then-publish sequence directly, verified to fail without the fix.
+
+**What this deliberately does not cover**, stated rather than discovered later: bundle orphan detection
+stays exactly as periodic and per-shard as it already was -- `BundleReferenceCounter`'s own javadoc explains
+why (bundle liveness is a reference count over a *set*, not a fact one publish event can hand over the way
+manifest supersession can); a manifest written but never published as head (the losing side of a CAS race)
+generates no candidate and remains `GcSchedulerTask`'s own responsibility; and a durably pinned generation
+whose pin is later released does not currently re-append a fresh candidate for it -- `GcSchedulerTask`'s
+sweep remains what eventually reclaims that case.
+
+Tests: `GcCandidateTests`, `BlobGcCandidateLogTests`, `GcCandidateTailerTests` (unit, fake clock/containers),
+two new cases on `ObjectStoreCommitHeadPublisherTests` (the append itself, and the lease-only-head
+regression), `GcCandidateQueueIT` (real cluster: a real write's supersession is discoverable from the object
+store alone at the exact location the plugin resolves, and a directly-constructed tailer against that same
+location deletes what should be deleted and spares what is pinned). Full plugin unit suite and the touched
+internalClusterTest groups (writer engine, snapshot, this feature's own IT) all green; the full
+internalClusterTest suite was kicked off to confirm nothing else regressed.
 
 ## Correction, 2026-08-15: the suites were not green, and the plan argued from deleted machinery
 

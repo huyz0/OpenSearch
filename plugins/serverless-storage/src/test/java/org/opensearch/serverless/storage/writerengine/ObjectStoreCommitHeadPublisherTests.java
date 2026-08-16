@@ -569,4 +569,158 @@ public class ObjectStoreCommitHeadPublisherTests extends OpenSearchTestCase {
             assertEquals(1, head.latestManifestGeneration());
         }
     }
+
+    /**
+     * The append this whole feature depends on: a successful publish that supersedes a real prior head
+     * must record exactly that supersession, with the *old* head's own identity -- not the new one's, and
+     * not a name it merely guessed at.
+     */
+    public void testASuccessfulPublicationThatSupersedesAPriorHeadAppendsExactlyOneCandidateForIt() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore localShardStateStore = new BlobContainerShardStateStore(blobContainer);
+        FsBlobStore candidateLogBlobStore = new FsBlobStore(1024, createTempDir(), false);
+        org.opensearch.serverless.storage.gc.BlobGcCandidateLog gcCandidateLog =
+            new org.opensearch.serverless.storage.gc.BlobGcCandidateLog(candidateLogBlobStore::blobContainer, BlobPath.cleanPath());
+        ObjectStoreCommitHeadPublisher publisherWithLog = new ObjectStoreCommitHeadPublisher(
+            new ObjectStoreCommitPublisher(new BlobContainerBundleStore(blobContainer), new BlobContainerManifestStore(blobContainer)),
+            localShardStateStore,
+            gcCandidateLog
+        );
+
+        try (Directory directory = new ByteBuffersDirectory()) {
+            SegmentInfos first = commitOneDocument(directory, "1");
+            assertTrue(
+                publisherWithLog.publishCommitAsHead(
+                    directory,
+                    first,
+                    INDEX_UUID,
+                    SHARD_ID,
+                    1,
+                    0,
+                    0,
+                    new WalPosition("epoch-0", 0),
+                    0,
+                    PruningStats.empty()
+                )
+            );
+            assertTrue(
+                "the first-ever publish supersedes nothing -- there was no prior head to name",
+                gcCandidateLog.entriesSince(null).isEmpty()
+            );
+
+            SegmentInfos second = commitOneDocument(directory, "2");
+            assertTrue(
+                publisherWithLog.publishCommitAsHead(
+                    directory,
+                    second,
+                    INDEX_UUID,
+                    SHARD_ID,
+                    1,
+                    1,
+                    1,
+                    new WalPosition("epoch-0", 1),
+                    0,
+                    PruningStats.empty()
+                )
+            );
+
+            java.util.List<org.opensearch.serverless.storage.gc.BlobGcCandidateLog.LoggedCandidate> pending = gcCandidateLog.entriesSince(
+                null
+            );
+            assertEquals("the second publish must record exactly one supersession", 1, pending.size());
+            org.opensearch.serverless.storage.gc.GcCandidate candidate = pending.get(0).candidate();
+            assertEquals(INDEX_UUID, candidate.indexUuid());
+            assertEquals(SHARD_ID, candidate.shardId());
+            assertEquals("the candidate must name the OLD head's own identity, not the new one's", 1, candidate.primaryTerm());
+            assertEquals(1, candidate.generation());
+        }
+    }
+
+    /**
+     * The bug the IT wiring test actually caught: {@code acquireOrRenewLease} can put a lease-only head at
+     * generation 0 in place before any commit is ever published (see that method's own javadoc). The first
+     * real publish afterward sees a non-null {@code currentHead} -- but generation 0 was never a real
+     * manifest, so this must not append a candidate naming it. {@code currentHead != null} alone is exactly
+     * the wrong condition; only a currentGeneration greater than zero means something real was superseded.
+     */
+    public void testAFirstPublicationAfterOnlyALeaseAcquisitionAppendsNoCandidate() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        ShardStateStore localShardStateStore = new BlobContainerShardStateStore(blobContainer);
+        FsBlobStore candidateLogBlobStore = new FsBlobStore(1024, createTempDir(), false);
+        org.opensearch.serverless.storage.gc.BlobGcCandidateLog gcCandidateLog =
+            new org.opensearch.serverless.storage.gc.BlobGcCandidateLog(candidateLogBlobStore::blobContainer, BlobPath.cleanPath());
+        ObjectStoreCommitHeadPublisher publisherWithLog = new ObjectStoreCommitHeadPublisher(
+            new ObjectStoreCommitPublisher(new BlobContainerBundleStore(blobContainer), new BlobContainerManifestStore(blobContainer)),
+            localShardStateStore,
+            gcCandidateLog
+        );
+
+        // Puts a lease-only ShardHead(primaryTerm=1, generation=0) in place, exactly as a writer engine
+        // activating does before it has published anything of its own.
+        assertTrue(publisherWithLog.acquireOrRenewLease(INDEX_UUID, SHARD_ID, 1, "node-a", System.currentTimeMillis() + 30_000));
+
+        try (Directory directory = new ByteBuffersDirectory()) {
+            SegmentInfos first = commitOneDocument(directory, "1");
+            assertTrue(
+                publisherWithLog.publishCommitAsHead(
+                    directory,
+                    first,
+                    INDEX_UUID,
+                    SHARD_ID,
+                    1,
+                    0,
+                    0,
+                    new WalPosition("epoch-0", 0),
+                    0,
+                    PruningStats.empty()
+                )
+            );
+        }
+
+        assertTrue(
+            "the lease-only placeholder head is not a real manifest -- nothing was actually superseded, so " + "nothing must be appended",
+            gcCandidateLog.entriesSince(null).isEmpty()
+        );
+    }
+
+    /** A {@code null} log (the default, and the off-by-default configuration) must not be reached for at all. */
+    public void testANullGcCandidateLogIsNeverDereferenced() throws Exception {
+        try (Directory directory = new ByteBuffersDirectory()) {
+            SegmentInfos first = commitOneDocument(directory, "1");
+            assertTrue(
+                headPublisher.publishCommitAsHead(
+                    directory,
+                    first,
+                    INDEX_UUID,
+                    SHARD_ID,
+                    1,
+                    0,
+                    0,
+                    new WalPosition("epoch-0", 0),
+                    0,
+                    PruningStats.empty()
+                )
+            );
+            SegmentInfos second = commitOneDocument(directory, "2");
+            // headPublisher (from setUp) was built with the two-argument constructor, so its
+            // gcCandidateLog is null -- this succeeding at all, without a NullPointerException, is the
+            // assertion.
+            assertTrue(
+                headPublisher.publishCommitAsHead(
+                    directory,
+                    second,
+                    INDEX_UUID,
+                    SHARD_ID,
+                    1,
+                    1,
+                    1,
+                    new WalPosition("epoch-0", 1),
+                    0,
+                    PruningStats.empty()
+                )
+            );
+        }
+    }
 }
