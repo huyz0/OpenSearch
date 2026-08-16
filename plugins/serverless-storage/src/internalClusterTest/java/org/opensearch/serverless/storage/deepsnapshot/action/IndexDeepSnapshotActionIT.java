@@ -96,8 +96,7 @@ public class IndexDeepSnapshotActionIT extends ServerlessStorageIntegTestCase {
             IndexDeepSnapshotAction.INSTANCE,
             new IndexDeepSnapshotRequest(indexName, REPO_NAME, "ordinary-deep-1")
         ).get();
-        assertTrue("the action must report the shards it copied", response.shardCount() >= 1);
-        assertEquals(1, response.shardCount());
+        assertEquals("the action must report the shards it copied", 1, response.shardCount());
 
         restoreAndAssertDocumentCount(indexName, "ordinary-deep-1", "ordinary-deep-restored", 12);
     }

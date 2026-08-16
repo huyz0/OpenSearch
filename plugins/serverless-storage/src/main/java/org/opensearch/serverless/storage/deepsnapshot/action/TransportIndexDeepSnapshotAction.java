@@ -145,16 +145,68 @@ public class TransportIndexDeepSnapshotAction extends TransportClusterManagerNod
             return;
         }
 
-        CopyContext context = new CopyContext(
-            new IndexId(request.indexName(), indexMetadata.getIndexUUID()),
-            new SnapshotId(request.snapshotName(), UUIDs.randomBase64UUID()),
-            repository,
-            indexMetadata.getNumberOfShards(),
-            System.currentTimeMillis(),
-            listener
-        );
+        IndexId indexId = new IndexId(request.indexName(), indexMetadata.getIndexUUID());
+        int numberOfShards = indexMetadata.getNumberOfShards();
+        // Checked up front, before a single byte is copied, rather than left to surface however
+        // Repository#finalizeSnapshot's own bookkeeping reacts to it -- found by round 4 of the bug
+        // hunt. indexId above is built from the index's own real UUID, not resolved through {@link
+        // RepositoryData#resolveNewIndices} the way a real _snapshot request resolves its own IndexId
+        // (SnapshotsService does exactly that): ShardDeepSnapshotRequest's indexUuid field is
+        // deliberately the real object-store UUID, doing double duty as this repository-facing
+        // identity too (see that request's own javadoc), so this repository-facing IndexId cannot
+        // simply be re-resolved independently without also re-plumbing how each shard locates its data
+        // in the object store -- a larger change than this finding's severity currently justifies. If
+        // this same target repository already holds an ordinary snapshot of an index with this same
+        // name under a *different* repository-internal id (any repository this index was ever
+        // snapshotted into through core's own _snapshot API, for instance), RepositoryData's own
+        // indices-by-name map has no merge function for two different IndexIds sharing one name --
+        // finalizeSnapshot's downstream addSnapshot call would otherwise throw IllegalStateException:
+        // Duplicate key partway through finalizing, after every shard's bytes were already copied.
+        // Failing loudly here instead costs nothing (no shard has been touched yet) and names the
+        // actual conflict rather than surfacing it as an opaque exception deep in core's own
+        // bookkeeping.
+        Repository targetRepository = repository;
+        targetRepository.getRepositoryData(ActionListener.wrap(repositoryData -> {
+            IndexId existing = repositoryData.getIndices().get(request.indexName());
+            if (identityConflictsWithExistingSnapshot(existing, indexId)) {
+                listener.onFailure(
+                    new IllegalStateException(
+                        "repository ["
+                            + request.repositoryName()
+                            + "] already holds a snapshot of index ["
+                            + request.indexName()
+                            + "] under a different identity ("
+                            + existing
+                            + " vs "
+                            + indexId
+                            + ") -- deep snapshots of this index must target a repository that has never held"
+                            + " an ordinary snapshot of it"
+                    )
+                );
+                return;
+            }
+            CopyContext context = new CopyContext(
+                indexId,
+                new SnapshotId(request.snapshotName(), UUIDs.randomBase64UUID()),
+                targetRepository,
+                numberOfShards,
+                System.currentTimeMillis(),
+                listener
+            );
+            copyShard(0, context, ShardGenerations.builder());
+        }, listener::onFailure));
+    }
 
-        copyShard(0, context, ShardGenerations.builder());
+    /**
+     * True if {@code existing} -- whatever {@link org.opensearch.repositories.RepositoryData#getIndices()}
+     * already has on file for this index name, or {@code null} if nothing does -- names a different
+     * repository-internal identity than {@code candidate}, the one this deep snapshot is about to use.
+     * Extracted as a small, pure predicate (rather than left inline in {@link #clusterManagerOperation})
+     * so round 4's own collision-avoidance check has a seam a plain unit test can exercise without a
+     * live repository -- see {@code TransportIndexDeepSnapshotActionTests}.
+     */
+    static boolean identityConflictsWithExistingSnapshot(IndexId existing, IndexId candidate) {
+        return existing != null && existing.getId().equals(candidate.getId()) == false;
     }
 
     /**
@@ -251,14 +303,16 @@ public class TransportIndexDeepSnapshotAction extends TransportClusterManagerNod
      * explicitly below rather than left to whatever inconsistency that would eventually surface as
      * downstream.
      *
-     * <p><b>What this identity check does not catch</b>, stated rather than left implicit: an in-place
-     * shard split (this plugin's own {@code resharding} package) changes an index's shard count without
-     * changing its UUID, so a split completing mid-copy passes the identity check below while
-     * {@code context.numberOfShards()}/{@code shardGenerations} stay sized to the shard count at {@link
-     * #clusterManagerOperation} time, not the resolved {@code indexMetadata}'s current one. Same
-     * category of gap as the concurrent-repository-write race already scoped out above: closing it
-     * properly needs either blocking resharding for the duration of a deep snapshot or discarding and
-     * restarting the copy on a detected split, neither of which is this round's scope.
+     * <p><b>The shard-count check round 4 of the bug hunt added.</b> An in-place shard split (this
+     * plugin's own {@code resharding} package) changes an index's shard count without changing its
+     * UUID, so a split completing mid-copy would pass the identity check above -- three independent
+     * finder angles converged on this exact gap across rounds 3 and 4, and while a full fix needs
+     * either blocking resharding for the duration of a deep snapshot or discarding and restarting the
+     * copy on a detected split (out of this round's scope, the same as the concurrent-repository-write
+     * race already accepted above), turning the silent corruption into a loud, named failure is cheap
+     * enough that leaving it merely documented was not: {@code shardGenerations} was built against
+     * {@code context.numberOfShards()}, fixed at {@link #clusterManagerOperation} time, so it is
+     * compared against the freshly-resolved {@code indexMetadata}'s current count below.
      */
     private void finalizeSnapshot(CopyContext context, ShardGenerations shardGenerations) {
         Repository repository = context.repository();
@@ -277,6 +331,24 @@ public class TransportIndexDeepSnapshotAction extends TransportClusterManagerNod
             // nothing matching) to describe in the finalized snapshot's own metadata, so this is
             // reported as a failure rather than finalizing with stale or mismatched data.
             listener.onFailure(new IndexNotFoundException(context.indexId().getName()));
+            return;
+        }
+        if (indexMetadata.getNumberOfShards() != numberOfShards) {
+            // An in-place shard split completed mid-copy -- shardGenerations only has entries for the
+            // shard count this copy started with, so finalizing against the index's now-different
+            // shard count would publish a snapshot whose own metadata and shard-generation data
+            // disagree, discoverable only later, on restore. Failing now names the cause instead.
+            listener.onFailure(
+                new IllegalStateException(
+                    "index ["
+                        + context.indexId().getName()
+                        + "] shard count changed from "
+                        + numberOfShards
+                        + " to "
+                        + indexMetadata.getNumberOfShards()
+                        + " while this deep snapshot was in flight -- retry after the split completes"
+                )
+            );
             return;
         }
         repository.getRepositoryData(ActionListener.wrap(repositoryData -> {
