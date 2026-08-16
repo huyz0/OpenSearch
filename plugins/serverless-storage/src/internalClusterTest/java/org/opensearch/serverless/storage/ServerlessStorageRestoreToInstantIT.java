@@ -114,59 +114,76 @@ public class ServerlessStorageRestoreToInstantIT extends ServerlessStorageIntegT
         }, 40, TimeUnit.SECONDS);
 
         // The assertion, and it is on the durable head rather than on a search, for a reason this test had
-        // to find out. Restoring moves the head to the generation that answers for the instant -- proven
-        // here against the manifest list itself, so the test asserts the resolution rather than restating
-        // it. What a search says after the index is reopened is a different question, and it has its own
-        // test below because the answer is not the one this one would imply.
+        // to find out. Restoring moves the head onto the *data* that was current at the instant asked for --
+        // proven here against the manifest list itself, so the test asserts the resolution rather than
+        // restating it.
+        //
+        // Asserted on the segments the head names rather than on its generation number, because a restore
+        // publishes a new generation carrying the resolved one's segments rather than rewinding onto the
+        // resolved generation itself (RestoreManifestSynthesis explains why: rewinding the head also rewinds
+        // WAL replay's floor, and replay then reapplies exactly what the restore rolled back). Content
+        // equality is the stronger claim in any case -- a generation number matching proves a number was
+        // written, and this proves the shard is actually pointing at the right bytes.
         String indexUuid = client().admin().cluster().prepareState().get().getState().metadata().index(INDEX_NAME).getIndexUUID();
         org.opensearch.common.blobstore.BlobContainer container = internalCluster().getDataNodeInstance(ServerlessStoragePlugin.class)
             .blobContainerForDirectoryFactory(indexUuid, 0);
-        java.util.List<org.opensearch.serverless.storage.manifest.CommitManifest> manifests =
-            new org.opensearch.serverless.storage.manifest.BlobContainerManifestStore(container).listManifests();
-        long expected = org.opensearch.serverless.storage.retention.PitrRestoreResolution.newestAtOrBefore(manifests, afterFirstDoc)
-            .orElseThrow()
-            .generation();
-        long actual = new org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore(container).get(indexUuid, 0)
-            .orElseThrow()
-            .head()
-            .latestManifestGeneration();
+        org.opensearch.serverless.storage.manifest.BlobContainerManifestStore manifestStore =
+            new org.opensearch.serverless.storage.manifest.BlobContainerManifestStore(container);
+        java.util.List<org.opensearch.serverless.storage.manifest.CommitManifest> manifests = manifestStore.listManifests();
+        org.opensearch.serverless.storage.manifest.CommitManifest resolved =
+            org.opensearch.serverless.storage.retention.PitrRestoreResolution.newestAtOrBefore(manifests, afterFirstDoc).orElseThrow();
+        org.opensearch.serverless.storage.shardstate.ShardHead head =
+            new org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore(container).get(indexUuid, 0).orElseThrow().head();
+        org.opensearch.serverless.storage.manifest.CommitManifest headManifest = manifestStore.readManifest(
+            head.primaryTerm(),
+            head.latestManifestGeneration()
+        );
 
         assertEquals(
-            "the head must sit at the generation that was current at the instant asked for, and not at a "
-                + "later one -- a restore that lands past the instant includes the writes the caller named a "
+            "the head must name the segments that were current at the instant asked for, and not a later "
+                + "commit's -- a restore that lands past the instant includes the writes the caller named a "
                 + "time to be rid of",
-            expected,
-            actual
+            resolved.segmentsFileName(),
+            headManifest.segmentsFileName()
+        );
+        assertEquals(
+            "and the same file set, so it is the same commit rather than a same-named one",
+            resolved.files(),
+            headManifest.files()
         );
         assertTrue(
-            "and that generation must genuinely predate the second write, or the timeline this test built "
-                + "is too coarse to be asserting anything",
-            manifests.stream().anyMatch(m -> m.generation() > actual && m.createdAtMillis() > afterFirstDoc)
+            "the restore must have published forward rather than rewound: everything else in this system "
+                + "assumes head generations only increase, and recovery reads the head",
+            headManifest.generation() > resolved.generation()
+        );
+        assertTrue(
+            "and the resolved generation must genuinely predate the second write, or the timeline this test "
+                + "built is too coarse to be asserting anything",
+            manifests.stream().anyMatch(m -> m.generation() > resolved.generation() && m.createdAtMillis() > afterFirstDoc)
         );
     }
 
     /**
-     * What a search says once the index is opened again, which is not what the restore did.
+     * What a search says once the index is opened again, which is the only question that decides whether a
+     * restore is real.
      *
-     * <p>The restore is correct: the test above proves the durable head lands on the generation that
-     * answers for the instant. Reopen the index and both documents are back. So a point-in-time restore
-     * moves the head and does not, on its own, survive recovery.
+     * <h4>What this caught</h4>
      *
-     * <p>Two candidate causes, and this test does not distinguish them, which is why it is marked rather
-     * than explained. WAL replay is the likelier: the write taken after the restore point is still in the
-     * WAL, and replay from the restored position is precisely designed to reapply writes a manifest does not
-     * yet carry -- it cannot tell "not yet published" from "deliberately rolled back". The other is that
-     * opening resolves the newest manifest rather than the head, in which case the head is not authoritative
-     * for recovery at all. The distinguishing measurement is whether the reopened shard's first new manifest
-     * descends from the restored generation or from the latest one.
+     * A restore used to move the head and be undone by the next recovery. The cause turned out to be the
+     * one this test's earlier form guessed at: WAL replay. {@code ObjectStoreCommitHeadPublisher
+     * #readLatestManifest} reads <em>the head</em>, and {@code ObjectStoreWriterEngine#replayWalOperations}
+     * takes that manifest's WAL position as its replay floor -- so rewinding the head onto an older
+     * generation rewound the floor with it, and replay, which exists to reapply writes a manifest does not
+     * yet carry and cannot tell those from writes deliberately rolled back, put every one of them back.
      *
-     * <p>This is the assertion the existing restore coverage could not have made:
+     * <p>The head being what recovery reads is the good half of that finding: it means the head is
+     * authoritative, and a restore only had to stop rewinding it. It now publishes a new generation carrying
+     * the target's segments and the newest manifest's WAL position -- see {@code RestoreManifestSynthesis}.
+     *
+     * <p>This is the assertion the rest of the restore coverage could not make:
      * {@code ServerlessStorageIndexSnapshotActionIT} checks the head record and never reopens the index, so
-     * a restore that is undone by recovery looks identical to one that holds.
+     * a restore undone by recovery looked identical there to one that holds. Reopening is the whole test.
      */
-    @org.apache.lucene.tests.util.LuceneTestCase.AwaitsFix(bugUrl = "a restore-in-place does not survive reopening the index: the writes past the restore point "
-        + "return, most likely reapplied by WAL replay, which cannot distinguish an unpublished write "
-        + "from one that was deliberately rolled back")
     public void testARestoredIndexStillReadsAsRestoredAfterItIsReopened() throws Exception {
         Path basePath = createTempDir("serverless-storage-restore-survives-reopen");
         Settings nodeSettings = Settings.builder()
@@ -210,6 +227,97 @@ public class ServerlessStorageRestoreToInstantIT extends ServerlessStorageIntegT
         assertBusy(() -> {
             client().admin().indices().prepareRefresh(INDEX_NAME).get();
             assertEquals("the document written after the restore point must not come back", 1, count());
+        });
+    }
+
+    /**
+     * The same round trip with WAL mirroring on, because the test above runs with it off and a restore has
+     * to hold in both configurations.
+     *
+     * <h4>What this does and does not establish, stated because the difference matters</h4>
+     *
+     * {@code serverless_storage.wal_mirroring.enabled} defaults to false, so the test above never reaches
+     * {@code ObjectStoreWriterEngine#replayWalOperations} at all -- it short-circuits. This one turns
+     * mirroring on and asserts, before anything else, that it actually took effect (a manifest carrying a
+     * WAL position), so it cannot silently degrade into a second copy of the test above.
+     *
+     * <p>It does <b>not</b> isolate {@code RestoreManifestSynthesis}' choice to take its WAL position from
+     * the newest manifest rather than the restored one. That was measured rather than assumed: reverting
+     * that field by hand leaves this test green, and so does deliberately leaving the second write unflushed
+     * so that it is durable in the WAL and named by no manifest at all. In this harness WAL replay
+     * contributes nothing to what the reopened shard reads, either because the write never reaches a
+     * replayed chunk or because the term floor excludes it -- which of those it is has not been
+     * established. So the field is kept because it is correct by construction (a restore that has decided
+     * not to replay a range must not advertise a floor beneath it) and not because a test proves it
+     * necessary. What carries both configurations is the stale-local-store half, and that one does have a
+     * test that fails without it.
+     */
+    public void testARestoreSurvivesReopeningWhenWalMirroringIsOn() throws Exception {
+        Path basePath = createTempDir("serverless-storage-restore-survives-reopen-wal");
+        Settings nodeSettings = Settings.builder()
+            .putList("path.repo", basePath.toString())
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey(), basePath.toString())
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_WAL_MIRRORING_ENABLED_SETTING.getKey(), true)
+            .build();
+        internalCluster().startClusterManagerOnlyNode(nodeSettings);
+        internalCluster().startDataOnlyNode(nodeSettings);
+
+        createIndex(
+            INDEX_NAME,
+            Settings.builder()
+                .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+                .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+                .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey(), true)
+                .build()
+        );
+        ensureGreen(INDEX_NAME);
+
+        client().prepareIndex(INDEX_NAME).setId("1").setSource("f", "first").get();
+        client().admin().indices().prepareFlush(INDEX_NAME).get();
+        client().execute(IndexSnapshotPinAction.INSTANCE, new IndexSnapshotPinRequest(INDEX_NAME, "as-of-one-doc")).get();
+        long afterFirstDoc = System.currentTimeMillis();
+        Thread.sleep(50);
+
+        client().prepareIndex(INDEX_NAME).setId("2").setSource("f", "second").get();
+        client().admin().indices().prepareFlush(INDEX_NAME).get();
+
+        // The guard that makes this test mean something. Everything below passes just as well with WAL
+        // mirroring off, in which case replay short-circuits and the WAL half of the fix is never reached --
+        // so assert first that the setting actually took effect, rather than trusting that putting it in the
+        // node settings was enough. A manifest published by a WAL-mirroring writer carries a WAL position;
+        // one published without mirroring carries null, deliberately (a placeholder position here is what
+        // once pinned WAL garbage collection cluster-wide).
+        String indexUuid = client().admin().cluster().prepareState().get().getState().metadata().index(INDEX_NAME).getIndexUUID();
+        org.opensearch.common.blobstore.BlobContainer walCheckContainer = internalCluster().getDataNodeInstance(
+            ServerlessStoragePlugin.class
+        ).blobContainerForDirectoryFactory(indexUuid, 0);
+        assertTrue(
+            "no manifest carries a WAL position, so WAL mirroring is not actually on and this test is not "
+                + "exercising WAL replay at all",
+            new org.opensearch.serverless.storage.manifest.BlobContainerManifestStore(walCheckContainer).listManifests()
+                .stream()
+                .anyMatch(m -> m.walPosition() != null)
+        );
+
+        assertTrue(client().admin().indices().prepareClose(INDEX_NAME).get().isAcknowledged());
+        assertBusy(() -> {
+            try {
+                client().execute(IndexSnapshotRestoreAction.INSTANCE, IndexSnapshotRestoreRequest.toInstant(INDEX_NAME, afterFirstDoc))
+                    .get();
+            } catch (Exception e) {
+                throw new AssertionError("restore not yet accepted: " + e.getMessage(), e);
+            }
+        }, 40, TimeUnit.SECONDS);
+        assertTrue(client().admin().indices().prepareOpen(INDEX_NAME).get().isAcknowledged());
+
+        assertBusy(() -> {
+            client().admin().indices().prepareRefresh(INDEX_NAME).get();
+            assertEquals(
+                "the document written after the restore point must not come back, and with WAL mirroring on "
+                    + "the WAL is where it would come back from",
+                1,
+                count()
+            );
         });
     }
 

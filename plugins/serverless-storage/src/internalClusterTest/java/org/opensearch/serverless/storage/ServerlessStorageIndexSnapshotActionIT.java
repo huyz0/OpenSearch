@@ -233,10 +233,21 @@ public class ServerlessStorageIndexSnapshotActionIT extends ServerlessStorageInt
 
             Optional<VersionedShardHead> head = shardStateStore.get(indexUuid, shardId);
             assertTrue(head.isPresent());
+            // Every shard's head must carry its own pinned commit's files after the index-wide restore.
+            // Asserted on the files rather than the generation number because a restore publishes a new
+            // generation carrying the pinned commit's segments rather than rewinding onto the pinned
+            // generation itself (RestoreManifestSynthesis has the reasoning) -- and because "the head names
+            // the right bytes" is what the index-wide restore is actually claiming per shard.
+            org.opensearch.serverless.storage.manifest.BlobContainerManifestStore manifestStore =
+                new org.opensearch.serverless.storage.manifest.BlobContainerManifestStore(container);
+            assertTrue(
+                "shard " + shardId + " must have published forward",
+                head.get().head().latestManifestGeneration() > pin.generation()
+            );
             assertEquals(
-                "every shard's real, durable head must reflect its own pinned generation after the index-wide restore",
-                pin.generation(),
-                head.get().head().latestManifestGeneration()
+                "shard " + shardId + "'s head must name exactly its own pinned commit's files",
+                manifestStore.readManifest(pin.primaryTerm(), pin.generation()).files(),
+                manifestStore.readManifest(head.get().head().primaryTerm(), head.get().head().latestManifestGeneration()).files()
             );
         }
     }

@@ -12,6 +12,7 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.plugins.Plugin;
+import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.retention.action.SnapshotPinAction;
 import org.opensearch.serverless.storage.retention.action.SnapshotPinRequest;
 import org.opensearch.serverless.storage.retention.action.SnapshotPinResponse;
@@ -109,7 +110,11 @@ public class ServerlessStorageSnapshotRestoreActionIT extends ServerlessStorageI
             () -> client().execute(SnapshotRestoreAction.INSTANCE, new SnapshotRestoreRequest(indexUuid, 0, SNAPSHOT_ID)).get()
         );
         assertEquals(pinned.primaryTerm(), restored.primaryTerm());
-        assertEquals(pinned.generation(), restored.generation());
+        assertTrue(
+            "a restore publishes forward rather than rewinding onto the pinned generation -- see "
+                + "RestoreManifestSynthesis for why the rewind did not survive a reopen",
+            restored.generation() > pinned.generation()
+        );
 
         BlobContainer container = internalCluster().getDataNodeInstance(ServerlessStoragePlugin.class)
             .blobContainerForDirectoryFactory(indexUuid, 0);
@@ -117,9 +122,18 @@ public class ServerlessStorageSnapshotRestoreActionIT extends ServerlessStorageI
         Optional<VersionedShardHead> headAfterRestore = shardStateStore.get(indexUuid, 0);
         assertTrue(headAfterRestore.isPresent());
         assertEquals(
-            "the shard's real, durable head must actually reflect the restored generation, not just the response",
-            pinned.generation(),
+            "the shard's real, durable head must actually be at what the response reported, not just the response",
+            restored.generation(),
             headAfterRestore.get().head().latestManifestGeneration()
+        );
+        // And that new generation must carry the pinned commit's bytes, which is what "restored" means.
+        // Asserted on the file set rather than the generation number for the reason above: the number moving
+        // forward proves the head advanced, and only this proves it advanced onto the right data.
+        BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(container);
+        assertEquals(
+            "the published generation must name exactly the pinned commit's files",
+            manifestStore.readManifest(pinned.primaryTerm(), pinned.generation()).files(),
+            manifestStore.readManifest(restored.primaryTerm(), restored.generation()).files()
         );
     }
 

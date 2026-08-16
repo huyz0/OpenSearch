@@ -19,6 +19,7 @@ import org.opensearch.serverless.storage.manifest.CommitManifest;
 import org.opensearch.serverless.storage.retention.BlobContainerDurablePinRegistry;
 import org.opensearch.serverless.storage.retention.PinRecord;
 import org.opensearch.serverless.storage.retention.PitrRestoreResolution;
+import org.opensearch.serverless.storage.retention.RestoreManifestSynthesis;
 import org.opensearch.serverless.storage.security.RestrictingBlobContainer;
 import org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore;
 import org.opensearch.serverless.storage.shardstate.CasResult;
@@ -34,9 +35,15 @@ import java.util.Set;
 
 /**
  * The actual work behind {@link SnapshotRestoreAction}: finds the (primaryTerm, generation) {@link
- * SnapshotPinAction} pinned under the request's {@code snapshotId} and CASes the shard's head to
- * point at it directly (bypassing {@link ShardHead#withPublishedGeneration}'s forward-only
- * validation -- a restore is deliberately a rollback, not a publication).
+ * SnapshotPinAction} pinned under the request's {@code snapshotId} and moves the shard's head onto that
+ * data.
+ *
+ * <p>It does that by <b>publishing a new generation carrying the target's segments</b>, not by rewinding
+ * the head onto the target generation itself. The rewind is the obvious implementation and it does not
+ * survive reopening the index: the head is what recovery reads, so rewinding it hands WAL replay a floor
+ * behind the rolled-back writes and replay reapplies them. See {@link RestoreManifestSynthesis} for the
+ * full reasoning and for the three other things publishing forward buys. This is why the head moves through
+ * {@link ShardHead#withPublishedGeneration}'s ordinary forward-only validation rather than around it.
  *
  * <p>Refuses to proceed if the shard's lease is currently held (see {@link
  * SnapshotRestoreAction}'s own javadoc for why) or if {@code snapshotId} names no pin on this
@@ -130,12 +137,30 @@ public class TransportSnapshotRestoreAction extends HandledTransportAction<Snaps
                         return;
                     }
 
-                    ShardHead restoredHead = new ShardHead(
-                        targetPin.primaryTerm(),
-                        currentHead.leaseHolderNodeId(),
-                        currentHead.leaseExpiryMillis(),
-                        targetPin.generation()
+                    // A restore publishes forward rather than rewinding the head onto the target
+                    // generation. RestoreManifestSynthesis' own javadoc has the full reasoning; the
+                    // short version is that the head is what recovery reads, so rewinding it also
+                    // rewinds WAL replay's floor and replay puts back every write the restore just
+                    // rolled back. The new manifest carries the target's segments and the newest
+                    // manifest's WAL position, which is what fences replay off them.
+                    BlobContainerManifestStore manifestStore = new BlobContainerManifestStore(container);
+                    java.util.List<CommitManifest> manifests = manifestStore.listManifests();
+                    CommitManifest target = manifestStore.readManifest(targetPin.primaryTerm(), targetPin.generation());
+                    CommitManifest newest = RestoreManifestSynthesis.newest(manifests);
+                    long publishedGeneration = RestoreManifestSynthesis.nextGeneration(manifests);
+                    CommitManifest restored = RestoreManifestSynthesis.restoredManifest(
+                        target,
+                        newest,
+                        Math.max(currentHead.primaryTerm(), targetPin.primaryTerm()),
+                        publishedGeneration,
+                        System.currentTimeMillis()
                     );
+                    // Written before the head moves, in the same order an ordinary publication uses: a
+                    // head pointing at a manifest that is not there yet is unreadable, and a manifest
+                    // nothing points at is merely garbage the next sweep collects.
+                    manifestStore.writeManifest(restored);
+
+                    ShardHead restoredHead = currentHead.withPublishedGeneration(restored.primaryTerm(), restored.generation());
                     CasResult result = shardStateStore.compareAndSet(
                         request.indexUuid(),
                         request.shardId(),
@@ -143,7 +168,7 @@ public class TransportSnapshotRestoreAction extends HandledTransportAction<Snaps
                         restoredHead
                     );
                     if (result == CasResult.SUCCESS) {
-                        listener.onResponse(new SnapshotRestoreResponse(targetPin.primaryTerm(), targetPin.generation()));
+                        listener.onResponse(new SnapshotRestoreResponse(restored.primaryTerm(), restored.generation()));
                         return;
                     }
                     // VERSION_CONFLICT: someone else moved the head between our read and write --

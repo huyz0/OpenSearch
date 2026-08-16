@@ -460,6 +460,23 @@ final class StoreRecovery {
     }
 
     /**
+     * See {@link EngineFactory#localStoreIsStale} for the full contract. Same resolution shape as
+     * {@link #recoverMissingLocalStoreFromEngine}.
+     */
+    private boolean localStoreIsStaleAccordingToEngine(IndexShard indexShard, String localSegmentsFileName)
+        throws IndexShardRecoveryException {
+        Optional<EngineFactory> engineFactory = shardEngineFactory(indexShard);
+        if (engineFactory.isEmpty()) {
+            return false;
+        }
+        try {
+            return engineFactory.get().localStoreIsStale(indexShard, localSegmentsFileName);
+        } catch (IOException e) {
+            throw new IndexShardRecoveryException(shardId, "engine failed to check whether the local store is stale", e);
+        }
+    }
+
+    /**
      * See {@link EngineFactory#recoverFromEngineNativeSnapshot} for the full contract. Same
      * resolution shape as {@link #recoverMissingLocalStoreFromEngine}.
      */
@@ -876,6 +893,32 @@ final class StoreRecovery {
                             );
                         }
                     }
+                }
+                if (si != null && indexShouldExists && localStoreIsStaleAccordingToEngine(indexShard, si.getSegmentsFileName())) {
+                    // The local commit was readable, so none of the catch-clause branches above ran --
+                    // but the engine says its own durable copy has moved on from it, and for such an
+                    // engine this node's disk is a cache, not the authority. Structurally the same
+                    // situation the in-place-merge-parent branch just below handles (a readable but
+                    // stale local store hiding the authoritative one), which is why it is handled the
+                    // same way: clean the leftover, then give the materialize hook its chance.
+                    //
+                    // The motivating case is a restore. An index closed, restored to an earlier point,
+                    // and reopened on the same node still has the pre-restore files on disk, and
+                    // recovering from them undoes the restore with no error anywhere.
+                    logger.debug("engine reports the local store is stale; replacing it from its durable copy");
+                    Lucene.cleanLuceneIndex(store.directory());
+                    if (recoverMissingLocalStoreFromEngine(indexShard, store) == false) {
+                        // The engine said stale and then declined to materialize. The local store is
+                        // already gone at this point, so there is nothing to fall back to -- fail
+                        // loudly rather than open an engine on a store this method just emptied.
+                        throw new IndexShardRecoveryException(
+                            shardId,
+                            "engine reported the local store as stale but did not replace it; the local store has "
+                                + "been cleaned and there is nothing left to recover from",
+                            null
+                        );
+                    }
+                    si = store.readLastCommittedSegmentsInfo();
                 }
                 if (si != null && indexShouldExists == false && inPlaceSplitMaterialized == false) {
                     // it exists on the directory, but shouldn't exist on the FS, its a leftover (possibly dangling)

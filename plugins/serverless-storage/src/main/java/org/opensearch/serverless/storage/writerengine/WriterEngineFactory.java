@@ -601,6 +601,40 @@ public final class WriterEngineFactory implements EngineFactory {
      * method doesn't attempt to close -- is what {@link ObjectStoreWriterEngine#engineRecoveryOperations()}
      * closes next, once the engine itself opens on top of what this method just materialized.
      */
+    /**
+     * Whether the local Lucene commit core just read is still the one this shard's head names.
+     *
+     * <h4>Why this is needed at all</h4>
+     *
+     * {@link #recoverMissingLocalStore} below only runs when this node has <em>no</em> readable local
+     * commit, which is the failover case it was written for. It says nothing about the case where the node
+     * does have one and it is out of date -- and for this engine that is a real case, because the object
+     * store is authoritative and a node's disk is a cache of it. A restore is how that happens on purpose:
+     * an index is closed, its head is moved onto an earlier commit, and it is reopened on the same node,
+     * whose local files still describe the pre-restore commit. Recovering from those files silently undoes
+     * the restore, which is exactly what {@code ServerlessStorageRestoreToInstantIT}'s reopen test caught.
+     *
+     * <h4>The comparison</h4>
+     *
+     * By segments file name, which identifies a commit: the head's manifest records the segments file its
+     * commit was published with, so a local commit naming a different one is a different commit. Cheaper
+     * than a checksum comparison and stronger than a generation number, which the local files do not carry.
+     *
+     * <p>A shard with no head or nothing published yet is not stale -- there is no authoritative commit to
+     * be behind, and answering "stale" would delete a local store with nothing to replace it.
+     */
+    @Override
+    public boolean localStoreIsStale(IndexShard indexShard, String localSegmentsFileName) throws IOException {
+        if (materializer == null) {
+            return false;
+        }
+        Optional<CommitManifest> head = headPublisher.readLatestManifest(
+            indexShard.shardId().getIndex().getUUID(),
+            indexShard.shardId().getId()
+        );
+        return head.isPresent() && head.get().segmentsFileName().equals(localSegmentsFileName) == false;
+    }
+
     @Override
     public boolean recoverMissingLocalStore(IndexShard indexShard, Store store) throws IOException {
         if (materializer == null) {

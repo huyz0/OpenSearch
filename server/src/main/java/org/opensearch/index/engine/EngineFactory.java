@@ -77,6 +77,41 @@ public interface EngineFactory {
     }
 
     /**
+     * Called by {@code StoreRecovery#internalRecoverFromStore} when a local Lucene commit <em>was</em>
+     * found and read successfully, to ask whether it is still the shard's authoritative commit. Default
+     * {@code false} (current behavior unchanged for every existing {@link EngineFactory}): the local
+     * commit is authoritative, because for an ordinary shard it is.
+     *
+     * <p>The counterpart to {@link #recoverMissingLocalStore}, and needed for the same reason. That hook
+     * only runs when there is no readable local commit at all, so an engine whose durable copy lives
+     * elsewhere is consulted only when this node happens to have nothing on disk. When the node <em>does</em>
+     * have something on disk, core recovers from it without ever asking -- and a local commit that is merely
+     * <em>stale</em> is indistinguishable, from core's side, from a current one. The motivating case is an
+     * index closed, restored to an earlier point from its durable copy, and reopened on the same node: the
+     * local files still describe the pre-restore commit, so recovery silently undoes the restore. Core
+     * already handles the structurally identical case for a revived in-place-merge parent, a few lines
+     * below where this is called; this generalizes it to any engine that can say its own local copy is out
+     * of date.
+     *
+     * <p>An engine returning {@code true} is asserting that {@link #recoverMissingLocalStore} will then be
+     * able to materialize the authoritative commit: core cleans the local Lucene index before calling it,
+     * so a {@code true} here followed by a {@code false} there leaves the shard with nothing and fails its
+     * recovery loudly rather than opening an engine on a store that was just emptied.
+     *
+     * @param indexShard the shard being recovered
+     * @param localSegmentsFileName the name of the segments file of the local commit core just read, which
+     *                              identifies the commit -- an engine compares it against whatever its own
+     *                              durable record says this shard's commit should be.
+     * @return {@code true} if the local commit is not the authoritative one and must be replaced.
+     * @throws IOException if the engine's own durable record could not be consulted -- surfaced as this
+     *                      shard's recovery failure rather than silently treated as "not stale", because
+     *                      guessing "not stale" here is what silently undoes a restore.
+     */
+    default boolean localStoreIsStale(IndexShard indexShard, String localSegmentsFileName) throws IOException {
+        return false;
+    }
+
+    /**
      * Called by {@code StoreRecovery#internalRecoverFromStore} exactly once, only for a shard
      * recovering via {@code RecoverySource.Type.IN_PLACE_SPLIT_SHARD} (a child shard of an in-place
      * split, dynamic-partitioning-plan.md Phase 0) -- before this shard's local translog is created
