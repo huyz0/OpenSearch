@@ -74,12 +74,12 @@ public class RestShardDeepSnapshotAction extends BaseRestHandler {
         Object repositoryName = body.get("repository");
         Object snapshotName = body.get("snapshot_name");
         Object snapshotUuid = body.get("snapshot_uuid");
-        if (!(indexName instanceof String)
-            || !(indexUuid instanceof String)
-            || !(shardId instanceof Number)
-            || !(repositoryName instanceof String)
-            || !(snapshotName instanceof String)
-            || !(snapshotUuid instanceof String)) {
+        if (indexName instanceof String == false
+            || indexUuid instanceof String == false
+            || shardId instanceof Number == false
+            || repositoryName instanceof String == false
+            || snapshotName instanceof String == false
+            || snapshotUuid instanceof String == false) {
             throw new IllegalArgumentException(
                 "request body must contain string \"index_name\", \"index_uuid\", \"repository\", \"snapshot_name\", "
                     + "\"snapshot_uuid\", and a numeric \"shard_id\""

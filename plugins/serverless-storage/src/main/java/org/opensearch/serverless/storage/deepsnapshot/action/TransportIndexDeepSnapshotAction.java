@@ -147,6 +147,12 @@ public class TransportIndexDeepSnapshotAction extends TransportClusterManagerNod
 
         IndexId indexId = new IndexId(request.indexName(), indexMetadata.getIndexUUID());
         int numberOfShards = indexMetadata.getNumberOfShards();
+        // Captured synchronously, before the getRepositoryData round trip below -- found by round 5 of
+        // the bug hunt: round 4 moved this action's first async hop earlier (was previously only inside
+        // finalizeSnapshot), and capturing startTime after that hop instead of before it would silently
+        // exclude the round trip's own latency from SnapshotInfo's reported start time, understating how
+        // long the deep snapshot actually took end to end.
+        long startTime = System.currentTimeMillis();
         // Checked up front, before a single byte is copied, rather than left to surface however
         // Repository#finalizeSnapshot's own bookkeeping reacts to it -- found by round 4 of the bug
         // hunt. indexId above is built from the index's own real UUID, not resolved through {@link
@@ -156,41 +162,37 @@ public class TransportIndexDeepSnapshotAction extends TransportClusterManagerNod
         // identity too (see that request's own javadoc), so this repository-facing IndexId cannot
         // simply be re-resolved independently without also re-plumbing how each shard locates its data
         // in the object store -- a larger change than this finding's severity currently justifies. If
-        // this same target repository already holds an ordinary snapshot of an index with this same
-        // name under a *different* repository-internal id (any repository this index was ever
-        // snapshotted into through core's own _snapshot API, for instance), RepositoryData's own
-        // indices-by-name map has no merge function for two different IndexIds sharing one name --
-        // finalizeSnapshot's downstream addSnapshot call would otherwise throw IllegalStateException:
-        // Duplicate key partway through finalizing, after every shard's bytes were already copied.
-        // Failing loudly here instead costs nothing (no shard has been touched yet) and names the
-        // actual conflict rather than surfacing it as an opaque exception deep in core's own
-        // bookkeeping.
-        Repository targetRepository = repository;
-        targetRepository.getRepositoryData(ActionListener.wrap(repositoryData -> {
+        // this same target repository already holds a snapshot of an index with this same name under a
+        // *different* repository-internal id (any snapshot -- ordinary or an earlier deep snapshot --
+        // this index, or a since-deleted index of the same name, was ever written into this repository
+        // under), RepositoryData's own indices-by-name map has no merge function for two different
+        // IndexIds sharing one name -- finalizeSnapshot's downstream addSnapshot call would otherwise
+        // throw IllegalStateException: Duplicate key partway through finalizing, after every shard's
+        // bytes were already copied. Failing loudly here instead costs nothing (no shard has been
+        // touched yet) and names the actual conflict rather than surfacing it as an opaque exception
+        // deep in core's own bookkeeping. Checked again in finalizeSnapshot, against the RepositoryData
+        // that check reads fresh for its own reasons -- see this action's own round-5 note there for
+        // why checking only here leaves a real, if narrow, race open.
+        //
+        // Known, accepted limitation, not fixed here: an index deleted and recreated under the same
+        // name permanently blocks every future deep snapshot of the new incarnation into any repository
+        // that ever held a snapshot of the old one, since nothing here (or in finalizeSnapshot) ever
+        // prunes the stale entry -- only deleting the old snapshot(s) from that repository through core's
+        // own means clears it. The same structural cause as the collision this check exists to catch,
+        // and the same "re-plumbing the wire protocol is disproportionate to this finding" reasoning
+        // above applies to actually resolving it, so it is named here rather than silently hit later.
+        repository.getRepositoryData(ActionListener.wrap(repositoryData -> {
             IndexId existing = repositoryData.getIndices().get(request.indexName());
             if (identityConflictsWithExistingSnapshot(existing, indexId)) {
-                listener.onFailure(
-                    new IllegalStateException(
-                        "repository ["
-                            + request.repositoryName()
-                            + "] already holds a snapshot of index ["
-                            + request.indexName()
-                            + "] under a different identity ("
-                            + existing
-                            + " vs "
-                            + indexId
-                            + ") -- deep snapshots of this index must target a repository that has never held"
-                            + " an ordinary snapshot of it"
-                    )
-                );
+                listener.onFailure(conflictException(request.repositoryName(), request.indexName(), existing, indexId));
                 return;
             }
             CopyContext context = new CopyContext(
                 indexId,
                 new SnapshotId(request.snapshotName(), UUIDs.randomBase64UUID()),
-                targetRepository,
+                repository,
                 numberOfShards,
-                System.currentTimeMillis(),
+                startTime,
                 listener
             );
             copyShard(0, context, ShardGenerations.builder());
@@ -201,12 +203,34 @@ public class TransportIndexDeepSnapshotAction extends TransportClusterManagerNod
      * True if {@code existing} -- whatever {@link org.opensearch.repositories.RepositoryData#getIndices()}
      * already has on file for this index name, or {@code null} if nothing does -- names a different
      * repository-internal identity than {@code candidate}, the one this deep snapshot is about to use.
-     * Extracted as a small, pure predicate (rather than left inline in {@link #clusterManagerOperation})
-     * so round 4's own collision-avoidance check has a seam a plain unit test can exercise without a
-     * live repository -- see {@code TransportIndexDeepSnapshotActionTests}.
+     * Extracted as a small, pure predicate (rather than left inline) so both of its call sites' checks
+     * (see {@link #clusterManagerOperation} and {@link #finalizeSnapshot}) share one definition, and so
+     * a plain unit test can exercise it without a live repository -- see {@code
+     * TransportIndexDeepSnapshotActionTests}.
      */
     static boolean identityConflictsWithExistingSnapshot(IndexId existing, IndexId candidate) {
         return existing != null && existing.getId().equals(candidate.getId()) == false;
+    }
+
+    /**
+     * The exception both {@link #clusterManagerOperation} and {@link #finalizeSnapshot} raise when
+     * {@link #identityConflictsWithExistingSnapshot} finds a real conflict -- one message, shared, so
+     * the two call sites (a cheap up-front check and its narrower-window finalize-time repeat) cannot
+     * drift into describing the same failure two different ways.
+     */
+    private static IllegalStateException conflictException(String repositoryName, String indexName, IndexId existing, IndexId candidate) {
+        return new IllegalStateException(
+            "repository ["
+                + repositoryName
+                + "] already holds a snapshot of index ["
+                + indexName
+                + "] under a different identity ("
+                + existing
+                + " vs "
+                + candidate
+                + ") -- deep snapshots of this index must target a repository that has never held a snapshot"
+                + " of an index with this name under a different identity"
+        );
     }
 
     /**
@@ -313,6 +337,16 @@ public class TransportIndexDeepSnapshotAction extends TransportClusterManagerNod
      * enough that leaving it merely documented was not: {@code shardGenerations} was built against
      * {@code context.numberOfShards()}, fixed at {@link #clusterManagerOperation} time, so it is
      * compared against the freshly-resolved {@code indexMetadata}'s current count below.
+     *
+     * <p><b>The repeated identity-conflict check round 5 of the bug hunt added.</b> {@link
+     * #clusterManagerOperation}'s own check against {@link #identityConflictsWithExistingSnapshot} runs
+     * once, before any shard is copied -- but the copy loop it guards can run long, and a concurrent
+     * writer (an ordinary {@code _snapshot} call, or another deep snapshot) can write a conflicting
+     * {@code IndexId} for this same index name into this repository during that window, which the
+     * up-front check has no way to see. Re-running the identical check here, against the {@code
+     * repositoryData} this method already re-fetches fresh for {@code getGenId()}'s sake, closes that
+     * window down to the same size every other freshness re-check in this method already accepts, at no
+     * extra repository-read cost.
      */
     private void finalizeSnapshot(CopyContext context, ShardGenerations shardGenerations) {
         Repository repository = context.repository();
@@ -352,6 +386,13 @@ public class TransportIndexDeepSnapshotAction extends TransportClusterManagerNod
             return;
         }
         repository.getRepositoryData(ActionListener.wrap(repositoryData -> {
+            IndexId existing = repositoryData.getIndices().get(context.indexId().getName());
+            if (identityConflictsWithExistingSnapshot(existing, context.indexId())) {
+                listener.onFailure(
+                    conflictException(repository.getMetadata().name(), context.indexId().getName(), existing, context.indexId())
+                );
+                return;
+            }
             // Metadata.builder(state) starts from the real cluster metadata rather than an empty one,
             // so a plain (non-gated) serverless index -- already present there -- is untouched, and
             // only the gated case gains the entry it was missing. indices(Map.of(...)) rather than

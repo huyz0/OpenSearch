@@ -8,6 +8,8 @@
 
 package org.opensearch.serverless.storage.deepsnapshot.action;
 
+import com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters;
+
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.action.support.clustermanager.AcknowledgedResponse;
 import org.opensearch.cluster.metadata.IndexMetadata;
@@ -17,6 +19,7 @@ import org.opensearch.repositories.fs.FsRepository;
 import org.opensearch.serverless.storage.ServerlessStorageIntegTestCase;
 import org.opensearch.serverless.storage.ServerlessStoragePlugin;
 import org.opensearch.serverless.storage.descriptor.DescriptorGate;
+import org.opensearch.serverless.storage.readerengine.lazydirectory.CleanerDaemonThreadLeakFilter;
 import org.opensearch.test.OpenSearchIntegTestCase;
 
 import java.nio.file.Path;
@@ -30,7 +33,7 @@ import java.util.List;
  * {@code _restore} API -- the assertion that matters, since it is what distinguishes a real snapshot
  * from something shaped like one.
  */
-@com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters(filters = org.opensearch.serverless.storage.readerengine.lazydirectory.CleanerDaemonThreadLeakFilter.class)
+@ThreadLeakFilters(filters = CleanerDaemonThreadLeakFilter.class)
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
 public class IndexDeepSnapshotActionIT extends ServerlessStorageIntegTestCase {
 

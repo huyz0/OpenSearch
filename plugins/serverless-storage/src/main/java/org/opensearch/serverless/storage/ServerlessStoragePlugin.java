@@ -65,6 +65,7 @@ import org.opensearch.serverless.storage.readerengine.lazydirectory.ServerlessSt
 import org.opensearch.serverless.storage.rest.ServerlessRestGate;
 import org.opensearch.serverless.storage.retention.BlobContainerDurablePinRegistry;
 import org.opensearch.serverless.storage.retention.DurablePinRegistry;
+import org.opensearch.serverless.storage.retention.PinLedgerSweepTask;
 import org.opensearch.serverless.storage.retention.PitrRetentionConfig;
 import org.opensearch.serverless.storage.security.EncryptingBlobContainer;
 import org.opensearch.serverless.storage.security.EncryptionKeyProvider;
@@ -1317,10 +1318,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      * shard 0 later moves off this node. Cleared, cancelling every entry, when this plugin's own
      * node closes.
      */
-    private final java.util.concurrent.ConcurrentMap<
-        String,
-        org.opensearch.serverless.storage.retention.PinLedgerSweepTask> pinLedgerSweepTasks =
-            new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.concurrent.ConcurrentMap<String, PinLedgerSweepTask> pinLedgerSweepTasks =
+        new java.util.concurrent.ConcurrentHashMap<>();
     /**
      * Guards {@link #pinLedgerSweepTasks} against the shutdown race round 2 of the bug hunt found:
      * {@code close()}'s {@code forEach(close).then(clear())} is two separate steps against a plain
@@ -2391,7 +2390,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                     if (pinLedgerSweepTasksClosed == false) {
                         pinLedgerSweepTasks.computeIfAbsent(
                             indexUuid,
-                            uuid -> new org.opensearch.serverless.storage.retention.PinLedgerSweepTask(
+                            uuid -> new PinLedgerSweepTask(
                                 threadPool,
                                 pinLedgerSweepInterval,
                                 uuid,
@@ -3003,7 +3002,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 // unsynchronized), but closing the gap keeps the invariant the javadoc states actually
                 // true for every mutator, not just two of the three.
                 synchronized (pinLedgerSweepTasksLock) {
-                    org.opensearch.serverless.storage.retention.PinLedgerSweepTask sweepTask = pinLedgerSweepTasks.remove(index.getUUID());
+                    PinLedgerSweepTask sweepTask = pinLedgerSweepTasks.remove(index.getUUID());
                     if (sweepTask != null) {
                         sweepTask.close();
                     }
@@ -3570,7 +3569,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         // check-then-insert uses, so a concurrent shard-0 open cannot slip a task in after the drain.
         synchronized (pinLedgerSweepTasksLock) {
             pinLedgerSweepTasksClosed = true;
-            pinLedgerSweepTasks.values().forEach(org.opensearch.serverless.storage.retention.PinLedgerSweepTask::close);
+            pinLedgerSweepTasks.values().forEach(PinLedgerSweepTask::close);
             pinLedgerSweepTasks.clear();
         }
         org.opensearch.serverless.storage.resharding.InPlaceMergeTriggerSchedulerTask mergeTriggerTask = inPlaceMergeTriggerSchedulerTask;
@@ -3659,13 +3658,13 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     }
 
     /**
-     * The {@link org.opensearch.serverless.storage.retention.PinLedgerSweepTask} {@link
+     * The {@link PinLedgerSweepTask} {@link
      * #getEngineFactory} started for this index uuid, or {@code null} if none was -- test-only
      * visibility. Whether one exists at all is the assertion the bug hunt's regression tests need:
      * neither a null-{@code shardRouting} administrative call nor a delete-denied container is
      * something a test can otherwise observe from outside this class.
      */
-    org.opensearch.serverless.storage.retention.PinLedgerSweepTask pinLedgerSweepTaskForTesting(String indexUuid) {
+    PinLedgerSweepTask pinLedgerSweepTaskForTesting(String indexUuid) {
         return pinLedgerSweepTasks.get(indexUuid);
     }
 }
