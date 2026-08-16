@@ -521,6 +521,34 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     );
 
     /**
+     * Round 006 item 6: how often this node sweeps a pin ledger it has a resolver for, dropping it
+     * once none of the pins it names are still live -- {@code PinLedgerSweepTask}'s own javadoc for
+     * why coverage is per-index (bounded to indices whose shard 0 has opened on this node) rather
+     * than fleet-wide. Off by default, matching every other GC-adjacent setting's own shape: nothing
+     * correctness-bearing depends on this running, an abandoned ledger is a bounded storage leak
+     * rather than a risk of losing anything, and {@code SnapshotReleaseAction} remains the only way a
+     * pin itself is ever released.
+     */
+    public static final Setting<TimeValue> SERVERLESS_STORAGE_PIN_LEDGER_SWEEP_INTERVAL_SETTING = Setting.timeSetting(
+        "serverless_storage.retention.pin_ledger_sweep_interval",
+        TimeValue.MINUS_ONE,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * How old a still-live pin ledger has to be before a sweep pass logs it as worth an operator's
+     * attention. See {@code PinLedgerSweepTask#DEFAULT_ABANDONED_AFTER_MILLIS}'s own javadoc for why
+     * two hours -- an order of magnitude past {@code TransportIndexSnapshotPinAction}'s own ten-minute
+     * unconfirmed-pin TTL, so a slow-but-healthy fan-out across a large shard count is never mistaken
+     * for an abandoned one.
+     */
+    public static final Setting<TimeValue> SERVERLESS_STORAGE_PIN_LEDGER_ABANDONED_AFTER_SETTING = Setting.timeSetting(
+        "serverless_storage.retention.pin_ledger_abandoned_after",
+        TimeValue.timeValueHours(2),
+        Setting.Property.NodeScope
+    );
+
+    /**
      * How often the node-level {@code WalGcSchedulerTask} sweeps for WAL chunks safe to delete
      * (rfc-serverless-opensearch.md &sect;6.4's own status note on this gap). Unlike {@link
      * #SERVERLESS_STORAGE_GC_INTERVAL_SETTING}'s sweep, this one needs no separate time-based
@@ -1276,6 +1304,23 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      */
     private volatile org.opensearch.serverless.storage.writerengine.EngineNativeSnapshotSupport engineNativeSnapshotSupport;
     private volatile long pitrWindowMillis = -1;
+    /**
+     * Round 006 item 6. {@code null} when off (the default), matching {@code compactionInterval}'s
+     * own "resolved once, null means disabled" shape just below.
+     */
+    private volatile TimeValue pinLedgerSweepInterval;
+    private volatile long pinLedgerAbandonedAfterMillis;
+    /**
+     * Dedups {@code PinLedgerSweepTask} by index uuid, since {@code getEngineFactory} runs once per
+     * shard-0 open and a relocation or restart-in-place must not start a second task racing the
+     * first -- see that task's own javadoc for why it is left running rather than torn down when
+     * shard 0 later moves off this node. Cleared, cancelling every entry, when this plugin's own
+     * node closes.
+     */
+    private final java.util.concurrent.ConcurrentMap<
+        String,
+        org.opensearch.serverless.storage.retention.PinLedgerSweepTask> pinLedgerSweepTasks =
+            new java.util.concurrent.ConcurrentHashMap<>();
     private volatile ReaderShardAdmissionController readerShardAdmissionController;
     // One shared instance node-wide, threaded into every shard's CompactionSchedulerConfig/
     // PartitionRewriteSchedulerConfig -- see RewriteAdmissionController's own javadoc for why these
@@ -1578,6 +1623,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_GC_RETENTION_WINDOW_SETTING,
             SERVERLESS_STORAGE_GC_CANDIDATE_TAIL_INTERVAL_SETTING,
             SERVERLESS_STORAGE_GC_CANDIDATE_LOOKBACK_SETTING,
+            SERVERLESS_STORAGE_PIN_LEDGER_SWEEP_INTERVAL_SETTING,
+            SERVERLESS_STORAGE_PIN_LEDGER_ABANDONED_AFTER_SETTING,
             SERVERLESS_STORAGE_WAL_GC_INTERVAL_SETTING,
             SERVERLESS_STORAGE_WAL_PER_SHARD_BUDGET_SETTING,
             SERVERLESS_STORAGE_WAL_FLUSH_BATCHING_ENABLED_SETTING,
@@ -1900,6 +1947,9 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             SERVERLESS_STORAGE_BUNDLE_CACHE_SIZE_SETTING.get(environment.settings()).getBytes()
         );
         pitrWindowMillis = SERVERLESS_STORAGE_PITR_WINDOW_SETTING.get(environment.settings()).millis();
+        TimeValue configuredPinLedgerSweepInterval = SERVERLESS_STORAGE_PIN_LEDGER_SWEEP_INTERVAL_SETTING.get(environment.settings());
+        pinLedgerSweepInterval = configuredPinLedgerSweepInterval.millis() > 0 ? configuredPinLedgerSweepInterval : null;
+        pinLedgerAbandonedAfterMillis = SERVERLESS_STORAGE_PIN_LEDGER_ABANDONED_AFTER_SETTING.get(environment.settings()).millis();
         TimeValue configuredCompactionInterval = SERVERLESS_STORAGE_COMPACTION_INTERVAL_SETTING.get(environment.settings());
         compactionInterval = configuredCompactionInterval.millis() > 0 ? configuredCompactionInterval : null;
         TimeValue configuredPartitionRewriteInterval = SERVERLESS_STORAGE_PARTITION_REWRITE_INTERVAL_SETTING.get(environment.settings());
@@ -2282,6 +2332,27 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             PitrRetentionConfig pitrRetentionConfig = pitrWindowMillis > 0
                 ? new PitrRetentionConfig(manifestStore, pinRegistry, pitrWindowMillis)
                 : null;
+
+            // Round 006 item 6. Shard 0 only, because that is the one place a pin ledger lives --
+            // see PinLedgerSweepTask's own javadoc for why this is per-index, node-local coverage
+            // rather than fleet-wide, and why the task is left running (deduped by indexUuid) rather
+            // than torn down when shard 0 later relocates off this node. Constructed here rather than
+            // threaded through ObjectStoreWriterEngine/ReaderEngineFactory's own long constructor
+            // chains: sweeping needs nothing from either engine, only the container resolver this
+            // method already has in scope.
+            if (shardIdValue == 0 && pinLedgerSweepInterval != null) {
+                pinLedgerSweepTasks.computeIfAbsent(
+                    indexUuid,
+                    uuid -> new org.opensearch.serverless.storage.retention.PinLedgerSweepTask(
+                        threadPool,
+                        pinLedgerSweepInterval,
+                        uuid,
+                        new org.opensearch.serverless.storage.retention.BlobContainerPinLedgerStore(scopedContainer),
+                        this::resolveBlobContainer,
+                        pinLedgerAbandonedAfterMillis
+                    )
+                );
+            }
 
             boolean isReaderShard = shardRouting != null && shardRouting.isSearchOnly();
             if (isReaderShard) {
@@ -3097,6 +3168,14 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new ActionHandler<>(
                 org.opensearch.serverless.storage.resharding.action.OrchestrateShardSplitAction.INSTANCE,
                 org.opensearch.serverless.storage.resharding.action.TransportOrchestrateShardSplitAction.class
+            ),
+            new ActionHandler<>(
+                org.opensearch.serverless.storage.deepsnapshot.action.ShardDeepSnapshotAction.INSTANCE,
+                org.opensearch.serverless.storage.deepsnapshot.action.TransportShardDeepSnapshotAction.class
+            ),
+            new ActionHandler<>(
+                org.opensearch.serverless.storage.deepsnapshot.action.IndexDeepSnapshotAction.INSTANCE,
+                org.opensearch.serverless.storage.deepsnapshot.action.TransportIndexDeepSnapshotAction.class
             )
         );
     }
@@ -3166,7 +3245,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new org.opensearch.serverless.storage.resharding.action.RestDisableWritePartitionRoutingAction(),
             new org.opensearch.serverless.storage.resharding.action.RestFenceSplitSourceAction(),
             new org.opensearch.serverless.storage.resharding.action.RestProvisionSplitTargetsAction(),
-            new org.opensearch.serverless.storage.resharding.action.RestOrchestrateShardSplitAction()
+            new org.opensearch.serverless.storage.resharding.action.RestOrchestrateShardSplitAction(),
+            new org.opensearch.serverless.storage.deepsnapshot.action.RestIndexDeepSnapshotAction()
         );
     }
 
@@ -3412,6 +3492,10 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         if (splitTriggerTask != null) {
             splitTriggerTask.close();
         }
+        // Round 006 item 6. One entry per index whose shard 0 opened on this node; every entry
+        // cancels its own scheduled task, the same as every other *SchedulerTask closed just above.
+        pinLedgerSweepTasks.values().forEach(org.opensearch.serverless.storage.retention.PinLedgerSweepTask::close);
+        pinLedgerSweepTasks.clear();
         org.opensearch.serverless.storage.resharding.InPlaceMergeTriggerSchedulerTask mergeTriggerTask = inPlaceMergeTriggerSchedulerTask;
         if (mergeTriggerTask != null) {
             mergeTriggerTask.close();
