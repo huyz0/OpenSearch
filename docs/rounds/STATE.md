@@ -284,6 +284,34 @@ write-behind projection kept only so the aggregate stays one search.
   `IndexBackedMappingStore`, so the suite stayed green against a store production did not register. The shared
   fixture now composes the store the way `ServerlessStoragePlugin` does.
 
+### Pins have a ledger now, so releasing one is retryable
+
+A pin is written per shard, so an index-wide pin is N pins under one id, and nothing recorded that they were
+one thing. Three consequences of the same gap: release walked the index's *current* shard count rather than
+the count the pin was taken across; a release that failed halfway left pins with nothing naming them; and a
+coordinator that died mid-fan-out leaked pins nobody could enumerate, holding generations against GC
+forever.
+
+Core solved this from the other direction for remote-store shallow copy, and the ledger is deliberately the
+same shape: there every lock on a remote segment file is paired with a `shallow-snap-<uuid>` blob in the
+repository, and snapshot deletion reads that blob to learn which locks to release -- **releasing first and
+deleting the record only afterwards**, so a failed release leaves the record for the next attempt. Their
+repository entry is the ledger. A pin taken through `_snapshot_pin` never goes near a repository, which is
+exactly what makes it cheap, so ours has to be written on purpose.
+
+`PinLedger` records the pin id, index, uuid and the shard count it covered, written **before** any pin is
+taken -- a record of intent, not of completion, because a ledger written afterwards would not exist for the
+case it is meant to cover. Release reads it, releases what it names, and deletes it last.
+
+Asserted by interrupting a release halfway and requiring a retry to finish the job; by releasing twice and
+requiring both to succeed; and -- the one that stops the others passing vacuously -- by rewriting the ledger
+to name fewer shards than were pinned and requiring the release to honour the record rather than the index's
+current shard count.
+
+Deliberately not carried: the pinned generations, which the pins themselves already state and release does
+not need. Still open: pins have no owner or TTL, so an abandoned ledger is discoverable but not yet swept,
+and the ledger lives in shard 0's container because that is the only per-index location the plugin exposes.
+
 ### A standard snapshot of a serverless index works: copied, finalized, restored by core
 
 The headline question of round 006, answered by building it. `DeepSnapshotOrchestrationIT` takes a

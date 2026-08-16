@@ -16,6 +16,9 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.index.IndexNotFoundException;
+import org.opensearch.serverless.storage.ServerlessStoragePlugin;
+import org.opensearch.serverless.storage.retention.BlobContainerPinLedgerStore;
+import org.opensearch.serverless.storage.retention.PinLedger;
 import org.opensearch.tasks.Task;
 import org.opensearch.transport.TransportService;
 import org.opensearch.transport.client.node.NodeClient;
@@ -43,6 +46,7 @@ public class TransportIndexSnapshotPinAction extends HandledTransportAction<Inde
 
     private final ClusterService clusterService;
     private final NodeClient client;
+    private final ServerlessStoragePlugin plugin;
 
     /**
      * Creates the transport action.
@@ -51,17 +55,20 @@ public class TransportIndexSnapshotPinAction extends HandledTransportAction<Inde
      * @param actionFilters applied by {@link HandledTransportAction} around every request.
      * @param clusterService resolves the request's index name to a UUID and shard count.
      * @param client dispatches each shard's {@link SnapshotPinAction}/{@link SnapshotReleaseAction} call.
+     * @param plugin resolves the index's shard 0 container, where the pin ledger is kept.
      */
     @Inject
     public TransportIndexSnapshotPinAction(
         TransportService transportService,
         ActionFilters actionFilters,
         ClusterService clusterService,
-        NodeClient client
+        NodeClient client,
+        ServerlessStoragePlugin plugin
     ) {
         super(IndexSnapshotPinAction.NAME, transportService, actionFilters, IndexSnapshotPinRequest::new);
         this.clusterService = clusterService;
         this.client = client;
+        this.plugin = plugin;
     }
 
     /**
@@ -89,6 +96,20 @@ public class TransportIndexSnapshotPinAction extends HandledTransportAction<Inde
         }
         String indexUuid = indexMetadata.getIndexUUID();
         int numberOfShards = indexMetadata.getNumberOfShards();
+
+        // The ledger is written BEFORE any pin, so it is a record of intent rather than of completion. That
+        // direction is deliberate and it is the only one that helps: a coordinator that dies mid-fan-out
+        // leaves pins behind, and a ledger written afterwards would not exist to say so. Written first, the
+        // worst case is a ledger naming a pin that was never taken -- and release is idempotent per shard,
+        // so acting on that costs nothing and clears it.
+        try {
+            new BlobContainerPinLedgerStore(plugin.blobContainerForDirectoryFactory(indexUuid, 0)).write(
+                new PinLedger(request.snapshotId(), request.indexName(), indexUuid, numberOfShards, System.currentTimeMillis())
+            );
+        } catch (Exception e) {
+            listener.onFailure(e);
+            return;
+        }
         pinShard(indexUuid, numberOfShards, 0, request.snapshotId(), new ArrayList<>(), listener);
     }
 

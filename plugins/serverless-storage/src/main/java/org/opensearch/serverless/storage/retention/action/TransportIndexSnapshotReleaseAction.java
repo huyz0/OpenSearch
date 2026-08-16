@@ -16,6 +16,9 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.index.IndexNotFoundException;
+import org.opensearch.serverless.storage.ServerlessStoragePlugin;
+import org.opensearch.serverless.storage.retention.BlobContainerPinLedgerStore;
+import org.opensearch.serverless.storage.retention.PinLedger;
 import org.opensearch.tasks.Task;
 import org.opensearch.transport.TransportService;
 import org.opensearch.transport.client.node.NodeClient;
@@ -30,6 +33,7 @@ public class TransportIndexSnapshotReleaseAction extends HandledTransportAction<
 
     private final ClusterService clusterService;
     private final NodeClient client;
+    private final ServerlessStoragePlugin plugin;
 
     /**
      * Creates the transport action.
@@ -44,11 +48,13 @@ public class TransportIndexSnapshotReleaseAction extends HandledTransportAction<
         TransportService transportService,
         ActionFilters actionFilters,
         ClusterService clusterService,
-        NodeClient client
+        NodeClient client,
+        ServerlessStoragePlugin plugin
     ) {
         super(IndexSnapshotReleaseAction.NAME, transportService, actionFilters, IndexSnapshotReleaseRequest::new);
         this.clusterService = clusterService;
         this.client = client;
+        this.plugin = plugin;
     }
 
     /**
@@ -74,7 +80,39 @@ public class TransportIndexSnapshotReleaseAction extends HandledTransportAction<
             listener.onFailure(new IndexNotFoundException(request.indexName()));
             return;
         }
-        releaseShard(indexMetadata.getIndexUUID(), indexMetadata.getNumberOfShards(), 0, request.snapshotId(), listener);
+        String indexUuid = indexMetadata.getIndexUUID();
+
+        // The ledger decides what to release, not the index's current shard count. Those can differ -- a
+        // resharded index has a different count than the one the pin was taken across, and walking the
+        // current count would release the wrong set while reporting success. The ledger records the set as
+        // it was.
+        //
+        // A missing ledger is not an error. It means either that this pin was never taken, or that a
+        // previous release already finished and removed the record; releasing per shard is idempotent, so
+        // falling back to the current shard count covers both, and covers pins taken before ledgers existed.
+        final BlobContainerPinLedgerStore ledgerStore;
+        final int shardsToRelease;
+        try {
+            ledgerStore = new BlobContainerPinLedgerStore(plugin.blobContainerForDirectoryFactory(indexUuid, 0));
+            shardsToRelease = ledgerStore.read(request.snapshotId()).map(PinLedger::shardCount).orElse(indexMetadata.getNumberOfShards());
+        } catch (Exception e) {
+            listener.onFailure(e);
+            return;
+        }
+
+        releaseShard(indexUuid, shardsToRelease, 0, request.snapshotId(), ActionListener.wrap(response -> {
+            // Deleted only after every pin it names is gone, which is what makes a failed release
+            // retryable rather than an invisible leak: the record survives the failure and the next
+            // attempt finds the same set. Core's shallow-copy delete orders it the same way and says so
+            // in its own comment.
+            try {
+                ledgerStore.delete(request.snapshotId());
+            } catch (Exception e) {
+                listener.onFailure(e);
+                return;
+            }
+            listener.onResponse(response);
+        }, listener::onFailure));
     }
 
     private void releaseShard(
