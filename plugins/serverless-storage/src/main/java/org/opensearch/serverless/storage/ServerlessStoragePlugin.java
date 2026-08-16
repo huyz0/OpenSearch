@@ -3246,7 +3246,8 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             new org.opensearch.serverless.storage.resharding.action.RestFenceSplitSourceAction(),
             new org.opensearch.serverless.storage.resharding.action.RestProvisionSplitTargetsAction(),
             new org.opensearch.serverless.storage.resharding.action.RestOrchestrateShardSplitAction(),
-            new org.opensearch.serverless.storage.deepsnapshot.action.RestIndexDeepSnapshotAction()
+            new org.opensearch.serverless.storage.deepsnapshot.action.RestIndexDeepSnapshotAction(),
+            new org.opensearch.serverless.storage.deepsnapshot.action.RestShardDeepSnapshotAction()
         );
     }
 
