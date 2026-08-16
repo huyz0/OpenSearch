@@ -32,11 +32,28 @@ import java.util.Objects;
  */
 public record DescriptorChange(String name, String uuid, Kind kind, long atMillis) implements Writeable {
 
-    /** What happened to a name. */
+    /**
+     * What happened to a name.
+     *
+     * <p>New values go on the end. The kind is serialized by ordinal, so appending is readable by a node
+     * that has not seen the new value in any log it wrote itself, and reordering would silently
+     * reinterpret every entry already on the object store.
+     */
     public enum Kind {
         CREATED,
         UPDATED,
-        DELETED
+        DELETED,
+        /**
+         * The index still exists but is closed, so it has no shard.
+         *
+         * <p>Distinct from {@link #UPDATED} because a closed index's shard has to be released, and distinct
+         * from {@link #DELETED} because the name is still live and still resolves. Before this existed the
+         * two were conflated into {@code UPDATED}: closing a gated index wrote {@code withState(CLOSE)},
+         * answered acknowledged, and left the writer holding its lease and renewing it, because the tailer
+         * could not tell a close from a mapping edit and released shards only for deletes. The index went on
+         * serving, and a restore-in-place -- which refuses while a lease is held -- was unreachable.
+         */
+        CLOSED
     }
 
     public DescriptorChange {
@@ -57,8 +74,25 @@ public record DescriptorChange(String name, String uuid, Kind kind, long atMilli
         out.writeVLong(atMillis);
     }
 
-    /** Whether the name is live after this change, which is all the name index needs to decide. */
+    /**
+     * Whether the name is live after this change, which is all the name index needs to decide.
+     *
+     * <p>A closed index is live: it still exists and its name still resolves. Only a delete takes a name
+     * out of the index.
+     */
     public boolean live() {
         return kind != Kind.DELETED;
+    }
+
+    /**
+     * Whether a node holding a shard for this index must let it go.
+     *
+     * <p>True for a delete and for a close, and deliberately not the negation of {@link #live()}: a closed
+     * index keeps its name and loses its shard, so the two questions have different answers and conflating
+     * them is what left a closed gated index serving traffic. The shard-release side is idempotent, so a
+     * repeat -- a mapping write against an already-closed index, say -- costs nothing.
+     */
+    public boolean releasesShard() {
+        return kind == Kind.DELETED || kind == Kind.CLOSED;
     }
 }

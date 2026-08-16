@@ -56,12 +56,22 @@ import java.util.concurrent.TimeUnit;
  *
  * <p>It does not pass, and what it found is worth more than the feature it was written for.
  * Restore-in-place refuses while a writer lease is held; the ordinary-index restore test releases that
- * lease by closing the index; and closing a gated index does not release it. The shard stays open, because
- * the only channel that tells other nodes about a gated index's change is the descriptor change log, and
- * {@code DescriptorChange} carries {@code (name, uuid, kind, atMillis)} with no state -- so the tailer
- * cannot tell a close from a mapping update and releases shards only for deletions. Fixing it means either
- * a persisted change-log format that carries state, or a descriptor read per update; that is a decision
- * about a format on the object store, not a line to add here.
+ * lease by closing the index; and closing a gated index does not release it.
+ *
+ * <p>Pulling that thread found three layers, not one, and two of them are now fixed. The only channel that
+ * tells other nodes about a gated index's change is the descriptor change log. {@code DescriptorChange}
+ * carried {@code (name, uuid, kind, atMillis)} with no state, so the tailer could not tell a close from a
+ * mapping update and released shards only for deletions -- it now carries {@code CLOSED}, and the tailer
+ * asks {@code releasesShard()} rather than {@code !live()}, because a closed index keeps its name and loses
+ * its shard. That alone changed nothing, which is how the second layer surfaced: a close is written through
+ * {@code IndexDescriptorPublisher.updateGated}, and that path recorded no change of any kind, so there was
+ * never an entry for the new kind to travel in. It records one now, which also means a mapping update
+ * republished that way stops leaving other nodes' caches stale.
+ *
+ * <p>The third layer is why this is still marked: this harness installs no change log, so nothing is
+ * appended and nothing tails it here regardless. Whether the release then holds, or the shard is
+ * immediately reopened on demand by the next write, has not been measured -- and guessing which, in a
+ * javadoc, is exactly the habit this file exists to resist.
  *
  * <p>Left {@code AwaitsFix} rather than weakened to assert the current behaviour, which is how this branch
  * already treats {@code GatedAndOrdinaryNameCollisionIT}'s finding and {@code GatedCreationDurabilityIT}'s
@@ -103,9 +113,12 @@ public class GatedShallowSnapshotIT extends org.opensearch.serverless.storage.Se
         DescriptorGate.uninstall();
     }
 
-    @org.apache.lucene.tests.util.LuceneTestCase.AwaitsFix(bugUrl = "closing a gated index does not release its writer lease, so restore-in-place is unreachable: "
-        + "DescriptorChange carries (name, uuid, kind, atMillis) and no state, so the tailer cannot tell a "
-        + "close from any other update and only releases shards of deleted indices")
+    @org.apache.lucene.tests.util.LuceneTestCase.AwaitsFix(bugUrl = "closing a gated index still does not release its writer lease, so restore-in-place stays "
+        + "unreachable. Two of the three layers are fixed: DescriptorChange now carries CLOSED and the "
+        + "tailer releases a shard for it, and the updater path -- which is the path a close takes -- now "
+        + "records a change at all, which it did not. What remains is that this harness installs no change "
+        + "log, so nothing is appended and nothing tails it; whether the release then sticks, or the shard "
+        + "is immediately reopened on demand, has not been established")
     public void testPinRestoreAndReleaseAllWorkOnAGatedIndex() throws Exception {
         internalCluster().startClusterManagerOnlyNode();
         internalCluster().startDataOnlyNode();

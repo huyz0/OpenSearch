@@ -332,6 +332,16 @@ public final class DescriptorGate {
                 descriptor,
                 org.opensearch.core.action.ActionListener.wrap(ignored -> future.complete(true), future::completeExceptionally)
             );
+            // Recorded here as well as on the publish path, which it was not before, and the omission had
+            // teeth. This is the path a close takes -- MetadataIndexStateService's gated branch writes
+            // descriptor.withState(CLOSE) through updateGated -- so nothing was appended to the change log
+            // for a close at all, and no other node ever learned of one. Adding Kind.CLOSED alone did not
+            // fix that, because no entry of any kind was being written for it to carry.
+            //
+            // It applies equally to every other update through here: a mapping change republished this way
+            // left other nodes' caches holding the previous descriptor until something else invalidated
+            // them.
+            recordChange(descriptor);
             return future;
         });
         // T58: Mappings for gated indices are stored directly inside IndexDescriptors in Object Storage.
@@ -462,12 +472,19 @@ public final class DescriptorGate {
      * which is the same reasoning {@code append} already applies inside itself.
      */
     private static void recordChange(IndexDescriptor descriptor) {
-        DescriptorChange change = new DescriptorChange(
-            descriptor.name(),
-            descriptor.uuid(),
-            descriptor.exists() ? DescriptorChange.Kind.UPDATED : DescriptorChange.Kind.DELETED,
-            System.currentTimeMillis()
-        );
+        DescriptorChange.Kind kind;
+        if (descriptor.exists() == false) {
+            kind = DescriptorChange.Kind.DELETED;
+        } else if (descriptor.state() == org.opensearch.cluster.metadata.IndexDescriptor.State.CLOSE) {
+            // Any write leaving the descriptor closed is reported as a close, not just the one that closed
+            // it. Stated as the index's state rather than as the operation that produced it, so a mapping
+            // write against an already-closed index cannot quietly report UPDATED and leave a node that
+            // missed the original close still holding the shard.
+            kind = DescriptorChange.Kind.CLOSED;
+        } else {
+            kind = DescriptorChange.Kind.UPDATED;
+        }
+        DescriptorChange change = new DescriptorChange(descriptor.name(), descriptor.uuid(), kind, System.currentTimeMillis());
         try {
             BlobDescriptorChangeLog changeLog = CHANGE_LOG.get();
             if (changeLog != null) {
