@@ -147,7 +147,6 @@ public class TransportIndexDeepSnapshotAction extends TransportClusterManagerNod
 
         CopyContext context = new CopyContext(
             new IndexId(request.indexName(), indexMetadata.getIndexUUID()),
-            request.repositoryName(),
             new SnapshotId(request.snapshotName(), UUIDs.randomBase64UUID()),
             repository,
             indexMetadata.getNumberOfShards(),
@@ -174,9 +173,15 @@ public class TransportIndexDeepSnapshotAction extends TransportClusterManagerNod
      * #finalizeSnapshot} re-resolves it fresh (see that method's own javadoc for why) rather than
      * reusing one captured here, so the shard count this loop bounds itself by is the only piece of
      * that original resolution this record still needs.
+     *
+     * <p>No separate {@code repositoryName} field either -- found duplicated by round 3 of the bug
+     * hunt: {@code repository} already carries its own name via {@code getMetadata().name()}, so the
+     * one call site that needs it as a string ({@link #copyShard}, building each shard's request) reads
+     * it from there instead of a second field that could drift from the {@code Repository} object next
+     * to it.
      */
-    private record CopyContext(IndexId indexId, String repositoryName, SnapshotId snapshotId, Repository repository, int numberOfShards,
-        long startTime, ActionListener<IndexDeepSnapshotResponse> listener) {
+    private record CopyContext(IndexId indexId, SnapshotId snapshotId, Repository repository, int numberOfShards, long startTime,
+        ActionListener<IndexDeepSnapshotResponse> listener) {
     }
 
     private void copyShard(int shardId, CopyContext context, ShardGenerations.Builder shardGenerations) {
@@ -190,7 +195,7 @@ public class TransportIndexDeepSnapshotAction extends TransportClusterManagerNod
                 context.indexId().getName(),
                 context.indexId().getId(),
                 shardId,
-                context.repositoryName(),
+                context.repository().getMetadata().name(),
                 context.snapshotId().getName(),
                 context.snapshotId().getUUID()
             ),
@@ -236,20 +241,41 @@ public class TransportIndexDeepSnapshotAction extends TransportClusterManagerNod
      * metadata for something that no longer exists. Re-resolving fresh here, right before it is folded
      * into {@code clusterMetadata}, narrows that window to as small as this method can make it, the
      * same reasoning this method already applies to {@code repositoryData.getGenId()} one line below.
+     *
+     * <p><b>The identity check round 3 of the bug hunt added.</b> A fresh resolution answers "does an
+     * index named this still exist," not "is it the same index" -- an index deleted and a same-named
+     * index created in its place mid-copy would resolve to a real, non-null {@code IndexMetadata} with
+     * a different {@link IndexMetadata#getIndexUUID()}, and combining that new identity's metadata with
+     * {@code shardGenerations} built against the original {@link CopyContext#indexId()} would finalize
+     * a snapshot whose own metadata and shard-generation data describe two different indices. Checked
+     * explicitly below rather than left to whatever inconsistency that would eventually surface as
+     * downstream.
+     *
+     * <p><b>What this identity check does not catch</b>, stated rather than left implicit: an in-place
+     * shard split (this plugin's own {@code resharding} package) changes an index's shard count without
+     * changing its UUID, so a split completing mid-copy passes the identity check below while
+     * {@code context.numberOfShards()}/{@code shardGenerations} stay sized to the shard count at {@link
+     * #clusterManagerOperation} time, not the resolved {@code indexMetadata}'s current one. Same
+     * category of gap as the concurrent-repository-write race already scoped out above: closing it
+     * properly needs either blocking resharding for the duration of a deep snapshot or discarding and
+     * restarting the copy on a detected split, neither of which is this round's scope.
      */
     private void finalizeSnapshot(CopyContext context, ShardGenerations shardGenerations) {
         Repository repository = context.repository();
         SnapshotId snapshotId = context.snapshotId();
         int numberOfShards = context.numberOfShards();
         ActionListener<IndexDeepSnapshotResponse> listener = context.listener();
+        ClusterState clusterState = clusterService.state();
         IndexMetadata indexMetadata = AbsentIndexDescriptorSuppliers.metadataOrDescriptor(
-            clusterService.state().metadata(),
+            clusterState.metadata(),
             context.indexId().getName()
         );
-        if (indexMetadata == null) {
-            // The index was deleted while this copy was in flight -- every shard's bytes were
-            // successfully copied, but there is nothing left to describe in the finalized snapshot's
-            // own metadata, so this is reported as a failure rather than finalizing with stale data.
+        if (indexMetadata == null || indexMetadata.getIndexUUID().equals(context.indexId().getId()) == false) {
+            // Either the index was deleted while this copy was in flight, or it was deleted and a
+            // same-named index created in its place (a different UUID) -- either way, every shard's
+            // bytes were successfully copied under the original identity, but there is nothing left (or
+            // nothing matching) to describe in the finalized snapshot's own metadata, so this is
+            // reported as a failure rather than finalizing with stale or mismatched data.
             listener.onFailure(new IndexNotFoundException(context.indexId().getName()));
             return;
         }
@@ -266,8 +292,10 @@ public class TransportIndexDeepSnapshotAction extends TransportClusterManagerNod
             // silently clobbering a descriptor an operator may have legitimately changed since.
             // indices(Map) is a plain putAll with no publish hook either way, and does not bump the
             // metadata version: this Metadata is genuinely never published, only handed to one
-            // repository call that reads it and discards it.
-            Metadata clusterMetadata = Metadata.builder(clusterService.state().metadata())
+            // repository call that reads it and discards it. Seeded from the same `clusterState`
+            // already resolved above (not a second clusterService.state() read here) so the identity
+            // check just performed and this Metadata are guaranteed built from one consistent snapshot.
+            Metadata clusterMetadata = Metadata.builder(clusterState.metadata())
                 .indices(Map.of(indexMetadata.getIndex().getName(), indexMetadata))
                 .build();
             long endTime = System.currentTimeMillis();

@@ -173,7 +173,7 @@ public class TransportShardDeepSnapshotAction extends HandledTransportAction<Sha
             // it if a crash or a shutdown-time GENERIC rejection skips the release below -- see that
             // constant's own javadoc.
             SnapshotPinRequest.expiring(request.indexUuid(), request.shardId(), pinId, System.currentTimeMillis() + PIN_TTL_MILLIS),
-            ActionListener.wrap(pin -> {
+            ActionListener.wrap(pin -> threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
                 // The heavy, genuinely blocking work -- Lucene reads, checksums, and a wait on
                 // the repository's own async snapshotShard -- runs here instead, on a thread this
                 // action dispatched for itself rather than one a listener callback merely
@@ -186,37 +186,34 @@ public class TransportShardDeepSnapshotAction extends HandledTransportAction<Sha
                 // version did) so a listener whose own onResponse throws (RestShardDeepSnapshotAction's
                 // RestToXContentListener does not self-swallow the way ActionListener.wrap does)
                 // cannot have this catch call onFailure a second time on top of it.
-                Runnable copyAndRelease = () -> {
-                    ShardDeepSnapshotResponse response;
-                    try {
-                        // Released on both paths, per the plan's own instruction -- the finally covers
-                        // exactly copyPinnedGeneration, not the listener calls below, so a release racing
-                        // a retry of this same request costs nothing beyond the round trip
-                        // (SnapshotReleaseAction's removePin is idempotent) and a single release call
-                        // covers both outcomes instead of one per branch.
-                        try {
-                            response = copyPinnedGeneration(request, pin);
-                        } finally {
-                            releasePin(request.indexUuid(), request.shardId(), pinId);
-                        }
-                    } catch (Exception e) {
-                        listener.onFailure(e);
-                        return;
-                    }
-                    listener.onResponse(response);
-                };
+                //
+                // No try/catch around the execute(...) submission itself (e.g. for a GENERIC pool
+                // rejecting under shutdown): this whole lambda is already the CheckedConsumer
+                // ActionListener.wrap's own onResponse calls inside its own try/catch, which routes any
+                // exception the lambda throws -- including one thrown by execute(...) before this
+                // Runnable ever runs -- to this wrap's onFailure (listener::onFailure) already. An
+                // explicit catch here would only duplicate that, found and reverted by round 3 of the
+                // bug hunt after round 2 added it without re-checking ActionListener.wrap's own
+                // contract.
+                ShardDeepSnapshotResponse response;
                 try {
-                    threadPool.executor(ThreadPool.Names.GENERIC).execute(copyAndRelease);
+                    // releasePin itself never throws (its own javadoc): a release racing a retry of
+                    // this same request costs nothing beyond the round trip (SnapshotReleaseAction's
+                    // removePin is idempotent), so a single call in finally, covering both the success
+                    // and failure paths below, is safe -- and unlike a releasePin that could throw
+                    // synchronously, it can never override a successful copyPinnedGeneration result with
+                    // a failure this finally raises instead.
+                    try {
+                        response = copyPinnedGeneration(request, pin);
+                    } finally {
+                        releasePin(request.indexUuid(), request.shardId(), pinId);
+                    }
                 } catch (Exception e) {
-                    // Submission itself can fail -- most realistically a RejectedExecutionException
-                    // from a GENERIC pool that is shutting down -- before copyAndRelease ever runs, so
-                    // neither its own release nor either listener call would otherwise fire and the
-                    // caller would hang. The pin still expires on its own via PIN_TTL_MILLIS in that
-                    // case (releasePin itself dispatches through the same client the caller does, so
-                    // attempting it here would only risk the identical rejection).
                     listener.onFailure(e);
+                    return;
                 }
-            }, listener::onFailure)
+                listener.onResponse(response);
+            }), listener::onFailure)
         );
     }
 
@@ -353,14 +350,29 @@ public class TransportShardDeepSnapshotAction extends HandledTransportAction<Sha
         }
     }
 
+    /**
+     * Never throws -- every failure, including one {@code client.execute} itself raises synchronously
+     * (before ever reaching the listener below), is logged and swallowed here rather than propagated.
+     * Found worth stating explicitly by round 3 of the bug hunt: this is called from inside {@code
+     * doExecute}'s own {@code finally}, and a caller relying on a synchronous exception from here to
+     * always mean "the finally is what failed" would otherwise have that assumption broken by whatever
+     * {@code copyPinnedGeneration} itself already did, or worse -- letting a release failure override a
+     * copy that had already succeeded is exactly the class of bug this method's own "never throws"
+     * contract exists to rule out. Safe to swallow: the pin's own {@code PIN_TTL_MILLIS} expiry already
+     * reclaims it if this call, or its dispatch, never completes.
+     */
     private void releasePin(String indexUuid, int shardId, String pinId) {
-        client.execute(
-            SnapshotReleaseAction.INSTANCE,
-            new SnapshotReleaseRequest(indexUuid, shardId, pinId),
-            ActionListener.wrap(
-                response -> {},
-                e -> logger.warn("could not release deep-snapshot pin [{}] on shard [{}/{}]", pinId, indexUuid, shardId, e)
-            )
-        );
+        try {
+            client.execute(
+                SnapshotReleaseAction.INSTANCE,
+                new SnapshotReleaseRequest(indexUuid, shardId, pinId),
+                ActionListener.wrap(
+                    response -> {},
+                    e -> logger.warn("could not release deep-snapshot pin [{}] on shard [{}/{}]", pinId, indexUuid, shardId, e)
+                )
+            );
+        } catch (Exception e) {
+            logger.warn("could not submit release of deep-snapshot pin [{}] on shard [{}/{}]", pinId, indexUuid, shardId, e);
+        }
     }
 }

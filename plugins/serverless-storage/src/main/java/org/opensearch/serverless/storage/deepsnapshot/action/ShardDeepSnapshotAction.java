@@ -33,11 +33,17 @@ import org.opensearch.action.ActionType;
  * <p>Requires no routing to a specific data node, the same reasoning {@link
  * org.opensearch.serverless.storage.retention.action.TransportSnapshotPinAction}'s own javadoc
  * gives: this operates purely against the shared object store and the target repository, never
- * against node-local shard state, so whichever node receives this request can execute it -- which is
- * what lets a deep snapshot's byte movement be distributed across nodes rather than serialized
- * through the cluster manager the way {@link
- * org.opensearch.serverless.storage.deepsnapshot.action.IndexDeepSnapshotAction}'s own {@code
- * finalizeSnapshot} call must be.
+ * against node-local shard state, so whichever node receives this request can execute it. Today
+ * {@link TransportIndexDeepSnapshotAction#copyShard} dispatches every shard through a plain {@link
+ * org.opensearch.transport.client.node.NodeClient}, which always resolves and runs the locally
+ * registered {@link TransportShardDeepSnapshotAction} in-process rather than routing over the
+ * network -- so every shard's byte copy for one index-level request in fact still runs on the same
+ * node ({@link IndexDeepSnapshotAction}'s cluster manager). What this property buys is that nothing
+ * about this action's own contract stops a future caller from routing each shard's request to a
+ * different, less-loaded node instead -- corrected here by round 3 of the bug hunt, which found the
+ * previous wording of this paragraph describing that follow-on as already true. See {@link
+ * TransportIndexDeepSnapshotAction}'s own class javadoc for the same "follow-on, not a correctness
+ * requirement" framing applied to true node-parallel dispatch.
  */
 public class ShardDeepSnapshotAction extends ActionType<ShardDeepSnapshotResponse> {
 

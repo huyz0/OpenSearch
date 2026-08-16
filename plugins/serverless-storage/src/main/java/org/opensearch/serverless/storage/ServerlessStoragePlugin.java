@@ -1326,12 +1326,19 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      * {@code close()}'s {@code forEach(close).then(clear())} is two separate steps against a plain
      * {@code ConcurrentHashMap}, so a shard-0 open racing shutdown could insert a freshly-scheduled
      * task after the drain and have {@code clear()} silently discard the map entry without ever
-     * cancelling it. Both {@link #getEngineFactory}'s check-then-insert and {@link #close()}'s
-     * set-then-drain synchronize on this lock so the two sequences cannot interleave -- a flag alone
-     * (checked, then acted on, as two separate steps) would only narrow the window, not close it.
+     * cancelling it. Every mutator of {@link #pinLedgerSweepTasks} -- {@link #getEngineFactory}'s
+     * check-then-insert, {@code afterIndexRemoved}'s check-then-remove, and {@link #close()}'s
+     * set-then-drain -- synchronizes on this lock so none of the three sequences can interleave with
+     * another; a flag alone (checked, then acted on, as two separate steps) would only narrow each
+     * window, not close it.
      */
     private final Object pinLedgerSweepTasksLock = new Object();
-    private volatile boolean pinLedgerSweepTasksClosed = false;
+    // Not volatile: every read and write of this flag already happens inside a block synchronized on
+    // pinLedgerSweepTasksLock (see that field's own javadoc), which already gives the same
+    // happens-before/visibility guarantee volatile would -- adding it here would only invite a future
+    // access outside the lock that reads it as "already safe," reopening the exact race the lock
+    // exists to close. Found by round 3 of the bug hunt for being redundant, not for being wrong.
+    private boolean pinLedgerSweepTasksClosed = false;
     private volatile ReaderShardAdmissionController readerShardAdmissionController;
     // One shared instance node-wide, threaded into every shard's CompactionSchedulerConfig/
     // PartitionRewriteSchedulerConfig -- see RewriteAdmissionController's own javadoc for why these
@@ -2987,9 +2994,19 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 // GENERIC-scheduled background task per index for the rest of the node's process
                 // lifetime. Idempotent: an index whose shard 0 never opened on this node simply has no
                 // entry to remove.
-                org.opensearch.serverless.storage.retention.PinLedgerSweepTask sweepTask = pinLedgerSweepTasks.remove(index.getUUID());
-                if (sweepTask != null) {
-                    sweepTask.close();
+                //
+                // Synchronized on the same lock getEngineFactory's insert and close()'s drain use --
+                // found missing by round 3 of the bug hunt: this is a third mutator of
+                // pinLedgerSweepTasks, and without the lock here the field's own javadoc claim ("both
+                // ... synchronize on this lock so the two sequences cannot interleave") was false. Not a
+                // live leak today (ConcurrentHashMap#remove and Cancellable#cancel are both safe to call
+                // unsynchronized), but closing the gap keeps the invariant the javadoc states actually
+                // true for every mutator, not just two of the three.
+                synchronized (pinLedgerSweepTasksLock) {
+                    org.opensearch.serverless.storage.retention.PinLedgerSweepTask sweepTask = pinLedgerSweepTasks.remove(index.getUUID());
+                    if (sweepTask != null) {
+                        sweepTask.close();
+                    }
                 }
             }
         });
