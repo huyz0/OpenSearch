@@ -56,6 +56,7 @@ import org.opensearch.transport.client.node.NodeClient;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Collections;
+import java.util.List;
 
 /**
  * The actual work behind {@link ShardDeepSnapshotAction}, and the wiring
@@ -172,7 +173,7 @@ public class TransportShardDeepSnapshotAction extends HandledTransportAction<Sha
             // it if a crash or a shutdown-time GENERIC rejection skips the release below -- see that
             // constant's own javadoc.
             SnapshotPinRequest.expiring(request.indexUuid(), request.shardId(), pinId, System.currentTimeMillis() + PIN_TTL_MILLIS),
-            ActionListener.wrap(pin -> threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
+            ActionListener.wrap(pin -> {
                 // The heavy, genuinely blocking work -- Lucene reads, checksums, and a wait on
                 // the repository's own async snapshotShard -- runs here instead, on a thread this
                 // action dispatched for itself rather than one a listener callback merely
@@ -185,20 +186,37 @@ public class TransportShardDeepSnapshotAction extends HandledTransportAction<Sha
                 // version did) so a listener whose own onResponse throws (RestShardDeepSnapshotAction's
                 // RestToXContentListener does not self-swallow the way ActionListener.wrap does)
                 // cannot have this catch call onFailure a second time on top of it.
-                ShardDeepSnapshotResponse response;
+                Runnable copyAndRelease = () -> {
+                    ShardDeepSnapshotResponse response;
+                    try {
+                        // Released on both paths, per the plan's own instruction -- the finally covers
+                        // exactly copyPinnedGeneration, not the listener calls below, so a release racing
+                        // a retry of this same request costs nothing beyond the round trip
+                        // (SnapshotReleaseAction's removePin is idempotent) and a single release call
+                        // covers both outcomes instead of one per branch.
+                        try {
+                            response = copyPinnedGeneration(request, pin);
+                        } finally {
+                            releasePin(request.indexUuid(), request.shardId(), pinId);
+                        }
+                    } catch (Exception e) {
+                        listener.onFailure(e);
+                        return;
+                    }
+                    listener.onResponse(response);
+                };
                 try {
-                    response = copyPinnedGeneration(request, pin);
+                    threadPool.executor(ThreadPool.Names.GENERIC).execute(copyAndRelease);
                 } catch (Exception e) {
-                    // Released on both paths, per the plan's own instruction. SnapshotReleaseAction's
-                    // removePin is idempotent, so a release racing a retry of this same request costs
-                    // nothing beyond the round trip. Non-blocking, so it adds no further nesting risk.
-                    releasePin(request.indexUuid(), request.shardId(), pinId);
+                    // Submission itself can fail -- most realistically a RejectedExecutionException
+                    // from a GENERIC pool that is shutting down -- before copyAndRelease ever runs, so
+                    // neither its own release nor either listener call would otherwise fire and the
+                    // caller would hang. The pin still expires on its own via PIN_TTL_MILLIS in that
+                    // case (releasePin itself dispatches through the same client the caller does, so
+                    // attempting it here would only risk the identical rejection).
                     listener.onFailure(e);
-                    return;
                 }
-                releasePin(request.indexUuid(), request.shardId(), pinId);
-                listener.onResponse(response);
-            }), listener::onFailure)
+            }, listener::onFailure)
         );
     }
 
@@ -264,13 +282,17 @@ public class TransportShardDeepSnapshotAction extends HandledTransportAction<Sha
                 // files from one directory while describing another. See
                 // DeepSnapshotOrchestrationIT's own comment at the equivalent line for why this
                 // assertion exists and is worth keeping rather than working around.
-                java.util.List<IndexCommit> commits = DirectoryReader.listCommits(store.directory());
-                if (commits.isEmpty()) {
+                List<IndexCommit> commits;
+                try {
+                    commits = DirectoryReader.listCommits(store.directory());
+                } catch (org.apache.lucene.index.IndexNotFoundException e) {
                     // A pinned generation naming zero committed segments -- a never-flushed index
                     // pinned between publication and its first flush is the realistic case, not
-                    // corruption. Named explicitly rather than left as the IndexOutOfBoundsException
-                    // .get(0) would throw, which the outer caller cannot distinguish from any other
-                    // unexpected failure.
+                    // corruption. DirectoryReader#listCommits never returns an empty list: absent a
+                    // segments_N file it throws Lucene's own IndexNotFoundException instead (verified
+                    // against lucene-core's SegmentInfos#readLatestCommit). Named explicitly here
+                    // rather than left as this exception, which the outer caller cannot distinguish
+                    // from any other unexpected failure.
                     throw new IllegalStateException(
                         "shard ["
                             + request.indexUuid()
@@ -278,7 +300,8 @@ public class TransportShardDeepSnapshotAction extends HandledTransportAction<Sha
                             + request.shardId()
                             + "] generation ["
                             + pin.generation()
-                            + "] has no committed segments to copy"
+                            + "] has no committed segments to copy",
+                        e
                     );
                 }
                 IndexCommit commit = commits.get(0);

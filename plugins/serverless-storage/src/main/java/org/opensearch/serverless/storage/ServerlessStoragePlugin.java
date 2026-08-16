@@ -1321,6 +1321,17 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         String,
         org.opensearch.serverless.storage.retention.PinLedgerSweepTask> pinLedgerSweepTasks =
             new java.util.concurrent.ConcurrentHashMap<>();
+    /**
+     * Guards {@link #pinLedgerSweepTasks} against the shutdown race round 2 of the bug hunt found:
+     * {@code close()}'s {@code forEach(close).then(clear())} is two separate steps against a plain
+     * {@code ConcurrentHashMap}, so a shard-0 open racing shutdown could insert a freshly-scheduled
+     * task after the drain and have {@code clear()} silently discard the map entry without ever
+     * cancelling it. Both {@link #getEngineFactory}'s check-then-insert and {@link #close()}'s
+     * set-then-drain synchronize on this lock so the two sequences cannot interleave -- a flag alone
+     * (checked, then acted on, as two separate steps) would only narrow the window, not close it.
+     */
+    private final Object pinLedgerSweepTasksLock = new Object();
+    private volatile boolean pinLedgerSweepTasksClosed = false;
     private volatile ReaderShardAdmissionController readerShardAdmissionController;
     // One shared instance node-wide, threaded into every shard's CompactionSchedulerConfig/
     // PartitionRewriteSchedulerConfig -- see RewriteAdmissionController's own javadoc for why these
@@ -2333,33 +2344,57 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 ? new PitrRetentionConfig(manifestStore, pinRegistry, pitrWindowMillis)
                 : null;
 
-            // Round 006 item 6. Shard 0 only, and only for a real shard-0 assignment -- shardRouting is
-            // null for administrative calls (mapping validation/update) that pass through this same
-            // method with no real shard behind them, and shardIdValue's own fallback-to-0 must not be
-            // read as "this node hosts shard 0" here the way it can be for the read-path constructions
-            // below, which are already conditioned on isReaderShard/a real routing entry. See
-            // PinLedgerSweepTask's own javadoc for why coverage is per-index, node-local rather than
-            // fleet-wide, and why the task is left running (deduped by indexUuid) rather than torn down
-            // when shard 0 later relocates off this node. Constructed here rather than threaded through
-            // ObjectStoreWriterEngine/ReaderEngineFactory's own long constructor chains: sweeping needs
-            // nothing from either engine, only the container resolver this method already has in scope.
+            // Round 006 item 6. The PRIMARY of shard 0 only, and only for a real assignment --
+            // shardRouting is null for administrative calls (mapping validation/update) that pass
+            // through this same method with no real shard behind them, and shardIdValue's own
+            // fallback-to-0 must not be read as "this node hosts shard 0" here the way it can be for
+            // the read-path constructions below, which are already conditioned on
+            // isReaderShard/a real routing entry.
+            //
+            // primary() matters as much as shardIdValue == 0: found by round 2 of the bug hunt that
+            // landed this whole block. A serverless index is forced to zero ordinary replicas and
+            // scales reads instead via search-only replicas of the SAME shard, so without this check
+            // every reader-replica copy of shard 0 -- and there can be many, elastically -- would
+            // independently start its own sweep task for the same index. The sweep's own correctness
+            // does not need multiple sweepers (deleting an already-deleted ledger is the documented
+            // no-op), so the redundancy bought nothing but contradicted this task's own "node-local,
+            // bounded" cost model by scaling sweep traffic with read fan-out rather than staying at
+            // roughly one sweeper per index.
+            //
+            // See PinLedgerSweepTask's own javadoc for why coverage is per-index, node-local rather
+            // than fleet-wide, and why the task is left running (deduped by indexUuid) rather than
+            // torn down when shard 0 later relocates off this node. Constructed here rather than
+            // threaded through ObjectStoreWriterEngine/ReaderEngineFactory's own long constructor
+            // chains: sweeping needs nothing from either engine, only the container resolver this
+            // method already has in scope.
             //
             // Built from the unrestricted blobContainer, not scopedContainer: scopedContainer denies
             // delete (line above, "GET+PUT but no DELETE"), and a sweep's whole job is deleting a
             // cleared ledger -- the same reason GcSchedulerConfig a few lines below is also built
             // against blobContainer directly rather than the read/write-scoped wrapper.
-            if (shardRouting != null && shardIdValue == 0 && pinLedgerSweepInterval != null) {
-                pinLedgerSweepTasks.computeIfAbsent(
-                    indexUuid,
-                    uuid -> new org.opensearch.serverless.storage.retention.PinLedgerSweepTask(
-                        threadPool,
-                        pinLedgerSweepInterval,
-                        uuid,
-                        new org.opensearch.serverless.storage.retention.BlobContainerPinLedgerStore(blobContainer),
-                        this::resolveBlobContainer,
-                        pinLedgerAbandonedAfterMillis
-                    )
-                );
+            //
+            // pinLedgerSweepTasksLock/pinLedgerSweepTasksClosed guard against the shutdown race round
+            // 2 of the bug hunt found: close() drains this map in two non-atomic steps (forEach(close)
+            // then clear()), and a shard-0 open racing shutdown could otherwise insert a
+            // freshly-scheduled task after the drain, which clear() would then silently discard
+            // without ever cancelling. See the field javadoc for why this needs a lock, not just a
+            // flag.
+            if (shardRouting != null && shardRouting.primary() && shardIdValue == 0 && pinLedgerSweepInterval != null) {
+                synchronized (pinLedgerSweepTasksLock) {
+                    if (pinLedgerSweepTasksClosed == false) {
+                        pinLedgerSweepTasks.computeIfAbsent(
+                            indexUuid,
+                            uuid -> new org.opensearch.serverless.storage.retention.PinLedgerSweepTask(
+                                threadPool,
+                                pinLedgerSweepInterval,
+                                uuid,
+                                new org.opensearch.serverless.storage.retention.BlobContainerPinLedgerStore(blobContainer),
+                                this::resolveBlobContainer,
+                                pinLedgerAbandonedAfterMillis
+                            )
+                        );
+                    }
+                }
             }
 
             boolean isReaderShard = shardRouting != null && shardRouting.isSearchOnly();
@@ -3514,8 +3549,13 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         }
         // Round 006 item 6. One entry per index whose shard 0 opened on this node; every entry
         // cancels its own scheduled task, the same as every other *SchedulerTask closed just above.
-        pinLedgerSweepTasks.values().forEach(org.opensearch.serverless.storage.retention.PinLedgerSweepTask::close);
-        pinLedgerSweepTasks.clear();
+        // Setting the closed flag and draining happen under the same lock getEngineFactory's
+        // check-then-insert uses, so a concurrent shard-0 open cannot slip a task in after the drain.
+        synchronized (pinLedgerSweepTasksLock) {
+            pinLedgerSweepTasksClosed = true;
+            pinLedgerSweepTasks.values().forEach(org.opensearch.serverless.storage.retention.PinLedgerSweepTask::close);
+            pinLedgerSweepTasks.clear();
+        }
         org.opensearch.serverless.storage.resharding.InPlaceMergeTriggerSchedulerTask mergeTriggerTask = inPlaceMergeTriggerSchedulerTask;
         if (mergeTriggerTask != null) {
             mergeTriggerTask.close();

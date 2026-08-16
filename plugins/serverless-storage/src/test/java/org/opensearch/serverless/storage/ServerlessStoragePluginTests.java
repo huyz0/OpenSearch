@@ -163,7 +163,46 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
             plugin.getEngineFactory(settings, primaryRouting);
             assertNotNull("a real shard-0 assignment must start the sweep task", plugin.pinLedgerSweepTaskForTesting(indexUuid));
         } finally {
-            threadPool.shutdownNow();
+            org.opensearch.threadpool.ThreadPool.terminate(threadPool, 10, java.util.concurrent.TimeUnit.SECONDS);
+        }
+    }
+
+    /**
+     * Bug hunt regression, round 2, finding 1: a serverless index is forced to zero ordinary replicas
+     * and instead scales reads via search-only replicas of the SAME shard, so a search-only replica of
+     * shard 0 hits this same wiring with {@code shardIdValue == 0} and a non-null routing entry -- the
+     * two conditions the round 1 fix above already checks. Without also checking {@code
+     * shardRouting.primary()}, every reader-replica copy of shard 0 would independently start its own
+     * sweep task for the same index, scaling sweep traffic with read fan-out instead of staying at
+     * roughly one sweeper per index.
+     */
+    public void testPinLedgerSweepIsNotSpawnedForASearchOnlyReplicaOfShardZero() throws Exception {
+        org.opensearch.threadpool.ThreadPool threadPool = new org.opensearch.threadpool.TestThreadPool(getTestName());
+        try {
+            ServerlessStoragePlugin plugin = newPluginWithPinLedgerSweep(threadPool);
+            IndexSettings settings = indexSettings(true);
+            String indexUuid = settings.getIndex().getUUID();
+            ShardId shardId = new ShardId(settings.getIndex(), 0);
+
+            ShardRouting searchOnlyRouting = TestShardRouting.newShardRouting(
+                shardId,
+                "node-1",
+                false,
+                true,
+                ShardRoutingState.INITIALIZING,
+                RecoverySource.EmptyStoreRecoverySource.INSTANCE
+            );
+            plugin.getEngineFactory(settings, searchOnlyRouting);
+            assertNull(
+                "a search-only replica of shard 0 must not start its own sweep task",
+                plugin.pinLedgerSweepTaskForTesting(indexUuid)
+            );
+
+            ShardRouting primaryRouting = TestShardRouting.newShardRouting(shardId, "node-1", true, ShardRoutingState.STARTED);
+            plugin.getEngineFactory(settings, primaryRouting);
+            assertNotNull("the primary of shard 0 must still start the sweep task", plugin.pinLedgerSweepTaskForTesting(indexUuid));
+        } finally {
+            org.opensearch.threadpool.ThreadPool.terminate(threadPool, 10, java.util.concurrent.TimeUnit.SECONDS);
         }
     }
 
@@ -200,7 +239,7 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
                 ledgerStore.list().isEmpty()
             );
         } finally {
-            threadPool.shutdownNow();
+            org.opensearch.threadpool.ThreadPool.terminate(threadPool, 10, java.util.concurrent.TimeUnit.SECONDS);
         }
     }
 

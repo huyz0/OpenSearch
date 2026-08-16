@@ -40,6 +40,7 @@ import org.opensearch.transport.client.node.NodeClient;
 import java.io.IOException;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 
 /**
  * The actual work behind {@link IndexDeepSnapshotAction}: resolve the index (gated or ordinary),
@@ -144,18 +145,17 @@ public class TransportIndexDeepSnapshotAction extends TransportClusterManagerNod
             return;
         }
 
-        int numberOfShards = indexMetadata.getNumberOfShards();
         CopyContext context = new CopyContext(
             new IndexId(request.indexName(), indexMetadata.getIndexUUID()),
             request.repositoryName(),
             new SnapshotId(request.snapshotName(), UUIDs.randomBase64UUID()),
             repository,
-            indexMetadata,
+            indexMetadata.getNumberOfShards(),
             System.currentTimeMillis(),
             listener
         );
 
-        copyShard(0, numberOfShards, context, ShardGenerations.builder());
+        copyShard(0, context, ShardGenerations.builder());
     }
 
     /**
@@ -168,14 +168,20 @@ public class TransportIndexDeepSnapshotAction extends TransportClusterManagerNod
      * deliberately not a field here: it is the one thing that is genuinely per-call state (a mutable
      * builder accumulated across the recursion), not per-request context, and keeping it a separate
      * parameter says so.
+     *
+     * <p>{@code numberOfShards} lives here rather than being re-derived from an {@code IndexMetadata}
+     * field, because this context deliberately carries no {@code IndexMetadata} at all -- {@link
+     * #finalizeSnapshot} re-resolves it fresh (see that method's own javadoc for why) rather than
+     * reusing one captured here, so the shard count this loop bounds itself by is the only piece of
+     * that original resolution this record still needs.
      */
-    private record CopyContext(IndexId indexId, String repositoryName, SnapshotId snapshotId, Repository repository,
-        IndexMetadata indexMetadata, long startTime, ActionListener<IndexDeepSnapshotResponse> listener) {
+    private record CopyContext(IndexId indexId, String repositoryName, SnapshotId snapshotId, Repository repository, int numberOfShards,
+        long startTime, ActionListener<IndexDeepSnapshotResponse> listener) {
     }
 
-    private void copyShard(int shardId, int numberOfShards, CopyContext context, ShardGenerations.Builder shardGenerations) {
-        if (shardId == numberOfShards) {
-            finalizeSnapshot(numberOfShards, context, shardGenerations.build());
+    private void copyShard(int shardId, CopyContext context, ShardGenerations.Builder shardGenerations) {
+        if (shardId == context.numberOfShards()) {
+            finalizeSnapshot(context, shardGenerations.build());
             return;
         }
         client.execute(
@@ -190,7 +196,7 @@ public class TransportIndexDeepSnapshotAction extends TransportClusterManagerNod
             ),
             ActionListener.wrap(response -> {
                 shardGenerations.put(context.indexId(), shardId, response.shardGeneration());
-                copyShard(shardId + 1, numberOfShards, context, shardGenerations);
+                copyShard(shardId + 1, context, shardGenerations);
             }, context.listener()::onFailure)
         );
     }
@@ -216,18 +222,37 @@ public class TransportIndexDeepSnapshotAction extends TransportClusterManagerNod
      * <p><b>The gated-index NPE this found.</b> {@code BlobStoreRepository#finalizeSnapshot} writes
      * each named index's own metadata into the repository, looking it up as {@code
      * clusterMetadata.index(name)} -- which answers null for a gated index, the same absence every
-     * other consumer in this plugin has had to learn to route around. Passing {@code
-     * indexMetadata} (already resolved through {@code AbsentIndexDescriptorSuppliers} in {@link
-     * #clusterManagerOperation}) folded into a copy of cluster metadata is what makes that lookup
-     * answer instead of NPEing -- found by {@code IndexDeepSnapshotActionIT}'s gated case, not
-     * reasoned in advance, the same "probe, do not reason" pattern this round's own predecessors
-     * document repeatedly.
+     * other consumer in this plugin has had to learn to route around. Resolving {@code indexMetadata}
+     * through {@code AbsentIndexDescriptorSuppliers} folded into a copy of cluster metadata is what
+     * makes that lookup answer instead of NPEing -- found by {@code IndexDeepSnapshotActionIT}'s gated
+     * case, not reasoned in advance, the same "probe, do not reason" pattern this round's own
+     * predecessors document repeatedly.
+     *
+     * <p><b>Why {@code indexMetadata} is resolved here rather than reused from {@link
+     * #clusterManagerOperation}.</b> Found by round 2 of the bug hunt that landed this whole action: a
+     * sequential multi-shard copy can run long enough for a mapping update or index deletion to land
+     * mid-flight, and reusing the metadata object {@code clusterManagerOperation} resolved before that
+     * loop started would silently snapshot stale mappings/settings -- or, for a deleted index, publish
+     * metadata for something that no longer exists. Re-resolving fresh here, right before it is folded
+     * into {@code clusterMetadata}, narrows that window to as small as this method can make it, the
+     * same reasoning this method already applies to {@code repositoryData.getGenId()} one line below.
      */
-    private void finalizeSnapshot(int numberOfShards, CopyContext context, ShardGenerations shardGenerations) {
+    private void finalizeSnapshot(CopyContext context, ShardGenerations shardGenerations) {
         Repository repository = context.repository();
         SnapshotId snapshotId = context.snapshotId();
-        IndexMetadata indexMetadata = context.indexMetadata();
+        int numberOfShards = context.numberOfShards();
         ActionListener<IndexDeepSnapshotResponse> listener = context.listener();
+        IndexMetadata indexMetadata = AbsentIndexDescriptorSuppliers.metadataOrDescriptor(
+            clusterService.state().metadata(),
+            context.indexId().getName()
+        );
+        if (indexMetadata == null) {
+            // The index was deleted while this copy was in flight -- every shard's bytes were
+            // successfully copied, but there is nothing left to describe in the finalized snapshot's
+            // own metadata, so this is reported as a failure rather than finalizing with stale data.
+            listener.onFailure(new IndexNotFoundException(context.indexId().getName()));
+            return;
+        }
         repository.getRepositoryData(ActionListener.wrap(repositoryData -> {
             // Metadata.builder(state) starts from the real cluster metadata rather than an empty one,
             // so a plain (non-gated) serverless index -- already present there -- is untouched, and
@@ -243,7 +268,7 @@ public class TransportIndexDeepSnapshotAction extends TransportClusterManagerNod
             // metadata version: this Metadata is genuinely never published, only handed to one
             // repository call that reads it and discards it.
             Metadata clusterMetadata = Metadata.builder(clusterService.state().metadata())
-                .indices(java.util.Map.of(indexMetadata.getIndex().getName(), indexMetadata))
+                .indices(Map.of(indexMetadata.getIndex().getName(), indexMetadata))
                 .build();
             long endTime = System.currentTimeMillis();
             SnapshotInfo snapshotInfo = new SnapshotInfo(
