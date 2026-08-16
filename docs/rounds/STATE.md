@@ -3,7 +3,53 @@
 Read this first, every time. It is the only source of truth for where work stands, and it
 is written to survive context loss: nothing here depends on remembering a previous session.
 
-Updated: 2026-08-16 (round 006 closed out below; GC candidate queue entry unchanged beneath it)
+Updated: 2026-08-17 (six-round bug hunt over round 006's item 5/6 diff, converged; entries beneath unchanged)
+
+## 2026-08-17: bug hunt over round 006's item 5/6 diff, six rounds to convergence
+
+Run against `76ea6f5ed78..HEAD` (the deep-snapshot transport action and the pin-ledger sweep, the two
+pieces of work the round-006 entry below shipped), each round an independent multi-angle review --
+line-by-line, removed-behavior, cross-file, reuse, simplification, efficiency, altitude, conventions,
+test-coverage -- followed by verification and mutation-testing before a fix landed. Findings per round:
+10, 9, 7, 4, 8, 0. The round-5 uptick was real but shallow: mostly formatting-convention fixes
+(`AGENTS.md`'s `foo == false`/140-column rules) and small cleanups surfaced alongside one genuine
+correctness gap in round 4's own fix; round 6's two independent passes found nothing, one returning an
+explicit empty list rather than manufacturing a marginal finding. Full unit suite (1341 tests) and
+`IndexDeepSnapshotActionIT` green after every round.
+
+**What round 006's own entry below did not yet know, found across the six rounds:**
+
+- The deep-snapshot pin had no TTL, no `PinLedger` entry, and its `doExecute` deadlocked on the same
+  `GENERIC` thread pool it dispatched onto (round 1) -- the same class of bug the round-006 entry below
+  already names two of; the bug hunt found the rest.
+- The pin-ledger sweep task (item 6) was wired against the delete-denied `scopedContainer`, so its own
+  delete call threw `SecurityException` on every pass forever -- item 6's entire purpose never worked,
+  and nothing said so past a WARN log (round 1).
+- The most severe find: `TransportIndexDeepSnapshotAction` built its repository-facing `IndexId` from
+  the index's own real UUID rather than resolving it through `RepositoryData#resolveNewIndices` the way
+  a real `_snapshot` request does. If the same index had ever been snapshotted normally into the same
+  target repository, `RepositoryData`'s indices-by-name map has no merge function for two different
+  `IndexId`s sharing one name -- `finalizeSnapshot` would throw `IllegalStateException: Duplicate key`
+  synchronously, after every shard's bytes were already copied. Fixed with a fail-loud check at both the
+  front door and again at finalize time (closing the TOCTOU window between them, found one round after
+  the first fix), not a full re-plumb of the wire protocol -- ruled disproportionate to this finding,
+  and named as an accepted limitation rather than silently left for the next person to hit.
+- `close()`'s drain of the pin-ledger-sweep-task map and `getEngineFactory`'s insert into it were two
+  non-atomic `ConcurrentHashMap` operations that could interleave with node shutdown; a third mutator
+  (`afterIndexRemoved`) was found still unguarded a round after the first two were locked.
+- `DirectoryReader.listCommits()` cannot return an empty list -- verified by disassembling
+  `lucene-core`'s `SegmentInfos.readLatestCommit` bytecode rather than trusting the javadoc -- so a
+  round-1 `commits.isEmpty()` guard was dead code, replaced with a catch on Lucene's own
+  `IndexNotFoundException`.
+
+**Five findings across the six rounds were investigated and deliberately left as documented, accepted
+limitations rather than fixed**, each because closing them fully would need either the SnapshotsService
+concurrent-snapshot tracking this action's own javadoc already scopes out, or the wire-protocol re-plumb
+above: an in-place shard split completing mid-copy (shard-count divergence is caught and fails loudly;
+the split itself is not prevented), a delete-and-recreate-under-the-same-name index permanently blocking
+future deep snapshots into a repository that held the old incarnation, `releasePin`'s blanket exception
+swallow, sequential (not node-parallel) shard copy dispatch, and the pin-ledger sweep task lock being
+enforced by convention at each call site rather than by a type.
 
 ## 2026-08-16: round 006 closes out -- items 1b, 5 and 6 landed, one new finding left open
 
