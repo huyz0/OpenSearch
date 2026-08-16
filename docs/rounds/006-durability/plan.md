@@ -227,15 +227,32 @@ already built.
 
 ## Sequencing, and what "done" means for each
 
-| # | item | done when | size |
+| # | item | state | size |
 |---|---|---|---|
-| 1 | pin surface reaches gated indices | pin and release: **done**. Restore: blocked on close releasing the shard | small → medium |
-| 1b | **close releases a gated shard** (new, found by 1) | closing a gated index releases its writer lease | medium — persisted format decision |
+| 1 | pin surface reaches gated indices | pin and release **done** | small → medium |
+| 1b | **close releases a gated shard** (new, found by 1) | **two of three layers fixed, still failing** — see below | medium |
 | 2 | restore to a time | **done**: resolution unit-tested, both refusals tested, head lands correctly | small |
-| 2b | **a restore must survive reopening** (new, found by 2) | reopened index still reads as restored | unknown until the cause is established |
-| 3 | audible omission | a wildcard snapshot on a gated cluster warns; asserted | small |
-| 4 | posture written down | one design page, linked from the snapshot page | small |
-| 5 | independent copy | **proven: copied, finalized, and restored by core.** What remains is a shipped action, not a question | small–medium |
+| 2b | **a restore must survive reopening** (new, found by 2) | **done** — cause was the local store, not the WAL | small once measured |
+| 3 | audible omission | **done**: wildcard snapshot on a gated cluster warns, predicate tested per spelling | small |
+| 4 | posture written down | **done**: `design/durability-posture.md`, banner on the snapshot page | small |
+| 5 | independent copy | proven end to end; **the shipped action is not built** | small–medium |
+| 6 | **ledger sweep** (new) | **not built, and deliberately not half-built** — see below | small, once the resolver exists |
+
+### 2b, resolved: the cause was the local store
+
+Two things undid a restore, and the guess recorded above named the second one. The first, and the one that actually carries it: reopening on a node that still holds the pre-restore Lucene files recovers from those files and never consults the object store at all. `recoverMissingLocalStore` only runs when there is no readable local commit. So `EngineFactory#localStoreIsStale` was added — an engine whose authority lives elsewhere can say its local copy is out of date, and `StoreRecovery` cleans and re-materialises. Core already did exactly this for a revived in-place-merge parent a few lines below; that branch is the precedent this generalises.
+
+The second is real but unproven: a rewound head also rewinds WAL replay's floor. A restore now publishes a new generation carrying the target's segments and the *newest* manifest's WAL position (`RestoreManifestSynthesis`), so it moves forward like every other publication — which also keeps head generations monotonic, makes a restore itself restorable-past, and lets GC keep the restored files because the live head manifest names them directly. **But no test demonstrates the WAL half.** With mirroring on, reverting that one field leaves the reopen test green, and so does leaving the write unflushed so it lives only in the WAL. It is kept because advertising a replay floor beneath a range you have decided not to replay is wrong by construction, and the test says plainly that it does not isolate it.
+
+### 1b, partially: three layers, not one
+
+`DescriptorChange` now carries `CLOSED`, and the tailer asks `releasesShard()` rather than `!live()` — a closed index keeps its name and loses its shard, and conflating those is what let a closed gated index go on serving. That changed nothing when measured, which surfaced the second layer: a close is written through `IndexDescriptorPublisher.updateGated`, and that path appended no change of any kind, so no entry existed for the new kind to travel in. It records one now, which also stops a mapping update republished that way leaving other nodes' caches stale.
+
+Still failing. The third layer is that the harness installs no change log, so nothing is appended and nothing tails it there regardless. Whether the release then holds, or the shard is reopened on demand by the next write, has **not** been measured — the marker says so rather than guessing.
+
+### 6, and why it is not built
+
+A sweep should drop a ledger once none of the pins it names are live, and log any ledger older than the unconfirmed TTL whose pins never got confirmed. The obstacle is placement, not logic: the ledger is per index and lives in shard 0's container, while `PitrRetentionSchedulerTask` is constructed per shard with only that shard's container. A sweep running from shard 0 alone can see only shard 0's pins, and a ledger deleted on that evidence would destroy the only record of pins still held on shards 1..N — precisely the leak the ledger exists to prevent. It needs a per-index container resolver first. Left unbuilt rather than built wrong.
 
 Items 1–4 are each independently shippable and none depends on 5. Item 5's spike is the gate on whether the
 rest of it is a days-long piece or a different design entirely, so the spike is the deliverable that

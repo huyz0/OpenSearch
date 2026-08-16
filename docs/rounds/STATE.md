@@ -404,6 +404,51 @@ The existing restore coverage could not have caught this: `ServerlessStorageInde
 the head record and never reopens the index, so a restore undone by recovery looks exactly like one that
 holds. **This now outranks the rest of the round** -- a restore that recovery undoes is not a restore.
 
+### Round 006: a restore survives reopening now, and that was the gate on the whole time machine
+
+The `AwaitsFix` that outranked everything else in the round is gone. A restore used to be undone by the
+next recovery, which meant a restore was not a restore whichever cause it turned out to be.
+
+**The cause was not the one the round guessed.** It guessed WAL replay. What actually carries it is the
+local store: reopening on a node that still holds the pre-restore Lucene files recovers from those files and
+never consults the object store at all, because `recoverMissingLocalStore` only runs when there is *no*
+readable local commit. `EngineFactory#localStoreIsStale` is the new seam — an engine whose authority lives
+in the object store can say its local copy is out of date, and `StoreRecovery` cleans and re-materialises.
+Core already did exactly this for a revived in-place-merge parent a few lines below the new branch, so this
+generalises an existing precedent rather than inventing one.
+
+**A restore also stopped rewinding the head.** It publishes a new generation carrying the target's segments
+(`RestoreManifestSynthesis`), so it moves forward like every other publication: head generations stay
+monotonic, a restore becomes a point on the timeline that can itself be restored past, and GC keeps the
+restored files because the live head manifest names them directly rather than depending on the pin
+outliving the restore. Three existing assertions that read "the head generation equals the target
+generation" now assert the head names the target's *files*, which is the stronger claim.
+
+**One half is reasoned and not proven, and it is labelled that way.** Taking the newest manifest's WAL
+position rather than the target's is correct by construction, but reverting that single field leaves the
+reopen test green even with WAL mirroring on — and so does leaving the write unflushed so it lives only in
+the WAL. The new mirroring-on test carries a guard that fails if mirroring silently is not on, and its
+javadoc says outright that it does not isolate that field. Measured in both directions rather than claimed.
+
+**Closing a gated index is two-thirds fixed and still failing.** `DescriptorChange` carries `CLOSED` and the
+tailer asks `releasesShard()` rather than `!live()`. That changed nothing, which surfaced the real second
+layer: the `updateGated` path — which is the path a close takes — appended no change of any kind, so no
+entry existed for the new kind to travel in. It records one now, which also stops mapping updates through
+that path leaving other nodes' caches stale. The third layer is that the harness installs no change log at
+all; whether the release then holds or the shard is reopened on demand has **not** been measured, and the
+marker says so.
+
+**Also landed**: the wildcard-snapshot omission now warns (all four spellings of "everything", one test
+each), and `design/durability-posture.md` says what each of the three tiers insures against, that a pin
+protects only against our own GC, and that fleet-wide physical DR is object-store configuration and not code
+here. The snapshot page's "considered, not built" section is corrected — the byte-copying variant is proven
+end to end, and the objection it recorded was always to the server-side-copy optimization, not to the
+operation.
+
+**Still open, and named in the plan**: the deep snapshot's shipped action (proof exists, API does not); the
+pin-ledger sweep, deliberately not half-built because it needs a per-index container resolver and a sweep
+run from shard 0 alone would delete the only record of pins still held on other shards.
+
 ### Round 006 opened: durability. Close was a label, and finding that out was the round's first result
 
 The plan is `docs/rounds/006-durability/plan.md`. Three tiers — pin, pointer snapshot, independent copy —
