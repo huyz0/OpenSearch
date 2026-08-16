@@ -17,8 +17,10 @@ import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.serverless.storage.ServerlessStoragePlugin;
+import org.opensearch.serverless.storage.retention.BlobContainerDurablePinRegistry;
 import org.opensearch.serverless.storage.retention.BlobContainerPinLedgerStore;
 import org.opensearch.serverless.storage.retention.PinLedger;
+import org.opensearch.serverless.storage.retention.PinRecord;
 import org.opensearch.tasks.Task;
 import org.opensearch.transport.TransportService;
 import org.opensearch.transport.client.node.NodeClient;
@@ -110,25 +112,76 @@ public class TransportIndexSnapshotPinAction extends HandledTransportAction<Inde
             listener.onFailure(e);
             return;
         }
-        pinShard(indexUuid, numberOfShards, 0, request.snapshotId(), new ArrayList<>(), listener);
+        // Phase one: every shard pinned with a short expiry. Phase two, below, makes them permanent once
+        // all of them exist. An index-wide pin is N sequential shard pins, and until this the failure mode
+        // of stopping in the middle was pins that hold generations against garbage collection forever --
+        // rollback only runs when a shard *fails*, never when the coordinator itself goes away. Now a
+        // half-finished pin lapses on its own, which is the direction to fail in for a mechanism whose only
+        // job is to prevent deletion.
+        long provisionalExpiry = System.currentTimeMillis() + UNCONFIRMED_PIN_TTL_MILLIS;
+        pinShard(indexUuid, numberOfShards, 0, request.snapshotId(), provisionalExpiry, new ArrayList<>(), listener);
     }
+
+    /**
+     * How long an unconfirmed pin holds its generation.
+     *
+     * <p>Long enough that a slow but healthy fan-out across many shards finishes well inside it, short
+     * enough that an abandoned one does not hold storage for meaningfully longer than the operation would
+     * have. Ten minutes is a judgment rather than a measurement: the fan-out is one register mutation per
+     * shard against the object store, so a thousand-shard index at even ten per second is under two
+     * minutes, and the cost of being wrong on the high side is bounded storage rather than a lost pin.
+     */
+    static final long UNCONFIRMED_PIN_TTL_MILLIS = 10 * 60 * 1000L;
 
     private void pinShard(
         String indexUuid,
         int numberOfShards,
         int shardId,
         String snapshotId,
+        long provisionalExpiry,
         List<Integer> pinnedSoFar,
         ActionListener<IndexSnapshotPinResponse> listener
     ) {
         if (shardId == numberOfShards) {
-            listener.onResponse(new IndexSnapshotPinResponse(numberOfShards));
+            confirmPins(indexUuid, numberOfShards, snapshotId, listener);
             return;
         }
-        client.execute(SnapshotPinAction.INSTANCE, new SnapshotPinRequest(indexUuid, shardId, snapshotId), ActionListener.wrap(response -> {
-            pinnedSoFar.add(shardId);
-            pinShard(indexUuid, numberOfShards, shardId + 1, snapshotId, pinnedSoFar, listener);
-        }, failure -> rollBackAndFail(indexUuid, snapshotId, pinnedSoFar, failure, listener)));
+        client.execute(
+            SnapshotPinAction.INSTANCE,
+            SnapshotPinRequest.expiring(indexUuid, shardId, snapshotId, provisionalExpiry),
+            ActionListener.wrap(response -> {
+                pinnedSoFar.add(shardId);
+                pinShard(indexUuid, numberOfShards, shardId + 1, snapshotId, provisionalExpiry, pinnedSoFar, listener);
+            }, failure -> rollBackAndFail(indexUuid, snapshotId, pinnedSoFar, failure, listener))
+        );
+    }
+
+    /**
+     * Phase two: every shard is pinned, so the pins become permanent.
+     *
+     * <p>Done here rather than by re-pinning, because the pinned generation must not change: a shard that
+     * committed new data between the two phases would otherwise be re-pinned at a later generation, quietly
+     * turning one point in time into two.
+     *
+     * <p>A failure here fails the request with the pins still provisional, which is the safe direction --
+     * they lapse, and the caller is told the pin did not take rather than being handed one that will
+     * disappear later without explanation.
+     */
+    private void confirmPins(String indexUuid, int numberOfShards, String snapshotId, ActionListener<IndexSnapshotPinResponse> listener) {
+        try {
+            for (int shardId = 0; shardId < numberOfShards; shardId++) {
+                new BlobContainerDurablePinRegistry(plugin.blobContainerForDirectoryFactory(indexUuid, shardId)).confirmPin(
+                    indexUuid,
+                    shardId,
+                    snapshotId,
+                    PinRecord.NEVER_EXPIRES
+                );
+            }
+        } catch (Exception e) {
+            listener.onFailure(e);
+            return;
+        }
+        listener.onResponse(new IndexSnapshotPinResponse(numberOfShards));
     }
 
     private void rollBackAndFail(

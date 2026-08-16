@@ -45,6 +45,7 @@ import java.util.Optional;
 public class TransportSnapshotPinAction extends HandledTransportAction<SnapshotPinRequest, SnapshotPinResponse> {
 
     private final ServerlessStoragePlugin plugin;
+    private final String localNodeId;
     private final ThreadPool threadPool;
 
     /**
@@ -63,6 +64,9 @@ public class TransportSnapshotPinAction extends HandledTransportAction<SnapshotP
         ThreadPool threadPool
     ) {
         super(SnapshotPinAction.NAME, transportService, actionFilters, SnapshotPinRequest::new);
+        // Recorded so a leftover pin can be traced to whoever took it. Read at construction because
+        // TransportService knows the local node and this action has no cluster service of its own.
+        this.localNodeId = transportService.getLocalNode() == null ? "" : transportService.getLocalNode().getId();
         this.plugin = plugin;
         this.threadPool = threadPool;
     }
@@ -74,6 +78,7 @@ public class TransportSnapshotPinAction extends HandledTransportAction<SnapshotP
      */
     @Override
     protected void doExecute(Task task, SnapshotPinRequest request, ActionListener<SnapshotPinResponse> listener) {
+        final String ownerId = localNodeId;
         threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
             try {
                 // Credential scoping per tier (rfc-serverless-opensearch.md &sect;15): pinning
@@ -98,7 +103,10 @@ public class TransportSnapshotPinAction extends HandledTransportAction<SnapshotP
 
                 long primaryTerm = head.get().head().primaryTerm();
                 long generation = head.get().head().latestManifestGeneration();
-                PinRecord newPin = new PinRecord(request.snapshotId(), primaryTerm, generation);
+                // Stamped with who took it and when it lapses. An index-wide pin puts every shard down with a
+                // short expiry and only makes them permanent once all of them exist, so a coordinator that
+                // stops halfway leaves pins that lapse rather than pins that must be hunted down.
+                PinRecord newPin = new PinRecord(request.snapshotId(), primaryTerm, generation, ownerId, request.expiresAtMillis());
 
                 // Create-or-replace, not additive (see SnapshotPinAction's own javadoc): replacePin
                 // adds the new pin and strips any older one under the same snapshotId within a

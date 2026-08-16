@@ -37,12 +37,47 @@ public interface DurablePinRegistry {
      * @param shardId   the shard to look up pinned manifest IDs for.
      */
     default Set<ManifestId> getPinnedManifestIds(String indexUuid, int shardId) throws IOException {
+        return getPinnedManifestIds(indexUuid, shardId, System.currentTimeMillis());
+    }
+
+    /**
+     * The generations pinned at a given instant -- expired pins excluded.
+     *
+     * <p><b>This is the single place expiry has to be honoured, and it is why the expiry is not decorative.</b>
+     * Garbage collection asks this question and only this question; a pin whose expiry has passed stops
+     * answering it, so the generation it was holding becomes collectable without anyone having to remove the
+     * record. That is what turns a coordinator dying mid-pin from a permanent leak into a bounded one.
+     *
+     * <p>The instant is a parameter rather than a clock read so that every pin in one sweep is judged
+     * against the same moment, and so the behaviour can be asserted without waiting for wall time.
+     */
+    default Set<ManifestId> getPinnedManifestIds(String indexUuid, int shardId, long nowMillis) throws IOException {
         Set<PinRecord> pins = getPins(indexUuid, shardId);
         java.util.Set<ManifestId> ids = new java.util.HashSet<>(pins.size());
         for (PinRecord pin : pins) {
-            ids.add(pin.toManifestId());
+            if (pin.isLiveAt(nowMillis)) {
+                ids.add(pin.toManifestId());
+            }
         }
         return ids;
+    }
+
+    /**
+     * Re-stamps every pin under this id with a new expiry, and does nothing if there is none.
+     *
+     * <p>What the second phase of taking an index-wide pin calls. Pins go down with a short expiry, and only
+     * once every shard has one does anything make them permanent -- so a coordinator that stops halfway
+     * leaves pins that lapse on their own rather than pins that must be found and removed. The failure mode
+     * inverts: previously an interrupted pin held generations forever, and now an interrupted pin releases
+     * them, which is the direction to fail in for something whose job is to stop deletion.
+     *
+     * @param indexUuid       the index whose shard is pinned.
+     * @param shardId         the shard within it.
+     * @param pinId           which pin to re-stamp.
+     * @param expiresAtMillis the new expiry, or {@link PinRecord#NEVER_EXPIRES} to make it permanent.
+     */
+    default void confirmPin(String indexUuid, int shardId, String pinId, long expiresAtMillis) throws IOException {
+        throw new UnsupportedOperationException("this registry cannot re-stamp a pin's expiry");
     }
 
     /**

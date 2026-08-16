@@ -62,6 +62,23 @@ public final class BlobContainerDurablePinRegistry implements DurablePinRegistry
     }
 
     @Override
+    public void confirmPin(String indexUuid, int shardId, String pinId, long expiresAtMillis) throws IOException {
+        mutate(indexUuid, shardId, current -> {
+            Set<PinRecord> next = new HashSet<>();
+            boolean changed = false;
+            for (PinRecord existing : current) {
+                if (existing.pinId().equals(pinId) && existing.expiresAtMillis() != expiresAtMillis) {
+                    next.add(existing.withExpiry(expiresAtMillis));
+                    changed = true;
+                } else {
+                    next.add(existing);
+                }
+            }
+            return changed ? next : current;
+        });
+    }
+
+    @Override
     public void removePin(String indexUuid, int shardId, String pinId) throws IOException {
         mutate(indexUuid, shardId, current -> {
             Set<PinRecord> next = new HashSet<>();
@@ -118,8 +135,15 @@ public final class BlobContainerDurablePinRegistry implements DurablePinRegistry
             }
 
             Set<PinRecord> next = mutation.apply(current);
-            if (next.equals(current)) {
-                return; // no-op mutation (idempotent add of an existing pin, or remove of an absent one)
+            if (next == current) {
+                // Reference, not equality, and the difference is load-bearing. PinRecord's equality is its
+                // identity -- pin id, term, generation -- and deliberately excludes the owner and expiry,
+                // so that adding the same pin twice is the no-op it is documented to be. That makes a set
+                // whose expiries have been re-stamped equal to the set before, so an equality check here
+                // silently discards exactly the mutation confirmPin exists to perform. Every mutation
+                // above returns `current` itself when it means no-op, so identity is both sufficient and
+                // exact.
+                return;
             }
 
             BlobRegisterCasResult result = blobContainer.compareAndSwapRegister(registerName, currentGeneration, serialize(next));
@@ -133,9 +157,34 @@ public final class BlobContainerDurablePinRegistry implements DurablePinRegistry
         );
     }
 
+    /**
+     * Marks a register written after pins gained an owner and an expiry.
+     *
+     * <p>The old format begins with the collection's size as a vInt, so any value a pin count could never
+     * take identifies the new one. Needed because these registers are durable: a deployment upgrading into
+     * this change has pins on disk in the old shape, and reading five fields out of a three-field record
+     * would not fail cleanly -- it would read into the next record and produce nonsense, which for a
+     * registry that decides what garbage collection may delete is the worst available outcome.
+     */
+    private static final int VERSIONED_MARKER = 0x7FFF_FFF0;
+
+    /** The only version written today. Present so the next change has somewhere to go. */
+    private static final int VERSION_WITH_OWNER_AND_EXPIRY = 1;
+
     private Set<PinRecord> deserialize(BlobRegister register) {
         try {
             StreamInput in = register.value().streamInput();
+            int first = in.readVInt();
+            if (first != VERSIONED_MARKER) {
+                // The old shape, and `first` was its collection size. Read exactly that many, as records
+                // that never expire -- see PinRecord#readLegacy for why that is the only safe reading.
+                Set<PinRecord> legacy = new HashSet<>(first);
+                for (int i = 0; i < first; i++) {
+                    legacy.add(PinRecord.readLegacy(in));
+                }
+                return legacy;
+            }
+            in.readVInt(); // version, only one so far
             return new HashSet<>(in.readList(PinRecord::new));
         } catch (IOException e) {
             throw new IllegalStateException("failed to deserialize pin registry", e);
@@ -144,6 +193,8 @@ public final class BlobContainerDurablePinRegistry implements DurablePinRegistry
 
     private static BytesReference serialize(Set<PinRecord> pins) throws IOException {
         BytesStreamOutput out = new BytesStreamOutput();
+        out.writeVInt(VERSIONED_MARKER);
+        out.writeVInt(VERSION_WITH_OWNER_AND_EXPIRY);
         out.writeCollection(pins, (o, pin) -> pin.writeTo(o));
         return out.bytes();
     }

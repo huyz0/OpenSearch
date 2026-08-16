@@ -12,6 +12,7 @@ import org.opensearch.action.ActionRequest;
 import org.opensearch.action.ActionRequestValidationException;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
+import org.opensearch.serverless.storage.retention.PinRecord;
 import org.opensearch.serverless.storage.retention.PitrRetentionPolicy;
 
 import java.io.IOException;
@@ -32,6 +33,19 @@ public class SnapshotPinRequest extends ActionRequest {
      * @param shardId the shard number within {@code indexUuid}.
      * @param snapshotId the snapshot name to pin the shard's current manifest generation under.
      */
+    public static SnapshotPinRequest expiring(String indexUuid, int shardId, String snapshotId, long expiresAtMillis) {
+        SnapshotPinRequest request = new SnapshotPinRequest(indexUuid, shardId, snapshotId);
+        request.expiresAtMillis = expiresAtMillis;
+        return request;
+    }
+
+    /** When the pin this takes stops holding its generation, or {@link PinRecord#NEVER_EXPIRES}. */
+    public long expiresAtMillis() {
+        return expiresAtMillis;
+    }
+
+    private long expiresAtMillis = PinRecord.NEVER_EXPIRES;
+
     public SnapshotPinRequest(String indexUuid, int shardId, String snapshotId) {
         this.indexUuid = indexUuid;
         this.shardId = shardId;
@@ -48,6 +62,7 @@ public class SnapshotPinRequest extends ActionRequest {
         this.indexUuid = in.readString();
         this.shardId = in.readVInt();
         this.snapshotId = in.readString();
+        this.expiresAtMillis = in.readLong();
     }
 
     /** @param out stream to write this request's fields to. */
@@ -57,6 +72,7 @@ public class SnapshotPinRequest extends ActionRequest {
         out.writeString(indexUuid);
         out.writeVInt(shardId);
         out.writeString(snapshotId);
+        out.writeLong(expiresAtMillis);
     }
 
     /** @return validation errors, or {@code null} if the request is well-formed. */

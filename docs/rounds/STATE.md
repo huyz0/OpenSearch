@@ -284,6 +284,40 @@ write-behind projection kept only so the aggregate stays one search.
   `IndexBackedMappingStore`, so the suite stayed green against a store production did not register. The shared
   fixture now composes the store the way `ServerlessStoragePlugin` does.
 
+### Pins expire, so an abandoned one stops holding storage
+
+Two-phase, which is what makes it work rather than merely exist. An index-wide pin puts every shard down
+with a ten-minute expiry, and only once every shard is pinned does a second pass make them permanent. A
+coordinator that stops halfway now leaves pins that lapse on their own, where before it left pins holding
+generations against garbage collection forever -- rollback only ever ran when a shard *failed*, never when
+the coordinator itself went away. The failure mode inverts, and inverts the right way for a mechanism whose
+only job is to prevent deletion.
+
+Confirming re-stamps the expiry rather than re-pinning, deliberately: a shard that committed between the two
+phases would otherwise be re-pinned at a later generation, quietly turning one point in time into two.
+
+**Expiry is honoured in the one place it can be.** `getPinnedManifestIds` is the only question garbage
+collection asks of the registry, so a lapsed pin simply stops answering it and what it held becomes
+collectable with nobody removing the record -- the record stays, so a sweep can still say who left it. The
+instant is a parameter, not a clock read, so one sweep judges every pin against one moment and the behaviour
+can be asserted without waiting for wall time.
+
+**Two things this turned up.**
+
+- **The register format is durable, so it needed a version.** Pins on disk were written before pins had an
+  owner or an expiry, and reading five fields out of a three-field record does not fail cleanly: it reads
+  into the next record and produces nonsense, which for the registry deciding what may be deleted is the
+  worst available outcome. A marker distinguishes the shapes, and old pins are read as never expiring --
+  the only safe reading of a pin taken when nothing could expire.
+- **The CAS path discarded the change.** `mutate` skipped writing when the new set `.equals` the old, and
+  `PinRecord`'s equality is its *identity* -- pin id, term, generation -- excluding owner and expiry so that
+  adding the same pin twice is the documented no-op. So a set whose expiries had been re-stamped was equal
+  to the set before it, and confirming a pin silently did nothing. Now identity, not equality: every
+  mutation already returns `current` itself when it means no-op, so the check is both sufficient and exact.
+
+Still open: nothing yet sweeps the ledgers of pins that lapsed, so an abandoned pin stops *holding* storage
+but its record remains until something removes it.
+
 ### Pins have a ledger now, so releasing one is retryable
 
 A pin is written per shard, so an index-wide pin is N pins under one id, and nothing recorded that they were
