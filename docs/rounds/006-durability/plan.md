@@ -230,13 +230,13 @@ already built.
 | # | item | state | size |
 |---|---|---|---|
 | 1 | pin surface reaches gated indices | pin and release **done** | small → medium |
-| 1b | **close releases a gated shard** (new, found by 1) | **two of three layers fixed, still failing** — see below | medium |
+| 1b | **close releases a gated shard** (new, found by 1) | **done** — the harness now drives a real change feed; `GatedShallowSnapshotIT` no longer carries `AwaitsFix` | medium |
 | 2 | restore to a time | **done**: resolution unit-tested, both refusals tested, head lands correctly | small |
 | 2b | **a restore must survive reopening** (new, found by 2) | **done** — cause was the local store, not the WAL | small once measured |
 | 3 | audible omission | **done**: wildcard snapshot on a gated cluster warns, predicate tested per spelling | small |
 | 4 | posture written down | **done**: `design/durability-posture.md`, banner on the snapshot page | small |
-| 5 | independent copy | proven end to end; **the shipped action is not built** | small–medium |
-| 6 | **ledger sweep** (new) | **not built, and deliberately not half-built** — see below | small, once the resolver exists |
+| 5 | independent copy | **shipped** for an ordinary source; **a new `AwaitsFix`** for a gated source — see below | small–medium |
+| 6 | **ledger sweep** (new) | **done**, node-local by design — see below | small, once the resolver exists |
 
 ### 2b, resolved: the cause was the local store
 
@@ -244,19 +244,27 @@ Two things undid a restore, and the guess recorded above named the second one. T
 
 The second is real but unproven: a rewound head also rewinds WAL replay's floor. A restore now publishes a new generation carrying the target's segments and the *newest* manifest's WAL position (`RestoreManifestSynthesis`), so it moves forward like every other publication — which also keeps head generations monotonic, makes a restore itself restorable-past, and lets GC keep the restored files because the live head manifest names them directly. **But no test demonstrates the WAL half.** With mirroring on, reverting that one field leaves the reopen test green, and so does leaving the write unflushed so it lives only in the WAL. It is kept because advertising a replay floor beneath a range you have decided not to replay is wrong by construction, and the test says plainly that it does not isolate it.
 
-### 1b, partially: three layers, not one
+### 1b, resolved: three layers, and the third was the harness
 
 `DescriptorChange` now carries `CLOSED`, and the tailer asks `releasesShard()` rather than `!live()` — a closed index keeps its name and loses its shard, and conflating those is what let a closed gated index go on serving. That changed nothing when measured, which surfaced the second layer: a close is written through `IndexDescriptorPublisher.updateGated`, and that path appended no change of any kind, so no entry existed for the new kind to travel in. It records one now, which also stops a mapping update republished that way leaving other nodes' caches stale.
 
-Still failing. The third layer is that the harness installs no change log, so nothing is appended and nothing tails it there regardless. Whether the release then holds, or the shard is reopened on demand by the next write, has **not** been measured — the marker says so rather than guessing.
+The third layer was `GatedShallowSnapshotIT`'s own harness: `installBlobBackedDescriptorPlane` installs the descriptor store and never calls `DescriptorGate.setChangeFeed`, so every test using it ran with an appender writing to nothing and no tailer reading anything, regardless of what the first two layers fixed. `startDescriptorChangeTail` wires a real `BlobDescriptorChangeLog` and a real `DescriptorChangeTailer` polling it, opted into only by the round-trip test. With that running the release holds: closing appends `CLOSED`, the tailer applies it, `IndicesClusterStateService.releaseGatedIndex` releases the shard, the lease lapses, and restore-in-place becomes reachable — proven both directions, since reverting the wiring reproduces the exact `IllegalStateException` the round trip named.
 
-### 6, and why it is not built
+### 5, shipped for an ordinary source, and what the gated case found
 
-A sweep should drop a ledger once none of the pins it names are live, and log any ledger older than the unconfirmed TTL whose pins never got confirmed. The obstacle is placement, not logic: the ledger is per index and lives in shard 0's container, while `PitrRetentionSchedulerTask` is constructed per shard with only that shard's container. A sweep running from shard 0 alone can see only shard 0's pins, and a ledger deleted on that evidence would destroy the only record of pins still held on shards 1..N — precisely the leak the ledger exists to prevent. It needs a per-index container resolver first. Left unbuilt rather than built wrong.
+`IndexDeepSnapshotAction`/`ShardDeepSnapshotAction` are the shipped action the spike was proven ahead of: pin, copy through a `Store` over a `LazyBundleDirectory` into the target repository via `Repository#snapshotShard`, finalize on the cluster manager, release on both paths. `IndexDeepSnapshotActionIT` proves an ordinary serverless index end to end — copied and restored by core's own `_restore`, every document back — and found two real bugs on the way that the spike's manual wiring never exercised: a same-thread-pool self-deadlock (the shard action blocked on a pin call that shares its own `GENERIC` dispatch, fixed by chaining through `ActionListener` instead of blocking) and a null `IndexMetadata` lookup inside `BlobStoreRepository#finalizeSnapshot` for a gated index's own metadata (fixed by folding the already-resolved descriptor metadata into the `Metadata` handed to finalize).
 
-Items 1–4 are each independently shippable and none depends on 5. Item 5's spike is the gate on whether the
-rest of it is a days-long piece or a different design entirely, so the spike is the deliverable that
-matters, not the feature.
+**What is not shipped.** A deep snapshot of a *gated* source completes — the copy and the finalize both succeed — and the restored shard then never allocates, stuck at `allocation_status[fetching_shard_data]`. Traced to `PrimaryShardAllocator` refusing a snapshot-recovery shard until `InternalSnapshotsInfoService` supplies a shard size via `Repository#getShardSnapshotStatus`, and that fetch (or the reroute it should trigger) never resolving — plausibly because this action does not replicate `SnapshotsService`'s own in-memory concurrent-snapshot tracking, which is a boundary this action's javadoc already named rather than one this finding introduces. Computed placement enabled on the node is the one variable that distinguishes the passing case from the stuck one. Left `AwaitsFix` in `IndexDeepSnapshotActionIT`, the test bounded to a 30-second wait plus a diagnostic failure rather than the indefinite hang that first surfaced it.
+
+### 6, built once the blocker was gone
+
+The per-index container resolver the plan said this needed already existed: `ShardCloner.ContainerResolver`, built for clone lineage-chasing, has exactly the `(indexUuid, shardId) -> BlobContainer` shape a sweep needs. `PinLedgerSweeper` reads every shard a ledger names through it and deletes the ledger only once none of them still carry a live `PinRecord` under its pin id — an unreadable shard counts as still holding the pin, not as absent, so a transient failure can never manufacture the exact leak the ledger exists to prevent. `PinLedgerSweepTask` schedules it per index, off by default, built where `getEngineFactory` already has both shard 0's container and a resolver for its siblings in scope, and deduped by index uuid so a relocation cannot race a second task against the first.
+
+**Coverage is node-local by design**, and that is stated rather than discovered later: an index whose shard 0 has never opened on this node is not swept, because there is no fleet-wide registry of which indices carry a ledger to drive this from — the same gap that made a truly global sweep out of scope when this item was first written. Building that registry, if it is ever wanted, is a new, separate item.
+
+Items 1–4 are each independently shippable and none depends on 5. Item 5's spike gated whether the
+rest of it was a days-long piece or a different design entirely; it turned out to be wiring, plus one
+real deadlock and one real null-lookup that only a genuine end-to-end test found.
 
 ## What this round deliberately does not do
 

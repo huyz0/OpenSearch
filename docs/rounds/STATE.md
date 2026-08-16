@@ -3,7 +3,76 @@
 Read this first, every time. It is the only source of truth for where work stands, and it
 is written to survive context loss: nothing here depends on remembering a previous session.
 
-Updated: 2026-08-16 (GC candidate queue below; everything past it is unchanged)
+Updated: 2026-08-16 (round 006 closed out below; GC candidate queue entry unchanged beneath it)
+
+## 2026-08-16: round 006 closes out -- items 1b, 5 and 6 landed, one new finding left open
+
+**1b, closed.** The third layer named in the last entry (`GatedShallowSnapshotIT`'s harness installed no
+change log, so nothing appended and nothing tailed regardless of what production wired) is fixed:
+`startDescriptorChangeTail` gives the test a real `BlobDescriptorChangeLog` and a real
+`DescriptorChangeTailer` polling it, opted into only by the round-trip test. With that running, closing a
+gated index appends `CLOSED`, the tailer applies it, `IndicesClusterStateService.releaseGatedIndex` releases
+the shard, the lease lapses, and restore-in-place -- which refuses while a lease is held -- becomes
+reachable. Confirmed both directions: reverting the wiring reproduces the exact `IllegalStateException` the
+`AwaitsFix` named. `GatedShallowSnapshotIT` no longer carries one.
+
+**Item 5, shipped for the case that matters most, found something real in the other.**
+`IndexDeepSnapshotAction`/`ShardDeepSnapshotAction` turn the round's own spike
+(`DeepSnapshotOrchestrationIT`) into a real transport action -- pin, copy through a `Store` over a
+`LazyBundleDirectory` into the target repository via core's own `Repository#snapshotShard`, finalize once on
+the cluster manager, release on both paths. Two bugs found and fixed while proving it through a real IT
+rather than through the spike's manual wiring:
+
+- A same-thread-pool self-deadlock: the shard action dispatched onto `GENERIC` and then blocked waiting on
+  `SnapshotPinAction`, which also dispatches onto `GENERIC`. Reproduced as a genuine hang -- the suite's
+  20-minute timeout fired with every thread parked. Fixed by chaining through `ActionListener` instead of
+  blocking, the same pattern `TransportIndexSnapshotPinAction` already uses.
+- `BlobStoreRepository#finalizeSnapshot` writes each index's own metadata via `clusterMetadata.index(name)`,
+  which answers null for a gated index. Fixed by folding the already-resolved `IndexMetadata` into a local,
+  unpublished copy of cluster metadata before the call.
+
+**Proven**: an ordinary serverless index, deep-copied through the shipped action and restored by core's
+ordinary `_restore` under a new name, every document back.
+
+**Found and left `AwaitsFix`, not swept under**: a deep snapshot of a *gated* source completes -- copy and
+finalize both succeed -- and the restored shard then never allocates, stuck at
+`allocation_status[fetching_shard_data]` forever. Traced one layer further before stopping:
+`PrimaryShardAllocator` refuses a snapshot-recovery shard until `SnapshotShardSizeInfo` answers, which
+`InternalSnapshotsInfoService` only ever supplies by fetching `Repository#getShardSnapshotStatus` on the
+cluster manager -- and that fetch, or the reroute it should trigger, never resolves for a snapshot finalized
+outside `SnapshotsService`'s own in-memory state tracking, which this action's own javadoc already named as
+a boundary it does not replicate. Computed placement being enabled on the node is the one difference between
+the passing and the stuck test -- recorded because it narrows where to look next, not because the restored
+index is itself gated (it deliberately is not, confirmed by the failure's own diagnostic). The test bounds
+its own wait now (30s health check, then a diagnostic failure) rather than the indefinite hang that first
+found this, so the suite stays fast either way.
+
+**Item 6, built once the blocker was gone.** The plan's own obstacle -- "needs a per-index container
+resolver first" -- turned out to already exist: `ShardCloner.ContainerResolver`, built for clone
+lineage-chasing. `PinLedgerSweeper` reads every shard a ledger names through it and deletes the ledger only
+once none of them still carry a live `PinRecord` under its pin id; an unreadable shard counts as still
+holding the pin, not as absent, so a transient failure can never manufacture the leak this class exists to
+close. `PinLedgerSweepTask` schedules it per index, off by default
+(`serverless_storage.retention.pin_ledger_sweep_interval`), built in `getEngineFactory` for shard 0 only and
+deduped by uuid. **Coverage is node-local by design, stated rather than implied**: an index whose shard 0
+has never opened on this node is not swept, because there is no fleet-wide registry of which indices have a
+ledger to drive this from, and building one is out of this item's own scope. Seven unit tests over real
+`FsBlobStore` containers, including the property the class exists for (a live pin on a shard other than 0
+must hold the ledger) and the fail-safe direction (an unreadable shard is never mistaken for a clear one).
+
+**B1, closed on its engineering half.** The branch's own 1,200-plus commits already answer the shape
+question: computed placement is built as a set of small, generally-useful core seams
+(`AbsentIndexRoutingSuppliers`, `GatedIndexRelease`, `EngineFactory#localStoreIsStale`, and the rest §15
+names) behind a plugin-installed gate that is off by default -- never a fork of core's allocator. That
+pattern is validated by the code as it stands and needs no further decision to keep following. What is
+genuinely still a human's to decide, and is not blocking anything in this round or the next: whether those
+seams are ever proposed upstream to `opensearch-project/OpenSearch` as real PRs, or stay a long-lived
+downstream patch set. That is a distribution/governance question, not an engineering one, and answering it
+was never this session's to make unilaterally.
+
+**Round 006's own sequencing table, final state**: items 1, 1b, 2, 2b, 3, 4 done; item 5 shipped with one
+new, precisely-located `AwaitsFix`; item 6 built and node-local by design. Nothing in the round is silently
+unaccounted for -- the one open item is a named, reproduced, partially-traced defect, not a gap.
 
 ## 2026-08-16: manifest GC gets an event-driven front door, so a warm-but-idle shard costs nothing
 
