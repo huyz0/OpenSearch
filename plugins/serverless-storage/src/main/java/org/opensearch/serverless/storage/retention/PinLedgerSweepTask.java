@@ -12,6 +12,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.serverless.storage.clone.ShardCloner;
+import org.opensearch.serverless.storage.scheduling.JitteredScheduling;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 
@@ -96,7 +97,12 @@ public final class PinLedgerSweepTask implements Closeable {
         this.sweeper = new PinLedgerSweeper(ledgerStore, containerResolver);
         this.abandonedAfterMillis = abandonedAfterMillis;
         this.indexUuid = indexUuid;
-        this.task = threadPool.scheduleWithFixedDelay(this::sweepOnce, interval, ThreadPool.Names.GENERIC);
+        // Jittered, matching GcSchedulerTask/WalGcSchedulerTask -- this task is "GC-adjacent" by its
+        // own setting's javadoc, and is constructed once per index in getEngineFactory, so a
+        // coordinated restart or object-store recovery event that opens many indices' shard 0 around
+        // the same moment would otherwise schedule every one of their sweeps in lockstep, the exact
+        // thundering herd JitteredScheduling exists to prevent for its siblings.
+        this.task = threadPool.scheduleWithFixedDelay(this::sweepOnce, JitteredScheduling.jitter(interval), ThreadPool.Names.GENERIC);
     }
 
     private void sweepOnce() {
@@ -124,5 +130,17 @@ public final class PinLedgerSweepTask implements Closeable {
     @Override
     public void close() {
         task.cancel();
+    }
+
+    /**
+     * Runs one sweep pass synchronously and rethrows rather than swallowing, so a test can observe
+     * both the result and any exception a production tick would otherwise only log and retry past --
+     * the shape a wiring regression (a delete-denied container, say) needs to fail a test loudly
+     * rather than leave it silently asserting "not deleted yet" with no reason why. Not used by
+     * {@link #sweepOnce()} itself, which keeps its own swallow-and-retry contract for the real
+     * scheduled tick.
+     */
+    public PinLedgerSweeper.SweepResult sweepNowForTesting(long nowMillis) throws Exception {
+        return sweeper.sweepOnce(nowMillis, abandonedAfterMillis);
     }
 }

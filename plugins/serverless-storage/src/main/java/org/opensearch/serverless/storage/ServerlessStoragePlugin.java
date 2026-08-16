@@ -2333,21 +2333,29 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 ? new PitrRetentionConfig(manifestStore, pinRegistry, pitrWindowMillis)
                 : null;
 
-            // Round 006 item 6. Shard 0 only, because that is the one place a pin ledger lives --
-            // see PinLedgerSweepTask's own javadoc for why this is per-index, node-local coverage
-            // rather than fleet-wide, and why the task is left running (deduped by indexUuid) rather
-            // than torn down when shard 0 later relocates off this node. Constructed here rather than
-            // threaded through ObjectStoreWriterEngine/ReaderEngineFactory's own long constructor
-            // chains: sweeping needs nothing from either engine, only the container resolver this
-            // method already has in scope.
-            if (shardIdValue == 0 && pinLedgerSweepInterval != null) {
+            // Round 006 item 6. Shard 0 only, and only for a real shard-0 assignment -- shardRouting is
+            // null for administrative calls (mapping validation/update) that pass through this same
+            // method with no real shard behind them, and shardIdValue's own fallback-to-0 must not be
+            // read as "this node hosts shard 0" here the way it can be for the read-path constructions
+            // below, which are already conditioned on isReaderShard/a real routing entry. See
+            // PinLedgerSweepTask's own javadoc for why coverage is per-index, node-local rather than
+            // fleet-wide, and why the task is left running (deduped by indexUuid) rather than torn down
+            // when shard 0 later relocates off this node. Constructed here rather than threaded through
+            // ObjectStoreWriterEngine/ReaderEngineFactory's own long constructor chains: sweeping needs
+            // nothing from either engine, only the container resolver this method already has in scope.
+            //
+            // Built from the unrestricted blobContainer, not scopedContainer: scopedContainer denies
+            // delete (line above, "GET+PUT but no DELETE"), and a sweep's whole job is deleting a
+            // cleared ledger -- the same reason GcSchedulerConfig a few lines below is also built
+            // against blobContainer directly rather than the read/write-scoped wrapper.
+            if (shardRouting != null && shardIdValue == 0 && pinLedgerSweepInterval != null) {
                 pinLedgerSweepTasks.computeIfAbsent(
                     indexUuid,
                     uuid -> new org.opensearch.serverless.storage.retention.PinLedgerSweepTask(
                         threadPool,
                         pinLedgerSweepInterval,
                         uuid,
-                        new org.opensearch.serverless.storage.retention.BlobContainerPinLedgerStore(scopedContainer),
+                        new org.opensearch.serverless.storage.retention.BlobContainerPinLedgerStore(blobContainer),
                         this::resolveBlobContainer,
                         pinLedgerAbandonedAfterMillis
                     )
@@ -2937,6 +2945,17 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 }
                 releaseCloneLineageForDeletedIndex(index.getUUID(), indexSettings.getNumberOfShards());
                 deregisterFromWalShardRegistryForDeletedIndex(index.getUUID(), indexSettings.getNumberOfShards());
+                // Round 006 item 6, found by the bug hunt that followed it: without this, a
+                // PinLedgerSweepTask started for this index (getEngineFactory, shard 0) was only ever
+                // torn down at full node close, so a workload that creates and deletes many serverless
+                // indices -- the ordinary shape of serverless usage -- accumulated one live,
+                // GENERIC-scheduled background task per index for the rest of the node's process
+                // lifetime. Idempotent: an index whose shard 0 never opened on this node simply has no
+                // entry to remove.
+                org.opensearch.serverless.storage.retention.PinLedgerSweepTask sweepTask = pinLedgerSweepTasks.remove(index.getUUID());
+                if (sweepTask != null) {
+                    sweepTask.close();
+                }
             }
         });
     }
@@ -3580,5 +3599,16 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     /** The reader-shard admission controller {@link #createComponents} built, or {@code null} if disabled -- test-only visibility. */
     ReaderShardAdmissionController readerShardAdmissionControllerForTesting() {
         return readerShardAdmissionController;
+    }
+
+    /**
+     * The {@link org.opensearch.serverless.storage.retention.PinLedgerSweepTask} {@link
+     * #getEngineFactory} started for this index uuid, or {@code null} if none was -- test-only
+     * visibility. Whether one exists at all is the assertion the bug hunt's regression tests need:
+     * neither a null-{@code shardRouting} administrative call nor a delete-denied container is
+     * something a test can otherwise observe from outside this class.
+     */
+    org.opensearch.serverless.storage.retention.PinLedgerSweepTask pinLedgerSweepTaskForTesting(String indexUuid) {
+        return pinLedgerSweepTasks.get(indexUuid);
     }
 }

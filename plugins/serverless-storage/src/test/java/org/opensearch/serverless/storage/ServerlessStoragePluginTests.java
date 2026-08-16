@@ -140,6 +140,84 @@ public class ServerlessStoragePluginTests extends OpenSearchTestCase {
         assertTrue(factory.get() instanceof WriterEngineFactory);
     }
 
+    /**
+     * Bug hunt regression, round 1, finding 3: {@code getEngineFactory} is called with a null {@code
+     * shardRouting} for purely administrative work (mapping validation/update -- {@code
+     * IndicesService#createMapperServiceForValidation}/{@code #createIndexMapperService}, not a real
+     * shard being opened), and the pre-existing shardIdValue fallback ("null routing defaults to
+     * shard 0") must not be read by the pin-ledger sweep wiring as "this node hosts shard 0" -- a real
+     * shard-0 assignment must still start the task.
+     */
+    public void testPinLedgerSweepIsNotSpawnedForAdministrativeNullShardRoutingCalls() throws Exception {
+        org.opensearch.threadpool.ThreadPool threadPool = new org.opensearch.threadpool.TestThreadPool(getTestName());
+        try {
+            ServerlessStoragePlugin plugin = newPluginWithPinLedgerSweep(threadPool);
+            IndexSettings settings = indexSettings(true);
+            String indexUuid = settings.getIndex().getUUID();
+
+            plugin.getEngineFactory(settings, null);
+            assertNull("a null shardRouting must not be read as this node hosting shard 0", plugin.pinLedgerSweepTaskForTesting(indexUuid));
+
+            ShardId shardId = new ShardId(settings.getIndex(), 0);
+            ShardRouting primaryRouting = TestShardRouting.newShardRouting(shardId, "node-1", true, ShardRoutingState.STARTED);
+            plugin.getEngineFactory(settings, primaryRouting);
+            assertNotNull("a real shard-0 assignment must start the sweep task", plugin.pinLedgerSweepTaskForTesting(indexUuid));
+        } finally {
+            threadPool.shutdownNow();
+        }
+    }
+
+    /**
+     * Bug hunt regression, round 1, finding 1: the pin-ledger sweep task was wired against the
+     * delete-denied {@code scopedContainer} ("GET+PUT but no DELETE"), so {@code
+     * PinLedgerSweeper#sweepOnce}'s {@code ledgerStore.delete(...)} call -- the entire point of the
+     * sweep -- threw {@code SecurityException} on every pass. Proven through the real production
+     * wiring: a ledger naming no live pins, written the same way {@code
+     * TransportIndexSnapshotPinAction} writes one, must actually be gone after one real sweep pass.
+     */
+    public void testPinLedgerSweepCanActuallyDeleteAnAbandonedLedger() throws Exception {
+        org.opensearch.threadpool.ThreadPool threadPool = new org.opensearch.threadpool.TestThreadPool(getTestName());
+        try {
+            ServerlessStoragePlugin plugin = newPluginWithPinLedgerSweep(threadPool);
+            IndexSettings settings = indexSettings(true);
+            String indexUuid = settings.getIndex().getUUID();
+            ShardId shardId = new ShardId(settings.getIndex(), 0);
+            ShardRouting primaryRouting = TestShardRouting.newShardRouting(shardId, "node-1", true, ShardRoutingState.STARTED);
+            plugin.getEngineFactory(settings, primaryRouting);
+
+            org.opensearch.serverless.storage.retention.PinLedgerSweepTask task = plugin.pinLedgerSweepTaskForTesting(indexUuid);
+            assertNotNull(task);
+
+            org.opensearch.common.blobstore.BlobContainer shard0Container = plugin.blobContainerForDirectoryFactory(indexUuid, 0);
+            org.opensearch.serverless.storage.retention.BlobContainerPinLedgerStore ledgerStore =
+                new org.opensearch.serverless.storage.retention.BlobContainerPinLedgerStore(shard0Container);
+            ledgerStore.write(new org.opensearch.serverless.storage.retention.PinLedger("pin-1", "test-index", indexUuid, 1, 0));
+
+            task.sweepNowForTesting(1000);
+
+            assertTrue(
+                "a ledger naming no live pins must actually be deleted by a real sweep pass, not merely attempted",
+                ledgerStore.list().isEmpty()
+            );
+        } finally {
+            threadPool.shutdownNow();
+        }
+    }
+
+    private ServerlessStoragePlugin newPluginWithPinLedgerSweep(org.opensearch.threadpool.ThreadPool threadPool) throws Exception {
+        ServerlessStoragePlugin plugin = new ServerlessStoragePlugin(Settings.EMPTY);
+        Path basePath = createTempDir();
+        Settings nodeSettings = Settings.builder()
+            .put("path.home", createTempDir().toString())
+            .putList("path.repo", basePath.toString())
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_BASE_PATH_SETTING.getKey(), basePath.toString())
+            .put(ServerlessStoragePlugin.SERVERLESS_STORAGE_PIN_LEDGER_SWEEP_INTERVAL_SETTING.getKey(), "1h")
+            .build();
+        Environment environment = TestEnvironment.newEnvironment(nodeSettings);
+        plugin.createComponents(null, clusterServiceFor(plugin), threadPool, null, null, null, environment, null, null, null, null);
+        return plugin;
+    }
+
     public void testEncryptionKeyConfiguredDoesNotBreakEngineFactoryConstruction() throws Exception {
         ServerlessStoragePlugin plugin = new ServerlessStoragePlugin(Settings.EMPTY);
         Path basePath = createTempDir();

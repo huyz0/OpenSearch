@@ -93,6 +93,24 @@ public class TransportShardDeepSnapshotAction extends HandledTransportAction<Sha
     /** How long one shard's copy may run before this action gives up on it. Copying is O(bytes), not O(shards). */
     private static final TimeValue COPY_TIMEOUT = TimeValue.timeValueMinutes(30);
 
+    /**
+     * How long the pin this action takes holds its generation before it lapses on its own.
+     *
+     * <p>Found by the bug hunt that followed round 006: the pin was originally taken with the plain
+     * {@link SnapshotPinRequest} constructor, which defaults to {@code PinRecord.NEVER_EXPIRES}, and
+     * this action writes no {@code PinLedger} entry for it (unlike {@code
+     * TransportIndexSnapshotPinAction}'s index-wide pins) -- so a node crash, kill, or the {@code
+     * GENERIC} executor itself rejecting work during shutdown between the pin succeeding and {@code
+     * releasePin}'s {@code finally} running left the pin held forever, invisible to {@code
+     * PinLedgerSweeper} because there was no ledger to find it in. An expiry comfortably longer than
+     * {@link #COPY_TIMEOUT} means an abandoned pin self-heals within a bounded window on its own,
+     * without needing ledger infrastructure this single, synchronously-released pin does not
+     * otherwise need -- the same reasoning gap {@code TransportIndexSnapshotPinAction}'s own
+     * provisional pins close with {@link org.opensearch.serverless.storage.retention.PinRecord
+     * #NEVER_EXPIRES} being the wrong default for anything that isn't confirmed by a second phase.
+     */
+    private static final long PIN_TTL_MILLIS = COPY_TIMEOUT.millis() * 2;
+
     private final ServerlessStoragePlugin plugin;
     private final RepositoriesService repositoriesService;
     private final NodeClient client;
@@ -147,7 +165,13 @@ public class TransportShardDeepSnapshotAction extends HandledTransportAction<Sha
         // queue -- a live deadlock, not a slow test.
         client.execute(
             SnapshotPinAction.INSTANCE,
-            new SnapshotPinRequest(request.indexUuid(), request.shardId(), pinId),
+            // Expiring rather than the plain (NEVER_EXPIRES) constructor, and found by the bug hunt
+            // that followed round 006 rather than at design time: no PinLedger entry is written for
+            // this pin (it is a single shard, synchronously released two lines below, unlike the
+            // index-wide pins a ledger exists for), so PIN_TTL_MILLIS is the only thing that reclaims
+            // it if a crash or a shutdown-time GENERIC rejection skips the release below -- see that
+            // constant's own javadoc.
+            SnapshotPinRequest.expiring(request.indexUuid(), request.shardId(), pinId, System.currentTimeMillis() + PIN_TTL_MILLIS),
             ActionListener.wrap(pin -> threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
                 // The heavy, genuinely blocking work -- Lucene reads, checksums, and a wait on
                 // the repository's own async snapshotShard -- runs here instead, on a thread this
@@ -155,16 +179,25 @@ public class TransportShardDeepSnapshotAction extends HandledTransportAction<Sha
                 // happened to complete on. copyPinnedGeneration's own blocking waits are on the
                 // repository's SNAPSHOT-pool work, a different pool from GENERIC, so there is no
                 // repeat of the same self-wait this replaces.
+                //
+                // The catch here guards copyPinnedGeneration alone, not the onResponse call itself --
+                // deliberately split from it (rather than wrapping both in one try, as an earlier
+                // version did) so a listener whose own onResponse throws (RestShardDeepSnapshotAction's
+                // RestToXContentListener does not self-swallow the way ActionListener.wrap does)
+                // cannot have this catch call onFailure a second time on top of it.
+                ShardDeepSnapshotResponse response;
                 try {
-                    listener.onResponse(copyPinnedGeneration(request, pin));
+                    response = copyPinnedGeneration(request, pin);
                 } catch (Exception e) {
-                    listener.onFailure(e);
-                } finally {
                     // Released on both paths, per the plan's own instruction. SnapshotReleaseAction's
                     // removePin is idempotent, so a release racing a retry of this same request costs
                     // nothing beyond the round trip. Non-blocking, so it adds no further nesting risk.
                     releasePin(request.indexUuid(), request.shardId(), pinId);
+                    listener.onFailure(e);
+                    return;
                 }
+                releasePin(request.indexUuid(), request.shardId(), pinId);
+                listener.onResponse(response);
             }), listener::onFailure)
         );
     }
@@ -231,7 +264,24 @@ public class TransportShardDeepSnapshotAction extends HandledTransportAction<Sha
                 // files from one directory while describing another. See
                 // DeepSnapshotOrchestrationIT's own comment at the equivalent line for why this
                 // assertion exists and is worth keeping rather than working around.
-                IndexCommit commit = DirectoryReader.listCommits(store.directory()).get(0);
+                java.util.List<IndexCommit> commits = DirectoryReader.listCommits(store.directory());
+                if (commits.isEmpty()) {
+                    // A pinned generation naming zero committed segments -- a never-flushed index
+                    // pinned between publication and its first flush is the realistic case, not
+                    // corruption. Named explicitly rather than left as the IndexOutOfBoundsException
+                    // .get(0) would throw, which the outer caller cannot distinguish from any other
+                    // unexpected failure.
+                    throw new IllegalStateException(
+                        "shard ["
+                            + request.indexUuid()
+                            + "/"
+                            + request.shardId()
+                            + "] generation ["
+                            + pin.generation()
+                            + "] has no committed segments to copy"
+                    );
+                }
+                IndexCommit commit = commits.get(0);
                 IndexShardSnapshotStatus status = IndexShardSnapshotStatus.newInitializing(null);
                 PlainActionFuture<String> copied = PlainActionFuture.newFuture();
                 store.incRef();
@@ -248,7 +298,21 @@ public class TransportShardDeepSnapshotAction extends HandledTransportAction<Sha
                         Collections.emptyMap(),
                         copied
                     );
-                    String shardGeneration = copied.actionGet(COPY_TIMEOUT);
+                    String shardGeneration;
+                    try {
+                        shardGeneration = copied.actionGet(COPY_TIMEOUT);
+                    } catch (Exception timedOutOrFailed) {
+                        // repository.snapshotShard is asynchronous and this timeout does not cancel
+                        // it -- the enclosing try-with-resources is about to close store/lazyDirectory/
+                        // cacheDirectory regardless, and a still-running copy reading from them after
+                        // that is exactly the class's own javadoc's "implementations must check
+                        // isAborted()" contract exists for. Signalling it here does not guarantee the
+                        // in-flight copy observes it before this method returns -- there is no barrier
+                        // that would -- but every check point it does reach before the resources are
+                        // gone stops there instead of touching closed state.
+                        status.abortIfNotCompleted("deep snapshot copy exceeded " + COPY_TIMEOUT);
+                        throw timedOutOrFailed;
+                    }
                     return new ShardDeepSnapshotResponse(shardGeneration);
                 } finally {
                     store.decRef();

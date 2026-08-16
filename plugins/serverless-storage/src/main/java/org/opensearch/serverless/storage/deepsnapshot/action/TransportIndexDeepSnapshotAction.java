@@ -144,63 +144,54 @@ public class TransportIndexDeepSnapshotAction extends TransportClusterManagerNod
             return;
         }
 
-        String indexUuid = indexMetadata.getIndexUUID();
         int numberOfShards = indexMetadata.getNumberOfShards();
-        IndexId indexId = new IndexId(request.indexName(), indexUuid);
-        SnapshotId snapshotId = new SnapshotId(request.snapshotName(), UUIDs.randomBase64UUID());
-        long startTime = System.currentTimeMillis();
-
-        copyShard(
-            0,
-            numberOfShards,
-            indexId,
-            indexUuid,
+        CopyContext context = new CopyContext(
+            new IndexId(request.indexName(), indexMetadata.getIndexUUID()),
             request.repositoryName(),
-            snapshotId,
+            new SnapshotId(request.snapshotName(), UUIDs.randomBase64UUID()),
             repository,
             indexMetadata,
-            ShardGenerations.builder(),
-            startTime,
+            System.currentTimeMillis(),
             listener
         );
+
+        copyShard(0, numberOfShards, context, ShardGenerations.builder());
     }
 
-    private void copyShard(
-        int shardId,
-        int numberOfShards,
-        IndexId indexId,
-        String indexUuid,
-        String repositoryName,
-        SnapshotId snapshotId,
-        Repository repository,
-        IndexMetadata indexMetadata,
-        ShardGenerations.Builder shardGenerations,
-        long startTime,
-        ActionListener<IndexDeepSnapshotResponse> listener
-    ) {
+    /**
+     * Everything one {@link #clusterManagerOperation} call carries through the whole recursive
+     * shard-copy fan-out and into {@link #finalizeSnapshot} unchanged -- bundled after the bug hunt
+     * that followed round 006 found the previous shape (8-11 positional parameters, most invariant
+     * across every recursive call) made adding any new piece of per-request state touch two method
+     * signatures and every call site, and made the {@code copyShard}-to-{@code finalizeSnapshot} call
+     * a long positional-argument list a reviewer had to diff by eye. {@code shardGenerations} is
+     * deliberately not a field here: it is the one thing that is genuinely per-call state (a mutable
+     * builder accumulated across the recursion), not per-request context, and keeping it a separate
+     * parameter says so.
+     */
+    private record CopyContext(IndexId indexId, String repositoryName, SnapshotId snapshotId, Repository repository,
+        IndexMetadata indexMetadata, long startTime, ActionListener<IndexDeepSnapshotResponse> listener) {
+    }
+
+    private void copyShard(int shardId, int numberOfShards, CopyContext context, ShardGenerations.Builder shardGenerations) {
         if (shardId == numberOfShards) {
-            finalizeSnapshot(indexId, numberOfShards, snapshotId, repository, indexMetadata, shardGenerations.build(), startTime, listener);
+            finalizeSnapshot(numberOfShards, context, shardGenerations.build());
             return;
         }
         client.execute(
             ShardDeepSnapshotAction.INSTANCE,
-            new ShardDeepSnapshotRequest(indexId.getName(), indexUuid, shardId, repositoryName, snapshotId.getName(), snapshotId.getUUID()),
+            new ShardDeepSnapshotRequest(
+                context.indexId().getName(),
+                context.indexId().getId(),
+                shardId,
+                context.repositoryName(),
+                context.snapshotId().getName(),
+                context.snapshotId().getUUID()
+            ),
             ActionListener.wrap(response -> {
-                shardGenerations.put(indexId, shardId, response.shardGeneration());
-                copyShard(
-                    shardId + 1,
-                    numberOfShards,
-                    indexId,
-                    indexUuid,
-                    repositoryName,
-                    snapshotId,
-                    repository,
-                    indexMetadata,
-                    shardGenerations,
-                    startTime,
-                    listener
-                );
-            }, listener::onFailure)
+                shardGenerations.put(context.indexId(), shardId, response.shardGeneration());
+                copyShard(shardId + 1, numberOfShards, context, shardGenerations);
+            }, context.listener()::onFailure)
         );
     }
 
@@ -232,29 +223,34 @@ public class TransportIndexDeepSnapshotAction extends TransportClusterManagerNod
      * reasoned in advance, the same "probe, do not reason" pattern this round's own predecessors
      * document repeatedly.
      */
-    private void finalizeSnapshot(
-        IndexId indexId,
-        int numberOfShards,
-        SnapshotId snapshotId,
-        Repository repository,
-        IndexMetadata indexMetadata,
-        ShardGenerations shardGenerations,
-        long startTime,
-        ActionListener<IndexDeepSnapshotResponse> listener
-    ) {
+    private void finalizeSnapshot(int numberOfShards, CopyContext context, ShardGenerations shardGenerations) {
+        Repository repository = context.repository();
+        SnapshotId snapshotId = context.snapshotId();
+        IndexMetadata indexMetadata = context.indexMetadata();
+        ActionListener<IndexDeepSnapshotResponse> listener = context.listener();
         repository.getRepositoryData(ActionListener.wrap(repositoryData -> {
-            // Metadata.builder(state) starts from the real cluster metadata rather than an empty
-            // one, so a plain (non-gated) serverless index -- already present there -- is
-            // untouched, and only the gated case gains the entry it was missing. put(..., false)
-            // does not bump the metadata version: this Metadata is never published, only handed to
-            // one repository call that reads it and discards it.
-            Metadata clusterMetadata = Metadata.builder(clusterService.state().metadata()).put(indexMetadata, false).build();
+            // Metadata.builder(state) starts from the real cluster metadata rather than an empty one,
+            // so a plain (non-gated) serverless index -- already present there -- is untouched, and
+            // only the gated case gains the entry it was missing. indices(Map.of(...)) rather than
+            // put(indexMetadata, false): put's identity short-circuit (indices.get(name) ==
+            // indexMetadata) protects the ordinary-index case, since indexMetadata came straight out
+            // of state.metadata() there, but for a gated index the resolved indexMetadata is a fresh
+            // object every call, so the short-circuit never fires and put falls through to
+            // publishDescriptorIfIncremental -- which unconditionally republishes the descriptor (and
+            // appends a change-log entry) from metadata captured before the shard-copy loop ran,
+            // silently clobbering a descriptor an operator may have legitimately changed since.
+            // indices(Map) is a plain putAll with no publish hook either way, and does not bump the
+            // metadata version: this Metadata is genuinely never published, only handed to one
+            // repository call that reads it and discards it.
+            Metadata clusterMetadata = Metadata.builder(clusterService.state().metadata())
+                .indices(java.util.Map.of(indexMetadata.getIndex().getName(), indexMetadata))
+                .build();
             long endTime = System.currentTimeMillis();
             SnapshotInfo snapshotInfo = new SnapshotInfo(
                 snapshotId,
-                List.of(indexId.getName()),
+                List.of(context.indexId().getName()),
                 Collections.emptyList(),
-                startTime,
+                context.startTime(),
                 null,
                 endTime,
                 numberOfShards,
