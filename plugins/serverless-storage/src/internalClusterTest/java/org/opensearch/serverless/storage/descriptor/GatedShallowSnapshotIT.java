@@ -10,7 +10,10 @@ package org.opensearch.serverless.storage.descriptor;
 
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.serverless.storage.ServerlessStoragePlugin;
 import org.opensearch.serverless.storage.retention.action.IndexSnapshotPinAction;
@@ -21,6 +24,8 @@ import org.opensearch.serverless.storage.retention.action.IndexSnapshotReleaseRe
 import org.opensearch.serverless.storage.retention.action.IndexSnapshotRestoreAction;
 import org.opensearch.serverless.storage.retention.action.IndexSnapshotRestoreRequest;
 import org.opensearch.test.OpenSearchIntegTestCase;
+import org.opensearch.threadpool.Scheduler;
+import org.opensearch.threadpool.ThreadPool;
 import org.junit.After;
 
 import java.util.Collection;
@@ -54,29 +59,30 @@ import java.util.concurrent.TimeUnit;
  * and asserts the later write is gone -- the only assertion that distinguishes a restore which moved the
  * head from one that returned quietly having done nothing.
  *
- * <p>It does not pass, and what it found is worth more than the feature it was written for.
- * Restore-in-place refuses while a writer lease is held; the ordinary-index restore test releases that
- * lease by closing the index; and closing a gated index does not release it.
+ * <p>It did not pass at first, and what it found on the way to passing is worth more than the feature it was
+ * written for. Restore-in-place refuses while a writer lease is held; the ordinary-index restore test
+ * releases that lease by closing the index; and closing a gated index did not release it.
  *
- * <p>Pulling that thread found three layers, not one, and two of them are now fixed. The only channel that
- * tells other nodes about a gated index's change is the descriptor change log. {@code DescriptorChange}
- * carried {@code (name, uuid, kind, atMillis)} with no state, so the tailer could not tell a close from a
- * mapping update and released shards only for deletions -- it now carries {@code CLOSED}, and the tailer
- * asks {@code releasesShard()} rather than {@code !live()}, because a closed index keeps its name and loses
- * its shard. That alone changed nothing, which is how the second layer surfaced: a close is written through
+ * <p>Pulling that thread found three layers, all now fixed. The only channel that tells other nodes about a
+ * gated index's change is the descriptor change log. {@code DescriptorChange} carried
+ * {@code (name, uuid, kind, atMillis)} with no state, so the tailer could not tell a close from a mapping
+ * update and released shards only for deletions -- it now carries {@code CLOSED}, and the tailer asks
+ * {@code releasesShard()} rather than {@code !live()}, because a closed index keeps its name and loses its
+ * shard. That alone changed nothing, which is how the second layer surfaced: a close is written through
  * {@code IndexDescriptorPublisher.updateGated}, and that path recorded no change of any kind, so there was
  * never an entry for the new kind to travel in. It records one now, which also means a mapping update
  * republished that way stops leaving other nodes' caches stale.
  *
- * <p>The third layer is why this is still marked: this harness installs no change log, so nothing is
- * appended and nothing tails it here regardless. Whether the release then holds, or the shard is
- * immediately reopened on demand by the next write, has not been measured -- and guessing which, in a
- * javadoc, is exactly the habit this file exists to resist.
- *
- * <p>Left {@code AwaitsFix} rather than weakened to assert the current behaviour, which is how this branch
- * already treats {@code GatedAndOrdinaryNameCollisionIT}'s finding and {@code GatedCreationDurabilityIT}'s
- * T17: a test that asserted the refusal would turn a defect into a specification. The pin and release
- * halves are proven by the tests that do run here.
+ * <p>The third layer was this harness: {@code installBlobBackedDescriptorPlane} never called {@code
+ * DescriptorGate.setChangeFeed}, so no test using it had ever appended a change or tailed one, regardless of
+ * what the first two layers fixed. {@link #startDescriptorChangeTail} closes it -- a real
+ * {@code BlobDescriptorChangeLog} and a real {@code DescriptorChangeTailer} polling it on a background
+ * thread, the same shape production runs, opted into only by the test that needs it. With that wired, the
+ * round trip passes: closing appends a {@code CLOSED} change, the tailer applies it and releases the shard,
+ * the lease goes with it, and restore-in-place becomes reachable. Confirmed the other direction too --
+ * reverting to no change feed reproduces the original failure exactly, the writer-lease
+ * {@code IllegalStateException} the AwaitsFix this class used to carry named -- so the fix is in the wiring
+ * this test drives, not in loosening what it asserts.
  */
 @OpenSearchIntegTestCase.ClusterScope(scope = OpenSearchIntegTestCase.Scope.TEST, numDataNodes = 0)
 public class GatedShallowSnapshotIT extends org.opensearch.serverless.storage.ServerlessStorageIntegTestCase {
@@ -108,22 +114,73 @@ public class GatedShallowSnapshotIT extends org.opensearch.serverless.storage.Se
             .build();
     }
 
+    private volatile Scheduler.Cancellable descriptorChangeTail;
+
     @After
     public void clearGate() throws Exception {
+        Scheduler.Cancellable tail = descriptorChangeTail;
+        descriptorChangeTail = null;
+        if (tail != null) {
+            tail.cancel();
+        }
         DescriptorGate.uninstall();
     }
 
-    @org.apache.lucene.tests.util.LuceneTestCase.AwaitsFix(bugUrl = "closing a gated index still does not release its writer lease, so restore-in-place stays "
-        + "unreachable. Two of the three layers are fixed: DescriptorChange now carries CLOSED and the "
-        + "tailer releases a shard for it, and the updater path -- which is the path a close takes -- now "
-        + "records a change at all, which it did not. What remains is that this harness installs no change "
-        + "log, so nothing is appended and nothing tails it; whether the release then sticks, or the shard "
-        + "is immediately reopened on demand, has not been established")
+    /**
+     * Starts the third layer the round trip below needs: an appender was already wired ({@code
+     * IndexDescriptorPublisher.updateGated} records a change on close) and a consumer already existed
+     * ({@code DescriptorChangeTailer} calls {@code GatedIndexRelease.release} for a change that {@code
+     * releasesShard()}), but nothing in this suite had ever connected them. {@code
+     * installBlobBackedDescriptorPlane} installs the descriptor store and the mapping store; it never calls
+     * {@code DescriptorGate.setChangeFeed}, so every test using it runs with an appender writing to nothing
+     * and no tailer reading anything.
+     *
+     * <p>A fresh {@code FsBlobStore} is enough: the only two parties that need to agree on where the log
+     * lives are the appender ({@code DescriptorGate}, wired here) and the tailer polling it, and nothing else
+     * reads this store. Scheduled at the same {@code ThreadPool.Names.GENERIC} production uses, at the
+     * setting's own floor (100ms) rather than its 5s default, so the {@code assertBusy} windows below do not
+     * need to be five times as generous just to give a background poll room to run.
+     *
+     * <p>Deliberately not folded into {@code installBlobBackedDescriptorPlane} itself: forty-odd other
+     * classes use that method and do not need a background thread walking an object store on every test run,
+     * and several exercise the descriptor cache's own TTL, which a tailer invalidating aggressively would
+     * change the timing of. Opt in per test, the same way {@code installOverFailableContainer} is a variant
+     * rather than a default.
+     */
+    private void startDescriptorChangeTail(DescriptorBackend backend) throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobDescriptorChangeLog changeLog = new BlobDescriptorChangeLog(blobStore::blobContainer, BlobPath.cleanPath());
+        DescriptorGate.setChangeFeed(changeLog);
+        DescriptorChangeTailer tailer = new DescriptorChangeTailer(changeLog, backend);
+        ThreadPool threadPool = internalCluster().getInstance(ThreadPool.class);
+        descriptorChangeTail = threadPool.scheduleWithFixedDelay(
+            tailer::tailOnce,
+            TimeValue.timeValueMillis(100),
+            ThreadPool.Names.GENERIC
+        );
+    }
+
+    /**
+     * The round trip the plan asked for: pin, write past it, close (which must release the lease), restore,
+     * and confirm the later write is gone.
+     *
+     * <p>This is the test that found the three layers {@link DescriptorChange}'s own javadoc and this class's
+     * history describe. The first two -- {@code CLOSED} as a kind, and {@code updateGated} recording one at
+     * all -- were fixed without this test passing, because nothing in the suite drove a change from append
+     * through to a shard actually being released. {@link #startDescriptorChangeTail} is that drive: with a
+     * real change log installed and a real tailer polling it, closing the index appends a {@code CLOSED}
+     * change, the tailer applies it and calls {@code GatedIndexRelease.release}, the data node's {@code
+     * IndicesClusterStateService} closes the shard it opened on demand, the writer lease goes with it, and
+     * restore-in-place -- which refuses while a lease is held -- becomes reachable. Proven rather than
+     * inferred: the assertion is the later write disappearing from a real search, not a log line saying the
+     * shard closed.
+     */
     public void testPinRestoreAndReleaseAllWorkOnAGatedIndex() throws Exception {
         internalCluster().startClusterManagerOnlyNode();
         internalCluster().startDataOnlyNode();
         ensureStableCluster(2);
-        installBlobBackedDescriptorPlane();
+        InstalledDescriptorPlane plane = installBlobBackedDescriptorPlane();
+        startDescriptorChangeTail(plane.points());
 
         assertTrue(
             client().admin().indices().create(new CreateIndexRequest("serverless_pin-me").settings(gated())).actionGet().isAcknowledged()
