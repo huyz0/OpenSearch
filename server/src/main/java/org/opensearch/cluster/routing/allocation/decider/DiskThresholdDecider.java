@@ -39,6 +39,7 @@ import org.opensearch.cluster.ClusterInfo;
 import org.opensearch.cluster.DiskUsage;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.RecoverySource;
 import org.opensearch.cluster.routing.RoutingNode;
@@ -659,13 +660,19 @@ public class DiskThresholdDecider extends AllocationDecider {
             long targetShardSize = 0;
             final Index mergeSourceIndex = indexMetadata.getResizeSourceIndex();
             final IndexMetadata sourceIndexMeta = metadata.index(mergeSourceIndex);
-            if (sourceIndexMeta != null) {
+            // Bug fix: routingTable.index(mergeSourceIndex.getName()) can legitimately return null even
+            // when sourceIndexMeta is non-null (the shrink source exists in metadata but has no routing
+            // table entry -- e.g. a closed index re-opened via addAsNew). The old code iterated the
+            // result of that call directly and NPE'd; the source then contributes no shard sizes and the
+            // caller falls back to defaultValue, rather than this throwing during allocation.
+            final IndexRoutingTable sourceRouting = routingTable.index(mergeSourceIndex.getName());
+            if (sourceIndexMeta != null && sourceRouting != null) {
                 final Set<ShardId> shardIds = IndexMetadata.selectRecoverFromShards(
                     shard.id(),
                     sourceIndexMeta,
                     indexMetadata.getNumberOfShards()
                 );
-                for (IndexShardRoutingTable shardRoutingTable : routingTable.index(mergeSourceIndex.getName())) {
+                for (IndexShardRoutingTable shardRoutingTable : sourceRouting) {
                     if (shardIds.contains(shardRoutingTable.shardId())) {
                         targetShardSize += clusterInfo.getShardSize(shardRoutingTable.primaryShard(), 0);
                     }

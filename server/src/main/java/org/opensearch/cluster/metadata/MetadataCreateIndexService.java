@@ -1936,8 +1936,14 @@ public class MetadataCreateIndexService {
         final IndexRoutingTable table = state.routingTable().index(sourceIndex);
         Map<String, AtomicInteger> nodesToNumRouting = new HashMap<>();
         int numShards = sourceMetadata.getNumberOfShards();
-        for (ShardRouting routing : table.shardsWithState(ShardRoutingState.STARTED)) {
-            nodesToNumRouting.computeIfAbsent(routing.currentNodeId(), (s) -> new AtomicInteger(0)).incrementAndGet();
+        // Bug fix: an index can be present in metadata and absent from the routing table (table == null
+        // here), which this used to dereference unconditionally and NPE on. No routing entry means no
+        // started shards, so no node holds a full copy -- falling through leaves nodesToAllocateOn empty
+        // and produces the existing, clearer error below, rather than an NPE the caller wasn't expecting.
+        if (table != null) {
+            for (ShardRouting routing : table.shardsWithState(ShardRoutingState.STARTED)) {
+                nodesToNumRouting.computeIfAbsent(routing.currentNodeId(), (s) -> new AtomicInteger(0)).incrementAndGet();
+            }
         }
         List<String> nodesToAllocateOn = new ArrayList<>();
         for (Map.Entry<String, AtomicInteger> entries : nodesToNumRouting.entrySet()) {
