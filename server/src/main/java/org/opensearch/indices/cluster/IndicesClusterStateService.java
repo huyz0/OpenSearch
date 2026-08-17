@@ -42,8 +42,8 @@ import org.opensearch.cluster.ClusterStateApplier;
 import org.opensearch.cluster.action.index.NodeMappingRefreshAction;
 import org.opensearch.cluster.action.shard.ShardStateAction;
 import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
-import org.opensearch.cluster.metadata.DescriptorOnlyCreation;
 import org.opensearch.cluster.metadata.GatedIndexRelease;
+import org.opensearch.cluster.metadata.IndexCreationStrategyRegistry;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodes;
@@ -805,7 +805,18 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
                 indicesService.removeIndex(index, NO_LONGER_ASSIGNED, "removing index (no descriptor supplier)");
                 continue;
             }
-            if (DescriptorOnlyCreation.skipsClusterState(indexService.getIndexSettings().getIndexMetadata())) {
+            // Phase D3 of core-pluggability-refactor-plan.md: IndexCreationStrategyRegistry.skipsClusterState(...)
+            // replaces DescriptorOnlyCreation.skipsClusterState(...) here -- the same predicate, discovered
+            // through the SPI instead of the static registry, and the same delegation the D2 final slice
+            // already used for MetadataCreateIndexService's own two skipsClusterState/claims sites. This was
+            // the last real DescriptorOnlyCreation reference in server/src/main outside that class's own
+            // definition and its SupplierBackedIndexCreationStrategy adapter -- removing it is what unblocks
+            // D3 (relocating both into the plugin), not a piece of Phase E's own much larger, still-deferred
+            // scope (isExternallyManaged() unification, the eviction subsystem, on-demand shard opening):
+            // this line is a pure predicate swap, not the settings/lifecycle-ownership extraction E2
+            // describes -- heldOnDemand, the eviction/idle-sweep machinery, and openedOnDemand below are
+            // completely untouched.
+            if (IndexCreationStrategyRegistry.skipsClusterState(indexService.getIndexSettings().getIndexMetadata())) {
                 // Live, gated, and not in openedOnDemand -- which is a bookkeeping race rather than a state
                 // worth asserting about. Both orderings of "claim and close" have one: claiming before the
                 // close leaves a window where this node still holds an index nothing has claimed, and
@@ -835,10 +846,12 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
                 // assertion demands it have been deleted or the cluster be new, neither of which is true of
                 // one that was never published in the first place.
                 //
-                // The gated guard above catches most of this, but it asks DescriptorOnlyCreation, and that
-                // registration goes away when the node's gate uninstalls -- while the indices it opened are
-                // still resident. This one cannot: an index that is not in the map is not this loop's to
-                // reason about, whoever closed it and whatever is registered.
+                // The gated guard above catches most of this, but it asks IndexCreationStrategyRegistry,
+                // which (through SupplierBackedIndexCreationStrategy) still ultimately asks
+                // DescriptorOnlyCreation's own gate -- and that registration goes away when the node's gate
+                // uninstalls, while the indices it opened are still resident. This one cannot: an index
+                // that is not in the map is not this loop's to reason about, whoever closed it and whatever
+                // is registered.
                 continue;
             }
             final IndexMetadata indexMetadata = state.metadata().index(index);
