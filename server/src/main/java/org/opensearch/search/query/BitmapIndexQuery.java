@@ -112,11 +112,14 @@ public class BitmapIndexQuery extends Query implements Accountable {
                 return new ScorerSupplier() {
                     long cost = -1;
 
-                    final DocIdSetBuilder result = new DocIdSetBuilder(reader.maxDoc(), values);
-                    final MergePointVisitor visitor = new MergePointVisitor(result);
-
+                    // Bug fix: these were eagerly constructed as instance initializers, so every call to
+                    // scorerSupplier() allocated a reader.maxDoc()-sized DocIdSetBuilder even when the
+                    // supplier's only ever used to answer cost() and get() is never called. Moved into
+                    // get(), the only place they're actually needed.
                     @Override
                     public Scorer get(long leadCost) throws IOException {
+                        final DocIdSetBuilder result = new DocIdSetBuilder(reader.maxDoc(), values);
+                        final MergePointVisitor visitor = new MergePointVisitor(result);
                         values.intersect(visitor);
                         return new ConstantScoreScorer(score(), scoreMode, result.build().iterator());
                     }

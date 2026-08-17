@@ -238,6 +238,72 @@ public class BitmapIndexQueryTests extends OpenSearchTestCase {
         assertEquals(new MatchNoDocsQuery(), query.rewrite(searcher));
     }
 
+    /**
+     * Bug fix regression test: ScorerSupplier used to build its DocIdSetBuilder/MergePointVisitor as
+     * instance initializers (constructed once, when scorerSupplier() was called), so a second call to
+     * get() on the same supplier would intersect into an already-built result instead of a fresh one.
+     * Moving the construction into get() itself means every call to get() is independent and repeatable.
+     */
+    public void testScorerSupplierGetIsRepeatable() throws IOException {
+        Document d = new Document();
+        d.add(new IntField("product_id", 1, Field.Store.NO));
+        w.addDocument(d);
+
+        d = new Document();
+        d.add(new IntField("product_id", 2, Field.Store.NO));
+        w.addDocument(d);
+
+        d = new Document();
+        d.add(new IntField("product_id", 4, Field.Store.NO));
+        w.addDocument(d);
+
+        w.commit();
+        reader = DirectoryReader.open(w);
+        searcher = newSearcher(reader);
+
+        RoaringBitmap bitmap = new RoaringBitmap();
+        bitmap.add(1);
+        bitmap.add(4);
+
+        BitmapIndexQuery query = new BitmapIndexQuery("product_id", bitmap);
+        Weight weight = searcher.createWeight(searcher.rewrite(query), ScoreMode.COMPLETE_NO_SCORES, 1f);
+
+        List<Integer> firstPassMatches = new ArrayList<>();
+        List<Integer> secondPassMatches = new ArrayList<>();
+        for (LeafReaderContext leaf : reader.leaves()) {
+            ScorerSupplier supplier1 = weight.scorerSupplier(leaf);
+            ScorerSupplier supplier2 = weight.scorerSupplier(leaf);
+            if (supplier1 == null || supplier2 == null) {
+                continue;
+            }
+
+            Scorer scorer1 = supplier1.get(supplier1.cost());
+            Scorer scorer2 = supplier2.get(supplier2.cost());
+            firstPassMatches.addAll(getMatchingValues(scorer1, leaf));
+            secondPassMatches.addAll(getMatchingValues(scorer2, leaf));
+        }
+
+        Collections.sort(firstPassMatches);
+        Collections.sort(secondPassMatches);
+        assertEquals(List.of(1, 4), firstPassMatches);
+        assertEquals(firstPassMatches, secondPassMatches);
+    }
+
+    private static List<Integer> getMatchingValues(Scorer scorer, LeafReaderContext leaf) throws IOException {
+        List<Integer> actual = new ArrayList<>();
+        SortedNumericDocValues dv = DocValues.getSortedNumeric(leaf.reader(), "product_id");
+        DocIdSetIterator it = scorer.iterator();
+        int docId;
+        while ((docId = it.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+            if (dv.advanceExact(docId)) {
+                for (int i = 0; i < dv.docValueCount(); i++) {
+                    actual.add((int) dv.nextValue());
+                }
+            }
+        }
+        return actual;
+    }
+
     public void testPointVisitor() throws IOException {
         w.close();
         // default codec uses 512 documents per leaf node, so we can cover the visit disi methods in PointVisitor
