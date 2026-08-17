@@ -41,7 +41,6 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodes;
-import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.RoutingTable;
 import org.opensearch.common.settings.ClusterSettings;
 
@@ -131,7 +130,10 @@ public class ClusterStateUpdaters {
             // This is the same guard index creation applies, and it is here for the same reason: state
             // recovery rebuilds the routing table from metadata, so it is the second place that decides
             // what gets published.
-            if (AbsentIndexRoutingSuppliers.shouldPublishRouting(cursor) == false) {
+            // Phase C4b of core-pluggability-refactor-plan.md: state.routingTable().shouldPublishRouting(...)
+            // replaces AbsentIndexRoutingSuppliers.shouldPublishRouting(...) here -- same predicate,
+            // discovered through the resolver already attached to this state's own routing table.
+            if (state.routingTable().shouldPublishRouting(cursor) == false) {
                 continue;
             }
             routingTableBuilder.addAsRecovery(cursor);

@@ -165,6 +165,7 @@ public class ComputedActiveShardCountingTests extends OpenSearchTestCase {
     private static ClusterState stateWithoutRouting(int shards) {
         return ClusterState.builder(ClusterName.DEFAULT)
             .metadata(Metadata.builder().put(indexMetadata(shards), false).build())
+            .routingTable(routingTableWithBridge())
             .nodes(DiscoveryNodes.builder().add(node("node-1")).add(node("node-2")).localNodeId("node-1").build())
             .build();
     }
@@ -173,9 +174,26 @@ public class ComputedActiveShardCountingTests extends OpenSearchTestCase {
         IndexMetadata metadata = indexMetadata(shards);
         return ClusterState.builder(ClusterName.DEFAULT)
             .metadata(Metadata.builder().put(metadata, false).build())
-            .routingTable(RoutingTable.builder().add(allStartedOn(metadata, nodeId)).build())
+            .routingTable(RoutingTable.builder(routingTableWithBridge()).add(allStartedOn(metadata, nodeId)).build())
             .nodes(DiscoveryNodes.builder().add(node("node-1")).add(node("node-2")).localNodeId("node-1").build())
             .build();
+    }
+
+    /**
+     * A real (non-EMPTY_ROUTING_TABLE) instance with the SupplierBackedIndexRoutingResolver bridge attached
+     * -- attachIndexRoutingResolver is deliberately a no-op on the shared EMPTY_ROUTING_TABLE singleton (see
+     * its own javadoc), so resolving via the SPI ClusterState#getIndexRoutingTable/ActiveShardCount/
+     * ClusterStateHealth already consult (Phase C4a of core-pluggability-refactor-plan.md) needs an explicit
+     * one here, same as production code gets from a real cluster state. This was a real, pre-existing gap:
+     * confirmed via git stash that testCountingSeesSuppliedShards/testHealthCountsSuppliedShardsRatherThanSkippingTheIndex/
+     * testHealthIsRedWhenComputedShardsAreUnassigned were already failing before any of this session's C4b
+     * work, because AbsentIndexRoutingSuppliers.register(...) alone was never bridged into the resolver
+     * ActiveShardCount/ClusterStateHealth have consulted since C4a.
+     */
+    private static RoutingTable routingTableWithBridge() {
+        RoutingTable routingTable = RoutingTable.builder().build();
+        routingTable.attachIndexRoutingResolver(new SupplierBackedIndexRoutingResolver());
+        return routingTable;
     }
 
     private static IndexMetadata indexMetadata(int shards) {

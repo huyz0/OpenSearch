@@ -71,7 +71,6 @@ import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.metadata.RepositoriesMetadata;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodes;
-import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.RoutingTable;
@@ -373,7 +372,11 @@ public class SnapshotsService extends AbstractLifecycleComponent implements Clus
                     if (stateForGatedCheck.metadata().indexOrResolved(indexName) != null) {
                         gatedIndices.add(indexName);
                     }
-                } else if (AbsentIndexRoutingSuppliers.shouldPublishRouting(published) == false) {
+                    // Phase C4b of core-pluggability-refactor-plan.md: stateForGatedCheck.routingTable()
+                    // .shouldPublishRouting(...) replaces AbsentIndexRoutingSuppliers.shouldPublishRouting(...)
+                    // here -- same predicate, discovered through the resolver attached to this state's own
+                    // routing table.
+                } else if (stateForGatedCheck.routingTable().shouldPublishRouting(published) == false) {
                     computedPlacementIndices.add(indexName);
                 }
             }

@@ -379,7 +379,10 @@ public class RoutingNodes implements Iterable<RoutingNode> {
         // would hand these indices back to the allocator, which is the one thing this area exists to
         // avoid. This helper is read only by the data node's own shard lifecycle, so hooking it
         // materializes shards locally and leaves allocation with nothing to allocate.
-        for (final ShardRouting computed : AbsentIndexRoutingSuppliers.localShards(clusterState, nodeId)) {
+        // Phase C4b of core-pluggability-refactor-plan.md: ClusterState#getLocallyComputedShards(...)
+        // replaces AbsentIndexRoutingSuppliers.localShards(...) here -- wiring IndexRoutingResolver
+        // #localShardsFor, declared since Phase C1 but not consulted by any core call site until now.
+        for (final ShardRouting computed : clusterState.getLocallyComputedShards(nodeId)) {
             if (computed.assignedToNode() && nodeId.equals(computed.currentNodeId())) {
                 shards.add(computed);
             }

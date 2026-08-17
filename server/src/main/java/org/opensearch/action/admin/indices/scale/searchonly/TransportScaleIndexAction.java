@@ -310,7 +310,7 @@ public class TransportScaleIndexAction extends TransportClusterManagerNodeAction
         final ActionListener<AcknowledgedResponse> listener
     ) {
         IndexMetadata indexMetadata = currentState.metadata().index(index);
-        if (!validator.validateScalePrerequisites(indexMetadata, index, listener, false)) {
+        if (!validator.validateScalePrerequisites(indexMetadata, currentState.routingTable(), index, listener, false)) {
             return;
         }
 
@@ -356,7 +356,7 @@ public class TransportScaleIndexAction extends TransportClusterManagerNodeAction
         @Override
         public ClusterState execute(final ClusterState currentState) {
             IndexMetadata indexMetadata = currentState.metadata().index(index);
-            if (validator.validateScalePrerequisites(indexMetadata, index, listener, true) == false) {
+            if (validator.validateScalePrerequisites(indexMetadata, currentState.routingTable(), index, listener, true) == false) {
                 this.validationFailed = true;
                 return currentState;
             }

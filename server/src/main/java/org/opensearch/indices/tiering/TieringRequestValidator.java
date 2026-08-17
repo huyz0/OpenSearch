@@ -18,7 +18,6 @@ import org.opensearch.cluster.health.ClusterHealthStatus;
 import org.opensearch.cluster.health.ClusterIndexHealth;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.node.DiscoveryNode;
-import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.allocation.DiskThresholdSettings;
@@ -72,7 +71,10 @@ public class TieringRequestValidator {
             //
             // Without this the index was still refused, by validateIndexHealth returning false for an
             // absent routing entry, and reported as "index is red" while being perfectly available.
-            if (AbsentIndexRoutingSuppliers.shouldPublishRouting(currentState.metadata().index(index)) == false) {
+            // Phase C4b of core-pluggability-refactor-plan.md: currentState.routingTable().shouldPublishRouting(...)
+            // replaces AbsentIndexRoutingSuppliers.shouldPublishRouting(...) here -- same predicate,
+            // discovered through the resolver attached to this state's own routing table.
+            if (currentState.routingTable().shouldPublishRouting(currentState.metadata().index(index)) == false) {
                 tieringValidationResult.addToRejected(
                     index,
                     "index shard placement is computed rather than published, and tiering relocates shards through the allocator"

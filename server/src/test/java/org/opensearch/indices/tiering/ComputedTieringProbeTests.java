@@ -167,6 +167,18 @@ public class ComputedTieringProbeTests extends OpenSearchTestCase {
             .numberOfReplicas(0)
             .build();
 
-        return ClusterState.builder(ClusterName.DEFAULT).metadata(Metadata.builder().put(metadata, false).build()).build();
+        // A real (non-EMPTY_ROUTING_TABLE) instance, not the builder's default -- attachIndexRoutingResolver
+        // is deliberately a no-op on the shared EMPTY_ROUTING_TABLE singleton (see its own javadoc), so
+        // resolving via the new SPI (Phase C4b of core-pluggability-refactor-plan.md, which
+        // TieringRequestValidator#validateHotToWarm now goes through for shouldPublishRouting) needs an
+        // explicit one here, same as production code gets from a real cluster state. Harmless for this
+        // class's other test, which resolves through AbsentIndexRoutingSuppliers directly and never reads
+        // this routing table's own attached resolver.
+        org.opensearch.cluster.routing.RoutingTable routingTable = org.opensearch.cluster.routing.RoutingTable.builder().build();
+        routingTable.attachIndexRoutingResolver(new org.opensearch.cluster.routing.SupplierBackedIndexRoutingResolver());
+        return ClusterState.builder(ClusterName.DEFAULT)
+            .metadata(Metadata.builder().put(metadata, false).build())
+            .routingTable(routingTable)
+            .build();
     }
 }

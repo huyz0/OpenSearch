@@ -242,8 +242,15 @@ public class ClusterStateUpdatersTests extends OpenSearchTestCase {
             "classic-idx",
             Settings.builder().put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 2).build()
         );
+        // A real (non-EMPTY_ROUTING_TABLE) instance, not the builder's default -- attachIndexRoutingResolver
+        // is deliberately a no-op on the shared EMPTY_ROUTING_TABLE singleton (see its own javadoc), so
+        // resolving via the new SPI (Phase C4b of core-pluggability-refactor-plan.md) needs an explicit one
+        // here, same as production code gets from a real cluster state.
+        final RoutingTable initialRoutingTable = RoutingTable.builder().build();
+        initialRoutingTable.attachIndexRoutingResolver(new org.opensearch.cluster.routing.SupplierBackedIndexRoutingResolver());
         final ClusterState initialState = ClusterState.builder(ClusterState.EMPTY_STATE)
             .metadata(Metadata.builder().put(computed, false).put(published, false).build())
+            .routingTable(initialRoutingTable)
             .build();
 
         org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers.registerUnpublished(

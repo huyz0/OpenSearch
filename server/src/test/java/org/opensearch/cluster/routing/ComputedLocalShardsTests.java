@@ -143,6 +143,7 @@ public class ComputedLocalShardsTests extends OpenSearchTestCase {
     private static ClusterState state(int shards) {
         return ClusterState.builder(ClusterName.DEFAULT)
             .metadata(Metadata.builder().put(index(COMPUTED, shards), false).build())
+            .routingTable(routingTableWithBridge())
             .nodes(DiscoveryNodes.builder().add(node("node-1")).add(node("node-2")).localNodeId("node-1").build())
             .build();
     }
@@ -155,9 +156,23 @@ public class ComputedLocalShardsTests extends OpenSearchTestCase {
 
         return ClusterState.builder(ClusterName.DEFAULT)
             .metadata(Metadata.builder().put(index(COMPUTED, 2), false).put(published, false).build())
-            .routingTable(RoutingTable.builder().add(routing.build()).build())
+            .routingTable(RoutingTable.builder(routingTableWithBridge()).add(routing.build()).build())
             .nodes(DiscoveryNodes.builder().add(node("node-1")).add(node("node-2")).localNodeId("node-1").build())
             .build();
+    }
+
+    /**
+     * A real (non-EMPTY_ROUTING_TABLE) instance with the SupplierBackedIndexRoutingResolver bridge attached
+     * -- attachIndexRoutingResolver is deliberately a no-op on the shared EMPTY_ROUTING_TABLE singleton (see
+     * its own javadoc), so resolving via the new SPI (Phase C4b of core-pluggability-refactor-plan.md, which
+     * RoutingNodes#localRoutingNode now goes through for localShardsFor) needs an explicit one here, same as
+     * production code gets from a real cluster state. Harmless for tests that register nothing on
+     * AbsentIndexRoutingSuppliers -- the bridge still answers empty with nothing registered underneath it.
+     */
+    private static RoutingTable routingTableWithBridge() {
+        RoutingTable routingTable = RoutingTable.builder().build();
+        routingTable.attachIndexRoutingResolver(new SupplierBackedIndexRoutingResolver());
+        return routingTable;
     }
 
     private static IndexMetadata index(String name, int shards) {

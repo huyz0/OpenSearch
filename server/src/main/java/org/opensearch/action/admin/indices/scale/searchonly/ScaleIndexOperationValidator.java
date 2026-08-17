@@ -10,7 +10,7 @@ package org.opensearch.action.admin.indices.scale.searchonly;
 
 import org.opensearch.action.support.clustermanager.AcknowledgedResponse;
 import org.opensearch.cluster.metadata.IndexMetadata;
-import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
+import org.opensearch.cluster.routing.RoutingTable;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.indices.replication.common.ReplicationType;
 
@@ -43,6 +43,11 @@ class ScaleIndexOperationValidator {
      * </ul>
      *
      * @param indexMetadata the metadata of the index to validate
+     * @param routingTable  the routing table {@code indexMetadata} was read alongside, consulted (Phase C4b
+     *                      of {@code core-pluggability-refactor-plan.md}) for whether this index's routing
+     *                      is computed rather than published; {@link RoutingTable#EMPTY_ROUTING_TABLE} (or
+     *                      any routing table with no resolver attached) is always safe to pass and answers
+     *                      exactly as before this parameter existed.
      * @param index         the name of the index being validated
      * @param listener      the action listener to notify in case of validation failure
      * @param isScaleDown   true if validating for scale-down, false for scale-up
@@ -50,6 +55,7 @@ class ScaleIndexOperationValidator {
      */
     boolean validateScalePrerequisites(
         IndexMetadata indexMetadata,
+        RoutingTable routingTable,
         String index,
         ActionListener<AcknowledgedResponse> listener,
         boolean isScaleDown
@@ -69,7 +75,11 @@ class ScaleIndexOperationValidator {
             // cluster state applier thread, so the failure landed in an applier rather than in the
             // request that caused it. The scale-up path was worse in a quieter way: a null guard meant it
             // built a routing table with no trace of the index and reported success.
-            if (AbsentIndexRoutingSuppliers.shouldPublishRouting(indexMetadata) == false) {
+            // Phase C4b of core-pluggability-refactor-plan.md: routingTable.shouldPublishRouting(...)
+            // replaces AbsentIndexRoutingSuppliers.shouldPublishRouting(...) here -- the same predicate,
+            // discovered through the resolver attached to this call's own routing table instead of the
+            // static registry.
+            if (routingTable.shouldPublishRouting(indexMetadata) == false) {
                 throw new IllegalArgumentException(
                     "Index ["
                         + index

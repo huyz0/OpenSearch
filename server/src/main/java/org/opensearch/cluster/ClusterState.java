@@ -66,6 +66,7 @@ import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.discovery.Discovery;
 
 import java.io.IOException;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
@@ -321,6 +322,38 @@ public class ClusterState implements ToXContentFragment, Diffable<ClusterState> 
             return null;
         }
         return resolver.resolve(this, indexMetadata);
+    }
+
+    /**
+     * Phase C4b of {@code core-pluggability-refactor-plan.md}: wires {@link IndexRoutingResolver#localShardsFor}
+     * -- declared since Phase C1 but, per that method's own "wiring status" note, never consulted by any
+     * core call site until now -- into {@link org.opensearch.cluster.routing.RoutingNodes#localRoutingNode}, replacing a direct call to the
+     * pre-existing static registry, {@code AbsentIndexRoutingSuppliers#localShards}.
+     *
+     * <p><b>Deliberately not gated by {@link ClusterStateMutationThreads}</b>, unlike {@link #getIndexRoutingTable}
+     * and {@link Metadata#indexOrResolved(String)}. Those guard a resolver that may do real (e.g. remote)
+     * work to answer an on-demand miss; this method's contract is the opposite by design -- {@code
+     * AbsentIndexRoutingSuppliers#localShards}'s own javadoc already requires an in-memory-only answer
+     * ("a plugin bug must not stop a node from applying cluster state"), because {@code localRoutingNode}
+     * is itself called from cluster-state application. Gating this call the same way the on-demand seams
+     * are gated would silently break it on the one thread it exists to run on.
+     *
+     * @return the shards this resolver believes {@code nodeId} locally hosts but that have no published
+     *         routing entry at all, or an empty collection if no resolver is attached or it declines.
+     */
+    public Collection<ShardRouting> getLocallyComputedShards(String nodeId) {
+        IndexRoutingResolver resolver = routingTable.indexRoutingResolver();
+        if (resolver == null) {
+            return java.util.List.of();
+        }
+        try {
+            Collection<ShardRouting> shards = resolver.localShardsFor(this, nodeId);
+            return shards == null ? java.util.List.of() : shards;
+        } catch (Exception e) {
+            // Matches AbsentIndexRoutingSuppliers#localShards' own failure direction: a throwing resolver
+            // must not stop a node from applying cluster state, so it is treated as "nothing computed here".
+            return java.util.List.of();
+        }
     }
 
     public ClusterBlocks blocks() {

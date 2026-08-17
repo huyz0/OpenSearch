@@ -2495,7 +2495,10 @@ public class MetadataCreateIndexService {
         // diffed on every cluster state change. Skipping publication is what makes the supplier
         // reachable at all -- with an entry published, it would never be consulted.
         RoutingTable.Builder routingTableBuilder = RoutingTable.builder(updatedState.routingTable());
-        if (org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers.shouldPublishRouting(updatedState.metadata().index(indexName))) {
+        // Phase C4b of core-pluggability-refactor-plan.md: updatedState.routingTable().shouldPublishRouting(...)
+        // replaces AbsentIndexRoutingSuppliers.shouldPublishRouting(...) here -- same predicate, discovered
+        // through the resolver attached to this state's own routing table.
+        if (updatedState.routingTable().shouldPublishRouting(updatedState.metadata().index(indexName))) {
             routingTableBuilder.addAsNew(updatedState.metadata().index(indexName));
         } else {
             // Creation is the assignment, so creation sets the primary term. A term is normally bumped by

@@ -128,6 +128,32 @@ public class RoutingTable implements Iterable<IndexRoutingTable>, Diffable<Routi
     }
 
     /**
+     * Phase C4b of {@code core-pluggability-refactor-plan.md}: wires {@link IndexRoutingResolver#shouldPublishRouting}
+     * -- declared since Phase C1 but, per that method's own "wiring status" note, not yet consulted by any
+     * core call site -- replacing direct calls to the pre-existing static registry, {@code
+     * AbsentIndexRoutingSuppliers#shouldPublishRouting}.
+     *
+     * <p>Lives here rather than on {@code ClusterState}, unlike {@link
+     * org.opensearch.cluster.ClusterState#getIndexRoutingTable}: this question only ever needs an {@link
+     * IndexMetadata}, which every real call site already has in hand, so there is no reason to require a
+     * full {@code ClusterState} the way resolving an actual routing table does.
+     *
+     * <p>{@code true} by default -- matching the resolver method's own default and the static registry's --
+     * so a node with no resolver attached, or one that declines/throws, always publishes routing, exactly
+     * today's behavior.
+     */
+    public boolean shouldPublishRouting(IndexMetadata indexMetadata) {
+        if (resolver == null || indexMetadata == null) {
+            return true;
+        }
+        try {
+            return resolver.shouldPublishRouting(indexMetadata);
+        } catch (Exception e) {
+            return true;
+        }
+    }
+
+    /**
      * Get's the {@link IndexShardRoutingTable} for the given shard id from the given {@link IndexRoutingTable}
      * or throws a {@link ShardNotFoundException} if no shard by the given id is found in the IndexRoutingTable.
      *

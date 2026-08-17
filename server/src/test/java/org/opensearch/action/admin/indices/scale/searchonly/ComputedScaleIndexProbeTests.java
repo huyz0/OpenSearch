@@ -19,6 +19,7 @@ import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.RecoverySource;
 import org.opensearch.cluster.routing.RoutingTable;
+import org.opensearch.cluster.routing.SupplierBackedIndexRoutingResolver;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.test.OpenSearchTestCase;
@@ -64,6 +65,7 @@ public class ComputedScaleIndexProbeTests extends OpenSearchTestCase {
 
         boolean valid = new ScaleIndexOperationValidator().validateScalePrerequisites(
             state.metadata().index(INDEX),
+            state.routingTable(),
             INDEX,
             listenerCapturing(failure),
             randomBoolean()
@@ -88,6 +90,7 @@ public class ComputedScaleIndexProbeTests extends OpenSearchTestCase {
 
         new ScaleIndexOperationValidator().validateScalePrerequisites(
             state.metadata().index(INDEX),
+            state.routingTable(),
             INDEX,
             listenerCapturing(failure),
             true
@@ -138,7 +141,16 @@ public class ComputedScaleIndexProbeTests extends OpenSearchTestCase {
     }
 
     private static ClusterState stateWithoutRouting() {
-        return ClusterState.builder(ClusterName.DEFAULT).metadata(Metadata.builder().put(indexMetadata(), false).build()).build();
+        // A real (non-EMPTY_ROUTING_TABLE) instance, not the builder's default -- attachIndexRoutingResolver
+        // is deliberately a no-op on the shared EMPTY_ROUTING_TABLE singleton (see its own javadoc), so
+        // resolving via the new SPI (Phase C4b of core-pluggability-refactor-plan.md) needs an explicit one
+        // here, same as production code gets from a real cluster state.
+        RoutingTable routingTable = RoutingTable.builder().build();
+        routingTable.attachIndexRoutingResolver(new SupplierBackedIndexRoutingResolver());
+        return ClusterState.builder(ClusterName.DEFAULT)
+            .metadata(Metadata.builder().put(indexMetadata(), false).build())
+            .routingTable(routingTable)
+            .build();
     }
 
     private static ClusterState stateWithPublishedRouting() {
