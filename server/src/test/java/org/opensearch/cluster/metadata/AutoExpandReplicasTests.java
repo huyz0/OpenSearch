@@ -98,6 +98,43 @@ public class AutoExpandReplicasTests extends OpenSearchTestCase {
         assertFalse(autoExpandReplicas.autoExpandToAll());
     }
 
+    /**
+     * Regression test for AutoExpandReplicas#anyIndexHasAutoExpandReplicas: the AllocationService fast
+     * path this backs must return false when nothing sets index.auto_expand_replicas at all, true as
+     * soon as any index does (even set explicitly to "false" -- presence is what's checked, not the
+     * parsed value), and it must never disagree with getAutoExpandReplicaChanges actually finding work.
+     */
+    public void testAnyIndexHasAutoExpandReplicas() {
+        Metadata noAutoExpand = Metadata.builder()
+            .put(IndexMetadata.builder("plain").settings(settings(Version.CURRENT)).numberOfShards(1).numberOfReplicas(1))
+            .build();
+        assertFalse(AutoExpandReplicas.anyIndexHasAutoExpandReplicas(noAutoExpand));
+
+        Metadata withAutoExpand = Metadata.builder()
+            .put(IndexMetadata.builder("plain").settings(settings(Version.CURRENT)).numberOfShards(1).numberOfReplicas(1))
+            .put(
+                IndexMetadata.builder("expanding")
+                    .settings(settings(Version.CURRENT).put("index.auto_expand_replicas", "0-all"))
+                    .numberOfShards(1)
+                    .numberOfReplicas(1)
+            )
+            .build();
+        assertTrue(AutoExpandReplicas.anyIndexHasAutoExpandReplicas(withAutoExpand));
+
+        Metadata explicitlyDisabled = Metadata.builder()
+            .put(
+                IndexMetadata.builder("explicit-false")
+                    .settings(settings(Version.CURRENT).put("index.auto_expand_replicas", "false"))
+                    .numberOfShards(1)
+                    .numberOfReplicas(1)
+            )
+            .build();
+        assertTrue(
+            "the setting's presence is what's checked, not its parsed value",
+            AutoExpandReplicas.anyIndexHasAutoExpandReplicas(explicitlyDisabled)
+        );
+    }
+
     public void testInvalidValues() {
         try {
             AutoExpandReplicas.SETTING.get(Settings.builder().put("index.auto_expand_replicas", "boom").build());
