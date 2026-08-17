@@ -14,7 +14,6 @@ import org.apache.lucene.util.Constants;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.node.ResourceUsageCollectorService;
-import org.opensearch.plugin.stats.NativeAllocatorPoolStats;
 import org.opensearch.ratelimitting.admissioncontrol.controllers.AdmissionController;
 import org.opensearch.ratelimitting.admissioncontrol.controllers.CpuBasedAdmissionController;
 import org.opensearch.ratelimitting.admissioncontrol.controllers.IoBasedAdmissionController;
@@ -45,7 +44,7 @@ public class AdmissionControlService {
     private final ClusterService clusterService;
     private final Settings settings;
     private final ResourceUsageCollectorService resourceUsageCollectorService;
-    private final Supplier<NativeAllocatorPoolStats> nativeAllocatorStatsSupplier;
+    private final Supplier<NativeMemoryPressureSignal> nativeMemoryPressureSignalSupplier;
 
     /**
      *
@@ -53,15 +52,18 @@ public class AdmissionControlService {
      * @param clusterService ClusterService Instance
      * @param threadPool ThreadPool Instance
      * @param resourceUsageCollectorService Instance used to get node resource usage stats
-     * @param nativeAllocatorStatsSupplier Nullable supplier of native allocator pool stats, forwarded to the
-     *                                     native-memory admission controller for indexing-pool based rejection
+     * @param nativeMemoryPressureSignalSupplier Nullable supplier of a native memory pressure signal, forwarded
+     *                                           to the native-memory admission controller for indexing-pool
+     *                                           based rejection -- see {@link NativeMemoryPressureSignal}'s
+     *                                           own javadoc for why this is generic rather than one plugin's
+     *                                           concrete pool-stats type
      */
     public AdmissionControlService(
         Settings settings,
         ClusterService clusterService,
         ThreadPool threadPool,
         ResourceUsageCollectorService resourceUsageCollectorService,
-        Supplier<NativeAllocatorPoolStats> nativeAllocatorStatsSupplier
+        Supplier<NativeMemoryPressureSignal> nativeMemoryPressureSignalSupplier
     ) {
         this.threadPool = threadPool;
         this.admissionControlSettings = new AdmissionControlSettings(clusterService.getClusterSettings(), settings);
@@ -69,7 +71,7 @@ public class AdmissionControlService {
         this.clusterService = clusterService;
         this.settings = settings;
         this.resourceUsageCollectorService = resourceUsageCollectorService;
-        this.nativeAllocatorStatsSupplier = nativeAllocatorStatsSupplier;
+        this.nativeMemoryPressureSignalSupplier = nativeMemoryPressureSignalSupplier;
         this.initialize();
     }
 
@@ -130,7 +132,7 @@ public class AdmissionControlService {
                     this.resourceUsageCollectorService,
                     this.clusterService,
                     this.settings,
-                    this.nativeAllocatorStatsSupplier
+                    this.nativeMemoryPressureSignalSupplier
                 );
             default:
                 throw new IllegalArgumentException("Not Supported AdmissionController : " + admissionControllerName);

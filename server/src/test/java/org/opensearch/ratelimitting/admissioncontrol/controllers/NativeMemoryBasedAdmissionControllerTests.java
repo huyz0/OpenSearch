@@ -8,12 +8,11 @@
 
 package org.opensearch.ratelimitting.admissioncontrol.controllers;
 
-import org.opensearch.arrow.spi.PoolGroup;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.node.NodeResourceUsageStats;
 import org.opensearch.node.ResourceUsageCollectorService;
-import org.opensearch.plugin.stats.NativeAllocatorPoolStats;
+import org.opensearch.ratelimitting.admissioncontrol.NativeMemoryPressureSignal;
 import org.opensearch.ratelimitting.admissioncontrol.enums.AdmissionControlActionType;
 import org.opensearch.ratelimitting.admissioncontrol.enums.AdmissionControlMode;
 import org.opensearch.ratelimitting.admissioncontrol.settings.NativeMemoryBasedAdmissionControllerSettings;
@@ -22,8 +21,8 @@ import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.threadpool.TestThreadPool;
 import org.opensearch.threadpool.ThreadPool;
 
-import java.util.List;
 import java.util.Optional;
+import java.util.OptionalDouble;
 import java.util.function.Supplier;
 
 import org.mockito.Mockito;
@@ -281,21 +280,17 @@ public class NativeMemoryBasedAdmissionControllerTests extends OpenSearchTestCas
         assertEquals(admissionController.getRejectionCount(AdmissionControlActionType.INDEXING.getType()), 5);
     }
 
-    private static Supplier<NativeAllocatorPoolStats> indexingPoolSupplier(long allocatedBytes, long limitBytes) {
-        return () -> new NativeAllocatorPoolStats(
-            -1,
-            -1,
-            List.of(
-                new NativeAllocatorPoolStats.PoolStats(
-                    "ingest",
-                    allocatedBytes,
-                    allocatedBytes,
-                    limitBytes,
-                    PoolGroup.INDEXING.getName(),
-                    0
-                )
-            )
-        );
+    /**
+     * Phase H of core-pluggability-refactor-plan.md: builds a NativeMemoryPressureSignal directly rather
+     * than routing through NativeAllocatorPoolStats/PoolGroup -- this test no longer needs to know the
+     * Arrow allocator's concrete pool-stats shape at all, which is the point of that phase.
+     */
+    private static Supplier<NativeMemoryPressureSignal> indexingPoolSupplier(long allocatedBytes, long limitBytes) {
+        double utilization = 100.0 * allocatedBytes / limitBytes;
+        NativeMemoryPressureSignal signal = actionType -> actionType == AdmissionControlActionType.INDEXING
+            ? OptionalDouble.of(utilization)
+            : OptionalDouble.empty();
+        return () -> signal;
     }
 
     public void testApplyControllerWhenIndexingPoolUsageBreached() {

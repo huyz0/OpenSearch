@@ -10,7 +10,6 @@ package org.opensearch.ratelimitting.admissioncontrol.controllers;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.opensearch.arrow.spi.PoolGroup;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
@@ -18,12 +17,13 @@ import org.opensearch.common.util.SingleObjectCache;
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.node.NodeResourceUsageStats;
 import org.opensearch.node.ResourceUsageCollectorService;
-import org.opensearch.plugin.stats.NativeAllocatorPoolStats;
+import org.opensearch.ratelimitting.admissioncontrol.NativeMemoryPressureSignal;
 import org.opensearch.ratelimitting.admissioncontrol.enums.AdmissionControlActionType;
 import org.opensearch.ratelimitting.admissioncontrol.settings.NativeMemoryBasedAdmissionControllerSettings;
 
 import java.util.Locale;
 import java.util.Optional;
+import java.util.OptionalDouble;
 import java.util.function.Supplier;
 
 /**
@@ -44,10 +44,12 @@ public class NativeMemoryBasedAdmissionController extends AdmissionController {
     private NativeMemoryBasedAdmissionControllerSettings settings;
 
     /**
-     * Nullable supplier of native allocator pool stats, installed by a plugin (today: ArrowBasePlugin).
-     * When {@code null} the indexing-pool admission check is skipped entirely and behavior is unchanged.
+     * Nullable supplier of a plugin-reported native memory pressure signal (today: ArrowBasePlugin, via
+     * an adapter built in {@code Node} -- see {@link NativeMemoryPressureSignal}'s own javadoc for why
+     * this is generic rather than one plugin's concrete pool-stats type). When {@code null} the
+     * indexing-pool admission check is skipped entirely and behavior is unchanged.
      */
-    private final Supplier<NativeAllocatorPoolStats> nativeAllocatorStatsSupplier;
+    private final Supplier<NativeMemoryPressureSignal> nativeMemoryPressureSignalSupplier;
 
     /**
      * Cached indexing-pool utilization percentage ({@code allocated / limit * 100}), or {@code null} when
@@ -60,20 +62,21 @@ public class NativeMemoryBasedAdmissionController extends AdmissionController {
      * @param resourceUsageCollectorService Instance used to get node resource usage stats
      * @param clusterService                ClusterService Instance
      * @param settings                      Immutable settings instance
-     * @param nativeAllocatorStatsSupplier  Nullable supplier of native allocator pool stats; when {@code null}
-     *                                      the indexing-pool admission check is disabled
+     * @param nativeMemoryPressureSignalSupplier  Nullable supplier of a native memory pressure signal;
+     *                                             when {@code null} the indexing-pool admission check is
+     *                                             disabled
      */
     public NativeMemoryBasedAdmissionController(
         String admissionControllerName,
         ResourceUsageCollectorService resourceUsageCollectorService,
         ClusterService clusterService,
         Settings settings,
-        Supplier<NativeAllocatorPoolStats> nativeAllocatorStatsSupplier
+        Supplier<NativeMemoryPressureSignal> nativeMemoryPressureSignalSupplier
     ) {
         super(admissionControllerName, resourceUsageCollectorService, clusterService);
         this.settings = new NativeMemoryBasedAdmissionControllerSettings(clusterService.getClusterSettings(), settings);
-        this.nativeAllocatorStatsSupplier = nativeAllocatorStatsSupplier;
-        this.indexingPoolUtilizationCache = nativeAllocatorStatsSupplier == null
+        this.nativeMemoryPressureSignalSupplier = nativeMemoryPressureSignalSupplier;
+        this.indexingPoolUtilizationCache = nativeMemoryPressureSignalSupplier == null
             ? null
             : new SingleObjectCache<>(INDEXING_POOL_STATS_REFRESH_INTERVAL, -1.0) {
                 @Override
@@ -164,30 +167,27 @@ public class NativeMemoryBasedAdmissionController extends AdmissionController {
     }
 
     /**
-     * Computes the current utilization percentage of the INDEXING native memory pool group as
-     * {@code allocated / limit * 100}. Returns {@code -1.0} (signal unavailable) when the supplier is
-     * absent, returns {@code null}, the INDEXING group is missing, or the pool limit is non-positive.
+     * Computes the current utilization percentage for {@link AdmissionControlActionType#INDEXING} via
+     * the installed {@link NativeMemoryPressureSignal}. Returns {@code -1.0} (signal unavailable) when
+     * the supplier is absent, returns {@code null}, throws, or has no signal for this action type.
      */
     private double computeIndexingPoolUtilizationPercent() {
-        Supplier<NativeAllocatorPoolStats> supplier = this.nativeAllocatorStatsSupplier;
+        Supplier<NativeMemoryPressureSignal> supplier = this.nativeMemoryPressureSignalSupplier;
         if (supplier == null) {
             return -1.0;
         }
-        NativeAllocatorPoolStats stats;
+        NativeMemoryPressureSignal signal;
         try {
-            stats = supplier.get();
+            signal = supplier.get();
         } catch (RuntimeException e) {
-            LOGGER.debug("native allocator pool stats supplier threw; skipping indexing-pool admission check", e);
+            LOGGER.debug("native memory pressure signal supplier threw; skipping indexing-pool admission check", e);
             return -1.0;
         }
-        if (stats == null) {
+        if (signal == null) {
             return -1.0;
         }
-        NativeAllocatorPoolStats.PoolStats indexingGroup = stats.getGroupedStats().get(PoolGroup.INDEXING.getName());
-        if (indexingGroup == null || indexingGroup.getLimitBytes() <= 0) {
-            return -1.0;
-        }
-        return 100.0 * indexingGroup.getAllocatedBytes() / indexingGroup.getLimitBytes();
+        OptionalDouble utilization = signal.utilizationPercentFor(AdmissionControlActionType.INDEXING);
+        return utilization.isPresent() ? utilization.getAsDouble() : -1.0;
     }
 
     /**

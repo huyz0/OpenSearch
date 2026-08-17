@@ -259,6 +259,7 @@ import org.opensearch.plugins.TaskManagerClientPlugin;
 import org.opensearch.plugins.TelemetryAwarePlugin;
 import org.opensearch.plugins.TelemetryPlugin;
 import org.opensearch.ratelimitting.admissioncontrol.AdmissionControlService;
+import org.opensearch.ratelimitting.admissioncontrol.NativeMemoryPressureSignal;
 import org.opensearch.ratelimitting.admissioncontrol.transport.AdmissionControlTransportInterceptor;
 import org.opensearch.repositories.RepositoriesModule;
 import org.opensearch.repositories.RepositoriesService;
@@ -1392,12 +1393,26 @@ public class Node implements Closeable {
                 reg -> reg.setNativeMemoryPressureSupplier(nodeResourceUsageTracker::getNativeMemoryUtilizationPercent)
             );
 
+            // Phase H of core-pluggability-refactor-plan.md: AdmissionControlService (and everything it
+            // constructs, including NativeMemoryBasedAdmissionController) takes the generic
+            // NativeMemoryPressureSignal, not the Arrow allocator's concrete pool-stats type -- this is
+            // the one place that adapts between them, so org.opensearch.ratelimitting.admissioncontrol
+            // itself has no arrow-spi dependency. null in means null out, same as before this adapter.
+            // The adapter instance itself is stateless (it re-reads nativeAllocatorStatsSupplier on every
+            // call), so one instance suffices for the life of the node -- this supplier just hands it back.
+            final NativeMemoryPressureSignal nativeMemoryPressureSignal = nativeAllocatorStatsSupplier == null
+                ? null
+                : new NativeAllocatorMemoryPressureSignal(nativeAllocatorStatsSupplier);
+            final Supplier<NativeMemoryPressureSignal> nativeMemoryPressureSignalSupplier = nativeMemoryPressureSignal == null
+                ? null
+                : () -> nativeMemoryPressureSignal;
+
             final AdmissionControlService admissionControlService = new AdmissionControlService(
                 settings,
                 clusterService,
                 threadPool,
                 resourceUsageCollectorService,
-                nativeAllocatorStatsSupplier
+                nativeMemoryPressureSignalSupplier
             );
 
             AdmissionControlTransportInterceptor admissionControlTransportInterceptor = new AdmissionControlTransportInterceptor(
