@@ -435,7 +435,7 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
             }
             IndexMetadata descriptorMetadata;
             try {
-                descriptorMetadata = AbsentIndexDescriptorSuppliers.metadataOrDescriptor(state.metadata(), index);
+                descriptorMetadata = state.metadata().indexOrResolved(index);
             } catch (Exception e) {
                 logger.debug(() -> new ParameterizedMessage("[{}] could not be checked for deletion", index), e);
                 continue;
@@ -1058,7 +1058,7 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
             // Published, so the ordinary path owns it and is either mid-flight or has already failed it.
             return;
         }
-        IndexMetadata indexMetadata = AbsentIndexDescriptorSuppliers.metadataOrDescriptor(state.metadata(), index);
+        IndexMetadata indexMetadata = state.metadata().indexOrResolved(index);
         if (indexMetadata == null) {
             return;
         }
@@ -1407,7 +1407,7 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
         }
 
         try {
-            final IndexMetadata indexMetadata = AbsentIndexDescriptorSuppliers.metadataOrDescriptor(state.metadata(), shardRouting.index());
+            final IndexMetadata indexMetadata = state.metadata().indexOrResolved(shardRouting.index());
             if (indexMetadata == null) {
                 failAndRemoveShard(shardRouting, true, "failed to create shard", new IndexNotFoundException(shardRouting.index()), state);
                 return;
@@ -1691,7 +1691,7 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
         if (shard == null) {
             return false;
         }
-        IndexMetadata indexMetadata = AbsentIndexDescriptorSuppliers.metadataOrDescriptor(state.metadata(), shardRouting.index());
+        IndexMetadata indexMetadata = state.metadata().indexOrResolved(shardRouting.index());
         if (indexMetadata == null) {
             // The index was deleted while this shard was recovering. There is nothing to start and the
             // deletion path will remove the shard. For a gated index the descriptor answers this rather

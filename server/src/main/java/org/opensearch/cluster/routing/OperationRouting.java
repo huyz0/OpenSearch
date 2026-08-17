@@ -34,7 +34,6 @@ package org.opensearch.cluster.routing;
 
 import org.apache.lucene.util.CollectionUtil;
 import org.opensearch.cluster.ClusterState;
-import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.VirtualShardRoutingHelper;
 import org.opensearch.cluster.metadata.WeightedRoutingMetadata;
@@ -531,7 +530,7 @@ public class OperationRouting {
      * table itself -- already has its supplier fallback and simply never ran, since this threw first.
      */
     protected IndexMetadata indexMetadata(ClusterState clusterState, String index) {
-        IndexMetadata indexMetadata = AbsentIndexDescriptorSuppliers.metadataOrDescriptor(clusterState.metadata(), index);
+        IndexMetadata indexMetadata = clusterState.metadata().indexOrResolved(index);
         if (indexMetadata == null) {
             throw new IndexNotFoundException(index);
         }

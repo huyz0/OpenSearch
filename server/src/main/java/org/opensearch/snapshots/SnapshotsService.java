@@ -63,7 +63,6 @@ import org.opensearch.cluster.SnapshotsInProgress.ShardState;
 import org.opensearch.cluster.SnapshotsInProgress.State;
 import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.coordination.FailedToCommitClusterStateException;
-import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.DataStream;
 import org.opensearch.cluster.metadata.DescriptorOnlyCreation;
 import org.opensearch.cluster.metadata.IndexMetadata;
@@ -371,7 +370,7 @@ public class SnapshotsService extends AbstractLifecycleComponent implements Clus
             for (String indexName : namesForGatedCheck) {
                 IndexMetadata published = stateForGatedCheck.metadata().index(indexName);
                 if (published == null) {
-                    if (AbsentIndexDescriptorSuppliers.metadataOrDescriptor(stateForGatedCheck.metadata(), indexName) != null) {
+                    if (stateForGatedCheck.metadata().indexOrResolved(indexName) != null) {
                         gatedIndices.add(indexName);
                     }
                 } else if (AbsentIndexRoutingSuppliers.shouldPublishRouting(published) == false) {
