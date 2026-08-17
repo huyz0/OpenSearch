@@ -104,6 +104,40 @@ public abstract class DataFormat {
         return false;
     }
 
+    /**
+     * Phase F of {@code core-pluggability-refactor-plan.md}. Whether {@code text} fields under this format
+     * must be force-stored in Lucene -- see {@code TextFieldMapper}'s own stored-field forcing (wired via
+     * {@code TextFieldMapper#requiresStoredFieldsForPluggableFormat}). {@code SourceFieldMapper}'s analogous
+     * stored-field forcing still does its own unconditional settings check as of this method's introduction
+     * -- migrating it to this same capability is a separate, not-yet-done follow-up (it needs its own
+     * instance-field/merge-builder plumbing to carry the resolved value across a mapping merge, the way
+     * {@code TextFieldMapper}/{@code KeywordFieldMapper} do; wiring it in without that would silently drop
+     * the force-stored guarantee across mapping updates).
+     *
+     * <p>Defaults to {@code true} -- <b>not</b> {@code false}, deliberately, unlike this file's other
+     * capability methods. Before this method existed, {@code TextFieldMapper} force-stored {@code text}
+     * fields whenever the pluggable-data-format feature was enabled at all, uniformly across every format,
+     * with no per-format opt-out. Matching that exactly means a format that does not override this method
+     * must keep getting stored fields, not lose them -- the opposite of {@link #unsupportedMapperTypes()}/
+     * {@link #rawValueTrackingRequired()}'s pattern only because the *sense* of "unset" differs: those two
+     * default to "keep the old universal restriction/guarantee active" via a non-{@code false} default
+     * ({@code Set.of("nested")}, {@code true}); this one's old universal behavior was also "active" (forced
+     * stored), so its behavior-preserving default is {@code true} for the identical reason, not {@code
+     * false}. A neutral-looking {@code false} default here would silently regress every currently-existing
+     * concrete {@code DataFormat} (none of which override this method as of its introduction) from
+     * "always force-stored" to "never force-stored" the instant this method started being consulted --
+     * exactly the class of ground-rule-1 ("no behavior change") violation this phase's own methodology
+     * exists to catch, and precisely the mistake an earlier, reverted attempt at this same method made
+     * before being caught and abandoned; see this file's git history for that attempt's own note on why.
+     * A format whose backend can reconstruct {@code text} values without Lucene's stored fields overrides
+     * this to return {@code false}.
+     *
+     * @return whether this format requires stored fields for text fields
+     */
+    public boolean requiresStoredFields() {
+        return true;
+    }
+
     @Override
     public final boolean equals(Object o) {
         if (this == o) return true;

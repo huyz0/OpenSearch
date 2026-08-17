@@ -81,6 +81,8 @@ import org.opensearch.index.IndexSettings;
 import org.opensearch.index.analysis.AnalyzerScope;
 import org.opensearch.index.analysis.IndexAnalyzers;
 import org.opensearch.index.analysis.NamedAnalyzer;
+import org.opensearch.index.engine.dataformat.DataFormat;
+import org.opensearch.index.engine.dataformat.DataFormatRegistry;
 import org.opensearch.index.engine.dataformat.FieldTypeCapabilities;
 import org.opensearch.index.fielddata.IndexFieldData;
 import org.opensearch.index.fielddata.plain.PagedBytesIndexFieldData;
@@ -337,15 +339,21 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
         protected final Parameter<Map<String, String>> meta = Parameter.metaParam();
 
         final TextParams.Analyzers analyzers;
+        private final boolean requiresStoredFields;
 
         public Builder(String name, IndexAnalyzers indexAnalyzers) {
             this(name, Version.CURRENT, indexAnalyzers);
         }
 
         public Builder(String name, Version indexCreatedVersion, IndexAnalyzers indexAnalyzers) {
+            this(name, indexCreatedVersion, indexAnalyzers, false);
+        }
+
+        public Builder(String name, Version indexCreatedVersion, IndexAnalyzers indexAnalyzers, boolean requiresStoredFields) {
             super(name);
             this.indexCreatedVersion = indexCreatedVersion;
             this.analyzers = new TextParams.Analyzers(indexAnalyzers);
+            this.requiresStoredFields = requiresStoredFields;
         }
 
         public Builder index(boolean index) {
@@ -473,8 +481,7 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
         public TextFieldMapper build(BuilderContext context) {
             FieldType fieldType = TextParams.buildFieldType(index, store, indexOptions, norms, termVectors);
             TextFieldType tft = buildFieldType(fieldType, context);
-            if (context.indexSettings().getAsBoolean(IndexSettings.INDEX_DERIVED_SOURCE_SETTING.getKey(), false)
-                || context.indexSettings().getAsBoolean(IndexSettings.PLUGGABLE_DATAFORMAT_ENABLED_SETTING.getKey(), false)) {
+            if (context.indexSettings().getAsBoolean(IndexSettings.INDEX_DERIVED_SOURCE_SETTING.getKey(), false) || requiresStoredFields) {
                 fieldType.setStored(true);
             }
             return new TextFieldMapper(
@@ -490,7 +497,37 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
         }
     }
 
-    public static final TypeParser PARSER = new TypeParser((n, c) -> new Builder(n, c.indexVersionCreated(), c.getIndexAnalyzers()));
+    public static final TypeParser PARSER = new TypeParser(
+        (n, c) -> new Builder(n, c.indexVersionCreated(), c.getIndexAnalyzers(), requiresStoredFieldsForPluggableFormat(c))
+    );
+
+    /**
+     * Phase F of {@code core-pluggability-refactor-plan.md}: whether the currently active pluggable data
+     * format (if any) requires {@code text} fields to be force-stored, per {@link
+     * DataFormat#requiresStoredFields()} -- replacing a blanket "pluggable data format means force-stored"
+     * rule with a per-format question. Mirrors {@code KeywordFieldMapper}'s identically-shaped {@code
+     * canConsumeRawValueForSource} -- see that method's own javadoc for why a null {@link DataFormatRegistry}
+     * falls back to the original flag check rather than a bare boolean. Package-private (not private) so a
+     * future migration of {@code SourceFieldMapper}'s analogous, still-unconverted stored-field-forcing
+     * check (see {@link DataFormat#requiresStoredFields()}'s javadoc) can reuse it without duplicating this
+     * logic.
+     */
+    static boolean requiresStoredFieldsForPluggableFormat(ParserContext parserContext) {
+        MapperService mapperService = parserContext.mapperService();
+        IndexSettings indexSettings = mapperService == null ? null : mapperService.getIndexSettings();
+        if (indexSettings == null) {
+            return false;
+        }
+        DataFormatRegistry registry = parserContext.dataFormatRegistry();
+        if (registry == null) {
+            return indexSettings.isPluggableDataFormatEnabled();
+        }
+        DataFormat activeFormat = registry.format(indexSettings.pluggableDataFormat());
+        if (activeFormat == null) {
+            return true;
+        }
+        return activeFormat.requiresStoredFields();
+    }
 
     /**
      * A phrase wrapped field analyzer
@@ -1011,6 +1048,7 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
     protected final Version indexCreatedVersion;
     protected final IndexAnalyzers indexAnalyzers;
     private final FielddataFrequencyFilter freqFilter;
+    private final boolean requiresStoredFields;
 
     protected TextFieldMapper(
         String simpleName,
@@ -1038,6 +1076,7 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
         this.indexCreatedVersion = builder.indexCreatedVersion;
         this.indexAnalyzers = builder.analyzers.indexAnalyzers;
         this.freqFilter = builder.freqFilter.getValue();
+        this.requiresStoredFields = builder.requiresStoredFields;
     }
 
     @Override
@@ -1047,7 +1086,7 @@ public class TextFieldMapper extends ParametrizedFieldMapper {
 
     @Override
     public ParametrizedFieldMapper.Builder getMergeBuilder() {
-        return new Builder(simpleName(), this.indexCreatedVersion, this.indexAnalyzers).init(this);
+        return new Builder(simpleName(), this.indexCreatedVersion, this.indexAnalyzers, this.requiresStoredFields).init(this);
     }
 
     @Override
