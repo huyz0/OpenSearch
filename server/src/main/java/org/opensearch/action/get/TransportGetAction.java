@@ -36,7 +36,6 @@ import org.opensearch.action.RoutingMissingException;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.single.shard.TransportSingleShardAction;
 import org.opensearch.cluster.ClusterState;
-import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.Metadata;
@@ -181,10 +180,7 @@ public class TransportGetAction extends TransportSingleShardAction<GetRequest, G
         //
         // A null answer means neither cluster state nor the descriptor knows this index, which is a case the
         // executor choice does not have to be right about: the request is about to fail on its own.
-        final IndexMetadata indexMetadata = AbsentIndexDescriptorSuppliers.metadataOrDescriptor(
-            clusterState.metadata(),
-            shardId.getIndex()
-        );
+        final IndexMetadata indexMetadata = clusterState.metadata().indexOrResolved(shardId.getIndex());
         if (indexMetadata != null && indexMetadata.isSystem()) {
             return ThreadPool.Names.SYSTEM_READ;
         } else if (indicesService.indexServiceSafe(shardId.getIndex()).getIndexSettings().isSearchThrottled()) {
