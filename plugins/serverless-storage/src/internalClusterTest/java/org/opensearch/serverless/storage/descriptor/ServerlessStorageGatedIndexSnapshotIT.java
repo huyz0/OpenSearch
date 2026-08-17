@@ -237,4 +237,68 @@ public class ServerlessStorageGatedIndexSnapshotIT extends org.opensearch.server
             );
         }
     }
+
+    /**
+     * Phase D2 of {@code core-pluggability-refactor-plan.md}. {@code SnapshotsService}'s wildcard-with
+     * -gated-indices warning (see {@link #testASnapshotOfEverythingSilentlyExcludesTheGatedFleet}'s own
+     * javadoc for what it protects against) is driven by {@code IndexCreationStrategyRegistry.isRegistered()}
+     * now, not {@code DescriptorOnlyCreation.isRegistered()} directly -- migrated because this call site only
+     * ever needed "is anything gated at all," which {@link
+     * org.opensearch.serverless.storage.ServerlessStoragePlugin#getIndexCreationStrategy()}'s registration
+     * (installed automatically at node startup, exactly like every other {@code ClusterPlugin} hook) now
+     * answers through a second, generic path. The functional test above proves the *behavior* survived the
+     * migration (the gated index is still excluded); this proves the specific *log message* still fires
+     * through the new registration path in a real cluster with the real plugin installed -- not just that
+     * {@code DescriptorOnlyCreation}'s own static registry (which nothing removed) happens to still work.
+     */
+    public void testWildcardSnapshotWarningFiresThroughTheNewRegistrationPath() throws Exception {
+        internalCluster().startClusterManagerOnlyNode();
+        internalCluster().startDataOnlyNode();
+        ensureStableCluster(2);
+        installBlobBackedDescriptorPlane();
+
+        client().admin()
+            .cluster()
+            .preparePutRepository("warning-repo")
+            .setType(FsRepository.TYPE)
+            .setSettings(Settings.builder().put("location", randomRepoPath().resolve("repo")))
+            .get();
+
+        Settings gated = Settings.builder()
+            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+            .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+            .put("index.serverless_storage.enabled", true)
+            .build();
+        client().admin().indices().prepareCreate("serverless_warning-gated").setSettings(gated).get();
+        assertBusy(() -> {
+            try {
+                client().prepareIndex("serverless_warning-gated").setId("1").setSource("f", "v").get();
+            } catch (Exception e) {
+                throw new AssertionError("write not yet servable: " + e.getMessage(), e);
+            }
+        });
+
+        org.apache.logging.log4j.Logger snapshotsServiceLogger = org.apache.logging.log4j.LogManager.getLogger(
+            org.opensearch.snapshots.SnapshotsService.class
+        );
+        try (org.opensearch.test.MockLogAppender appender = org.opensearch.test.MockLogAppender.createForLoggers(snapshotsServiceLogger)) {
+            appender.addExpectation(
+                new org.opensearch.test.MockLogAppender.SeenEventExpectation(
+                    "wildcard-with-gated-indices warning",
+                    org.opensearch.snapshots.SnapshotsService.class.getName(),
+                    org.apache.logging.log4j.Level.WARN,
+                    "*resolves its indices by wildcard on a cluster with gated indices*"
+                )
+            );
+
+            client().admin()
+                .cluster()
+                .prepareCreateSnapshot("warning-repo", "warning-snapshot")
+                .setIndices("*")
+                .setWaitForCompletion(true)
+                .get();
+
+            appender.assertAllExpectationsMatched();
+        }
+    }
 }

@@ -64,7 +64,7 @@ import org.opensearch.cluster.SnapshotsInProgress.State;
 import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.coordination.FailedToCommitClusterStateException;
 import org.opensearch.cluster.metadata.DataStream;
-import org.opensearch.cluster.metadata.DescriptorOnlyCreation;
+import org.opensearch.cluster.metadata.IndexCreationStrategyRegistry;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.Metadata;
@@ -407,7 +407,14 @@ public class SnapshotsService extends AbstractLifecycleComponent implements Clus
         //
         // Deliberately not a new field on SnapshotInfo either: the engine-native snapshot design kept that
         // surface unchanged on purpose, and this is not the change that should be the first to break it.
-        if (DescriptorOnlyCreation.isRegistered() && mayHaveMatchedGatedIndices(request.indices())) {
+        //
+        // Phase D2 of core-pluggability-refactor-plan.md: IndexCreationStrategyRegistry.isRegistered()
+        // replaces DescriptorOnlyCreation.isRegistered() here -- this call site only ever needed "is
+        // anything gated at all," never a specific name, so it needed no other change. See
+        // IndexCreationStrategyRegistry's own javadoc for why nothing is lost for a node without a
+        // ClusterPlugin supplying a strategy: it answers false unconditionally, exactly like
+        // DescriptorOnlyCreation.isRegistered() did before anything registered with it.
+        if (IndexCreationStrategyRegistry.isRegistered() && mayHaveMatchedGatedIndices(request.indices())) {
             logger.warn(
                 "snapshot [{}] resolves its indices by wildcard on a cluster with gated indices. Gated indices "
                     + "have no cluster state entry for a wildcard to match, so they are not in this snapshot "

@@ -78,6 +78,8 @@ import org.opensearch.cluster.applicationtemplates.SystemTemplatesPlugin;
 import org.opensearch.cluster.applicationtemplates.SystemTemplatesService;
 import org.opensearch.cluster.coordination.PersistedStateRegistry;
 import org.opensearch.cluster.metadata.AliasValidator;
+import org.opensearch.cluster.metadata.IndexCreationStrategy;
+import org.opensearch.cluster.metadata.IndexCreationStrategyRegistry;
 import org.opensearch.cluster.metadata.IndexMetadataResolver;
 import org.opensearch.cluster.metadata.IndexTemplateMetadata;
 import org.opensearch.cluster.metadata.Metadata;
@@ -800,6 +802,25 @@ public class Node implements Closeable {
                     new ResolverAttachingClusterStateApplier(indexMetadataResolver, indexRoutingResolver)
                 );
             }
+
+            // Phase D2 of core-pluggability-refactor-plan.md: give the node its plugin-supplied
+            // IndexCreationStrategy, if any ClusterPlugin on this node provides one. Unlike the resolvers
+            // above, claims() is a pure, cheap, synchronous, purely-local predicate with no deadlock-safety
+            // concerns and nothing to propagate through cluster state -- a one-time registration here,
+            // mirroring exactly how DescriptorOnlyCreation.register(...) is called once from a plugin's own
+            // bootstrap today, is the whole of what's needed. See IndexCreationStrategyRegistry's own
+            // javadoc.
+            List<IndexCreationStrategy> indexCreationStrategies = clusterPlugins.stream()
+                .map(ClusterPlugin::getIndexCreationStrategy)
+                .filter(Optional::isPresent)
+                .map(Optional::get)
+                .collect(toList());
+            if (indexCreationStrategies.size() > 1) {
+                throw new IllegalStateException(
+                    "at most one ClusterPlugin may supply an IndexCreationStrategy, but found " + indexCreationStrategies.size()
+                );
+            }
+            indexCreationStrategies.stream().findFirst().ifPresent(IndexCreationStrategyRegistry::register);
             final Set<Setting<?>> consistentSettings = settingsModule.getConsistentSettings();
             if (consistentSettings.isEmpty() == false) {
                 clusterService.addLocalNodeClusterManagerListener(
