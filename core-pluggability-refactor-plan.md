@@ -338,9 +338,9 @@ Update this table as work lands. Don't let it go stale — it's the fastest way 
 
 | Phase | Status | Notes |
 |---|---|---|
-| A1 | not started | |
-| A2 | not started | |
-| A3 | not started | |
+| A1 | **done** | Wired `refuseToWriteAMappingFromTheClusterStateThread(indexMetadata)` in immediately before `IndexDescriptorPublisher.createGated(...)` in `clusterStateCreateIndex`'s gated branch — exactly where the surrounding comment said "the refusal below" already lived. New `RefuseGatedWriteOnClusterStateThreadTests` (2 tests); 142 pre-existing gated/create-index tests unaffected. |
+| A2 | **done** | `MetadataIndexAliasesService`'s gated-index alias branch now refuses `AliasAction.Add` with a filter/routing/write-index flag instead of silently keeping only the name. Updated the two stale "gated index provably has no aliases" comments in `Metadata.java`/`IndexNameExpressionResolver.java` to state the real, enforced invariant. New `GatedIndexAliasFilterSafetyTests` (5 tests); 18+76+46 pre-existing tests unaffected. |
+| A3 | **done** | Investigated whether anything depends on the removed `SPLITTING`/`recoveringChildShards`/`parentShardId`/`shardWithRecoveringChild` representation, on this branch **and on `main`**. Found zero real callers on either: `OperationRouting#shardWithRecoveringChild` was never called by anything but its own definition even on `main`, and every other reference lived only in `main`'s dedicated `ShardRoutingStateSplitTests` unit test. It was speculative scaffolding for an earlier design, never wired to a production caller on either branch — not a load-bearing wire-compat concern. Decision: leave the removal as-is (reinstating would resurrect genuinely dead code), documented as a deliberate, reviewed decision via a class-level javadoc note on `ShardRoutingState` pointing at `SplitShardsMetadata` as the current mechanism. No hand-editable release-notes slot exists yet for an unreleased version in this repo's PR-title-driven changelog, so this status-log entry is the durable record of the decision. |
 | B | not started | |
 | C1-C5 | not started | |
 | D1-D3 | not started | |
