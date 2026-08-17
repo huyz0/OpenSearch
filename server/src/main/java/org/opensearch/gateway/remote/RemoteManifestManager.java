@@ -88,10 +88,47 @@ public class RemoteManifestManager {
         Setting.Property.NodeScope
     );
 
+    /**
+     * Phase G of {@code core-pluggability-refactor-plan.md}. {@link ClusterMetadataManifest#MANIFEST_CURRENT_CODEC_VERSION}
+     * (currently {@link ClusterMetadataManifest#CODEC_V6}) is, by that class's own documented design,
+     * written unconditionally by every node the moment it starts -- see {@code ClusterMetadataManifest}'s
+     * static initializer comment for why that is deliberate for this fork rather than a bug. That is a
+     * one-way door: once any node has written a {@code CODEC_V6} manifest, the repository is no longer
+     * readable by a build that only understands up to {@link ClusterMetadataManifest#CODEC_V5} -- see
+     * {@link ClusterMetadataManifest#FORK_CODEC_BASE}'s own javadoc for the sharper version of the same
+     * property. This setting is the escape hatch the review that produced
+     * {@code core-pluggability-refactor-plan.md} asked for: "an explicit, documented cluster setting...
+     * rather than an unconditional bump."
+     *
+     * <p><b>Default {@code false} on purpose, not {@code true}</b> -- unlike most gates in this codebase,
+     * this one does NOT flip to change default behavior. Every existing deployment of this fork already
+     * writes {@code CODEC_V6} unconditionally; defaulting this setting to "pin back to V5" would silently
+     * change that on the next upgrade, and defaulting the earlier draft of this setting to "must opt in
+     * to V6" broke the migration tests that assert an incremental update lands on {@code
+     * MANIFEST_CURRENT_CODEC_VERSION} -- exactly the kind of default-behavior change Phase G's own ground
+     * rule ("no behavior change for a node without an explicit opt-in") exists to prevent. So: {@code
+     * false} here means "today's behavior, unchanged" -- CODEC_V6 written unconditionally, same as
+     * before this setting existed. An operator who wants the staged-rollout safety this setting exists to
+     * provide sets it {@code true} to pin manifests at {@link ClusterMetadataManifest#CODEC_V5} (a fully
+     * supported, actively-parsed format -- see {@code PARSER_V5}/{@code fromXContentV5}) until they are
+     * ready to cross the one-way door deliberately.
+     *
+     * <p>Manifest sharding overrides this pin when enabled ({@link #manifestShardCount} {@code > 0}):
+     * {@code CODEC_V6}'s shard-reference fields have no {@code CODEC_V5} representation, so an operator
+     * who explicitly turns sharding on has already made the CODEC_V6 decision via that setting.
+     */
+    public static final Setting<Boolean> CLUSTER_REMOTE_STORE_STATE_PIN_CODEC_V5_SETTING = Setting.boolSetting(
+        "cluster.remote_store.state.pin_manifest_codec_v5",
+        false,
+        Setting.Property.Dynamic,
+        Setting.Property.NodeScope
+    );
+
     private static final Logger logger = LogManager.getLogger(RemoteManifestManager.class);
 
     private volatile TimeValue metadataManifestUploadTimeout;
     private volatile int manifestShardCount;
+    private volatile boolean pinCodecV5;
     private final String nodeId;
     private final RemoteWriteableEntityBlobStore<ClusterMetadataManifest, RemoteClusterMetadataManifest> manifestBlobStore;
     private final RemoteWriteableEntityBlobStore<ManifestShardContent, RemoteManifestShard> manifestShardBlobStore;
@@ -110,6 +147,7 @@ public class RemoteManifestManager {
     ) {
         this.metadataManifestUploadTimeout = clusterSettings.get(METADATA_MANIFEST_UPLOAD_TIMEOUT_SETTING);
         this.manifestShardCount = clusterSettings.get(CLUSTER_REMOTE_STORE_STATE_MANIFEST_SHARD_COUNT_SETTING);
+        this.pinCodecV5 = clusterSettings.get(CLUSTER_REMOTE_STORE_STATE_PIN_CODEC_V5_SETTING);
         this.nodeId = nodeId;
         this.manifestBlobStore = new RemoteWriteableEntityBlobStore<>(
             blobStoreTransferService,
@@ -129,6 +167,7 @@ public class RemoteManifestManager {
         );
         clusterSettings.addSettingsUpdateConsumer(METADATA_MANIFEST_UPLOAD_TIMEOUT_SETTING, this::setMetadataManifestUploadTimeout);
         clusterSettings.addSettingsUpdateConsumer(CLUSTER_REMOTE_STORE_STATE_MANIFEST_SHARD_COUNT_SETTING, this::setManifestShardCount);
+        clusterSettings.addSettingsUpdateConsumer(CLUSTER_REMOTE_STORE_STATE_PIN_CODEC_V5_SETTING, this::setPinCodecV5);
         this.compressor = blobStoreRepository.getCompressor();
         this.namedXContentRegistry = blobStoreRepository.getNamedXContentRegistry();
         this.blobStoreRepository = blobStoreRepository;
@@ -136,6 +175,27 @@ public class RemoteManifestManager {
 
     private void setManifestShardCount(int manifestShardCount) {
         this.manifestShardCount = manifestShardCount;
+    }
+
+    private void setPinCodecV5(boolean pinCodecV5) {
+        this.pinCodecV5 = pinCodecV5;
+    }
+
+    /**
+     * Phase G of {@code core-pluggability-refactor-plan.md}. {@code MANIFEST_CURRENT_CODEC_VERSION}
+     * (today's unconditional default) unless an operator has explicitly pinned to {@code CODEC_V5} --
+     * and even then, sharding (an operator's own explicit opt-in) overrides the pin, since {@code
+     * CODEC_V6}'s shard-reference fields have no {@code CODEC_V5} representation. See {@link
+     * #CLUSTER_REMOTE_STORE_STATE_PIN_CODEC_V5_SETTING}'s own javadoc for why the default preserves
+     * today's behavior rather than requiring opt-in to it.
+     */
+    // Package-private rather than private so RemoteManifestManagerTests can exercise it directly instead
+    // of standing up a full uploadManifest() flow just to observe this one decision.
+    int resolveCodecVersion(int shardCountForThisManifest) {
+        if (shardCountForThisManifest > 0 || pinCodecV5 == false) {
+            return ClusterMetadataManifest.MANIFEST_CURRENT_CODEC_VERSION;
+        }
+        return ClusterMetadataManifest.CODEC_V5;
     }
 
     RemoteClusterStateManifestInfo uploadManifest(
@@ -218,7 +278,7 @@ public class RemoteManifestManager {
                 .opensearchVersion(Version.CURRENT)
                 .nodeId(nodeId)
                 .committed(committed)
-                .codecVersion(ClusterMetadataManifest.MANIFEST_CURRENT_CODEC_VERSION)
+                .codecVersion(resolveCodecVersion(shardCountForThisManifest))
                 .indices(inlineIndices)
                 .previousClusterUUID(previousClusterUUID)
                 .clusterUUIDCommitted(clusterState.metadata().clusterUUIDCommitted())

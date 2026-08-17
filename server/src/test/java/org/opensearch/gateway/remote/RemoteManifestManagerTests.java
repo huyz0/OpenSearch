@@ -100,6 +100,53 @@ public class RemoteManifestManagerTests extends OpenSearchTestCase {
         assertEquals(metadataManifestUploadTimeout, remoteManifestManager.getMetadataManifestUploadTimeout().seconds());
     }
 
+    /**
+     * Phase G of core-pluggability-refactor-plan.md: resolveCodecVersion's default-behavior-preserving
+     * shape. See CLUSTER_REMOTE_STORE_STATE_PIN_CODEC_V5_SETTING's own javadoc for why the default is
+     * false (today's unconditional CODEC_V6) rather than true (would have been a default-behavior change).
+     */
+    public void testResolveCodecVersionDefaultsToCurrentCodecUnconditionally() {
+        assertEquals(
+            "with nothing configured, every write must land on the current codec, unchanged from before this setting existed",
+            ClusterMetadataManifest.MANIFEST_CURRENT_CODEC_VERSION,
+            remoteManifestManager.resolveCodecVersion(0)
+        );
+    }
+
+    public void testResolveCodecVersionPinnedToV5WhenNotSharding() {
+        clusterSettings.applySettings(
+            Settings.builder().put(RemoteManifestManager.CLUSTER_REMOTE_STORE_STATE_PIN_CODEC_V5_SETTING.getKey(), true).build()
+        );
+
+        assertEquals(ClusterMetadataManifest.CODEC_V5, remoteManifestManager.resolveCodecVersion(0));
+    }
+
+    public void testResolveCodecVersionShardingOverridesThePin() {
+        clusterSettings.applySettings(
+            Settings.builder().put(RemoteManifestManager.CLUSTER_REMOTE_STORE_STATE_PIN_CODEC_V5_SETTING.getKey(), true).build()
+        );
+
+        assertEquals(
+            "an operator who explicitly turned sharding on has already made the CODEC_V6 decision",
+            ClusterMetadataManifest.MANIFEST_CURRENT_CODEC_VERSION,
+            remoteManifestManager.resolveCodecVersion(4)
+        );
+    }
+
+    public void testResolveCodecVersionPinSettingIsDynamic() {
+        assertEquals(ClusterMetadataManifest.MANIFEST_CURRENT_CODEC_VERSION, remoteManifestManager.resolveCodecVersion(0));
+
+        clusterSettings.applySettings(
+            Settings.builder().put(RemoteManifestManager.CLUSTER_REMOTE_STORE_STATE_PIN_CODEC_V5_SETTING.getKey(), true).build()
+        );
+        assertEquals(ClusterMetadataManifest.CODEC_V5, remoteManifestManager.resolveCodecVersion(0));
+
+        clusterSettings.applySettings(
+            Settings.builder().put(RemoteManifestManager.CLUSTER_REMOTE_STORE_STATE_PIN_CODEC_V5_SETTING.getKey(), false).build()
+        );
+        assertEquals(ClusterMetadataManifest.MANIFEST_CURRENT_CODEC_VERSION, remoteManifestManager.resolveCodecVersion(0));
+    }
+
     public void testReadLatestMetadataManifestFailedIOException() throws IOException {
         final ClusterState clusterState = RemoteClusterStateServiceTests.generateClusterStateWithOneIndex()
             .nodes(RemoteClusterStateServiceTests.nodesWithLocalNodeClusterManager())

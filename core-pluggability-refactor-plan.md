@@ -349,6 +349,6 @@ Update this table as work lands. Don't let it go stale — it's the fastest way 
 | D1-D3 | not started | |
 | E1-E2 | not started | |
 | F | not started | |
-| G | not started | |
+| G | **done, with a polarity change from the plan's original draft** | Added `RemoteManifestManager.CLUSTER_REMOTE_STORE_STATE_PIN_CODEC_V5_SETTING` (dynamic, default `false`). The plan draft proposed defaulting to "must opt in to CODEC_V6," but implementing that broke `RemoteClusterStateServiceTests#verifyCodecMigrationManifest` (and would have silently changed every existing deployment's wire format on next upgrade) — exactly the ground-rule violation Phase G itself set out to avoid. Flipped the polarity instead: default `false` = today's behavior unchanged (CODEC_V6 written unconditionally); an operator sets it `true` to pin manifests at `CODEC_V5` for staged-rollout safety. Manifest sharding (`manifestShardCount > 0`, itself an explicit opt-in) overrides the pin, since `CODEC_V6`'s shard-reference fields have no `CODEC_V5` representation. `resolveCodecVersion` made package-private for direct testability. New tests in `RemoteManifestManagerTests` (4 tests) cover the default, the pin, sharding overriding the pin, and the setting being dynamic; 80 pre-existing `RemoteClusterStateServiceTests` + 3 pre-existing `RemoteManifestManagerTests` remain green with zero changes needed. |
 | H | not started | |
 | I | not started | |

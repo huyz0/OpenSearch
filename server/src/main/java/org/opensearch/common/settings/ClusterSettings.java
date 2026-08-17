@@ -205,6 +205,7 @@ import java.util.function.Predicate;
 import static org.opensearch.gateway.remote.RemoteGlobalMetadataManager.GLOBAL_METADATA_UPLOAD_TIMEOUT_SETTING;
 import static org.opensearch.gateway.remote.RemoteIndexMetadataManager.INDEX_METADATA_UPLOAD_TIMEOUT_SETTING;
 import static org.opensearch.gateway.remote.RemoteManifestManager.CLUSTER_REMOTE_STORE_STATE_MANIFEST_SHARD_COUNT_SETTING;
+import static org.opensearch.gateway.remote.RemoteManifestManager.CLUSTER_REMOTE_STORE_STATE_PIN_CODEC_V5_SETTING;
 import static org.opensearch.gateway.remote.RemoteManifestManager.METADATA_MANIFEST_UPLOAD_TIMEOUT_SETTING;
 
 /**
@@ -820,6 +821,7 @@ public final class ClusterSettings extends AbstractScopedSettings {
                 GLOBAL_METADATA_UPLOAD_TIMEOUT_SETTING,
                 METADATA_MANIFEST_UPLOAD_TIMEOUT_SETTING,
                 CLUSTER_REMOTE_STORE_STATE_MANIFEST_SHARD_COUNT_SETTING,
+                CLUSTER_REMOTE_STORE_STATE_PIN_CODEC_V5_SETTING,
                 RemoteClusterStateService.REMOTE_STATE_READ_TIMEOUT_SETTING,
                 RemoteClusterStateService.REMOTE_CLUSTER_STATE_DEFER_INDEX_METADATA_SETTING,
                 RemoteClusterStateService.CLUSTER_REMOTE_STORE_STATE_PATH_PREFIX,
