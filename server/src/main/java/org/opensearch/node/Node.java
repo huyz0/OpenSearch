@@ -196,6 +196,8 @@ import org.opensearch.indices.SystemIndices;
 import org.opensearch.indices.analysis.AnalysisModule;
 import org.opensearch.indices.breaker.BreakerSettings;
 import org.opensearch.indices.breaker.HierarchyCircuitBreakerService;
+import org.opensearch.indices.cluster.IndexResidencyPolicy;
+import org.opensearch.indices.cluster.IndexResidencyPolicyRegistry;
 import org.opensearch.indices.cluster.IndicesClusterStateService;
 import org.opensearch.indices.recovery.PeerRecoverySourceService;
 import org.opensearch.indices.recovery.PeerRecoveryTargetService;
@@ -781,8 +783,7 @@ public class Node implements Closeable {
                 .collect(toList());
             if (indexMetadataResolvers.size() > 1) {
                 throw new IllegalStateException(
-                    "at most one ClusterPlugin may supply an IndexMetadataResolver, but found "
-                        + indexMetadataResolvers.size()
+                    "at most one ClusterPlugin may supply an IndexMetadataResolver, but found " + indexMetadataResolvers.size()
                 );
             }
             List<IndexRoutingResolver> indexRoutingResolvers = clusterPlugins.stream()
@@ -821,6 +822,22 @@ public class Node implements Closeable {
                 );
             }
             indexCreationStrategies.stream().findFirst().ifPresent(IndexCreationStrategyRegistry::register);
+
+            // Phase E2 of core-pluggability-refactor-plan.md: give the node its plugin-supplied
+            // IndexResidencyPolicy, if any ClusterPlugin on this node provides one. Same one-registration-
+            // at-startup shape as IndexCreationStrategy immediately above, for the same reason -- see
+            // IndexResidencyPolicyRegistry's own javadoc.
+            List<IndexResidencyPolicy> indexResidencyPolicies = clusterPlugins.stream()
+                .map(ClusterPlugin::getIndexResidencyPolicy)
+                .filter(Optional::isPresent)
+                .map(Optional::get)
+                .collect(toList());
+            if (indexResidencyPolicies.size() > 1) {
+                throw new IllegalStateException(
+                    "at most one ClusterPlugin may supply an IndexResidencyPolicy, but found " + indexResidencyPolicies.size()
+                );
+            }
+            indexResidencyPolicies.stream().findFirst().ifPresent(IndexResidencyPolicyRegistry::register);
             final Set<Setting<?>> consistentSettings = settingsModule.getConsistentSettings();
             if (consistentSettings.isEmpty() == false) {
                 clusterService.addLocalNodeClusterManagerListener(

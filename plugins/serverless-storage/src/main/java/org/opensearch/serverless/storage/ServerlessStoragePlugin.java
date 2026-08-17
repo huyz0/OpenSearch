@@ -39,6 +39,7 @@ import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.shard.IndexSettingProvider;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.filecache.FileCacheFactory;
+import org.opensearch.indices.cluster.IndexResidencyPolicy;
 import org.opensearch.plugins.ActionPlugin;
 import org.opensearch.plugins.ClusterPlugin;
 import org.opensearch.plugins.EnginePlugin;
@@ -52,6 +53,7 @@ import org.opensearch.serverless.storage.allocation.SuspendedShardAllocationDeci
 import org.opensearch.serverless.storage.compaction.CompactionPolicy;
 import org.opensearch.serverless.storage.compaction.CompactionRebaseExecutor;
 import org.opensearch.serverless.storage.compaction.CompactionSchedulerConfig;
+import org.opensearch.serverless.storage.descriptor.ServerlessGatedIndexResidencyPolicy;
 import org.opensearch.serverless.storage.descriptor.SupplierBackedIndexCreationStrategy;
 import org.opensearch.serverless.storage.directory.InMemoryShardDirectory;
 import org.opensearch.serverless.storage.directory.ShardDirectory;
@@ -1593,6 +1595,52 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         Setting.Property.NodeScope
     );
 
+    /**
+     * Phase E2 of {@code core-pluggability-refactor-plan.md}: how often a node checks whether the gated
+     * indices it opened on demand still exist. Zero disables the sweep. Backs {@link
+     * org.opensearch.serverless.storage.descriptor.ServerlessGatedIndexResidencyPolicy#sweepInterval()} --
+     * declared here rather than on that class because every {@code Setting} this plugin owns lives here,
+     * enforced by {@code testEveryDeclaredSettingFieldIsRegisteredInGetSettings}. Same key this setting had
+     * when it was a hardcoded {@code Setting} field on core's own {@code IndicesClusterStateService}.
+     */
+    public static final Setting<TimeValue> GATED_SHARD_SWEEP_INTERVAL_SETTING = Setting.timeSetting(
+        "indices.gated.deleted_shard_sweep_interval",
+        TimeValue.timeValueSeconds(60),
+        TimeValue.ZERO,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * Phase E2 of {@code core-pluggability-refactor-plan.md}: how long a gated index this node opened on
+     * demand may sit untouched before it is closed again. Zero disables idle eviction. Backs {@link
+     * org.opensearch.serverless.storage.descriptor.ServerlessGatedIndexResidencyPolicy#idleEvictionAfter()}
+     * -- see {@link #GATED_SHARD_SWEEP_INTERVAL_SETTING}'s own javadoc for why this is declared here.
+     *
+     * <p>Thirty minutes rather than something shorter because the cost of being wrong is asymmetric.
+     * Evicting a shard about to be used again costs one cold start -- a descriptor read and a shard open.
+     * Not evicting costs heap that is never given back.
+     */
+    public static final Setting<TimeValue> GATED_SHARD_IDLE_EVICTION_SETTING = Setting.timeSetting(
+        "indices.gated.idle_eviction_after",
+        TimeValue.timeValueMinutes(30),
+        TimeValue.ZERO,
+        Setting.Property.NodeScope
+    );
+
+    /**
+     * Phase E2 of {@code core-pluggability-refactor-plan.md}: the most gated indices this node will hold
+     * open at once, or zero to derive one from the heap using this plugin's own measured per-index cost
+     * ({@code GatedResidencySoakIT} measured 150,888 bytes per open gated index). Backs {@link
+     * org.opensearch.serverless.storage.descriptor.ServerlessGatedIndexResidencyPolicy#maxOpen()} -- see
+     * {@link #GATED_SHARD_SWEEP_INTERVAL_SETTING}'s own javadoc for why this is declared here.
+     */
+    public static final Setting<Integer> GATED_MAX_OPEN_SETTING = Setting.intSetting(
+        "indices.gated.max_open",
+        0,
+        0,
+        Setting.Property.NodeScope
+    );
+
     public static final Setting<TimeValue> DESCRIPTOR_CHANGE_LOG_RETENTION_SETTING = Setting.timeSetting(
         "serverless_storage.descriptor.change_log_retention",
         TimeValue.timeValueHours(1),
@@ -1617,6 +1665,9 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     @Override
     public List<Setting<?>> getSettings() {
         return List.of(
+            GATED_SHARD_SWEEP_INTERVAL_SETTING,
+            GATED_SHARD_IDLE_EVICTION_SETTING,
+            GATED_MAX_OPEN_SETTING,
             DESCRIPTOR_CHANGE_TAIL_INTERVAL_SETTING,
             DESCRIPTOR_CACHE_FRESHNESS_SETTING,
             DESCRIPTOR_CHANGE_LOG_RETENTION_SETTING,
@@ -2950,6 +3001,16 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     @Override
     public Optional<IndexCreationStrategy> getIndexCreationStrategy() {
         return Optional.of(new SupplierBackedIndexCreationStrategy());
+    }
+
+    /**
+     * Phase E2 of {@code core-pluggability-refactor-plan.md}. See {@link ServerlessGatedIndexResidencyPolicy}'s
+     * own javadoc for what this hands core and why the settings it reads live on this plugin now rather
+     * than on {@code IndicesClusterStateService}.
+     */
+    @Override
+    public Optional<IndexResidencyPolicy> getIndexResidencyPolicy() {
+        return Optional.of(new ServerlessGatedIndexResidencyPolicy(settings));
     }
 
     @Override

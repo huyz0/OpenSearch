@@ -123,17 +123,28 @@ public interface ClusterPlugin {
     }
 
     /**
-     * Phase D1 of {@code core-pluggability-refactor-plan.md}: a plugin-owned strategy that can take over
-     * index creation and deletion entirely for the indices it claims -- see {@link
+     * Phase D of {@code core-pluggability-refactor-plan.md}: a plugin-owned decision of which index
+     * names/requests belong to a plugin-managed plane -- see {@link
      * org.opensearch.cluster.metadata.IndexCreationStrategy}'s own javadoc. Empty by default, so a node
      * without this plugin creates and deletes indices exactly as it always has.
-     *
-     * <p><b>Definition only, not yet consulted anywhere</b> -- see {@code IndexCreationStrategy}'s javadoc
-     * for why Phase D2's call-site migration is deliberately separate from this registration point.
      *
      * @opensearch.experimental
      */
     default Optional<IndexCreationStrategy> getIndexCreationStrategy() {
+        return Optional.empty();
+    }
+
+    /**
+     * Phase E2 of {@code core-pluggability-refactor-plan.md}: a plugin-owned policy tuning {@link
+     * org.opensearch.indices.cluster.IndicesClusterStateService}'s on-demand-opened-index residency
+     * bookkeeping (sweep interval, idle-eviction threshold, max-open ceiling) -- see {@link
+     * org.opensearch.indices.cluster.IndexResidencyPolicy}'s own javadoc for exactly what this does and
+     * does not move out of core. Empty by default, so a node without this plugin uses the same numeric
+     * defaults it always has.
+     *
+     * @opensearch.experimental
+     */
+    default Optional<org.opensearch.indices.cluster.IndexResidencyPolicy> getIndexResidencyPolicy() {
         return Optional.empty();
     }
 

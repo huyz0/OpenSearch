@@ -12,9 +12,11 @@ import org.opensearch.Version;
 import org.opensearch.action.admin.cluster.stats.GatedMappingStatsAggregator;
 import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.index.Index;
 import org.opensearch.index.mapper.UnknownFieldRefresh;
+import org.opensearch.indices.cluster.IndexResidencyPolicyRegistry;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.List;
@@ -63,6 +65,7 @@ public class CoreIsInertWithoutAPluginTests extends OpenSearchTestCase {
         UnknownFieldRefresh.register(null);
         GatedMappingStatsAggregator.register(null);
         IndexCreationStrategyRegistry.register(null);
+        IndexResidencyPolicyRegistry.register(null);
     }
 
     @Override
@@ -101,6 +104,20 @@ public class CoreIsInertWithoutAPluginTests extends OpenSearchTestCase {
         assertFalse("the unknown field refresher", UnknownFieldRefresh.isRegistered());
         assertFalse("the gated mapping stats aggregator", GatedMappingStatsAggregator.isRegistered());
         assertFalse("the index-creation strategy", IndexCreationStrategyRegistry.isRegistered());
+        assertFalse("the index-residency policy", IndexResidencyPolicyRegistry.isRegistered());
+    }
+
+    /**
+     * Phase E2 of {@code core-pluggability-refactor-plan.md}: unlike every other seam above, an unregistered
+     * {@code IndexResidencyPolicy} does not answer "does nothing" -- {@code IndicesClusterStateService}'s
+     * sweep timer runs on every node, plugin or not, and always has. So a stock node must see the exact
+     * numeric defaults that used to be hardcoded {@code Setting} fields on that class, not merely "no
+     * exception."
+     */
+    public void testResidencyPolicyDefaultsMatchTheHistoricalHardcodedValues() {
+        assertEquals("sweep interval", TimeValue.timeValueSeconds(60), IndexResidencyPolicyRegistry.sweepInterval());
+        assertEquals("idle eviction threshold", TimeValue.timeValueMinutes(30), IndexResidencyPolicyRegistry.idleEvictionAfter());
+        assertEquals("max open (zero means derive one)", 0, IndexResidencyPolicyRegistry.maxOpen());
     }
 
     /** An index either is in cluster state or does not exist. That is main's rule and it must still hold. */

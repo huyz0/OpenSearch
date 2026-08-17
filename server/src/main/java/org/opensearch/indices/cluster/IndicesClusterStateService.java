@@ -62,7 +62,6 @@ import org.opensearch.common.Nullable;
 import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.lifecycle.AbstractLifecycleComponent;
-import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.AbstractRunnable;
@@ -275,68 +274,17 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
         );
     }
 
-    /**
-     * How often a node checks whether the gated indices it opened on demand still exist.
-     *
-     * <p>Zero disables the sweep, which is what an ordinary cluster wants: with no descriptor supplier
-     * installed nothing is ever opened on demand, so the sweep would have nothing to walk.
+    /*
+     * Phase E2 of core-pluggability-refactor-plan.md: the sweep interval, idle-eviction threshold, and
+     * max-open ceiling that used to be hardcoded Setting fields here -- indices.gated.deleted_shard_sweep_
+     * interval, indices.gated.idle_eviction_after, and indices.gated.max_open -- are now read from
+     * IndexResidencyPolicyRegistry, which answers with a registered plugin's own values or with these exact
+     * same numeric defaults if nothing is registered. See IndexResidencyPolicy's own javadoc for why the
+     * settings moved but the mechanism reading them did not, and for the reasoning that used to live in
+     * this class's own javadoc for each one (the T10 CPU-starvation measurement behind the max-open
+     * ceiling, the 150,888-bytes-per-index heap measurement behind its derived default, and the asymmetric
+     * cost of evicting too eagerly vs. not evicting at all behind the thirty-minute idle default).
      */
-    public static final Setting<TimeValue> GATED_SHARD_SWEEP_INTERVAL_SETTING = Setting.timeSetting(
-        "indices.gated.deleted_shard_sweep_interval",
-        TimeValue.timeValueSeconds(60),
-        TimeValue.ZERO,
-        Setting.Property.NodeScope
-    );
-
-    /**
-     * How long a gated index this node opened on demand may sit untouched before it is closed again.
-     *
-     * <p>Zero disables eviction, restoring the previous behaviour. That behaviour is the defect this
-     * setting exists for: {@link #removeIndices} skips every gated index and {@link #openedOnDemand}
-     * shrinks only on deletion or shutdown, so a node's resident set counts every distinct tenant it has
-     * ever served rather than the ones it is serving. Measured at 150,888 bytes of heap and 3 file
-     * descriptors per open index, a node reaches roughly 110,000 of them at a 31 GiB heap, and at a hundred
-     * million tenants nothing else stops it getting there. The design's whole premise is that residency
-     * tracks the working set; without this it tracks the population with a delay.
-     *
-     * <p>Thirty minutes rather than something shorter because the cost of being wrong is asymmetric.
-     * Evicting a shard about to be used again costs one cold start -- a descriptor read and a shard open.
-     * Not evicting costs heap that is never given back. Thirty minutes keeps an hourly reporting job's
-     * shards warm while stopping a day of one-off tenants accumulating.
-     */
-    public static final Setting<TimeValue> GATED_SHARD_IDLE_EVICTION_SETTING = Setting.timeSetting(
-        "indices.gated.idle_eviction_after",
-        TimeValue.timeValueMinutes(30),
-        TimeValue.ZERO,
-        Setting.Property.NodeScope
-    );
-
-    /**
-     * The most gated indices this node will hold open at once, or zero to derive one from the heap.
-     *
-     * <p>The idle sweep bounds residency only while it can keep up, and T10 measured that it cannot.
-     * Draining a hundred indices takes 5.1 seconds on a quiet node and 66.7 under twenty busy threads --
-     * 19.6 per second against 1.5, a thirteenfold collapse. It is not the sweep interval, since the sweep
-     * runs throughout, and not queue depth, since {@code GENERIC} is a scaling pool. It is CPU: the threads
-     * exist and are not scheduled, and closing an index flushes, so eviction competes for exactly the
-     * resource whose scarcity caused the backlog.
-     *
-     * <p>A timer-driven bound is therefore weakest when the node is busiest, which is the wrong direction
-     * for the property this whole design rests on. A cap enforced where an index is <em>opened</em> does not
-     * depend on scheduling at all: the work happens on the request that would breach it, so the ceiling
-     * holds whatever the background threads are managing.
-     *
-     * <p><b>The default is derived rather than chosen.</b> {@code GatedResidencySoakIT} measured 150,888
-     * bytes of heap per open gated index, flat from 100 of them to 11,470, so half the heap divided by that
-     * is a number with a measurement behind it rather than a guess -- about 110,000 on a 31 GiB node. Half
-     * rather than all, because the other half is what the node is for.
-     */
-    public static final Setting<Integer> GATED_MAX_OPEN_SETTING = Setting.intSetting(
-        "indices.gated.max_open",
-        0,
-        0,
-        Setting.Property.NodeScope
-    );
 
     /**
      * Heap cost of one open gated index, measured rather than estimated.
@@ -366,8 +314,8 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
             GatedIndexRelease.register(index -> releaseGatedIndex(index, "gated index was deleted"));
             gatedMaxOpen = resolveGatedMaxOpen();
             logger.debug("gated indices capped at {} open on this node", gatedMaxOpen);
-            TimeValue interval = GATED_SHARD_SWEEP_INTERVAL_SETTING.get(settings);
-            TimeValue idleAfter = GATED_SHARD_IDLE_EVICTION_SETTING.get(settings);
+            TimeValue interval = IndexResidencyPolicyRegistry.sweepInterval();
+            TimeValue idleAfter = IndexResidencyPolicyRegistry.idleEvictionAfter();
             if (interval.millis() > 0) {
                 // Both halves of the on-demand lifecycle on one timer rather than two. They walk the same
                 // set, they close through the same method, and running them apart would mean two schedules
@@ -458,7 +406,8 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
      * <p>The other half of the on-demand lifecycle, and the half that decides whether this design works at
      * scale. {@link #sweepDeletedGatedIndices} answers "is this index gone", which bounds nothing: a node
      * serving live tenants keeps every one of them open forever, so its resident set is the number of
-     * distinct tenants it has ever seen. See {@link #GATED_SHARD_IDLE_EVICTION_SETTING} for what that costs.
+     * distinct tenants it has ever seen. See {@link IndexResidencyPolicy#idleEvictionAfter()} for what that
+     * costs.
      *
      * <p><b>Every shard of the index, not any.</b> An index is evicted only when all of its shards are cold,
      * because closing the index closes all of them, and one busy shard is reason enough to keep the whole
@@ -478,7 +427,7 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
      * <p>Computed once at start rather than per open, since it depends on nothing that changes.
      */
     private int resolveGatedMaxOpen() {
-        int configured = GATED_MAX_OPEN_SETTING.get(settings);
+        int configured = IndexResidencyPolicyRegistry.maxOpen();
         if (configured > 0) {
             return configured;
         }

@@ -14,7 +14,6 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.index.IndexService;
 import org.opensearch.indices.IndicesService;
-import org.opensearch.indices.cluster.IndicesClusterStateService;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.test.OpenSearchIntegTestCase;
 import org.junit.After;
@@ -123,8 +122,8 @@ public class GatedIdleEvictionIT extends org.opensearch.serverless.storage.Serve
             // Without computed placement a gated index has no routing table, the on-demand opener declines,
             // and no shard is ever built -- so there would be nothing to evict and this would pass empty.
             .put(org.opensearch.serverless.storage.ServerlessStoragePlugin.COMPUTED_PLACEMENT_ENABLED_SETTING.getKey(), true)
-            .put(IndicesClusterStateService.GATED_SHARD_SWEEP_INTERVAL_SETTING.getKey(), SWEEP_EVERY)
-            .put(IndicesClusterStateService.GATED_SHARD_IDLE_EVICTION_SETTING.getKey(), IDLE_AFTER)
+            .put(org.opensearch.serverless.storage.ServerlessStoragePlugin.GATED_SHARD_SWEEP_INTERVAL_SETTING.getKey(), SWEEP_EVERY)
+            .put(org.opensearch.serverless.storage.ServerlessStoragePlugin.GATED_SHARD_IDLE_EVICTION_SETTING.getKey(), IDLE_AFTER)
             .build();
     }
 
@@ -181,7 +180,9 @@ public class GatedIdleEvictionIT extends org.opensearch.serverless.storage.Serve
     public void testEvictionOffKeepsThemResident() throws Exception {
         internalCluster().startClusterManagerOnlyNode();
         String dataNode = internalCluster().startDataOnlyNode(
-            Settings.builder().put(IndicesClusterStateService.GATED_SHARD_IDLE_EVICTION_SETTING.getKey(), TimeValue.ZERO).build()
+            Settings.builder()
+                .put(org.opensearch.serverless.storage.ServerlessStoragePlugin.GATED_SHARD_IDLE_EVICTION_SETTING.getKey(), TimeValue.ZERO)
+                .build()
         );
         ensureStableCluster(2);
         installBlobBackedDescriptorPlane();
@@ -302,9 +303,9 @@ public class GatedIdleEvictionIT extends org.opensearch.serverless.storage.Serve
         String dataNode = internalCluster().startDataOnlyNode(
             Settings.builder()
                 // No idle eviction and no sweep: the cap is the only thing left that can bound residency.
-                .put(IndicesClusterStateService.GATED_SHARD_IDLE_EVICTION_SETTING.getKey(), TimeValue.ZERO)
-                .put(IndicesClusterStateService.GATED_SHARD_SWEEP_INTERVAL_SETTING.getKey(), TimeValue.ZERO)
-                .put(IndicesClusterStateService.GATED_MAX_OPEN_SETTING.getKey(), CEILING)
+                .put(org.opensearch.serverless.storage.ServerlessStoragePlugin.GATED_SHARD_IDLE_EVICTION_SETTING.getKey(), TimeValue.ZERO)
+                .put(org.opensearch.serverless.storage.ServerlessStoragePlugin.GATED_SHARD_SWEEP_INTERVAL_SETTING.getKey(), TimeValue.ZERO)
+                .put(org.opensearch.serverless.storage.ServerlessStoragePlugin.GATED_MAX_OPEN_SETTING.getKey(), CEILING)
                 .build()
         );
         ensureStableCluster(2);
