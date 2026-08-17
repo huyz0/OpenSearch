@@ -41,6 +41,7 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodes;
+import org.opensearch.cluster.routing.IndexRoutingResolver;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.RoutingNode;
@@ -48,6 +49,7 @@ import org.opensearch.cluster.routing.RoutingNodes;
 import org.opensearch.cluster.routing.RoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.Nullable;
 import org.opensearch.common.UUIDs;
 import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.io.stream.BytesStreamOutput;
@@ -277,6 +279,41 @@ public class ClusterState implements ToXContentFragment, Diffable<ClusterState> 
 
     public RoutingTable getRoutingTable() {
         return routingTable();
+    }
+
+    /**
+     * Phase C3 of {@code core-pluggability-refactor-plan.md}: {@code routingTable().index(indexName)},
+     * falling back to the attached {@link org.opensearch.cluster.routing.IndexRoutingResolver} (see that
+     * interface's own javadoc) on a miss.
+     *
+     * <p>This -- not {@code RoutingTable#index(String)} itself -- is the seam: real routing resolution
+     * needs the index's {@link org.opensearch.cluster.metadata.IndexMetadata} (at minimum its shard
+     * count), which a bare {@link RoutingTable} does not hold but a {@link ClusterState} does, via {@link
+     * #metadata()} -- which, since Phase C2, already resolves a gated/deferred index's metadata on its
+     * own miss. So this single method composes both resolvers correctly for any caller with a {@code
+     * ClusterState} in hand, which is nearly every core caller today ({@code OperationRouting},
+     * {@code IndexNameExpressionResolver}, the action layer) -- see
+     * {@code core-pluggability-refactor-plan.md} Phase C4 for the caller migration this enables.
+     *
+     * @return the resolved {@link org.opensearch.cluster.routing.IndexRoutingTable}, or {@code null} if
+     *         neither the routing table nor the resolver has one -- callers must treat this identically
+     *         to how they already treat a direct {@code routingTable().index(name)} miss.
+     */
+    @Nullable
+    public IndexRoutingTable getIndexRoutingTable(String indexName) {
+        IndexRoutingTable published = routingTable.index(indexName);
+        if (published != null) {
+            return published;
+        }
+        IndexRoutingResolver resolver = routingTable.indexRoutingResolver();
+        if (resolver == null) {
+            return null;
+        }
+        IndexMetadata indexMetadata = metadata.index(indexName);
+        if (indexMetadata == null) {
+            return null;
+        }
+        return resolver.resolve(this, indexMetadata);
     }
 
     public ClusterBlocks blocks() {

@@ -81,9 +81,38 @@ public class RoutingTable implements Iterable<IndexRoutingTable>, Diffable<Routi
     // index to IndexRoutingTable map
     private final Map<String, IndexRoutingTable> indicesRouting;
 
+    /**
+     * Phase C3 of {@code core-pluggability-refactor-plan.md}. Storage for a plugin-supplied {@link
+     * IndexRoutingResolver}, propagated the same way {@link org.opensearch.cluster.metadata.Metadata}'s
+     * own resolver is (see that field's javadoc for the full reasoning): a mutable, non-wire field, not a
+     * constructor parameter -- this constructor is {@code public} and used directly by callers this
+     * branch does not control, so its arity cannot change.
+     *
+     * <p><b>Design note this phase's implementation surfaced:</b> unlike {@code Metadata#index(String)},
+     * a bare {@code RoutingTable} genuinely cannot consult this resolver from inside {@link
+     * #index(String)} itself -- real routing resolution needs the index's {@code IndexMetadata} (at
+     * minimum, its shard count) and often the live node list, and {@code RoutingTable} deliberately holds
+     * neither; it is one of {@link org.opensearch.cluster.ClusterState}'s constituent parts, not the
+     * whole. The consultation point is therefore a new method on {@code ClusterState} itself (which holds
+     * both {@code metadata()} and {@code routingTable()} together), not here. This field only stores the
+     * resolver so it survives every {@code RoutingTable} mutation on a node, the same way {@code
+     * Metadata}'s does.
+     */
+    private transient IndexRoutingResolver resolver;
+
     public RoutingTable(long version, final Map<String, IndexRoutingTable> indicesRouting) {
         this.version = version;
         this.indicesRouting = Collections.unmodifiableMap(indicesRouting);
+    }
+
+    /** See {@link #resolver}'s own javadoc for why this is a mutable setter, not a constructor parameter. */
+    public void attachIndexRoutingResolver(IndexRoutingResolver resolver) {
+        this.resolver = resolver;
+    }
+
+    /** The currently-attached resolver, or {@code null} if none is. */
+    public IndexRoutingResolver indexRoutingResolver() {
+        return resolver;
     }
 
     /**
@@ -480,7 +509,13 @@ public class RoutingTable implements Iterable<IndexRoutingTable>, Diffable<Routi
 
         @Override
         public RoutingTable apply(RoutingTable part) {
-            return new RoutingTable(version, indicesRouting.apply(part.indicesRouting));
+            RoutingTable applied = new RoutingTable(version, indicesRouting.apply(part.indicesRouting));
+            // Phase C3 of core-pluggability-refactor-plan.md: same fix MetadataDiff#apply needed and for
+            // the same reason -- this constructs a fresh RoutingTable with nothing to inherit a resolver
+            // from on its own, and diff application is the normal way cluster state propagates after the
+            // first full state.
+            applied.attachIndexRoutingResolver(part.resolver);
+            return applied;
         }
 
         @Override
@@ -513,6 +548,8 @@ public class RoutingTable implements Iterable<IndexRoutingTable>, Diffable<Routi
 
         private long version;
         private Map<String, IndexRoutingTable> indicesRouting = new HashMap<>();
+        /** Carried forward to whatever this builder produces. See {@link RoutingTable#resolver}'s own javadoc. */
+        private IndexRoutingResolver resolver;
 
         public Builder() {
 
@@ -523,6 +560,17 @@ public class RoutingTable implements Iterable<IndexRoutingTable>, Diffable<Routi
             for (IndexRoutingTable indexRoutingTable : routingTable) {
                 indicesRouting.put(indexRoutingTable.getIndex().getName(), indexRoutingTable);
             }
+            resolver = routingTable.resolver;
+        }
+
+        /**
+         * Overrides the resolver this builder's {@link #build()} attaches. See {@code
+         * Metadata.Builder#resolver}'s own javadoc for the parallel case -- most callers never need this,
+         * it exists for the one place that has to attach it in the first place.
+         */
+        public Builder resolver(IndexRoutingResolver resolver) {
+            this.resolver = resolver;
+            return this;
         }
 
         public Builder updateNodes(long version, RoutingNodes routingNodes) {
@@ -756,6 +804,7 @@ public class RoutingTable implements Iterable<IndexRoutingTable>, Diffable<Routi
                 throw new IllegalStateException("once build is called the builder cannot be reused");
             }
             RoutingTable table = new RoutingTable(version, indicesRouting);
+            table.attachIndexRoutingResolver(resolver);
             indicesRouting = null;
             return table;
         }
