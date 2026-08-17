@@ -852,13 +852,36 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
 
     public IndexMetadata index(String index) {
         IndexMetadataHolder holder = indices.get(index);
-        if (holder != null) {
-            return holder.get();
-        }
-        // Phase C2 of core-pluggability-refactor-plan.md: the one seam every caller of this method gets
-        // for free, instead of each of them separately calling a static registry on their own miss.
-        if (resolver == null) {
-            return null;
+        return holder == null ? null : holder.get();
+    }
+
+    /**
+     * Phase C of {@code core-pluggability-refactor-plan.md}, corrected mid-session after a real regression
+     * this exact design surfaced. {@link #index(String)}'s published-metadata-only answer, falling back to
+     * an attached {@link IndexMetadataResolver} on a miss.
+     *
+     * <p><b>Deliberately a separate, explicitly-named method -- not folded into {@link #index(String)}
+     * itself.</b> An earlier version of this phase made {@code index(String)} auto-consult the resolver for
+     * every caller, on the premise that every caller "gets it for free" instead of remembering a second
+     * path. That premise turned out to be exactly backwards for a caller that relies on {@code
+     * index(String)}'s null-ness as a <em>distinguishing signal</em> rather than a plain existence check --
+     * confirmed via a real, {@code internalClusterTest}-verified regression: {@code
+     * MetadataDeleteIndexService#deleteIndices} uses {@code currentMetadata.index(index) == null} to decide
+     * whether an index is gated and needs the durable, retried tombstone-write path; auto-resolving there
+     * silently made that check say "no" for a genuinely gated index, and its tombstone stopped being written
+     * durably. See {@code core-pluggability-refactor-plan.md}'s C5 status-log entry for the full failure
+     * evidence. This method exists so a caller that explicitly wants the fallback (this phase's Phase C4a
+     * candidate call sites) can ask for it by name, while every other caller of {@link #index(String)} --
+     * which is nearly every read path in the codebase, most of which were never audited for this pattern --
+     * keeps exactly its pre-existing behavior, unconditionally, with no auditing required.
+     *
+     * @see IndexMetadataResolver for the full resolver contract, including the guarantee that this never
+     *      reaches a cluster-state-mutation thread.
+     */
+    public IndexMetadata indexOrResolved(String index) {
+        IndexMetadata published = index(index);
+        if (published != null || resolver == null) {
+            return published;
         }
         // See ClusterStateMutationThreads' own javadoc for the deadlock this refusal prevents: a resolver
         // may do real (e.g. remote) work to answer, and this thread needs to make progress before that work
@@ -871,9 +894,23 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
     }
 
     /**
-     * Attaches the per-node fallback {@link #index(String)} consults on a miss. See {@link #resolver}'s
-     * own javadoc for why this is a mutable setter rather than a constructor parameter, and for what
-     * still has to call it before this has any effect.
+     * The {@link #indexOrResolved(String)} counterpart to {@link #index(Index)}: the published entry if its
+     * uuid matches, otherwise the resolver's answer if its uuid matches -- a caller with a concrete {@link
+     * Index} has already resolved a name to a uuid, and answering with metadata for a different uuid would
+     * serve a request against a deleted index's successor.
+     */
+    public IndexMetadata indexOrResolved(Index index) {
+        IndexMetadata resolved = indexOrResolved(index.getName());
+        if (resolved != null && resolved.getIndexUUID().equals(index.getUUID())) {
+            return resolved;
+        }
+        return null;
+    }
+
+    /**
+     * Attaches the per-node fallback {@link #indexOrResolved(String)} consults on a miss. See {@link
+     * #resolver}'s own javadoc for why this is a mutable setter rather than a constructor parameter, and for
+     * what still has to call it before this has any effect.
      *
      * <p>A no-op on {@link #EMPTY_METADATA} itself: that field is a shared, JVM-wide singleton --
      * {@link org.opensearch.cluster.ClusterState.Builder}'s default when no explicit metadata is set, and

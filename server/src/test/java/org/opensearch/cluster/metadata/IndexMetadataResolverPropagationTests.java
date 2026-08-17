@@ -11,35 +11,64 @@ package org.opensearch.cluster.metadata;
 import org.opensearch.Version;
 import org.opensearch.cluster.Diff;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.core.index.Index;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**
- * Phase C2 of core-pluggability-refactor-plan.md.
+ * Phase C2 of core-pluggability-refactor-plan.md, corrected mid-session after a real regression this design
+ * caused: {@link Metadata#index(String)} itself no longer consults a resolver -- see {@link
+ * Metadata#indexOrResolved(String)}'s own javadoc, and the plan's C5 status-log entry, for the full story.
  *
- * <p>{@link Metadata#index(String)} consults an attached {@link IndexMetadataResolver} on a miss --
- * this covers the resolve-on-miss behavior itself, and (the part that's easy to get wrong) that the
- * resolver survives every mechanism a new {@link Metadata} instance gets produced from an existing one
- * on the same node: {@link Metadata.Builder#Builder(Metadata)} and {@link Metadata#diff(Metadata)}'s
- * {@link Diff#apply}. Neither of those two paths carries the field for free -- see the resolver field's
- * own javadoc on {@code Metadata} for why each needed an explicit line.
+ * <p>Covers: {@code index(String)} never resolving (its pre-existing, unconditional contract), {@code
+ * indexOrResolved(String)}/{@code indexOrResolved(Index)} resolving on a miss, and (the part that's easy to
+ * get wrong) that the resolver survives every mechanism a new {@link Metadata} instance gets produced from
+ * an existing one on the same node: {@link Metadata.Builder#Builder(Metadata)} and {@link
+ * Metadata#diff(Metadata)}'s {@link Diff#apply}. Neither of those two paths carries the field for free --
+ * see the resolver field's own javadoc on {@code Metadata} for why each needed an explicit line.
  */
 public class IndexMetadataResolverPropagationTests extends OpenSearchTestCase {
 
     private static final IndexMetadataResolver ALWAYS_SYNTHESIZE = (metadata, name) -> index(name);
 
-    public void testResolverIsConsultedOnlyOnAMiss() {
+    public void testPlainIndexNeverConsultsTheResolverEvenWhenOneIsAttached() {
+        // The whole point of the mid-session correction: index(String) must behave identically whether or
+        // not a resolver is attached, so every one of its many existing callers -- most never audited for
+        // reliance on its null-ness as a signal -- is completely unaffected by this feature existing.
         Metadata metadata = Metadata.builder().put(index("real"), false).build();
         metadata.attachIndexMetadataResolver(ALWAYS_SYNTHESIZE);
 
-        assertNotNull("a real entry must resolve without ever reaching the resolver", metadata.index("real"));
-        assertNotNull("a miss must fall through to the resolver", metadata.index("synthesized"));
-        assertEquals("synthesized", metadata.index("synthesized").getIndex().getName());
+        assertNotNull("a real entry must still resolve", metadata.index("real"));
+        assertNull("a miss must stay a miss -- index(String) is not the resolver seam", metadata.index("synthesized"));
+    }
+
+    public void testIndexOrResolvedIsConsultedOnlyOnAMiss() {
+        Metadata metadata = Metadata.builder().put(index("real"), false).build();
+        metadata.attachIndexMetadataResolver(ALWAYS_SYNTHESIZE);
+
+        assertNotNull("a real entry must resolve without ever reaching the resolver", metadata.indexOrResolved("real"));
+        assertNotNull("a miss must fall through to the resolver", metadata.indexOrResolved("synthesized"));
+        assertEquals("synthesized", metadata.indexOrResolved("synthesized").getIndex().getName());
+    }
+
+    public void testIndexOrResolvedByIndexChecksTheUuid() {
+        Metadata metadata = Metadata.builder().build();
+        metadata.attachIndexMetadataResolver(ALWAYS_SYNTHESIZE);
+        IndexMetadata synthesized = index("gated");
+
+        assertNotNull(metadata.indexOrResolved(synthesized.getIndex()));
+        assertNull(
+            "a stale uuid for the same name must not resolve -- that would serve a deleted index's successor",
+            metadata.indexOrResolved(new Index("gated", "some-other-uuid"))
+        );
     }
 
     public void testNoResolverAttachedMeansUnchangedBehavior() {
         Metadata metadata = Metadata.builder().put(index("real"), false).build();
 
-        assertNull("with nothing attached, a miss must still just be null, exactly as before this phase", metadata.index("missing"));
+        assertNull(
+            "with nothing attached, a miss must still just be null, exactly as before this phase",
+            metadata.indexOrResolved("missing")
+        );
     }
 
     public void testResolverPropagatesThroughBuilderMutation() {
@@ -50,7 +79,7 @@ public class IndexMetadataResolverPropagationTests extends OpenSearchTestCase {
         Metadata after = Metadata.builder(before).put(IndexMetadata.builder(before.index("real")).numberOfReplicas(2)).build();
 
         assertSame(ALWAYS_SYNTHESIZE, after.indexMetadataResolver());
-        assertNotNull("the mutated copy must still resolve a miss", after.index("still-a-miss"));
+        assertNotNull("the mutated copy must still resolve a miss", after.indexOrResolved("still-a-miss"));
     }
 
     public void testResolverPropagatesThroughDiffApply() {
@@ -70,12 +99,12 @@ public class IndexMetadataResolverPropagationTests extends OpenSearchTestCase {
             ALWAYS_SYNTHESIZE,
             applied.indexMetadataResolver()
         );
-        assertNotNull(applied.index("still-a-miss-after-diff"));
+        assertNotNull(applied.indexOrResolved("still-a-miss-after-diff"));
     }
 
     public void testResolverIsNotConsultedOnAnUnsafeThread() throws InterruptedException {
         // See ClusterStateMutationThreadsTests for the thread-name matching itself; this is the
-        // consumer-side guarantee IndexMetadataResolver's own javadoc documents: Metadata#index(String)
+        // consumer-side guarantee IndexMetadataResolver's own javadoc documents: indexOrResolved(String)
         // must never call resolve() from one of these threads, since a resolver may do real work to answer.
         Metadata metadata = Metadata.builder().put(index("real"), false).build();
         metadata.attachIndexMetadataResolver(ALWAYS_SYNTHESIZE);
@@ -85,7 +114,7 @@ public class IndexMetadataResolverPropagationTests extends OpenSearchTestCase {
         Thread clusterApplierThread = new Thread(
             () -> {
                 try {
-                    result.set(metadata.index("synthesized"));
+                    result.set(metadata.indexOrResolved("synthesized"));
                 } catch (Throwable t) {
                     failure.set(t);
                 }

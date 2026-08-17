@@ -15,27 +15,37 @@ import org.opensearch.common.annotation.ExperimentalApi;
  * Phase C of {@code core-pluggability-refactor-plan.md}: a plugin-supplied fallback for resolving an
  * index's {@link IndexMetadata} when it has no entry in {@link Metadata}'s own index map.
  *
- * <p>Consulted from exactly one place -- {@link Metadata#index(String)} -- on a lookup miss, so every
- * other core caller of {@code metadata.index(name)} (there were roughly twenty of them scattered across
- * {@code OperationRouting}, {@code IndexNameExpressionResolver}, the action layer, and more, before this
- * seam existed) needs no changes at all to correctly resolve an index a plugin manages the metadata for
- * outside cluster state. Before this interface existed, each of those call sites had to remember to call
- * a static registry (previously {@code AbsentIndexDescriptorSuppliers}) instead of the plain accessor --
- * this interface exists specifically to remove that "every caller has to know a second path exists"
- * failure mode, by moving the fallback into the one place every caller already goes through.
+ * <p><b>Consulted from {@link Metadata#indexOrResolved(String)}, a separate, explicitly-named method --
+ * not from {@link Metadata#index(String)} itself.</b> This is a correction made mid-session after an
+ * earlier version of this design, which folded resolver consultation directly into {@code index(String)}
+ * for every caller, caused a real, {@code internalClusterTest}-confirmed regression: {@code
+ * MetadataDeleteIndexService#deleteIndices} relies on {@code index(String)}'s null-ness as a
+ * <em>distinguishing signal</em> ("is this index gated, and does it need the durable tombstone-write path")
+ * rather than a plain existence check, and auto-resolving broke that distinction silently. See {@code
+ * core-pluggability-refactor-plan.md}'s C5 status-log entry for the full failure evidence.
+ *
+ * <p>The practical effect: a caller that wants the fallback (this plan's Phase C4a candidate call sites,
+ * migrating off the pre-existing static registry, previously {@code AbsentIndexDescriptorSuppliers}) must
+ * call {@code indexOrResolved(String)} by name instead of the plain accessor. This is one extra word at
+ * each of those call sites, in exchange for leaving every other caller of {@code index(String)} -- which is
+ * nearly every read path in the codebase, the overwhelming majority never audited for the
+ * distinguishing-signal pattern -- completely untouched, with no risk and no auditing required. A resolver
+ * implementation itself does not need to know or care about this distinction; it only ever sees calls that
+ * already want the fallback.
  *
  * <p>Registered via {@link org.opensearch.plugins.ClusterPlugin#getIndexMetadataResolver()}. Absent by
  * default, so an ordinary cluster with no such plugin installed resolves exactly as it always has --
- * {@link Metadata#index(String)} returns {@code null} for a genuinely nonexistent index either way.
+ * {@link Metadata#indexOrResolved(String)} returns {@code null} for a genuinely nonexistent index either
+ * way, same as {@link Metadata#index(String)} always has and still does.
  *
- * <p><b>Never invoked on a cluster-state-mutation thread, by construction.</b> {@link Metadata#index(String)}
- * checks {@link org.opensearch.cluster.ClusterStateMutationThreads#blockingIsUnsafeOnCurrentThread()} before
- * consulting a resolver at all -- see that class's own javadoc for the deadlock this exists to prevent. This
- * means a {@code resolve} implementation does <em>not</em> need to detect or guard against being called from
- * one of those threads itself; core already guarantees it will not be. It is, however, still on the hook for
- * every other caller of {@link Metadata#index(String)} -- which is nearly every read path in the codebase --
- * so {@code resolve} must still answer quickly (e.g. from a resolver-owned local cache) rather than perform
- * unbounded blocking I/O on an arbitrary request thread.
+ * <p><b>Never invoked on a cluster-state-mutation thread, by construction.</b> {@link
+ * Metadata#indexOrResolved(String)} checks {@link
+ * org.opensearch.cluster.ClusterStateMutationThreads#blockingIsUnsafeOnCurrentThread()} before consulting a
+ * resolver at all -- see that class's own javadoc for the deadlock this exists to prevent. This means a
+ * {@code resolve} implementation does <em>not</em> need to detect or guard against being called from one of
+ * those threads itself; core already guarantees it will not be. It is, however, still on the hook for every
+ * other caller of {@code indexOrResolved(String)}, so {@code resolve} must still answer quickly (e.g. from a
+ * resolver-owned local cache) rather than perform unbounded blocking I/O on an arbitrary request thread.
  *
  * @opensearch.experimental
  */
@@ -52,7 +62,7 @@ public interface IndexMetadataResolver {
      * @param indexName the index name that had no entry.
      * @return the resolved {@link IndexMetadata}, or {@code null} if this resolver has no answer either --
      *         which callers must treat identically to "the index does not exist," the same as any other
-     *         {@code Metadata#index(String)} miss.
+     *         {@code Metadata#indexOrResolved(String)} miss.
      */
     @Nullable
     IndexMetadata resolve(Metadata metadata, String indexName);

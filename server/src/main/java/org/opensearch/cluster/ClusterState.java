@@ -289,9 +289,11 @@ public class ClusterState implements ToXContentFragment, Diffable<ClusterState> 
      * <p>This -- not {@code RoutingTable#index(String)} itself -- is the seam: real routing resolution
      * needs the index's {@link org.opensearch.cluster.metadata.IndexMetadata} (at minimum its shard
      * count), which a bare {@link RoutingTable} does not hold but a {@link ClusterState} does, via {@link
-     * #metadata()} -- which, since Phase C2, already resolves a gated/deferred index's metadata on its
-     * own miss. So this single method composes both resolvers correctly for any caller with a {@code
-     * ClusterState} in hand, which is nearly every core caller today ({@code OperationRouting},
+     * #metadata()}. Since this method is itself an explicit "please resolve" call (unlike a bare {@code
+     * routingTable().index(name)}), it deliberately calls {@link Metadata#indexOrResolved(String)} rather
+     * than the plain {@link Metadata#index(String)} -- see that method's own javadoc for why the two are
+     * not interchangeable. So this single method composes both resolvers correctly for any caller with a
+     * {@code ClusterState} in hand, which is nearly every core caller today ({@code OperationRouting},
      * {@code IndexNameExpressionResolver}, the action layer) -- see
      * {@code core-pluggability-refactor-plan.md} Phase C4 for the caller migration this enables.
      *
@@ -309,12 +311,12 @@ public class ClusterState implements ToXContentFragment, Diffable<ClusterState> 
         if (resolver == null) {
             return null;
         }
-        // See ClusterStateMutationThreads' own javadoc for why: independent of metadata.index(indexName)'s
+        // See ClusterStateMutationThreads' own javadoc for why: independent of indexOrResolved(indexName)'s
         // own identical guard below, since a resolver that answers may still do real (e.g. remote) work.
         if (ClusterStateMutationThreads.blockingIsUnsafeOnCurrentThread()) {
             return null;
         }
-        IndexMetadata indexMetadata = metadata.index(indexName);
+        IndexMetadata indexMetadata = metadata.indexOrResolved(indexName);
         if (indexMetadata == null) {
             return null;
         }
