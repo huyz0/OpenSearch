@@ -32,6 +32,7 @@
 
 package org.opensearch.plugins;
 
+import org.opensearch.cluster.metadata.IndexCreationStrategy;
 import org.opensearch.cluster.metadata.IndexMetadataResolver;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.node.DiscoveryNode;
@@ -118,6 +119,21 @@ public interface ClusterPlugin {
      * @opensearch.experimental
      */
     default Optional<IndexRoutingResolver> getIndexRoutingResolver() {
+        return Optional.empty();
+    }
+
+    /**
+     * Phase D1 of {@code core-pluggability-refactor-plan.md}: a plugin-owned strategy that can take over
+     * index creation and deletion entirely for the indices it claims -- see {@link
+     * org.opensearch.cluster.metadata.IndexCreationStrategy}'s own javadoc. Empty by default, so a node
+     * without this plugin creates and deletes indices exactly as it always has.
+     *
+     * <p><b>Definition only, not yet consulted anywhere</b> -- see {@code IndexCreationStrategy}'s javadoc
+     * for why Phase D2's call-site migration is deliberately separate from this registration point.
+     *
+     * @opensearch.experimental
+     */
+    default Optional<IndexCreationStrategy> getIndexCreationStrategy() {
         return Optional.empty();
     }
 
