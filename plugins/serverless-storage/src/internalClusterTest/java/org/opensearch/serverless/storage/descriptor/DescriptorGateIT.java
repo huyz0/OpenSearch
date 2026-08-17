@@ -10,7 +10,6 @@ package org.opensearch.serverless.storage.descriptor;
 
 import org.opensearch.Version;
 import org.opensearch.action.support.IndicesOptions;
-import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.IndexDescriptor;
@@ -50,7 +49,7 @@ public class DescriptorGateIT extends org.opensearch.serverless.storage.Serverle
         BlobDescriptorBackend store = installBlobBackedDescriptorPlane().points();
         store.create(descriptor("gated-logs"));
 
-        ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
+        ClusterState empty = emptyClusterStateWithDescriptorResolver();
         var resolved = resolver().concreteIndices(empty, IndicesOptions.strictExpandOpen(), "gated-logs");
 
         assertEquals("a gated index must be nameable by a request", 1, resolved.length);
@@ -68,7 +67,7 @@ public class DescriptorGateIT extends org.opensearch.serverless.storage.Serverle
         store.create(descriptor("gated-logs"));
         // Deliberately not installed.
 
-        ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
+        ClusterState empty = emptyClusterStateWithDescriptorResolver();
         expectThrows(
             IndexNotFoundException.class,
             () -> resolver().concreteIndexNames(empty, IndicesOptions.strictExpandOpen(), "gated-logs")
@@ -79,7 +78,7 @@ public class DescriptorGateIT extends org.opensearch.serverless.storage.Serverle
     public void testAMissingNameStillRaises() throws Exception {
         installBlobBackedDescriptorPlane();
 
-        ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
+        ClusterState empty = emptyClusterStateWithDescriptorResolver();
         expectThrows(
             IndexNotFoundException.class,
             () -> resolver().concreteIndexNames(empty, IndicesOptions.strictExpandOpen(), "never-existed")

@@ -162,13 +162,19 @@ public class MetadataUpdateSettingsService {
         // Close and open are deliberately not refused alongside it. Those are expressible -- IndexDescriptor
         // carries State, and their gated paths really do write descriptor.withState(...) -- which is the
         // difference between an operation that is unsupported and one that merely has no cluster state entry.
-        final java.util.List<Index> gated = AbsentIndexDescriptorSuppliers.gatedAmong(clusterService.state().metadata(), request.indices());
+        // Phase C4b of core-pluggability-refactor-plan.md: clusterService.state().metadata().gatedAmong(...)
+        // replaces AbsentIndexDescriptorSuppliers.gatedAmong(...) here -- same predicate, discovered through
+        // the resolver attached to this state's own metadata.
+        final java.util.List<Index> gated = clusterService.state().metadata().gatedAmong(request.indices());
         if (gated.isEmpty() == false) {
             // The index must still exist, and saying so first matters: an operator who mistyped a name needs
             // "no such index", not "unsupported", or they will go looking for a feature gap instead of a typo.
+            //
+            // Phase C4b: clusterService.state().metadata().existsOrResolved(...) replaces
+            // AbsentIndexDescriptorSuppliers.supply(...) + a manual null/exists() check -- this call only
+            // ever needed the collapsed "does it resolve" answer, never the raw descriptor's other fields.
             for (Index index : gated) {
-                IndexDescriptor descriptor = AbsentIndexDescriptorSuppliers.supply(index.getName());
-                if (descriptor == null || descriptor.exists() == false) {
+                if (clusterService.state().metadata().existsOrResolved(index.getName()) == false) {
                     listener.onFailure(new IndexNotFoundException(index.getName()));
                     return;
                 }

@@ -908,6 +908,45 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
     }
 
     /**
+     * Phase C4b of {@code core-pluggability-refactor-plan.md}: whether a name resolves to something that
+     * exists, consulting the published lookup first and an attached {@link IndexMetadataResolver} only on a
+     * miss -- replacing the pre-existing static registry, {@code AbsentIndexDescriptorSuppliers#exists}.
+     *
+     * <p>Deliberately composed from {@link #indexOrResolved(String)} rather than a bespoke check: {@code
+     * AbsentIndexDescriptorSuppliers#exists}'s own body already collapses "no answer" and "a tombstoned
+     * descriptor" into the same false, exactly what {@code indexOrResolved} already does by construction
+     * (its own resolver chain returns null for both). A caller that needs to tell those two apart, or that
+     * needs the underlying descriptor's own fields (uuid, state, aliases), cannot use this method -- that is
+     * a real, narrower set of call sites this phase deliberately left on the static registry, since {@link
+     * IndexMetadataResolver} correctly does not expose plugin-specific descriptor vocabulary.
+     */
+    public boolean existsOrResolved(String indexName) {
+        return getIndicesLookup().containsKey(indexName) || indexOrResolved(indexName) != null;
+    }
+
+    /**
+     * Phase C4b of {@code core-pluggability-refactor-plan.md}: the names among {@code indices} that are
+     * gated, meaning this {@link Metadata} has no entry and an attached {@link IndexMetadataResolver} does
+     * -- replacing the pre-existing static registry, {@code AbsentIndexDescriptorSuppliers#gatedAmong}.
+     *
+     * <p>For the operations that cannot be expressed on a resolved index at all, so they can refuse clearly
+     * instead of failing on {@link #getIndexSafe} with "no such index" -- see that static registry's own
+     * javadoc for the full reasoning, unchanged here, only the discovery path is new.
+     */
+    public List<Index> gatedAmong(Index[] indices) {
+        if (indices == null) {
+            return List.of();
+        }
+        List<Index> gated = new ArrayList<>();
+        for (Index index : indices) {
+            if (index(index) == null && indexOrResolved(index) != null) {
+                gated.add(index);
+            }
+        }
+        return gated;
+    }
+
+    /**
      * Attaches the per-node fallback {@link #indexOrResolved(String)} consults on a miss. See {@link
      * #resolver}'s own javadoc for why this is a mutable setter rather than a constructor parameter, and for
      * what still has to call it before this has any effect.

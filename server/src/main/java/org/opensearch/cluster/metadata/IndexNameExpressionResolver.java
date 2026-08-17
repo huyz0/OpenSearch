@@ -364,6 +364,10 @@ public class IndexNameExpressionResolver {
                 // which carries the uuid the concrete Index needs. Consulted only on a miss, so a name
                 // present in the lookup never reaches the seam and no cluster that has not opted in pays
                 // a lookup it did not pay before.
+                //
+                // Deliberately still AbsentIndexDescriptorSuppliers directly, not migrated in Phase C4b of
+                // core-pluggability-refactor-plan.md: this reads descriptor.uuid()/state() directly below,
+                // which IndexMetadataResolver's generic contract deliberately does not expose.
                 IndexDescriptor descriptor = AbsentIndexDescriptorSuppliers.supply(expression);
                 if (descriptor != null && descriptor.exists()) {
                     // The same rule shouldTrackConcreteIndex applies to a published index, applied here
@@ -629,7 +633,10 @@ public class IndexNameExpressionResolver {
         // was told a gated index does not exist and auto-created an ordinary one over the top of it. S49
         // and S50 measured the consequence: gating did not survive a first write, and every end-to-end
         // result claimed before then was served by indices that were no longer gated.
-        return AbsentIndexDescriptorSuppliers.exists(state.metadata(), resolvedAliasOrIndex);
+        // Phase C4b of core-pluggability-refactor-plan.md: state.metadata().existsOrResolved(...) replaces
+        // AbsentIndexDescriptorSuppliers.exists(...) here -- same collapsed exists-or-tombstoned semantics,
+        // discovered through the resolver attached to this state's own metadata.
+        return state.metadata().existsOrResolved(resolvedAliasOrIndex);
     }
 
     /**
@@ -1278,7 +1285,10 @@ public class IndexNameExpressionResolver {
                 // Area H: an index whose metadata is not in cluster state answers from the descriptor
                 // instead. The order matters and is asserted: a name present in the lookup never reaches
                 // the seam, so no cluster that has not opted in pays a lookup it did not pay before.
-                return AbsentIndexDescriptorSuppliers.exists(metadata, expression);
+                // Phase C4b of core-pluggability-refactor-plan.md: metadata.existsOrResolved(...) replaces
+                // AbsentIndexDescriptorSuppliers.exists(...) here -- same collapsed exists-or-tombstoned
+                // semantics, discovered through the resolver attached to this metadata.
+                return metadata.existsOrResolved(expression);
             }
 
             // treat aliases as unavailable indices when ignoreAliases is set to true (e.g. delete index and update aliases api)

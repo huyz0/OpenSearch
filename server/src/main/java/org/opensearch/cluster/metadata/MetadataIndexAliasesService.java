@@ -163,6 +163,10 @@ public class MetadataIndexAliasesService {
                 }
                 IndexMetadata index = metadata.get(action.getIndex());
                 if (index == null) {
+                    // Deliberately still AbsentIndexDescriptorSuppliers directly, not migrated in Phase C4b
+                    // of core-pluggability-refactor-plan.md: this reads gated.aliases() below, a
+                    // plugin-specific field IndexMetadataResolver's generic IndexMetadata contract does not
+                    // carry.
                     IndexDescriptor gated = AbsentIndexDescriptorSuppliers.supply(action.getIndex());
                     if (gated != null && gated.exists()) {
                         List<String> currentAliases = new ArrayList<>(gated.aliases());

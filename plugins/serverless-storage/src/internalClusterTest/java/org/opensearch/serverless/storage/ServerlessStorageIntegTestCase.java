@@ -251,4 +251,27 @@ public abstract class ServerlessStorageIntegTestCase extends OpenSearchIntegTest
             cacheBytes
         );
     }
+
+    /**
+     * A bare, hand-built {@link org.opensearch.cluster.ClusterState}, carrying the same
+     * {@code SupplierBackedIndexMetadataResolver} bridge a real cluster's {@code ResolverAttachingClusterStateApplier}
+     * (wired in {@code Node.java}) attaches to every applied state.
+     *
+     * <p>Several tests in this suite build their own {@code ClusterState} directly, deliberately bypassing a
+     * real cluster round-trip to test {@code IndexNameExpressionResolver}'s resolution logic in isolation.
+     * Before Phase C4b of {@code core-pluggability-refactor-plan.md}, that was harmless: resolution asked
+     * the static {@code AbsentIndexDescriptorSuppliers} registry directly, which does not care which {@code
+     * ClusterState}/{@code Metadata} instance is in hand. Once {@code IndexNameExpressionResolver} was
+     * migrated to ask {@code Metadata#indexOrResolved}/{@code #existsOrResolved} instead, that stopped being
+     * true -- the resolver lives on the specific {@code Metadata} instance, and a hand-built one has none
+     * attached (real cluster tests here found this: {@code DescriptorGateIT}/{@code DescriptorLifecycleIT}/
+     * {@code GatedWildcardVisibilityIT} all failed with a spurious {@code IndexNotFoundException} until this
+     * helper existed). Use this in place of {@code ClusterState.builder(ClusterName.DEFAULT).build()}
+     * wherever a test needs a bare state that still resolves gated names correctly.
+     */
+    protected static org.opensearch.cluster.ClusterState emptyClusterStateWithDescriptorResolver() {
+        org.opensearch.cluster.metadata.Metadata metadata = org.opensearch.cluster.metadata.Metadata.builder().build();
+        metadata.attachIndexMetadataResolver(new org.opensearch.cluster.metadata.SupplierBackedIndexMetadataResolver());
+        return org.opensearch.cluster.ClusterState.builder(org.opensearch.cluster.ClusterName.DEFAULT).metadata(metadata).build();
+    }
 }

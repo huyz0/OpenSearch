@@ -192,6 +192,10 @@ public class DanglingIndicesState implements ClusterStateListener {
         if (graveyard.containsIndex(index)) {
             return true;
         }
+        // Deliberately still AbsentIndexDescriptorSuppliers directly, not migrated in Phase C4b of
+        // core-pluggability-refactor-plan.md: this reads descriptor.uuid() below and needs the three-way
+        // null/tombstoned/live distinction, which IndexMetadataResolver's generic, collapsed contract
+        // deliberately does not expose.
         IndexDescriptor descriptor = AbsentIndexDescriptorSuppliers.supply(index.getName());
         return descriptor != null && descriptor.uuid().equals(index.getUUID()) && descriptor.exists() == false;
     }

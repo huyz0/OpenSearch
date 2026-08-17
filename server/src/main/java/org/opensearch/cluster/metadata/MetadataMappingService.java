@@ -369,6 +369,10 @@ public class MetadataMappingService {
          * genuine deletion looks like here: {@code BlobDescriptorBackend#get} answers a tombstoned name with
          * the tombstone record, not null, so this only ever refuses on an answer that actually says so.
          */
+        // Deliberately still AbsentIndexDescriptorSuppliers directly, not migrated in Phase C4b of
+        // core-pluggability-refactor-plan.md: this needs the raw IndexDescriptor's own uuid() and the
+        // three-way null/tombstoned/live distinction, which IndexMetadataResolver's generic, collapsed
+        // "null means absent" contract deliberately does not expose (see that interface's own javadoc).
         private void refuseIfDescriptorShowsTheIndexIsGone(Index index) {
             if (AbsentIndexDescriptorSuppliers.isRegistered() == false) {
                 return;

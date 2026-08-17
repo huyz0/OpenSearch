@@ -67,7 +67,15 @@ public class GatedIndexResolutionGapTests extends OpenSearchTestCase {
         );
 
         // The seam answers, which is the premise: the descriptor is available and says the index exists.
-        ClusterState emptyState = ClusterState.builder(ClusterName.DEFAULT).build();
+        //
+        // A real (non-EMPTY_METADATA) instance, not the builder's default -- attachIndexMetadataResolver is
+        // deliberately a no-op on the shared EMPTY_METADATA singleton (see its own javadoc), so resolving
+        // via the new SPI (Phase C4b of core-pluggability-refactor-plan.md, which
+        // IndexNameExpressionResolver#aliasOrIndexExists now goes through) needs an explicit one here, same
+        // as production code gets from a real cluster state.
+        Metadata metadata = Metadata.builder().build();
+        metadata.attachIndexMetadataResolver(new SupplierBackedIndexMetadataResolver());
+        ClusterState emptyState = ClusterState.builder(ClusterName.DEFAULT).metadata(metadata).build();
         assertTrue(
             "the premise: the descriptor seam resolves this name",
             AbsentIndexDescriptorSuppliers.exists(emptyState.metadata(), "gated-idx")

@@ -10,7 +10,6 @@ package org.opensearch.serverless.storage.descriptor;
 
 import org.opensearch.Version;
 import org.opensearch.action.support.IndicesOptions;
-import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexDescriptor;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
@@ -78,7 +77,7 @@ public class GatedWildcardVisibilityIT extends org.opensearch.serverless.storage
     public void testAnExactGatedNameResolves() throws Exception {
         installWithTenants();
 
-        ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
+        ClusterState empty = emptyClusterStateWithDescriptorResolver();
         String[] resolved = resolver().concreteIndexNames(empty, IndicesOptions.strictExpandOpen(), tenant(0));
 
         assertEquals("the premise: the gate resolves an exact name", 1, resolved.length);
@@ -94,7 +93,7 @@ public class GatedWildcardVisibilityIT extends org.opensearch.serverless.storage
     public void testAPrefixWildcardOverGatedTenants() throws Exception {
         installWithTenants();
 
-        ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
+        ClusterState empty = emptyClusterStateWithDescriptorResolver();
         String[] resolved = report("serverless_tenant-*", empty, IndicesOptions.lenientExpandOpen());
 
         assertEquals(
@@ -123,7 +122,7 @@ public class GatedWildcardVisibilityIT extends org.opensearch.serverless.storage
     public void testMatchAllDeliberatelyDoesNotExpandOverGatedTenants() throws Exception {
         installWithTenants();
 
-        ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
+        ClusterState empty = emptyClusterStateWithDescriptorResolver();
         String[] resolved = report("*", empty, IndicesOptions.lenientExpandOpen());
 
         assertEquals("match-all means everything in cluster state, and a gated index is not in it", 0, resolved.length);
@@ -140,7 +139,7 @@ public class GatedWildcardVisibilityIT extends org.opensearch.serverless.storage
     public void testWhetherTheMissIsReportedAtAll() throws Exception {
         installWithTenants();
 
-        ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
+        ClusterState empty = emptyClusterStateWithDescriptorResolver();
         IndicesOptions strict = IndicesOptions.fromOptions(false, false, true, false);
 
         String outcome;
@@ -170,7 +169,7 @@ public class GatedWildcardVisibilityIT extends org.opensearch.serverless.storage
     public void testALeadingWildcardIsRefusedRatherThanAnswered() throws Exception {
         installWithTenants();
 
-        ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
+        ClusterState empty = emptyClusterStateWithDescriptorResolver();
         UnsupportedWildcardException refused = expectThrows(
             UnsupportedWildcardException.class,
             () -> resolver().concreteIndexNames(empty, IndicesOptions.lenientExpandOpen(), "*-003")
@@ -185,7 +184,7 @@ public class GatedWildcardVisibilityIT extends org.opensearch.serverless.storage
     public void testAnEmbeddedWildcardIsRefused() throws Exception {
         installWithTenants();
 
-        ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
+        ClusterState empty = emptyClusterStateWithDescriptorResolver();
         expectThrows(
             UnsupportedWildcardException.class,
             () -> resolver().concreteIndexNames(empty, IndicesOptions.lenientExpandOpen(), "tenant*003")
@@ -203,7 +202,7 @@ public class GatedWildcardVisibilityIT extends org.opensearch.serverless.storage
         installWithTenants();
         DescriptorGate.setWildcardExpansionLimit(TENANTS - 1);
 
-        ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
+        ClusterState empty = emptyClusterStateWithDescriptorResolver();
         UnsupportedWildcardException refused = expectThrows(
             UnsupportedWildcardException.class,
             () -> resolver().concreteIndexNames(empty, IndicesOptions.lenientExpandOpen(), "serverless_tenant-*")
@@ -220,7 +219,7 @@ public class GatedWildcardVisibilityIT extends org.opensearch.serverless.storage
         installWithTenants();
         DescriptorGate.setWildcardExpansionLimit(TENANTS);
 
-        ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
+        ClusterState empty = emptyClusterStateWithDescriptorResolver();
         String[] resolved = resolver().concreteIndexNames(empty, IndicesOptions.lenientExpandOpen(), "serverless_tenant-*");
 
         assertEquals("a pattern matching exactly the cap is within it", TENANTS, resolved.length);
@@ -236,7 +235,7 @@ public class GatedWildcardVisibilityIT extends org.opensearch.serverless.storage
         installWithTenants();
         DescriptorGate.setWildcardExpansionLimit(0);
 
-        ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
+        ClusterState empty = emptyClusterStateWithDescriptorResolver();
         expectThrows(
             UnsupportedWildcardException.class,
             () -> resolver().concreteIndexNames(empty, IndicesOptions.lenientExpandOpen(), "serverless_tenant-*")
@@ -247,7 +246,7 @@ public class GatedWildcardVisibilityIT extends org.opensearch.serverless.storage
     public void testAPrefixMatchingNoGatedIndexIsEmptyRatherThanRefused() throws Exception {
         installWithTenants();
 
-        ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
+        ClusterState empty = emptyClusterStateWithDescriptorResolver();
         String[] resolved = resolver().concreteIndexNames(empty, IndicesOptions.lenientExpandOpen(), "nosuchprefix-*");
 
         assertEquals("matching nothing is a real answer, and differs from being unable to answer", 0, resolved.length);
@@ -263,7 +262,7 @@ public class GatedWildcardVisibilityIT extends org.opensearch.serverless.storage
         BlobDescriptorBackend store = installWithTenants();
         store.put(descriptorWithState(tenant(0), IndexDescriptor.State.DELETED));
 
-        ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
+        ClusterState empty = emptyClusterStateWithDescriptorResolver();
         String[] resolved = resolver().concreteIndexNames(empty, IndicesOptions.lenientExpandOpen(), "serverless_tenant-*");
 
         assertEquals("a deleted index must not match", TENANTS - 1, resolved.length);
@@ -338,7 +337,7 @@ public class GatedWildcardVisibilityIT extends org.opensearch.serverless.storage
         // to carry its uuid, or the request cannot reach the shard. Those reads are the feature. The one
         // this is about is the extra lookup of the pattern itself, and only a zero-match prefix leaves it
         // alone in the count.
-        ClusterState empty = ClusterState.builder(ClusterName.DEFAULT).build();
+        ClusterState empty = emptyClusterStateWithDescriptorResolver();
         long before = store.readCount();
         resolver().concreteIndexNames(empty, IndicesOptions.lenientExpandOpen(), "nosuchprefix-*");
         long reads = store.readCount() - before;

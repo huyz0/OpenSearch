@@ -9,7 +9,6 @@
 package org.opensearch.serverless.storage.descriptor;
 
 import org.opensearch.action.support.IndicesOptions;
-import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexDescriptor;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
@@ -78,7 +77,7 @@ public class DescriptorLifecycleIT extends org.opensearch.serverless.storage.Ser
 
         // 2. Nameable. H8a wired the resolver and until W3 nothing supplied it, so this raised
         // IndexNotFoundException on every node.
-        ClusterState stateWithoutIt = ClusterState.builder(ClusterName.DEFAULT).build();
+        ClusterState stateWithoutIt = emptyClusterStateWithDescriptorResolver();
         var resolved = new IndexNameExpressionResolver(new ThreadContext(Settings.EMPTY)).concreteIndices(
             stateWithoutIt,
             IndicesOptions.strictExpandOpen(),

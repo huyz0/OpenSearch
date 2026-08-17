@@ -183,7 +183,10 @@ public class MetadataIndexStateService {
         //
         // Resolved on this thread, which is the transport thread that received the request: the seam refuses
         // to answer on the cluster state thread, so checking inside the update task would learn nothing.
-        final List<Index> gated = AbsentIndexDescriptorSuppliers.gatedAmong(clusterService.state().metadata(), request.indices());
+        // Phase C4b of core-pluggability-refactor-plan.md: clusterService.state().metadata().gatedAmong(...)
+        // replaces AbsentIndexDescriptorSuppliers.gatedAmong(...) here -- same predicate, discovered through
+        // the resolver attached to this state's own metadata.
+        final List<Index> gated = clusterService.state().metadata().gatedAmong(request.indices());
         if (gated.isEmpty() == false) {
             if (gated.size() > 50) {
                 listener.onFailure(
@@ -965,7 +968,10 @@ public class MetadataIndexStateService {
     ) {
         // Same refusal as closeIndices, and reachable by the same route: an operator opening a name that
         // resolves through a descriptor rather than through cluster state.
-        final List<Index> gatedToOpen = AbsentIndexDescriptorSuppliers.gatedAmong(clusterService.state().metadata(), request.indices());
+        // Phase C4b of core-pluggability-refactor-plan.md: clusterService.state().metadata().gatedAmong(...)
+        // replaces AbsentIndexDescriptorSuppliers.gatedAmong(...) here -- same predicate, discovered through
+        // the resolver attached to this state's own metadata.
+        final List<Index> gatedToOpen = clusterService.state().metadata().gatedAmong(request.indices());
         if (gatedToOpen.isEmpty() == false) {
             if (gatedToOpen.size() > 50) {
                 listener.onFailure(
@@ -1234,6 +1240,10 @@ public class MetadataIndexStateService {
         threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
             try {
                 for (Index index : gatedIndices) {
+                    // Deliberately still AbsentIndexDescriptorSuppliers directly, not migrated in Phase C4b
+                    // of core-pluggability-refactor-plan.md: this republishes descriptor.withState(...)
+                    // below, which needs the concrete IndexDescriptor IndexMetadataResolver's generic
+                    // IndexMetadata contract does not carry.
                     IndexDescriptor descriptor = AbsentIndexDescriptorSuppliers.supply(index.getName());
                     if (descriptor == null || descriptor.exists() == false) {
                         throw new IndexNotFoundException(index.getName());
@@ -1255,6 +1265,9 @@ public class MetadataIndexStateService {
         threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
             try {
                 for (Index index : gatedIndices) {
+                    // Same reason as closeGatedIndices' identical shape: republishes descriptor.withState(...)
+                    // below, so it needs the concrete IndexDescriptor, deliberately left on
+                    // AbsentIndexDescriptorSuppliers directly (Phase C4b of core-pluggability-refactor-plan.md).
                     IndexDescriptor descriptor = AbsentIndexDescriptorSuppliers.supply(index.getName());
                     if (descriptor == null || descriptor.exists() == false) {
                         throw new IndexNotFoundException(index.getName());
