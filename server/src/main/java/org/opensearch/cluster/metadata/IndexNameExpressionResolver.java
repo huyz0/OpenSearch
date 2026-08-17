@@ -699,11 +699,15 @@ public class IndexNameExpressionResolver {
             // Site 14, found by T39 on the search half of the end-to-end path rather than by S52 on the
             // write half, and only reachable once an index stays gated through a write.
             //
-            // Answered here rather than through the descriptor seam, because the descriptor cannot make
-            // this answer wrong: T29 established that an index declaring any alias keeps its cluster state
-            // entry, since every alias operation is a cluster state update over metadata a gated index does
-            // not have. So a gated index has no aliases, and "no filtering required" is the complete
-            // answer rather than a degraded one.
+            // Answered here rather than through the descriptor seam -- correctly, but not for the reason
+            // this comment used to give. A gated index CAN hold aliases (see
+            // MetadataIndexAliasesService#applyAliasActions), so "a gated index has no aliases" was never
+            // actually true. What makes "no filtering required" the right answer regardless is narrower and
+            // enforced, not assumed: MetadataIndexAliasesService refuses (Phase A2 of
+            // core-pluggability-refactor-plan.md) any Add action against a gated index that carries a
+            // filter, a routing value, or a write-index flag, because IndexDescriptor#aliases has nowhere to
+            // record any of those. So every alias a gated index can possibly hold is unfiltered by
+            // construction, which is what this method actually needs to be true.
             if (AbsentIndexDescriptorSuppliers.isRegistered()) {
                 return null;
             }

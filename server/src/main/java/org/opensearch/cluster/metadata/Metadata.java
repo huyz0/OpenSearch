@@ -479,15 +479,24 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
         for (String index : concreteIndices) {
             IndexMetadataHolder indexMetadata = indices.get(index);
             if (indexMetadata == null) {
-                // A gated index, which resolves by name and has no entry in this map. Reporting no aliases
-                // is correct rather than merely safe: DescriptorRepresentable refuses to gate an index that
-                // has any alias at all -- T29 widened that from filtered aliases to every alias, because an
-                // alias operation is a cluster state update and a gated index cannot take one, so an alias
-                // could be set at creation and then never added, removed or repointed. A gated index
-                // therefore provably has none.
+                // A gated index, which resolves by name and has no entry in this map -- and can genuinely
+                // hold aliases: MetadataIndexAliasesService#applyAliasActions has a dedicated branch that
+                // adds/removes plain (name-only) aliases on a gated index via IndexDescriptorPublisher,
+                // entirely outside cluster state. Reporting none here (rather than resolving them through
+                // that same descriptor seam) is a completeness gap in responses like GET /index, tracked
+                // separately -- see core-pluggability-refactor-plan.md Phase C, which would give this
+                // method the same resolver seam Metadata#index(String) is meant to get.
                 //
-                // Without this the next line threw a NullPointerException, in production as well as under
-                // assertions, for GET /index on any gated name.
+                // It is NOT a filtering-safety gap: that same service now refuses (Phase A2) any Add action
+                // for a gated index that carries a filter, an indexRouting/searchRouting value, or a
+                // writeIndex flag, specifically because IndexDescriptor#aliases is a bare List<String> with
+                // nowhere to record any of those, and this method (and filteringAliases below) both used to
+                // assume "no aliases" rather than "no filtered aliases" -- which was true by coincidence,
+                // not by any check. Any alias a gated index holds today is provably unfiltered by
+                // construction, so skipping filter resolution here remains correct.
+                //
+                // Without this `continue` the next line threw a NullPointerException, in production as well
+                // as under assertions, for GET /index on any gated name.
                 continue;
             }
             List<AliasMetadata> filteredValues = new ArrayList<>();

@@ -167,6 +167,31 @@ public class MetadataIndexAliasesService {
                     if (gated != null && gated.exists()) {
                         List<String> currentAliases = new ArrayList<>(gated.aliases());
                         if (action instanceof AliasAction.Add addAction) {
+                            // Phase A2 of core-pluggability-refactor-plan.md. IndexDescriptor#aliases is a
+                            // plain List<String> -- it has nowhere to record a filter, a routing value, or
+                            // a write-index flag. Silently keeping only the name while an operator asked
+                            // for one of those too is exactly the "provably has none" invariant
+                            // Metadata#aliasesForConcreteIndex and IndexNameExpressionResolver#filteringAliases
+                            // both rely on, quietly turned false: a filtered alias would appear to succeed
+                            // here and then never be enforced there, which is a silent document-level-security
+                            // bypass, not a cosmetic gap. Refusing the action is strictly narrower than the
+                            // previous (buggy) behavior, so nothing that worked correctly before stops working.
+                            if (addAction.getFilter() != null
+                                || addAction.getIndexRouting() != null
+                                || addAction.getSearchRouting() != null
+                                || addAction.writeIndex() != null) {
+                                throw new IllegalArgumentException(
+                                    "alias ["
+                                        + addAction.getAlias()
+                                        + "] for index ["
+                                        + action.getIndex()
+                                        + "] cannot carry a filter, a routing value, or a write-index flag: "
+                                        + "this index type records only alias names, and silently dropping any "
+                                        + "of those would leave a filter that looks configured but is never "
+                                        + "enforced. A plain (name-only) alias is supported; add filtering or "
+                                        + "routing once this index type has somewhere to store them."
+                                );
+                            }
                             if (!currentAliases.contains(addAction.getAlias())) {
                                 currentAliases.add(addAction.getAlias());
                                 IndexDescriptorPublisher.updateGated(gated.withAliases(currentAliases));
