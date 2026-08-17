@@ -47,7 +47,6 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.ResolvedIndices;
-import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.PlainShardsIterator;
 import org.opensearch.cluster.routing.ShardsIterator;
@@ -147,7 +146,7 @@ public class TransportAnalyzeAction extends TransportSingleShardAction<AnalyzeAc
         // here. The empty iterator below remains correct for an index that genuinely has no shards, but
         // for a computed index it turned analyze into NoShardAvailableActionException against an index
         // whose shard was open and serving writes.
-        IndexRoutingTable indexRoutingTable = AbsentIndexRoutingSuppliers.resolve(state, request.concreteIndex());
+        IndexRoutingTable indexRoutingTable = state.getIndexRoutingTable(request.concreteIndex());
         if (indexRoutingTable == null) {
             // In metadata but not in routing, and nothing supplied one. An empty iterator makes this a
             // NoShardAvailableActionException, which is what the caller already handles; returning null

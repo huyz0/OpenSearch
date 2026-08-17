@@ -43,7 +43,6 @@ import org.opensearch.action.support.broadcast.BroadcastShardOperationFailedExce
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.ResolvedIndices;
-import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.service.ClusterService;
@@ -183,7 +182,7 @@ public abstract class TransportBroadcastReplicationAction<
             // thousand that had genuinely been written. It is dropped because it is redundant rather than
             // because it is inconvenient -- resolve already answers null for an index that is in neither
             // table, which is the case the metadata check was standing in for.
-            IndexRoutingTable indexRouting = AbsentIndexRoutingSuppliers.resolve(clusterState, index);
+            IndexRoutingTable indexRouting = clusterState.getIndexRoutingTable(index);
             if (indexRouting != null) {
                 for (IndexShardRoutingTable shardRouting : indexRouting.getShards().values()) {
                     shardIds.add(shardRouting.shardId());

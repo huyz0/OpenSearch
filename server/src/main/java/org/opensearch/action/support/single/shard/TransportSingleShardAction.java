@@ -47,7 +47,6 @@ import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.ResolvedIndices;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodes;
-import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.FailAwareWeightedRouting;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
@@ -219,8 +218,8 @@ public abstract class TransportSingleShardAction<Request extends SingleShardRequ
             }
 
             ShardsIterator shardIt = shards(clusterState, internalRequest);
-            if (shardIt == null && resolveIndex(request) && AbsentIndexRoutingSuppliers.isRegistered()) {
-                IndexRoutingTable indexRoutingTable = AbsentIndexRoutingSuppliers.resolve(clusterState, concreteSingleIndex);
+            if (shardIt == null && resolveIndex(request)) {
+                IndexRoutingTable indexRoutingTable = clusterState.getIndexRoutingTable(concreteSingleIndex);
                 if (indexRoutingTable != null) {
                     shardIt = indexRoutingTable.randomAllActiveShardsIt();
                 }
