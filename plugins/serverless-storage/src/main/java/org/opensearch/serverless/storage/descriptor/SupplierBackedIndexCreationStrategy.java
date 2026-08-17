@@ -6,7 +6,10 @@
  * compatible open source license.
  */
 
-package org.opensearch.cluster.metadata;
+package org.opensearch.serverless.storage.descriptor;
+
+import org.opensearch.cluster.metadata.IndexCreationStrategy;
+import org.opensearch.cluster.metadata.IndexMetadata;
 
 /**
  * Phase D2 of {@code core-pluggability-refactor-plan.md}: a generic {@link IndexCreationStrategy} adapter
@@ -17,7 +20,7 @@ package org.opensearch.cluster.metadata;
  *
  * <p><b>Behaviorally identical to the check every existing call site performs today</b> ({@code
  * DescriptorOnlyCreation.isRegistered() && DescriptorOnlyCreation.namesAServerlessIndex(name)}), not a new
- * decision -- migrating a call site from that direct check to {@link IndexCreationStrategyRegistry#claims}
+ * decision -- migrating a call site from that direct check to {@code IndexCreationStrategyRegistry#claims}
  * (which resolves to this adapter, once a plugin returns it from {@code getIndexCreationStrategy()}) is
  * therefore a change in <em>how</em> the same answer is discovered, not <em>what</em> the answer is. Safe
  * to install unconditionally, including before {@link DescriptorOnlyCreation#register} has ever run
@@ -31,6 +34,12 @@ package org.opensearch.cluster.metadata;
  * this whole adapter's own "same answer, second path" contract. {@link #skipsClusterState} and {@link
  * #describeClaimedNamespace()} delegate to {@link DescriptorOnlyCreation}'s existing gate and namespace
  * constant the same way.
+ *
+ * <p><b>Phase D3: relocated from {@code server/src/main} into this plugin</b>, alongside {@link
+ * DescriptorOnlyCreation} itself -- once that class was plugin-resident, the "bridge to a core-resident
+ * class" framing this adapter's own name and javadoc describe no longer applied literally (both classes are
+ * now in the same module), but the shape was kept unchanged rather than redesigned: same two classes, same
+ * delegation, only the package moved.
  */
 public final class SupplierBackedIndexCreationStrategy implements IndexCreationStrategy {
 

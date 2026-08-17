@@ -11,7 +11,6 @@ package org.opensearch.serverless.storage;
 import org.opensearch.cluster.metadata.IndexCreationStrategy;
 import org.opensearch.cluster.metadata.IndexMetadataResolver;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
-import org.opensearch.cluster.metadata.SupplierBackedIndexCreationStrategy;
 import org.opensearch.cluster.metadata.SupplierBackedIndexMetadataResolver;
 import org.opensearch.cluster.routing.IndexRoutingResolver;
 import org.opensearch.cluster.routing.ShardRouting;
@@ -53,6 +52,7 @@ import org.opensearch.serverless.storage.allocation.SuspendedShardAllocationDeci
 import org.opensearch.serverless.storage.compaction.CompactionPolicy;
 import org.opensearch.serverless.storage.compaction.CompactionRebaseExecutor;
 import org.opensearch.serverless.storage.compaction.CompactionSchedulerConfig;
+import org.opensearch.serverless.storage.descriptor.SupplierBackedIndexCreationStrategy;
 import org.opensearch.serverless.storage.directory.InMemoryShardDirectory;
 import org.opensearch.serverless.storage.directory.ShardDirectory;
 import org.opensearch.serverless.storage.format.BlobContainerBundleStore;
@@ -2938,13 +2938,14 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
 
     /**
      * Phase D2 of {@code core-pluggability-refactor-plan.md}. Additive, and behaviorally a no-op change:
-     * {@link org.opensearch.cluster.metadata.SupplierBackedIndexCreationStrategy} delegates straight back to
-     * {@link org.opensearch.cluster.metadata.DescriptorOnlyCreation}'s existing static registry, so this
-     * exposes the exact same gating decision every existing call site already makes through a second,
-     * generic path -- not a new one. {@code DescriptorGate#install} still registers with {@code
-     * DescriptorOnlyCreation} directly, exactly as before; this only adds a seam a migrated core call site
-     * can reach the identical answer through (see that adapter's own javadoc for why it is safe to return
-     * unconditionally, including before installation has run).
+     * {@link SupplierBackedIndexCreationStrategy} delegates straight back to {@code DescriptorOnlyCreation}'s
+     * existing static registry, so this exposes the exact same gating decision every existing call site
+     * already makes through a second, generic path -- not a new one. {@code DescriptorGate#install} still
+     * registers with {@code DescriptorOnlyCreation} directly, exactly as before; this only adds a seam a
+     * migrated core call site can reach the identical answer through (see that adapter's own javadoc for why
+     * it is safe to return unconditionally, including before installation has run). Phase D3 later relocated
+     * both classes from {@code server/} into this plugin (see {@code DescriptorOnlyCreation}'s own javadoc),
+     * but the wiring here is unchanged.
      */
     @Override
     public Optional<IndexCreationStrategy> getIndexCreationStrategy() {

@@ -39,17 +39,19 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public class DescriptorOnlyResidencyTests extends OpenSearchTestCase {
 
+    private final TestIndexCreationStrategy strategy = new TestIndexCreationStrategy();
+
     @Before
-    public void registerCreationStrategyBridge() {
-        // D2's final slice moved clusterStateCreateIndex's skipsClusterState consultation onto
-        // IndexCreationStrategyRegistry -- see ServerlessNamespaceTests's own javadoc for the pre-existing
-        // gap this same bridge closes.
-        IndexCreationStrategyRegistry.register(new SupplierBackedIndexCreationStrategy());
+    public void registerStrategy() {
+        // Phase D3 of core-pluggability-refactor-plan.md: a test-local IndexCreationStrategy, not
+        // DescriptorOnlyCreation (relocated into plugins/serverless-storage) -- see TestIndexCreationStrategy's
+        // own javadoc.
+        IndexCreationStrategyRegistry.register(strategy);
     }
 
     @After
     public void clearRegistrations() {
-        DescriptorOnlyCreation.register(null);
+        strategy.deactivate();
         IndexDescriptorPublisher.register(null);
         IndexDescriptorPublisher.registerCreator(null);
         IndexCreationStrategyRegistry.register(null);
@@ -66,7 +68,7 @@ public class DescriptorOnlyResidencyTests extends OpenSearchTestCase {
             published.incrementAndGet();
             return java.util.concurrent.CompletableFuture.completedFuture(Boolean.TRUE);
         });
-        DescriptorOnlyCreation.register(indexMetadata -> true);
+        strategy.activate(indexMetadata -> true);
 
         ClusterState state = ClusterState.builder(ClusterName.DEFAULT).build();
         for (int i = 0; i < 1_000; i++) {
@@ -116,7 +118,7 @@ public class DescriptorOnlyResidencyTests extends OpenSearchTestCase {
         // future is what the acknowledgement waits on. Registering only a publisher would leave
         // createGated returning null, which creation now treats as "no record anywhere".
         IndexDescriptorPublisher.registerCreator(descriptor -> java.util.concurrent.CompletableFuture.completedFuture(Boolean.TRUE));
-        DescriptorOnlyCreation.register(indexMetadata -> indexMetadata.getIndex().getName().startsWith("serverless-"));
+        strategy.activate(indexMetadata -> indexMetadata.getIndex().getName().startsWith("serverless-"));
 
         ClusterState state = ClusterState.builder(ClusterName.DEFAULT).build();
         for (int i = 0; i < 50; i++) {

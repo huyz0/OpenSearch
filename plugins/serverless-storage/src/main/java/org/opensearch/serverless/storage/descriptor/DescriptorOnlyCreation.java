@@ -6,8 +6,9 @@
  * compatible open source license.
  */
 
-package org.opensearch.cluster.metadata;
+package org.opensearch.serverless.storage.descriptor;
 
+import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.Settings;
 
 import java.util.concurrent.atomic.AtomicReference;
@@ -37,6 +38,17 @@ import java.util.function.Predicate;
  * silently failed is a lost index.
  *
  * <p>Closed by default. Nothing changes until something opens it.
+ *
+ * <p><b>Phase D3 of {@code core-pluggability-refactor-plan.md}: relocated from {@code server/src/main} into
+ * this plugin.</b> This class was always plugin business -- the specific "serverless_" naming convention
+ * below is exactly the vocabulary the whole refactor exists to keep out of core. Phase D2 already migrated
+ * every production call site in core onto the generic {@code IndexCreationStrategy} SPI (see {@link
+ * SupplierBackedIndexCreationStrategy}, which now implements that SPI from within this plugin instead of
+ * bridging to a core-resident class); this move closes the loop, once six {@code server/src/test} files that
+ * white-box-tested this class directly were rewritten to drive the SPI through a test-local strategy instead
+ * (see core's own {@code TestIndexCreationStrategy}). The one test that genuinely exercised this class's own
+ * naming convention, not core's consultation of it, moved here with it -- see {@code
+ * DescriptorOnlyCreationTests}.
  */
 public final class DescriptorOnlyCreation {
 

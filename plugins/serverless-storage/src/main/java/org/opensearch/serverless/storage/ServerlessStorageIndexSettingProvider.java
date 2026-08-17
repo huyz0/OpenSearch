@@ -15,6 +15,7 @@ import org.opensearch.index.IndexModule;
 import org.opensearch.index.shard.IndexSettingProvider;
 import org.opensearch.indices.replication.common.ReplicationType;
 import org.opensearch.serverless.storage.allocation.ServerlessStorageExistingShardsAllocator;
+import org.opensearch.serverless.storage.descriptor.DescriptorOnlyCreation;
 import org.opensearch.serverless.storage.resharding.DataStreamBackingIndexNames;
 import org.opensearch.serverless.storage.resharding.DataStreamShardCountAdvisorCache;
 
@@ -111,7 +112,7 @@ public final class ServerlessStorageIndexSettingProvider implements IndexSetting
         // asserted at the gate because everything downstream -- storage, computed placement, the engine --
         // already keys off the setting, and rewriting all of that to ask about the name would be a much
         // larger change for the same answer. See DescriptorOnlyCreation#SERVERLESS_NAME_PREFIX.
-        final boolean namespaced = org.opensearch.cluster.metadata.DescriptorOnlyCreation.namesAServerlessIndex(indexName);
+        final boolean namespaced = DescriptorOnlyCreation.namesAServerlessIndex(indexName);
         if (namespaced) {
             dataStreamSettings.put(ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey(), true);
         }

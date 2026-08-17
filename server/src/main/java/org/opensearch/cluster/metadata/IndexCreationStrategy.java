@@ -12,7 +12,7 @@ import org.opensearch.action.admin.indices.create.CreateIndexClusterStateUpdateR
 
 /**
  * Phase D1 of {@code core-pluggability-refactor-plan.md}: an SPI a plugin implements to decide which index
- * names/requests belong to it, replacing the fork's name-prefix convention (previously {@link
+ * names/requests belong to it, replacing the fork's name-prefix convention (previously {@code
  * DescriptorOnlyCreation}'s {@code namesAServerlessIndex}-style check) with an explicit, plugin-owned
  * decision.
  *
@@ -30,7 +30,7 @@ import org.opensearch.action.admin.indices.create.CreateIndexClusterStateUpdateR
  *
  * <ul>
  *   <li>Deletion mechanics are already generic, plugin-independent infrastructure: {@link
- *       MetadataDeleteIndexService} never consults {@link DescriptorOnlyCreation} at all (gated deletion is
+ *       MetadataDeleteIndexService} never consults {@code DescriptorOnlyCreation} at all (gated deletion is
  *       decided entirely by Phase C's {@code Metadata#indexOrResolved} null-ness signal), and the actual
  *       tombstone write is handed off through {@code DurableTombstones}'s own {@code register(Writer)}
  *       static hook -- a working, already-appropriately-scoped extension point this interface would have
@@ -40,11 +40,11 @@ import org.opensearch.action.admin.indices.create.CreateIndexClusterStateUpdateR
  *       op_type=create} atomicity reasoning, GENERIC-threadpool dispatch to avoid blocking a transport
  *       worker) hands the low-level descriptor write off through {@code IndexDescriptorPublisher}'s own
  *       {@code registerCreator}/{@code registerUpdater} static hooks -- again already generic, already
- *       working, and never touched by {@link DescriptorOnlyCreation} or by anything this interface would
+ *       working, and never touched by {@code DescriptorOnlyCreation} or by anything this interface would
  *       have added.
  * </ul>
  *
- * <p>What {@link DescriptorOnlyCreation} actually is, once separated from those two already-solved
+ * <p>What {@code DescriptorOnlyCreation} actually is, once separated from those two already-solved
  * concerns, is narrower than a full creation/deletion strategy: a single gating <em>decision</em>, "does
  * this index name/request belong to the gated plane," hardcoded today as a string-prefix check. That
  * decision is the one piece with no existing generic extension point -- and the one thing left for this
@@ -85,7 +85,8 @@ import org.opensearch.action.admin.indices.create.CreateIndexClusterStateUpdateR
  *       independent of {@code claims()}, rejected as speculative -- nothing today needs the two concepts to
  *       ever disagree, and the one real implementation would answer both identically; (c) a name-only
  *       {@link #claims(String)} overload, with the richer, request-aware overload defaulting to it -- chosen,
- *       because every real implementation of this interface today (see {@link SupplierBackedIndexCreationStrategy})
+ *       because every real implementation of this interface today (see {@code SupplierBackedIndexCreationStrategy},
+ *       a plugin-owned implementation since Phase D3 relocated it out of {@code server/})
  *       already ignores the request entirely, so the name-only question is the actually-primitive one and
  *       the request-aware overload is the derived convenience, not the other way around.
  * </ul>

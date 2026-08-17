@@ -54,7 +54,6 @@ public class CoreIsInertWithoutAPluginTests extends OpenSearchTestCase {
         AbsentIndexDescriptorSuppliers.register(null);
         AbsentIndexDescriptorSuppliers.registerExpander(null);
         AbsentIndexRoutingSuppliers.register(null);
-        DescriptorOnlyCreation.register(null);
         DescriptorPrefetch.register(null);
         IndexDescriptorPublisher.register(null);
         IndexDescriptorPublisher.registerCreator(null);
@@ -94,7 +93,6 @@ public class CoreIsInertWithoutAPluginTests extends OpenSearchTestCase {
         assertFalse("descriptor resolution", AbsentIndexDescriptorSuppliers.isRegistered());
         assertFalse("wildcard expansion over gated indices", AbsentIndexDescriptorSuppliers.isExpanderRegistered());
         assertFalse("computed routing", AbsentIndexRoutingSuppliers.isRegistered());
-        assertFalse("the creation gate", DescriptorOnlyCreation.isRegistered());
         assertFalse("the descriptor prefetcher", DescriptorPrefetch.isRegistered());
         assertFalse("the descriptor publisher", IndexDescriptorPublisher.isRegistered());
         assertFalse("the durable tombstone writer", DurableTombstones.isRegistered());
@@ -126,13 +124,9 @@ public class CoreIsInertWithoutAPluginTests extends OpenSearchTestCase {
     /** Creation writes to cluster state, which is what makes an ordinary index ordinary. */
     public void testNothingSkipsClusterStateOnCreation() {
         assertFalse(
-            "with no gate installed every index must keep its cluster state entry, and a gate that threw "
-                + "would also have to answer false rather than strand the index with no record anywhere",
-            DescriptorOnlyCreation.skipsClusterState(anIndex("ordinary"))
-        );
-        assertFalse(
-            "the SPI a plugin would reach the same gate through must agree with the static registry above "
-                + "on a stock node -- both unset, both false",
+            "with no strategy registered every index must keep its cluster state entry, and a strategy "
+                + "that threw would also have to answer false rather than strand the index with no record "
+                + "anywhere",
             IndexCreationStrategyRegistry.skipsClusterState(anIndex("ordinary"))
         );
         assertFalse(

@@ -12,6 +12,7 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.IndexRoutingTable;
+import org.opensearch.serverless.storage.descriptor.DescriptorOnlyCreation;
 
 /**
  * C5. Decides which indices get computed placement, and installs the supplier.
@@ -116,7 +117,7 @@ public final class ComputedPlacementGate {
      */
     public static boolean placementIsComputed(IndexMetadata indexMetadata) {
         return indexMetadata != null
-            && org.opensearch.cluster.metadata.DescriptorOnlyCreation.namesAServerlessIndex(indexMetadata.getIndex().getName())
+            && DescriptorOnlyCreation.namesAServerlessIndex(indexMetadata.getIndex().getName())
             && ownsIndex(indexMetadata);
     }
 

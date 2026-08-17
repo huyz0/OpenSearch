@@ -30,29 +30,31 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public class RefuseGatedWriteOnClusterStateThreadTests extends OpenSearchTestCase {
 
+    private final TestIndexCreationStrategy strategy = new TestIndexCreationStrategy();
+
     @Before
-    public void registerCreationStrategyBridge() {
-        // D2's final slice moved clusterStateCreateIndex's skipsClusterState consultation onto
-        // IndexCreationStrategyRegistry -- see ServerlessNamespaceTests's own javadoc for the pre-existing
-        // gap this same bridge closes.
-        IndexCreationStrategyRegistry.register(new SupplierBackedIndexCreationStrategy());
+    public void registerStrategy() {
+        // Phase D3 of core-pluggability-refactor-plan.md: a test-local IndexCreationStrategy, not
+        // DescriptorOnlyCreation (relocated into plugins/serverless-storage) -- see TestIndexCreationStrategy's
+        // own javadoc.
+        IndexCreationStrategyRegistry.register(strategy);
     }
 
     @After
     public void clearRegistrations() {
-        DescriptorOnlyCreation.register(null);
+        strategy.deactivate();
         IndexDescriptorPublisher.register(null);
         IndexDescriptorPublisher.registerCreator(null);
         IndexCreationStrategyRegistry.register(null);
     }
 
     public void testGatedCreationOnClusterStateThreadIsRefusedNotBlocked() throws Exception {
-        DescriptorOnlyCreation.register(indexMetadata -> true);
+        strategy.activate(indexMetadata -> true);
         IndexDescriptorPublisher.registerCreator(descriptor -> CompletableFuture.completedFuture(Boolean.TRUE));
 
         AtomicReference<Throwable> caught = new AtomicReference<>();
         CountDownLatch done = new CountDownLatch(1);
-        // Matched by name only, same as AbsentIndexDescriptorSuppliers#blockingIsUnsafeHere itself --
+        // Matched by name only, same as ClusterStateMutationThreads#blockingIsUnsafeOnCurrentThread itself --
         // this is exactly how a real cluster-manager update-task thread would be named.
         Thread updateThread = new Thread(() -> {
             try {
@@ -87,7 +89,7 @@ public class RefuseGatedWriteOnClusterStateThreadTests extends OpenSearchTestCas
     }
 
     public void testGatedCreationOffClusterStateThreadStillWorks() {
-        DescriptorOnlyCreation.register(indexMetadata -> true);
+        strategy.activate(indexMetadata -> true);
         IndexDescriptorPublisher.registerCreator(descriptor -> CompletableFuture.completedFuture(Boolean.TRUE));
 
         AtomicReference<CompletableFuture<Boolean>> handedOver = new AtomicReference<>();

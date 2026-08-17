@@ -42,17 +42,19 @@ public class DescriptorOnlyCreationScalingTests extends OpenSearchTestCase {
     private static final int[] POPULATIONS = { 1_000, 10_000, 50_000 };
     private static final int REPEATS = 10;
 
+    private final TestIndexCreationStrategy strategy = new TestIndexCreationStrategy();
+
     @Before
-    public void registerCreationStrategyBridge() {
-        // D2's final slice moved clusterStateCreateIndex's skipsClusterState consultation onto
-        // IndexCreationStrategyRegistry -- see ServerlessNamespaceTests's own javadoc for the pre-existing
-        // gap this same bridge closes.
-        IndexCreationStrategyRegistry.register(new SupplierBackedIndexCreationStrategy());
+    public void registerStrategy() {
+        // Phase D3 of core-pluggability-refactor-plan.md: a test-local IndexCreationStrategy, not
+        // DescriptorOnlyCreation (relocated into plugins/serverless-storage) -- see TestIndexCreationStrategy's
+        // own javadoc.
+        IndexCreationStrategyRegistry.register(strategy);
     }
 
     @After
     public void clearRegistrations() {
-        DescriptorOnlyCreation.register(null);
+        strategy.deactivate();
         IndexDescriptorPublisher.register(null);
         IndexDescriptorPublisher.registerCreator(null);
         IndexCreationStrategyRegistry.register(null);
@@ -67,7 +69,7 @@ public class DescriptorOnlyCreationScalingTests extends OpenSearchTestCase {
         for (int population : POPULATIONS) {
             ClusterState base = stateWith(population);
 
-            DescriptorOnlyCreation.register(null);
+            strategy.deactivate();
             IndexDescriptorPublisher.register(null);
             IndexDescriptorPublisher.registerCreator(null);
             double throughClusterState = time(base, "cs-" + population);
@@ -81,7 +83,7 @@ public class DescriptorOnlyCreationScalingTests extends OpenSearchTestCase {
                 published.incrementAndGet();
                 return java.util.concurrent.CompletableFuture.completedFuture(Boolean.TRUE);
             });
-            DescriptorOnlyCreation.register(indexMetadata -> true);
+            strategy.activate(indexMetadata -> true);
             double throughDescriptor = time(base, "desc-" + population);
 
             assertTrue("the gated path must actually have published descriptors, or it measured nothing", published.get() > 0);
@@ -124,7 +126,7 @@ public class DescriptorOnlyCreationScalingTests extends OpenSearchTestCase {
         // future is what the acknowledgement waits on. Registering only a publisher would leave
         // createGated returning null, which creation now treats as "no record anywhere".
         IndexDescriptorPublisher.registerCreator(descriptor -> java.util.concurrent.CompletableFuture.completedFuture(Boolean.TRUE));
-        DescriptorOnlyCreation.register(indexMetadata -> true);
+        strategy.activate(indexMetadata -> true);
 
         double atThousand = time(stateWith(1_000), "flat-small");
         double atFiftyThousand = time(stateWith(50_000), "flat-large");
@@ -182,7 +184,7 @@ public class DescriptorOnlyCreationScalingTests extends OpenSearchTestCase {
      * publisher installed would exist nowhere, so creation must refuse rather than succeed silently.
      */
     public void testCreationRefusesWhenNothingWouldRecordTheIndex() {
-        DescriptorOnlyCreation.register(indexMetadata -> true);
+        strategy.activate(indexMetadata -> true);
         IndexDescriptorPublisher.register(null);
         IndexDescriptorPublisher.registerCreator(null);
 

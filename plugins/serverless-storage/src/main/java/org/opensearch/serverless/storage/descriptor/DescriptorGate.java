@@ -12,7 +12,6 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.admin.cluster.stats.GatedMappingStatsAggregator;
 import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
-import org.opensearch.cluster.metadata.DescriptorOnlyCreation;
 import org.opensearch.cluster.metadata.DescriptorPrefetch;
 import org.opensearch.cluster.metadata.DurableTombstones;
 import org.opensearch.cluster.metadata.IndexDescriptor;

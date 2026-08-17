@@ -9,7 +9,6 @@
 package org.opensearch.serverless.storage.descriptor;
 
 import org.opensearch.Version;
-import org.opensearch.cluster.metadata.DescriptorOnlyCreation;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.Settings;
 import org.junit.After;

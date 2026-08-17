@@ -27,12 +27,9 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 /**
- * The two halves of "a name belongs to exactly one plane", asserted from core.
- *
- * <p>An index is gated because of its name. The plugin's gate refuses a name outside the {@code serverless_}
- * namespace, so no name out there can be held by a descriptor alone; {@code clusterStateCreateIndex} refuses a
- * name inside it a cluster state entry, so no name in here can be held by cluster state. This class owns the second half and the
- * routing decision that follows from the first.
+ * The half of "a name belongs to exactly one plane" that lives in core: {@code clusterStateCreateIndex}
+ * refuses a namespaced name a cluster state entry when the registered {@link IndexCreationStrategy} declines
+ * it, rather than quietly making it an ordinary index.
  *
  * <h2>What this replaced</h2>
  *
@@ -45,50 +42,32 @@ import static org.mockito.Mockito.when;
  * protected against (a creation admitted down a road it could not finish) cannot happen when the name is the
  * decision, and the tests here are what says so.
  *
- * <h2>A real, pre-existing gap this class's own D2-final-slice migration found</h2>
+ * <h2>Phase D3: no longer {@code DescriptorOnlyCreation}</h2>
  *
- * {@code MetadataCreateIndexService#certainlyGated} was migrated to {@code IndexCreationStrategyRegistry
- * .claims(...)} back in D2's second slice, but this test class was never updated to also register the
- * {@code SupplierBackedIndexCreationStrategy} bridge into that registry -- it only ever registered directly
- * on {@link DescriptorOnlyCreation}, the registry {@code certainlyGated} no longer reads. That silently
- * broke {@code testCertainlyGatedIsTheNameAndNothingElse} before this class's own final D2 slice (the
- * {@code clusterStateCreateIndex} migration this class also exercises) ever touched it -- confirmed by
- * running this suite against the pre-final-slice commit, which already failed the same way. Registering the
- * bridge here, unconditionally, in {@code @Before} (mirroring how {@code SupplierBackedIndexCreationStrategy}
- * is documented safe to register unconditionally in production, since it answers false until {@link
- * DescriptorOnlyCreation} itself has something registered) fixes both that pre-existing gap and this class's
- * own new coverage of {@code clusterStateCreateIndex}'s two sites in one change.
+ * This class used to register directly on {@code DescriptorOnlyCreation}'s static registry. D3 of {@code
+ * core-pluggability-refactor-plan.md} relocated that class into {@code plugins/serverless-storage} -- it was
+ * never core's vocabulary to own, and {@code server/src/test} was the only reason it still had to compile
+ * here. What this class actually tests -- that {@code MetadataCreateIndexService} correctly consults
+ * whatever {@link IndexCreationStrategy} is registered -- does not need {@code DescriptorOnlyCreation}'s own
+ * specific "serverless_" naming convention, only a stand-in with the same shape; see {@link
+ * TestIndexCreationStrategy}. The pure unit test of that specific naming convention moved with the class
+ * itself, into the plugin's own test suite.
  */
 public class ServerlessNamespaceTests extends OpenSearchTestCase {
 
+    private final TestIndexCreationStrategy strategy = new TestIndexCreationStrategy();
+
     @Before
-    public void registerCreationStrategyBridge() {
-        // Mirrors production: ServerlessStoragePlugin#getIndexCreationStrategy() always returns this same
-        // adapter, unconditionally, and it answers false until DescriptorOnlyCreation itself has a gate
-        // registered -- so registering it here doesn't change what any test below asserts, only makes
-        // IndexCreationStrategyRegistry (which MetadataCreateIndexService now actually consults) reachable
-        // at all, the same way Node.java makes it reachable on a real cluster.
-        IndexCreationStrategyRegistry.register(new SupplierBackedIndexCreationStrategy());
+    public void registerStrategy() {
+        IndexCreationStrategyRegistry.register(strategy);
     }
 
     @After
     public void clearRegistrations() {
-        DescriptorOnlyCreation.register(null);
+        strategy.deactivate();
         IndexDescriptorPublisher.register(null);
         IndexDescriptorPublisher.registerCreator(null);
         IndexCreationStrategyRegistry.register(null);
-    }
-
-    public void testTheNamespaceIsAPrefixOnTheNameAndNothingElse() {
-        assertTrue(DescriptorOnlyCreation.namesAServerlessIndex("serverless_tenant-42"));
-        assertTrue(
-            "the prefix alone is in the namespace, however useless a name it is",
-            DescriptorOnlyCreation.namesAServerlessIndex("serverless_")
-        );
-        assertFalse(DescriptorOnlyCreation.namesAServerlessIndex("tenant-42"));
-        assertFalse("a prefix in the middle is not a prefix", DescriptorOnlyCreation.namesAServerlessIndex("my-serverless_index"));
-        assertFalse("the hyphenated spelling is a different name", DescriptorOnlyCreation.namesAServerlessIndex("serverless-tenant"));
-        assertFalse("total on the name means null is an answer, not a throw", DescriptorOnlyCreation.namesAServerlessIndex(null));
     }
 
     /**
@@ -100,7 +79,7 @@ public class ServerlessNamespaceTests extends OpenSearchTestCase {
      * against cluster state and against nothing else, so it took a name a live descriptor already held.
      */
     public void testANamespacedIndexTheGateDeclinesIsRefusedRatherThanMadeOrdinary() {
-        DescriptorOnlyCreation.register(indexMetadata -> false);
+        strategy.activate(indexMetadata -> false);
 
         IllegalArgumentException refused = expectThrows(
             IllegalArgumentException.class,
@@ -115,7 +94,7 @@ public class ServerlessNamespaceTests extends OpenSearchTestCase {
         );
         assertTrue(
             "the caller has to be told which plane refused it, or this is the silent decline the area is about: " + refused.getMessage(),
-            refused.getMessage().contains("serverless_declined") && refused.getMessage().contains("serverless namespace")
+            refused.getMessage().contains("serverless_declined") && refused.getMessage().contains("test namespace")
         );
     }
 
@@ -124,7 +103,7 @@ public class ServerlessNamespaceTests extends OpenSearchTestCase {
      * cluster's gate, and an ordinary name must be untouched by any of it.
      */
     public void testAnOrdinaryNameTheGateDeclinesStillGetsItsEntry() {
-        DescriptorOnlyCreation.register(indexMetadata -> false);
+        strategy.activate(indexMetadata -> false);
 
         ClusterState state = MetadataCreateIndexService.clusterStateCreateIndex(
             ClusterState.builder(ClusterName.DEFAULT).build(),
@@ -173,7 +152,7 @@ public class ServerlessNamespaceTests extends OpenSearchTestCase {
             service.certainlyGated(request("serverless_tenant-1"), lastState)
         );
 
-        DescriptorOnlyCreation.register(indexMetadata -> true);
+        strategy.activate(indexMetadata -> true);
         assertTrue(
             "a name in the namespace can only be gated or refused, and neither needs the cluster manager -- "
                 + "not even with a template whose alias will refuse it",

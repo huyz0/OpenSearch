@@ -6,18 +6,22 @@
  * compatible open source license.
  */
 
-package org.opensearch.cluster.metadata;
+package org.opensearch.serverless.storage.descriptor;
 
 import org.opensearch.Version;
+import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.test.OpenSearchTestCase;
 import org.junit.After;
 
 /**
- * D2's final slice of core-pluggability-refactor-plan.md: {@link IndexCreationStrategy}'s two new methods
- * ({@link IndexCreationStrategy#claims(String)} and {@link IndexCreationStrategy#skipsClusterState(IndexMetadata)})
- * and {@link SupplierBackedIndexCreationStrategy}'s delegation to {@link DescriptorOnlyCreation} for both,
- * mirroring {@link SupplierBackedIndexMetadataResolverTests}'s own shape for the analogous C5 adapter.
+ * D2's final slice of {@code core-pluggability-refactor-plan.md}: {@code IndexCreationStrategy}'s two
+ * methods ({@code claims(String)} and {@code skipsClusterState(IndexMetadata)}) and {@link
+ * SupplierBackedIndexCreationStrategy}'s delegation to {@link DescriptorOnlyCreation} for both, mirroring
+ * core's own {@code SupplierBackedIndexMetadataResolverTests} shape for the analogous C5 adapter.
+ *
+ * <p>Phase D3: relocated from {@code server/src/test} into this plugin alongside both classes it tests --
+ * see {@link DescriptorOnlyCreation}'s own javadoc for the full move.
  */
 public class SupplierBackedIndexCreationStrategyTests extends OpenSearchTestCase {
 

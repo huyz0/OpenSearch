@@ -323,7 +323,7 @@ public class MetadataDeleteIndexService {
      * <p>A gated index has no cluster state entry, so everything below would fail on it, and
      * {@code getIndexSafe} is where it failed: "no such index" for a name the resolver had just resolved to
      * a concrete {@link Index} carrying the descriptor's uuid. Creation grew its branch for this
-     * ({@code MetadataCreateIndexService} consulting {@link DescriptorOnlyCreation}) and deletion never grew
+     * ({@code MetadataCreateIndexService} consulting {@code DescriptorOnlyCreation}) and deletion never grew
      * the matching one, so a gated index could be created and could never be deleted.
      *
      * <p>Nothing caught it because the only test that deletes one lives in a class that had been muted for

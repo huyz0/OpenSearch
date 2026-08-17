@@ -48,6 +48,8 @@ import java.util.Set;
  */
 public class GatedIndexMappingUpdateTests extends OpenSearchTestCase {
 
+    private final TestIndexCreationStrategy strategy = new TestIndexCreationStrategy();
+
     private ThreadPool threadPool;
 
     @Before
@@ -92,17 +94,16 @@ public class GatedIndexMappingUpdateTests extends OpenSearchTestCase {
     }
 
     @Before
-    public void registerCreationStrategyBridge() {
-        // D2's final slice moved MetadataCreateIndexService's own skipsClusterState consultation onto
-        // IndexCreationStrategyRegistry -- this test only registers on DescriptorOnlyCreation directly, so
-        // without this bridge (safe unconditionally, matching production's own ServerlessStoragePlugin
-        // wiring) the gate below would never be reachable through the path core actually consults.
-        IndexCreationStrategyRegistry.register(new SupplierBackedIndexCreationStrategy());
+    public void registerStrategy() {
+        // Phase D3 of core-pluggability-refactor-plan.md: a test-local IndexCreationStrategy, not
+        // DescriptorOnlyCreation (relocated into plugins/serverless-storage) -- see TestIndexCreationStrategy's
+        // own javadoc.
+        IndexCreationStrategyRegistry.register(strategy);
     }
 
     @After
     public void clearRegistrations() {
-        DescriptorOnlyCreation.register(null);
+        strategy.deactivate();
         IndexDescriptorPublisher.register(null);
         IndexDescriptorPublisher.registerCreator(null);
         MappingGenerationStore.register(null);
@@ -119,7 +120,7 @@ public class GatedIndexMappingUpdateTests extends OpenSearchTestCase {
         // future is what the acknowledgement waits on. Registering only a publisher would leave
         // createGated returning null, which creation now treats as "no record anywhere".
         IndexDescriptorPublisher.registerCreator(descriptor -> java.util.concurrent.CompletableFuture.completedFuture(Boolean.TRUE));
-        DescriptorOnlyCreation.register(indexMetadata -> true);
+        strategy.activate(indexMetadata -> true);
 
         ClusterState state = MetadataCreateIndexService.clusterStateCreateIndex(
             ClusterState.builder(ClusterName.DEFAULT).build(),

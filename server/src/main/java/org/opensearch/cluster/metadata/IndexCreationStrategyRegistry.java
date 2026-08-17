@@ -14,8 +14,9 @@ import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Phase D2 of {@code core-pluggability-refactor-plan.md}: the node-level holder for the single {@link
- * IndexCreationStrategy} a {@link org.opensearch.plugins.ClusterPlugin} may supply, mirroring {@link
- * DescriptorOnlyCreation}'s own static-registry shape deliberately -- the safest possible way to introduce
+ * IndexCreationStrategy} a {@link org.opensearch.plugins.ClusterPlugin} may supply, mirroring {@code
+ * DescriptorOnlyCreation}'s own static-registry shape deliberately (a plugin-owned class since Phase D3
+ * relocated it out of {@code server/}) -- the safest possible way to introduce
  * this seam is one that looks structurally identical to the mechanism already proven in this exact spot,
  * changing only <em>who decides</em> a name is claimed, not <em>how</em> that decision is discovered.
  *
@@ -25,7 +26,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * #claims} answers {@code false} unconditionally, so a node without the plugin behaves exactly as it did
  * before this class existed.
  *
- * <p>A predicate that throws is treated as "does not claim this," matching {@link
+ * <p>A predicate that throws is treated as "does not claim this," matching {@code
  * DescriptorOnlyCreation#skipsClusterState}'s own failure direction: the failure mode of wrongly answering
  * {@code true} (an index treated as claimed when it should not have been) is worse than the failure mode of
  * wrongly answering {@code false} (an index that falls through to the ordinary path it would have taken
