@@ -69,6 +69,7 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.ClusterStateObserver;
 import org.opensearch.cluster.InternalClusterInfoService;
 import org.opensearch.cluster.NodeConnectionsService;
+import org.opensearch.cluster.ResolverAttachingClusterStateApplier;
 import org.opensearch.cluster.StreamNodeConnectionsService;
 import org.opensearch.cluster.action.index.MappingUpdatedAction;
 import org.opensearch.cluster.action.shard.LocalShardStateAction;
@@ -77,6 +78,7 @@ import org.opensearch.cluster.applicationtemplates.SystemTemplatesPlugin;
 import org.opensearch.cluster.applicationtemplates.SystemTemplatesService;
 import org.opensearch.cluster.coordination.PersistedStateRegistry;
 import org.opensearch.cluster.metadata.AliasValidator;
+import org.opensearch.cluster.metadata.IndexMetadataResolver;
 import org.opensearch.cluster.metadata.IndexTemplateMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.metadata.MetadataCreateDataStreamService;
@@ -90,6 +92,7 @@ import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodeRole;
 import org.opensearch.cluster.routing.BatchedRerouteService;
 import org.opensearch.cluster.routing.ComputedPlacementMembershipService;
+import org.opensearch.cluster.routing.IndexRoutingResolver;
 import org.opensearch.cluster.routing.RerouteService;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.allocation.AwarenessReplicaBalance;
@@ -763,6 +766,40 @@ public class Node implements Closeable {
             }
             clusterService.addStateApplier(scriptService);
             resourcesToClose.add(clusterService);
+
+            // Phase C of core-pluggability-refactor-plan.md: give the node its plugin-supplied
+            // IndexMetadataResolver/IndexRoutingResolver, if any ClusterPlugin on this node provides
+            // one. See ResolverAttachingClusterStateApplier's own javadoc for why this attachment point
+            // -- a high-priority applier -- is the right one, and Metadata#resolver's javadoc for the
+            // propagation mechanics that carry the attached resolver forward from here.
+            List<IndexMetadataResolver> indexMetadataResolvers = clusterPlugins.stream()
+                .map(ClusterPlugin::getIndexMetadataResolver)
+                .filter(Optional::isPresent)
+                .map(Optional::get)
+                .collect(toList());
+            if (indexMetadataResolvers.size() > 1) {
+                throw new IllegalStateException(
+                    "at most one ClusterPlugin may supply an IndexMetadataResolver, but found "
+                        + indexMetadataResolvers.size()
+                );
+            }
+            List<IndexRoutingResolver> indexRoutingResolvers = clusterPlugins.stream()
+                .map(ClusterPlugin::getIndexRoutingResolver)
+                .filter(Optional::isPresent)
+                .map(Optional::get)
+                .collect(toList());
+            if (indexRoutingResolvers.size() > 1) {
+                throw new IllegalStateException(
+                    "at most one ClusterPlugin may supply an IndexRoutingResolver, but found " + indexRoutingResolvers.size()
+                );
+            }
+            Optional<IndexMetadataResolver> indexMetadataResolver = indexMetadataResolvers.stream().findFirst();
+            Optional<IndexRoutingResolver> indexRoutingResolver = indexRoutingResolvers.stream().findFirst();
+            if (indexMetadataResolver.isPresent() || indexRoutingResolver.isPresent()) {
+                clusterService.addHighPriorityApplier(
+                    new ResolverAttachingClusterStateApplier(indexMetadataResolver, indexRoutingResolver)
+                );
+            }
             final Set<Setting<?>> consistentSettings = settingsModule.getConsistentSettings();
             if (consistentSettings.isEmpty() == false) {
                 clusterService.addLocalNodeClusterManagerListener(

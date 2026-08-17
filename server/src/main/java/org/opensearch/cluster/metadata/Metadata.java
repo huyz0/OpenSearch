@@ -863,8 +863,18 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
      * Attaches the per-node fallback {@link #index(String)} consults on a miss. See {@link #resolver}'s
      * own javadoc for why this is a mutable setter rather than a constructor parameter, and for what
      * still has to call it before this has any effect.
+     *
+     * <p>A no-op on {@link #EMPTY_METADATA} itself: that field is a shared, JVM-wide singleton --
+     * {@link org.opensearch.cluster.ClusterState.Builder}'s default when no explicit metadata is set, and
+     * reused as a convenience placeholder throughout tests and bootstrap code -- so mutating this transient
+     * field on it would leak one caller's resolver into every other unrelated {@code ClusterState} that
+     * also defaults to it, on this node and (in tests) across the whole JVM. There is nothing to resolve
+     * against an empty placeholder anyway, so skipping the attach is behaviorally correct, not just safe.
      */
     public void attachIndexMetadataResolver(IndexMetadataResolver resolver) {
+        if (this == EMPTY_METADATA) {
+            return;
+        }
         this.resolver = resolver;
     }
 

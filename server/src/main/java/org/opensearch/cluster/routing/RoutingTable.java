@@ -105,8 +105,20 @@ public class RoutingTable implements Iterable<IndexRoutingTable>, Diffable<Routi
         this.indicesRouting = Collections.unmodifiableMap(indicesRouting);
     }
 
-    /** See {@link #resolver}'s own javadoc for why this is a mutable setter, not a constructor parameter. */
+    /**
+     * See {@link #resolver}'s own javadoc for why this is a mutable setter, not a constructor parameter.
+     *
+     * <p>A no-op on {@link #EMPTY_ROUTING_TABLE} itself: that field is a shared, JVM-wide singleton --
+     * {@link org.opensearch.cluster.ClusterState.Builder}'s default when no explicit routing table is set,
+     * and reused as a convenience placeholder throughout tests and bootstrap code -- so mutating this
+     * transient field on it would leak one caller's resolver into every other unrelated {@code
+     * ClusterState} that also defaults to it. See {@link org.opensearch.cluster.metadata.Metadata
+     * #attachIndexMetadataResolver}'s identical guard for the full reasoning.
+     */
     public void attachIndexRoutingResolver(IndexRoutingResolver resolver) {
+        if (this == EMPTY_ROUTING_TABLE) {
+            return;
+        }
         this.resolver = resolver;
     }
 
