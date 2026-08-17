@@ -17,6 +17,7 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.indices.SystemIndices;
 import org.opensearch.test.OpenSearchTestCase;
 import org.junit.After;
+import org.junit.Before;
 
 import java.util.Collections;
 import java.util.Set;
@@ -43,14 +44,39 @@ import static org.mockito.Mockito.when;
  * descriptor already held. Their subject was retired rather than their assertions weakened; what they
  * protected against (a creation admitted down a road it could not finish) cannot happen when the name is the
  * decision, and the tests here are what says so.
+ *
+ * <h2>A real, pre-existing gap this class's own D2-final-slice migration found</h2>
+ *
+ * {@code MetadataCreateIndexService#certainlyGated} was migrated to {@code IndexCreationStrategyRegistry
+ * .claims(...)} back in D2's second slice, but this test class was never updated to also register the
+ * {@code SupplierBackedIndexCreationStrategy} bridge into that registry -- it only ever registered directly
+ * on {@link DescriptorOnlyCreation}, the registry {@code certainlyGated} no longer reads. That silently
+ * broke {@code testCertainlyGatedIsTheNameAndNothingElse} before this class's own final D2 slice (the
+ * {@code clusterStateCreateIndex} migration this class also exercises) ever touched it -- confirmed by
+ * running this suite against the pre-final-slice commit, which already failed the same way. Registering the
+ * bridge here, unconditionally, in {@code @Before} (mirroring how {@code SupplierBackedIndexCreationStrategy}
+ * is documented safe to register unconditionally in production, since it answers false until {@link
+ * DescriptorOnlyCreation} itself has something registered) fixes both that pre-existing gap and this class's
+ * own new coverage of {@code clusterStateCreateIndex}'s two sites in one change.
  */
 public class ServerlessNamespaceTests extends OpenSearchTestCase {
+
+    @Before
+    public void registerCreationStrategyBridge() {
+        // Mirrors production: ServerlessStoragePlugin#getIndexCreationStrategy() always returns this same
+        // adapter, unconditionally, and it answers false until DescriptorOnlyCreation itself has a gate
+        // registered -- so registering it here doesn't change what any test below asserts, only makes
+        // IndexCreationStrategyRegistry (which MetadataCreateIndexService now actually consults) reachable
+        // at all, the same way Node.java makes it reachable on a real cluster.
+        IndexCreationStrategyRegistry.register(new SupplierBackedIndexCreationStrategy());
+    }
 
     @After
     public void clearRegistrations() {
         DescriptorOnlyCreation.register(null);
         IndexDescriptorPublisher.register(null);
         IndexDescriptorPublisher.registerCreator(null);
+        IndexCreationStrategyRegistry.register(null);
     }
 
     public void testTheNamespaceIsAPrefixOnTheNameAndNothingElse() {

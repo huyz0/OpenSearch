@@ -61,4 +61,63 @@ public final class IndexCreationStrategyRegistry {
             return false;
         }
     }
+
+    /**
+     * Whether the registered strategy (if any) claims the given index name, with no request in scope --
+     * see {@link IndexCreationStrategy#claims(String)}. Answers {@code false} when nothing is registered,
+     * or when the registered strategy throws.
+     */
+    public static boolean claims(String indexName) {
+        IndexCreationStrategy strategy = STRATEGY.get();
+        if (strategy == null) {
+            return false;
+        }
+        try {
+            return strategy.claims(indexName);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * Whether the registered strategy (if any) says this finished {@link IndexMetadata} should skip its
+     * cluster-state entry -- see {@link IndexCreationStrategy#skipsClusterState(IndexMetadata)}. Answers
+     * {@code false} when nothing is registered, when {@code indexMetadata} is {@code null}, or when the
+     * registered strategy throws -- the same "wrongly answering false costs what it always cost, wrongly
+     * answering true costs the index's only record" direction {@code DescriptorOnlyCreation.skipsClusterState}
+     * already established for this exact predicate.
+     */
+    public static boolean skipsClusterState(IndexMetadata indexMetadata) {
+        IndexCreationStrategy strategy = STRATEGY.get();
+        if (strategy == null || indexMetadata == null) {
+            return false;
+        }
+        try {
+            return strategy.skipsClusterState(indexMetadata);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * The registered strategy's description of the namespace it claims -- see {@link
+     * IndexCreationStrategy#describeClaimedNamespace()}. Only meaningful (and only ever called by a caller)
+     * after {@link #claims} has already answered {@code true}, so this falls back to the interface's own
+     * generic default if nothing is registered or the registered strategy throws, rather than exposing that
+     * as a separate failure mode callers need to handle.
+     */
+    public static String describeClaimedNamespace() {
+        IndexCreationStrategy strategy = STRATEGY.get();
+        if (strategy == null) {
+            return DEFAULT_DESCRIPTION;
+        }
+        try {
+            return strategy.describeClaimedNamespace();
+        } catch (Exception e) {
+            return DEFAULT_DESCRIPTION;
+        }
+    }
+
+    private static final String DEFAULT_DESCRIPTION = new IndexCreationStrategy() {
+    }.describeClaimedNamespace();
 }

@@ -63,6 +63,7 @@ public class CoreIsInertWithoutAPluginTests extends OpenSearchTestCase {
         MappingGenerationStore.register(null);
         UnknownFieldRefresh.register(null);
         GatedMappingStatsAggregator.register(null);
+        IndexCreationStrategyRegistry.register(null);
     }
 
     @Override
@@ -101,6 +102,7 @@ public class CoreIsInertWithoutAPluginTests extends OpenSearchTestCase {
         assertFalse("the mapping generation store", MappingGenerationStore.isRegistered());
         assertFalse("the unknown field refresher", UnknownFieldRefresh.isRegistered());
         assertFalse("the gated mapping stats aggregator", GatedMappingStatsAggregator.isRegistered());
+        assertFalse("the index-creation strategy", IndexCreationStrategyRegistry.isRegistered());
     }
 
     /** An index either is in cluster state or does not exist. That is main's rule and it must still hold. */
@@ -127,6 +129,16 @@ public class CoreIsInertWithoutAPluginTests extends OpenSearchTestCase {
             "with no gate installed every index must keep its cluster state entry, and a gate that threw "
                 + "would also have to answer false rather than strand the index with no record anywhere",
             DescriptorOnlyCreation.skipsClusterState(anIndex("ordinary"))
+        );
+        assertFalse(
+            "the SPI a plugin would reach the same gate through must agree with the static registry above "
+                + "on a stock node -- both unset, both false",
+            IndexCreationStrategyRegistry.skipsClusterState(anIndex("ordinary"))
+        );
+        assertFalse(
+            "and the claim half of the same SPI must be unclaimed for every name, not just ordinary ones, "
+                + "including a name that would be in a plugin's namespace if one were installed",
+            IndexCreationStrategyRegistry.claims("serverless_would-be-namespaced")
         );
     }
 

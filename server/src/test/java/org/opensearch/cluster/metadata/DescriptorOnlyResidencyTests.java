@@ -14,6 +14,7 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.test.OpenSearchTestCase;
 import org.junit.After;
+import org.junit.Before;
 
 import java.util.Locale;
 import java.util.Set;
@@ -38,11 +39,20 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public class DescriptorOnlyResidencyTests extends OpenSearchTestCase {
 
+    @Before
+    public void registerCreationStrategyBridge() {
+        // D2's final slice moved clusterStateCreateIndex's skipsClusterState consultation onto
+        // IndexCreationStrategyRegistry -- see ServerlessNamespaceTests's own javadoc for the pre-existing
+        // gap this same bridge closes.
+        IndexCreationStrategyRegistry.register(new SupplierBackedIndexCreationStrategy());
+    }
+
     @After
     public void clearRegistrations() {
         DescriptorOnlyCreation.register(null);
         IndexDescriptorPublisher.register(null);
         IndexDescriptorPublisher.registerCreator(null);
+        IndexCreationStrategyRegistry.register(null);
     }
 
     /** The load-bearing one: gated indices must leave no cluster state entry at all. */

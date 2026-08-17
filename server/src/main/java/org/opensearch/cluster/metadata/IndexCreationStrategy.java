@@ -59,6 +59,43 @@ import org.opensearch.action.admin.indices.create.CreateIndexClusterStateUpdateR
  * <p>Registered via a new {@code ClusterPlugin.getIndexCreationStrategy()} default-empty hook, the same
  * registration point Phase C1's resolvers use.
  *
+ * <p><b>Extended to close out D2's own two remaining {@code clusterStateCreateIndex} call sites</b> (the
+ * ones the D2-scoping status-log row identified as the genuinely dangerous, nine-line region and deliberately
+ * left alone during the first two D2 slices). Reading those two sites found they ask two questions {@link
+ * #claims(String, CreateIndexClusterStateUpdateRequest)} cannot answer as originally shaped:
+ *
+ * <ul>
+ *   <li>{@code skipsClusterState}'s gate consults a <em>finished</em> {@link IndexMetadata}, not a
+ *       pre-build {@link CreateIndexClusterStateUpdateRequest} -- and is a strictly narrower question than
+ *       {@code claims()} (the real gate additionally checks placement ownership and descriptor
+ *       representability, both unknowable before the index is built). Three shapes were considered for
+ *       this: (a) broaden {@code claims()} itself to accept {@link IndexMetadata}, rejected because it
+ *       would conflate a pre-admission decision with a post-build one that can legitimately disagree with
+ *       it; (b) leave the underlying static predicate where it is and only rename it out of core's
+ *       vocabulary, rejected because it keeps a second, parallel plugin-registration point alive for no
+ *       reason once one already exists; (c) add a dedicated, symmetric {@link #skipsClusterState} method
+ *       to this same interface, the same "narrow, purpose-built method" shape {@link #claims} itself was
+ *       narrowed to during D1 -- chosen, since it keeps exactly one registration point per plugin while
+ *       being honest that the two questions are genuinely different.
+ *   <li>The two-plane-collision refusal has no {@link CreateIndexClusterStateUpdateRequest} in scope at
+ *       all -- only a name. Three shapes were considered: (a) pass a fabricated {@code null} request into
+ *       the existing two-arg {@link #claims}, rejected because a future implementation that legitimately
+ *       reads the request would silently NPE, and the plan's own D2 text already flagged a fabricated null
+ *       as the wrong answer; (b) a distinctly-named method (e.g. {@code reservesNamespace}) kept
+ *       independent of {@code claims()}, rejected as speculative -- nothing today needs the two concepts to
+ *       ever disagree, and the one real implementation would answer both identically; (c) a name-only
+ *       {@link #claims(String)} overload, with the richer, request-aware overload defaulting to it -- chosen,
+ *       because every real implementation of this interface today (see {@link SupplierBackedIndexCreationStrategy})
+ *       already ignores the request entirely, so the name-only question is the actually-primitive one and
+ *       the request-aware overload is the derived convenience, not the other way around.
+ * </ul>
+ *
+ * <p>A third, smaller gap the same two call sites' error messages exposed: both interpolate {@code
+ * DescriptorOnlyCreation.SERVERLESS_NAME_PREFIX} directly into user-facing text, which is exactly the kind
+ * of core-names-the-plugin's-vocabulary-by-name coupling this whole plan exists to remove, just in a
+ * message string rather than control flow. {@link #describeClaimedNamespace()} lets the registered strategy
+ * supply its own description instead.
+ *
  * <p><b>Deliberately not annotated {@code @ExperimentalApi} at the type level.</b> That annotation requires
  * every type this interface exposes as a public member to itself be {@code @PublicApi}/{@code
  * @ExperimentalApi}/{@code @DeprecatedApi} (enforced at compile time) -- but {@link
@@ -81,6 +118,55 @@ public interface IndexCreationStrategy {
      * follow whatever generic hooks that behavior already runs through ({@code IndexDescriptorPublisher},
      * {@code DurableTombstones}, {@code Metadata#indexOrResolved}) rather than the ordinary cluster-state
      * -entry path.
+     *
+     * <p>Defaults to {@link #claims(String)} -- every real implementation of this interface answers this
+     * question from the name alone (see this type's own javadoc for why that overload, not this one, is
+     * the primitive a plugin should implement). Override this directly only if a claim genuinely depends on
+     * request content a name alone can't express.
      */
-    boolean claims(String indexName, CreateIndexClusterStateUpdateRequest request);
+    default boolean claims(String indexName, CreateIndexClusterStateUpdateRequest request) {
+        return claims(indexName);
+    }
+
+    /**
+     * Whether this strategy claims the given index name, with no request in scope. Used at call sites that
+     * only ever have a name (or a finished {@link IndexMetadata}, which carries one) to consult, not the
+     * original creation request -- e.g. {@code MetadataCreateIndexService}'s two-plane-collision refusal,
+     * which runs after the index has already been built.
+     *
+     * <p>Defaults to {@code false}, matching this interface's overall "unregistered/unclaimed changes
+     * nothing" shape: a node without a plugin overriding this sees every name as unclaimed.
+     */
+    default boolean claims(String indexName) {
+        return false;
+    }
+
+    /**
+     * Whether a finished {@link IndexMetadata} should skip its cluster-state entry entirely -- a strictly
+     * narrower, post-build question than {@link #claims}, since a name can be admitted to this strategy's
+     * plane in general (worth taking off the ordinary road) yet still fail this check for a reason only
+     * knowable once the index is fully built (e.g. it isn't representable the way this strategy's
+     * off-cluster-state storage requires). {@code MetadataCreateIndexService#clusterStateCreateIndex}
+     * consults this, not {@link #claims}, to decide whether to write a cluster-state entry at all.
+     *
+     * <p>Defaults to {@code false}: an unclaimed or unregistered index always keeps its cluster-state
+     * entry, exactly today's behavior for a node without this strategy installed.
+     */
+    default boolean skipsClusterState(IndexMetadata indexMetadata) {
+        return false;
+    }
+
+    /**
+     * A human-readable description of the namespace/condition this strategy claims, for use in
+     * user-facing error text (e.g. "the index cannot have a cluster state entry because it is in
+     * &lt;this&gt;"). Only ever read after {@link #claims} has already answered {@code true}, so a plugin
+     * whose claim is unconditional can return a fixed string; a plugin whose claim depends on more than the
+     * name can still describe it generically here.
+     *
+     * <p>Defaults to a generic description that names no product/plugin concept, matching this interface's
+     * own core-side vocabulary.
+     */
+    default String describeClaimedNamespace() {
+        return "a namespace claimed by a registered index-creation strategy";
+    }
 }

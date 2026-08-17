@@ -91,12 +91,22 @@ public class GatedIndexMappingUpdateTests extends OpenSearchTestCase {
         );
     }
 
+    @Before
+    public void registerCreationStrategyBridge() {
+        // D2's final slice moved MetadataCreateIndexService's own skipsClusterState consultation onto
+        // IndexCreationStrategyRegistry -- this test only registers on DescriptorOnlyCreation directly, so
+        // without this bridge (safe unconditionally, matching production's own ServerlessStoragePlugin
+        // wiring) the gate below would never be reachable through the path core actually consults.
+        IndexCreationStrategyRegistry.register(new SupplierBackedIndexCreationStrategy());
+    }
+
     @After
     public void clearRegistrations() {
         DescriptorOnlyCreation.register(null);
         IndexDescriptorPublisher.register(null);
         IndexDescriptorPublisher.registerCreator(null);
         MappingGenerationStore.register(null);
+        IndexCreationStrategyRegistry.register(null);
     }
 
     /**

@@ -14,6 +14,7 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.test.OpenSearchTestCase;
 import org.junit.After;
+import org.junit.Before;
 
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -29,18 +30,25 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public class RefuseGatedWriteOnClusterStateThreadTests extends OpenSearchTestCase {
 
+    @Before
+    public void registerCreationStrategyBridge() {
+        // D2's final slice moved clusterStateCreateIndex's skipsClusterState consultation onto
+        // IndexCreationStrategyRegistry -- see ServerlessNamespaceTests's own javadoc for the pre-existing
+        // gap this same bridge closes.
+        IndexCreationStrategyRegistry.register(new SupplierBackedIndexCreationStrategy());
+    }
+
     @After
     public void clearRegistrations() {
         DescriptorOnlyCreation.register(null);
         IndexDescriptorPublisher.register(null);
         IndexDescriptorPublisher.registerCreator(null);
+        IndexCreationStrategyRegistry.register(null);
     }
 
     public void testGatedCreationOnClusterStateThreadIsRefusedNotBlocked() throws Exception {
         DescriptorOnlyCreation.register(indexMetadata -> true);
-        IndexDescriptorPublisher.registerCreator(
-            descriptor -> CompletableFuture.completedFuture(Boolean.TRUE)
-        );
+        IndexDescriptorPublisher.registerCreator(descriptor -> CompletableFuture.completedFuture(Boolean.TRUE));
 
         AtomicReference<Throwable> caught = new AtomicReference<>();
         CountDownLatch done = new CountDownLatch(1);
@@ -63,7 +71,10 @@ public class RefuseGatedWriteOnClusterStateThreadTests extends OpenSearchTestCas
             }
         }, "opensearch[test][clusterManagerService#updateTask][T#1]");
         updateThread.start();
-        assertTrue("the update-task thread must finish quickly, not block on a store write", done.await(10, java.util.concurrent.TimeUnit.SECONDS));
+        assertTrue(
+            "the update-task thread must finish quickly, not block on a store write",
+            done.await(10, java.util.concurrent.TimeUnit.SECONDS)
+        );
         updateThread.join();
 
         assertNotNull("a gated creation reached on the cluster-state-update thread must be refused", caught.get());
@@ -77,9 +88,7 @@ public class RefuseGatedWriteOnClusterStateThreadTests extends OpenSearchTestCas
 
     public void testGatedCreationOffClusterStateThreadStillWorks() {
         DescriptorOnlyCreation.register(indexMetadata -> true);
-        IndexDescriptorPublisher.registerCreator(
-            descriptor -> CompletableFuture.completedFuture(Boolean.TRUE)
-        );
+        IndexDescriptorPublisher.registerCreator(descriptor -> CompletableFuture.completedFuture(Boolean.TRUE));
 
         AtomicReference<CompletableFuture<Boolean>> handedOver = new AtomicReference<>();
         ClusterState result = MetadataCreateIndexService.clusterStateCreateIndex(

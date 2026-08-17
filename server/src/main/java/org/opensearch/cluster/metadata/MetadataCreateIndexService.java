@@ -2373,7 +2373,16 @@ public class MetadataCreateIndexService {
         // Failure semantics invert from H2b's here. During dual write a lost descriptor cost a
         // comparison; now it costs the index, so publish is required to report that someone was
         // listening rather than being allowed to no-op.
-        if (DescriptorOnlyCreation.skipsClusterState(indexMetadata)) {
+        //
+        // Phase D2 of core-pluggability-refactor-plan.md (final slice): IndexCreationStrategyRegistry
+        // .skipsClusterState(...) replaces DescriptorOnlyCreation.skipsClusterState(...) directly here --
+        // the same predicate, discovered through the SPI instead of the static registry. Deliberately not
+        // IndexCreationStrategyRegistry.claims(...): that answers a different, broader question (is this
+        // name/request admitted to the strategy's plane at all), while this branch needs the strategy's own
+        // narrower, post-build gate (placement ownership, descriptor representability -- see
+        // IndexCreationStrategy#skipsClusterState's own javadoc for why the two can disagree). Everything
+        // below this line -- the nine lines T18/T23/T17/T49/T52/W4 are load-bearing for -- is unchanged.
+        if (IndexCreationStrategyRegistry.skipsClusterState(indexMetadata)) {
             // T18. The descriptor write is the creation, so it goes through createGated rather than
             // publish: op_type=create makes it atomic against a competing creation (T23 measured eight
             // concurrent creations of one name all acknowledged without it), and the future carries the
@@ -2447,14 +2456,23 @@ public class MetadataCreateIndexService {
         // name a live descriptor already held. In the namespace there is no such road: an index that cannot
         // be gated cannot exist under this name, and the caller is told which feature stopped it rather than
         // being handed a differently-shaped index than it asked for.
-        if (DescriptorOnlyCreation.isRegistered() && DescriptorOnlyCreation.namesAServerlessIndex(indexName)) {
+        //
+        // Phase D2 of core-pluggability-refactor-plan.md (final slice): IndexCreationStrategyRegistry
+        // .claims(indexName) replaces DescriptorOnlyCreation.isRegistered() && namesAServerlessIndex(...) --
+        // the same predicate (see IndexCreationStrategy#claims(String)'s own javadoc for why the name-only
+        // overload, not the request-taking one, is what belongs here: this branch runs after the index is
+        // already built, with no CreateIndexClusterStateUpdateRequest in scope). The error text's namespace
+        // description is now sourced from the registered strategy too, instead of interpolating
+        // DescriptorOnlyCreation.SERVERLESS_NAME_PREFIX directly -- the message-text half of the same
+        // core-shouldn't-name-the-plugin's-vocabulary problem the boolean check itself already had.
+        if (IndexCreationStrategyRegistry.claims(indexName)) {
             String reason = DescriptorRepresentable.whyNotRepresentable(indexMetadata);
             throw new IllegalArgumentException(
                 "index ["
                     + indexName
-                    + "] is in the serverless namespace ["
-                    + DescriptorOnlyCreation.SERVERLESS_NAME_PREFIX
-                    + "] and so may not have a cluster state entry, but it could not be gated"
+                    + "] is in "
+                    + IndexCreationStrategyRegistry.describeClaimedNamespace()
+                    + " and so may not have a cluster state entry, but it could not be gated"
                     + (reason == null ? "" : ": " + reason)
                     + ". Create it under a name outside that namespace, or drop what makes it "
                     + "unrepresentable as a descriptor."
@@ -2675,6 +2693,12 @@ public class MetadataCreateIndexService {
         // Deliberately not the larger change the plan's own D2 sketch also names for this method (deleting
         // it entirely in favor of a plugin-owned IndexCreationValidator) -- that changes what gets validated
         // and where; this changes only how the same predicate is discovered.
+        //
+        // Final D2 slice: the error text below now sources its namespace description from the registered
+        // strategy (IndexCreationStrategyRegistry.describeClaimedNamespace()) instead of interpolating
+        // DescriptorOnlyCreation.SERVERLESS_NAME_PREFIX directly -- the same message-text fix applied at
+        // clusterStateCreateIndex's own two-plane-collision refusal, so core stops naming this plugin's
+        // vocabulary in both places that do, not just the boolean check the first D2 slices already moved.
         if (IndexCreationStrategyRegistry.claims(request.index(), request) == false) {
             return;
         }
@@ -2693,9 +2717,9 @@ public class MetadataCreateIndexService {
         throw new IllegalArgumentException(
             "index ["
                 + request.index()
-                + "] is in the serverless namespace ["
-                + DescriptorOnlyCreation.SERVERLESS_NAME_PREFIX
-                + "], whose indices keep no cluster state entry, and it requests "
+                + "] is in "
+                + IndexCreationStrategyRegistry.describeClaimedNamespace()
+                + ", whose indices keep no cluster state entry, and it requests "
                 + unsupported
                 + ", which such an index cannot have. Create it outside the namespace, or drop what it "
                 + "cannot support."

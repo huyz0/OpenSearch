@@ -8,8 +8,6 @@
 
 package org.opensearch.cluster.metadata;
 
-import org.opensearch.action.admin.indices.create.CreateIndexClusterStateUpdateRequest;
-
 /**
  * Phase D2 of {@code core-pluggability-refactor-plan.md}: a generic {@link IndexCreationStrategy} adapter
  * delegating to {@link DescriptorOnlyCreation}'s existing static registry, mirroring {@code
@@ -25,11 +23,29 @@ import org.opensearch.action.admin.indices.create.CreateIndexClusterStateUpdateR
  * to install unconditionally, including before {@link DescriptorOnlyCreation#register} has ever run
  * (nothing gated yet) or on a node with descriptor gating disabled entirely (nothing ever registers) --
  * both cases already resolve to {@code false} today, and continue to.
+ *
+ * <p><b>Extended for D2's final two call sites</b> ({@code MetadataCreateIndexService#clusterStateCreateIndex}'s
+ * {@code skipsClusterState} branch and its two-plane-collision refusal): {@link #claims(String)} (not the
+ * two-arg overload, which now defaults to it) carries the actual name-only check that used to live directly
+ * on the two-arg method -- nothing about the check itself changed, only which method expresses it, matching
+ * this whole adapter's own "same answer, second path" contract. {@link #skipsClusterState} and {@link
+ * #describeClaimedNamespace()} delegate to {@link DescriptorOnlyCreation}'s existing gate and namespace
+ * constant the same way.
  */
 public final class SupplierBackedIndexCreationStrategy implements IndexCreationStrategy {
 
     @Override
-    public boolean claims(String indexName, CreateIndexClusterStateUpdateRequest request) {
+    public boolean claims(String indexName) {
         return DescriptorOnlyCreation.isRegistered() && DescriptorOnlyCreation.namesAServerlessIndex(indexName);
+    }
+
+    @Override
+    public boolean skipsClusterState(IndexMetadata indexMetadata) {
+        return DescriptorOnlyCreation.skipsClusterState(indexMetadata);
+    }
+
+    @Override
+    public String describeClaimedNamespace() {
+        return "the serverless namespace [" + DescriptorOnlyCreation.SERVERLESS_NAME_PREFIX + "]";
     }
 }
