@@ -85,6 +85,25 @@ public abstract class DataFormat {
         return true;
     }
 
+    /**
+     * Phase F of {@code core-pluggability-refactor-plan.md}. Whether a dynamically-mapped {@code text}
+     * value under this format should get the classic auto-added {@code .keyword} multi-field (with an
+     * {@code ignore_above} of 256) alongside the {@code text} field itself -- see {@code
+     * DocumentParser#builderSupplierForText}.
+     *
+     * <p>Defaults to {@code false}, matching every pluggable format's current behavior exactly: before this
+     * method existed, {@code DocumentParser.builderSupplierForText} never added the auto-keyword multi-field
+     * whenever the pluggable-data-format feature was enabled at all, uniformly across every format. A format
+     * that does not override this method therefore keeps today's behavior unchanged. A format whose backend
+     * benefits from (or needs) the same term-aggregation/sort-friendly keyword shape that non-pluggable
+     * indices get by default overrides this to return {@code true}.
+     *
+     * @return whether this format wants the auto-added keyword multi-field on dynamically-mapped text
+     */
+    public boolean dynamicTextIncludesKeywordMultiField() {
+        return false;
+    }
+
     @Override
     public final boolean equals(Object o) {
         if (this == o) return true;
