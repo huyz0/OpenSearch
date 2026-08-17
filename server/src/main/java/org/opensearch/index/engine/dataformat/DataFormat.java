@@ -46,6 +46,26 @@ public abstract class DataFormat {
      */
     public abstract Set<FieldTypeCapabilities> supportedFields();
 
+    /**
+     * Phase F of {@code core-pluggability-refactor-plan.md}. Mapper type names (e.g. {@code "nested"}) this
+     * format cannot handle -- structural, whole-mapper-tree-shape questions, distinct from {@link
+     * #supportedFields()}'s per-field-type capability model, which has no vocabulary for them.
+     *
+     * <p>Defaults to {@code Set.of("nested")}, matching every pluggable format's current behavior exactly:
+     * before this method existed, {@code ObjectMapper.TypeParser.parseNested} rejected a nested mapper
+     * whenever the pluggable-data-format feature was enabled at all, uniformly across every format, with no
+     * per-format opinion possible. A format that does not override this method is therefore unaffected by
+     * this method's existence -- it keeps today's universal "nested is unsupported" behavior for free,
+     * rather than silently gaining nested support it was never verified to handle. A format wanting to
+     * declare it *does* support nested documents overrides this to exclude {@code "nested"} (or return
+     * {@code Set.of()}).
+     *
+     * @return the mapper type names this format does not support
+     */
+    public Set<String> unsupportedMapperTypes() {
+        return Set.of("nested");
+    }
+
     @Override
     public final boolean equals(Object o) {
         if (this == o) return true;
