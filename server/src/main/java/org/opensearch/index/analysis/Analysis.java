@@ -343,6 +343,13 @@ public class Analysis {
     }
 
     public static Path resolveAnalyzerPath(Environment env, String wordListPath) {
+        // Bug fix (path traversal): this resolved and normalized wordListPath without ever checking it
+        // stayed under the config directory -- unlike parseWordList's own call site above (line 257),
+        // which already guards the identical resolve-and-normalize with isUnderConfig. A wordListPath
+        // containing ".." could previously escape config/ entirely.
+        if (isUnderConfig(env, wordListPath) == false) {
+            throw new IllegalArgumentException("Resource path must be inside config directory: " + wordListPath);
+        }
         return env.configDir().resolve(wordListPath).normalize();
     }
 
