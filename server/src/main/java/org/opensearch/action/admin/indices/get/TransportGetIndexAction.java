@@ -35,7 +35,6 @@ package org.opensearch.action.admin.indices.get;
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.clustermanager.info.TransportClusterInfoAction;
 import org.opensearch.cluster.ClusterState;
-import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.AliasMetadata;
 import org.opensearch.cluster.metadata.Context;
 import org.opensearch.cluster.metadata.IndexMetadata;
@@ -151,7 +150,7 @@ public class TransportGetIndexAction extends TransportClusterInfoAction<GetIndex
                             // on a name the resolver had just accepted -- a crash rather than the silent
                             // drop the identical pattern caused in TransportGetSettingsAction, but with the
                             // same root cause: metadata read from the one place a gated index is never in.
-                            IndexMetadata indexMetadata = AbsentIndexDescriptorSuppliers.metadataOrDescriptor(state.metadata(), index);
+                            IndexMetadata indexMetadata = state.metadata().indexOrResolved(index);
                             if (indexMetadata == null) {
                                 continue;
                             }
@@ -176,7 +175,7 @@ public class TransportGetIndexAction extends TransportClusterInfoAction<GetIndex
                     if (!doneContext) {
                         final Map<String, Context> contextBuilder = new HashMap<>();
                         for (String index : concreteIndices) {
-                            IndexMetadata indexMetadata = AbsentIndexDescriptorSuppliers.metadataOrDescriptor(state.metadata(), index);
+                            IndexMetadata indexMetadata = state.metadata().indexOrResolved(index);
                             if (indexMetadata == null) {
                                 continue;
                             }

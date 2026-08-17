@@ -38,7 +38,6 @@ import org.opensearch.action.support.clustermanager.TransportClusterManagerNodeR
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.block.ClusterBlockLevel;
-import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.ResolvedIndices;
@@ -129,7 +128,7 @@ public class TransportGetSettingsAction extends TransportClusterManagerNodeReadA
             // GatedPopulationSoakIT measured what that looks like at population: 50,000 gated names looked
             // up, 0 resolved, 0 failures. An empty settings map reads exactly like a correct answer for an
             // index that has no settings, which is why it survived this long unnoticed.
-            IndexMetadata indexMetadata = AbsentIndexDescriptorSuppliers.metadataOrDescriptor(state.getMetadata(), concreteIndex);
+            IndexMetadata indexMetadata = state.getMetadata().indexOrResolved(concreteIndex);
             if (indexMetadata == null) {
                 continue;
             }
