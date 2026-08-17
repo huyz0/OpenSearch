@@ -32,8 +32,10 @@
 
 package org.opensearch.plugins;
 
+import org.opensearch.cluster.metadata.IndexMetadataResolver;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.node.DiscoveryNode;
+import org.opensearch.cluster.routing.IndexRoutingResolver;
 import org.opensearch.cluster.routing.allocation.ExistingShardsAllocator;
 import org.opensearch.cluster.routing.allocation.allocator.ShardsAllocator;
 import org.opensearch.cluster.routing.allocation.decider.AllocationDecider;
@@ -43,6 +45,7 @@ import org.opensearch.common.settings.Settings;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Map;
+import java.util.Optional;
 import java.util.function.Supplier;
 
 /**
@@ -92,6 +95,30 @@ public interface ClusterPlugin {
      */
     default Collection<IndexNameExpressionResolver.ExpressionResolver> getIndexNameCustomResolvers() {
         return Collections.emptyList();
+    }
+
+    /**
+     * Phase C of {@code core-pluggability-refactor-plan.md}: a fallback for resolving an index's {@link
+     * org.opensearch.cluster.metadata.IndexMetadata} when {@link org.opensearch.cluster.metadata.Metadata}
+     * has no entry for it -- see {@link org.opensearch.cluster.metadata.IndexMetadataResolver}'s own
+     * javadoc for why this is a single seam rather than something every caller needs to know about.
+     * Empty by default, so a node without this plugin resolves exactly as it always has.
+     *
+     * @opensearch.experimental
+     */
+    default Optional<IndexMetadataResolver> getIndexMetadataResolver() {
+        return Optional.empty();
+    }
+
+    /**
+     * Phase C of {@code core-pluggability-refactor-plan.md}: the routing-table counterpart to {@link
+     * #getIndexMetadataResolver()} -- see {@link IndexRoutingResolver}'s own javadoc. Empty by default,
+     * so a node without this plugin resolves exactly as it always has.
+     *
+     * @opensearch.experimental
+     */
+    default Optional<IndexRoutingResolver> getIndexRoutingResolver() {
+        return Optional.empty();
     }
 
     /**
