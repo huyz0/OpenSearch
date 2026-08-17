@@ -57,6 +57,8 @@ import org.opensearch.monitor.MonitorService;
 import org.opensearch.monitor.os.OsProbe;
 import org.opensearch.node.remotestore.RemoteStoreNodeStats;
 import org.opensearch.plugin.stats.NativeAllocatorPoolStats;
+import org.opensearch.plugins.Plugin;
+import org.opensearch.plugins.PluginNodeStats;
 import org.opensearch.plugins.PluginsService;
 import org.opensearch.ratelimitting.admissioncontrol.AdmissionControlService;
 import org.opensearch.repositories.RepositoriesService;
@@ -70,6 +72,9 @@ import org.opensearch.transport.TransportService;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
@@ -263,7 +268,8 @@ public class NodeService implements Closeable {
         boolean admissionControl,
         boolean cacheService,
         boolean remoteStoreNodeStats,
-        boolean nativeMemory
+        boolean nativeMemory,
+        boolean pluginStats
     ) {
         // for indices stats we want to include previous allocated shards stats as well (it will
         // only be applied to the sensible ones to use, like refresh/merge/flush/indexing stats)
@@ -305,13 +311,32 @@ public class NodeService implements Closeable {
             // Serialized over the wire so the coordinator renders the source node's value,
             // not its own. Returns -1 on non-Linux platforms or when /proc/self/status is
             // unreadable.
-            OsProbe.getInstance().getProcessNativeMemoryBytes()
+            OsProbe.getInstance().getProcessNativeMemoryBytes(),
+            pluginStats ? collectPluginStats() : null
         );
     }
 
     @Nullable
     private NativeAllocatorPoolStats collectNativeAllocatorStats() {
         return nativeAllocatorStatsSupplier != null ? nativeAllocatorStatsSupplier.get() : null;
+    }
+
+    /**
+     * Phase B of core-pluggability-refactor-plan.md. Collects every installed plugin's own
+     * {@link Plugin#nodeStats()} contribution into one map, keyed by each entry's
+     * {@code getWriteableName()} -- the same key {@link NodeStats#toXContent} renders it under and the
+     * transport wire format frames it by. A later plugin overwriting an earlier one under the same key is
+     * a plugin-authoring bug (two plugins both naming their {@link PluginNodeStats} the same
+     * {@code getWriteableName()}), not something this method tries to detect or resolve.
+     */
+    private Map<String, PluginNodeStats> collectPluginStats() {
+        Map<String, PluginNodeStats> collected = new HashMap<>();
+        for (Plugin plugin : pluginService.filterPlugins(Plugin.class)) {
+            for (PluginNodeStats stats : plugin.nodeStats()) {
+                collected.put(stats.getWriteableName(), stats);
+            }
+        }
+        return collected;
     }
 
     public IngestService getIngestService() {

@@ -39,6 +39,7 @@ import org.opensearch.cluster.metadata.IndexTemplateMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.node.DiscoveryNodeRole;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.inject.Module;
 import org.opensearch.common.lifecycle.LifecycleComponent;
@@ -263,6 +264,24 @@ public abstract class Plugin implements Closeable {
      * @return paths to probe; empty by default
      */
     public List<Path> getAdditionalHealthPaths(Settings settings) {
+        return Collections.emptyList();
+    }
+
+    /**
+     * Returns plugin-contributed node statistics that surface under {@code _nodes/stats}.
+     * Each entry renders at top-level under {@code nodes.<id>.<getWriteableName()>}.
+     *
+     * <p>Plugins that override this method must also register the concrete
+     * {@link PluginNodeStats} subclass via {@link #getNamedWriteables()} so the
+     * coordinator can deserialize per-node payloads received over transport.
+     *
+     * <p>Default: empty. Restored by Phase B of {@code core-pluggability-refactor-plan.md} -- see
+     * {@link PluginNodeStats}'s own javadoc for why.
+     *
+     * @opensearch.experimental
+     */
+    @ExperimentalApi
+    public List<PluginNodeStats> nodeStats() {
         return Collections.emptyList();
     }
 
