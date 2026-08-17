@@ -8,8 +8,12 @@
 
 package org.opensearch.serverless.storage;
 
+import org.opensearch.cluster.metadata.IndexMetadataResolver;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
+import org.opensearch.cluster.metadata.SupplierBackedIndexMetadataResolver;
+import org.opensearch.cluster.routing.IndexRoutingResolver;
 import org.opensearch.cluster.routing.ShardRouting;
+import org.opensearch.cluster.routing.SupplierBackedIndexRoutingResolver;
 import org.opensearch.cluster.routing.allocation.ExistingShardsAllocator;
 import org.opensearch.cluster.routing.allocation.decider.AllocationDecider;
 import org.opensearch.cluster.service.ClusterService;
@@ -2905,6 +2909,27 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
     @Override
     public Map<String, ExistingShardsAllocator> getExistingShardsAllocators() {
         return Collections.singletonMap(ServerlessStorageExistingShardsAllocator.NAME, serverlessStorageExistingShardsAllocator);
+    }
+
+    /**
+     * Phase C5 of {@code core-pluggability-refactor-plan.md}. Additive: {@link
+     * org.opensearch.serverless.storage.descriptor.DescriptorGate#install} still registers with {@link
+     * org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers} exactly as before -- this only adds a
+     * second, generic path ({@code Metadata#index(String)} on a miss) to the same answer, which {@link
+     * SupplierBackedIndexMetadataResolver} reads by delegating straight back to that registry. See that
+     * class's own javadoc for why it is safe to return unconditionally here (including before {@code
+     * DescriptorGate.install} has run, and on a node where descriptor gating is disabled entirely): with
+     * nothing registered in the static registry yet, it resolves to {@code null}, identical to today.
+     */
+    @Override
+    public Optional<IndexMetadataResolver> getIndexMetadataResolver() {
+        return Optional.of(new SupplierBackedIndexMetadataResolver());
+    }
+
+    /** The routing counterpart to {@link #getIndexMetadataResolver()} -- see that method's own javadoc. */
+    @Override
+    public Optional<IndexRoutingResolver> getIndexRoutingResolver() {
+        return Optional.of(new SupplierBackedIndexRoutingResolver());
     }
 
     @Override
