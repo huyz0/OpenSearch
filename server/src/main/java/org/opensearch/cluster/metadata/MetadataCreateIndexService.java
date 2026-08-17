@@ -370,7 +370,12 @@ public class MetadataCreateIndexService {
     ) {
         // The road, chosen from the name before any of the work that would once have been needed to choose
         // it. Unregistered answers false, so an ordinary cluster never reaches the branch below.
-        if (DescriptorOnlyCreation.isRegistered() && DescriptorOnlyCreation.namesAServerlessIndex(request.index())) {
+        //
+        // Phase D2 of core-pluggability-refactor-plan.md: IndexCreationStrategyRegistry.claims(...) replaces
+        // DescriptorOnlyCreation.isRegistered() && namesAServerlessIndex(...) here -- the same predicate,
+        // discovered through the new SPI instead of the static registry directly. createGatedIndex's own
+        // body, and everything downstream of this branch, is unchanged.
+        if (IndexCreationStrategyRegistry.claims(request.index(), request)) {
             // Exact rather than admitted-on-a-guess: the name says which plane this belongs in, so there is
             // no road to fall back from and no template to resolve first.
             createGatedIndex(request, listener);
@@ -428,7 +433,9 @@ public class MetadataCreateIndexService {
      * rather than by whichever snapshot either node happened to hold.
      */
     public boolean certainlyGated(final CreateIndexClusterStateUpdateRequest request, final ClusterState state) {
-        return DescriptorOnlyCreation.isRegistered() && DescriptorOnlyCreation.namesAServerlessIndex(request.index());
+        // Phase D2 of core-pluggability-refactor-plan.md: same migration as createIndex()'s own top branch --
+        // see that call site's comment.
+        return IndexCreationStrategyRegistry.claims(request.index(), request);
     }
 
     /**
@@ -1012,7 +1019,11 @@ public class MetadataCreateIndexService {
         // which missed a template-gated creation and made it pay for the throwaway IndexService this exists
         // to avoid; then it read template-merged settings, which cost a resolution here and another there.
         // A name costs neither and cannot disagree with the gate, because the gate reads the same name.
-        if (DescriptorOnlyCreation.isRegistered() == false || DescriptorOnlyCreation.namesAServerlessIndex(request.index()) == false) {
+        //
+        // Phase D2 of core-pluggability-refactor-plan.md: same migration as createIndex()'s own top branch,
+        // negated -- isRegistered()==false || namesAServerlessIndex(...)==false is De Morgan's equivalent of
+        // !claims(...).
+        if (IndexCreationStrategyRegistry.claims(request.index(), request) == false) {
             return "the index is not in the serverless namespace";
         }
         if (sourceMetadata != null) {
@@ -2659,7 +2670,12 @@ public class MetadataCreateIndexService {
      * change than this.
      */
     private void validateServerlessNamespace(CreateIndexClusterStateUpdateRequest request) {
-        if (DescriptorOnlyCreation.isRegistered() == false || DescriptorOnlyCreation.namesAServerlessIndex(request.index()) == false) {
+        // Phase D2 of core-pluggability-refactor-plan.md: same migration as createIndex()'s own top branch,
+        // negated -- see whyATemporaryIndexServiceIsStillNeeded's comment for the De Morgan's equivalence.
+        // Deliberately not the larger change the plan's own D2 sketch also names for this method (deleting
+        // it entirely in favor of a plugin-owned IndexCreationValidator) -- that changes what gets validated
+        // and where; this changes only how the same predicate is discovered.
+        if (IndexCreationStrategyRegistry.claims(request.index(), request) == false) {
             return;
         }
         final String unsupported;

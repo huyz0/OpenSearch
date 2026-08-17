@@ -44,7 +44,7 @@ import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.block.ClusterBlockLevel;
 import org.opensearch.cluster.metadata.ComposableIndexTemplate;
 import org.opensearch.cluster.metadata.ComposableIndexTemplate.DataStreamTemplate;
-import org.opensearch.cluster.metadata.DescriptorOnlyCreation;
+import org.opensearch.cluster.metadata.IndexCreationStrategyRegistry;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.metadata.MetadataCreateDataStreamService;
@@ -144,7 +144,11 @@ public final class AutoCreateAction extends ActionType<CreateIndexResponse> {
             // Auto-creation is the door index-per-tenant actually arrives through, and the name is enough to
             // know which plane it belongs in -- no template to resolve, and no chance of disagreeing with the
             // gate, which reads the same name.
-            if (DescriptorOnlyCreation.isRegistered() && DescriptorOnlyCreation.namesAServerlessIndex(indexName)) {
+            //
+            // Phase D2 of core-pluggability-refactor-plan.md: IndexCreationStrategyRegistry.claims(...)
+            // replaces DescriptorOnlyCreation.isRegistered() && namesAServerlessIndex(...) here -- see
+            // MetadataCreateIndexService#createIndex's own comment for the same migration.
+            if (IndexCreationStrategyRegistry.claims(indexName, updateRequest)) {
                 createIndexService.createIndex(
                     updateRequest,
                     ActionListener.map(
