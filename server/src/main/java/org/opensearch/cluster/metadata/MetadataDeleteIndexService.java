@@ -105,20 +105,28 @@ public class MetadataDeleteIndexService {
 
         // Which of these are gated, decided here rather than inside the transform.
         //
-        // It has to be here because AbsentIndexDescriptorSuppliers refuses to answer on a cluster state
-        // thread at all: C1's guard returns null on clusterManagerService#updateTask, since resolving a
-        // descriptor there means a remote read on the thread that applies cluster state, which is the W4
+        // It has to be here because a resolver refuses to answer on a cluster state thread at all --
+        // Metadata#indexOrResolved's own ClusterStateMutationThreads guard (originally
+        // AbsentIndexDescriptorSuppliers's) returns null on clusterManagerService#updateTask, since resolving
+        // a descriptor there means a remote read on the thread that applies cluster state, which is the W4
         // deadlock. The first attempt at this partitioned inside execute and every index came back
         // not-gated, so the delete threw exactly as before -- the guard did its job and the code asking the
         // question was in the one place forbidden to ask it.
         //
         // This method runs on a transport thread, where blocking is allowed and where T39 already puts the
         // equivalent read for shard opening.
+        //
+        // Phase C4a of core-pluggability-refactor-plan.md: currentMetadata.index(index) on the line below is
+        // deliberately the plain, never-resolving accessor -- this is exactly the "is it gated" distinguishing
+        // check that made Metadata#index(String) auto-resolving unsafe in the first place (see Metadata
+        // #indexOrResolved's own javadoc for that history). indexOrResolved(index) on the next line is the
+        // separate, explicit "now actually fetch the gated metadata" call this method already needed a second
+        // question for.
         final Map<Index, IndexMetadata> gatedDeletions = new HashMap<>();
         final Metadata currentMetadata = clusterService.state().metadata();
         for (Index index : request.indices()) {
             if (currentMetadata.index(index) == null) {
-                IndexMetadata descriptorMetadata = AbsentIndexDescriptorSuppliers.metadataOrDescriptor(currentMetadata, index);
+                IndexMetadata descriptorMetadata = currentMetadata.indexOrResolved(index);
                 if (descriptorMetadata != null) {
                     gatedDeletions.put(index, descriptorMetadata);
                 }
@@ -323,7 +331,7 @@ public class MetadataDeleteIndexService {
      * the delete had thrown.
      *
      * <p>The map is passed in rather than computed here because resolving a descriptor is a remote read and
-     * this runs on the cluster state thread, where {@link AbsentIndexDescriptorSuppliers} refuses to answer.
+     * this runs on the cluster state thread, where {@link Metadata#indexOrResolved(Index)} refuses to answer.
      */
     private ClusterState deleteIndices(ClusterState currentState, Set<Index> indices, Map<Index, IndexMetadata> gatedDeletions) {
         final Metadata meta = currentState.metadata();
