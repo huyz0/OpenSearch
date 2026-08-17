@@ -50,7 +50,6 @@ import org.opensearch.cluster.ClusterStateObserver;
 import org.opensearch.cluster.action.shard.ShardStateAction;
 import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.block.ClusterBlockLevel;
-import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.ResolvedIndices;
 import org.opensearch.cluster.node.DiscoveryNode;
@@ -574,10 +573,7 @@ public abstract class TransportReplicationAction<
                 // The twelfth site, found by T39 rather than by S52 or S53, because it is past the point
                 // every earlier attempt stopped at: it runs on the data node once the primary permit is
                 // held, which no gated write had ever reached.
-                final IndexMetadata indexMetadata = AbsentIndexDescriptorSuppliers.metadataOrDescriptor(
-                    clusterState.metadata(),
-                    primaryShardReference.routingEntry().index()
-                );
+                final IndexMetadata indexMetadata = clusterState.metadata().indexOrResolved(primaryShardReference.routingEntry().index());
                 if (indexMetadata == null) {
                     throw new IndexNotFoundException(primaryShardReference.routingEntry().index());
                 }
@@ -1011,10 +1007,7 @@ public abstract class TransportReplicationAction<
                 // Site 10. The shard has been chosen by now, so this is the coordinator asking for the
                 // index's bones one last time before it hands the request to a node. Absent from cluster
                 // state is not absent from the cluster.
-                final IndexMetadata indexMetadata = AbsentIndexDescriptorSuppliers.metadataOrDescriptor(
-                    state.metadata(),
-                    request.shardId().getIndex()
-                );
+                final IndexMetadata indexMetadata = state.metadata().indexOrResolved(request.shardId().getIndex());
                 if (indexMetadata == null) {
                     // ensure that the cluster state on the node is at least as high as the node that decided that the index was there
                     if (state.version() < request.routedBasedOnClusterVersion()) {
