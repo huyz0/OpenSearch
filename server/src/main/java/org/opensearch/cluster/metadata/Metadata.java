@@ -296,6 +296,30 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
 
     private final Map<String, SortedMap<Long, String>> systemTemplatesLookup;
 
+    /**
+     * Phase C2 of {@code core-pluggability-refactor-plan.md}. A plugin-supplied fallback {@link
+     * #index(String)} consults on a lookup miss -- see {@link IndexMetadataResolver}'s own javadoc.
+     *
+     * <p>Deliberately NOT a constructor parameter and NOT part of {@link #writeTo}/{@link #readFrom}: a
+     * resolver is a per-node, in-process callback (typically closing over a plugin's local caches), not
+     * cluster state -- it would be meaningless, and unsafely non-serializable, to send over the wire.
+     * Instead it is propagated by every code path that produces a new {@code Metadata} from an existing
+     * one on the <em>same</em> node -- {@link Builder#Builder(Metadata)} and {@link MetadataDiff#apply}
+     * both carry the previous instance's resolver forward, so once attached it survives every subsequent
+     * mutation and every diff application on that node indefinitely.
+     *
+     * <p><b>What is NOT yet wired (tracked as the remaining Phase C2 step):</b> the single attachment
+     * point that gives a node's very first {@code ClusterState}/{@code Metadata} its resolver in the
+     * first place -- e.g. a {@code ClusterStateApplier} registered during {@code Node} construction,
+     * alongside wherever the resolved {@code ClusterPlugin} list is already collected for other hooks
+     * like {@code EnginePlugin#getEngineFactory}. Until that lands, {@link #attachIndexMetadataResolver}
+     * has no real caller and this field stays {@code null} on every node -- {@link #index(String)}
+     * behaves exactly as it did before this field existed. Landing the propagation mechanics first (this
+     * commit) and the one-time attachment point separately keeps each piece independently testable and
+     * revertable, which matters for a change this close to the hottest read path in the codebase.
+     */
+    private transient IndexMetadataResolver resolver;
+
     Metadata(
         String clusterUUID,
         boolean clusterUUIDCommitted,
@@ -827,7 +851,27 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
 
     public IndexMetadata index(String index) {
         IndexMetadataHolder holder = indices.get(index);
-        return holder == null ? null : holder.get();
+        if (holder != null) {
+            return holder.get();
+        }
+        // Phase C2 of core-pluggability-refactor-plan.md: the one seam every caller of this method gets
+        // for free, instead of each of them separately calling a static registry on their own miss.
+        return resolver == null ? null : resolver.resolve(this, index);
+    }
+
+    /**
+     * Attaches the per-node fallback {@link #index(String)} consults on a miss. See {@link #resolver}'s
+     * own javadoc for why this is a mutable setter rather than a constructor parameter, and for what
+     * still has to call it before this has any effect.
+     */
+    public void attachIndexMetadataResolver(IndexMetadataResolver resolver) {
+        this.resolver = resolver;
+    }
+
+    /** The currently-attached resolver, or {@code null} if none is. Exposed mainly for tests and for the
+     *  code paths ({@link Builder#Builder(Metadata)}, {@link MetadataDiff#apply}) that propagate it. */
+    public IndexMetadataResolver indexMetadataResolver() {
+        return resolver;
     }
 
     /**
@@ -1213,6 +1257,13 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
             builder.indexHolders(indices.apply(part.indices));
             builder.templates(templates.apply(part.templates.getTemplates()));
             builder.customs(customs.apply(part.customs));
+            // Phase C2 of core-pluggability-refactor-plan.md: builder() above is the from-scratch
+            // no-arg constructor (deliberately, per the comment above), so it has no resolver to carry
+            // forward on its own -- unlike Builder(Metadata), which copies one. Diff application is the
+            // normal way cluster state propagates after the first full state, so without this line every
+            // node but the one that originally built a Metadata locally would silently lose its resolver
+            // on the very next cluster state update.
+            builder.resolver(part.resolver);
             return builder.build();
         }
     }
@@ -1474,6 +1525,9 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
 
         private Map<String, SortedMap<Long, String>> systemTemplatesLookup;
 
+        /** Carried forward to whatever this builder produces. See {@link Metadata#resolver}'s own javadoc. */
+        private IndexMetadataResolver resolver;
+
         public Builder() {
             clusterUUID = UNKNOWN_CLUSTER_UUID;
             indices = new HashMap<>();
@@ -1495,6 +1549,18 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
             this.templates = new HashMap<>(metadata.templates.getTemplates());
             this.customs = new HashMap<>(metadata.customs);
             this.previousMetadata = metadata;
+            this.resolver = metadata.resolver;
+        }
+
+        /**
+         * Overrides the resolver this builder's {@link #build()} attaches, instead of whatever {@link
+         * #Builder(Metadata)} (if used) already copied forward. Most callers never need this -- the
+         * resolver already propagates on its own -- this exists for the one place that has to attach it
+         * in the first place (a from-scratch {@link #builder()} has nothing to copy from).
+         */
+        public Builder resolver(IndexMetadataResolver resolver) {
+            this.resolver = resolver;
+            return this;
         }
 
         /**
@@ -1985,7 +2051,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
         }
 
         protected Metadata buildMetadataWithPreviousIndicesLookups() {
-            return new Metadata(
+            Metadata built = new Metadata(
                 clusterUUID,
                 clusterUUIDCommitted,
                 version,
@@ -2005,6 +2071,8 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
                 Collections.unmodifiableSortedMap(previousMetadata.indicesLookup),
                 systemTemplatesLookup
             );
+            built.resolver = resolver;
+            return built;
         }
 
         protected Metadata buildMetadataWithRecomputedIndicesLookups() {
@@ -2110,7 +2178,7 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
             String[] allClosedIndicesArray = allClosedIndices.toArray(Strings.EMPTY_ARRAY);
             String[] visibleClosedIndicesArray = visibleClosedIndices.toArray(Strings.EMPTY_ARRAY);
 
-            return new Metadata(
+            Metadata built = new Metadata(
                 clusterUUID,
                 clusterUUIDCommitted,
                 version,
@@ -2130,6 +2198,8 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
                 indicesLookup,
                 systemTemplatesLookup
             );
+            built.resolver = resolver;
+            return built;
         }
 
         private SortedMap<String, IndexAbstraction> buildIndicesLookup() {
