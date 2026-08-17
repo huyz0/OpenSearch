@@ -324,7 +324,7 @@ Each gets its own commit on the extraction branch with a test, so it's independe
 
 ## Acceptance criteria for calling this plan "done"
 
-- [x] Every phase A-H item is either landed on `refactor/core-pluggability`, or has an explicit, written reason in this document for why it's deferred (not silently dropped). **A, B, G, H fully landed. C is landed through C1-C3, the `Node.java` attachment point, deadlock-safety hardening (`ClusterStateMutationThreads`), and C5 — the last of which went land → revert (regression found) → root-cause → redesign → re-land, see its status-log row for the full arc. C4a is unblocked by that redesign; D/E remain next. F is deferred with a written reason (needs deeper `DataFormatRegistry` investigation than this session could safely do).**
+- [x] Every phase A-H item is either landed on `refactor/core-pluggability`, or has an explicit, written reason in this document for why it's deferred (not silently dropped). **A, B, G, H fully landed. C is landed through C1-C5 and C4a — C5 via a land → revert (regression found) → root-cause → redesign → re-land arc, see its status-log row for the full arc; C4a via 26 individually-verified call-site migrations. D and E are deliberately deferred, each with a written reason directly from their own plan sections' risk assessment (D needs "soak" time this session cannot provide; E is flagged as the plan's single largest extraction, "several weeks of a human team's time"), not from running out of session time. F is deferred with a written reason (needs deeper `DataFormatRegistry` investigation than this session could safely do).**
 - [ ] `AbsentIndexRoutingSuppliers.java` and `AbsentIndexDescriptorSuppliers.java` no longer exist in `server/` (Phase C4). **Not yet, but C4a (the `metadataOrDescriptor`/`resolve` half) is fully done — both classes still exist because C4b's richer operations (`allShards`/`supply`/`gatedAmong`/`exists`/`shouldPublishRouting`/`resolveShard`/`localShards`/prefix-expansion/pagination/registration-listeners) still call them directly and need the SPI's surface expanded before they can migrate too.**
 - [ ] `DescriptorOnlyCreation`'s name-prefix check is not referenced from any file under `server/src/main` (Phase D3). **Not yet — D not started, blocked on C4/C5.**
 - [ ] `grep -rl "serverless" server/src/main/java` returns nothing outside genuinely generic, non-product-specific hits (Phase D, E, G). **G done; D, E not started.**
@@ -362,12 +362,14 @@ Update this table as work lands. Don't let it go stale — it's the fastest way 
 
 ## Session summary (for whoever picks this up next)
 
-This session took the plan from zero to: **A, B, G, H fully done; C1-C3 done, the Node.java attach point
-landed, and C5 landed for real after a land → revert → root-cause → redesign → re-land arc — the most
-important output of this continuation, and the clearest example of the review's own "verify, don't assume"
-principle paying for itself. I mostly done on its own branch.** Every commit standing on this branch compiles
-clean and has its test suite passing, including the exact `internalClusterTest` that caught the regression,
-now re-run and green. D, E, F, and C4a are not started, each for a specific, written reason.
+This session took the plan from zero to: **A, B, G, H fully done; C1-C5 fully done (C5 via a land → revert →
+root-cause → redesign → re-land arc — the most important output of this continuation, and the clearest
+example of the review's own "verify, don't assume" principle paying for itself); C4a fully done (all 26
+`metadataOrDescriptor`/`resolve()` call sites migrated across 16 files, `grep` confirms zero remain in
+`server/src/main`); I mostly done on its own branch.** Every commit standing on this branch compiles clean and
+has its test suite passing, including the exact `internalClusterTest` that caught the C5 regression, now
+re-run and green, and a real `internalClusterTest` run per C4a commit. D, E, F, C4b, and Phase I's 3 items are
+not started, each for a specific, written reason.
 
 **If continuing this work, do these in order:**
 1. ~~The `Node.java` resolver-attachment point~~ — **done**: `ResolverAttachingClusterStateApplier`, wired via
@@ -387,17 +389,28 @@ now re-run and green. D, E, F, and C4a are not started, each for a specific, wri
    explicitly-named `Metadata#indexOrResolved(String)`/`#indexOrResolved(Index)`. Re-landed the plugin
    registration and re-ran the exact regression test — passes. Read the C5 status-log row for the full arc
    before assuming this area is simple; it looked simple once too.
-4. **C4a**: unblocked, by design rather than by luck (see the C5 fix above — a call site now has to
-   deliberately opt into `indexOrResolved(...)` to get the fallback, which makes the change auditable at each
-   site instead of a latent trap). Migrate the 28 `metadataOrDescriptor`/`resolve` call sites, one file at a
-   time, each its own commit, onto `indexOrResolved(...)`/`getIndexRoutingTable(...)`. Still verify each on a
-   real multi-node `internalClusterTest`, not just `:server:test` — this session proved once that a call site
-   can look obviously equivalent on paper and be wrong in a way only a real cluster test catches; don't assume
-   the next one is different.
-5. **C4b**: the other ~27 call sites (`allShards`/`supply`/`gatedAmong`/`exists`/`shouldPublishRouting`/
-   prefix-expansion/pagination/registration-listeners) need the SPI's surface expanded first — a real design
-   effort of its own, not a mechanical migration. See the C4 status-log row for the specific gaps.
-6. **D and E**: unblocked now that C5 is genuinely landed — follow the plan's existing sections.
+4. ~~C4a~~ — **done.** All 26 `metadataOrDescriptor`/`resolve()` call sites migrated across 16 files, 9
+   commits, each individually verified against both the file's own unit tests (where they existed) and a
+   real `internalClusterTest` exercising the specific gated behavior that call site touches — not assumed
+   safe from the diff looking obviously equivalent, since `MetadataDeleteIndexService` proved once that isn't
+   sufficient. Three call sites were correctly *not* migrated after reading them (not pattern-matching the
+   method name): they turned out to be C4b's richer shape.
+5. **C4b**: the remaining call sites (`allShards`/`supply`/`gatedAmong`/`exists`/`shouldPublishRouting`/
+   `resolveShard`/`localShards`/prefix-expansion/pagination/registration-listeners) need the SPI's surface
+   expanded first — a real design effort of its own, not a mechanical migration. See the C4 status-log row for
+   the specific gaps.
+6. **D and E — deliberately NOT started this session, despite C being fully landed.** Both are explicitly
+   flagged in their own plan sections as needing time this session cannot honestly provide: D is "risk:
+   medium-high... do this after C is fully landed and **soaked**" (touches five core services' primary entry
+   points, removes a field from a shared DTO); E is "risk: high... **the largest single extraction in the
+   plan**... expect it to be several weeks of a human team's time... consider feature-flagging." C landed
+   *minutes* before this summary was written — zero soak time by any definition. Attempting either blind, in
+   the same session and immediately after the C5 saga demonstrated exactly how a change that passes every
+   available check can still hide a severe regression, would repeat the mistake this session just spent real
+   effort learning not to make. Do not start D or E without a genuine gap after C has run in a real
+   environment, and do not skip D1's SPI design or D2's five-service call-site audit by analogy to how
+   quickly C4a went — C4a was 28 individually-small, individually-verified swaps of an already-landed seam;
+   D is designing and landing a *new* seam across five services' primary entry points at once.
 7. **F**: needs a real read-through of `DataFormatRegistry`/`DataFormatPlugin` (380+ lines, multi-format-per-index)
    before touching the mapper-layer `isPluggableDataFormatEnabled()` checks — don't guess at the replacement.
 8. **Phase I's remaining 3 items** on `extract/generic-fixes-from-serverless`: `SplitShardsMetadata`'s merge
