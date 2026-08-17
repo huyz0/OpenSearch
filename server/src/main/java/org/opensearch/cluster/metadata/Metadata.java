@@ -38,6 +38,7 @@ import org.apache.lucene.util.CollectionUtil;
 import org.opensearch.action.AliasesRequest;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.ClusterState.FeatureAware;
+import org.opensearch.cluster.ClusterStateMutationThreads;
 import org.opensearch.cluster.Diff;
 import org.opensearch.cluster.Diffable;
 import org.opensearch.cluster.DiffableUtils;
@@ -856,7 +857,17 @@ public class Metadata implements Iterable<IndexMetadata>, Diffable<Metadata>, To
         }
         // Phase C2 of core-pluggability-refactor-plan.md: the one seam every caller of this method gets
         // for free, instead of each of them separately calling a static registry on their own miss.
-        return resolver == null ? null : resolver.resolve(this, index);
+        if (resolver == null) {
+            return null;
+        }
+        // See ClusterStateMutationThreads' own javadoc for the deadlock this refusal prevents: a resolver
+        // may do real (e.g. remote) work to answer, and this thread needs to make progress before that work
+        // could complete on the one thread this codebase already knows must never be blocked this way.
+        if (ClusterStateMutationThreads.blockingIsUnsafeOnCurrentThread()) {
+            logger.debug("refusing to consult the IndexMetadataResolver for [{}] on {}", index, Thread.currentThread().getName());
+            return null;
+        }
+        return resolver.resolve(this, index);
     }
 
     /**

@@ -112,6 +112,37 @@ public class IndexRoutingResolverPropagationTests extends OpenSearchTestCase {
         );
     }
 
+    public void testGetIndexRoutingTableIsNotConsultedOnAnUnsafeThread() throws InterruptedException {
+        // Mirrors IndexMetadataResolverPropagationTests#testResolverIsNotConsultedOnAnUnsafeThread for the
+        // routing-resolver half of the same guarantee.
+        IndexMetadata gated = indexMetadata("gated");
+        Metadata metadata = Metadata.builder().build();
+        metadata.attachIndexMetadataResolver((meta, name) -> "gated".equals(name) ? gated : null);
+
+        RoutingTable routingTable = RoutingTable.builder().build();
+        routingTable.attachIndexRoutingResolver((state, meta) -> emptyRoutingTable(meta));
+
+        ClusterState state = ClusterState.builder(ClusterName.DEFAULT).metadata(metadata).routingTable(routingTable).build();
+
+        java.util.concurrent.atomic.AtomicReference<IndexRoutingTable> result = new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.atomic.AtomicReference<Throwable> failure = new java.util.concurrent.atomic.AtomicReference<>();
+        Thread clusterManagerThread = new Thread(
+            () -> {
+                try {
+                    result.set(state.getIndexRoutingTable("gated"));
+                } catch (Throwable t) {
+                    failure.set(t);
+                }
+            },
+            "opensearch[nodeA][clusterManagerService#updateTask][T#1]"
+        );
+        clusterManagerThread.start();
+        clusterManagerThread.join();
+
+        assertNull("a routing resolver must never be consulted from the cluster manager's own update thread", result.get());
+        assertNull(failure.get());
+    }
+
     public void testClusterStatePrefersPublishedRoutingOverTheResolver() {
         IndexMetadata real = indexMetadata("real");
         Metadata metadata = Metadata.builder().put(real, false).build();

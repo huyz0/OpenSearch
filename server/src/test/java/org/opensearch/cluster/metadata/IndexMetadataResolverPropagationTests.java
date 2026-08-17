@@ -73,6 +73,32 @@ public class IndexMetadataResolverPropagationTests extends OpenSearchTestCase {
         assertNotNull(applied.index("still-a-miss-after-diff"));
     }
 
+    public void testResolverIsNotConsultedOnAnUnsafeThread() throws InterruptedException {
+        // See ClusterStateMutationThreadsTests for the thread-name matching itself; this is the
+        // consumer-side guarantee IndexMetadataResolver's own javadoc documents: Metadata#index(String)
+        // must never call resolve() from one of these threads, since a resolver may do real work to answer.
+        Metadata metadata = Metadata.builder().put(index("real"), false).build();
+        metadata.attachIndexMetadataResolver(ALWAYS_SYNTHESIZE);
+
+        java.util.concurrent.atomic.AtomicReference<IndexMetadata> result = new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.atomic.AtomicReference<Throwable> failure = new java.util.concurrent.atomic.AtomicReference<>();
+        Thread clusterApplierThread = new Thread(
+            () -> {
+                try {
+                    result.set(metadata.index("synthesized"));
+                } catch (Throwable t) {
+                    failure.set(t);
+                }
+            },
+            "opensearch[nodeA][clusterApplierService#updateTask][T#1]"
+        );
+        clusterApplierThread.start();
+        clusterApplierThread.join();
+
+        assertNull("a resolver must never be consulted from the cluster applier's own update thread", result.get());
+        assertNull(failure.get());
+    }
+
     private static IndexMetadata index(String name) {
         return IndexMetadata.builder(name)
             .settings(

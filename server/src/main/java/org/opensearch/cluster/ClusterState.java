@@ -309,6 +309,11 @@ public class ClusterState implements ToXContentFragment, Diffable<ClusterState> 
         if (resolver == null) {
             return null;
         }
+        // See ClusterStateMutationThreads' own javadoc for why: independent of metadata.index(indexName)'s
+        // own identical guard below, since a resolver that answers may still do real (e.g. remote) work.
+        if (ClusterStateMutationThreads.blockingIsUnsafeOnCurrentThread()) {
+            return null;
+        }
         IndexMetadata indexMetadata = metadata.index(indexName);
         if (indexMetadata == null) {
             return null;

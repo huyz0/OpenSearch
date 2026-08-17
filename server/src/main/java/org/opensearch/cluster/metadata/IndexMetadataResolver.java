@@ -28,13 +28,23 @@ import org.opensearch.common.annotation.ExperimentalApi;
  * default, so an ordinary cluster with no such plugin installed resolves exactly as it always has --
  * {@link Metadata#index(String)} returns {@code null} for a genuinely nonexistent index either way.
  *
+ * <p><b>Never invoked on a cluster-state-mutation thread, by construction.</b> {@link Metadata#index(String)}
+ * checks {@link org.opensearch.cluster.ClusterStateMutationThreads#blockingIsUnsafeOnCurrentThread()} before
+ * consulting a resolver at all -- see that class's own javadoc for the deadlock this exists to prevent. This
+ * means a {@code resolve} implementation does <em>not</em> need to detect or guard against being called from
+ * one of those threads itself; core already guarantees it will not be. It is, however, still on the hook for
+ * every other caller of {@link Metadata#index(String)} -- which is nearly every read path in the codebase --
+ * so {@code resolve} must still answer quickly (e.g. from a resolver-owned local cache) rather than perform
+ * unbounded blocking I/O on an arbitrary request thread.
+ *
  * @opensearch.experimental
  */
 @ExperimentalApi
 public interface IndexMetadataResolver {
 
     /**
-     * Called only when {@code metadata.getIndices().get(indexName)} already returned nothing.
+     * Called only when {@code metadata.getIndices().get(indexName)} already returned nothing, and never
+     * from a thread where blocking would be unsafe -- see this interface's own javadoc.
      *
      * @param metadata  the {@link Metadata} the lookup missed against, for a resolver that needs
      *                  additional cluster-state context (e.g. to check whether the name collides with
