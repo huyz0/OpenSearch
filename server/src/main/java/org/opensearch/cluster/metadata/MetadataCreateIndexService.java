@@ -1213,7 +1213,12 @@ public class MetadataCreateIndexService {
         }
         if (INDEX_NUMBER_OF_REPLICAS_SETTING.exists(indexSettingsBuilder) == false
             || indexSettingsBuilder.get(SETTING_NUMBER_OF_REPLICAS) == null) {
-            indexSettingsBuilder.put(SETTING_NUMBER_OF_REPLICAS, DEFAULT_REPLICA_COUNT_SETTING.get(currentState.metadata().settings()));
+            // Bug fix: DEFAULT_REPLICA_COUNT_SETTING.get(currentState.metadata().settings()) only ever
+            // resolves the persistent/transient cluster settings, silently ignoring the node-local
+            // (opensearch.yml) default -- clusterSettings.get(...) correctly layers node settings as the
+            // base with persistent/transient overrides on top, matching how every other dynamic setting
+            // is meant to be read.
+            indexSettingsBuilder.put(SETTING_NUMBER_OF_REPLICAS, clusterSettings.get(DEFAULT_REPLICA_COUNT_SETTING));
         }
         if (settings.get(SETTING_AUTO_EXPAND_REPLICAS) != null && indexSettingsBuilder.get(SETTING_AUTO_EXPAND_REPLICAS) == null) {
             indexSettingsBuilder.put(SETTING_AUTO_EXPAND_REPLICAS, settings.get(SETTING_AUTO_EXPAND_REPLICAS));
@@ -1775,9 +1780,11 @@ public class MetadataCreateIndexService {
         }
         if (indexName.isEmpty() || indexName.get().charAt(0) != '.') {
             // Apply aware replica balance validation only to non system indices
+            // Bug fix: same node-local-default-ignoring bug as in aggregateIndexSettings -- read via
+            // ClusterSettings, which correctly layers node settings under persistent/transient overrides.
             int replicaCount = settings.getAsInt(
                 IndexMetadata.SETTING_NUMBER_OF_REPLICAS,
-                DEFAULT_REPLICA_COUNT_SETTING.get(this.clusterService.state().metadata().settings())
+                clusterService.getClusterSettings().get(DEFAULT_REPLICA_COUNT_SETTING)
             );
             int searchReplicaCount = settings.getAsInt(SETTING_NUMBER_OF_SEARCH_REPLICAS, 0);
             AutoExpandReplicas autoExpandReplica = AutoExpandReplicas.SETTING.get(settings);
