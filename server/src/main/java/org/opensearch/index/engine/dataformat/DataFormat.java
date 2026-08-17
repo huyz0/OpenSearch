@@ -138,6 +138,38 @@ public abstract class DataFormat {
         return true;
     }
 
+    /**
+     * Phase F of {@code core-pluggability-refactor-plan.md}. Whether this format needs {@code _source}
+     * retained -- i.e. whether a mapping is rejected for setting {@code "_source": {"enabled": false}} --
+     * see {@code SourceFieldMapper}'s own validation (wired via {@code SourceFieldMapper
+     * #requiresSourceEnabledForPluggableFormat}).
+     *
+     * <p><b>Deliberately a separate method from {@link #requiresStoredFields()}, not a reuse of it,
+     * even though both migrated off the same {@code PLUGGABLE_DATAFORMAT_ENABLED_SETTING} flag check.</b>
+     * They ask genuinely different questions: {@code requiresStoredFields()} controls whether {@code text}
+     * fields' individual Lucene {@link org.apache.lucene.document.FieldType} gets {@code setStored(true)};
+     * {@code _source}'s own {@code FieldType} (see {@code SourceFieldMapper.Defaults#FIELD_TYPE}) is
+     * <em>already</em> unconditionally stored regardless of this method or any setting -- what this method
+     * actually gates is a mapping-time validation rejecting the document {@code _source} blob being
+     * disabled entirely. A format could plausibly need one without the other (reconstructing individual
+     * field values from per-field stored data is a different capability than needing the whole original
+     * document blob retained), so collapsing them into one method would be answering a question this class
+     * was never asked, purely to save a method declaration -- not a simplification worth making.
+     *
+     * <p>Defaults to {@code true}, matching every pluggable format's current behavior exactly (before this
+     * method existed, {@code SourceFieldMapper} rejected {@code enabled=false} whenever the
+     * pluggable-data-format feature was on at all, uniformly across every format) -- see {@link
+     * #requiresStoredFields()}'s own javadoc for why the behavior-preserving default here is {@code true},
+     * not the {@code false}/{@code Set.of("nested")}-style "neutral" default this file's structural
+     * -question methods use; the reasoning is identical, not a copy-paste-without-checking repeat of the
+     * bug that default polarity caused there.
+     *
+     * @return whether this format requires {@code _source} to stay enabled
+     */
+    public boolean requiresSourceEnabled() {
+        return true;
+    }
+
     @Override
     public final boolean equals(Object o) {
         if (this == o) return true;
