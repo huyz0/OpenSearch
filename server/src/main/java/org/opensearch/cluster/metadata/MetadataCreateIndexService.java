@@ -2321,10 +2321,12 @@ public class MetadataCreateIndexService {
      * broken, which is how the same defect was found the last two times.
      */
     private static void refuseToWriteAMappingFromTheClusterStateThread(IndexMetadata indexMetadata) {
-        // The same list AbsentIndexDescriptorSuppliers refuses to resolve descriptors on, reused rather than
-        // copied: two lists of the threads where blocking is unsafe drift, and the narrower one is the one
-        // that lets something through.
-        if (AbsentIndexDescriptorSuppliers.blockingIsUnsafeHere()) {
+        // Phase C4b of core-pluggability-refactor-plan.md: ClusterStateMutationThreads
+        // .blockingIsUnsafeOnCurrentThread() replaces AbsentIndexDescriptorSuppliers.blockingIsUnsafeHere()
+        // here -- the exact same thread-name list, already generalized in Phase C4a specifically so this
+        // kind of duplicate list (this call site's own comment used to warn about exactly that risk) would
+        // have one place to live instead of two that could drift.
+        if (org.opensearch.cluster.ClusterStateMutationThreads.blockingIsUnsafeOnCurrentThread()) {
             String thread = Thread.currentThread().getName();
             throw new IllegalStateException(
                 "index ["
