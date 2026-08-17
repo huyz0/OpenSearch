@@ -46,6 +46,7 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.common.xcontent.support.XContentMapValues;
 import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.index.IndexSettings;
 import org.opensearch.index.compositeindex.datacube.startree.StarTreeIndexSettings;
 import org.opensearch.index.engine.dataformat.DataFormat;
 import org.opensearch.index.engine.dataformat.DataFormatRegistry;
@@ -479,13 +480,24 @@ public class ObjectMapper extends Mapper implements Cloneable {
          * for a reason unrelated to the mapping itself -- falls back to {@code true}, preserving the exact
          * universal rejection every pluggable-format index has always gotten rather than silently allowing
          * nested through on an unresolvable format.
+         *
+         * <p>{@code parserContext.mapperService()}/{@code mapperService.getIndexSettings()} are each guarded
+         * against being {@code null} independently before use (not just before the first dereference) --
+         * {@code KeywordFieldMapper}'s identically-shaped {@code canConsumeRawValueForSource} hit exactly this
+         * gap (a mocked {@code MapperService} with {@code getIndexSettings()} unstubbed, i.e. {@code null}, in
+         * {@code TypeParsersTests}/{@code ParametrizedMapperTests}) after only guarding the outer null.
          */
         private static boolean isNestedUnsupportedByActiveDataFormat(ParserContext parserContext) {
             DataFormatRegistry registry = parserContext.dataFormatRegistry();
+            MapperService mapperService = parserContext.mapperService();
+            IndexSettings indexSettings = mapperService == null ? null : mapperService.getIndexSettings();
             if (registry == null) {
-                return isPluggableDataFormatEnabled(parserContext.getSettings());
+                return indexSettings != null && indexSettings.isPluggableDataFormatEnabled();
             }
-            String activeFormatName = parserContext.mapperService().getIndexSettings().pluggableDataFormat();
+            if (indexSettings == null) {
+                return true;
+            }
+            String activeFormatName = indexSettings.pluggableDataFormat();
             DataFormat activeFormat = registry.format(activeFormatName);
             if (activeFormat == null) {
                 return true;

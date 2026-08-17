@@ -63,6 +63,8 @@ import org.opensearch.index.IndexSettings;
 import org.opensearch.index.analysis.IndexAnalyzers;
 import org.opensearch.index.analysis.NamedAnalyzer;
 import org.opensearch.index.compositeindex.datacube.DimensionType;
+import org.opensearch.index.engine.dataformat.DataFormat;
+import org.opensearch.index.engine.dataformat.DataFormatRegistry;
 import org.opensearch.index.engine.dataformat.FieldTypeCapabilities;
 import org.opensearch.index.fielddata.IndexFieldData;
 import org.opensearch.index.fielddata.plain.SortedSetOrdinalsIndexFieldData;
@@ -271,16 +273,39 @@ public final class KeywordFieldMapper extends ParametrizedFieldMapper {
         }
     }
 
-    public static final TypeParser PARSER = new TypeParser(
-        (n, c) -> new Builder(
-            n,
-            c.getIndexAnalyzers(),
-            Optional.ofNullable(c.mapperService())
-                .map(MapperService::getIndexSettings)
-                .map(IndexSettings::isPluggableDataFormatEnabled)
-                .orElse(false)
-        )
-    );
+    public static final TypeParser PARSER = new TypeParser((n, c) -> new Builder(n, c.getIndexAnalyzers(), canConsumeRawValueForSource(c)));
+
+    /**
+     * Phase F of {@code core-pluggability-refactor-plan.md}: whether a keyword field under the currently
+     * active pluggable data format (if any) needs raw-value tracking, per {@link
+     * DataFormat#rawValueTrackingRequired()} -- replacing a blanket "pluggable data format means raw-value
+     * tracking" rule with a per-format question. Mirrors {@code ObjectMapper}'s identically-shaped {@code
+     * isNestedUnsupportedByActiveDataFormat} -- see that method's own javadoc for why a null {@link
+     * DataFormatRegistry} falls back to the original flag check rather than a bare boolean: a {@code
+     * ParserContext}/{@code MapperService} built directly, bypassing {@code DocumentMapperParser}'s own
+     * registry-threading (as several lightweight mapper-only test harnesses do), can have the feature
+     * enabled via settings with no registry wired at all.
+     */
+    private static boolean canConsumeRawValueForSource(TypeParser.ParserContext parserContext) {
+        MapperService mapperService = parserContext.mapperService();
+        IndexSettings indexSettings = mapperService == null ? null : mapperService.getIndexSettings();
+        if (indexSettings == null) {
+            // Matches the pre-existing Optional.ofNullable(...).map(...).map(...).orElse(false) chain this
+            // replaced: both mapperService() and getIndexSettings() can independently be null (confirmed by
+            // TypeParsersTests#testMultiFieldWithinMultiField/ParametrizedMapperTests#testMultifields, which
+            // exercise a MapperService with no index settings at all).
+            return false;
+        }
+        DataFormatRegistry registry = parserContext.dataFormatRegistry();
+        if (registry == null) {
+            return indexSettings.isPluggableDataFormatEnabled();
+        }
+        DataFormat activeFormat = registry.format(indexSettings.pluggableDataFormat());
+        if (activeFormat == null) {
+            return true;
+        }
+        return activeFormat.rawValueTrackingRequired();
+    }
 
     @Override
     protected void canDeriveSourceInternal() {

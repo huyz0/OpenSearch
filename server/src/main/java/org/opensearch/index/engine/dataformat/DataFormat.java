@@ -66,6 +66,25 @@ public abstract class DataFormat {
         return Set.of("nested");
     }
 
+    /**
+     * Phase F of {@code core-pluggability-refactor-plan.md}. Whether a {@code keyword} field under this
+     * format needs a synthetic raw-value shadow field type built and populated (to reconstruct {@code
+     * _source} when {@code ignore_above}/a normalizer would otherwise lose the original value) -- see {@code
+     * KeywordFieldMapper}'s own {@code canConsumeRawValueForSource}.
+     *
+     * <p>Defaults to {@code true}, matching every pluggable format's current behavior exactly: before this
+     * method existed, {@code KeywordFieldMapper.PARSER} enabled raw-value tracking whenever the
+     * pluggable-data-format feature was enabled at all, uniformly across every format. A format that does
+     * not override this method therefore keeps today's behavior unchanged -- it does not silently lose raw
+     * -value tracking it was relying on. A format that never loses a keyword field's raw value some other
+     * way (so this reconstruction is unnecessary) overrides this to return {@code false}.
+     *
+     * @return whether this format requires raw-value tracking for keyword fields
+     */
+    public boolean rawValueTrackingRequired() {
+        return true;
+    }
+
     @Override
     public final boolean equals(Object o) {
         if (this == o) return true;
