@@ -517,7 +517,16 @@ public class NestedQueryBuilder extends AbstractQueryBuilder<NestedQueryBuilder>
     public void visit(QueryBuilderVisitor visitor) {
         visitor.accept(this);
         if (query != null) {
-            visitor.getChildVisitor(BooleanClause.Occur.MUST).accept(query);
+            // Bug fix: this previously called visitor.getChildVisitor(...).accept(query), which visits
+            // only the nested query itself and never recurses into its own sub-clauses -- and NPEs if
+            // getChildVisitor legitimately returns null, a documented possibility in its own contract.
+            // query.visit(subVisitor) is the correct call: it lets `query` (whatever QueryBuilder it is)
+            // recurse into its own children via the sub-visitor, matching every other QueryBuilder's
+            // visit() implementation in this codebase (e.g. BoolQueryBuilder).
+            final QueryBuilderVisitor subVisitor = visitor.getChildVisitor(BooleanClause.Occur.MUST);
+            if (subVisitor != null) {
+                query.visit(subVisitor);
+            }
         }
     }
 }
