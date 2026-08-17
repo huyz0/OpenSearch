@@ -11,7 +11,6 @@ package org.opensearch.action.pagination;
 import org.opensearch.OpenSearchParseException;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
-import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
@@ -120,7 +119,7 @@ public class ShardPaginationStrategy implements PaginationStrategy<ShardRouting>
             // published, and an index deleted between the two reads. Both dereferenced null here, which
             // made a computed index a NullPointerException on this path rather than the missing row it is
             // on the unpaginated one.
-            IndexRoutingTable indexRouting = AbsentIndexRoutingSuppliers.resolve(clusterState, indexName);
+            IndexRoutingTable indexRouting = clusterState.getIndexRoutingTable(indexName);
             if (indexRouting == null) {
                 continue;
             }

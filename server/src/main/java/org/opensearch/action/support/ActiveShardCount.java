@@ -176,7 +176,7 @@ public final class ActiveShardCount implements Writeable {
             // create API waits forever for shards that were never going to be published. That is what
             // C12 hit: creation hung until the twenty-minute suite timeout. Counting has to consult the
             // supplier the same way routing resolution does.
-            final IndexRoutingTable indexRoutingTable = AbsentIndexRoutingSuppliers.resolve(clusterState, indexName);
+            final IndexRoutingTable indexRoutingTable = clusterState.getIndexRoutingTable(indexName);
             if (indexRoutingTable == null && indexMetadata.getState() == IndexMetadata.State.CLOSE) {
                 // its possible the index was closed while waiting for active shard copies,
                 // in this case, we'll just consider it that we have enough active shard copies

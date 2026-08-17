@@ -34,7 +34,6 @@ package org.opensearch.cluster.health;
 import org.opensearch.action.admin.cluster.health.ClusterHealthRequest;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
-import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
@@ -100,7 +99,7 @@ public final class ClusterStateHealth implements Iterable<ClusterIndexHealth>, W
             // no routing entry is not neutral here: it removes the index from every counter, so a
             // cluster whose computed indices have no shards anywhere still reports GREEN. A false green
             // is worse than a hang, because it makes every downstream test pass vacuously.
-            IndexRoutingTable indexRoutingTable = AbsentIndexRoutingSuppliers.resolve(clusterState, index);
+            IndexRoutingTable indexRoutingTable = clusterState.getIndexRoutingTable(index);
             IndexMetadata indexMetadata = clusterState.metadata().index(index);
             if (indexRoutingTable == null) {
                 continue;
@@ -184,7 +183,7 @@ public final class ClusterStateHealth implements Iterable<ClusterIndexHealth>, W
         int computeDelayedUnassignedShards = 0;
 
         for (String index : concreteIndices) {
-            IndexRoutingTable indexRoutingTable = AbsentIndexRoutingSuppliers.resolve(clusterState, index);
+            IndexRoutingTable indexRoutingTable = clusterState.getIndexRoutingTable(index);
             IndexMetadata indexMetadata = clusterState.metadata().index(index);
             if (indexRoutingTable == null) {
                 continue;
@@ -261,7 +260,7 @@ public final class ClusterStateHealth implements Iterable<ClusterIndexHealth>, W
             if (clusterState.routingTable().hasIndex(index)) {
                 continue; // already counted above
             }
-            IndexRoutingTable computed = AbsentIndexRoutingSuppliers.resolve(clusterState, index);
+            IndexRoutingTable computed = clusterState.getIndexRoutingTable(index);
             if (computed == null) {
                 continue;
             }
