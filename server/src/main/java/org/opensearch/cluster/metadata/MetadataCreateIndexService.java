@@ -2395,6 +2395,13 @@ public class MetadataCreateIndexService {
             // Initial creation-time mappings are carried directly in IndexDescriptor.from(indexMetadata)
             // and written atomically to object storage by IndexDescriptorPublisher.createGated(indexMetadata),
             // avoiding system index round-trips entirely.
+            //
+            // The refusal itself: this comment used to describe it without the call actually being here,
+            // which is the defect Phase A1 of the core-pluggability-refactor-plan.md found and closed. A
+            // creation reaching this branch from createGatedIndex's GENERIC executor is fine; one reaching it
+            // from inside a cluster state task (auto-creation, rollover, data stream creation) is exactly the
+            // W4 deadlock this method exists to refuse instead of hitting.
+            refuseToWriteAMappingFromTheClusterStateThread(indexMetadata);
             java.util.concurrent.CompletableFuture<Boolean> write = IndexDescriptorPublisher.createGated(indexMetadata);
             if (write == null) {
                 throw new IllegalStateException(
