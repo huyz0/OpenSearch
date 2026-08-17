@@ -223,8 +223,15 @@ final class ShardSplittingQuery extends Query {
 
     private static void findSplitDocs(String idField, Predicate<BytesRef> includeInShard, LeafReader leafReader, IntConsumer consumer)
         throws IOException {
-        Terms terms = leafReader.terms(idField);
-        TermsEnum iterator = terms.iterator();
+        // Bug fix: leafReader.terms(idField) legitimately returns null when this segment has no
+        // documents carrying idField at all (e.g. a segment with no _routing values, when this is
+        // called with RoutingFieldMapper.NAME) -- terms.iterator() then NPEs. No terms for the field
+        // means no docs to find.
+        final Terms terms = leafReader.terms(idField);
+        if (terms == null) {
+            return;
+        }
+        final TermsEnum iterator = terms.iterator();
         BytesRef idTerm;
         PostingsEnum postingsEnum = null;
         while ((idTerm = iterator.next()) != null) {
