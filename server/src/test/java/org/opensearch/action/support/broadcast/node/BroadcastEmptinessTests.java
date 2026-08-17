@@ -14,6 +14,8 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
+import org.opensearch.cluster.routing.RoutingTable;
+import org.opensearch.cluster.routing.SupplierBackedIndexRoutingResolver;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.test.OpenSearchTestCase;
 import org.junit.After;
@@ -112,6 +114,14 @@ public class BroadcastEmptinessTests extends OpenSearchTestCase {
     }
 
     private static ClusterState state() {
+        // A real (non-EMPTY_ROUTING_TABLE) instance, not the builder's default -- attachIndexRoutingResolver
+        // is deliberately a no-op on the shared EMPTY_ROUTING_TABLE singleton (see its own javadoc), so
+        // resolving via the new SPI (Phase C4b of core-pluggability-refactor-plan.md, which
+        // BroadcastEmptiness#check now goes through) needs an explicit one here, same as production code
+        // gets from a real cluster state. Harmless for the tests here that register nothing -- the bridge
+        // still answers false/empty with nothing registered underneath it.
+        RoutingTable routingTable = RoutingTable.builder().build();
+        routingTable.attachIndexRoutingResolver(new SupplierBackedIndexRoutingResolver());
         return ClusterState.builder(ClusterName.DEFAULT)
             .metadata(
                 Metadata.builder()
@@ -119,6 +129,7 @@ public class BroadcastEmptinessTests extends OpenSearchTestCase {
                     .put(index(CLOSED_INDEX, IndexMetadata.State.CLOSE), false)
                     .build()
             )
+            .routingTable(routingTable)
             .build();
     }
 

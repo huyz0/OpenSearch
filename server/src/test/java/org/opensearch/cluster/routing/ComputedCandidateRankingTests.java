@@ -162,8 +162,16 @@ public class ComputedCandidateRankingTests extends OpenSearchTestCase {
             .numberOfReplicas(2)
             .build();
 
+        // A real (non-EMPTY_ROUTING_TABLE) instance, not the builder's default -- attachIndexRoutingResolver
+        // is deliberately a no-op on the shared EMPTY_ROUTING_TABLE singleton (see its own javadoc), so
+        // resolving via the new SPI (Phase C4b of core-pluggability-refactor-plan.md, which OperationRouting
+        // now goes through) needs an explicit one here, same as production code gets from a real cluster
+        // state.
+        RoutingTable routingTable = RoutingTable.builder().build();
+        routingTable.attachIndexRoutingResolver(new SupplierBackedIndexRoutingResolver());
         return ClusterState.builder(ClusterName.DEFAULT)
             .metadata(Metadata.builder().put(metadata, false).build())
+            .routingTable(routingTable)
             .nodes(DiscoveryNodes.builder().add(node("node-1")).add(node("node-2")).add(node("node-3")).localNodeId("node-1").build())
             .build();
     }

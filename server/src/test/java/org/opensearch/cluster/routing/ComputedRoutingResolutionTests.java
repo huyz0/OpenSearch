@@ -128,8 +128,17 @@ public class ComputedRoutingResolutionTests extends OpenSearchTestCase {
             .numberOfReplicas(0)
             .build();
 
+        // A real (non-EMPTY_ROUTING_TABLE) instance, not the builder's default -- attachIndexRoutingResolver
+        // is deliberately a no-op on the shared EMPTY_ROUTING_TABLE singleton (see its own javadoc), so
+        // resolving via the new SPI (Phase C4b of core-pluggability-refactor-plan.md, which OperationRouting
+        // now goes through for indexShards/shards) needs an explicit one here, same as production code gets
+        // from a real cluster state. Harmless for tests that register nothing on AbsentIndexRoutingSuppliers
+        // -- the bridge still answers empty with nothing registered underneath it.
+        RoutingTable routingTable = RoutingTable.builder().build();
+        routingTable.attachIndexRoutingResolver(new SupplierBackedIndexRoutingResolver());
         return ClusterState.builder(ClusterName.DEFAULT)
             .metadata(Metadata.builder().put(metadata, false).build())
+            .routingTable(routingTable)
             .nodes(DiscoveryNodes.builder().add(node("node-1")).add(node("node-2")).localNodeId("node-1").build())
             .build();
     }

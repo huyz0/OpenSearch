@@ -60,6 +60,15 @@ public final class BroadcastEmptiness {
         String[] concreteIndices,
         Set<String> indicesWithShards
     ) {
+        // Deliberately still AbsentIndexRoutingSuppliers.isRegistered(), not
+        // clusterState.routingTable().indexRoutingResolver() != null (Phase C4b of
+        // core-pluggability-refactor-plan.md attempted that swap and a real test caught why it's wrong):
+        // "a resolver is attached" is a node-lifetime-scoped fact, true for as long as a plugin implements
+        // the SPI at all, while this guard needs "is the underlying feature *currently active*" -- a
+        // dynamically-toggled fact the SupplierBackedIndexRoutingResolver bridge's own methods already
+        // answer correctly (they read the live static registry each call), but that isRegistered()-shaped
+        // question itself has no equivalent on the IndexRoutingResolver interface. Migrating this specific
+        // check would make the guard fire even when the underlying registry the bridge wraps is empty.
         if (AbsentIndexRoutingSuppliers.isRegistered() == false) {
             return List.of();
         }

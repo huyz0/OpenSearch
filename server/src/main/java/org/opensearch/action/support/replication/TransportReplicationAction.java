@@ -53,7 +53,6 @@ import org.opensearch.cluster.block.ClusterBlockLevel;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.ResolvedIndices;
 import org.opensearch.cluster.node.DiscoveryNode;
-import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.AllocationId;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
@@ -1058,7 +1057,10 @@ public abstract class TransportReplicationAction<
                 // The OrNull behaviour is preserved for the case with no supplier: an index present in
                 // metadata and absent from routing still reaches the retry branch rather than throwing,
                 // which is what Phase A wanted and what that branch already handled.
-                final IndexShardRoutingTable shardRoutingTable = AbsentIndexRoutingSuppliers.resolveShard(state, request.shardId());
+                // Phase C4b of core-pluggability-refactor-plan.md: state.resolveShard(...) replaces
+                // AbsentIndexRoutingSuppliers.resolveShard(...) here -- same composition, discovered through
+                // the resolver attached to this state's own routing table.
+                final IndexShardRoutingTable shardRoutingTable = state.resolveShard(request.shardId());
                 final ShardRouting primary = shardRoutingTable == null ? null : shardRoutingTable.primaryShard();
                 if (primary == null || primary.active() == false) {
                     logger.trace(

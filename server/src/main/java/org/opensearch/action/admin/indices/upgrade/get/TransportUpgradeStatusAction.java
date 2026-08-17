@@ -39,7 +39,6 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.block.ClusterBlockLevel;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
-import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.ShardsIterator;
 import org.opensearch.cluster.service.ClusterService;
@@ -93,7 +92,10 @@ public class TransportUpgradeStatusAction extends TransportBroadcastByNodeAction
      */
     @Override
     protected ShardsIterator shards(ClusterState clusterState, UpgradeStatusRequest request, String[] concreteIndices) {
-        return AbsentIndexRoutingSuppliers.allShards(clusterState, concreteIndices);
+        // Phase C4b of core-pluggability-refactor-plan.md: clusterState.allShards(...) replaces
+        // AbsentIndexRoutingSuppliers.allShards(...) here -- same composition, discovered through the
+        // resolver attached to this state's own routing table.
+        return clusterState.allShards(concreteIndices);
     }
 
     @Override

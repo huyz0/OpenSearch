@@ -69,6 +69,12 @@ public class TransportCatShardsAction extends HandledTransportAction<CatShardsRe
             // listing silently omits those shards. Requested only when a placement supplier is installed,
             // because metadata is the expensive part of a cluster state response and an ordinary cluster
             // must keep paying exactly what it paid before.
+            // Deliberately still AbsentIndexRoutingSuppliers.isRegistered(), not the new
+            // IndexRoutingResolver SPI (Phase C4b of core-pluggability-refactor-plan.md): this decides what
+            // to REQUEST, before any ClusterState exists to hold an attached resolver, and the SPI's
+            // per-ClusterState-instance attachment (deliberately not a node-level singleton, to avoid
+            // reintroducing global state) has no equivalent "is a resolver configured on this node at all"
+            // question answerable without one.
             if (AbsentIndexRoutingSuppliers.isRegistered()) {
                 clusterStateRequest.metadata(true);
             }
@@ -110,9 +116,12 @@ public class TransportCatShardsAction extends HandledTransportAction<CatShardsRe
                             clusterStateResponse
                         );
                         catShardsResponse.setNodes(clusterStateResponse.getState().getNodes());
+                        // Phase C4b of core-pluggability-refactor-plan.md: getState().allShards() replaces
+                        // AbsentIndexRoutingSuppliers.allShards(...) here -- same composition, discovered
+                        // through the resolver attached to this state's own routing table.
                         catShardsResponse.setResponseShards(
                             Objects.isNull(paginationStrategy)
-                                ? AbsentIndexRoutingSuppliers.allShards(clusterStateResponse.getState())
+                                ? clusterStateResponse.getState().allShards()
                                 : paginationStrategy.getRequestedEntities()
                         );
                         catShardsResponse.setPageToken(Objects.isNull(paginationStrategy) ? null : paginationStrategy.getResponseToken());

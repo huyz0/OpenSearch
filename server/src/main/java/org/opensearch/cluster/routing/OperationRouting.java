@@ -343,7 +343,12 @@ public class OperationRouting {
                 // An installed supplier can compute the entry rather than reporting its absence, which
                 // is how a serverless index avoids publishing routing at all. Falls back to Phase A's
                 // pessimistic answer when nothing is installed or the supplier declines.
-                indexRouting = AbsentIndexRoutingSuppliers.supply(clusterState, indexMetadata);
+                // Phase C4b of core-pluggability-refactor-plan.md: clusterState.getIndexRoutingTable(index)
+                // replaces AbsentIndexRoutingSuppliers.supply(...) here -- same resolution (this branch has
+                // already confirmed the published lookup missed, so the redundant re-check inside
+                // getIndexRoutingTable costs one extra map lookup, not a behavior change), discovered
+                // through the resolver attached to this state's own routing table.
+                indexRouting = clusterState.getIndexRoutingTable(index);
                 if (indexRouting == null) {
                     indexRouting = noShardsAvailable(indexMetadata);
                 }
@@ -546,7 +551,12 @@ public class OperationRouting {
         // which is worse than not supplying at all: the failure looks like a missing index rather than
         // like an unsupported configuration.
         if (clusterState.routingTable().hasIndex(index) == false) {
-            IndexRoutingTable supplied = AbsentIndexRoutingSuppliers.supply(clusterState, indexMetadata);
+            // Phase C4b of core-pluggability-refactor-plan.md: clusterState.getIndexRoutingTable(index)
+            // replaces AbsentIndexRoutingSuppliers.supply(...) here -- same resolution (this branch has
+            // already confirmed the published lookup missed, so the redundant re-check inside
+            // getIndexRoutingTable costs one extra map lookup, not a behavior change), discovered through
+            // the resolver attached to this state's own routing table.
+            IndexRoutingTable supplied = clusterState.getIndexRoutingTable(index);
             if (supplied != null) {
                 IndexShardRoutingTable shard = supplied.shard(shardId);
                 if (shard != null) {

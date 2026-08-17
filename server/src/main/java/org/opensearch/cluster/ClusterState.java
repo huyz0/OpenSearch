@@ -44,10 +44,12 @@ import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.routing.IndexRoutingResolver;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
+import org.opensearch.cluster.routing.PlainShardsIterator;
 import org.opensearch.cluster.routing.RoutingNode;
 import org.opensearch.cluster.routing.RoutingNodes;
 import org.opensearch.cluster.routing.RoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
+import org.opensearch.cluster.routing.ShardsIterator;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.Nullable;
 import org.opensearch.common.UUIDs;
@@ -61,20 +63,24 @@ import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.common.io.stream.VersionedNamedWriteable;
+import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.xcontent.ToXContentFragment;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.discovery.Discovery;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.Spliterators;
+import java.util.function.Predicate;
 import java.util.stream.StreamSupport;
 
 import static org.opensearch.cluster.coordination.Coordinator.ZEN1_BWC_TERM;
@@ -344,16 +350,143 @@ public class ClusterState implements ToXContentFragment, Diffable<ClusterState> 
     public Collection<ShardRouting> getLocallyComputedShards(String nodeId) {
         IndexRoutingResolver resolver = routingTable.indexRoutingResolver();
         if (resolver == null) {
-            return java.util.List.of();
+            return List.of();
         }
         try {
             Collection<ShardRouting> shards = resolver.localShardsFor(this, nodeId);
-            return shards == null ? java.util.List.of() : shards;
+            return shards == null ? List.of() : shards;
         } catch (Exception e) {
             // Matches AbsentIndexRoutingSuppliers#localShards' own failure direction: a throwing resolver
             // must not stop a node from applying cluster state, so it is treated as "nothing computed here".
-            return java.util.List.of();
+            return List.of();
         }
+    }
+
+    /**
+     * The "no filter" predicate for {@link #allShards(String[], Predicate, boolean)}, held as a constant so
+     * the fast path can recognise it by identity and delegate to {@link RoutingTable#allShards(String[])}
+     * itself rather than to an equivalent method -- see that method's own javadoc for why the distinction
+     * matters (a test that stubs the exact method a caller used to call would not notice an
+     * equivalent-but-different one).
+     */
+    private static final Predicate<ShardRouting> ALL_SHARDS = shardRouting -> true;
+
+    /**
+     * Phase C4b of {@code core-pluggability-refactor-plan.md}: every shard of {@code concreteIndices},
+     * resolving each index through {@link #getIndexRoutingTable(String)} rather than reading {@link
+     * #routingTable()} directly -- replacing the pre-existing static registry, {@code
+     * AbsentIndexRoutingSuppliers#allShards}. Composed entirely from already-wired primitives ({@link
+     * #getIndexRoutingTable(String)}, itself already resolver-aware and thread-guarded) rather than adding
+     * new {@link IndexRoutingResolver} surface -- this is a batch/predicate operation over what {@link
+     * IndexRoutingResolver#resolve} already answers per index, not a new question a resolver needs to
+     * answer.
+     *
+     * <p>Falls straight through to {@link RoutingTable}'s own equivalent methods when nothing is registered
+     * -- not merely behaviorally identical but the exact same call, for the reason {@code
+     * AbsentIndexRoutingSuppliers#allShards}'s own javadoc gives: a caller or test bound to a specific
+     * method (a mock verifying {@code allShards(String[])} was called, say) must see that exact call.
+     *
+     * @param includeRelocationTargets whether to add the target of a relocating shard, as recovery needs
+     */
+    public ShardsIterator allShards(String[] concreteIndices, Predicate<ShardRouting> predicate, boolean includeRelocationTargets) {
+        if (routingTable.indexRoutingResolver() == null) {
+            if (includeRelocationTargets) {
+                return routingTable.allShardsIncludingRelocationTargets(concreteIndices);
+            }
+            if (predicate == ALL_SHARDS) {
+                return routingTable.allShards(concreteIndices);
+            }
+            return routingTable.allShardsSatisfyingPredicate(concreteIndices, predicate);
+        }
+        // A list rather than a set, because these callers rely on shard identity being preserved.
+        List<ShardRouting> shards = new ArrayList<>();
+        for (String index : concreteIndices) {
+            IndexRoutingTable indexRoutingTable = getIndexRoutingTable(index);
+            if (indexRoutingTable == null) {
+                continue;
+            }
+            for (IndexShardRoutingTable shardRoutingTable : indexRoutingTable) {
+                for (ShardRouting shardRouting : shardRoutingTable) {
+                    if (predicate.test(shardRouting) == false) {
+                        continue;
+                    }
+                    shards.add(shardRouting);
+                    if (includeRelocationTargets && shardRouting.relocating()) {
+                        shards.add(shardRouting.getTargetRelocatingShard());
+                    }
+                }
+            }
+        }
+        return new PlainShardsIterator(shards);
+    }
+
+    /** Every shard of the named indices, the common case. */
+    public ShardsIterator allShards(String[] concreteIndices) {
+        return allShards(concreteIndices, ALL_SHARDS, false);
+    }
+
+    /** Every shard of the named indices, plus the targets of any that are relocating. */
+    public ShardsIterator allShardsIncludingRelocationTargets(String[] concreteIndices) {
+        return allShards(concreteIndices, ALL_SHARDS, true);
+    }
+
+    /**
+     * Every shard in the cluster, including those of indices that publish no routing entry -- for the
+     * callers that name no indices at all ({@code _cat/shards}, {@code _cat/allocation}), which cannot use
+     * the array-taking overloads above because they have no list to pass and {@link
+     * RoutingTable#allShards()} takes its list from the routing table's own key set, which an unpublished
+     * index is not in. See {@code AbsentIndexRoutingSuppliers#allShards(ClusterState)}'s own javadoc for
+     * why enumerating {@link #metadata()} is acceptable here specifically (callers of this overload are
+     * already linear in shard count) but would not be on a request path, which is why this is a separate
+     * overload rather than the array form's zero-length case.
+     */
+    public List<ShardRouting> allShards() {
+        if (routingTable.indexRoutingResolver() == null) {
+            return routingTable.allShards();
+        }
+        List<ShardRouting> shards = new ArrayList<>(routingTable.allShards());
+        for (IndexMetadata indexMetadata : metadata()) {
+            if (routingTable.shouldPublishRouting(indexMetadata)) {
+                // Published, so routingTable.allShards() above already returned it.
+                continue;
+            }
+            IndexRoutingTable computed = getIndexRoutingTable(indexMetadata.getIndex().getName());
+            if (computed == null) {
+                continue;
+            }
+            for (IndexShardRoutingTable shardRoutingTable : computed) {
+                for (ShardRouting shardRouting : shardRoutingTable) {
+                    shards.add(shardRouting);
+                }
+            }
+        }
+        return shards;
+    }
+
+    /**
+     * Phase C4b of {@code core-pluggability-refactor-plan.md}: one shard's routing table, from the
+     * published entry or the resolved one, or null if neither has it -- replacing the pre-existing static
+     * registry, {@code AbsentIndexRoutingSuppliers#resolveShard}. Delegates to {@link
+     * RoutingTable#shardRoutingTableOrNull} for the published case rather than reimplementing it, because
+     * the two absences it distinguishes are not the same absence: an index with no entry is a
+     * maybe-resolvable index and returns null; an index that <em>has</em> an entry without this shard is a
+     * caller asking for a shard that does not exist, and that must keep throwing {@link
+     * org.opensearch.index.shard.ShardNotFoundException}.
+     *
+     * <p>This is the exact call shape Phase C4a's own status log deliberately left unmigrated at {@code
+     * TransportReplicationAction#resolveShard} and {@code IndicesClusterStateService}'s two uses, pending
+     * confirmation the published/absent distinction above would carry through a migration -- confirmed here
+     * by delegating to {@link RoutingTable#shardRoutingTableOrNull} exactly rather than reimplementing it,
+     * so the distinction is structurally preserved, not re-derived.
+     */
+    @Nullable
+    public IndexShardRoutingTable resolveShard(ShardId shardId) {
+        IndexShardRoutingTable published = routingTable.shardRoutingTableOrNull(shardId);
+        if (published != null) {
+            return published;
+        }
+        IndexRoutingTable computed = getIndexRoutingTable(shardId.getIndex().getName());
+        return computed == null ? null : computed.shard(shardId.id());
     }
 
     public ClusterBlocks blocks() {

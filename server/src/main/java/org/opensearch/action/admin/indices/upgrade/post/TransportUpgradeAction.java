@@ -41,7 +41,6 @@ import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.block.ClusterBlockLevel;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.Metadata;
-import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.RoutingTable;
 import org.opensearch.cluster.routing.ShardRouting;
@@ -182,7 +181,10 @@ public class TransportUpgradeAction extends TransportBroadcastByNodeAction<Upgra
      */
     @Override
     protected ShardsIterator shards(ClusterState clusterState, UpgradeRequest request, String[] concreteIndices) {
-        ShardsIterator iterator = AbsentIndexRoutingSuppliers.allShards(clusterState, concreteIndices);
+        // Phase C4b of core-pluggability-refactor-plan.md: clusterState.allShards(...) replaces
+        // AbsentIndexRoutingSuppliers.allShards(...) here -- same composition, discovered through the
+        // resolver attached to this state's own routing table.
+        ShardsIterator iterator = clusterState.allShards(concreteIndices);
         Set<String> indicesWithMissingPrimaries = indicesWithMissingPrimaries(clusterState, concreteIndices);
         if (indicesWithMissingPrimaries.isEmpty()) {
             return iterator;

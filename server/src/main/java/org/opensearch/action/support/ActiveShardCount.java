@@ -190,6 +190,11 @@ public final class ActiveShardCount implements Writeable {
                 // that the shards are not active: the caller then times out with its own message instead
                 // of an NPE thrown from a cluster state applier thread, where it would take down the
                 // listener rather than the request.
+                // Deliberately still AbsentIndexRoutingSuppliers.isRegistered(), not
+                // clusterState.routingTable().indexRoutingResolver() != null -- see BroadcastEmptiness#check's
+                // own comment (Phase C4b of core-pluggability-refactor-plan.md) for why the two are not
+                // equivalent: a resolver being attached is a node-lifetime-scoped fact, not the dynamically
+                // toggled "is the underlying feature active" question this assertion actually needs.
                 assert AbsentIndexRoutingSuppliers.isRegistered() : "open index [" + indexName + "] has no routing entry";
                 return false;
             }

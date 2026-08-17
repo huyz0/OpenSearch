@@ -47,7 +47,6 @@ import org.opensearch.cluster.metadata.IndexCreationStrategyRegistry;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodes;
-import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.ComputedShardRouting;
 import org.opensearch.cluster.routing.IndexRoutingTable;
 import org.opensearch.cluster.routing.IndexShardRoutingTable;
@@ -1075,7 +1074,13 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
         if (indexMetadata == null) {
             return;
         }
-        IndexRoutingTable computed = AbsentIndexRoutingSuppliers.supply(state, indexMetadata);
+        // Phase C4b of core-pluggability-refactor-plan.md: state.getIndexRoutingTable(...) replaces
+        // AbsentIndexRoutingSuppliers.supply(...) here -- same resolution (index is already confirmed
+        // unpublished via state.metadata().index(index) == null above, so the redundant re-check inside
+        // getIndexRoutingTable costs one extra map lookup, not a behavior change). Only this one resolution
+        // call is migrated -- the surrounding on-demand shard-opening lifecycle/locking (Phase E's
+        // openComputedShardsOnDemand extraction) is completely untouched.
+        IndexRoutingTable computed = state.getIndexRoutingTable(index.getName());
         if (computed == null) {
             // No placement means no opinion about where this index lives, which is what an unconfigured
             // cluster answers. Opening a shard here on a guess is how an index ends up served from two
@@ -1581,7 +1586,10 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
         if (published.isEmpty() == false || state.routingTable().hasIndex(shardRouting.index())) {
             return published;
         }
-        IndexShardRoutingTable computed = AbsentIndexRoutingSuppliers.resolveShard(state, shardRouting.shardId());
+        // Phase C4b of core-pluggability-refactor-plan.md: state.resolveShard(...) replaces
+        // AbsentIndexRoutingSuppliers.resolveShard(...) here -- same composition, discovered through the
+        // resolver attached to this state's own routing table.
+        IndexShardRoutingTable computed = state.resolveShard(shardRouting.shardId());
         if (computed == null) {
             return published;
         }
@@ -1603,7 +1611,10 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
      * shard describes the state it is in.
      */
     private static IndexShardRoutingTable computedAwareShardRoutingTable(ClusterState state, ShardRouting shardRouting) {
-        IndexShardRoutingTable resolved = AbsentIndexRoutingSuppliers.resolveShard(state, shardRouting.shardId());
+        // Phase C4b of core-pluggability-refactor-plan.md: state.resolveShard(...) replaces
+        // AbsentIndexRoutingSuppliers.resolveShard(...) here -- same composition, discovered through the
+        // resolver attached to this state's own routing table.
+        IndexShardRoutingTable resolved = state.resolveShard(shardRouting.shardId());
         if (resolved != null) {
             return resolved;
         }

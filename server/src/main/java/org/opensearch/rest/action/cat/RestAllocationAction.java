@@ -91,6 +91,10 @@ public class RestAllocationAction extends AbstractCatAction {
         // As in cat shards: an index whose routing is computed exists only in metadata, so without this
         // its shards are missing from the per-node counts. Gated on registration so an ordinary cluster
         // keeps the smaller response it has always had.
+        // Deliberately still AbsentIndexRoutingSuppliers.isRegistered(), not the new IndexRoutingResolver
+        // SPI (Phase C4b of core-pluggability-refactor-plan.md) -- see TransportCatShardsAction's identical
+        // call site for why: this decides what to REQUEST, before any ClusterState exists to hold an
+        // attached resolver.
         if (AbsentIndexRoutingSuppliers.isRegistered()) {
             clusterStateRequest.metadata(true);
         }
@@ -142,7 +146,10 @@ public class RestAllocationAction extends AbstractCatAction {
     private Table buildTable(RestRequest request, final ClusterStateResponse state, final NodesStatsResponse stats) {
         final Map<String, Integer> allocs = new HashMap<>();
 
-        for (ShardRouting shard : AbsentIndexRoutingSuppliers.allShards(state.getState())) {
+        // Phase C4b of core-pluggability-refactor-plan.md: state.getState().allShards() replaces
+        // AbsentIndexRoutingSuppliers.allShards(...) here -- same composition, discovered through the
+        // resolver attached to this state's own routing table.
+        for (ShardRouting shard : state.getState().allShards()) {
             String nodeId = "UNASSIGNED";
 
             if (shard.assignedToNode()) {

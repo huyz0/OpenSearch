@@ -38,7 +38,6 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.block.ClusterBlockLevel;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
-import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.ShardsIterator;
 import org.opensearch.cluster.service.ClusterService;
@@ -121,10 +120,13 @@ public class TransportForceMergeAction extends TransportBroadcastByNodeAction<
      */
     @Override
     protected ShardsIterator shards(ClusterState clusterState, ForceMergeRequest request, String[] concreteIndices) {
+        // Phase C4b of core-pluggability-refactor-plan.md: clusterState.allShards(...) replaces
+        // AbsentIndexRoutingSuppliers.allShards(...) at both branches below -- same composition, discovered
+        // through the resolver attached to this state's own routing table.
         if (request.primaryOnly()) {
-            return AbsentIndexRoutingSuppliers.allShards(clusterState, concreteIndices, ShardRouting::primary, false);
+            return clusterState.allShards(concreteIndices, ShardRouting::primary, false);
         } else {
-            return AbsentIndexRoutingSuppliers.allShards(clusterState, concreteIndices);
+            return clusterState.allShards(concreteIndices);
         }
     }
 

@@ -20,7 +20,6 @@ import org.opensearch.cluster.block.ClusterBlockException;
 import org.opensearch.cluster.block.ClusterBlockLevel;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
-import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.ShardRouting;
 import org.opensearch.cluster.routing.ShardsIterator;
 import org.opensearch.cluster.service.ClusterService;
@@ -175,7 +174,10 @@ public class TransportGetIngestionStateAction extends TransportBroadcastByNodeAc
             );
         }
 
-        return AbsentIndexRoutingSuppliers.allShards(clusterState, request.indices(), shardFilter, false);
+        // Phase C4b of core-pluggability-refactor-plan.md: clusterState.allShards(...) replaces
+        // AbsentIndexRoutingSuppliers.allShards(...) here -- same predicate/composition, discovered through
+        // the resolver attached to this state's own routing table.
+        return clusterState.allShards(request.indices(), shardFilter, false);
     }
 
     @Override

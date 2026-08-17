@@ -61,7 +61,6 @@ import org.opensearch.cluster.metadata.MetadataIndexStateService;
 import org.opensearch.cluster.metadata.MetadataIndexUpgradeService;
 import org.opensearch.cluster.metadata.RepositoriesMetadata;
 import org.opensearch.cluster.node.DiscoveryNode;
-import org.opensearch.cluster.routing.AbsentIndexRoutingSuppliers;
 import org.opensearch.cluster.routing.RecoverySource;
 import org.opensearch.cluster.routing.RecoverySource.SnapshotRecoverySource;
 import org.opensearch.cluster.routing.RoutingChangesObserver;
@@ -978,7 +977,11 @@ public class RestoreService implements ClusterStateApplier {
                         // that is too small admits a restore that overflows the file cache. Unlike the
                         // rest of this seam, it fails towards doing the damage rather than towards
                         // reporting nothing.
-                        List<ShardRouting> routings = AbsentIndexRoutingSuppliers.allShards(clusterService.state())
+                        // Phase C4b of core-pluggability-refactor-plan.md: clusterService.state().allShards()
+                        // replaces AbsentIndexRoutingSuppliers.allShards(...) here -- same composition,
+                        // discovered through the resolver attached to this state's own routing table.
+                        List<ShardRouting> routings = clusterService.state()
+                            .allShards()
                             .stream()
                             .filter(isRemoteSnapshotShard)
                             .collect(Collectors.toList());
