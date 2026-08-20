@@ -518,9 +518,13 @@ public class MetadataCreateIndexService {
                     // that would claim this name in the other plane.
                     listener.onFailure(
                         new IllegalStateException(
+                            // Phase J3: namespace description from the registered strategy, not core's
+                            // own words for one product's namespace.
                             "index ["
                                 + request.index()
-                                + "] is in the serverless namespace and was neither gated nor refused, which "
+                                + "] is in "
+                                + IndexCreationStrategyRegistry.describeClaimedNamespace()
+                                + " and was neither gated nor refused, which "
                                 + "should not be possible; creating it anywhere now would claim the name in "
                                 + "both planes"
                         )
@@ -1024,7 +1028,8 @@ public class MetadataCreateIndexService {
         // negated -- isRegistered()==false || namesAServerlessIndex(...)==false is De Morgan's equivalent of
         // !claims(...).
         if (IndexCreationStrategyRegistry.claims(request.index(), request) == false) {
-            return "the index is not in the serverless namespace";
+            // Phase J3: description from the registered strategy, not core's own words for one product's.
+            return "the index is not in " + IndexCreationStrategyRegistry.describeClaimedNamespace();
         }
         if (sourceMetadata != null) {
             return "it is being built from an existing index";

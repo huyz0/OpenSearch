@@ -39,8 +39,7 @@ public class IndexCreationStrategyRegistryTests extends OpenSearchTestCase {
         );
         assertNotNull("falls back to the interface's own generic default", IndexCreationStrategyRegistry.describeClaimedNamespace());
         assertEquals(
-            "with nothing registered there is no cap on multi-index open/close, which is what an "
-                + "unclaimed index has always had",
+            "with nothing registered there is no cap on multi-index open/close, which is what an " + "unclaimed index has always had",
             Integer.MAX_VALUE,
             IndexCreationStrategyRegistry.maxMultiIndexStateChangeTargets()
         );
