@@ -421,7 +421,7 @@ public class MetadataCreateIndexService {
      * <p>The namespace removes the question. A name in it is gated or the creation fails -- {@code
      * clusterStateCreateIndex} refuses it a cluster state entry, so there is no ordinary road to fall back
      * onto and nothing that needs the cluster manager. The conditions that used to decline here are refused
-     * outright by {@link #validateServerlessNamespace}, and they are refused identically on every node,
+     * outright by {@link #validateClaimedNamespaceRequest}, and they are refused identically on every node,
      * because the check reads the request rather than the cluster.
      *
      * <h4>The same-name race, which the namespace also settles</h4>
@@ -2672,7 +2672,7 @@ public class MetadataCreateIndexService {
 
     private void validate(CreateIndexClusterStateUpdateRequest request, ClusterState state) {
         validateIndexName(request.index(), state);
-        validateServerlessNamespace(request);
+        validateClaimedNamespaceRequest(request);
         validateIndexSettings(request.index(), request.settings(), forbidPrivateIndexSettings);
         validateContext(request);
         validateIngestionSourceSettings(request.settings(), state);
@@ -2692,7 +2692,7 @@ public class MetadataCreateIndexService {
      * written to two places), and closing it means resolving templates during validation, which is a larger
      * change than this.
      */
-    private void validateServerlessNamespace(CreateIndexClusterStateUpdateRequest request) {
+    private void validateClaimedNamespaceRequest(CreateIndexClusterStateUpdateRequest request) {
         // Phase D2 of core-pluggability-refactor-plan.md: same migration as createIndex()'s own top branch,
         // negated -- see whyATemporaryIndexServiceIsStillNeeded's comment for the De Morgan's equivalence.
         // Deliberately not the larger change the plan's own D2 sketch also names for this method (deleting

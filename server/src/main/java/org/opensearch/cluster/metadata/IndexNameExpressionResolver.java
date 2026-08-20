@@ -1452,7 +1452,7 @@ public class IndexNameExpressionResolver {
                 return Set.of();
             }
             if (expansion.exceeded()) {
-                throw UnsupportedWildcardException.tooManyMatches(expression, expansion.limit());
+                throw UnsupportedWildcardException.tooManyMatches(expression, expansion.limit(), expansion.limitSettingName());
             }
             Set<String> names = new HashSet<>();
             for (AbsentIndexDescriptorSuppliers.PrefixMatch match : expansion.matches()) {

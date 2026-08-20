@@ -188,10 +188,20 @@ public class MetadataIndexStateService {
         // the resolver attached to this state's own metadata.
         final List<Index> gated = clusterService.state().metadata().gatedAmong(request.indices());
         if (gated.isEmpty() == false) {
-            if (gated.size() > 50) {
+            // Phase J3 of core-pluggability-refactor-plan.md: the cap and the namespace wording both come
+            // from the registered strategy now, instead of core hardcoding 50 and naming one product's
+            // storage technology in an error a user reads. Unregistered answers MAX_VALUE/a generic
+            // description, so a node without the plugin is unaffected -- and cannot reach here anyway,
+            // since nothing is gated without a resolver attached.
+            final int maxTargets = IndexCreationStrategyRegistry.maxMultiIndexStateChangeTargets();
+            if (gated.size() > maxTargets) {
                 listener.onFailure(
                     new IllegalArgumentException(
-                        "Multi-index close operations on serverless indices exceeding 50 targets are disabled to prevent high-cost Object Storage operations. Specified: "
+                        "Multi-index close operations on indices in "
+                            + IndexCreationStrategyRegistry.describeClaimedNamespace()
+                            + " may target at most "
+                            + maxTargets
+                            + " indices, because each one costs a separate external-storage operation. Specified: "
                             + gated.size()
                     )
                 );
@@ -203,7 +213,11 @@ public class MetadataIndexStateService {
             }
             listener.onFailure(
                 new UnsupportedOperationException(
-                    "cannot close serverless " + names(gated) + ": mixed request with ordinary and serverless indices is not supported"
+                    "cannot close "
+                        + names(gated)
+                        + " in "
+                        + IndexCreationStrategyRegistry.describeClaimedNamespace()
+                        + ": mixed request with these and ordinary indices is not supported"
                 )
             );
             return;
@@ -973,10 +987,16 @@ public class MetadataIndexStateService {
         // the resolver attached to this state's own metadata.
         final List<Index> gatedToOpen = clusterService.state().metadata().gatedAmong(request.indices());
         if (gatedToOpen.isEmpty() == false) {
-            if (gatedToOpen.size() > 50) {
+            // Phase J3: same strategy-supplied cap and namespace wording as closeIndices above.
+            final int maxTargets = IndexCreationStrategyRegistry.maxMultiIndexStateChangeTargets();
+            if (gatedToOpen.size() > maxTargets) {
                 listener.onFailure(
                     new IllegalArgumentException(
-                        "Multi-index open operations on serverless indices exceeding 50 targets are disabled to prevent high-cost Object Storage operations. Specified: "
+                        "Multi-index open operations on indices in "
+                            + IndexCreationStrategyRegistry.describeClaimedNamespace()
+                            + " may target at most "
+                            + maxTargets
+                            + " indices, because each one costs a separate external-storage operation. Specified: "
                             + gatedToOpen.size()
                     )
                 );
@@ -988,7 +1008,11 @@ public class MetadataIndexStateService {
             }
             listener.onFailure(
                 new UnsupportedOperationException(
-                    "cannot open serverless " + names(gatedToOpen) + ": mixed request with ordinary and serverless indices is not supported"
+                    "cannot open "
+                        + names(gatedToOpen)
+                        + " in "
+                        + IndexCreationStrategyRegistry.describeClaimedNamespace()
+                        + ": mixed request with these and ordinary indices is not supported"
                 )
             );
             return;

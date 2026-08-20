@@ -179,14 +179,17 @@ public class MetadataUpdateSettingsService {
                     return;
                 }
             }
+            // Phase J3 of core-pluggability-refactor-plan.md: the namespace description comes from the
+            // registered strategy rather than core naming one product in an error a user reads.
             listener.onFailure(
                 new UnsupportedOperationException(
-                    "cannot update settings on serverless "
+                    "cannot update settings on "
                         + (gated.size() == 1 ? "index " + gated.get(0).getName() : "indices " + gated)
+                        + " in "
+                        + IndexCreationStrategyRegistry.describeClaimedNamespace()
                         + (gated.size() == request.indices().length
-                            ? ": a serverless index keeps no settings in cluster state and its descriptor has "
-                                + "nowhere to record arbitrary ones"
-                            : ": mixed request with ordinary and serverless indices is not supported")
+                            ? ": such an index keeps no settings in cluster state and has nowhere to record " + "arbitrary ones"
+                            : ": mixed request with these and ordinary indices is not supported")
                 )
             );
             return;

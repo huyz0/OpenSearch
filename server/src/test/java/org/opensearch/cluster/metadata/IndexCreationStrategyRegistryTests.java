@@ -38,6 +38,38 @@ public class IndexCreationStrategyRegistryTests extends OpenSearchTestCase {
             IndexCreationStrategyRegistry.skipsClusterState(null)
         );
         assertNotNull("falls back to the interface's own generic default", IndexCreationStrategyRegistry.describeClaimedNamespace());
+        assertEquals(
+            "with nothing registered there is no cap on multi-index open/close, which is what an "
+                + "unclaimed index has always had",
+            Integer.MAX_VALUE,
+            IndexCreationStrategyRegistry.maxMultiIndexStateChangeTargets()
+        );
+    }
+
+    /**
+     * Phase J3 of {@code core-pluggability-refactor-plan.md}: the multi-index open/close cap that {@code
+     * MetadataIndexStateService} used to hardcode as 50.
+     */
+    public void testMaxMultiIndexStateChangeTargetsComesFromTheStrategy() {
+        IndexCreationStrategyRegistry.register(new IndexCreationStrategy() {
+            @Override
+            public int maxMultiIndexStateChangeTargets() {
+                return 7;
+            }
+        });
+        assertEquals(7, IndexCreationStrategyRegistry.maxMultiIndexStateChangeTargets());
+
+        IndexCreationStrategyRegistry.register(new IndexCreationStrategy() {
+            @Override
+            public int maxMultiIndexStateChangeTargets() {
+                throw new RuntimeException("boom");
+            }
+        });
+        assertEquals(
+            "a broken strategy must not refuse every multi-index request; it falls back to no cap",
+            Integer.MAX_VALUE,
+            IndexCreationStrategyRegistry.maxMultiIndexStateChangeTargets()
+        );
     }
 
     public void testDelegatesToTheRegisteredStrategy() {

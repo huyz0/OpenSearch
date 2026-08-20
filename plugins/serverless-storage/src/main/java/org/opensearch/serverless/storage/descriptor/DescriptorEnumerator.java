@@ -16,6 +16,7 @@ import org.opensearch.cluster.metadata.IndexDescriptor;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.serverless.storage.ServerlessStoragePlugin;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
@@ -180,7 +181,12 @@ public final class DescriptorEnumerator implements DescriptorPrefixBackend {
             throw new DescriptorUnavailableException(safePrefix + "*", e);
         }
         if (found.size() > limit) {
-            return AbsentIndexDescriptorSuppliers.PrefixExpansion.tooMany(limit);
+            // Phase J3 of core-pluggability-refactor-plan.md: this plugin names its own setting in the
+            // refusal, instead of core interpolating this key into UnsupportedWildcardException's message.
+            return AbsentIndexDescriptorSuppliers.PrefixExpansion.tooMany(
+                limit,
+                ServerlessStoragePlugin.SERVERLESS_STORAGE_WILDCARD_MAX_EXPANDED_INDICES_SETTING.getKey()
+            );
         }
         List<AbsentIndexDescriptorSuppliers.PrefixMatch> matches = new ArrayList<>(found.size());
         for (BlobMetadata blob : found) {

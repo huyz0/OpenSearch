@@ -170,4 +170,23 @@ public interface IndexCreationStrategy {
     default String describeClaimedNamespace() {
         return "a namespace claimed by a registered index-creation strategy";
     }
+
+    /**
+     * The most claimed indices a single multi-index state change (open/close) may target, or {@link
+     * Integer#MAX_VALUE} for no limit.
+     *
+     * <p>Phase J3 of {@code core-pluggability-refactor-plan.md}. {@code MetadataIndexStateService} used to
+     * hardcode {@code 50} here, in a message that additionally named the specific storage technology whose
+     * per-operation cost motivated the number ("to prevent high-cost Object Storage operations"). Both the
+     * limit and the reason for it are properties of a particular strategy's storage model, not of core:
+     * a strategy whose backing store makes bulk state changes cheap has no reason to be capped at all,
+     * which is why the default is "no limit" rather than 50.
+     *
+     * <p>Defaults to {@link Integer#MAX_VALUE}, so a node with no strategy registered -- or one whose
+     * strategy does not override this -- applies no cap, exactly the behavior of any index that isn't
+     * claimed in the first place.
+     */
+    default int maxMultiIndexStateChangeTargets() {
+        return Integer.MAX_VALUE;
+    }
 }

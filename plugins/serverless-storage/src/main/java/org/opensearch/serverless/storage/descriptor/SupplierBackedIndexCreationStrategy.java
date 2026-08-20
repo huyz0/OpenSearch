@@ -57,4 +57,16 @@ public final class SupplierBackedIndexCreationStrategy implements IndexCreationS
     public String describeClaimedNamespace() {
         return "the serverless namespace [" + DescriptorOnlyCreation.SERVERLESS_NAME_PREFIX + "]";
     }
+
+    /**
+     * Phase J3 of {@code core-pluggability-refactor-plan.md}: the 50-target cap on multi-index open/close,
+     * which {@code MetadataIndexStateService} used to hardcode along with a message naming Object Storage
+     * as the reason. Both belong here: a gated index's open/close is a separate object-store operation, so
+     * the cost this bounds is this plugin's storage model, not a property of multi-index requests in
+     * general. Core's default is no cap.
+     */
+    @Override
+    public int maxMultiIndexStateChangeTargets() {
+        return 50;
+    }
 }

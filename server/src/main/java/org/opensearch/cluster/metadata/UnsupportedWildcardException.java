@@ -65,16 +65,22 @@ public class UnsupportedWildcardException extends OpenSearchStatusException {
         );
     }
 
-    /** A prefix that matches more indices than one request may expand to. */
-    public static UnsupportedWildcardException tooManyMatches(String expression, int limit) {
+    /**
+     * A prefix that matches more indices than one request may expand to.
+     *
+     * <p>Phase J3 of {@code core-pluggability-refactor-plan.md}: {@code limitSettingName} is supplied by
+     * whichever expander produced the limit, rather than core interpolating one specific plugin's setting
+     * key. Null when the expander did not name one, in which case the sentence is simply omitted.
+     */
+    public static UnsupportedWildcardException tooManyMatches(String expression, int limit, String limitSettingName) {
         return new UnsupportedWildcardException(
             "wildcard ["
                 + expression
                 + "] matches more than ["
                 + limit
                 + "] indices. Expanding it would place every match in this request, so narrow the prefix or "
-                + "name the indices exactly. The limit is controlled by "
-                + "[serverless_storage.wildcard.max_expanded_indices]."
+                + "name the indices exactly."
+                + (limitSettingName == null ? "" : " The limit is controlled by [" + limitSettingName + "].")
         );
     }
 }

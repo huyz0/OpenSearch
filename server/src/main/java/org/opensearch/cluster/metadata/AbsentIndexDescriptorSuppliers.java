@@ -228,14 +228,27 @@ public final class AbsentIndexDescriptorSuppliers {
      * @param exceeded whether more than {@code limit} indices matched, so no answer is being given
      * @param limit the cap that was applied, carried so an error can name it
      */
-    public record PrefixExpansion(List<PrefixMatch> matches, boolean exceeded, int limit) {
+    public record PrefixExpansion(List<PrefixMatch> matches, boolean exceeded, int limit, String limitSettingName) {
 
         public static PrefixExpansion of(List<PrefixMatch> matches) {
-            return new PrefixExpansion(matches, false, -1);
+            return new PrefixExpansion(matches, false, -1, null);
         }
 
+        /**
+         * Phase J3 of {@code core-pluggability-refactor-plan.md}: {@code limitSettingName} lets the
+         * expander name its own setting in the refusal a user reads. Core used to interpolate one specific
+         * plugin's setting key ({@code serverless_storage.wildcard.max_expanded_indices}) into {@code
+         * UnsupportedWildcardException}'s message, which is core naming a plugin's vocabulary. Nullable:
+         * an expander that would rather not name a setting gets a message that simply omits the sentence.
+         */
+        public static PrefixExpansion tooMany(int limit, String limitSettingName) {
+            return new PrefixExpansion(List.of(), true, limit, limitSettingName);
+        }
+
+        /** @deprecated use {@link #tooMany(int, String)} so the expander names its own limit setting. */
+        @Deprecated
         public static PrefixExpansion tooMany(int limit) {
-            return new PrefixExpansion(List.of(), true, limit);
+            return new PrefixExpansion(List.of(), true, limit, null);
         }
     }
 

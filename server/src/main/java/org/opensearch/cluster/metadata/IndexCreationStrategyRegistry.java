@@ -119,6 +119,24 @@ public final class IndexCreationStrategyRegistry {
         }
     }
 
+    /**
+     * The registered strategy's cap on how many claimed indices one multi-index open/close may target --
+     * see {@link IndexCreationStrategy#maxMultiIndexStateChangeTargets()}. Answers {@link Integer#MAX_VALUE}
+     * (no cap) when nothing is registered or the registered strategy throws, matching this registry's
+     * overall "unregistered changes nothing" shape.
+     */
+    public static int maxMultiIndexStateChangeTargets() {
+        IndexCreationStrategy strategy = STRATEGY.get();
+        if (strategy == null) {
+            return Integer.MAX_VALUE;
+        }
+        try {
+            return strategy.maxMultiIndexStateChangeTargets();
+        } catch (Exception e) {
+            return Integer.MAX_VALUE;
+        }
+    }
+
     private static final String DEFAULT_DESCRIPTION = new IndexCreationStrategy() {
     }.describeClaimedNamespace();
 }
