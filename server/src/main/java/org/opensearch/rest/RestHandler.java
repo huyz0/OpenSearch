@@ -133,24 +133,25 @@ public interface RestHandler {
     }
 
     /**
-     * Declares this handler's availability on a node running in serverless mode
-     * (rfc-serverless-opensearch.md &sect;11) -- disaggregated storage makes several existing APIs
-     * meaningless or dangerous (shard-store APIs report on local disk state that may not exist;
-     * {@code _forcemerge} semantics change entirely under a compaction service; snapshot/restore is
-     * partially redundant with a manifest-native format), so serverless mode needs a way to gate
-     * REST surface per handler rather than all-or-nothing.
+     * Declares whether this handler is meaningful on a node whose storage or metadata plane is managed
+     * externally rather than by the node itself -- for example a deployment that disaggregates storage,
+     * where several existing APIs become meaningless or dangerous: shard-store APIs report on local disk
+     * state that may not exist, {@code _forcemerge} semantics change entirely under an external compaction
+     * service, and snapshot/restore is partly redundant with a manifest-native format. Such a deployment
+     * needs to gate REST surface per handler rather than all-or-nothing.
      *
-     * <p>Defaults to {@link ServerlessScope#UNAVAILABLE} deliberately: new APIs must opt in
-     * consciously to running under serverless mode rather than being silently exposed by omission.
+     * <p>Defaults to {@link ApiAvailabilityScope#UNAVAILABLE} deliberately: new APIs must opt in
+     * consciously rather than being silently exposed by omission.
      *
      * <p><b>This is a declaration, and core never acts on it.</b>
      * Nothing in {@link RestController} or anywhere else in core reads this method, and that is the
      * design rather than an unfinished state. A handler declaring {@code UNAVAILABLE} is served
      * exactly as before on an ordinary node, so this method cannot change the behaviour of a node
-     * running without a serverless plugin.
+     * running without a plugin that enforces it. {@code RestControllerTests} carries a test asserting
+     * exactly that, so it stays true.
      *
-     * <p>Enforcement belongs to whichever plugin defines what "serverless mode" means for a
-     * deployment, and it already has somewhere to live: a plugin returning a wrapper from
+     * <p>Enforcement belongs to whichever plugin defines what an externally-managed deployment means,
+     * and it already has somewhere to live: a plugin returning a wrapper from
      * {@link org.opensearch.plugins.ActionPlugin#getRestHandlerWrapper} sees every registered
      * handler and can refuse the ones this method excludes. That needs no core setting and no core
      * enforcement branch, which is why neither exists.
@@ -158,23 +159,29 @@ public interface RestHandler {
      * <p>Core carries the vocabulary alone so that handlers, this module's own and every plugin's,
      * can record their intended availability incrementally instead of a plugin having to maintain
      * an external list of route names that drifts every time a handler is added.
+     *
+     * <p><b>Phase J of {@code core-pluggability-refactor-plan.md}: renamed from {@code serverlessScope()}.</b>
+     * The mechanism is unchanged and was already correct -- the declaration belongs next to the handler it
+     * describes, and enforcement was already fully plugin-owned. What was wrong was only the vocabulary:
+     * a core-wide interface on {@code @PublicApi} {@link RestHandler}, implemented by handlers throughout
+     * core, named after one specific product. The question each handler actually answers is generic.
      */
-    default ServerlessScope serverlessScope() {
-        return ServerlessScope.UNAVAILABLE;
+    default ApiAvailabilityScope apiAvailabilityScope() {
+        return ApiAvailabilityScope.UNAVAILABLE;
     }
 
     /**
-     * The three availability levels a {@link RestHandler} can declare via {@link #serverlessScope()}.
+     * The three availability levels a {@link RestHandler} can declare via {@link #apiAvailabilityScope()}.
      *
      * @opensearch.api
      */
-    @PublicApi(since = "3.0.0")
-    enum ServerlessScope {
-        /** Available to ordinary callers on a node running in serverless mode. */
+    @PublicApi(since = "3.8.0")
+    enum ApiAvailabilityScope {
+        /** Available to ordinary callers on a node whose storage/metadata plane is externally managed. */
         AVAILABLE,
-        /** Available only to internal/system callers on a node running in serverless mode, never external clients. */
+        /** Available only to internal/system callers on such a node, never to external clients. */
         INTERNAL_ONLY,
-        /** Not available at all on a node running in serverless mode -- the default for any unannotated handler. */
+        /** Not available at all on such a node -- the default for any handler that does not declare otherwise. */
         UNAVAILABLE
     }
 
@@ -250,8 +257,8 @@ public interface RestHandler {
         }
 
         @Override
-        public ServerlessScope serverlessScope() {
-            return delegate.serverlessScope();
+        public ApiAvailabilityScope apiAvailabilityScope() {
+            return delegate.apiAvailabilityScope();
         }
     }
 

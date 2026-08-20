@@ -42,7 +42,7 @@ import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.common.SetOnce;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
-import org.opensearch.rest.RestHandler.ServerlessScope;
+import org.opensearch.rest.RestHandler.ApiAvailabilityScope;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.rest.action.document.RestIndexAction.AutoIdHandler;
 import org.opensearch.rest.action.document.RestIndexAction.CreateHandler;
@@ -66,10 +66,10 @@ public class RestIndexActionTests extends RestActionTestCase {
         controller().registerHandler(new AutoIdHandler(() -> clusterStateSupplier.get().nodes()));
     }
 
-    public void testServerlessScopeIsAvailableForEveryVariant() {
-        assertEquals(ServerlessScope.AVAILABLE, new RestIndexAction().serverlessScope());
-        assertEquals(ServerlessScope.AVAILABLE, new CreateHandler().serverlessScope());
-        assertEquals(ServerlessScope.AVAILABLE, new AutoIdHandler(() -> clusterStateSupplier.get().nodes()).serverlessScope());
+    public void testApiAvailabilityScopeIsAvailableForEveryVariant() {
+        assertEquals(ApiAvailabilityScope.AVAILABLE, new RestIndexAction().apiAvailabilityScope());
+        assertEquals(ApiAvailabilityScope.AVAILABLE, new CreateHandler().apiAvailabilityScope());
+        assertEquals(ApiAvailabilityScope.AVAILABLE, new AutoIdHandler(() -> clusterStateSupplier.get().nodes()).apiAvailabilityScope());
     }
 
     public void testPath() {

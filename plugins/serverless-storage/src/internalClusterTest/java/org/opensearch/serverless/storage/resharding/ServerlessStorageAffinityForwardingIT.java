@@ -9,7 +9,7 @@
 package org.opensearch.serverless.storage.resharding;
 
 import org.opensearch.action.search.SearchResponse;
-import org.opensearch.action.support.ServerlessAffinityRouting;
+import org.opensearch.action.support.CoordinatorAffinityRouting;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodes;
@@ -68,7 +68,7 @@ public class ServerlessStorageAffinityForwardingIT extends org.opensearch.server
             if (exclude.contains(candidate)) {
                 continue;
             }
-            if (wantNodeId.equals(ServerlessAffinityRouting.getAffinityNodeId(candidate, allNodeIds))) {
+            if (wantNodeId.equals(CoordinatorAffinityRouting.getAffinityNodeId(candidate, allNodeIds))) {
                 return candidate;
             }
         }

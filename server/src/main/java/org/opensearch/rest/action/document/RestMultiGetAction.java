@@ -37,7 +37,7 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.core.common.Strings;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.rest.BaseRestHandler;
-import org.opensearch.rest.RestHandler.ServerlessScope;
+import org.opensearch.rest.RestHandler.ApiAvailabilityScope;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.rest.action.RestToXContentListener;
 import org.opensearch.search.fetch.subphase.FetchSourceContext;
@@ -103,7 +103,7 @@ public class RestMultiGetAction extends BaseRestHandler {
 
     /** Phase 5 REST gating audit: standard read, alongside get (already AVAILABLE). */
     @Override
-    public ServerlessScope serverlessScope() {
-        return ServerlessScope.AVAILABLE;
+    public ApiAvailabilityScope apiAvailabilityScope() {
+        return ApiAvailabilityScope.AVAILABLE;
     }
 }

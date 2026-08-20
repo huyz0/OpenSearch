@@ -10,7 +10,7 @@ package org.opensearch.serverless.storage.retention.action;
 
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.rest.BaseRestHandler;
-import org.opensearch.rest.RestHandler.ServerlessScope;
+import org.opensearch.rest.RestHandler.ApiAvailabilityScope;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.rest.action.RestToXContentListener;
 import org.opensearch.transport.client.node.NodeClient;
@@ -48,8 +48,8 @@ public class RestSnapshotReleaseAction extends BaseRestHandler {
      * invalidates.
      */
     @Override
-    public ServerlessScope serverlessScope() {
-        return ServerlessScope.AVAILABLE;
+    public ApiAvailabilityScope apiAvailabilityScope() {
+        return ApiAvailabilityScope.AVAILABLE;
     }
 
     @Override

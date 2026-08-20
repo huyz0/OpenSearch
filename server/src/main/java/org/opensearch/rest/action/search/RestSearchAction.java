@@ -49,7 +49,7 @@ import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.rest.BaseRestHandler;
-import org.opensearch.rest.RestHandler.ServerlessScope;
+import org.opensearch.rest.RestHandler.ApiAvailabilityScope;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.rest.action.RestActions;
 import org.opensearch.rest.action.RestCancellableNodeClient;
@@ -126,8 +126,8 @@ public class RestSearchAction extends BaseRestHandler {
      * {@code UNAVAILABLE} alongside everything else in core.
      */
     @Override
-    public ServerlessScope serverlessScope() {
-        return ServerlessScope.AVAILABLE;
+    public ApiAvailabilityScope apiAvailabilityScope() {
+        return ApiAvailabilityScope.AVAILABLE;
     }
 
     @Override

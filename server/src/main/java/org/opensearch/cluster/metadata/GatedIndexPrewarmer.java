@@ -10,7 +10,7 @@ package org.opensearch.cluster.metadata;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.opensearch.action.support.ServerlessAffinityRouting;
+import org.opensearch.action.support.CoordinatorAffinityRouting;
 import org.opensearch.cluster.ClusterChangedEvent;
 import org.opensearch.cluster.ClusterStateApplier;
 import org.opensearch.cluster.node.DiscoveryNode;
@@ -30,10 +30,10 @@ import java.util.List;
  * This applier runs once per node -- {@link org.opensearch.indices.cluster.IndicesClusterStateService}
  * constructs one instance per node, and {@link ClusterStateApplier#applyClusterState} fires on every
  * node for the same cluster-state transition. Prefetching the full {@code activeGatedIndices} set
- * unfiltered, as this class did before {@link ServerlessAffinityRouting} had a caller, means N nodes
+ * unfiltered, as this class did before {@link CoordinatorAffinityRouting} had a caller, means N nodes
  * each independently re-warm all M indices: N times the store reads a single node join should cost,
  * and every node's cache converges on holding the same full population rather than each holding its
- * own roughly M/N share -- destroying the affinity-driven cache locality {@link ServerlessAffinityRouting}
+ * own roughly M/N share -- destroying the affinity-driven cache locality {@link CoordinatorAffinityRouting}
  * exists to create ({@code getAffinityNode} is deterministic, so every node computing it against the
  * same cluster state agrees on which one owns a given name).
  *
@@ -78,7 +78,7 @@ public class GatedIndexPrewarmer implements ClusterStateApplier {
         String localNodeId = nodes.getLocalNodeId();
         List<String> ownShare = new ArrayList<>();
         for (String indexName : activeGatedIndices) {
-            DiscoveryNode affinityNode = ServerlessAffinityRouting.getAffinityNode(indexName, nodes);
+            DiscoveryNode affinityNode = CoordinatorAffinityRouting.getAffinityNode(indexName, nodes);
             if (affinityNode != null && localNodeId != null && localNodeId.equals(affinityNode.getId())) {
                 ownShare.add(indexName);
             }

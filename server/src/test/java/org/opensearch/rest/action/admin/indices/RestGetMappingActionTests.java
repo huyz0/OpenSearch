@@ -8,17 +8,17 @@
 
 package org.opensearch.rest.action.admin.indices;
 
-import org.opensearch.rest.RestHandler.ServerlessScope;
+import org.opensearch.rest.RestHandler.ApiAvailabilityScope;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.threadpool.TestThreadPool;
 import org.opensearch.threadpool.ThreadPool;
 
 public class RestGetMappingActionTests extends OpenSearchTestCase {
 
-    public void testServerlessScopeIsAvailable() {
+    public void testApiAvailabilityScopeIsAvailable() {
         ThreadPool threadPool = new TestThreadPool(getClass().getName());
         try {
-            assertEquals(ServerlessScope.AVAILABLE, new RestGetMappingAction(threadPool).serverlessScope());
+            assertEquals(ApiAvailabilityScope.AVAILABLE, new RestGetMappingAction(threadPool).apiAvailabilityScope());
         } finally {
             threadPool.shutdown();
         }

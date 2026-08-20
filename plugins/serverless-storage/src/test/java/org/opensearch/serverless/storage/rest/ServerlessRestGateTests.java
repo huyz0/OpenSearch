@@ -37,15 +37,15 @@ public class ServerlessRestGateTests extends OpenSearchTestCase {
     /** A handler that records whether it ran, so "refused" can mean "did not execute" rather than "returned 410". */
     private static final class RecordingHandler implements RestHandler {
 
-        private final ServerlessScope scope;
+        private final ApiAvailabilityScope scope;
         private final AtomicBoolean ran = new AtomicBoolean();
 
-        RecordingHandler(ServerlessScope scope) {
+        RecordingHandler(ApiAvailabilityScope scope) {
             this.scope = scope;
         }
 
         @Override
-        public ServerlessScope serverlessScope() {
+        public ApiAvailabilityScope apiAvailabilityScope() {
             return scope;
         }
 
@@ -73,7 +73,7 @@ public class ServerlessRestGateTests extends OpenSearchTestCase {
     }
 
     public void testAnAvailableHandlerIsLeftAlone() throws Exception {
-        RecordingHandler handler = new RecordingHandler(RestHandler.ServerlessScope.AVAILABLE);
+        RecordingHandler handler = new RecordingHandler(RestHandler.ApiAvailabilityScope.AVAILABLE);
 
         RestHandler gated = new ServerlessRestGate().apply(handler);
 
@@ -83,7 +83,7 @@ public class ServerlessRestGateTests extends OpenSearchTestCase {
     }
 
     public void testAnUnavailableHandlerIsRefusedWithoutRunning() throws Exception {
-        RecordingHandler handler = new RecordingHandler(RestHandler.ServerlessScope.UNAVAILABLE);
+        RecordingHandler handler = new RecordingHandler(RestHandler.ApiAvailabilityScope.UNAVAILABLE);
 
         FakeRestChannel channel = dispatch(new ServerlessRestGate().apply(handler));
 
@@ -96,7 +96,7 @@ public class ServerlessRestGateTests extends OpenSearchTestCase {
      * handler declaring itself internal is saying exactly that callers arriving this way must not reach it.
      */
     public void testAnInternalOnlyHandlerIsAlsoRefused() throws Exception {
-        RecordingHandler handler = new RecordingHandler(RestHandler.ServerlessScope.INTERNAL_ONLY);
+        RecordingHandler handler = new RecordingHandler(RestHandler.ApiAvailabilityScope.INTERNAL_ONLY);
 
         FakeRestChannel channel = dispatch(new ServerlessRestGate().apply(handler));
 
@@ -105,7 +105,7 @@ public class ServerlessRestGateTests extends OpenSearchTestCase {
     }
 
     /**
-     * A handler that says nothing is refused, because {@code serverlessScope()} defaults to UNAVAILABLE.
+     * A handler that says nothing is refused, because {@code apiAvailabilityScope()} defaults to UNAVAILABLE.
      * That default is why core cannot be the one enforcing this: were the check in {@code RestController},
      * every handler in every plugin that had never heard of serverless mode would need an override.
      */
@@ -128,13 +128,13 @@ public class ServerlessRestGateTests extends OpenSearchTestCase {
      * would unregister the path rather than refuse it, and the request would 404 instead of 410.
      */
     public void testARefusedHandlerStillDescribesItself() {
-        RecordingHandler handler = new RecordingHandler(RestHandler.ServerlessScope.UNAVAILABLE);
+        RecordingHandler handler = new RecordingHandler(RestHandler.ApiAvailabilityScope.UNAVAILABLE);
 
         RestHandler gated = new ServerlessRestGate().apply(handler);
 
         assertEquals(handler.routes(), gated.routes());
         assertEquals(handler.supportsContentStream(), gated.supportsContentStream());
-        assertEquals(handler.serverlessScope(), gated.serverlessScope());
+        assertEquals(handler.apiAvailabilityScope(), gated.apiAvailabilityScope());
     }
 
     /**

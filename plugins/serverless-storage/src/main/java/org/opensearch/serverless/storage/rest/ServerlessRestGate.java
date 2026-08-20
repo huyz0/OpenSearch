@@ -32,7 +32,7 @@ import java.util.function.UnaryOperator;
  * {@link org.opensearch.rest.RestController}, a field, an extra constructor, and a 410 branch in
  * {@code dispatchRequest}. It was default-off and so broke nothing, but it put a decision in core rather
  * than a hook, which is the thing core changes here are supposed to avoid. Core keeps only the vocabulary,
- * {@link RestHandler#serverlessScope()}, which nothing in core reads.
+ * {@link RestHandler#apiAvailabilityScope()}, which nothing in core reads.
  *
  * <p>{@code ActionPlugin.getRestHandlerWrapper} already exists upstream and already sees every handler, so
  * no new seam was needed for this at all.
@@ -50,7 +50,7 @@ public final class ServerlessRestGate implements UnaryOperator<RestHandler> {
 
     @Override
     public RestHandler apply(RestHandler handler) {
-        if (handler.serverlessScope() == RestHandler.ServerlessScope.AVAILABLE) {
+        if (handler.apiAvailabilityScope() == RestHandler.ApiAvailabilityScope.AVAILABLE) {
             // Returned unwrapped rather than wrapped-and-passed-through, so that an available handler
             // keeps its own identity for anything that inspects it (usage stats, deprecation wrapping).
             return handler;

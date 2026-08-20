@@ -42,7 +42,7 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.rest.RestChannel;
-import org.opensearch.rest.RestHandler.ServerlessScope;
+import org.opensearch.rest.RestHandler.ApiAvailabilityScope;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.test.client.NoOpNodeClient;
@@ -61,8 +61,8 @@ import static org.mockito.Mockito.mock;
  */
 public class RestBulkActionTests extends OpenSearchTestCase {
 
-    public void testServerlessScopeIsAvailable() {
-        assertEquals(ServerlessScope.AVAILABLE, new RestBulkAction(Settings.EMPTY).serverlessScope());
+    public void testApiAvailabilityScopeIsAvailable() {
+        assertEquals(ApiAvailabilityScope.AVAILABLE, new RestBulkAction(Settings.EMPTY).apiAvailabilityScope());
     }
 
     public void testBulkPipelineUpsert() throws Exception {

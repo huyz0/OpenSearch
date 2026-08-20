@@ -8,12 +8,12 @@
 
 package org.opensearch.rest.action.document;
 
-import org.opensearch.rest.RestHandler.ServerlessScope;
+import org.opensearch.rest.RestHandler.ApiAvailabilityScope;
 import org.opensearch.test.OpenSearchTestCase;
 
 public class RestGetActionTests extends OpenSearchTestCase {
 
-    public void testServerlessScopeIsAvailable() {
-        assertEquals(ServerlessScope.AVAILABLE, new RestGetAction().serverlessScope());
+    public void testApiAvailabilityScopeIsAvailable() {
+        assertEquals(ApiAvailabilityScope.AVAILABLE, new RestGetAction().apiAvailabilityScope());
     }
 }

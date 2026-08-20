@@ -239,7 +239,7 @@ public class RestControllerTests extends OpenSearchTestCase {
     }
 
     /**
-     * Core never acts on {@link RestHandler#serverlessScope()}, and this is the test that says so.
+     * Core never acts on {@link RestHandler#apiAvailabilityScope()}, and this is the test that says so.
      *
      * <p>An earlier version of this class enforced the declaration itself, behind a
      * {@code rest.serverless_mode.enabled} setting. It worked, and it was default-off, but it put a
@@ -264,8 +264,8 @@ public class RestControllerTests extends OpenSearchTestCase {
             }
 
             @Override
-            public ServerlessScope serverlessScope() {
-                return ServerlessScope.UNAVAILABLE;
+            public ApiAvailabilityScope apiAvailabilityScope() {
+                return ApiAvailabilityScope.UNAVAILABLE;
             }
         });
         AssertingChannel channel = new AssertingChannel(fakeRequest, false, RestStatus.OK);

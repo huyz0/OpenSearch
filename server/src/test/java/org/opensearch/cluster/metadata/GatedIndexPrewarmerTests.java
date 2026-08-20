@@ -9,7 +9,7 @@
 package org.opensearch.cluster.metadata;
 
 import org.opensearch.Version;
-import org.opensearch.action.support.ServerlessAffinityRouting;
+import org.opensearch.action.support.CoordinatorAffinityRouting;
 import org.opensearch.cluster.ClusterChangedEvent;
 import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.ClusterState;
@@ -47,7 +47,7 @@ public class GatedIndexPrewarmerTests extends OpenSearchTestCase {
      * {@code wantNodeId} -- so the test drives real affinity decisions rather than guessing
      * whether a fixed literal name happens to land where the test wants it to.
      *
-     * <p>{@code allNodeIds} must be every node id {@link ServerlessAffinityRouting#getAffinityNode}
+     * <p>{@code allNodeIds} must be every node id {@link CoordinatorAffinityRouting#getAffinityNode}
      * would see in the real {@code DiscoveryNodes} the test builds -- including the cluster-manager,
      * since the production code iterates every node with no role filtering. Passing a narrower set
      * here than the real one would compute a different winner than the code under test actually sees.
@@ -55,7 +55,7 @@ public class GatedIndexPrewarmerTests extends OpenSearchTestCase {
     private static String nameWithAffinityFor(String wantNodeId, List<String> allNodeIds) {
         for (int i = 0; i < 10_000; i++) {
             String candidate = "gated-affinity-probe-" + i;
-            if (wantNodeId.equals(ServerlessAffinityRouting.getAffinityNodeId(candidate, allNodeIds))) {
+            if (wantNodeId.equals(CoordinatorAffinityRouting.getAffinityNodeId(candidate, allNodeIds))) {
                 return candidate;
             }
         }

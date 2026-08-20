@@ -36,7 +36,7 @@ import org.opensearch.action.delete.DeleteRequest;
 import org.opensearch.action.support.ActiveShardCount;
 import org.opensearch.index.VersionType;
 import org.opensearch.rest.BaseRestHandler;
-import org.opensearch.rest.RestHandler.ServerlessScope;
+import org.opensearch.rest.RestHandler.ApiAvailabilityScope;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.rest.action.RestActions;
 import org.opensearch.rest.action.RestStatusToXContentListener;
@@ -87,7 +87,7 @@ public class RestDeleteAction extends BaseRestHandler {
 
     /** Phase 5 REST gating audit: core document CRUD, alongside index/get/bulk (already AVAILABLE). */
     @Override
-    public ServerlessScope serverlessScope() {
-        return ServerlessScope.AVAILABLE;
+    public ApiAvailabilityScope apiAvailabilityScope() {
+        return ApiAvailabilityScope.AVAILABLE;
     }
 }

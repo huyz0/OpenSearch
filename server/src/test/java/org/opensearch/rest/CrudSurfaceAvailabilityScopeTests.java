@@ -23,7 +23,7 @@ import org.opensearch.test.OpenSearchTestCase;
 /**
  * Phase 5 (rfc-serverless-opensearch.md, REST API gating audit): a real serverless deployment with
  * {@code serverless_storage.rest_gating.enabled} turned on needs the ordinary CRUD/read surface to
- * keep working -- {@code RestHandler#serverlessScope()} defaults to {@code UNAVAILABLE}, so every
+ * keep working -- {@code RestHandler#apiAvailabilityScope()} defaults to {@code UNAVAILABLE}, so every
  * handler needs an explicit opt-in, and nothing previously enumerated the set that opts in.
  *
  * <p>Auditing the whole REST surface found create-index, delete-index, delete-document,
@@ -38,7 +38,7 @@ import org.opensearch.test.OpenSearchTestCase;
  * reintroducing an unusable deployment. It intentionally does not re-verify the handlers that already
  * declared {@code AVAILABLE} before this pass -- those were presumably reviewed when each was added.
  */
-public class ServerlessCrudSurfaceScopeTests extends OpenSearchTestCase {
+public class CrudSurfaceAvailabilityScopeTests extends OpenSearchTestCase {
 
     public void testCreateIndexIsAvailable() {
         assertAvailable(new RestCreateIndexAction());
@@ -82,8 +82,8 @@ public class ServerlessCrudSurfaceScopeTests extends OpenSearchTestCase {
                 + " must be AVAILABLE under serverless mode, or a gated "
                 + "deployment loses this operation entirely -- the default is UNAVAILABLE, so this is an "
                 + "explicit opt-in a future change could silently drop",
-            RestHandler.ServerlessScope.AVAILABLE,
-            handler.serverlessScope()
+            RestHandler.ApiAvailabilityScope.AVAILABLE,
+            handler.apiAvailabilityScope()
         );
     }
 }

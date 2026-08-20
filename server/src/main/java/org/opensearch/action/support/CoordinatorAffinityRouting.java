@@ -24,9 +24,9 @@ import java.util.List;
  * <p>Uses consistent rendezvous hashing over node IDs to map an index name to a primary
  * candidate coordinator node, maximizing coordinator LRU descriptor cache hit ratios (Area B).
  */
-public final class ServerlessAffinityRouting {
+public final class CoordinatorAffinityRouting {
 
-    private ServerlessAffinityRouting() {}
+    private CoordinatorAffinityRouting() {}
 
     /**
      * Finds the preferred coordinator node for an index name based on rendezvous weight.

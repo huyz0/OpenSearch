@@ -325,7 +325,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
 
     /**
      * Whether this node refuses REST handlers that have not declared themselves available under serverless
-     * mode, per each handler's {@link org.opensearch.rest.RestHandler#serverlessScope()}.
+     * mode, per each handler's {@link org.opensearch.rest.RestHandler#apiAvailabilityScope()}.
      *
      * <p>Off by default, and enforcement lives entirely in {@link ServerlessRestGate}, which this plugin
      * hands to core through the pre-existing {@code ActionPlugin.getRestHandlerWrapper} hook. Core has no

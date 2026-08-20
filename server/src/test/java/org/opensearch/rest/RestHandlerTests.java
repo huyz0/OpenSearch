@@ -15,27 +15,27 @@ public class RestHandlerTests extends OpenSearchTestCase {
 
     private static final RestHandler DEFAULT_HANDLER = (request, channel, client) -> {};
 
-    public void testServerlessScopeDefaultsToUnavailable() {
-        assertEquals(RestHandler.ServerlessScope.UNAVAILABLE, DEFAULT_HANDLER.serverlessScope());
+    public void testApiAvailabilityScopeDefaultsToUnavailable() {
+        assertEquals(RestHandler.ApiAvailabilityScope.UNAVAILABLE, DEFAULT_HANDLER.apiAvailabilityScope());
     }
 
-    public void testWrapperDelegatesServerlessScope() {
+    public void testWrapperDelegatesApiAvailabilityScope() {
         RestHandler declaresAvailable = new RestHandler() {
             @Override
             public void handleRequest(RestRequest request, RestChannel channel, NodeClient client) {}
 
             @Override
-            public RestHandler.ServerlessScope serverlessScope() {
-                return RestHandler.ServerlessScope.AVAILABLE;
+            public RestHandler.ApiAvailabilityScope apiAvailabilityScope() {
+                return RestHandler.ApiAvailabilityScope.AVAILABLE;
             }
         };
 
         RestHandler wrapped = RestHandler.wrapper(declaresAvailable);
-        assertEquals(RestHandler.ServerlessScope.AVAILABLE, wrapped.serverlessScope());
+        assertEquals(RestHandler.ApiAvailabilityScope.AVAILABLE, wrapped.apiAvailabilityScope());
     }
 
     public void testWrapperDelegatesDefaultUnavailableToo() {
         RestHandler wrapped = RestHandler.wrapper(DEFAULT_HANDLER);
-        assertEquals(RestHandler.ServerlessScope.UNAVAILABLE, wrapped.serverlessScope());
+        assertEquals(RestHandler.ApiAvailabilityScope.UNAVAILABLE, wrapped.apiAvailabilityScope());
     }
 }

@@ -8,12 +8,12 @@
 
 package org.opensearch.rest.action.admin.indices;
 
-import org.opensearch.rest.RestHandler.ServerlessScope;
+import org.opensearch.rest.RestHandler.ApiAvailabilityScope;
 import org.opensearch.test.OpenSearchTestCase;
 
 public class RestGetSettingsActionTests extends OpenSearchTestCase {
 
-    public void testServerlessScopeIsAvailable() {
-        assertEquals(ServerlessScope.AVAILABLE, new RestGetSettingsAction().serverlessScope());
+    public void testApiAvailabilityScopeIsAvailable() {
+        assertEquals(ApiAvailabilityScope.AVAILABLE, new RestGetSettingsAction().apiAvailabilityScope());
     }
 }

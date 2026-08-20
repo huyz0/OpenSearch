@@ -35,7 +35,7 @@ package org.opensearch.rest.action.admin.indices;
 import org.opensearch.cluster.metadata.AliasMetadata;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
-import org.opensearch.rest.RestHandler.ServerlessScope;
+import org.opensearch.rest.RestHandler.ApiAvailabilityScope;
 import org.opensearch.rest.RestResponse;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -50,8 +50,8 @@ import static org.hamcrest.Matchers.equalTo;
 
 public class RestGetAliasesActionTests extends OpenSearchTestCase {
 
-    public void testServerlessScopeIsAvailable() {
-        assertEquals(ServerlessScope.AVAILABLE, new RestGetAliasesAction().serverlessScope());
+    public void testApiAvailabilityScopeIsAvailable() {
+        assertEquals(ApiAvailabilityScope.AVAILABLE, new RestGetAliasesAction().apiAvailabilityScope());
     }
 
     // # Assumes the following setup

@@ -24,7 +24,7 @@ import org.opensearch.action.search.SearchResponse;
 import org.opensearch.action.support.ActionFilter;
 import org.opensearch.action.support.ActionFilterChain;
 import org.opensearch.action.support.ActionRequestMetadata;
-import org.opensearch.action.support.ServerlessAffinityRouting;
+import org.opensearch.action.support.CoordinatorAffinityRouting;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.IndexMetadata;
@@ -55,7 +55,7 @@ import java.util.function.Supplier;
  * Plan item B4/B5/B6 (plan-100m-index-implementation.md, Area B): for a request naming several
  * indices that a load balancer cannot hash on its own (wildcards, aliases, {@code _bulk},
  * {@code _msearch}) -- the receiving coordinator resolves what the request actually touches and, if
- * every touched index is gated (Area H) and they all agree on one {@link ServerlessAffinityRouting}
+ * every touched index is gated (Area H) and they all agree on one {@link CoordinatorAffinityRouting}
  * target, forwards the whole request there once. A single-index request that a load balancer
  * already hashed correctly never reaches this filter's forwarding branch at all: it's already local.
  *
@@ -88,7 +88,7 @@ import java.util.function.Supplier;
  * requests this filter has itself forwarded, stashed in {@link ThreadContext} so it survives a
  * request being re-entrant-dispatched back through the same filter chain on the same logical
  * request's context. In addition to that marker, the decision is naturally self-terminating even
- * without it: {@link ServerlessAffinityRouting#getAffinityNode} is a deterministic function of
+ * without it: {@link CoordinatorAffinityRouting#getAffinityNode} is a deterministic function of
  * cluster state, so the node this request lands on after one forward computes the same answer and
  * finds itself already the target -- the marker exists for the residual case B5 calls out (a
  * transient cluster-state disagreement between two nodes' reads), not as the only line of defence.
@@ -334,7 +334,7 @@ public final class AffinityForwardingActionFilter implements ActionFilter {
      * The real resolution: expands wildcards/aliases (for {@code SearchRequest}/{@code MultiSearchRequest};
      * bulk items are taken literally, matching {@link WritePartitionRoutingActionFilter}'s own
      * choice not to resolve aliases on the write path) and checks each concrete name against both
-     * {@link AbsentIndexDescriptorSuppliers} (is it gated at all) and {@link ServerlessAffinityRouting}
+     * {@link AbsentIndexDescriptorSuppliers} (is it gated at all) and {@link CoordinatorAffinityRouting}
      * (which node owns it). Returns the single node every touched index agrees on, or {@code null} if
      * there isn't one -- including because at least one touched index isn't gated at all, since an
      * ordinary index has no descriptor-cache-locality problem for this filter to solve.
@@ -372,7 +372,7 @@ public final class AffinityForwardingActionFilter implements ActionFilter {
             if (gated == false) {
                 return null;
             }
-            DiscoveryNode candidate = ServerlessAffinityRouting.getAffinityNode(name, state.nodes());
+            DiscoveryNode candidate = CoordinatorAffinityRouting.getAffinityNode(name, state.nodes());
             if (candidate == null) {
                 return null;
             }

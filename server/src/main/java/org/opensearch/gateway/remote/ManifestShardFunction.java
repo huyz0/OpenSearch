@@ -28,11 +28,11 @@ import java.util.Objects;
  *
  * <h2>E7 -- alignment with the coordinator/descriptor-cache affinity hash</h2>
  *
- * {@code ServerlessAffinityRouting} (Area B, {@code plugins/serverless-storage}) already rendezvous-
+ * {@code CoordinatorAffinityRouting} (Area B, {@code plugins/serverless-storage}) already rendezvous-
  * hashes indices onto coordinator nodes for a different reason (spreading resolver-cache warmth). The
  * RFC calls out that if the manifest's own partition function matched that one, a coordinator's warm
  * set and its manifest-shard read set would coincide -- "a free win from two independent designs lining
- * up." This class deliberately does not attempt that coupling: {@code ServerlessAffinityRouting}
+ * up." This class deliberately does not attempt that coupling: {@code CoordinatorAffinityRouting}
  * partitions over the current, size-varying node set (rendezvous hashing is defined precisely so adding
  * or removing a node reshuffles as little as possible), while this partitions over a shard count fixed
  * in the manifest and never derived from cluster size (see this class's own {@code shardCount} contract
