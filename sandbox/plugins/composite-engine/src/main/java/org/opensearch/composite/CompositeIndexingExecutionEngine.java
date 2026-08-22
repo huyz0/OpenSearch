@@ -48,7 +48,6 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -78,7 +77,15 @@ public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine
     private static final Logger logger = LogManager.getLogger(CompositeIndexingExecutionEngine.class);
 
     private final IndexingExecutionEngine<?, ?> primaryEngine;
-    private final Set<IndexingExecutionEngine<?, ?>> secondaryEngines;
+    /**
+     * Secondary engines in a fixed, explicit order — the order every fan-out here, in
+     * {@link CompositeWriter} and in {@link CompositeDocumentInput} iterates. It used to be a
+     * {@code Set.copyOf(...)}, whose iteration order is unspecified, while
+     * {@link CompositeWriter#addDoc} promised rollback "in order" and {@code doRefresh} matched
+     * two separate iterations of it positionally. Both were correct only by accident of
+     * immutable-set stability.
+     */
+    private final List<IndexingExecutionEngine<?, ?>> secondaryEngines;
     private final CompositeDataFormat compositeDataFormat;
     private final Committer committer;
     private final IndexSettings indexSettings;
@@ -145,13 +152,21 @@ public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine
         this.primaryEngine = dataFormatRegistry.getIndexingEngine(engineSettings, primaryFormat);
         allFormats.add(primaryFormat);
 
-        List<IndexingExecutionEngine<?, ?>> secondaries = new ArrayList<>();
+        // Order secondaries exactly the way CompositeDataFormatPlugin.assignCapabilities orders
+        // them (ascending priority, stable so equal priorities keep the setting-list order), so
+        // the order a format claims capabilities in is the order it is written in.
+        List<DataFormat> secondaryFormats = new ArrayList<>(secondaryFormatNames.size());
         for (String secondaryName : secondaryFormatNames) {
-            DataFormat secondaryFormat = dataFormatRegistry.format(secondaryName);
+            secondaryFormats.add(dataFormatRegistry.format(secondaryName));
+        }
+        secondaryFormats.sort(CompositeDataFormatPlugin.PRECEDENCE_ORDER);
+
+        List<IndexingExecutionEngine<?, ?>> secondaries = new ArrayList<>(secondaryFormats.size());
+        for (DataFormat secondaryFormat : secondaryFormats) {
             secondaries.add(dataFormatRegistry.getIndexingEngine(engineSettings, secondaryFormat));
             allFormats.add(secondaryFormat);
         }
-        this.secondaryEngines = Set.copyOf(secondaries);
+        this.secondaryEngines = List.copyOf(secondaries);
 
         this.compositeDataFormat = new CompositeDataFormat(primaryFormat, allFormats);
         this.committer = committer;
@@ -189,9 +204,9 @@ public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine
      * @throws IllegalArgumentException if any configured format is not registered
      */
     static void validateFormatsRegistered(DataFormatRegistry registry, String primaryFormatName, List<String> secondaryFormatNames) {
-        validateFormatIsRegistered(registry, primaryFormatName);
+        validateFormatIsRegistered(registry, primaryFormatName, "Primary");
         for (String secondaryName : secondaryFormatNames) {
-            validateFormatIsRegistered(registry, secondaryName);
+            validateFormatIsRegistered(registry, secondaryName, "Secondary");
             if (secondaryName.equals(primaryFormatName)) {
                 throw new IllegalStateException(
                     "Secondary data format [" + secondaryName + "] is the same as primary :[" + primaryFormatName + "]"
@@ -200,13 +215,19 @@ public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine
         }
     }
 
-    private static void validateFormatIsRegistered(DataFormatRegistry registry, String dataFormatName) {
+    /**
+     * @param role the configured role of {@code dataFormatName} — {@code "Primary"} or
+     *             {@code "Secondary"}. This method is called for both, so hardcoding "Primary"
+     *             (as it used to) misreported every secondary-format misconfiguration.
+     */
+    private static void validateFormatIsRegistered(DataFormatRegistry registry, String dataFormatName, String role) {
         if (dataFormatName == null || dataFormatName.isBlank()) {
-            throw new IllegalArgumentException("Primary data format name must not be null or blank");
+            throw new IllegalArgumentException(role + " data format name must not be null or blank");
         }
         if (registry.format(dataFormatName) == null) {
             throw new IllegalArgumentException(
-                "Primary data format ["
+                role
+                    + " data format ["
                     + dataFormatName
                     + "] is not registered on this node. Available formats: "
                     + registry.getRegisteredFormats()
@@ -266,21 +287,18 @@ public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine
     private RefreshResult doRefresh(RefreshInput refreshInput) throws IOException {
         tryDeletePendingFiles();
 
-        // All per-format engines refresh normally (primary passes through, secondary does addIndexes)
+        // All per-format engines refresh normally (primary passes through, secondary does addIndexes).
+        // Each result is keyed by its own engine's format as it is produced — the previous version
+        // refreshed into a positional list and then re-iterated secondaryEngines to pair results
+        // back up by index, which was only safe while both iterations happened to agree.
         RefreshInput perFormatInput = new RefreshInput(refreshInput.existingSegments(), refreshInput.writerFiles());
-        RefreshResult primary = primaryEngine.refresh(perFormatInput);
-        List<RefreshResult> secResults = new ArrayList<>();
+        Map<DataFormat, RefreshResult> resultsByFormat = new LinkedHashMap<>();
+        resultsByFormat.put(primaryEngine.getDataFormat(), primaryEngine.refresh(perFormatInput));
         for (IndexingExecutionEngine<?, ?> engine : secondaryEngines) {
-            secResults.add(engine.refresh(perFormatInput));
+            resultsByFormat.put(engine.getDataFormat(), engine.refresh(perFormatInput));
         }
 
         // Assemble per-gen segments from all formats
-        Map<DataFormat, RefreshResult> resultsByFormat = new LinkedHashMap<>();
-        resultsByFormat.put(primaryEngine.getDataFormat(), primary);
-        int i = 0;
-        for (IndexingExecutionEngine<?, ?> engine : secondaryEngines) {
-            resultsByFormat.put(engine.getDataFormat(), secResults.get(i++));
-        }
         Map<Long, Segment.Builder> mergedByGen = new LinkedHashMap<>();
         for (Map.Entry<DataFormat, RefreshResult> entry : resultsByFormat.entrySet()) {
             buildSegment(entry.getKey(), entry.getValue(), mergedByGen);
@@ -503,7 +521,11 @@ public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine
     @Override
     public CompositeDocumentInput newDocumentInput() {
         DocumentInput<?> primaryInput = primaryEngine.newDocumentInput();
-        Map<DataFormat, DocumentInput<?>> secondaryInputMap = new IdentityHashMap<>();
+        // LinkedHashMap, not IdentityHashMap: CompositeWriter.addDoc walks these inputs and the
+        // per-format writers in lockstep and rolls back "in order" on failure, which needs a
+        // defined iteration order. (DataFormat's equals/hashCode are final and name-based, so
+        // identity keying bought nothing here either.)
+        Map<DataFormat, DocumentInput<?>> secondaryInputMap = new LinkedHashMap<>();
         for (IndexingExecutionEngine<?, ?> engine : secondaryEngines) {
             secondaryInputMap.put(engine.getDataFormat(), engine.newDocumentInput());
         }
@@ -597,11 +619,14 @@ public class CompositeIndexingExecutionEngine implements IndexingExecutionEngine
     }
 
     /**
-     * Returns the secondary delegate engines.
+     * Returns the secondary delegate engines in the composite's canonical fan-out order
+     * (ascending {@link DataFormat#priority()}, ties broken by the order they appear in
+     * {@code index.composite.secondary_data_formats}). Callers may rely on that order; it is the
+     * same order capabilities are claimed in.
      *
-     * @return the secondary engines
+     * @return the secondary engines, in order
      */
-    public Set<IndexingExecutionEngine<?, ?>> getSecondaryDelegates() {
+    public Collection<IndexingExecutionEngine<?, ?>> getSecondaryDelegates() {
         return secondaryEngines;
     }
 

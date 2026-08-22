@@ -35,4 +35,22 @@ public class SnapshotRestoreRequestTests extends OpenSearchTestCase {
     public void testValidateAcceptsAWellFormedRequest() {
         assertNull(new SnapshotRestoreRequest("idx-uuid", 0, "snap-1").validate());
     }
+
+    /**
+     * The indexUuid becomes a blob-path segment ({@code BlobPath.cleanPath().add(indexUuid)}) that
+     * the underlying store resolves without normalising, so a {@code ..} or {@code /} in it used to
+     * be a path the caller chose rather than a shard the caller owns. The authoritative control is
+     * the transport action's cluster-metadata resolution; this boundary check is the cheap half
+     * that refuses the obviously hostile shapes outright.
+     */
+    public void testValidateRejectsATraversalShapedIndexUuid() {
+        ActionRequestValidationException e = new SnapshotRestoreRequest("../../../etc", 0, "snap-1").validate();
+        assertNotNull(e);
+        assertTrue(e.getMessage(), e.getMessage().contains("indexUuid must contain only"));
+    }
+
+    /** Every character a real generated uuid can carry must still be accepted. */
+    public void testValidateAcceptsTheFullRealIndexUuidAlphabet() {
+        assertNull(new SnapshotRestoreRequest("Ab0-_zZ9", 0, "snap-1").validate());
+    }
 }

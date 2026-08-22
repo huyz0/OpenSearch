@@ -105,9 +105,28 @@ public class MetadataIndexAliasesService {
         final IndicesAliasesClusterStateUpdateRequest request,
         final ActionListener<ClusterStateUpdateResponse> listener
     ) {
+        // Descriptor writes issued while the state update runs, so the acknowledgement can wait for them.
+        //
+        // An alias action against a gated index changes nothing in cluster state -- the index has no entry
+        // there -- so the descriptor write is the whole of the operation. It used to be issued inside
+        // execute() with its future discarded, which meant the request was acknowledged whether or not the
+        // alias was ever recorded, and identically when no updater was installed at all.
+        //
+        // Overwritten rather than appended to, because a cluster state task may be re-executed and only the
+        // run that commits is the one whose writes matter. The same reasoning MetadataDeleteIndexService
+        // applies to the list of indices it tombstones, and it is safe for the same reason: each write is an
+        // idempotent read-modify-write at the store, so a re-executed task issues it twice and converges.
+        final java.util.concurrent.atomic.AtomicReference<List<java.util.concurrent.CompletableFuture<Boolean>>> gatedWrites =
+            new java.util.concurrent.atomic.AtomicReference<>(List.of());
+
+        final ActionListener<ClusterStateUpdateResponse> deferred = ActionListener.wrap(
+            response -> whenGatedAliasWritesLand(gatedWrites.get(), response, listener),
+            listener::onFailure
+        );
+
         clusterService.submitStateUpdateTask(
             "index-aliases",
-            new AckedClusterStateUpdateTask<ClusterStateUpdateResponse>(Priority.URGENT, request, listener) {
+            new AckedClusterStateUpdateTask<ClusterStateUpdateResponse>(Priority.URGENT, request, deferred) {
                 @Override
                 protected ClusterStateUpdateResponse newResponse(boolean acknowledged) {
                     return new ClusterStateUpdateResponse(acknowledged);
@@ -120,16 +139,85 @@ public class MetadataIndexAliasesService {
 
                 @Override
                 public ClusterState execute(ClusterState currentState) {
-                    return applyAliasActions(currentState, request.actions());
+                    return applyAliasActions(currentState, request.actions(), gatedWrites::set);
                 }
             }
         );
     }
 
     /**
+     * Holds the acknowledgement until every gated alias write is durable, failing it if one is not.
+     *
+     * <p>Nothing blocks. The futures complete on the descriptor store's own executor and the listener is
+     * completed from there, which is what lets a write be both off the cluster state thread and ahead of the
+     * client being told the request succeeded -- the same window {@code DurableTombstones} uses for a
+     * deletion's tombstone.
+     */
+    private static void whenGatedAliasWritesLand(
+        final List<java.util.concurrent.CompletableFuture<Boolean>> writes,
+        final ClusterStateUpdateResponse response,
+        final ActionListener<ClusterStateUpdateResponse> listener
+    ) {
+        if (writes.isEmpty()) {
+            listener.onResponse(response);
+            return;
+        }
+        java.util.concurrent.CompletableFuture.allOf(writes.toArray(new java.util.concurrent.CompletableFuture[0]))
+            .whenComplete((ignored, failure) -> {
+                if (failure != null) {
+                    Throwable cause = failure.getCause() != null ? failure.getCause() : failure;
+                    listener.onFailure(
+                        cause instanceof Exception
+                            ? (Exception) cause
+                            : new IllegalStateException("an alias change could not be recorded", cause)
+                    );
+                    return;
+                }
+                for (java.util.concurrent.CompletableFuture<Boolean> write : writes) {
+                    if (Boolean.TRUE.equals(write.getNow(Boolean.FALSE)) == false) {
+                        listener.onFailure(new IllegalStateException("an alias change could not be recorded against its index"));
+                        return;
+                    }
+                }
+                listener.onResponse(response);
+            });
+    }
+
+    /**
      * Handles the cluster state transition to a version that reflects the provided {@link AliasAction}s.
+     *
+     * <p>The two-argument form drops whatever descriptor writes the actions produce, which is right only for
+     * a caller that has no acknowledgement to defer. {@link #indicesAliases} uses the three-argument form.
      */
     public ClusterState applyAliasActions(ClusterState currentState, Iterable<AliasAction> actions) {
+        return applyAliasActions(currentState, actions, writes -> {});
+    }
+
+    /**
+     * @param gatedWrites receives the descriptor writes issued for indices with no cluster state entry, so
+     *                    the caller can hold its acknowledgement until they land. Called once, with every
+     *                    write this pass issued, including when there are none.
+     */
+    public ClusterState applyAliasActions(
+        ClusterState currentState,
+        Iterable<AliasAction> actions,
+        java.util.function.Consumer<List<java.util.concurrent.CompletableFuture<Boolean>>> gatedWrites
+    ) {
+        final List<java.util.concurrent.CompletableFuture<Boolean>> descriptorWrites = new ArrayList<>();
+        try {
+            return applyAliasActions(currentState, actions, descriptorWrites);
+        } finally {
+            // Reported even when an action threw, so writes already issued for earlier actions are still
+            // waited on rather than left in flight behind a failed request.
+            gatedWrites.accept(List.copyOf(descriptorWrites));
+        }
+    }
+
+    private ClusterState applyAliasActions(
+        ClusterState currentState,
+        Iterable<AliasAction> actions,
+        List<java.util.concurrent.CompletableFuture<Boolean>> descriptorWrites
+    ) {
         List<Index> indicesToClose = new ArrayList<>();
         Map<String, IndexService> indices = new HashMap<>();
         try {
@@ -164,12 +252,12 @@ public class MetadataIndexAliasesService {
                 IndexMetadata index = metadata.get(action.getIndex());
                 if (index == null) {
                     // Deliberately still AbsentIndexDescriptorSuppliers directly, not migrated to the
-                    // resolver-backed Metadata accessors: this reads gated.aliases() below, a
-                    // plugin-specific field IndexMetadataResolver's generic IndexMetadata contract does not
-                    // carry.
+                    // resolver-backed Metadata accessors: what is being asked here is specifically "does
+                    // this name resolve in the gated plane", which the generic IndexMetadata contract cannot
+                    // express. It is used for that question alone -- the alias list itself is read by the
+                    // store when it applies the mutation, not from this possibly-stale copy.
                     IndexDescriptor gated = AbsentIndexDescriptorSuppliers.supply(action.getIndex());
                     if (gated != null && gated.exists()) {
-                        List<String> currentAliases = new ArrayList<>(gated.aliases());
                         if (action instanceof AliasAction.Add addAction) {
                             // IndexDescriptor#aliases is a plain List<String> -- it has nowhere to record
                             // a filter, a routing value, or
@@ -196,14 +284,32 @@ public class MetadataIndexAliasesService {
                                         + "routing once this index type has somewhere to store them."
                                 );
                             }
-                            if (!currentAliases.contains(addAction.getAlias())) {
-                                currentAliases.add(addAction.getAlias());
-                                IndexDescriptorPublisher.updateGated(gated.withAliases(currentAliases));
-                            }
+                            // The change is handed over rather than applied here, and the difference is the
+                            // whole of it. `gated` came out of the resolution cache and can be a freshness
+                            // window stale -- on this thread it is the cached copy or nothing, since the
+                            // resolver refuses I/O on the cluster state thread. Writing
+                            // gated.withAliases(...) back was unconditional, so it also reverted whatever
+                            // else had changed on the real descriptor meanwhile, a concurrent dynamic-field
+                            // addition most of all. The store applies this to what it actually holds, under
+                            // a conditional write.
+                            final String toAdd = addAction.getAlias();
+                            descriptorWrites.add(IndexDescriptorPublisher.updateGated(action.getIndex(), current -> {
+                                if (current.aliases().contains(toAdd)) {
+                                    // Already there. Returning the descriptor unchanged is how this says
+                                    // "nothing to write" without a write, which keeps a repeated request
+                                    // free rather than merely harmless.
+                                    return current;
+                                }
+                                List<String> withAdded = new ArrayList<>(current.aliases());
+                                withAdded.add(toAdd);
+                                return current.withAliases(withAdded);
+                            }));
                         } else if (action instanceof AliasAction.Remove removeAction) {
-                            if (currentAliases.remove(removeAction.getAlias())) {
-                                IndexDescriptorPublisher.updateGated(gated.withAliases(currentAliases));
-                            }
+                            final String toRemove = removeAction.getAlias();
+                            descriptorWrites.add(IndexDescriptorPublisher.updateGated(action.getIndex(), current -> {
+                                List<String> withoutRemoved = new ArrayList<>(current.aliases());
+                                return withoutRemoved.remove(toRemove) ? current.withAliases(withoutRemoved) : current;
+                            }));
                         }
                         continue;
                     }

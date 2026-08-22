@@ -72,7 +72,6 @@ import org.opensearch.transport.TransportService;
 import java.io.Closeable;
 import java.io.IOException;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
@@ -298,9 +297,48 @@ public class NodeService implements Closeable {
             // Serialized over the wire so the coordinator renders the source node's value,
             // not its own. Returns -1 on non-Linux platforms or when /proc/self/status is
             // unreadable.
-            OsProbe.getInstance().getProcessNativeMemoryBytes(),
+            cachedProcessNativeMemoryBytes(),
             pluginStats ? collectPluginStats() : null
         );
+    }
+
+    /**
+     * How long one {@code /proc/self/status} reading is reused.
+     *
+     * <p>{@link OsProbe#getProcessNativeMemoryBytes()} reads and line-scans {@code /proc/self/status} and
+     * then queries two {@code MemoryMXBean} pools -- roughly 50-200 microseconds of syscall and parsing --
+     * and it ran on every {@code stats(...)} call regardless of what the caller actually asked for. The
+     * {@code nativeMemory} flag that used to gate it is now ignored on purpose (see the parameter's own
+     * comment: the value is deliberately always captured), so gating it again would change what
+     * {@code _nodes/stats} reports rather than only what it costs.
+     *
+     * <p>A short reuse window removes the repetition without changing the value anybody sees: a resident
+     * set does not move meaningfully inside a second, and the several stats consumers on a node (monitoring
+     * polls, the coordinator fanning out, internal callers) frequently sample within one.
+     */
+    private static final long NATIVE_MEMORY_CACHE_NANOS = TimeUnit.SECONDS.toNanos(1);
+
+    private volatile long cachedNativeMemoryBytes = -1L;
+    // Initialised exactly one window in the past rather than to a sentinel, so the first call always reads
+    // the probe and the comparison below never has to special-case "nothing cached yet" (nor risk the
+    // overflow a Long.MIN_VALUE sentinel would produce in the subtraction).
+    private volatile long cachedNativeMemoryAtNanos = System.nanoTime() - NATIVE_MEMORY_CACHE_NANOS;
+
+    /**
+     * The process-level native memory estimate, re-read at most once per {@link #NATIVE_MEMORY_CACHE_NANOS}.
+     *
+     * <p>Unsynchronised on purpose: two callers racing past the window both read the probe and both publish,
+     * which costs one redundant read and can never publish anything other than a genuine reading.
+     */
+    private long cachedProcessNativeMemoryBytes() {
+        long now = System.nanoTime();
+        if (now - cachedNativeMemoryAtNanos < NATIVE_MEMORY_CACHE_NANOS) {
+            return cachedNativeMemoryBytes;
+        }
+        long bytes = OsProbe.getInstance().getProcessNativeMemoryBytes();
+        cachedNativeMemoryBytes = bytes;
+        cachedNativeMemoryAtNanos = now;
+        return bytes;
     }
 
     /**

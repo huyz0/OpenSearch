@@ -175,11 +175,9 @@ public final class ReaderShardPreWarmCoordinator implements ClusterStateApplier 
             // not a missing one. Nothing is "newly eligible" without a prior epoch to be new against.
             return;
         }
-        // A membership object with an unchanged previousNodeIds() compared to the last time this
-        // applier ran real work would mean the same epoch transition was already acted on -- but
-        // ClusterStateApplier only fires on a real state transition, and previousNodeIds() only
-        // changes when withNodes shifts the epoch, so reaching here with a non-empty previous epoch
-        // already means something changed since the last transition. No separate dedup needed.
+        if (membershipChanged(event) == false) {
+            return;
+        }
 
         TransportService transportService = transportServiceSupplier.get();
         if (transportService == null) {
@@ -246,6 +244,32 @@ public final class ReaderShardPreWarmCoordinator implements ClusterStateApplier 
                 }
             }
         }
+    }
+
+    /**
+     * Whether the membership this event carries differs from the one the previous state carried -- the
+     * only condition under which anything is newly eligible for anything.
+     *
+     * <p><b>This class used to assert it did not need this check, and the assertion was wrong.</b> The
+     * comment here read: "ClusterStateApplier only fires on a real state transition, and previousNodeIds()
+     * only changes when withNodes shifts the epoch, so reaching here with a non-empty previous epoch
+     * already means something changed since the last transition. No separate dedup needed." Both halves
+     * are true and the conclusion does not follow. An applier fires on every transition, and almost none
+     * of them are membership changes; {@code previousNodeIds()} is non-empty <em>permanently</em> once the
+     * first epoch change has happened, because it is a field of a value that keeps being republished
+     * unchanged. So after one membership change, every later cluster state event -- an index created, a
+     * suspension tick, an affinity record, anything at all -- re-dispatched the entire fan-out to the same
+     * targets again. The per-event budget bounded each burst and nothing ever stopped them, so the cluster
+     * settled into a self-sustaining object-store read storm that looked like steady-state load.
+     *
+     * <p>Comparing the two states' memberships is what "the node set changed" actually means. Equality
+     * rather than version, because a republished identical value is not an epoch transition no matter what
+     * its version says, and {@link ComputedPlacementMembership#equals} already includes the previous epoch
+     * for the same reason.
+     */
+    static boolean membershipChanged(ClusterChangedEvent event) {
+        return ComputedPlacementMembershipService.get(event.state())
+            .equals(ComputedPlacementMembershipService.get(event.previousState())) == false;
     }
 
     /**

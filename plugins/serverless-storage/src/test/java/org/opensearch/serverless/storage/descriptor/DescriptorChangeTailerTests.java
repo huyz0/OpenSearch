@@ -260,6 +260,185 @@ public class DescriptorChangeTailerTests extends OpenSearchTestCase {
         new DescriptorChangeTailer(logOver(shared), backendOver(createTempDir())).tailOnce();
     }
 
+    /**
+     * The cursor must not step over a bucket the read could not finish.
+     *
+     * <p>The read used to catch its own {@link java.io.IOException} mid-iteration and return the entries it
+     * had reached, which is indistinguishable from a complete read of a shorter log. This then advanced the
+     * cursor past everything it had asked for, including the buckets it never managed to list -- permanently,
+     * since they are behind the cursor from then on. The tailer's own comment claimed the opposite: "left
+     * un-advanced on purpose, so the next pass retries the same range rather than stepping over changes it
+     * never read."
+     *
+     * <p>Driven by making one bucket unreadable for exactly one pass, which is the shape a transient object
+     * store failure has.
+     */
+    public void testTheCursorDoesNotAdvancePastABucketItCouldNotRead() throws Exception {
+        Path shared = createTempDir();
+        org.opensearch.common.blobstore.BlobStore store = new FsBlobStore(1024, shared, false);
+        java.util.concurrent.atomic.AtomicBoolean failing = new java.util.concurrent.atomic.AtomicBoolean(true);
+
+        // Buckets are discovered through children() and still cannot be listed, which is the partial case
+        // rather than a total failure: the tailer knows the bucket is there and cannot read what is in it.
+        java.util.function.Function<BlobPath, org.opensearch.common.blobstore.BlobContainer> containers = path -> {
+            org.opensearch.common.blobstore.BlobContainer real = store.blobContainer(path);
+            return failing.get() ? new UnlistableContainer(real, failing) : real;
+        };
+
+        // A driven clock, because the loss this is about only shows once the bucket has rolled: an
+        // unreadable bucket that is still the current one gets re-read by accident on the next pass. The
+        // permanent version is a bucket that goes unread and is then behind the cursor forever.
+        final long[] now = { java.util.concurrent.TimeUnit.HOURS.toMillis(1000) };
+        new BlobDescriptorChangeLog(store::blobContainer, BlobPath.cleanPath(), () -> now[0]).append(created("serverless_tenant-a"));
+        String entryBucket = BlobDescriptorChangeLog.bucketOf(now[0]);
+
+        List<String> invalidated = new ArrayList<>();
+        DescriptorChangeTailer tailer = new DescriptorChangeTailer(
+            new BlobDescriptorChangeLog(containers, BlobPath.cleanPath(), () -> now[0]),
+            new RecordingBackend(invalidated)
+        );
+
+        // Three buckets later, so a cursor that advanced on a failed read would step over the entry's
+        // bucket rather than happening to land back on it.
+        now[0] += 3 * java.util.concurrent.TimeUnit.MINUTES.toMillis(1);
+
+        assertEquals("nothing could be read", 0, tailer.tailOnce());
+        assertEquals("and the pass must say so rather than looking quiet", 1, tailer.incompleteReadCount());
+        assertTrue(
+            "the cursor must not step over a bucket it never read, which is permanent: " + tailer.resumeFrom(),
+            tailer.resumeFrom().compareTo(entryBucket) <= 0
+        );
+
+        failing.set(false);
+        assertEquals("the change is still delivered once the bucket is readable", 1, tailer.tailOnce());
+        assertEquals(List.of("serverless_tenant-a"), invalidated);
+    }
+
+    /**
+     * An entry appended by a node whose clock is a little behind is still read.
+     *
+     * <p>Entries are bucketed by the appender's wall clock and the cursor is named by the reader's, and the
+     * two agree only as well as NTP makes them. With the cursor at the current bucket, a reader a few
+     * seconds ahead across a boundary names bucket N while an appender at the same instant is still writing
+     * into N-1 -- which the cursor has passed. That entry is not read late, it is never read at all, and for
+     * a gated index nothing else would ever mention it. The cursor is held back by more than any plausible
+     * skew for that reason.
+     */
+    public void testAnEntryFromANodeWhoseClockIsBehindIsStillRead() throws Exception {
+        Path shared = createTempDir();
+        org.opensearch.common.blobstore.BlobStore store = new FsBlobStore(1024, shared, false);
+
+        // The reader's clock, a bucket boundary plus a moment.
+        final long readerNow = java.util.concurrent.TimeUnit.HOURS.toMillis(1000) + 200;
+        // The appender's, five seconds behind it, which puts its entry in the previous bucket.
+        final long appenderNow = readerNow - java.util.concurrent.TimeUnit.SECONDS.toMillis(5);
+        assertNotEquals(
+            "the test is only meaningful if the two clocks land in different buckets",
+            BlobDescriptorChangeLog.bucketOf(readerNow),
+            BlobDescriptorChangeLog.bucketOf(appenderNow)
+        );
+
+        BlobDescriptorChangeLog appenderLog = new BlobDescriptorChangeLog(store::blobContainer, BlobPath.cleanPath(), () -> appenderNow);
+        appenderLog.append(created("serverless_tenant-skewed"));
+
+        List<String> invalidated = new ArrayList<>();
+        DescriptorChangeTailer tailer = new DescriptorChangeTailer(
+            new BlobDescriptorChangeLog(store::blobContainer, BlobPath.cleanPath(), () -> readerNow),
+            new RecordingBackend(invalidated)
+        );
+
+        assertEquals("an entry a few seconds of skew behind the cursor must still arrive", 1, tailer.tailOnce());
+        assertEquals(List.of("serverless_tenant-skewed"), invalidated);
+        // And still exactly once, because the exclusion set spans every bucket the lagging cursor revisits.
+        assertEquals(0, tailer.tailOnce());
+        assertEquals(1, invalidated.size());
+    }
+
+    /**
+     * A container whose listings fail, standing in for a bucket the object store cannot serve.
+     *
+     * <p>{@code children()} still answers, and wraps what it returns, because that is the shape that
+     * exercises the bug: the bucket is discovered and then cannot be read. A container that could not even
+     * be enumerated would fail the whole pass, which the tailer already handled.
+     */
+    private static final class UnlistableContainer implements org.opensearch.common.blobstore.BlobContainer {
+        private final org.opensearch.common.blobstore.BlobContainer delegate;
+        private final java.util.concurrent.atomic.AtomicBoolean failing;
+
+        UnlistableContainer(org.opensearch.common.blobstore.BlobContainer delegate, java.util.concurrent.atomic.AtomicBoolean failing) {
+            this.delegate = delegate;
+            this.failing = failing;
+        }
+
+        @Override
+        public java.util.Map<String, org.opensearch.common.blobstore.BlobMetadata> listBlobs() throws java.io.IOException {
+            if (failing.get()) {
+                throw new java.io.IOException("bucket unavailable");
+            }
+            return delegate.listBlobs();
+        }
+
+        @Override
+        public java.util.Map<String, org.opensearch.common.blobstore.BlobContainer> children() throws java.io.IOException {
+            java.util.Map<String, org.opensearch.common.blobstore.BlobContainer> wrapped = new java.util.LinkedHashMap<>();
+            for (java.util.Map.Entry<String, org.opensearch.common.blobstore.BlobContainer> child : delegate.children().entrySet()) {
+                wrapped.put(child.getKey(), new UnlistableContainer(child.getValue(), failing));
+            }
+            return wrapped;
+        }
+
+        @Override
+        public java.util.Map<String, org.opensearch.common.blobstore.BlobMetadata> listBlobsByPrefix(String prefix)
+            throws java.io.IOException {
+            if (failing.get()) {
+                throw new java.io.IOException("bucket unavailable");
+            }
+            return delegate.listBlobsByPrefix(prefix);
+        }
+
+        @Override
+        public BlobPath path() {
+            return delegate.path();
+        }
+
+        @Override
+        public boolean blobExists(String blobName) throws java.io.IOException {
+            return delegate.blobExists(blobName);
+        }
+
+        @Override
+        public java.io.InputStream readBlob(String blobName) throws java.io.IOException {
+            return delegate.readBlob(blobName);
+        }
+
+        @Override
+        public java.io.InputStream readBlob(String blobName, long position, long length) throws java.io.IOException {
+            return delegate.readBlob(blobName, position, length);
+        }
+
+        @Override
+        public void writeBlob(String blobName, java.io.InputStream inputStream, long blobSize, boolean failIfAlreadyExists)
+            throws java.io.IOException {
+            delegate.writeBlob(blobName, inputStream, blobSize, failIfAlreadyExists);
+        }
+
+        @Override
+        public void writeBlobAtomic(String blobName, java.io.InputStream inputStream, long blobSize, boolean failIfAlreadyExists)
+            throws java.io.IOException {
+            delegate.writeBlobAtomic(blobName, inputStream, blobSize, failIfAlreadyExists);
+        }
+
+        @Override
+        public org.opensearch.common.blobstore.DeleteResult delete() throws java.io.IOException {
+            return delegate.delete();
+        }
+
+        @Override
+        public void deleteBlobsIgnoringIfNotExists(List<String> blobNames) throws java.io.IOException {
+            delegate.deleteBlobsIgnoringIfNotExists(blobNames);
+        }
+    }
+
     /** A backend that records what it was asked to forget. */
     private static final class RecordingBackend implements DescriptorBackend {
         private final List<String> invalidated;

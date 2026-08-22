@@ -390,7 +390,14 @@ public class RemoteClusterStateCleanupManager implements Closeable {
                 // own index list may live behind shard references too, and those references have to be
                 // followed to find out which index blobs it actually named before deciding any of them
                 // are stale.
-                remoteManifestManager.resolveIndices(clusterMetadataManifest).forEach(uploadedIndexMetadata -> {
+                //
+                // Tolerant here and strict there, and the asymmetry is the point: this list produces
+                // deletion candidates, so a shard blob that cannot be read costs an under-delete (index
+                // blobs left in place), while the active loop's list produces the keep-set, where the
+                // same tolerance would delete still-referenced blobs. It also stops one unreadable shard
+                // blob from wedging every future sweep before it reaches the manifest delete below --
+                // see resolveIndicesToleratingMissingShards' own javadoc.
+                remoteManifestManager.resolveIndicesToleratingMissingShards(clusterMetadataManifest).forEach(uploadedIndexMetadata -> {
                     String fileName = RemoteClusterStateUtils.getFormattedIndexFileName(uploadedIndexMetadata.getUploadedFilename());
                     if (filesToKeep.contains(fileName) == false) {
                         staleIndexMetadataPaths.add(fileName);
@@ -462,13 +469,6 @@ public class RemoteClusterStateCleanupManager implements Closeable {
             deleteStalePaths(new ArrayList<>(staleGlobalMetadataPaths));
             deleteStalePaths(new ArrayList<>(staleIndexMetadataPaths));
             deleteStalePaths(new ArrayList<>(staleEphemeralAttributePaths));
-            if (staleManifestShardPaths.isEmpty() == false) {
-                // Guarded, unlike the three calls above: sharding is off by default (see
-                // RemoteManifestManager#CLUSTER_REMOTE_STORE_STATE_MANIFEST_SHARD_COUNT_SETTING), so
-                // this set is empty on every cleanup sweep for a cluster that has never turned it on --
-                // no reason to make a blob-store round trip to delete nothing on every single sweep.
-                deleteStalePaths(new ArrayList<>(staleManifestShardPaths));
-            }
 
             try {
                 remoteRoutingTableService.deleteStaleIndexRoutingPaths(new ArrayList<>(staleIndexRoutingPaths));
@@ -497,6 +497,29 @@ public class RemoteClusterStateCleanupManager implements Closeable {
             // Delete Manifests in the very end to avoid dangling routing files in-case deletion of stale index routing
             // files after deleting manifests
             deleteStalePaths(new ArrayList<>(staleManifestPaths));
+
+            if (staleManifestShardPaths.isEmpty() == false) {
+                // AFTER the manifests, and that ordering is load-bearing rather than cosmetic -- it is the
+                // same rule the comment above states, applied to the one reference class that used to
+                // violate it. A manifest shard blob is reachable only through the manifest that names it,
+                // and reading it is how a later sweep enumerates that manifest's index blobs. Deleting the
+                // shard blobs first meant that if the manifest delete then failed transiently, every
+                // subsequent sweep had to resolve a still-stale sharded manifest whose shard blobs were
+                // already gone, threw on the missing blob, and never reached the manifest delete that
+                // would have ended it: cleanup wedged permanently and remote state grew without bound.
+                //
+                // Deleting after leaves the opposite residue if *this* delete is the one that fails: shard
+                // blobs whose manifest is already gone. Nothing reads them and nothing enumerates them
+                // again, so they leak -- but a bounded leak of at most one manifest's worth of shard blobs
+                // per failed sweep is categorically better than a sweep that can never make progress again,
+                // and the index metadata those shards referenced was already deleted above.
+                //
+                // Guarded, unlike the calls above: sharding is off by default (see
+                // RemoteManifestManager#CLUSTER_REMOTE_STORE_STATE_MANIFEST_SHARD_COUNT_SETTING), so
+                // this set is empty on every cleanup sweep for a cluster that has never turned it on --
+                // no reason to make a blob-store round trip to delete nothing on every single sweep.
+                deleteStalePaths(new ArrayList<>(staleManifestShardPaths));
+            }
 
         } catch (IllegalStateException e) {
             logger.error("Error while fetching Remote Cluster Metadata manifests", e);

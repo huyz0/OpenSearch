@@ -19,6 +19,7 @@ import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.io.EOFException;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -1673,4 +1674,175 @@ public class SplitShardsMetadataTests extends OpenSearchTestCase {
         }
     }
 
+    // ---------------------------------------------------------------------------------------
+    // Deserialization hardening. Both read paths bypass Builder entirely, so until this pass
+    // neither ran any of the invariants Builder enforces on every mutation. That mattered on the
+    // document-routing hot path: getShardIdOfHash binary-searches a root's child ranges and its
+    // only protection against a hash falling into a gap was a bare `assert`, disabled in
+    // production -- so a single crafted or corrupt custom NPE'd routing on every node that applied
+    // it. These tests build states Builder can never produce (via the package-private constructor)
+    // and prove both read paths now refuse them.
+    // ---------------------------------------------------------------------------------------
+
+    /** A root whose children leave hashes 101..199 owned by nobody -- exactly the routing-NPE shape. */
+    private static SplitShardsMetadata metadataWithGappedChildRanges() {
+        ShardRange[][] roots = new ShardRange[1][];
+        roots[0] = new ShardRange[] { new ShardRange(1, Integer.MIN_VALUE, 100), new ShardRange(2, 200, Integer.MAX_VALUE) };
+        return new SplitShardsMetadata(roots, new HashMap<>(), new HashSet<>(), new HashSet<>(Arrays.asList(1, 2)), 2);
+    }
+
+    /** A root whose children both claim hashes 50..100. */
+    private static SplitShardsMetadata metadataWithOverlappingChildRanges() {
+        ShardRange[][] roots = new ShardRange[1][];
+        roots[0] = new ShardRange[] { new ShardRange(1, Integer.MIN_VALUE, 100), new ShardRange(2, 50, Integer.MAX_VALUE) };
+        return new SplitShardsMetadata(roots, new HashMap<>(), new HashSet<>(), new HashSet<>(Arrays.asList(1, 2)), 2);
+    }
+
+    public void testStreamReadRejectsGappedChildRanges() throws IOException {
+        BytesStreamOutput out = new BytesStreamOutput();
+        metadataWithGappedChildRanges().writeTo(out);
+
+        try (StreamInput in = out.bytes().streamInput()) {
+            IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> new SplitShardsMetadata(in));
+            assertTrue(e.getMessage(), e.getMessage().contains("is missing from the list of shard ranges"));
+        }
+    }
+
+    public void testStreamReadRejectsOverlappingChildRanges() throws IOException {
+        BytesStreamOutput out = new BytesStreamOutput();
+        metadataWithOverlappingChildRanges().writeTo(out);
+
+        try (StreamInput in = out.bytes().streamInput()) {
+            IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> new SplitShardsMetadata(in));
+            assertTrue(e.getMessage(), e.getMessage().contains("Shard range overlap"));
+        }
+    }
+
+    public void testXContentParseRejectsGappedChildRanges() throws IOException {
+        XContentBuilder builder = JsonXContent.contentBuilder();
+        builder.startObject();
+        metadataWithGappedChildRanges().toXContent(builder, ToXContent.EMPTY_PARAMS);
+        builder.endObject();
+
+        try (XContentParser parser = createParser(JsonXContent.jsonXContent, BytesReference.bytes(builder))) {
+            IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> SplitShardsMetadata.parse(parser));
+            assertTrue(e.getMessage(), e.getMessage().contains("is missing from the list of shard ranges"));
+        }
+    }
+
+    public void testXContentParseRejectsOverlappingChildRanges() throws IOException {
+        XContentBuilder builder = JsonXContent.contentBuilder();
+        builder.startObject();
+        metadataWithOverlappingChildRanges().toXContent(builder, ToXContent.EMPTY_PARAMS);
+        builder.endObject();
+
+        try (XContentParser parser = createParser(JsonXContent.jsonXContent, BytesReference.bytes(builder))) {
+            IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> SplitShardsMetadata.parse(parser));
+            assertTrue(e.getMessage(), e.getMessage().contains("Shard range overlap"));
+        }
+    }
+
+    /**
+     * The root-shard count used to be a raw vint sizing {@code new ShardRange[n][]} <em>before</em>
+     * a single element byte was consumed, so five bytes could demand a multi-gigabyte array. The
+     * guarded read now bounds the claimed count by the bytes that could possibly back it.
+     */
+    public void testStreamReadRejectsAnImpossiblyLargeRootShardCountBeforeAllocating() throws IOException {
+        BytesStreamOutput out = new BytesStreamOutput();
+        out.writeVInt(1_000_000_000);
+
+        try (StreamInput in = out.bytes().streamInput()) {
+            expectThrows(EOFException.class, () -> new SplitShardsMetadata(in));
+        }
+    }
+
+    public void testStreamReadRejectsANegativeRootShardCount() throws IOException {
+        BytesStreamOutput out = new BytesStreamOutput();
+        // A five-byte vint whose decoded value is negative -- writeVInt itself never emits this.
+        out.writeByte((byte) 0x80);
+        out.writeByte((byte) 0x80);
+        out.writeByte((byte) 0x80);
+        out.writeByte((byte) 0x80);
+        out.writeByte((byte) 0x08);
+
+        try (StreamInput in = out.bytes().streamInput()) {
+            expectThrows(Exception.class, () -> new SplitShardsMetadata(in));
+        }
+    }
+
+    /**
+     * Field-order independence. {@code root_shards_to_all_children} arriving before {@code
+     * num_of_root_shards} used to size the root array from the {@code -1} initial value and die
+     * with a bare {@link NegativeArraySizeException}; JSON object members carry no ordering
+     * guarantee, so that was a real blob shape, not a hypothetical one.
+     */
+    public void testXContentParseIsIndependentOfFieldOrder() throws IOException {
+        String json = "{\"root_shards_to_all_children\":{\"0\":["
+            + "{\"shard_id\":1,\"start\":-2147483648,\"end\":0},"
+            + "{\"shard_id\":2,\"start\":1,\"end\":2147483647}]},"
+            + "\"num_of_root_shards\":1,\"max_shard_id\":2,"
+            + "\"active_shard_ids\":[1,2],\"parent_to_child_shards\":{}}";
+
+        try (XContentParser parser = createParser(JsonXContent.jsonXContent, json)) {
+            SplitShardsMetadata parsed = SplitShardsMetadata.parse(parser);
+            assertEquals(1, parsed.getNumberOfRootShards());
+            assertEquals(1, parsed.getShardIdOfHash(0, -5));
+            assertEquals(2, parsed.getShardIdOfHash(0, 5));
+        }
+    }
+
+    public void testXContentParseRejectsAMissingRootShardCount() throws IOException {
+        String json = "{\"max_shard_id\":2,\"active_shard_ids\":[0],\"root_shards_to_all_children\":{},\"parent_to_child_shards\":{}}";
+
+        try (XContentParser parser = createParser(JsonXContent.jsonXContent, json)) {
+            IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> SplitShardsMetadata.parse(parser));
+            assertTrue(e.getMessage(), e.getMessage().contains("num_of_root_shards"));
+        }
+    }
+
+    /** The count has no stream length to bound it here, so it needs its own explicit ceiling. */
+    public void testXContentParseRejectsAnImpossiblyLargeRootShardCount() throws IOException {
+        String json = "{\"num_of_root_shards\":2000000,\"max_shard_id\":0,\"active_shard_ids\":[0],"
+            + "\"root_shards_to_all_children\":{},\"parent_to_child_shards\":{}}";
+
+        try (XContentParser parser = createParser(JsonXContent.jsonXContent, json)) {
+            IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> SplitShardsMetadata.parse(parser));
+            assertTrue(e.getMessage(), e.getMessage().contains("exceeds the maximum"));
+        }
+    }
+
+    /** A root-shard key is an index into the root array, so it must be inside it. */
+    public void testXContentParseRejectsARootShardKeyOutsideTheTable() throws IOException {
+        String json = "{\"num_of_root_shards\":1,\"max_shard_id\":5,\"active_shard_ids\":[0],"
+            + "\"root_shards_to_all_children\":{\"5\":[{\"shard_id\":1,\"start\":-2147483648,\"end\":2147483647}]},"
+            + "\"parent_to_child_shards\":{}}";
+
+        try (XContentParser parser = createParser(JsonXContent.jsonXContent, json)) {
+            IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> SplitShardsMetadata.parse(parser));
+            assertTrue(e.getMessage(), e.getMessage().contains("outside the"));
+        }
+    }
+
+    /** {@code Integer.parseInt} on a field name used to surface as a bare NumberFormatException. */
+    public void testXContentParseRejectsANonNumericShardIdKeyWithAClearMessage() throws IOException {
+        String json = "{\"num_of_root_shards\":1,\"max_shard_id\":2,\"active_shard_ids\":[0],"
+            + "\"root_shards_to_all_children\":{\"not-a-number\":[{\"shard_id\":1,\"start\":-2147483648,\"end\":2147483647}]},"
+            + "\"parent_to_child_shards\":{}}";
+
+        try (XContentParser parser = createParser(JsonXContent.jsonXContent, json)) {
+            IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> SplitShardsMetadata.parse(parser));
+            assertTrue(e.getMessage(), e.getMessage().contains("non-numeric shard id key"));
+        }
+    }
+
+    /** {@code max_shard_id} starts at {@code numberOfRootShards - 1} and only ever grows. */
+    public void testXContentParseRejectsAMaxShardIdInconsistentWithTheRootShardCount() throws IOException {
+        String json = "{\"num_of_root_shards\":4,\"max_shard_id\":0,\"active_shard_ids\":[0],"
+            + "\"root_shards_to_all_children\":{},\"parent_to_child_shards\":{}}";
+
+        try (XContentParser parser = createParser(JsonXContent.jsonXContent, json)) {
+            IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> SplitShardsMetadata.parse(parser));
+            assertTrue(e.getMessage(), e.getMessage().contains("is inconsistent with"));
+        }
+    }
 }

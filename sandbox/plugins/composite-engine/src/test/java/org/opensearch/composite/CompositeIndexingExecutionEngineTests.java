@@ -59,6 +59,67 @@ public class CompositeIndexingExecutionEngineTests extends OpenSearchTestCase {
         assertEquals(2, engine.getSecondaryDelegates().size());
     }
 
+    /**
+     * The secondaries fan out in a fixed order — the same ascending-priority order in which
+     * CompositeDataFormatPlugin.assignCapabilities lets formats claim capabilities. They used to
+     * be held in a {@code Set.copyOf(...)} whose iteration order is unspecified, while
+     * CompositeWriter.addDoc promised rollback "in order" and doRefresh paired two separate
+     * iterations of that set up positionally.
+     */
+    public void testSecondaryDelegatesFanOutInPrecedenceOrder() {
+        // Configured "slow" (priority 90) before "fast" (priority 10); precedence order flips them.
+        CompositeIndexingExecutionEngine engine = engineWithPriorities("lucene", 1, Map.of("slow", 90L, "fast", 10L), "slow", "fast");
+
+        List<String> order = engine.getSecondaryDelegates().stream().map(e -> e.getDataFormat().name()).toList();
+        assertEquals(List.of("fast", "slow"), order);
+
+        // The per-format document inputs are built by walking the same ordered collection, so the
+        // writer's rollback order matches.
+        CompositeDocumentInput input = engine.newDocumentInput();
+        assertEquals(order, input.getSecondaryInputs().keySet().stream().map(DataFormat::name).toList());
+        input.close();
+    }
+
+    /** Equal priorities keep the order the setting listed them in (the sort is stable). */
+    public void testSecondaryDelegatesWithEqualPriorityKeepSettingOrder() {
+        CompositeIndexingExecutionEngine engine = engineWithPriorities("lucene", 1, Map.of("b", 7L, "a", 7L), "b", "a");
+        assertEquals(List.of("b", "a"), engine.getSecondaryDelegates().stream().map(e -> e.getDataFormat().name()).toList());
+    }
+
+    private static CompositeIndexingExecutionEngine engineWithPriorities(
+        String primaryName,
+        long primaryPriority,
+        Map<String, Long> secondaryPriorities,
+        String... secondaryNamesInSettingOrder
+    ) {
+        Map<String, DataFormat> formats = new HashMap<>();
+        Map<String, DataFormatPlugin> plugins = new HashMap<>();
+        formats.put(primaryName, CompositeTestHelper.stubFormat(primaryName, primaryPriority, Set.of()));
+        plugins.put(primaryName, CompositeTestHelper.stubPlugin(primaryName, primaryPriority));
+        secondaryPriorities.forEach((name, priority) -> {
+            formats.put(name, CompositeTestHelper.stubFormat(name, priority, Set.of()));
+            plugins.put(name, CompositeTestHelper.stubPlugin(name, priority));
+        });
+
+        DataFormatRegistry registry = mock(DataFormatRegistry.class);
+        formats.forEach((name, format) -> when(registry.format(name)).thenReturn(format));
+        when(registry.getIndexingEngine(any(), any())).thenAnswer(
+            invocation -> plugins.get(((DataFormat) invocation.getArgument(1)).name()).indexingEngine(null)
+        );
+
+        Settings settings = Settings.builder()
+            .put("index.composite.primary_data_format", primaryName)
+            .putList("index.composite.secondary_data_formats", secondaryNamesInSettingOrder)
+            .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+            .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+            .build();
+        IndexMetadata indexMetadata = IndexMetadata.builder("test-index").settings(settings).build();
+        IndexSettings indexSettings = new IndexSettings(indexMetadata, Settings.EMPTY);
+
+        return new CompositeIndexingExecutionEngine(indexSettings, null, new CompositeTestHelper.StubCommitter(), registry, null, null);
+    }
+
     public void testConstructorThrowsWhenPrimaryFormatNotRegistered() {
         DataFormatRegistry registry = mock(DataFormatRegistry.class);
         when(registry.format("parquet")).thenReturn(null);
@@ -134,6 +195,47 @@ public class CompositeIndexingExecutionEngineTests extends OpenSearchTestCase {
             () -> CompositeIndexingExecutionEngine.validateFormatsRegistered(registry, "parquet", List.of())
         );
         assertTrue(ex.getMessage().contains("parquet"));
+        assertTrue(ex.getMessage(), ex.getMessage().startsWith("Primary data format [parquet]"));
+    }
+
+    /**
+     * The message must name the role that actually failed. validateFormatIsRegistered runs for
+     * every secondary too, but hardcoded "Primary data format ...", so a mistyped secondary
+     * reported a primary-format problem.
+     */
+    public void testValidateFormatsRegisteredNamesTheSecondaryRoleForAMissingSecondary() {
+        DataFormatRegistry registry = mock(DataFormatRegistry.class);
+        when(registry.format("lucene")).thenReturn(CompositeTestHelper.stubFormat("lucene", 1, Set.of()));
+        when(registry.format("parquet")).thenReturn(null);
+        when(registry.getRegisteredFormats()).thenReturn(Set.of(CompositeTestHelper.stubFormat("lucene", 1, Set.of())));
+
+        IllegalArgumentException ex = expectThrows(
+            IllegalArgumentException.class,
+            () -> CompositeIndexingExecutionEngine.validateFormatsRegistered(registry, "lucene", List.of("parquet"))
+        );
+        assertTrue(ex.getMessage(), ex.getMessage().startsWith("Secondary data format [parquet]"));
+        assertFalse(ex.getMessage(), ex.getMessage().contains("Primary"));
+    }
+
+    public void testValidateFormatsRegisteredNamesTheSecondaryRoleForABlankSecondary() {
+        DataFormatRegistry registry = mock(DataFormatRegistry.class);
+        when(registry.format("lucene")).thenReturn(CompositeTestHelper.stubFormat("lucene", 1, Set.of()));
+
+        IllegalArgumentException ex = expectThrows(
+            IllegalArgumentException.class,
+            () -> CompositeIndexingExecutionEngine.validateFormatsRegistered(registry, "lucene", List.of("   "))
+        );
+        assertEquals("Secondary data format name must not be null or blank", ex.getMessage());
+    }
+
+    public void testValidateFormatsRegisteredNamesThePrimaryRoleForABlankPrimary() {
+        DataFormatRegistry registry = mock(DataFormatRegistry.class);
+
+        IllegalArgumentException ex = expectThrows(
+            IllegalArgumentException.class,
+            () -> CompositeIndexingExecutionEngine.validateFormatsRegistered(registry, "  ", List.of())
+        );
+        assertEquals("Primary data format name must not be null or blank", ex.getMessage());
     }
 
     public void testValidateFormatsRegisteredRejectsMissingSecondary() {

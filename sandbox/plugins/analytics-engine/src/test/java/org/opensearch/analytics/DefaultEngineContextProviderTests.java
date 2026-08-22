@@ -9,13 +9,20 @@
 package org.opensearch.analytics;
 
 import org.apache.calcite.schema.SchemaPlus;
+import org.opensearch.OpenSearchStatusException;
 import org.opensearch.action.support.IndicesOptions;
+import org.opensearch.analytics.spi.AnalyticsSearchBackendPlugin;
 import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.core.rest.RestStatus;
 import org.opensearch.test.OpenSearchTestCase;
+
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.function.UnaryOperator;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.same;
@@ -66,5 +73,65 @@ public class DefaultEngineContextProviderTests extends OpenSearchTestCase {
             org.mockito.ArgumentMatchers.anyBoolean(),
             any(String[].class)
         );
+    }
+
+    /** A backend whose only interesting behaviour is how it converts exceptions. */
+    private static AnalyticsSearchBackendPlugin backend(String name, UnaryOperator<Exception> converter) {
+        return new AnalyticsSearchBackendPlugin() {
+            @Override
+            public String name() {
+                return name;
+            }
+
+            @Override
+            public Exception convertException(Exception original) {
+                return converter.apply(original);
+            }
+        };
+    }
+
+    private static AnalyticsPlugin.DefaultEngineContextProvider providerWith(AnalyticsSearchBackendPlugin... backends) {
+        Map<String, AnalyticsSearchBackendPlugin> byName = new LinkedHashMap<>();
+        for (AnalyticsSearchBackendPlugin b : backends) {
+            byName.put(b.name(), b);
+        }
+        return new AnalyticsPlugin.DefaultEngineContextProvider(
+            mock(ClusterService.class),
+            mock(IndexNameExpressionResolver.class),
+            byName
+        );
+    }
+
+    /** A single recognising backend still gets to apply its typed status (e.g. 429). */
+    public void testConvertExceptionUsesTheOnlyBackendThatRecognisesIt() {
+        Exception original = new RuntimeException("native pool exhausted");
+        OpenSearchStatusException converted = new OpenSearchStatusException("breaker", RestStatus.TOO_MANY_REQUESTS);
+
+        AnalyticsPlugin.DefaultEngineContextProvider ctx = providerWith(backend("lucene", e -> e), backend("datafusion", e -> converted));
+
+        assertSame(converted, ctx.convertException(original));
+    }
+
+    /**
+     * The old implementation returned the FIRST backend whose conversion changed the exception,
+     * so a backend that never ran the query could relabel another backend's failure, and which
+     * one won depended on plugin registration order. With no way to identify the responsible
+     * backend at this call site, an ambiguous conversion must be declined.
+     */
+    public void testConvertExceptionDeclinesWhenTwoBackendsBothClaimIt() {
+        Exception original = new RuntimeException("boom");
+        AnalyticsPlugin.DefaultEngineContextProvider ctx = providerWith(
+            backend("lucene", e -> new OpenSearchStatusException("lucene says 400", RestStatus.BAD_REQUEST)),
+            backend("datafusion", e -> new OpenSearchStatusException("datafusion says 429", RestStatus.TOO_MANY_REQUESTS))
+        );
+
+        assertSame("an unattributable failure must be surfaced unchanged", original, ctx.convertException(original));
+    }
+
+    public void testConvertExceptionReturnsOriginalWhenNoBackendRecognisesIt() {
+        Exception original = new RuntimeException("boom");
+        AnalyticsPlugin.DefaultEngineContextProvider ctx = providerWith(backend("lucene", e -> e), backend("datafusion", e -> e));
+
+        assertSame(original, ctx.convertException(original));
     }
 }

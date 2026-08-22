@@ -50,6 +50,28 @@ public class SnapshotPinRequestTests extends OpenSearchTestCase {
     }
 
     /**
+     * The indexUuid becomes a blob-path segment ({@code BlobPath.cleanPath().add(indexUuid)}) that
+     * the underlying store resolves without normalising, so a {@code ..} or {@code /} in it used to
+     * be a path the caller chose rather than a shard the caller owns. The authoritative control is
+     * the transport action's cluster-metadata resolution (see {@link
+     * TransportSnapshotPinActionTests}); this boundary check is the cheap half that refuses the
+     * obviously hostile shapes outright.
+     */
+    public void testValidateRejectsATraversalShapedIndexUuid() {
+        for (String hostile : new String[] { "../../../etc", "..", "a/b", "a\\b", "idx uuid", "idx.uuid", "idx\u0000uuid" }) {
+            ActionRequestValidationException e = new SnapshotPinRequest(hostile, 0, "snap-1").validate();
+            assertNotNull("[" + hostile + "] must not be accepted as an index uuid", e);
+            assertTrue(e.getMessage(), e.getMessage().contains("indexUuid must contain only"));
+        }
+    }
+
+    /** Every character a real generated uuid can carry must still be accepted. */
+    public void testValidateAcceptsTheFullRealIndexUuidAlphabet() {
+        assertNull(new SnapshotPinRequest("Ab0-_zZ9", 0, "snap-1").validate());
+        assertNull("the _na_ placeholder must remain valid", new SnapshotPinRequest("_na_", 0, "snap-1").validate());
+    }
+
+    /**
      * "pitr" is PitrRetentionPolicy's own reserved pinId for its internal PITR-window pins.
      * Accepting it here would let a caller's own replacePin call wipe out every legitimate PITR
      * pin on this shard right now, or have their own "snapshot" silently deleted by the next

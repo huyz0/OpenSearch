@@ -259,8 +259,14 @@ public class DataFormatRegistry {
      * field type; any requested capability left unclaimed is a {@link MapperParsingException}. Backs
      * {@link DataFormatPlugin#assignCapabilities}'s default implementation — composite plugins override
      * that method instead and spread capabilities across their sub-formats.
+     *
+     * <p>Static deliberately: the assignment reads nothing but its two arguments, and making it an
+     * instance method meant the interface default had to dereference a registry it is not always given.
+     * A plugin exercised outside a wired node (which is how the assignment is unit-tested) passes null
+     * there, so the default threw {@link NullPointerException} instead of the documented
+     * {@link MapperParsingException}.
      */
-    public void assignSingleFormatCapabilities(MappedFieldType fieldType, DataFormat format) {
+    public static void assignSingleFormatCapabilities(MappedFieldType fieldType, DataFormat format) {
         Set<FieldTypeCapabilities.Capability> requested = fieldType.requestedCapabilities();
         if (requested.isEmpty()) {
             fieldType.setCapabilityMap(Map.of());

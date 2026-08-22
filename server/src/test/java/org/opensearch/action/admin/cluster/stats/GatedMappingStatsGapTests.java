@@ -119,6 +119,33 @@ public class GatedMappingStatsGapTests extends OpenSearchTestCase {
         );
     }
 
+    /**
+     * The aggregate is a real search over the whole gated population, and {@code _cluster/stats} is polled
+     * on a fixed interval by every collector watching the cluster. Recomputing it per call is the cost this
+     * reuse window removes; the counts it summarises -- the distribution of field <em>types</em> -- change
+     * far more slowly than the polling does.
+     */
+    public void testTheAggregateIsReusedAcrossStatsCallsRatherThanRecomputedPerCall() throws Exception {
+        java.util.concurrent.atomic.AtomicInteger calls = new java.util.concurrent.atomic.AtomicInteger();
+        GatedMappingStatsAggregator.register(() -> {
+            calls.incrementAndGet();
+            return new GatedMappingStatsAggregator.GatedFieldTypeCounts(java.util.Map.of("keyword", 40), java.util.Map.of("keyword", 30));
+        });
+        ClusterState state = ClusterState.builder(ClusterName.DEFAULT)
+            .metadata(Metadata.builder().put(ordinaryIndexWithKeywordField("ordinary"), false).build())
+            .build();
+
+        for (int i = 0; i < 5; i++) {
+            assertEquals("every call must still report the same, correct counts", 41L, countOf(MappingStats.of(state), "keyword"));
+        }
+        assertEquals("five stats calls must cost one aggregation", 1, calls.get());
+
+        // And the reuse is genuinely bounded rather than permanent.
+        GatedMappingStatsAggregator.clearCache();
+        assertEquals(41L, countOf(MappingStats.of(state), "keyword"));
+        assertEquals(2, calls.get());
+    }
+
     /** A failing aggregate leaves ordinary stats intact rather than failing the whole stats call. */
     public void testAFailingAggregateLeavesOrdinaryStatsIntact() throws Exception {
         GatedMappingStatsAggregator.register(() -> { throw new IllegalStateException("descriptor store down"); });

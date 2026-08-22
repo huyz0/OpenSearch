@@ -8,6 +8,8 @@
 
 package org.opensearch.composite.merge;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.index.engine.dataformat.DataFormat;
 import org.opensearch.index.engine.dataformat.MergeInput;
@@ -18,11 +20,13 @@ import org.opensearch.index.engine.exec.Segment;
 import org.opensearch.index.engine.exec.WriterFileSet;
 
 import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * Executes a composite merge: primary format first, then secondaries using the
@@ -34,19 +38,49 @@ import java.util.Map;
 @ExperimentalApi
 public class CompositeMergeExecutor {
 
-    private final Map<DataFormat, Merger> mergers;
+    private static final Logger logger = LogManager.getLogger(CompositeMergeExecutor.class);
 
-    public CompositeMergeExecutor(Map<DataFormat, Merger> mergers) {
+    /**
+     * Deletes merge output files through the store layer rather than the filesystem.
+     * <p>
+     * Implemented by {@code CompositeIndexingExecutionEngine::deleteFiles}, which fans the
+     * request out to every per-format engine and therefore through each format's
+     * {@code DataFormatStoreHandler}. That routing is required, not cosmetic: parquet's handler
+     * owns a native {@code TieredObjectStore} registry, and deleting its files with raw NIO
+     * behind the handler's back leaves stale registry entries pointing at files that no longer
+     * exist.
+     */
+    @FunctionalInterface
+    public interface MergeOutputCleaner {
+        /**
+         * Deletes {@code filesByFormat} (keyed by {@link DataFormat#name()}) and returns whatever
+         * could not be deleted yet, in the same shape.
+         */
+        Map<String, Collection<String>> deleteFiles(Map<String, Collection<String>> filesByFormat) throws IOException;
+    }
+
+    private final Map<DataFormat, Merger> mergers;
+    private final MergeOutputCleaner cleaner;
+
+    public CompositeMergeExecutor(Map<DataFormat, Merger> mergers, MergeOutputCleaner cleaner) {
         this.mergers = Map.copyOf(mergers);
+        this.cleaner = Objects.requireNonNull(cleaner, "cleaner must not be null");
     }
 
     /**
      * Executes the merge described by the plan.
+     * <p>
+     * Failures propagate with their original type: an {@link IOException} raised by a per-format
+     * merger leaves this method as an {@link IOException}, matching {@link CompositeMerger#merge}'s
+     * declared {@code throws IOException}. (It used to be rewrapped as an
+     * {@code UncheckedIOException}, so every {@code catch (IOException)} around a composite merge
+     * silently missed it.)
      *
      * @param plan the pre-validated merge plan
      * @return the combined merge result across all formats
+     * @throws IOException if any per-format merge fails with an I/O error
      */
-    public MergeResult execute(MergePlan plan) {
+    public MergeResult execute(MergePlan plan) throws IOException {
         List<FormatMergeResult> completed = new ArrayList<>();
         try {
             FormatMergeResult primaryResult = mergeFormat(plan, plan.primaryFormat(), null);
@@ -59,6 +93,9 @@ public class CompositeMergeExecutor {
 
             for (DataFormat secondary : plan.secondaryFormats()) {
                 FormatMergeResult secondaryResult = mergeFormat(plan, secondary, mapping);
+                // Track it before the cross-format checks below: the merger has already written
+                // this format's output, so if a check fails its files must be cleaned up too.
+                completed.add(secondaryResult);
                 // Verify secondary produced output when primary did
                 if (primaryResult.mergedFiles() != null && secondaryResult.mergedFiles() == null) {
                     throw new IllegalStateException(
@@ -87,14 +124,51 @@ public class CompositeMergeExecutor {
                         );
                     }
                 }
-                completed.add(secondaryResult);
             }
 
             return toMergeResult(completed, mapping);
         } catch (Exception e) {
-            completed.forEach(FormatMergeResult::cleanup);
-            if (e instanceof RuntimeException re) throw re;
-            throw new UncheckedIOException((IOException) e);
+            cleanup(completed, e);
+            if (e instanceof RuntimeException runtimeException) {
+                throw runtimeException;
+            }
+            if (e instanceof IOException ioException) {
+                throw ioException;
+            }
+            // {@link Merger#merge} declares only IOException, so nothing else checked can reach
+            // here unless a sub-format violates that contract. Wrap it rather than blind-casting
+            // to IOException, which would surface as a ClassCastException that hides the real
+            // failure.
+            throw new IOException("Composite merge failed with an unexpected checked exception", e);
+        }
+    }
+
+    /**
+     * Best-effort removal of merge output already written by formats that completed before the
+     * failure. Routed through {@link MergeOutputCleaner} so each format's store handler observes
+     * the deletion. A cleanup failure never replaces the merge failure — it is logged and attached
+     * as a suppressed exception.
+     */
+    private void cleanup(List<FormatMergeResult> completed, Exception mergeFailure) {
+        Map<String, Collection<String>> filesByFormat = new LinkedHashMap<>();
+        for (FormatMergeResult result : completed) {
+            WriterFileSet merged = result.mergedFiles();
+            if (merged == null || merged.files().isEmpty()) {
+                continue;
+            }
+            filesByFormat.computeIfAbsent(result.format().name(), k -> new ArrayList<>()).addAll(merged.files());
+        }
+        if (filesByFormat.isEmpty()) {
+            return;
+        }
+        try {
+            Map<String, Collection<String>> undeleted = cleaner.deleteFiles(filesByFormat);
+            if (undeleted != null && undeleted.isEmpty() == false) {
+                logger.warn("merge cleanup left stale merge output behind; will be retried on the next refresh: {}", undeleted);
+            }
+        } catch (Exception cleanupFailure) {
+            mergeFailure.addSuppressed(cleanupFailure);
+            logger.warn("failed to delete stale merge output after a failed composite merge", cleanupFailure);
         }
     }
 

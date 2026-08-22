@@ -218,6 +218,70 @@ public class ShardReactivationActionFilterTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * <b>The most common way a search names an index, and the filter skipped every one of them.</b> Each
+     * requested name was looked up with {@code state.metadata().index(name)}, which matches concrete names
+     * only -- so {@code logs-*}, an alias, or a data stream found null, took no reactivation and no wait,
+     * and under the default strict search-replica routing the client saw "all shards failed": the exact
+     * failure this filter's own javadoc says must never surface.
+     */
+    public void testAWildcardSearchStillWaitsForReactivation() throws Exception {
+        IndexMetadata indexMetadata = readerIndexMetadata();
+        ClusterService clusterService = ClusterServiceUtils.createClusterService(threadPool);
+        try {
+            ClusterServiceUtils.setState(clusterService, clusterStateWithSearchReplica(indexMetadata, false));
+
+            AtomicBoolean proceeded = new AtomicBoolean(false);
+            SearchRequest request = new SearchRequest("id*");
+            filter(clusterService).apply(null, SearchAction.NAME, request, null, null, recordingChain(proceeded));
+
+            assertFalse("a wildcard that resolves to a reactivating index must be held just like its name would be", proceeded.get());
+
+            ClusterServiceUtils.setState(clusterService, clusterStateWithSearchReplica(indexMetadata, true));
+            assertBusy(() -> assertTrue("and released once the reader copy is STARTED", proceeded.get()));
+        } finally {
+            clusterService.close();
+        }
+    }
+
+    /**
+     * <b>The wait that could not end, on a cluster whose steady state is silence.</b> The filter reads the
+     * state, decides to wait, and only then builds its observer -- and {@code waitForNextChange} evaluates
+     * only states <em>newer</em> than the observed one. A reader copy that reached STARTED in the gap
+     * between those two reads satisfied a predicate against a state the observer would never test, so on a
+     * scale-to-zero cluster with nothing else happening the search sat for the full wait and then proceeded
+     * anyway. Nothing about that looks like a bug from outside: the search succeeds, slowly, every time.
+     *
+     * <p>The two states are injected through the same {@code ClusterService} the filter reads twice: stale
+     * for {@code apply}, current for the observer. That is precisely the race, made deterministic.
+     */
+    public void testAWaitIsNotTakenWhenTheStateAlreadySatisfiesIt() {
+        IndexMetadata indexMetadata = readerIndexMetadata();
+        ClusterService real = ClusterServiceUtils.createClusterService(threadPool);
+        try {
+            ClusterServiceUtils.setState(real, clusterStateWithSearchReplica(indexMetadata, true));
+            ClusterState stale = clusterStateWithSearchReplica(indexMetadata, false);
+
+            ClusterService clusterService = org.mockito.Mockito.spy(real);
+            java.util.concurrent.atomic.AtomicBoolean firstRead = new java.util.concurrent.atomic.AtomicBoolean(true);
+            org.mockito.Mockito.doAnswer(invocation -> firstRead.compareAndSet(true, false) ? stale : real.state())
+                .when(clusterService)
+                .state();
+
+            AtomicBoolean proceeded = new AtomicBoolean(false);
+            SearchRequest request = new SearchRequest(INDEX);
+            filter(clusterService).apply(null, SearchAction.NAME, request, null, null, recordingChain(proceeded));
+
+            assertTrue(
+                "a search whose reader copy started between the two reads must proceed at once, not wait "
+                    + "for a cluster state change that a quiet cluster will never produce",
+                proceeded.get()
+            );
+        } finally {
+            real.close();
+        }
+    }
+
     /** In metadata, absent from routing: cold. */
     private static ClusterState clusterStateWithoutRouting(IndexMetadata indexMetadata) {
         return ClusterState.builder(new ClusterName("test"))

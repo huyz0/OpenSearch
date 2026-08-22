@@ -11,8 +11,8 @@ package org.opensearch.nativebridge;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.nativebridge.spi.AnalyticsBackendNativeMemoryStats;
 import org.opensearch.nativebridge.spi.NativeLibraryLoader;
-import org.opensearch.plugin.stats.AnalyticsBackendNativeMemoryStats;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.List;

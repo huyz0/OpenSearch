@@ -159,7 +159,13 @@ public class TransportShardSplitAction extends HandledTransportAction<ShardSplit
         if (indexMetadata == null) {
             throw new IllegalArgumentException(role + " index [" + indexUuid + "] does not exist");
         }
-        if (shardId >= indexMetadata.getNumberOfShards()) {
+        // An in-place split reserves child shard ids at or above number_of_shards without growing it
+        // (IndexMetadata#inSyncAllocationIds documents exactly that), so a bare `>= getNumberOfShards()`
+        // bound would refuse a real child shard. Consulting the split metadata keeps the check "does this
+        // shard exist" rather than "is this id below the original count", and matches the identical helper
+        // the retention, compaction and clone transports use -- kept in step deliberately so the two
+        // cannot drift into disagreeing about what a real shard is.
+        if (shardId >= indexMetadata.getNumberOfShards() && indexMetadata.getSplitShardsMetadata().getRangeOfShard(shardId) == null) {
             throw new IllegalArgumentException(
                 role
                     + " shard ["

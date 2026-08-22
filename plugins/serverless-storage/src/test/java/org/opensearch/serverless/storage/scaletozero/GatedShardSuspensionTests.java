@@ -86,13 +86,76 @@ public class GatedShardSuspensionTests extends OpenSearchTestCase {
         ClusterService clusterService = clusterServiceFor(state);
         ShardSuspensionCoordinator coordinator = new ShardSuspensionCoordinator(clusterService, mock(Client.class), 0L, false, registry);
 
-        assertNotNull("the premise: the shard is placed before it sleeps", AbsentIndexRoutingSuppliers.supply(state, "gated", null).shard(1));
+        assertNotNull(
+            "the premise: the shard is placed before it sleeps",
+            AbsentIndexRoutingSuppliers.supply(state, "gated", null).shard(1)
+        );
 
         coordinator.suspendWriterShard(GATED_UUID, 1);
 
         IndexRoutingTable afterSuspension = AbsentIndexRoutingSuppliers.supply(state, "gated", null);
         assertNull("the suspended shard must no longer be placed", afterSuspension.shard(1));
         assertNotNull("and its siblings must be untouched", afterSuspension.shard(0));
+    }
+
+    /**
+     * <b>The role dimension, and the outage that produced it.</b> A gated suspension used to record a
+     * shard id and nothing else, so a reader that had been idle long enough to sleep took the whole shard
+     * out of placement -- the writer with it. Scale-to-zero decides the two roles on unrelated schedules,
+     * so this unplaced the primary of an index that was being actively written to, because its search
+     * traffic had gone quiet.
+     */
+    public void testAReaderSuspensionLeavesTheWriterPlaced() {
+        registry.install();
+        AbsentIndexRoutingSuppliers.register((state, metadata) -> placementWithReaders());
+        ClusterState state = ClusterState.builder(ClusterName.DEFAULT).build();
+        ClusterService clusterService = clusterServiceFor(state);
+        ShardSuspensionCoordinator coordinator = new ShardSuspensionCoordinator(clusterService, mock(Client.class), 0L, false, registry);
+
+        coordinator.suspendReaderShard(GATED_UUID, 1);
+
+        IndexRoutingTable afterSuspension = AbsentIndexRoutingSuppliers.supply(state, "gated", null);
+        assertNotNull("a reader suspension must not unplace the shard: its writer is still serving", afterSuspension.shard(1));
+        assertNotNull("and the primary specifically must still be there", afterSuspension.shard(1).primaryShard());
+        assertTrue("while the search-only copies it actually suspended are gone", afterSuspension.shard(1).searchOnlyReplicas().isEmpty());
+        assertFalse("an untouched sibling shard keeps its reader copies", afterSuspension.shard(0).searchOnlyReplicas().isEmpty());
+    }
+
+    /**
+     * <b>The half that did not exist: waking up.</b> {@code reactivate} had no production caller at all,
+     * and both routes that should have reached it resolved indices through {@code
+     * state.metadata().index(name)}, which is null for a gated index by definition. So a gated shard that
+     * fell asleep was removed from every routing resolution on this node and never came back -- until the
+     * entry happened to be evicted, or the node restarted.
+     */
+    public void testAGatedSuspensionCanBeWokenAgain() {
+        registry.install();
+        AbsentIndexRoutingSuppliers.register((state, metadata) -> placement());
+        ClusterState state = ClusterState.builder(ClusterName.DEFAULT).build();
+        ClusterService clusterService = clusterServiceFor(state);
+        ShardSuspensionCoordinator coordinator = new ShardSuspensionCoordinator(clusterService, mock(Client.class), 0L, false, registry);
+        coordinator.suspendWriterShard(GATED_UUID, 1);
+        assertNull("the premise: the shard is asleep", AbsentIndexRoutingSuppliers.supply(state, "gated", null).shard(1));
+
+        assertTrue("waking an index with something asleep must report a change", registry.reactivateAll(GATED_UUID, false));
+
+        assertNotNull(
+            "a woken gated shard must be placed again on the very next resolution, with no cluster state "
+                + "update in between -- there is none to wait for",
+            AbsentIndexRoutingSuppliers.supply(state, "gated", null).shard(1)
+        );
+        assertFalse("and waking an index with nothing asleep must report no change", registry.reactivateAll(GATED_UUID, false));
+    }
+
+    /** Waking one role must leave the other exactly as it was, or reactivation becomes its own outage. */
+    public void testWakingOneRoleLeavesTheOtherAsleep() {
+        registry.suspend(GATED_UUID, 1, false);
+        registry.suspend(GATED_UUID, 1, true);
+
+        assertTrue(registry.reactivateAll(GATED_UUID, true));
+
+        assertTrue("the writer suspension must survive a reader wake", registry.isSuspended(GATED_UUID, 1));
+        assertFalse(registry.isReaderSuspended(GATED_UUID, 1));
     }
 
     /**
@@ -283,6 +346,35 @@ public class GatedShardSuspensionTests extends OpenSearchTestCase {
         ClusterService clusterService = mock(ClusterService.class);
         when(clusterService.state()).thenReturn(state);
         return clusterService;
+    }
+
+    /** A started search-only copy, which is the role a reader suspension removes and nothing else does. */
+    private static org.opensearch.cluster.routing.ShardRouting startedSearchOnlyCopy(ShardId shardId) {
+        return org.opensearch.cluster.routing.ShardRouting.newUnassigned(
+            shardId,
+            false,
+            true,
+            RecoverySource.EmptyStoreRecoverySource.INSTANCE,
+            new org.opensearch.cluster.routing.UnassignedInfo(
+                org.opensearch.cluster.routing.UnassignedInfo.Reason.CLUSTER_RECOVERED,
+                "computed placement"
+            )
+        ).initialize("node-2", null, org.opensearch.cluster.routing.ShardRouting.UNAVAILABLE_EXPECTED_SHARD_SIZE).moveToStarted();
+    }
+
+    /** The same placement with a search-only copy per shard, which is what a reader suspension acts on. */
+    private static IndexRoutingTable placementWithReaders() {
+        Index index = new Index("gated", GATED_UUID);
+        IndexRoutingTable.Builder placement = IndexRoutingTable.builder(index);
+        for (int shard = 0; shard < SHARDS; shard++) {
+            ShardId shardId = new ShardId(index, shard);
+            placement.addIndexShard(
+                new IndexShardRoutingTable.Builder(shardId).addShard(
+                    ComputedShardRouting.started(shardId, "node-1", RecoverySource.EmptyStoreRecoverySource.INSTANCE)
+                ).addShard(startedSearchOnlyCopy(shardId)).build()
+            );
+        }
+        return placement.build();
     }
 
     private static IndexRoutingTable placement() {

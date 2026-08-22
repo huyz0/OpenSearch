@@ -55,7 +55,26 @@ public class GatedIndexAliasFilterSafetyTests extends OpenSearchTestCase {
 
     private static final String GATED_INDEX = "gated-index";
 
-    private void registerGatedDescriptor() {
+    /**
+     * Stands in for the descriptor store: the mutation is applied to what the store holds, which is the
+     * point of the seam taking a mutation rather than a finished descriptor. A caller that built the new
+     * descriptor from its own cached copy could not be told apart from one that read the store first, and
+     * that is how a close reverted a concurrent mapping update.
+     */
+    private AtomicReference<IndexDescriptor> stored;
+
+    private void installStore(IndexDescriptor initial) {
+        stored = new AtomicReference<>(initial);
+        IndexDescriptorPublisher.registerUpdater((name, mutation) -> {
+            if (GATED_INDEX.equals(name) == false) {
+                return CompletableFuture.completedFuture(Boolean.FALSE);
+            }
+            stored.updateAndGet(mutation::apply);
+            return CompletableFuture.completedFuture(Boolean.TRUE);
+        });
+    }
+
+    private static IndexDescriptor gatedDescriptor() {
         IndexMetadata metadata = IndexMetadata.builder(GATED_INDEX)
             .settings(
                 Settings.builder()
@@ -66,38 +85,69 @@ public class GatedIndexAliasFilterSafetyTests extends OpenSearchTestCase {
             .numberOfShards(1)
             .numberOfReplicas(0)
             .build();
-        IndexDescriptor descriptor = IndexDescriptor.from(metadata);
+        return IndexDescriptor.from(metadata);
+    }
+
+    private void registerGatedDescriptor() {
+        IndexDescriptor descriptor = gatedDescriptor();
         AbsentIndexDescriptorSuppliers.register(name -> GATED_INDEX.equals(name) ? descriptor : null);
     }
 
     public void testPlainAliasOnGatedIndexIsAccepted() {
         registerGatedDescriptor();
-        AtomicReference<IndexDescriptor> updated = new AtomicReference<>();
-        IndexDescriptorPublisher.registerUpdater(descriptor -> {
-            updated.set(descriptor);
-            return CompletableFuture.completedFuture(Boolean.TRUE);
-        });
+        installStore(gatedDescriptor());
 
         ClusterState state = ClusterState.builder(ClusterName.DEFAULT).build();
         // No filter, no routing, no write-index -- must still work exactly as before this fix.
         service.applyAliasActions(state, singletonList(new AliasAction.Add(GATED_INDEX, "plain-alias", null, null, null, null, null)));
 
-        assertNotNull("a name-only alias on a gated index must still be recorded", updated.get());
-        assertEquals(List.of("plain-alias"), updated.get().aliases());
+        assertEquals(List.of("plain-alias"), stored.get().aliases());
+    }
+
+    /**
+     * The alias is added to what the store holds, not to the copy the caller resolved.
+     *
+     * <p>This is the regression the mutation-shaped seam exists for. The resolved descriptor is a cached one
+     * -- on the cluster state thread it is the cached one or nothing at all -- so anything that changed
+     * since, a dynamic field most obviously, is absent from it. Writing that copy back reverted the field
+     * while acknowledging the alias, and a document carrying the reverted field is then unqueryable on it.
+     */
+    public void testTheAliasIsAppliedToWhatTheStoreHoldsRatherThanToTheCallersCopy() {
+        // What resolution answers with: no mapping, because it was cached before the field was added.
+        registerGatedDescriptor();
+        // What the store actually holds: the same index, one dynamic field further on.
+        installStore(gatedDescriptor().withMapping(7L, java.util.Map.of("age", java.util.Map.of("type", "long"))));
+
+        ClusterState state = ClusterState.builder(ClusterName.DEFAULT).build();
+        service.applyAliasActions(state, singletonList(new AliasAction.Add(GATED_INDEX, "plain-alias", null, null, null, null, null)));
+
+        assertEquals(List.of("plain-alias"), stored.get().aliases());
+        assertEquals("the concurrent mapping update must survive the alias change", 7L, stored.get().mappingGeneration());
+        assertEquals(java.util.Map.of("age", java.util.Map.of("type", "long")), stored.get().initialMapping());
+    }
+
+    /** Adding an alias that is already there writes nothing, rather than rewriting the descriptor. */
+    public void testAddingAnAliasThatIsAlreadyThereIsANoOp() {
+        registerGatedDescriptor();
+        installStore(gatedDescriptor().withAliases(List.of("plain-alias")));
+        IndexDescriptor before = stored.get();
+
+        ClusterState state = ClusterState.builder(ClusterName.DEFAULT).build();
+        service.applyAliasActions(state, singletonList(new AliasAction.Add(GATED_INDEX, "plain-alias", null, null, null, null, null)));
+
+        assertSame("an idempotent request must not produce a write", before, stored.get());
     }
 
     public void testFilteredAliasOnGatedIndexIsRefused() {
         registerGatedDescriptor();
-        IndexDescriptorPublisher.registerUpdater(descriptor -> CompletableFuture.completedFuture(Boolean.TRUE));
+        installStore(gatedDescriptor());
 
         ClusterState state = ClusterState.builder(ClusterName.DEFAULT).build();
         IllegalArgumentException e = expectThrows(
             IllegalArgumentException.class,
             () -> service.applyAliasActions(
                 state,
-                singletonList(
-                    new AliasAction.Add(GATED_INDEX, "filtered-alias", "{\"term\":{\"tenant\":\"a\"}}", null, null, null, null)
-                )
+                singletonList(new AliasAction.Add(GATED_INDEX, "filtered-alias", "{\"term\":{\"tenant\":\"a\"}}", null, null, null, null))
             )
         );
         assertTrue(e.getMessage().contains("filter"));
@@ -105,7 +155,7 @@ public class GatedIndexAliasFilterSafetyTests extends OpenSearchTestCase {
 
     public void testRoutedAliasOnGatedIndexIsRefused() {
         registerGatedDescriptor();
-        IndexDescriptorPublisher.registerUpdater(descriptor -> CompletableFuture.completedFuture(Boolean.TRUE));
+        installStore(gatedDescriptor());
 
         ClusterState state = ClusterState.builder(ClusterName.DEFAULT).build();
         expectThrows(
@@ -119,7 +169,7 @@ public class GatedIndexAliasFilterSafetyTests extends OpenSearchTestCase {
 
     public void testWriteIndexAliasOnGatedIndexIsRefused() {
         registerGatedDescriptor();
-        IndexDescriptorPublisher.registerUpdater(descriptor -> CompletableFuture.completedFuture(Boolean.TRUE));
+        installStore(gatedDescriptor());
 
         ClusterState state = ClusterState.builder(ClusterName.DEFAULT).build();
         expectThrows(
@@ -132,31 +182,36 @@ public class GatedIndexAliasFilterSafetyTests extends OpenSearchTestCase {
     }
 
     public void testRemovingAnAliasFromAGatedIndexIsUnaffected() {
-        registerGatedDescriptor();
         // Seed the descriptor with an alias already on it, as if a previous plain Add had succeeded.
-        IndexMetadata metadata = IndexMetadata.builder(GATED_INDEX)
-            .settings(
-                Settings.builder()
-                    .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
-                    .put(IndexMetadata.SETTING_INDEX_UUID, GATED_INDEX + "-uuid")
-                    .build()
-            )
-            .numberOfShards(1)
-            .numberOfReplicas(0)
-            .build();
-        AbsentIndexDescriptorSuppliers.register(
-            name -> GATED_INDEX.equals(name) ? IndexDescriptor.from(metadata).withAliases(List.of("plain-alias")) : null
-        );
-        AtomicReference<IndexDescriptor> updated = new AtomicReference<>();
-        IndexDescriptorPublisher.registerUpdater(descriptor -> {
-            updated.set(descriptor);
-            return CompletableFuture.completedFuture(Boolean.TRUE);
-        });
+        IndexDescriptor withAlias = gatedDescriptor().withAliases(List.of("plain-alias"));
+        AbsentIndexDescriptorSuppliers.register(name -> GATED_INDEX.equals(name) ? withAlias : null);
+        installStore(withAlias);
 
         ClusterState state = ClusterState.builder(ClusterName.DEFAULT).build();
         service.applyAliasActions(state, singletonList(new AliasAction.Remove(GATED_INDEX, "plain-alias", true)));
 
-        assertNotNull(updated.get());
-        assertTrue("the alias must be gone after removal", updated.get().aliases().isEmpty());
+        assertTrue("the alias must be gone after removal", stored.get().aliases().isEmpty());
+    }
+
+    /**
+     * With no updater installed the request fails rather than acknowledging.
+     *
+     * <p>A gated index has no cluster state entry, so an unrecorded alias change is not a change at all.
+     * {@code updateGated} used to answer null there, which every call site read as success.
+     */
+    public void testAnAliasChangeWithNothingToRecordItFails() throws Exception {
+        registerGatedDescriptor();
+        IndexDescriptorPublisher.registerUpdater(null);
+
+        ClusterState state = ClusterState.builder(ClusterName.DEFAULT).build();
+        AtomicReference<List<CompletableFuture<Boolean>>> writes = new AtomicReference<>();
+        service.applyAliasActions(
+            state,
+            singletonList(new AliasAction.Add(GATED_INDEX, "plain-alias", null, null, null, null, null)),
+            writes::set
+        );
+
+        assertEquals(1, writes.get().size());
+        assertTrue("the write must be reported as failed rather than absent", writes.get().get(0).isCompletedExceptionally());
     }
 }

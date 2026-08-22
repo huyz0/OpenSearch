@@ -106,6 +106,15 @@ public final class TransportReactivateShardsAction extends TransportClusterManag
     ) {
         String indexName = request.indexName();
         boolean reader = request.reader();
+        if (reactivateGated(state, indexName, reader)) {
+            // A gated index has nothing in cluster state to rewrite, so there is no update to submit: the
+            // suspension lives in this node's own registry and clearing it is the whole reactivation.
+            // Answered here rather than falling through, because the task below would find no metadata,
+            // return the state unchanged, and report success for a wake that never happened -- which is
+            // exactly how a suspended gated shard came to be unreachable forever.
+            listener.onResponse(new AcknowledgedResponse(true));
+            return;
+        }
         ReactivateTask task = new ReactivateTask(indexName, reader, listener);
         clusterService.submitStateUpdateTask(
             "serverless-storage-reactivate-shards",
@@ -114,6 +123,50 @@ public final class TransportReactivateShardsAction extends TransportClusterManag
             reactivateExecutor,
             task
         );
+    }
+
+    /**
+     * Wakes a gated index's sleeping shards on this node, and reports whether this was a gated index at
+     * all.
+     *
+     * <p><b>Why this exists on the cluster-manager specifically.</b> The gated suspension record is
+     * node-local and, in practice, written only by {@code ShardSuspensionCoordinator}, which runs only on
+     * the elected cluster manager. So the node whose placement a gated suspension actually affects is this
+     * one, and this action is already the thing every reactivation path forwards to the cluster manager.
+     * The forwarding that was built for cluster-state mutation turns out to be exactly the routing this
+     * needs, for a reactivation that mutates no cluster state at all.
+     *
+     * <p>Resolved through {@link org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers}, the way
+     * the rest of the plugin resolves a gated index, rather than through {@code metadata().index(name)}:
+     * the defining property of a gated index is that the second one answers null for it, so a reactivation
+     * path built on it could never wake one.
+     *
+     * @return true when this was a gated index and there is therefore no cluster-state work to do.
+     */
+    private static boolean reactivateGated(ClusterState state, String indexName, boolean reader) {
+        if (state.metadata().index(indexName) != null) {
+            return false;
+        }
+        org.opensearch.serverless.storage.scaletozero.GatedShardSuspensionRegistry suspensions =
+            org.opensearch.serverless.storage.scaletozero.GatedShardSuspensionRegistry.installed();
+        if (suspensions == null) {
+            return false; // not a gated cluster; let the ordinary path answer for whatever this name is.
+        }
+        IndexMetadata gated = org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.metadataOrDescriptor(
+            state.metadata(),
+            indexName
+        );
+        if (gated == null) {
+            return false; // no such index anywhere: the ordinary path's own no-op answer is the right one.
+        }
+        if (suspensions.reactivateAll(gated.getIndexUUID(), reader)) {
+            logger.info(
+                "reactivated gated {} shard(s) of index [{}] without a cluster state update",
+                reader ? "reader" : "writer",
+                indexName
+            );
+        }
+        return true;
     }
 
     /**

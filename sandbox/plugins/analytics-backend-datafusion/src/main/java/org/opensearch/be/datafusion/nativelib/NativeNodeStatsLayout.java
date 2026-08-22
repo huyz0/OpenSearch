@@ -8,7 +8,7 @@
 
 package org.opensearch.be.datafusion.nativelib;
 
-import org.opensearch.plugin.stats.AnalyticsBackendTaskCancellationStats;
+import org.opensearch.be.datafusion.stats.AnalyticsBackendTaskCancellationStats;
 
 import java.lang.foreign.MemoryLayout;
 import java.lang.foreign.MemoryLayout.PathElement;

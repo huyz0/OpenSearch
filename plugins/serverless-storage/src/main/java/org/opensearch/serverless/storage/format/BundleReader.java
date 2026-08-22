@@ -23,6 +23,15 @@ import java.util.Map;
  */
 public final class BundleReader {
 
+    /**
+     * The smallest a single header entry's encoding can possibly be: 2-byte name length + 8-byte
+     * file length + 8-byte checksum, with the name itself at its minimum (zero) length. Used only
+     * as an upper bound on a header's claimed {@code entryCount} against its remaining byte
+     * length -- see {@link #parseHeader} for why. The exact mirror of {@code
+     * WalChunkReader#MIN_BYTES_PER_RECORD}, which bounds that reader's own count the same way.
+     */
+    private static final int MIN_BYTES_PER_ENTRY = 2 + 8 + 8;
+
     private BundleReader() {}
 
     /**
@@ -54,6 +63,20 @@ public final class BundleReader {
             int entryCount = in.readInt();
             if (entryCount < 0) {
                 throw new BundleFormatException("negative entry count " + entryCount);
+            }
+            // A sanity bound, checked BEFORE the four entryCount-sized allocations below and well
+            // before the header checksum is verified: a single corrupted bit landing in this field
+            // (while magic/version stay intact) could otherwise produce a huge positive value,
+            // causing an OutOfMemoryError instead of the clean BundleFormatException this method's
+            // own contract promises ("fail closed"). MIN_BYTES_PER_ENTRY is the smallest a real
+            // entry's encoding can possibly be, so entryCount can never legitimately exceed the
+            // remaining bytes divided by it. Same guard, same reasoning, as WalChunkReader's
+            // already-hardened record count.
+            int remainingBytes = rawIn.available();
+            if (entryCount > remainingBytes / MIN_BYTES_PER_ENTRY) {
+                throw new BundleFormatException(
+                    "entry count " + entryCount + " impossibly large for a header with only " + remainingBytes + " bytes remaining"
+                );
             }
 
             Map<String, BundleFileEntry> entries = new LinkedHashMap<>(entryCount);

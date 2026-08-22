@@ -1097,6 +1097,79 @@ public class DataFormatAwareEngineTests extends OpenSearchTestCase {
     }
 
     /**
+     * A refresh listener throwing from {@code beforeRefresh()} must not strand {@code refreshLock}.
+     * <p>
+     * {@code notifyRefreshListenersBefore()} used to run between {@code refreshLock.lock()} and the
+     * {@code try} whose {@code finally} unlocks it, so a listener that threw left the lock held forever
+     * by a dead stack. Every merge thread afterwards blocked forever in {@code applyMergeChanges} →
+     * {@code refreshLock.lock()}, leaking a thread from the node-wide MERGE pool per occurrence and
+     * pinning {@code activeMerges} so tiering drains could never complete.
+     */
+    public void testRefreshListenerThrowingBeforeRefreshDoesNotLeakRefreshLock() throws Exception {
+        ReferenceManager.RefreshListener throwingListener = new ReferenceManager.RefreshListener() {
+            @Override
+            public void beforeRefresh() throws IOException {
+                throw new IOException("simulated beforeRefresh failure");
+            }
+
+            @Override
+            public void afterRefresh(boolean didRefresh) {}
+        };
+
+        Path translogPath = createTempDir();
+        String uuid = Translog.createEmptyTranslog(translogPath, SequenceNumbers.NO_OPS_PERFORMED, shardId, primaryTerm.get());
+        bootstrapStoreWithMetadata(store, uuid);
+        DataFormatAwareEngine engine = new DataFormatAwareEngine(
+            buildDFAEngineConfig(store, translogPath, List.of(), List.of(throwingListener))
+        );
+        try {
+            expectThrows(RefreshFailedEngineException.class, () -> engine.refresh("before-listener-throws"));
+            assertFalse("refreshLock must not be held after a throwing beforeRefresh listener", refreshLockHeld(engine));
+        } finally {
+            try {
+                engine.close();
+            } catch (Exception ignored) {
+                // Already closed by failEngine.
+            }
+        }
+    }
+
+    /**
+     * The same guarantee for the exit path: {@code notifyRefreshListenersAfter()} and the writer closes
+     * run inside the lock-protected region, but a throw from either must still release
+     * {@code refreshLock} — the unlock lives in the enclosing {@code finally}, not alongside them.
+     */
+    public void testRefreshListenerThrowingAfterRefreshDoesNotLeakRefreshLock() throws Exception {
+        ReferenceManager.RefreshListener throwingListener = new ReferenceManager.RefreshListener() {
+            @Override
+            public void beforeRefresh() {}
+
+            @Override
+            public void afterRefresh(boolean didRefresh) throws IOException {
+                throw new IOException("simulated afterRefresh failure");
+            }
+        };
+
+        Path translogPath = createTempDir();
+        String uuid = Translog.createEmptyTranslog(translogPath, SequenceNumbers.NO_OPS_PERFORMED, shardId, primaryTerm.get());
+        bootstrapStoreWithMetadata(store, uuid);
+        DataFormatAwareEngine engine = new DataFormatAwareEngine(
+            buildDFAEngineConfig(store, translogPath, List.of(), List.of(throwingListener))
+        );
+        try {
+            engine.index(indexOp(createParsedDocWithInput("1", null)));
+            expectThrows(RefreshFailedEngineException.class, () -> engine.refresh("after-listener-throws"));
+            assertFalse("refreshLock must not be held after a throwing afterRefresh listener", refreshLockHeld(engine));
+        } finally {
+            try {
+                engine.close();
+            } catch (Exception ignored) {
+                // Already closed by failEngine.
+            }
+        }
+    }
+
+    /**
      * Verifies that engine close (closeNoLock) drains the flushQueue and closes any
      * writers still sitting in it. Without this, a writer checked out of the pool and
      * placed in the flushQueue (but not yet flushed) would be orphaned on engine close,
@@ -3186,6 +3259,18 @@ public class DataFormatAwareEngineTests extends OpenSearchTestCase {
         f.setAccessible(true);
         java.util.Collection<?> queue = (java.util.Collection<?>) f.get(engine);
         return queue.size();
+    }
+
+    /**
+     * Reads whether {@code DataFormatAwareEngine.refreshLock} is currently held by anyone. A leaked
+     * refreshLock is invisible from the outside — it only shows up later as merge threads blocking
+     * forever in {@code applyMergeChanges} — so the lock state itself is what the tests assert on.
+     */
+    @SuppressForbidden(reason = "test utility needs reflective access to verify internal lock state")
+    private static boolean refreshLockHeld(DataFormatAwareEngine engine) throws Exception {
+        java.lang.reflect.Field f = DataFormatAwareEngine.class.getDeclaredField("refreshLock");
+        f.setAccessible(true);
+        return ((java.util.concurrent.locks.ReentrantLock) f.get(engine)).isLocked();
     }
 
     /**

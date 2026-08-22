@@ -89,6 +89,18 @@ public abstract class TieringService implements ClusterStateListener {
     protected final AllocationService allocationService;
     /** The set of indices currently being tiered. */
     protected final Set<Index> tieringIndices;
+    /**
+     * Indices whose H2W preparation (write block + per-shard flush/sync) is running on <em>this</em>
+     * cluster-manager right now. They are write-blocked and marked {@code INDEX_TIERING_STATE=HOT} but
+     * are not yet in {@link #tieringIndices} (that happens when {@code tier()} commits), so without this
+     * set {@link #removeWriteBlockForCancelledDfaIndices} would mistake a live prepare for an orphaned
+     * block and lift the block mid-preparation.
+     * <p>
+     * Deliberately in-memory and per-cluster-manager: that is exactly the distinction we need. A
+     * prepare is driven by the elected cluster-manager, so if it dies mid-prepare the entry disappears
+     * with it and the new cluster-manager correctly treats the leftover block as orphaned and lifts it.
+     */
+    private final Set<Index> prepareInProgressIndices;
     /** The disk threshold settings. */
     protected final DiskThresholdSettings diskThresholdSettings;
     /** The file cache settings. */
@@ -132,6 +144,7 @@ public abstract class TieringService implements ClusterStateListener {
         this.allocationService = allocationService;
         this.nodeId = nodeEnvironment.nodeId();
         this.tieringIndices = ConcurrentHashMap.newKeySet();
+        this.prepareInProgressIndices = ConcurrentHashMap.newKeySet();
         this.diskThresholdSettings = new DiskThresholdSettings(settings, clusterService.getClusterSettings());
         this.fileCacheSettings = new FileCacheSettings(settings, clusterService.getClusterSettings());
         this.shardLimitValidator = shardLimitValidator;
@@ -227,18 +240,28 @@ public abstract class TieringService implements ClusterStateListener {
                     && !event.state().blocks().hasGlobalBlock(STATE_NOT_RECOVERED_BLOCK))) {
                 reconstructInProgressTieringRequests(event.state(), getTieringType(), source);
             }
-            if (event.routingTableChanged() && tieringIndices.isEmpty() == false) {
+            // Both of the checks below must run on metadata changes as well as routing changes.
+            // Completion: the tier reroute may move no shard at all (they are already on target-tier
+            // nodes), in which case the routing table never changes and the index would otherwise sit in
+            // its in-progress state until some unrelated event happened to shake the routing table.
+            // Write-block removal: a cancel processed before any shard relocated produces a metadata-only
+            // change, which on a quiet cluster would leave the index write-blocked indefinitely.
+            final boolean stateChanged = event.routingTableChanged() || event.metadataChanged();
+            if (stateChanged && tieringIndices.isEmpty() == false) {
                 logger.debug(
                     () -> String.format(
                         Locale.ROOT,
-                        "[%s] processing %d in-progress requests after routing table update",
+                        "[%s] processing %d in-progress requests after cluster state update",
                         source,
                         tieringIndices.size()
                     )
                 );
                 processTieringInProgress(event.state(), source);
             }
-            if (event.routingTableChanged()) {
+            // Only the H2W service owns the deferred write block (it is the only tier direction that
+            // sets one), so only it sweeps for orphans. Running it from both services would need the
+            // prepare-in-progress guard to be shared between them.
+            if (stateChanged && getTieringType() == IndexModule.TieringState.HOT_TO_WARM) {
                 removeWriteBlockForCancelledDfaIndices(event.state());
             }
         }
@@ -760,14 +783,41 @@ public abstract class TieringService implements ClusterStateListener {
     }
 
     /**
-     * Lifts the write block from DFA indices whose H2W cancel completed but the block was intentionally
-     * kept to prevent writes reaching warm-node shards that still run a read-only engine.
+     * Marks an index as having an H2W preparation in flight on this cluster-manager, so the orphan sweep
+     * below leaves its write block alone. Must be paired with {@link #clearPrepareInProgress(Index)} on
+     * every exit path of the prepare flow.
+     *
+     * @param index the index whose preparation is starting
+     */
+    public void markPrepareInProgress(final Index index) {
+        prepareInProgressIndices.add(index);
+    }
+
+    /**
+     * Clears the prepare-in-flight mark set by {@link #markPrepareInProgress(Index)}. Idempotent.
+     *
+     * @param index the index whose preparation has finished (successfully or not)
+     */
+    public void clearPrepareInProgress(final Index index) {
+        prepareInProgressIndices.remove(index);
+    }
+
+    /**
+     * Lifts the write block from DFA indices that carry an H2W write block with no H2W operation left to
+     * justify it — either because the cancel completed (the block is intentionally kept during cancel to
+     * stop writes reaching warm-node shards still running a read-only engine) or because the
+     * cluster-manager died between adding the block and setting the tier state, leaving the index
+     * write-blocked with frozen engines and no operation to cancel.
      *
      * <p>Called on every routing-table or metadata change. It removes the block only when:
      * <ol>
-     *   <li>The index is NOT in {@code tieringIndices} (cancel completed, no active tiering)</li>
+     *   <li>The index is NOT in {@code tieringIndices} (no active tiering)</li>
+     *   <li>The index has no preparation in flight on this cluster-manager</li>
      *   <li>The index is a DFA index</li>
-     *   <li>{@code INDEX_TIERING_STATE=HOT} (cancel reverted the tier state)</li>
+     *   <li>{@code INDEX_TIERING_STATE=HOT} — written both by a cancel and by the write-block step of
+     *       preparation, which is what makes an interrupted preparation recoverable. The value must be
+     *       present: an absent setting means tiering never touched this index, so its write block belongs
+     *       to whoever set it and must not be lifted here.</li>
      *   <li>{@code INDEX_BLOCKS_WRITE=true} (block still set from H2W preparation)</li>
      *   <li>All shards are {@code started} on HOT nodes (writable engine is live)</li>
      * </ol>
@@ -777,6 +827,10 @@ public abstract class TieringService implements ClusterStateListener {
         for (IndexMetadata indexMetadata : clusterState.metadata()) {
             // Only act on indices that are NOT currently tiering
             if (tieringIndices.contains(indexMetadata.getIndex())) {
+                continue;
+            }
+            // ... and whose preparation is not still running on this cluster-manager
+            if (prepareInProgressIndices.contains(indexMetadata.getIndex())) {
                 continue;
             }
             if (!TieringUtils.isDfaIndex(indexMetadata)) {
@@ -815,7 +869,11 @@ public abstract class TieringService implements ClusterStateListener {
                     for (Index index : indicesToUnblock) {
                         IndexMetadata indexMetadata = currentState.metadata().index(index);
                         if (indexMetadata == null) continue;
-                        // Re-check conditions inside the task to guard against TOCTOU
+                        // Re-check conditions inside the task to guard against TOCTOU — including a
+                        // preparation that started between the scan above and this task executing.
+                        if (tieringIndices.contains(index) || prepareInProgressIndices.contains(index)) {
+                            continue;
+                        }
                         String tieringState = indexMetadata.getSettings().get(INDEX_TIERING_STATE.getKey(), "");
                         boolean hasWriteBlock = INDEX_BLOCKS_WRITE_SETTING.get(indexMetadata.getSettings());
                         if (!IndexModule.TieringState.HOT.toString().equals(tieringState) || !hasWriteBlock) {

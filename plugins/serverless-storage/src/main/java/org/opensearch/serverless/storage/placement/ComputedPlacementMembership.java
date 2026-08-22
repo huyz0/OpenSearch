@@ -17,6 +17,7 @@ import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.core.xcontent.XContentParser;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -46,11 +47,13 @@ import java.util.TreeSet;
  * rendezvous hashing is order-independent by construction, but relying on that would make
  * this contract weaker than it needs to be, and a weaker contract here is a split view of the cluster.
  *
- * <p><b>What this deliberately does not do.</b> It never removes a node. Removal is a decommission
- * decision, needs to move data before it takes effect, and is not implemented; membership therefore
- * grows monotonically for now. That is a recorded limitation rather than an oversight: adding removal
- * later is additive, whereas removing a node automatically on absence is the bug this class exists to
- * prevent.
+ * <p><b>Removal exists, and this paragraph used to say it did not.</b> It said removal "is not
+ * implemented; membership therefore grows monotonically for now", which stopped being true when {@link
+ * #withoutNodes} landed for scale-to-zero -- see that method's own javadoc for why a permanently departed
+ * node has to be removable. A class javadoc that describes a safety property the class no longer has is
+ * worse than no javadoc, because it is what a reader checks instead of the code. What is still true is the
+ * asymmetry: this type can express a removal, and deciding when one is safe belongs to {@link
+ * ComputedPlacementMembershipService}, which is the only place that can tell a restart from a departure.
  */
 public final class ComputedPlacementMembership extends AbstractNamedDiffable<Custom> implements Custom {
 
@@ -59,6 +62,17 @@ public final class ComputedPlacementMembership extends AbstractNamedDiffable<Cus
      * runtime. Persistence is the requirement rather than a nicety: a membership that had to be
      * rediscovered after a restart would be empty exactly when the shards need it most, which is the
      * failure this class exists to prevent.
+     *
+     * <p><b>And for a while it was only claimed.</b> {@link #context()} declared {@code API_AND_GATEWAY}
+     * and the plugin registered a {@code NamedWriteable} for the wire, but gateway persistence round-trips
+     * through XContent and {@code Metadata.Builder.fromXContent} <em>skips</em> a custom it has no parser
+     * for -- it logs "Skipping unknown custom object with type" and moves on, because the alternative is a
+     * node refusing to start over a plugin it no longer has. So a full-cluster restart came back with no
+     * membership at all: {@code ComputedRoutingTable.eligibleNodes} then fell through to the live
+     * {@code DiscoveryNodes} during the join window, which is the time-varying node list this whole class
+     * exists to stop placement from using, and the version restarted at 1 so nothing could recognise the
+     * loss as loss. The parser registration ({@code ServerlessStoragePlugin#getNamedXContent}) and {@link
+     * #fromXContent} are the other half of this declaration, not an optional extra.
      */
     public static final String TYPE = "computed_placement_membership";
 
@@ -222,15 +236,86 @@ public final class ComputedPlacementMembership extends AbstractNamedDiffable<Cus
         return Metadata.API_AND_GATEWAY;
     }
 
+    /**
+     * <b>Every field, because this is the persisted form and it used to drop one.</b> {@code
+     * previousNodeIds} was written to the wire and omitted here, so even once a parser existed a restart
+     * would have come back with the current membership and no previous epoch. That is not a cosmetic loss:
+     * {@code WarmCandidates} derives "where was this shard warm before the last change" from it, and an
+     * empty previous epoch reads as a real answer meaning "there is no history", so every shard in the
+     * cluster would have looked cold at exactly the moment a restart made warmth worth knowing. The
+     * version is written for the same reason: a membership that restarts its version at 1 defeats every
+     * staleness check that compares one.
+     */
     @Override
     public XContentBuilder toXContent(XContentBuilder builder, ToXContent.Params params) throws IOException {
-        builder.field("version", version);
-        builder.startArray("node_ids");
+        builder.field(VERSION_FIELD, version);
+        builder.startArray(NODE_IDS_FIELD);
         for (String nodeId : nodeIds) {
             builder.value(nodeId);
         }
         builder.endArray();
+        builder.startArray(PREVIOUS_NODE_IDS_FIELD);
+        for (String nodeId : previousNodeIds) {
+            builder.value(nodeId);
+        }
+        builder.endArray();
         return builder;
+    }
+
+    static final String VERSION_FIELD = "version";
+    static final String NODE_IDS_FIELD = "node_ids";
+    static final String PREVIOUS_NODE_IDS_FIELD = "previous_node_ids";
+
+    /**
+     * Reads back what {@link #toXContent} wrote, which is what makes {@code API_AND_GATEWAY} true rather
+     * than merely declared.
+     *
+     * <p>Registered by {@code ServerlessStoragePlugin#getNamedXContent}. The wire format ({@link
+     * #writeTo}) is deliberately untouched by this: it is already deployed, and a membership that two
+     * versions of a node serialise differently is the split view this class exists to prevent.
+     *
+     * <p>Unknown fields are skipped rather than rejected, matching how core's own metadata customs parse.
+     * A node that meets a field a later version wrote should lose that field, not refuse to start and
+     * leave the cluster without a membership at all -- which is the failure mode this whole parser is here
+     * to remove.
+     */
+    public static ComputedPlacementMembership fromXContent(XContentParser parser) throws IOException {
+        long version = 0L;
+        List<String> nodeIds = new ArrayList<>();
+        List<String> previousNodeIds = new ArrayList<>();
+
+        XContentParser.Token token = parser.currentToken();
+        if (token == null) {
+            token = parser.nextToken();
+        }
+        if (token != XContentParser.Token.START_OBJECT) {
+            throw new IllegalArgumentException("expected a START_OBJECT for [" + TYPE + "] but got " + token);
+        }
+        String currentFieldName = null;
+        while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
+            if (token == XContentParser.Token.FIELD_NAME) {
+                currentFieldName = parser.currentName();
+            } else if (token == XContentParser.Token.START_ARRAY) {
+                List<String> target = null;
+                if (NODE_IDS_FIELD.equals(currentFieldName)) {
+                    target = nodeIds;
+                } else if (PREVIOUS_NODE_IDS_FIELD.equals(currentFieldName)) {
+                    target = previousNodeIds;
+                }
+                while ((token = parser.nextToken()) != XContentParser.Token.END_ARRAY) {
+                    if (target != null && token == XContentParser.Token.VALUE_STRING) {
+                        target.add(parser.text());
+                    }
+                }
+            } else if (token.isValue()) {
+                if (VERSION_FIELD.equals(currentFieldName)) {
+                    version = parser.longValue();
+                }
+            } else {
+                parser.skipChildren();
+            }
+        }
+        return of(nodeIds, previousNodeIds, version);
     }
 
     public static NamedDiff<Custom> readDiffFrom(StreamInput in) throws IOException {

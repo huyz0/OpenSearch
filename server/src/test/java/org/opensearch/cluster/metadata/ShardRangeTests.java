@@ -358,17 +358,83 @@ public class ShardRangeTests extends OpenSearchTestCase {
         assertEquals("Incorrect end value", 100, shardRange.end());
     }
 
-    public void testParseEmptyObject() throws IOException {
-        String json = "{}";
+    /**
+     * An empty object used to parse to the {@code (-1, -1, -1)} defaults, which is not a shard
+     * range at all: shard id -1 exists nowhere, and admitting it let a corrupt or tampered blob put
+     * a range nothing owns into {@code SplitShardsMetadata}'s routing tables. Every field is
+     * required now -- {@link ShardRange#toXContent} always writes all three, so no legitimate
+     * writer ever produces this shape.
+     */
+    public void testParseEmptyObjectIsRejectedRatherThanDefaulted() throws IOException {
+        XContentParser parser = createParser("{}");
+        parser.nextToken();
 
-        XContentParser parser = createParser(json);
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> ShardRange.parse(parser));
+        assertTrue(e.getMessage(), e.getMessage().contains("missing required field"));
+    }
+
+    public void testParseRejectsAPartialObject() throws IOException {
+        XContentParser parser = createParser("{\"shard_id\": 1, \"start\": 0}");
+        parser.nextToken();
+
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> ShardRange.parse(parser));
+        assertTrue(e.getMessage(), e.getMessage().contains("end"));
+    }
+
+    public void testParseRejectsANegativeShardId() throws IOException {
+        XContentParser parser = createParser("{\"shard_id\": -1, \"start\": 0, \"end\": 100}");
+        parser.nextToken();
+
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> ShardRange.parse(parser));
+        assertTrue(e.getMessage(), e.getMessage().contains("negative shard id"));
+    }
+
+    /**
+     * A backwards range contains no hash at all, so nothing can ever route to it -- and the
+     * contiguity check {@code SplitShardsMetadata} builds on top reasons about start/end as if they
+     * were ordered.
+     */
+    public void testParseRejectsAnInvertedRange() throws IOException {
+        XContentParser parser = createParser("{\"shard_id\": 1, \"start\": 100, \"end\": 0}");
+        parser.nextToken();
+
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> ShardRange.parse(parser));
+        assertTrue(e.getMessage(), e.getMessage().contains("ends before it"));
+    }
+
+    /**
+     * start/end are hash bounds over the whole signed-int space, so negative bounds -- and the
+     * full-width range a never-split root shard owns -- must stay perfectly valid. It is the
+     * relation between them that is checked, not their sign.
+     */
+    public void testParseAcceptsLegitimateNegativeHashBounds() throws IOException {
+        XContentParser parser = createParser("{\"shard_id\": 0, \"start\": " + Integer.MIN_VALUE + ", \"end\": " + Integer.MAX_VALUE + "}");
         parser.nextToken();
 
         ShardRange shardRange = ShardRange.parse(parser);
+        assertEquals(Integer.MIN_VALUE, shardRange.start());
+        assertEquals(Integer.MAX_VALUE, shardRange.end());
+    }
 
-        assertEquals("Empty object should have default shard ID", -1, shardRange.shardId());
-        assertEquals("Empty object should have default start", -1, shardRange.start());
-        assertEquals("Empty object should have default end", -1, shardRange.end());
+    /** The stream path gets the identical validation -- it too bypasses any builder. */
+    public void testStreamReadRejectsAnInvertedRange() throws IOException {
+        BytesStreamOutput out = new BytesStreamOutput();
+        out.writeVInt(1);
+        out.writeInt(100);
+        out.writeInt(0);
+
+        StreamInput in = out.bytes().streamInput();
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> new ShardRange(in));
+        assertTrue(e.getMessage(), e.getMessage().contains("ends before it"));
+    }
+
+    public void testStreamReadAcceptsLegitimateNegativeHashBounds() throws IOException {
+        BytesStreamOutput out = new BytesStreamOutput();
+        new ShardRange(0, Integer.MIN_VALUE, Integer.MAX_VALUE).writeTo(out);
+
+        ShardRange read = new ShardRange(out.bytes().streamInput());
+        assertEquals(Integer.MIN_VALUE, read.start());
+        assertEquals(Integer.MAX_VALUE, read.end());
     }
 
     public void testParseWithExtraFields() throws IOException {

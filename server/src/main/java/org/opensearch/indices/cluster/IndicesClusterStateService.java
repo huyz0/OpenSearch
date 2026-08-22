@@ -356,21 +356,35 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
             return;
         }
 
-        updateFailedShardsCache(state);
+        // Derived once and threaded through every step below, rather than re-derived by each of them.
+        //
+        // RoutingNodes#localRoutingNode is a full scan of every shard of every index in the cluster -- that
+        // is the deliberate trade it makes (see its own javadoc): it allocates only for this node's shards
+        // instead of retaining the whole cluster's inverse index on the ClusterState, and pays a scan for
+        // it. Six of the steps below wanted the same value for the same state, so the scan ran six times
+        // per applied state where the structure it replaced was built once. Hoisting keeps the whole memory
+        // win and cuts the CPU back to one scan: at 500,000 shards that is five avoided full walks of the
+        // routing table on the cluster applier thread, per applied state.
+        //
+        // Safe because every one of them derived it from exactly this state and this node id: event.state()
+        // is `state`, and state.nodes().getLocalNodeId() does not change within one application.
+        final RoutingNode localRoutingNode = RoutingNodes.localRoutingNode(state, state.nodes().getLocalNodeId());
+
+        updateFailedShardsCache(state, localRoutingNode);
 
         deleteIndices(event); // also deletes shards of deleted indices
 
-        removeIndices(event); // also removes shards of removed indices
+        removeIndices(event, localRoutingNode); // also removes shards of removed indices
 
-        failMissingShards(state);
+        failMissingShards(state, localRoutingNode);
 
-        removeShards(state);   // removes any local shards that doesn't match what the cluster-manager expects
+        removeShards(state, localRoutingNode);   // removes any local shards that doesn't match what the cluster-manager expects
 
-        updateIndices(event); // can also fail shards, but these are then guaranteed to be in failedShardsCache
+        updateIndices(event, localRoutingNode); // can also fail shards, but these are then guaranteed to be in failedShardsCache
 
-        createIndices(state);
+        createIndices(state, localRoutingNode);
 
-        createOrUpdateShards(state);
+        createOrUpdateShards(state, localRoutingNode);
     }
 
     /**
@@ -379,9 +393,9 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
      * Resends shard failures for shards that are still marked as allocated to this node but previously failed.
      *
      * @param state new cluster state
+     * @param localRoutingNode this node's shards in {@code state}, computed once by the caller
      */
-    private void updateFailedShardsCache(final ClusterState state) {
-        RoutingNode localRoutingNode = RoutingNodes.localRoutingNode(state, state.nodes().getLocalNodeId());
+    private void updateFailedShardsCache(final ClusterState state, @Nullable final RoutingNode localRoutingNode) {
         if (localRoutingNode == null) {
             failedShardsCache.clear();
             return;
@@ -483,14 +497,14 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
      * {@link org.opensearch.indices.store.IndicesStore}).
      *
      * @param event the cluster changed event
+     * @param localRoutingNode this node's shards in {@code event.state()}, computed once by the caller
      */
-    private void removeIndices(final ClusterChangedEvent event) {
+    private void removeIndices(final ClusterChangedEvent event, @Nullable final RoutingNode localRoutingNode) {
         final ClusterState state = event.state();
         final String localNodeId = state.nodes().getLocalNodeId();
         assert localNodeId != null;
 
         final Set<Index> indicesWithShards = new HashSet<>();
-        RoutingNode localRoutingNode = RoutingNodes.localRoutingNode(state, localNodeId);
         if (localRoutingNode != null) { // null e.g. if we are not a data node
             for (ShardRouting shardRouting : localRoutingNode) {
                 indicesWithShards.add(shardRouting.index());
@@ -587,9 +601,9 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
      * Notifies cluster-manager about shards that don't exist but are supposed to be active on this node.
      *
      * @param state new cluster state
+     * @param localRoutingNode this node's shards in {@code state}, computed once by the caller
      */
-    private void failMissingShards(final ClusterState state) {
-        RoutingNode localRoutingNode = RoutingNodes.localRoutingNode(state, state.nodes().getLocalNodeId());
+    private void failMissingShards(final ClusterState state, @Nullable final RoutingNode localRoutingNode) {
         if (localRoutingNode == null) {
             return;
         }
@@ -614,13 +628,13 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
      * This method does not delete the shard data.
      *
      * @param state new cluster state
+     * @param localRoutingNode this node's shards in {@code state}, computed once by the caller
      */
-    private void removeShards(final ClusterState state) {
+    private void removeShards(final ClusterState state, @Nullable final RoutingNode localRoutingNode) {
         final String localNodeId = state.nodes().getLocalNodeId();
         assert localNodeId != null;
 
         // remove shards based on routing nodes (no deletion of data)
-        RoutingNode localRoutingNode = RoutingNodes.localRoutingNode(state, localNodeId);
         for (AllocatedIndex<? extends Shard> indexService : indicesService) {
             if (gatedResidency.heldOnDemand(indexService.index())) {
                 // A shard opened from a descriptor is in no routing node, so the loop below would read it
@@ -835,9 +849,8 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
         ).initialize(placed.currentNodeId(), placed.allocationId().getId(), ShardRouting.UNAVAILABLE_EXPECTED_SHARD_SIZE);
     }
 
-    private void createIndices(final ClusterState state) {
+    private void createIndices(final ClusterState state, @Nullable final RoutingNode localRoutingNode) {
         // we only create indices for shards that are allocated
-        RoutingNode localRoutingNode = RoutingNodes.localRoutingNode(state, state.nodes().getLocalNodeId());
         if (localRoutingNode == null) {
             return;
         }
@@ -897,7 +910,7 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
         }
     }
 
-    private void updateIndices(ClusterChangedEvent event) {
+    private void updateIndices(ClusterChangedEvent event, @Nullable final RoutingNode localRoutingNode) {
         if (!event.metadataChanged()) {
             return;
         }
@@ -940,7 +953,6 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
                     indicesService.removeIndex(indexService.index(), FAILURE, "removing index (" + reason + ")");
 
                     // fail shards that would be created or updated by createOrUpdateShards
-                    RoutingNode localRoutingNode = RoutingNodes.localRoutingNode(state, state.nodes().getLocalNodeId());
                     if (localRoutingNode != null) {
                         for (final ShardRouting shardRouting : localRoutingNode) {
                             if (shardRouting.index().equals(index) && failedShardsCache.containsKey(shardRouting.shardId()) == false) {
@@ -953,8 +965,7 @@ public class IndicesClusterStateService extends AbstractLifecycleComponent imple
         }
     }
 
-    private void createOrUpdateShards(final ClusterState state) {
-        RoutingNode localRoutingNode = RoutingNodes.localRoutingNode(state, state.nodes().getLocalNodeId());
+    private void createOrUpdateShards(final ClusterState state, @Nullable final RoutingNode localRoutingNode) {
         if (localRoutingNode == null) {
             return;
         }

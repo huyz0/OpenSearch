@@ -1256,29 +1256,77 @@ public class MetadataIndexStateService {
         return "indices " + indices.stream().map(Index::getName).collect(java.util.stream.Collectors.toList());
     }
 
+    /**
+     * Moves every named gated index to {@code targetState}, acknowledging only once all of them are stored.
+     *
+     * <p><b>Why the acknowledgement waits.</b>
+     *
+     * For a gated index the descriptor write <em>is</em> the state change: there is no cluster state entry
+     * behind it that would still carry a close if the write were lost. Both of these paths used to call
+     * {@code updateGated} and throw the returned future away, then answer {@code acknowledged=true}
+     * immediately -- so a close could be acknowledged while the index stayed OPEN and went on taking writes,
+     * which is precisely the failure {@code IndexDescriptor#toIndexMetadata}'s own comment records from the
+     * other direction. A null return meaning "no updater installed" was indistinguishable from success too.
+     *
+     * <p>Nothing blocks. {@link IndexDescriptorPublisher#updateGated} runs the read-modify-write on the
+     * store's own executor and completes the listener from there; this thread only hands the work over. That
+     * is the same arrangement {@code DurableTombstones} uses for a deletion's tombstone.
+     *
+     * <p><b>Why the new state is a mutation rather than a descriptor.</b>
+     *
+     * The descriptor resolved here is a cached one and may be a freshness window out of date. Writing
+     * {@code cached.withState(...)} back would revert everything that changed on the real descriptor since
+     * -- a concurrent dynamic-field addition, most obviously. Handing over the change instead lets the store
+     * apply it to what it actually holds, under a conditional write.
+     */
+    private void updateGatedIndicesState(
+        final List<Index> gatedIndices,
+        final IndexDescriptor.State targetState,
+        final ActionListener<Void> whenAllStored
+    ) {
+        threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
+            try {
+                // The existence check stays on the resolved descriptor: an operator naming an index that is
+                // not there needs "no such index" rather than a write failure. Deliberately still
+                // AbsentIndexDescriptorSuppliers directly, since this is the gated plane's own record.
+                for (Index index : gatedIndices) {
+                    IndexDescriptor descriptor = AbsentIndexDescriptorSuppliers.supply(index.getName());
+                    if (descriptor == null || descriptor.exists() == false) {
+                        throw new IndexNotFoundException(index.getName());
+                    }
+                }
+                // Grouped so the acknowledgement waits for the last one and reports the first failure, the
+                // same shape a multi-index delete already uses for its tombstones.
+                final ActionListener<Void> perIndex = new org.opensearch.action.support.GroupedActionListener<>(
+                    ActionListener.wrap(ignored -> whenAllStored.onResponse(null), whenAllStored::onFailure),
+                    gatedIndices.size()
+                );
+                for (Index index : gatedIndices) {
+                    IndexDescriptorPublisher.updateGated(
+                        index.getName(),
+                        current -> current.state() == targetState ? current : current.withState(targetState),
+                        perIndex
+                    );
+                }
+            } catch (Exception e) {
+                whenAllStored.onFailure(e);
+            }
+        });
+    }
+
     private void closeGatedIndices(
         final CloseIndexClusterStateUpdateRequest request,
         final List<Index> gatedIndices,
         final ActionListener<CloseIndexResponse> listener
     ) {
-        threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
-            try {
-                for (Index index : gatedIndices) {
-                    // Deliberately still AbsentIndexDescriptorSuppliers directly, not migrated to the
-                    // resolver-seam accessors: this republishes descriptor.withState(...)
-                    // below, which needs the concrete IndexDescriptor IndexMetadataResolver's generic
-                    // IndexMetadata contract does not carry.
-                    IndexDescriptor descriptor = AbsentIndexDescriptorSuppliers.supply(index.getName());
-                    if (descriptor == null || descriptor.exists() == false) {
-                        throw new IndexNotFoundException(index.getName());
-                    }
-                    IndexDescriptorPublisher.updateGated(descriptor.withState(IndexDescriptor.State.CLOSE));
-                }
-                listener.onResponse(new CloseIndexResponse(true, false, Collections.emptyList()));
-            } catch (Exception e) {
-                listener.onFailure(e);
-            }
-        });
+        updateGatedIndicesState(
+            gatedIndices,
+            IndexDescriptor.State.CLOSE,
+            ActionListener.wrap(
+                ignored -> listener.onResponse(new CloseIndexResponse(true, false, Collections.emptyList())),
+                listener::onFailure
+            )
+        );
     }
 
     private void openGatedIndices(
@@ -1286,22 +1334,10 @@ public class MetadataIndexStateService {
         final List<Index> gatedIndices,
         final ActionListener<OpenIndexClusterStateUpdateResponse> listener
     ) {
-        threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
-            try {
-                for (Index index : gatedIndices) {
-                    // Same reason as closeGatedIndices' identical shape: republishes descriptor.withState(...)
-                    // below, so it needs the concrete IndexDescriptor, deliberately left on
-                    // AbsentIndexDescriptorSuppliers directly rather than the resolver-seam accessors.
-                    IndexDescriptor descriptor = AbsentIndexDescriptorSuppliers.supply(index.getName());
-                    if (descriptor == null || descriptor.exists() == false) {
-                        throw new IndexNotFoundException(index.getName());
-                    }
-                    IndexDescriptorPublisher.updateGated(descriptor.withState(IndexDescriptor.State.OPEN));
-                }
-                listener.onResponse(new OpenIndexClusterStateUpdateResponse(true, true));
-            } catch (Exception e) {
-                listener.onFailure(e);
-            }
-        });
+        updateGatedIndicesState(
+            gatedIndices,
+            IndexDescriptor.State.OPEN,
+            ActionListener.wrap(ignored -> listener.onResponse(new OpenIndexClusterStateUpdateResponse(true, true)), listener::onFailure)
+        );
     }
 }

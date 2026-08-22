@@ -1823,6 +1823,181 @@ public class TieringServiceTests extends OpenSearchTestCase {
     }
 
     /**
+     * A cancel processed before any shard relocated produces a metadata-only cluster change. Gating the
+     * sweep on {@code routingTableChanged()} alone (despite the javadoc promising "every routing-table or
+     * metadata change") left such an index write-blocked indefinitely on a quiet cluster.
+     */
+    public void testRemoveWriteBlock_MetadataOnlyChange_SubmitsTask() {
+        TestTieringService service = newTestTieringService();
+        ClusterState clusterState = hotDfaIndexWithWriteBlockOnHotNode("dfa-metadata-only", "dfa-metadata-only-uuid");
+
+        service.clusterChanged(buildMetadataChangedEvent(clusterState));
+
+        verify(clusterService, org.mockito.Mockito.atLeastOnce()).submitStateUpdateTask(
+            org.mockito.Mockito.contains("remove-write-block"),
+            any(ClusterStateUpdateTask.class)
+        );
+    }
+
+    /**
+     * An index whose H2W preparation is still running on THIS cluster-manager carries exactly the same
+     * cluster-state signature as one orphaned by a failover — write-blocked, {@code INDEX_TIERING_STATE
+     * = HOT}, shards started on hot nodes, not yet in {@code tieringIndices}. The in-memory
+     * prepare-in-progress mark is what tells them apart; while it is set the block must be left alone,
+     * or the sweep would unblock writes in the middle of the "last ever" flush.
+     */
+    public void testRemoveWriteBlock_PrepareInProgress_DoesNotSubmitTask() {
+        String dfaIndexName = "dfa-prepare-in-flight";
+        String dfaUuid = "dfa-prepare-in-flight-uuid";
+        TestTieringService service = newTestTieringService();
+        ClusterState clusterState = hotDfaIndexWithWriteBlockOnHotNode(dfaIndexName, dfaUuid);
+
+        service.markPrepareInProgress(new Index(dfaIndexName, dfaUuid));
+        service.clusterChanged(buildRoutingTableChangedEvent(clusterState));
+
+        verify(clusterService, never()).submitStateUpdateTask(org.mockito.Mockito.contains("remove-write-block"), any());
+
+        // Once the preparation finishes (or its cluster-manager is gone and the successor never had the
+        // mark), the very same state is recognised as an orphaned block and swept.
+        service.clearPrepareInProgress(new Index(dfaIndexName, dfaUuid));
+        service.clusterChanged(buildRoutingTableChangedEvent(clusterState));
+
+        verify(clusterService, org.mockito.Mockito.atLeastOnce()).submitStateUpdateTask(
+            org.mockito.Mockito.contains("remove-write-block"),
+            any(ClusterStateUpdateTask.class)
+        );
+    }
+
+    /**
+     * An index that tiering has never touched has no {@code INDEX_TIERING_STATE} at all. Its write block
+     * belongs to whoever set it (a user, ILM, ...) and must never be lifted by the tiering sweep.
+     */
+    public void testRemoveWriteBlock_NoTieringStateSetting_Skipped() {
+        String indexName = "dfa-user-blocked";
+        String uuid = "dfa-user-blocked-uuid";
+        Index idx = new Index(indexName, uuid);
+
+        Settings userBlockedSettings = Settings.builder()
+            .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+            .put(IndexMetadata.SETTING_INDEX_UUID, uuid)
+            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+            .put(INDEX_NUMBER_OF_REPLICAS_SETTING.getKey(), 0)
+            .put(IndexSettings.PLUGGABLE_DATAFORMAT_ENABLED_SETTING.getKey(), true)
+            .put(IndexMetadata.INDEX_BLOCKS_WRITE_SETTING.getKey(), true)
+            // INDEX_TIERING_STATE deliberately absent
+            .build();
+        IndexMetadata meta = IndexMetadata.builder(indexName).settings(userBlockedSettings).numberOfShards(1).numberOfReplicas(0).build();
+
+        TestTieringService service = newTestTieringService();
+        ClusterState clusterState = clusterStateWithStartedHotShard(Metadata.builder().put(meta, false).build(), idx);
+
+        service.clusterChanged(buildRoutingTableChangedEvent(clusterState));
+
+        verify(clusterService, never()).submitStateUpdateTask(org.mockito.Mockito.contains("remove-write-block"), any());
+    }
+
+    /**
+     * Tiering completion must also be evaluated on metadata-only changes: if every shard already sits on
+     * a target-tier node the tier reroute moves nothing, the routing table never changes, and the index
+     * would otherwise stay in HOT_TO_WARM until some unrelated event shook the routing table.
+     */
+    public void testClusterChanged_MetadataOnlyChange_ProcessesTieringCompletion() {
+        tieringService.tieringIndices.add(testIndex);
+
+        ClusterState currentState = mock(ClusterState.class);
+        RoutingTable routingTable = mock(RoutingTable.class);
+        Metadata metadata = mock(Metadata.class);
+        ShardRouting shard = mock(ShardRouting.class);
+        DiscoveryNodes nodes = mock(DiscoveryNodes.class);
+        DiscoveryNode node = mock(DiscoveryNode.class);
+
+        when(currentState.routingTable()).thenReturn(routingTable);
+        when(routingTable.hasIndex(testIndex)).thenReturn(true);
+        when(routingTable.allShards(testIndex.getName())).thenReturn(Collections.singletonList(shard));
+        when(shard.unassigned()).thenReturn(false);
+        when(shard.started()).thenReturn(true);
+        when(shard.currentNodeId()).thenReturn("node1");
+        when(currentState.getNodes()).thenReturn(nodes);
+        when(nodes.get("node1")).thenReturn(node);
+        when(node.isWarmNode()).thenReturn(true);
+        when(currentState.metadata()).thenReturn(metadata);
+        when(metadata.index(testIndex)).thenReturn(indexMetadata);
+        when(metadata.iterator()).thenReturn(Collections.emptyIterator());
+
+        tieringService.clusterChanged(buildMetadataChangedEvent(currentState));
+
+        verify(clusterService).submitStateUpdateTask(anyString(), any(ClusterStateUpdateTask.class));
+    }
+
+    private TestTieringService newTestTieringService() {
+        return new TestTieringService(
+            Settings.EMPTY,
+            clusterService,
+            mock(ClusterInfoService.class),
+            mock(IndexNameExpressionResolver.class),
+            mock(AllocationService.class),
+            nodeEnvironment,
+            shardLimitValidator
+        );
+    }
+
+    /**
+     * Cluster state for a DFA index that is {@code INDEX_TIERING_STATE=HOT}, write-blocked, and whose
+     * single shard is started on a hot node — the signature of both a completed H2W cancel and a
+     * preparation that lost its cluster-manager.
+     */
+    private ClusterState hotDfaIndexWithWriteBlockOnHotNode(String indexName, String uuid) {
+        Settings dfaHotSettings = Settings.builder()
+            .put(INDEX_TIERING_STATE.getKey(), IndexModule.TieringState.HOT.toString())
+            .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+            .put(IndexMetadata.SETTING_INDEX_UUID, uuid)
+            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+            .put(INDEX_NUMBER_OF_REPLICAS_SETTING.getKey(), 0)
+            .put(IndexSettings.PLUGGABLE_DATAFORMAT_ENABLED_SETTING.getKey(), true)
+            .put(IndexMetadata.INDEX_BLOCKS_WRITE_SETTING.getKey(), true)
+            .build();
+        IndexMetadata dfaHotMeta = IndexMetadata.builder(indexName).settings(dfaHotSettings).numberOfShards(1).numberOfReplicas(0).build();
+        return clusterStateWithStartedHotShard(Metadata.builder().put(dfaHotMeta, false).build(), new Index(indexName, uuid));
+    }
+
+    private ClusterState clusterStateWithStartedHotShard(Metadata meta, Index index) {
+        ShardRouting shard = mock(ShardRouting.class);
+        when(shard.unassigned()).thenReturn(false);
+        when(shard.started()).thenReturn(true);
+        when(shard.currentNodeId()).thenReturn("hot1");
+
+        DiscoveryNode hotNode = mock(DiscoveryNode.class);
+        when(hotNode.isWarmNode()).thenReturn(false);
+        DiscoveryNodes nodes = mock(DiscoveryNodes.class);
+        when(nodes.get("hot1")).thenReturn(hotNode);
+
+        ClusterState clusterState = mock(ClusterState.class);
+        RoutingTable rtMock = mock(RoutingTable.class);
+        when(clusterState.metadata()).thenReturn(meta);
+        when(clusterState.routingTable()).thenReturn(rtMock);
+        when(clusterState.getNodes()).thenReturn(nodes);
+        when(rtMock.hasIndex(index)).thenReturn(true);
+        when(rtMock.allShards(index.getName())).thenReturn(Collections.singletonList(shard));
+        return clusterState;
+    }
+
+    private ClusterChangedEvent buildMetadataChangedEvent(ClusterState currentState) {
+        ClusterChangedEvent event = mock(ClusterChangedEvent.class);
+        ClusterState previousState = mock(ClusterState.class);
+        DiscoveryNodes previousNodes = mock(DiscoveryNodes.class);
+
+        when(event.localNodeClusterManager()).thenReturn(true);
+        when(event.state()).thenReturn(currentState);
+        when(event.previousState()).thenReturn(previousState);
+        when(previousNodes.isLocalNodeElectedClusterManager()).thenReturn(true);
+        when(previousState.nodes()).thenReturn(previousNodes);
+        when(event.routingTableChanged()).thenReturn(false);
+        when(event.metadataChanged()).thenReturn(true);
+        when(event.blocksChanged()).thenReturn(false);
+        return event;
+    }
+
+    /**
      * Non-DFA index with write block in HOT state — must be completely ignored.
      */
     public void testRemoveWriteBlock_NonDfaIndex_Skipped() {

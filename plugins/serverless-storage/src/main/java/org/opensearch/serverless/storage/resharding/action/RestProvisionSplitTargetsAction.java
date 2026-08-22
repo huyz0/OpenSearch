@@ -32,6 +32,16 @@ import static org.opensearch.rest.RestRequest.Method.POST;
  */
 public class RestProvisionSplitTargetsAction extends BaseRestHandler {
 
+    /**
+     * Ceiling on how many target index names one call may name. Every element becomes a real index
+     * this call provisions, so an uncapped list turns a single request into arbitrarily much
+     * cluster-state work; core caps a split's shard count for the same reason. Comfortably above
+     * any real split (core's own default index shard ceiling is 1024), so this only ever refuses a
+     * request that was never going to be a sane split in the first place -- and refuses it up front,
+     * as a 400, rather than part-way through provisioning.
+     */
+    static final int MAX_TARGET_INDICES = 1024;
+
     /** Creates the handler; stateless, so no configuration is needed. */
     public RestProvisionSplitTargetsAction() {}
 
@@ -65,6 +75,11 @@ public class RestProvisionSplitTargetsAction extends BaseRestHandler {
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
         String sourceIndexName = request.param("source");
         String[] targetIndices = Strings.splitStringByCommaToArray(request.param("target_indices"));
+        if (targetIndices.length > MAX_TARGET_INDICES) {
+            throw new IllegalArgumentException(
+                "\"target_indices\" names " + targetIndices.length + " indices, more than the maximum of " + MAX_TARGET_INDICES
+            );
+        }
         ProvisionSplitTargetsRequest provisionRequest = new ProvisionSplitTargetsRequest(sourceIndexName, Arrays.asList(targetIndices));
         return channel -> client.execute(ProvisionSplitTargetsAction.INSTANCE, provisionRequest, new RestToXContentListener<>(channel));
     }

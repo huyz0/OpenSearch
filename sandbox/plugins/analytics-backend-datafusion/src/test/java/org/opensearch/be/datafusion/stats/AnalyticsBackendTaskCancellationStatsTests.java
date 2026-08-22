@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.plugin.stats;
+package org.opensearch.be.datafusion.stats;
 
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.xcontent.XContentFactory;
@@ -110,6 +110,20 @@ public class AnalyticsBackendTaskCancellationStatsTests extends OpenSearchTestCa
         String expected = "{\"analytics_search_task\":{\"current_count_post_cancel\":2,\"total_count_post_cancel\":147},"
             + "\"analytics_search_shard_task\":{\"current_count_post_cancel\":5,\"total_count_post_cancel\":892}}";
         assertEquals(expected, json);
+    }
+
+    /**
+     * The rendered JSON key of this contribution is its {@code getWriteableName()}: {@code NodeStats}
+     * opens an object of that name and calls {@link AnalyticsBackendTaskCancellationStats#toXContent}
+     * inside it. Pinning the name here keeps the wire-framing key, the {@code pluginStats} map key and
+     * the {@code _nodes/stats} key from drifting apart.
+     */
+    public void testWriteableNameIsTheRenderedKey() {
+        assertEquals("analytics_task_cancellation", AnalyticsBackendTaskCancellationStats.WRITEABLE_NAME);
+        assertEquals(
+            AnalyticsBackendTaskCancellationStats.WRITEABLE_NAME,
+            new AnalyticsBackendTaskCancellationStats(1, 2, 3, 4).getWriteableName()
+        );
     }
 
     /**

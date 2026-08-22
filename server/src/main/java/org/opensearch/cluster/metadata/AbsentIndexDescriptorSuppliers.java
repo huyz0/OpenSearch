@@ -36,7 +36,9 @@ import java.util.function.Function;
  * but it is still a remote call where a map read was local. Every caller of this seam is on a path that
  * already does remote work, and a supplier that blocks a transport thread would be a worse problem than
  * the one this solves. The supplier is therefore expected to answer from a cache and to decline rather
- * than block when it cannot.
+ * than block when it cannot -- and, since expectation is not enforcement, {@link
+ * #THREADS_WHERE_BLOCKING_IS_UNSAFE} now names the event-loop threads as well, so a supplier that would
+ * have blocked one is never asked to.
  *
  * <p>Unset by default, so an ordinary cluster resolves exactly as it always has.
  *
@@ -77,15 +79,38 @@ public final class AbsentIndexDescriptorSuppliers {
      * hole and the failure only appears on a cache miss, which is the case testing does not produce.
      *
      * <p>So this makes it impossible rather than forbidden. A warm descriptor still answers, because that
-     * costs no I/O and never reaches a supplier that would block. A cold one degrades to the same absence
-     * the seam already models everywhere. That turns a silent stall into a reported absence, which is the
-     * same trade the auto-creation removal made when it landed alongside the shard path rather than
-     * before it.
+     * costs no I/O and never reaches a supplier that would block. A cold one degrades -- but to what
+     * depends on which thread refused, and the difference matters: on a cluster-state thread it degrades
+     * to the absence the seam already models everywhere (that trade is long-standing and those call sites
+     * have no second tier), while on an event-loop thread it raises {@link DescriptorUnavailableException}.
+     * Answering "absent" there would report a live index as missing to a client and invite it to create
+     * over the top; "unavailable" says what actually happened and is retryable. See {@link #supply(String)}.
+     *
+     * <p><b>The event-loop threads are here for a different reason than the cluster-state threads, and it
+     * is not deadlock.</b> This class's own javadoc already states the rule -- "a supplier that blocks a
+     * transport thread would be a worse problem than the one this solves" -- but nothing enforced it. The
+     * resolver's descriptor branch and {@link Metadata#indexOrResolved} are reached synchronously from the
+     * coordinating thread of a bulk or search request, which is ordinarily an {@code http_server_worker} or
+     * {@code transport_worker} event loop. A cold descriptor there is one or two object-store round trips
+     * with retries and sleep-backoff, or up to a three-second wait to collapse onto an in-flight read. An
+     * event-loop thread is shared by every connection multiplexed onto it, so one such stall stalls all of
+     * them -- and there are only a handful of these threads per node, so a few concurrent cold lookups take
+     * the node's whole network layer down for the duration. Core already treats these two names as
+     * "never block here" ({@code Transports#isTransportThread}, used by assertions across the codebase);
+     * this makes the descriptor seam honour that rather than assert about it.
+     *
+     * <p>Matched by the same substring rule as the rest of this list; the two strings are the values of
+     * {@code HttpServerTransport#HTTP_SERVER_WORKER_THREAD_NAME_PREFIX} and
+     * {@code TcpTransport#TRANSPORT_WORKER_THREAD_NAME_PREFIX}, written out rather than imported to keep
+     * this static seam free of a dependency on the transport packages -- the same reason the cluster-state
+     * thread names above are literals rather than references to the services that own them.
      */
     private static final String[] THREADS_WHERE_BLOCKING_IS_UNSAFE = {
         "clusterApplierService#updateTask",
         "clusterManagerService#updateTask",
-        "masterService#updateTask" };
+        "masterService#updateTask",
+        "http_server_worker",
+        "transport_worker" };
 
     /**
      * Whether the calling thread is one a supplier must not block.
@@ -102,6 +127,16 @@ public final class AbsentIndexDescriptorSuppliers {
             }
         }
         return false;
+    }
+
+    /**
+     * Whether the calling thread is one of the two network event loops, as opposed to a cluster-state
+     * thread. Both are unsafe to block, but they differ in what a refusal may answer: see
+     * {@link #supply(String)}.
+     */
+    static boolean onEventLoopThread() {
+        String threadName = Thread.currentThread().getName();
+        return threadName.contains("http_server_worker") || threadName.contains("transport_worker");
     }
 
     private AbsentIndexDescriptorSuppliers() {}
@@ -136,10 +171,26 @@ public final class AbsentIndexDescriptorSuppliers {
         }
         if (blockingIsUnsafeHere()) {
             Function<String, IndexDescriptor> cached = CACHED_SUPPLIER.get();
-            if (cached != null) {
-                return cached.apply(indexName);
+            IndexDescriptor warm = cached == null ? null : cached.apply(indexName);
+            if (warm != null) {
+                return warm;
             }
             logger.debug("refusing to resolve the descriptor for [{}] on {}", indexName, Thread.currentThread().getName());
+            if (isRegistered() && onEventLoopThread()) {
+                // Refusing to block is right; answering "absent" is not. On an event-loop thread a cold
+                // descriptor means we declined to find out, and null is this seam's word for "does not
+                // exist" -- so returning it here would turn a busy network thread into a spurious
+                // IndexNotFoundException for an index that is perfectly alive, and invite the caller to
+                // create over the top of it. That is the exact confusion DescriptorUnavailableException
+                // exists to prevent, and it already reports as SERVICE_UNAVAILABLE, which is the correct
+                // client response: retry, and by then the descriptor is likely warm.
+                //
+                // The cluster-state threads above keep answering null deliberately. Their null is
+                // load-bearing and long-standing: those two consultation points have no second tier to
+                // fall back on, so throwing there would fail every gated index on every state update
+                // rather than degrade one lookup.
+                throw new DescriptorUnavailableException(indexName, null);
+            }
             return null;
         }
         Function<String, IndexDescriptor> supplier = SUPPLIER.get();
@@ -307,8 +358,48 @@ public final class AbsentIndexDescriptorSuppliers {
     private record SynthesisedMetadata(IndexDescriptor descriptor, IndexMetadata metadata) {
     }
 
+    /**
+     * The byte ceiling for {@link #SYNTHESISED}.
+     *
+     * <p><b>Bytes, not entries, and that distinction is the whole point.</b> This cache used to be built
+     * with {@code setMaximumWeight(50_000)} and no weigher, which -- since {@link CacheBuilder}'s default
+     * weigher is one per entry -- meant "fifty thousand synthesised {@link IndexMetadata} instances,
+     * whatever they weigh". A synthesised instance carries the index's whole mapping, so a tenant with a
+     * few thousand fields is hundreds of kilobytes on its own and fifty thousand of them are hundreds of
+     * megabytes of heap held by a cache whose stated purpose is instance <em>stability</em>, not capacity.
+     * This registry's sibling, the plugin's descriptor cache, was deliberately converted to a byte bound
+     * after exactly this failure shape was measured there; this is the same correction applied here.
+     *
+     * <p>Two hundred and fifty-six megabytes is deliberately generous rather than tuned: the cost of
+     * evicting too eagerly is a re-synthesis plus, worse, a fresh instance that breaks the identity memo in
+     * {@code AbsentIndexRoutingSuppliers} which this cache exists to keep hitting (an 18x regression when
+     * it misses -- see {@link #synthesisedMetadata}). The point of the change is that the bound is now
+     * expressed in the resource that actually runs out.
+     */
+    private static final long SYNTHESISED_MAX_BYTES = 256L * 1024 * 1024;
+
+    /**
+     * Roughly what one cached entry retains: the mapping source dominates by orders of magnitude, and it is
+     * held compressed (see {@code MappingMetadata}, which keeps only a {@code CompressedXContent}), so the
+     * compressed length is the honest figure rather than the expanded one. The settings and the fixed
+     * per-entry overhead are approximated by a flat constant -- this is a bound, not an accounting.
+     */
+    private static long synthesisedWeight(String indexName, SynthesisedMetadata value) {
+        long weight = 1024L + 2L * (indexName == null ? 0 : indexName.length());
+        IndexMetadata metadata = value.metadata();
+        if (metadata != null) {
+            MappingMetadata mapping = metadata.mapping();
+            if (mapping != null) {
+                weight += mapping.source().compressed().length;
+            }
+            weight += 64L * metadata.getSettings().size();
+        }
+        return weight;
+    }
+
     private static final Cache<String, SynthesisedMetadata> SYNTHESISED = CacheBuilder.<String, SynthesisedMetadata>builder()
-        .setMaximumWeight(50_000)
+        .setMaximumWeight(SYNTHESISED_MAX_BYTES)
+        .weigher(AbsentIndexDescriptorSuppliers::synthesisedWeight)
         .build();
 
     /** Drops every synthesised instance, which a test must do because this registry is static. */

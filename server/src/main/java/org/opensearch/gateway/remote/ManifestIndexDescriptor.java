@@ -148,10 +148,15 @@ public class ManifestIndexDescriptor implements Writeable, ToXContentObject {
 
     public ManifestIndexDescriptor(StreamInput in) throws IOException {
         this.state = IndexMetadata.State.fromId(in.readByte());
-        int aliasCount = in.readVInt();
-        Map<String, AliasMetadata> aliases = new HashMap<>(aliasCount);
-        for (int i = 0; i < aliasCount; i++) {
-            AliasMetadata alias = new AliasMetadata(in);
+        // readList, not a raw readVInt() count driving a pre-sized HashMap: the byte layout is
+        // unchanged (writeTo still writes a vint count then each alias), but readList's length read
+        // is the guarded one -- it rejects negatives, caps the count, and refuses a count larger
+        // than the bytes left in the stream. Pre-sizing from the raw count was the cheap-input case:
+        // `new HashMap<>(1 << 30)` allocates nothing itself, but makes the very first put build a
+        // billion-entry table, so a blob carrying a huge count and a single real alias was enough.
+        // Matches the sibling ManifestShardContent, which already reads its list this way.
+        Map<String, AliasMetadata> aliases = new HashMap<>();
+        for (AliasMetadata alias : in.readList(AliasMetadata::new)) {
             aliases.put(alias.getAlias(), alias);
         }
         this.aliases = Collections.unmodifiableMap(aliases);

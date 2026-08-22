@@ -69,7 +69,16 @@ public class BlobDescriptorChangeLogTests extends OpenSearchTestCase {
         int entriesDirectlyInABucket = 0;
         for (BlobContainer bucket : buckets.values()) {
             prefixes += bucket.children().size();
-            entriesDirectlyInABucket += bucket.listBlobs().size();
+            for (String blob : bucket.listBlobs().keySet()) {
+                // Lucene's ExtrasFS drops an "extra0" entry into every directory it creates, as a file or as
+                // a directory depending on the seed, and it caught this assertion counting whatever was in
+                // the directory rather than whatever this class put there. The property under test is where
+                // an *append* lands; a marker the test framework wrote is not one. The sibling assertion in
+                // BlobDescriptorBackendTests was already softened for the same reason.
+                if (org.apache.lucene.tests.mockfile.ExtrasFS.isExtra(blob) == false) {
+                    entriesDirectlyInABucket++;
+                }
+            }
         }
         assertEquals("an append under the bucket itself is the layout that had the ceiling", 0, entriesDirectlyInABucket);
         assertThat(
@@ -108,6 +117,146 @@ public class BlobDescriptorChangeLogTests extends OpenSearchTestCase {
 
     public void testAnUnwrittenLogReadsEmptyRatherThanFailing() throws Exception {
         assertTrue(logOver(createTempDir()).since(null).isEmpty());
+    }
+
+    /**
+     * One unreadable object under a bucket must not hide the readable entries beside it.
+     *
+     * <p>This is a regression test for a real one. Reporting a partial read to the caller -- so a tailer's
+     * cursor cannot step over an entry it never read -- was implemented by throwing out of the per-entry
+     * loop, which aborted the caller's loop over the bucket's shards. A single unparseable object under a
+     * bucket therefore hid every real entry in it, while {@code failedAppendCount()} still said zero: a log
+     * that reads empty is indistinguishable from a cluster where nothing happened.
+     *
+     * <p>It was not hypothetical and it was not rare. Lucene's {@code ExtrasFS} drops an empty {@code extra0}
+     * file into every directory it creates, on about one seed in four, and an empty file is exactly this
+     * object. Three tests in this class failed on those seeds and passed on the others.
+     *
+     * <p>Written by hand rather than left to the seed, because a defect that appears on a quarter of runs is
+     * one that gets rerun rather than fixed.
+     */
+    public void testAnUnreadableObjectDoesNotHideTheEntriesBesideIt() throws Exception {
+        Path directory = createTempDir();
+        BlobDescriptorChangeLog log = logOver(directory);
+        log.append(change("serverless_tenant-a", DescriptorChange.Kind.CREATED));
+        log.append(change("serverless_tenant-b", DescriptorChange.Kind.CREATED));
+
+        // An empty object directly under the bucket, which is what a partially written entry and a foreign
+        // object both look like from here: it is listed, and it cannot be parsed.
+        BlobContainer changelog = storeOver(directory).blobContainer(BlobPath.cleanPath().add("changelog"));
+        String bucket = changelog.children().keySet().iterator().next();
+        changelog.children()
+            .get(bucket)
+            .writeBlob("unreadable", BytesReference.fromByteBuffer(java.nio.ByteBuffer.allocate(0)).streamInput(), 0, true);
+
+        assertEquals(
+            "the entries that are readable must still come back",
+            Set.of("serverless_tenant-a", "serverless_tenant-b"),
+            log.since(null).stream().map(DescriptorChange::name).collect(Collectors.toSet())
+        );
+
+        // And the read still has to admit it was partial, or a reader would advance its cursor past the
+        // entry it could not read. Both halves matter: delivering what was read, and saying what was not.
+        BlobDescriptorChangeLog.ChangeBatch batch = log.readSince(null, Set.of());
+        assertEquals(2, batch.entries().size());
+        assertFalse("an unread entry must leave the batch incomplete", batch.complete());
+        assertEquals(bucket, batch.firstUnreadBucket());
+    }
+
+    /**
+     * A bucket whose listing fails yields nothing from that bucket and is reported, rather than looking
+     * like an empty bucket.
+     */
+    public void testABucketThatCannotBeListedIsReportedRatherThanReadAsEmpty() throws Exception {
+        Path directory = createTempDir();
+        BlobDescriptorChangeLog log = logOver(directory);
+        log.append(change("serverless_tenant-a", DescriptorChange.Kind.CREATED));
+
+        FsBlobStore store = storeOver(directory);
+        // Wrapped at the root, and the wrapper wraps what children() hands back. That indirection is the
+        // point: the read discovers buckets through children() rather than through this function, so a
+        // wrapper applied only here would never be reached by a bucket.
+        BlobDescriptorChangeLog unreadable = new BlobDescriptorChangeLog(
+            path -> new UnlistableContainer(store.blobContainer(path)),
+            BlobPath.cleanPath()
+        );
+
+        BlobDescriptorChangeLog.ChangeBatch batch = unreadable.readSince(null, Set.of());
+        assertTrue(batch.entries().isEmpty());
+        assertFalse("an unlistable bucket is not an empty one", batch.complete());
+        assertNotNull(batch.firstUnreadBucket());
+    }
+
+    /** A container that refuses to list, standing in for a bucket the object store cannot serve. */
+    private static final class UnlistableContainer implements BlobContainer {
+        private final BlobContainer delegate;
+
+        UnlistableContainer(BlobContainer delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public Map<String, org.opensearch.common.blobstore.BlobMetadata> listBlobs() throws java.io.IOException {
+            throw new java.io.IOException("bucket unavailable");
+        }
+
+        @Override
+        public Map<String, org.opensearch.common.blobstore.BlobMetadata> listBlobsByPrefix(String prefix) throws java.io.IOException {
+            throw new java.io.IOException("bucket unavailable");
+        }
+
+        @Override
+        public Map<String, BlobContainer> children() throws java.io.IOException {
+            // Wrapped, so a bucket discovered through here is unlistable too. Left unwrapped, the read
+            // would find perfectly readable buckets and the test would assert nothing.
+            Map<String, BlobContainer> wrapped = new java.util.LinkedHashMap<>();
+            for (Map.Entry<String, BlobContainer> child : delegate.children().entrySet()) {
+                wrapped.put(child.getKey(), new UnlistableContainer(child.getValue()));
+            }
+            return wrapped;
+        }
+
+        @Override
+        public BlobPath path() {
+            return delegate.path();
+        }
+
+        @Override
+        public boolean blobExists(String blobName) throws java.io.IOException {
+            return delegate.blobExists(blobName);
+        }
+
+        @Override
+        public java.io.InputStream readBlob(String blobName) throws java.io.IOException {
+            return delegate.readBlob(blobName);
+        }
+
+        @Override
+        public java.io.InputStream readBlob(String blobName, long position, long length) throws java.io.IOException {
+            return delegate.readBlob(blobName, position, length);
+        }
+
+        @Override
+        public void writeBlob(String blobName, java.io.InputStream inputStream, long blobSize, boolean failIfAlreadyExists)
+            throws java.io.IOException {
+            delegate.writeBlob(blobName, inputStream, blobSize, failIfAlreadyExists);
+        }
+
+        @Override
+        public void writeBlobAtomic(String blobName, java.io.InputStream inputStream, long blobSize, boolean failIfAlreadyExists)
+            throws java.io.IOException {
+            delegate.writeBlobAtomic(blobName, inputStream, blobSize, failIfAlreadyExists);
+        }
+
+        @Override
+        public org.opensearch.common.blobstore.DeleteResult delete() throws java.io.IOException {
+            return delegate.delete();
+        }
+
+        @Override
+        public void deleteBlobsIgnoringIfNotExists(List<String> blobNames) throws java.io.IOException {
+            delegate.deleteBlobsIgnoringIfNotExists(blobNames);
+        }
     }
 
     public void testAppendedChangesComeBack() throws Exception {

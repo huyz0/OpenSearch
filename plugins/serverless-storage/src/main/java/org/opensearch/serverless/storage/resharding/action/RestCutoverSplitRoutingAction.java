@@ -30,6 +30,15 @@ import static org.opensearch.rest.RestRequest.Method.POST;
  */
 public class RestCutoverSplitRoutingAction extends BaseRestHandler {
 
+    /**
+     * Ceiling on how many target index names one call may name. Every element becomes an alias
+     * action applied in a single cluster-state update, so an uncapped list turns one request into
+     * arbitrarily much cluster-manager work. Same bound and same reasoning as {@link
+     * RestProvisionSplitTargetsAction#MAX_TARGET_INDICES}, which caps the provisioning half of this
+     * same split flow -- these two lists always describe the same set of targets.
+     */
+    static final int MAX_TARGET_INDICES = RestProvisionSplitTargetsAction.MAX_TARGET_INDICES;
+
     /** Creates the handler; stateless, so no configuration is needed. */
     public RestCutoverSplitRoutingAction() {}
 
@@ -63,6 +72,11 @@ public class RestCutoverSplitRoutingAction extends BaseRestHandler {
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
         String aliasName = request.param("alias");
         String[] targetIndices = Strings.splitStringByCommaToArray(request.param("target_indices"));
+        if (targetIndices.length > MAX_TARGET_INDICES) {
+            throw new IllegalArgumentException(
+                "\"target_indices\" names " + targetIndices.length + " indices, more than the maximum of " + MAX_TARGET_INDICES
+            );
+        }
         CutoverSplitRoutingRequest cutoverRequest = new CutoverSplitRoutingRequest(aliasName, Arrays.asList(targetIndices));
         return channel -> client.execute(CutoverSplitRoutingAction.INSTANCE, cutoverRequest, new RestToXContentListener<>(channel));
     }

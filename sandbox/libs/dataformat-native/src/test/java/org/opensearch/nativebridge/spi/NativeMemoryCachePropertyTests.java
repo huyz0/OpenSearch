@@ -6,11 +6,10 @@
  * compatible open source license.
  */
 
-package org.opensearch.node;
+package org.opensearch.nativebridge.spi;
 
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.SingleObjectCache;
-import org.opensearch.plugin.stats.AnalyticsBackendNativeMemoryStats;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.concurrent.atomic.AtomicInteger;
@@ -25,6 +24,11 @@ import java.util.concurrent.atomic.AtomicInteger;
  * and a call after TTL expiry SHALL trigger a refresh.
  * <p>
  * <b>Validates: Requirements 7.2, 7.3, 7.4</b>
+ *
+ * <p>Moved here from {@code :server} along with {@link AnalyticsBackendNativeMemoryStats} itself.
+ * Note that this exercises the generic {@link SingleObjectCache} contract with these stats as the
+ * payload; the refresh-interval cache that once wrapped this type in {@code NativeMemoryService}
+ * hand-rolled its own caching and never used {@code SingleObjectCache}, and that service is gone.
  */
 public class NativeMemoryCachePropertyTests extends OpenSearchTestCase {
 

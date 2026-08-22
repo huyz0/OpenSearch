@@ -12,7 +12,14 @@
  * This is the stable plugin name that all extending plugins bind to.
  */
 
-apply plugin: 'opensearch.internal-cluster-test'
+// NOTE: no 'opensearch.internal-cluster-test' here on purpose. This plugin has no
+// src/internalClusterTest tree: its coordinator-level ITs live in the standalone
+// :sandbox:qa:analytics-engine-coordinator project, deliberately outside the plugin so the
+// IT classpath can pull in the DataFusion backend, Arrow Flight and the test-ppl frontend
+// without dragging those onto the plugin's own classpath. The source set (plus an
+// internalClusterTestImplementation dep and an internalClusterTest jvmArgs block) was left
+// behind by that move and configured a task that had nothing to run; removed so the build
+// config and the source tree agree.
 
 opensearchplugin {
   description = 'Analytics engine hub: discovers and wires query extensions via ExtensiblePlugin SPI.'
@@ -105,9 +112,6 @@ dependencies {
   // Unit tests run on a flat classpath (no plugin classloader), so pull arrow-base's runtime
   // jars in via the project dep — tests then use the same Arrow + Netty allocator as production.
   testImplementation project(':plugins:arrow-base')
-
-  // Arrow Flight streaming transport for ITs
-  internalClusterTestImplementation project(':plugins:arrow-flight-rpc')
 
   // Calcite bytecode references @Immutable from immutables — resolve at test compile time
   testCompileOnly 'org.immutables:value-annotations:2.8.8'
@@ -207,24 +211,11 @@ configurations.all {
 }
 
 // Arrow needs these --add-opens for direct-memory access via reflection.
-// Applied to both unit test and internal cluster test tasks.
 test {
   jvmArgs '--add-opens=java.base/java.nio=ALL-UNNAMED'
   jvmArgs '--add-opens=java.base/sun.nio.ch=ALL-UNNAMED'
   jvmArgs '-Darrow.memory.debug.allocator=false'
   // arrow-memory-netty (provided by arrow-base) needs Netty direct-memory access.
-  systemProperty 'io.netty.allocator.numDirectArenas', '1'
-  systemProperty 'io.netty.noUnsafe', 'false'
-  systemProperty 'io.netty.tryUnsafe', 'true'
-  systemProperty 'io.netty.tryReflectionSetAccessible', 'true'
-}
-
-// Arrow/Flight requires these JVM flags
-internalClusterTest {
-  jvmArgs '--add-opens=java.base/java.nio=ALL-UNNAMED'
-  jvmArgs '--add-opens=java.base/java.lang=ALL-UNNAMED'
-  jvmArgs '--add-opens=java.base/sun.nio.ch=ALL-UNNAMED'
-  jvmArgs '-Darrow.memory.debug.allocator=false'
   systemProperty 'io.netty.allocator.numDirectArenas', '1'
   systemProperty 'io.netty.noUnsafe', 'false'
   systemProperty 'io.netty.tryUnsafe', 'true'

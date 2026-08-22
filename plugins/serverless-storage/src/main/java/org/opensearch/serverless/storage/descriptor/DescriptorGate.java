@@ -169,6 +169,9 @@ public final class DescriptorGate {
         // The store is published before the supplier that reads it, so no resolution can observe a
         // registered supplier backed by a null store.
         STORE.set(store);
+        // Where change log appends go. Taken from the store rather than passed in, so this cannot end up
+        // pointing at a different pool from the descriptor writes it accompanies.
+        APPEND_EXECUTOR.set(store == null ? null : store.writeExecutor());
         AbsentIndexDescriptorSuppliers.register(DescriptorGate::supply);
         AbsentIndexDescriptorSuppliers.registerCached(DescriptorGate::supplyIfFresh);
         // T28. Wildcards, which until now matched no gated index at all: every branch of the resolver's
@@ -243,7 +246,20 @@ public final class DescriptorGate {
                     prefixWrites.putTombstoneAsync(descriptor);
                 }
             }
-            recordChange(descriptor);
+            // Deliberately no change log entry, which is a change and needs stating.
+            //
+            // This hook is called from Metadata.Builder.put, which means it runs on the cluster manager's
+            // state update thread *and* on every other node's applier thread as that state's diff is
+            // applied. Appending here was therefore N nodes each writing the same entry, and each of those
+            // appends was an inline blocking writeBlob on a thread that must not do I/O -- the constraint
+            // this hook's own comment above records having found the hard way, honoured for the descriptor
+            // write beside it and not for the append.
+            //
+            // Nothing is lost by dropping it. An index reaching this hook is an index that is *in* cluster
+            // state, so every node learns of the change through the state it is applying at this very
+            // moment; the change log exists for indices cluster state never mentions. Those are written by
+            // the creator, the updater, the mapping compare-and-swap and the tombstone writer, and all four
+            // record.
         });
         // The durable half of deletion, which had a hook in MetadataDeleteIndexService and no registrar, so
         // every gated delete acknowledged with nothing durable behind it.
@@ -269,7 +285,26 @@ public final class DescriptorGate {
                 deleted.size()
             );
             for (org.opensearch.cluster.metadata.IndexMetadata metadata : deleted) {
-                store.putTombstoneAsync(IndexDescriptor.from(metadata).tombstoned(System.currentTimeMillis()), perTombstone);
+                IndexDescriptor tombstone = IndexDescriptor.from(metadata).tombstoned(System.currentTimeMillis());
+                // The change log entry for a deletion, which had no writer at all until now, and its absence
+                // was the worst of the five.
+                //
+                // The publisher above has an exists()==false branch that records a DELETED, and nothing
+                // reaches it: publish() is only ever called with metadata for an index that is in cluster
+                // state, and an all-gated delete does not go through a cluster state update in the first
+                // place -- MetadataDeleteIndexService.deleteGatedIndices writes the tombstone and
+                // acknowledges. So no node was ever told that a gated index had been deleted. Every other
+                // node went on resolving it from cache as live for the whole freshness window, a minute by
+                // default, and *accepted acknowledged writes against a deleted index* for that long. It also
+                // left DescriptorChangeTailer's delete-driven shard release unreachable in production, so
+                // the only thing closing those shards was the periodic sweep.
+                //
+                // Recorded after the write is durable rather than beside it, because an entry for a
+                // tombstone that never landed would have other nodes drop a live index's shards.
+                store.putTombstoneAsync(tombstone, org.opensearch.core.action.ActionListener.wrap(ignored -> {
+                    recordChange(tombstone);
+                    perTombstone.onResponse(null);
+                }, perTombstone::onFailure));
             }
         });
         // T18. The creator is a separate registration from the publisher because the two have opposite
@@ -290,7 +325,24 @@ public final class DescriptorGate {
         IndexDescriptorPublisher.registerCreator(descriptor -> {
             DescriptorBackedMappingStore.registerDescriptor(descriptor);
             projectMappingForStats(mappingStore, descriptor);
-            java.util.concurrent.CompletableFuture<Boolean> created = store.createAsync(descriptor);
+            java.util.concurrent.CompletableFuture<Boolean> created = store.createAsync(descriptor).thenApply(won -> {
+                // The creation's change log entry, which this path never wrote.
+                //
+                // A gated creation is the one descriptor write that goes nowhere near the publisher, so no
+                // node other than this one learned that the name now exists. Mostly that costs nothing --
+                // absence is not cached, so a cold node reads the store and finds it -- except after a
+                // delete: readFromStore answers a deleted name with its tombstone, the cache admits it, and
+                // a node that read the name while it was deleted goes on answering "deleted" for the whole
+                // freshness window after it is recreated. The local cache is handled by create() itself;
+                // this is how the other nodes hear.
+                //
+                // Only on a win. Recording a creation that lost the race would invalidate every other node's
+                // cache on behalf of a name this call does not hold.
+                if (Boolean.TRUE.equals(won)) {
+                    recordChange(descriptor, DescriptorChange.Kind.CREATED);
+                }
+                return won;
+            });
             if (prefixBackend instanceof DescriptorBackend == false || prefixBackend == store) {
                 return created;
             }
@@ -320,29 +372,24 @@ public final class DescriptorGate {
                 });
             });
         });
-        IndexDescriptorPublisher.registerUpdater(descriptor -> {
-            DescriptorBackedMappingStore.registerDescriptor(descriptor);
-            // Also here, not only on creation: a descriptor republished for any other reason carries the
-            // current mapping with it, and projecting it is idempotent under external versioning. Cheaper
-            // than reasoning about which republish paths can and cannot have changed the fields.
-            projectMappingForStats(mappingStore, descriptor);
-            java.util.concurrent.CompletableFuture<Boolean> future = new java.util.concurrent.CompletableFuture<>();
-            store.putAsync(
-                descriptor,
-                org.opensearch.core.action.ActionListener.wrap(ignored -> future.complete(true), future::completeExceptionally)
-            );
-            // Recorded here as well as on the publish path, which it was not before, and the omission had
-            // teeth. This is the path a close takes -- MetadataIndexStateService's gated branch writes
-            // descriptor.withState(CLOSE) through updateGated -- so nothing was appended to the change log
-            // for a close at all, and no other node ever learned of one. Adding Kind.CLOSED alone did not
-            // fix that, because no entry of any kind was being written for it to carry.
-            //
-            // It applies equally to every other update through here: a mapping change republished this way
-            // left other nodes' caches holding the previous descriptor until something else invalidated
-            // them.
-            recordChange(descriptor);
-            return future;
-        });
+        // The update path, which is a read-modify-write and is now shaped like one.
+        //
+        // It used to take a finished descriptor and put it, unconditionally. Every caller built that
+        // descriptor by resolving the current one -- from the cache, and on the cluster state thread from
+        // the cache or not at all -- changing one field and handing it back, so the write reverted anything
+        // else that had changed inside the freshness window. A close issued while a dynamic field was being
+        // added rolled that field out of the mapping and acknowledged.
+        //
+        // Taking the mutation instead lets the read happen here, past the cache, and the write happen
+        // conditionally on the version that read observed. See IndexDescriptorPublisher.DescriptorMutator.
+        IndexDescriptorPublisher.registerUpdater(
+            (name, mutation) -> java.util.concurrent.CompletableFuture.supplyAsync(
+                // On the store's own executor, because the caller may be the cluster state thread -- the
+                // alias path is -- and this both reads and writes the object store.
+                () -> applyToDescriptor(store, mappingStore, name, mutation),
+                writeExecutorOf(store)
+            )
+        );
         // T58: Mappings for gated indices are stored directly inside IndexDescriptors in Object Storage.
         //
         // Registered from the caller rather than constructed here, and that is a correction. T58 replaced
@@ -383,6 +430,80 @@ public final class DescriptorGate {
         DescriptorOnlyCreation.register(DescriptorGate::gatable);
         nodeInstalled();
         logger.info("descriptor resolution installed against the object store");
+    }
+
+    /** How many times a losing conditional write is re-based before the update is reported as contention. */
+    private static final int MAX_UPDATE_ATTEMPTS = 16;
+
+    /**
+     * The pool a backend's writes run on, falling back to the calling thread.
+     *
+     * <p>The fallback is for a backend that has no pool of its own -- an in-memory one, or a mock, whose
+     * writes are not I/O and for which an executor hop would be pure ceremony. It must never be reached by
+     * the object store backend, which overrides {@link DescriptorBackend#writeExecutor()} precisely because
+     * running its writes inline on a cluster state thread hangs the node.
+     */
+    private static java.util.concurrent.Executor writeExecutorOf(DescriptorBackend store) {
+        java.util.concurrent.Executor executor = store == null ? null : store.writeExecutor();
+        return executor == null ? Runnable::run : executor;
+    }
+
+    /**
+     * Applies one change to a stored descriptor: fresh read, mutate, conditional write, retry if it lost.
+     *
+     * <p>The same loop {@code MappingGenerationStore.updateMapping} runs one level up, and for the same
+     * reason. Re-basing on the value that won is what makes concurrent changes to one descriptor compose --
+     * an alias added while a mapping is being extended has to leave both, and the only way to be sure of
+     * that is to apply the change to what the winner wrote rather than to what this caller last saw.
+     *
+     * <p>A mutation that returns its argument unchanged writes nothing and reports success. That is how an
+     * already-satisfied request -- adding an alias that is there, closing an index that is closed -- costs
+     * no write rather than merely doing no harm.
+     *
+     * <p>Bounded rather than unbounded, because a livelock here would hang the request instead of failing
+     * it. Sixteen matches the mapping loop above it.
+     */
+    private static boolean applyToDescriptor(
+        DescriptorBackend store,
+        MappingGenerationStore.Store mappingStore,
+        String name,
+        java.util.function.UnaryOperator<IndexDescriptor> mutation
+    ) {
+        for (int attempt = 0; attempt < MAX_UPDATE_ATTEMPTS; attempt++) {
+            DescriptorBackend.VersionedDescriptor current = store.getForUpdate(name);
+            IndexDescriptor descriptor = current == null ? null : current.descriptor();
+            if (descriptor == null || descriptor.exists() == false) {
+                // Absent or tombstoned. Failing rather than writing is the point: recreating a deleted
+                // index by way of an alias change is exactly the resurrection tombstones exist to stop.
+                throw new org.opensearch.index.IndexNotFoundException(name);
+            }
+            IndexDescriptor updated = mutation.apply(descriptor);
+            if (updated == null || updated == descriptor) {
+                DescriptorBackedMappingStore.registerDescriptor(descriptor);
+                return true;
+            }
+            if (store.compareAndSwap(updated, current.storeVersion())) {
+                DescriptorBackedMappingStore.registerDescriptor(updated);
+                // Also here, not only on creation: a descriptor written for any other reason carries the
+                // current mapping with it, and projecting it is idempotent under external versioning.
+                // Cheaper than reasoning about which paths can and cannot have changed the fields.
+                projectMappingForStats(mappingStore, updated);
+                // The entry this path has always had to write, and the reason it exists as a kind of its
+                // own. A close goes through here, and before the log heard about it no other node learned
+                // that a gated index had closed: it kept the shard, kept renewing the writer lease, and a
+                // restore-in-place -- which refuses while a lease is held -- was unreachable.
+                recordChange(updated);
+                return true;
+            }
+            logger.debug("descriptor update for [{}] lost the race on attempt {}; re-reading and re-applying", name, attempt + 1);
+        }
+        throw new IllegalStateException(
+            "the descriptor for ["
+                + name
+                + "] could not be updated after "
+                + MAX_UPDATE_ATTEMPTS
+                + " attempts, which means sustained contention"
+        );
     }
 
     /**
@@ -428,7 +549,15 @@ public final class DescriptorGate {
 
     /** Clears the registration, which a node shutting down must do. */
     /**
-     * The change log, which had nowhere to be called from until the publisher above called it.
+     * The change log, written by every path above that changes a descriptor a gated index depends on.
+     *
+     * <p>Four of them: the creator, the updater, the tombstone writer, and {@link
+     * DescriptorBackedMappingStore}'s compare-and-swap. Deliberately <em>not</em> the publisher, which
+     * records indices that are in cluster state and would therefore have every node in the cluster append
+     * the same entry from its applier thread. The set matters as a set: {@code BlobDescriptorBackend}
+     * justifies a sixty second freshness window on the grounds that this feed carries every change, so a
+     * fifth write path that does not record here silently makes that window the only mechanism rather than
+     * the backstop.
      *
      * <p>What the log carries is cache invalidation and shard release on other nodes, applied by
      * {@code DescriptorChangeTailer}. It once also fed an in-memory name index on every node; that index
@@ -460,38 +589,90 @@ public final class DescriptorGate {
     }
 
     /**
+     * Where change log appends run, taken from the store so this does not need its own pool.
+     *
+     * <p>An append is a blob write, and the paths that record one reach here from threads that must not do
+     * I/O: the alias path calls the updater from the cluster manager's state update thread, and a tombstone
+     * completes on whatever thread the store's write finished on. The store already owns a pool chosen for
+     * exactly this -- {@code GENERIC}, passed to {@code BlobDescriptorBackend} by the plugin with the
+     * comment "which pool is the caller's decision precisely because getting it wrong hangs a node rather
+     * than slowing one down" -- so the append shares it rather than inventing a second answer.
+     *
+     * <p>Same-thread when nothing is installed, which is a test and an in-memory backend.
+     */
+    private static final AtomicReference<java.util.concurrent.Executor> APPEND_EXECUTOR = new AtomicReference<>();
+
+    /**
      * Records one descriptor write to the log, so other nodes learn of it.
      *
-     * <p>Nothing is applied locally: this node wrote the descriptor, so its own cache is already correct,
-     * and the log exists to carry the change to nodes that were not party to the write. Those consume it
-     * through {@code DescriptorChangeTailer}, which invalidates their caches and releases shards of a
-     * deleted gated index.
-     *
-     * <p>Never throws. A descriptor write that succeeded must not be undone by a derived feed failing,
-     * which is the same reasoning {@code append} already applies inside itself.
+     * <p>The kind is derived from the descriptor's own state rather than from the operation, so a write that
+     * leaves the descriptor closed is reported as a close whatever produced it. A mapping write against an
+     * already-closed index cannot then quietly report UPDATED and leave a node that missed the original
+     * close still holding the shard.
      */
     private static void recordChange(IndexDescriptor descriptor) {
         DescriptorChange.Kind kind;
         if (descriptor.exists() == false) {
             kind = DescriptorChange.Kind.DELETED;
         } else if (descriptor.state() == org.opensearch.cluster.metadata.IndexDescriptor.State.CLOSE) {
-            // Any write leaving the descriptor closed is reported as a close, not just the one that closed
-            // it. Stated as the index's state rather than as the operation that produced it, so a mapping
-            // write against an already-closed index cannot quietly report UPDATED and leave a node that
-            // missed the original close still holding the shard.
             kind = DescriptorChange.Kind.CLOSED;
         } else {
             kind = DescriptorChange.Kind.UPDATED;
         }
+        recordChange(descriptor, kind);
+    }
+
+    /**
+     * Records one descriptor write to the log under a kind the caller names.
+     *
+     * <p>Nothing is applied locally: this node wrote the descriptor, so its own cache is already correct,
+     * and the log exists to carry the change to nodes that were not party to the write. Those consume it
+     * through {@code DescriptorChangeTailer}, which invalidates their caches and releases shards of a
+     * deleted or closed gated index.
+     *
+     * <p><b>Off the calling thread.</b> The append was an inline blocking {@code writeBlob}, and the callers
+     * are cluster state hooks and completion callbacks. The descriptor write beside it was made
+     * asynchronous for precisely this reason and the append was left behind, which is the shape of omission
+     * this file has produced before: the reasoning was written down, applied to one of the two writes, and
+     * not to the other.
+     *
+     * <p>Never throws, and a rejected execution is not an error either. A descriptor write that succeeded
+     * must not be undone by a derived feed failing, which is the same reasoning {@code append} already
+     * applies inside itself.
+     */
+    private static void recordChange(IndexDescriptor descriptor, DescriptorChange.Kind kind) {
+        BlobDescriptorChangeLog changeLog = CHANGE_LOG.get();
+        if (changeLog == null) {
+            return;
+        }
         DescriptorChange change = new DescriptorChange(descriptor.name(), descriptor.uuid(), kind, System.currentTimeMillis());
+        java.util.concurrent.Executor executor = APPEND_EXECUTOR.get();
         try {
-            BlobDescriptorChangeLog changeLog = CHANGE_LOG.get();
-            if (changeLog != null) {
+            if (executor == null) {
                 changeLog.append(change);
+            } else {
+                executor.execute(() -> changeLog.append(change));
             }
         } catch (RuntimeException e) {
+            // Including a rejected execution, which is a busy or closing node rather than a fault. The cost
+            // is a stale cache entry elsewhere until its window expires, which is what the window is for.
             logger.warn("could not record the descriptor change for [{}]; the feed will need a rebuild: {}", descriptor.name(), e);
         }
+    }
+
+    /**
+     * Records a descriptor another component in this package has just written.
+     *
+     * <p>Here rather than there because the change log is this class's to own -- it is what {@link
+     * #setChangeFeed} installs and what {@link #uninstall} clears -- and a second holder of it would be a
+     * second thing to keep in step. The one caller outside this class is
+     * {@link DescriptorBackedMappingStore}, whose compare-and-swap is the fifth descriptor write path and
+     * the last one that recorded nothing: a dynamic field added on one node left every other node's cached
+     * descriptor claiming the older mapping generation for the whole freshness window, which is what
+     * {@code StoreBackedFieldRefresher} then has to discover the hard way.
+     */
+    static void recordWrite(IndexDescriptor descriptor) {
+        recordChange(descriptor);
     }
 
     /**
@@ -561,6 +742,9 @@ public final class DescriptorGate {
         DescriptorOnlyCreation.register(null);
         UnknownFieldRefresh.register(null);
         STORE.set(null);
+        // With the store gone there is nowhere for an append to run, and holding a reference to a closing
+        // node's pool is the leak this method exists to prevent.
+        APPEND_EXECUTOR.set(null);
     }
 
 }

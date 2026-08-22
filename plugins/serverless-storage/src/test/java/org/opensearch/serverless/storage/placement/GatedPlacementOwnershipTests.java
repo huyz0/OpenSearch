@@ -55,14 +55,12 @@ public class GatedPlacementOwnershipTests extends OpenSearchTestCase {
      * synthesised metadata carries no marker and the gate correctly refuses ownership.
      */
     private static void registerClaimedKeyDeclaringStrategy() {
-        org.opensearch.cluster.metadata.IndexCreationStrategyRegistry.register(
-            new org.opensearch.cluster.metadata.IndexCreationStrategy() {
-                @Override
-                public String claimedIndexSettingKey() {
-                    return org.opensearch.serverless.storage.ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey();
-                }
+        org.opensearch.cluster.metadata.IndexCreationStrategyRegistry.register(new org.opensearch.cluster.metadata.IndexCreationStrategy() {
+            @Override
+            public String claimedIndexSettingKey() {
+                return org.opensearch.serverless.storage.ServerlessStoragePlugin.SERVERLESS_STORAGE_ENABLED_SETTING.getKey();
             }
-        );
+        });
     }
 
     /**

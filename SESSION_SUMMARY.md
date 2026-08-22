@@ -1,7 +1,8 @@
 # Session summary — resume from here
 
 Working directory for this work is **this repo** (`/home/tuong/work/OpenSearch`), branch
-`feature/pluggable-engine-per-shard-role`. Not the parent `/home/tuong/work` directory — that's an
+**`feature/serverless`** (earlier versions of this file named `feature/pluggable-engine-per-shard-role`,
+which this work has since moved off). Not the parent `/home/tuong/work` directory — that's an
 unrelated empty git init, only relevant if a shell's cwd silently resets there mid-session (a known
 environment quirk hit repeatedly earlier; always `cd` back into this repo before running anything).
 

@@ -319,15 +319,50 @@ public class AnalyticsPlugin extends Plugin implements ExtensiblePlugin, ActionP
             return getContext(clusterService.state());
         }
 
+        /**
+         * {@inheritDoc}
+         * <p>
+         * Unlike {@code AnalyticsSearchService}, which converts through
+         * {@code backends.get(plan.getBackendId())} — the backend that actually ran the fragment —
+         * this coordinator-side hook is reached from
+         * {@code DefaultPlanExecutor.doExecute}'s listener, which is built before a plan (and
+         * therefore before a backend id) exists. {@link EngineContextProvider#convertException}
+         * takes only the exception, so the responsible backend genuinely is not available here.
+         * <p>
+         * The old loop returned the first backend whose conversion changed the exception, which
+         * on a node with several backends installed let a backend that had nothing to do with the
+         * query relabel another backend's failure — and made which one wins depend on plugin
+         * registration order. Instead we ask every backend and only accept an <em>unambiguous</em>
+         * answer: exactly one claimant means the error is recognisably that backend's, so its
+         * typed status (e.g. a 429 for a memory-pool trip) is honoured. Zero claimants, or two
+         * disagreeing claimants, means we cannot attribute the failure, so the original exception
+         * is surfaced unchanged rather than guessed at.
+         * <p>
+         * With today's backend set this is behaviour-preserving: only the DataFusion backend
+         * overrides {@code convertException}, so there is never more than one claimant.
+         */
         @Override
         public Exception convertException(Exception e) {
+            Exception claimed = null;
+            AnalyticsSearchBackendPlugin claimant = null;
             for (AnalyticsSearchBackendPlugin backend : backends.values()) {
                 Exception converted = backend.convertException(e);
-                if (converted != e) {
-                    return converted;
+                if (converted == e) {
+                    continue;
                 }
+                if (claimant != null) {
+                    logger.warn(
+                        "[analytics-engine] backends [{}] and [{}] both converted the same coordinator failure; "
+                            + "cannot attribute it to one backend, surfacing the original exception",
+                        claimant.name(),
+                        backend.name()
+                    );
+                    return e;
+                }
+                claimant = backend;
+                claimed = converted;
             }
-            return e;
+            return claimant == null ? e : claimed;
         }
     }
 

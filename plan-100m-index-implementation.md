@@ -331,8 +331,16 @@ because the target is in the body or needs resolution first.
 
 ### B.2 What exists
 
-Nothing. Coordinating-only nodes exist as a role and need no change; the routing in front of them does
-not exist.
+*Updated 2026-08-22 — this section said "Nothing" and was stale.* The **external** routing this area is
+about (load-balancer-level consistent hashing in front of coordinating-only nodes) still does not exist,
+and that remains the substance of B1–B2 below. What does exist is the **in-cluster** analogue built
+since: `CoordinatorAffinityRouting` (rendezvous hashing, in core) plus the plugin's
+`AffinityForwardingActionFilter`, which forwards a request to the node that owns an index's affinity
+share so per-index cached state is reused. It is **off by default** and is not a substitute for
+LB-level routing — it spends an extra intra-cluster hop to get the affinity the LB would have given for
+free — but it does mean the "route the same index to the same node" mechanism is designed, tested and
+available, and B1–B2 should be read as moving that decision out to the edge rather than inventing it.
+Coordinating-only nodes still exist as a role and still need no change.
 
 ### B.3 Tasks
 

@@ -65,4 +65,35 @@ public class RestCutoverSplitRoutingActionTests extends OpenSearchTestCase {
         RestRequest request = requestWithParams(params);
         assertNotNull(action.prepareRequest(request, null));
     }
+
+    /**
+     * The list is uncapped input that turns into one alias action per element inside a single
+     * cluster-state update, so an enormous list is one request's worth of authorisation buying
+     * arbitrarily much cluster-manager work. It must be refused at the boundary, as a client error.
+     */
+    public void testPrepareRequestRejectsAnOverlongTargetIndicesList() {
+        StringBuilder tooMany = new StringBuilder("target-0");
+        for (int i = 1; i <= RestCutoverSplitRoutingAction.MAX_TARGET_INDICES; i++) {
+            tooMany.append(",target-").append(i);
+        }
+        Map<String, String> params = new HashMap<>();
+        params.put("alias", "my-alias");
+        params.put("target_indices", tooMany.toString());
+        RestRequest request = requestWithParams(params);
+
+        IllegalArgumentException e = expectThrows(IllegalArgumentException.class, () -> action.prepareRequest(request, null));
+        assertTrue(e.getMessage(), e.getMessage().contains("more than the maximum"));
+    }
+
+    /** Exactly at the cap is still a legitimate request -- the bound is inclusive. */
+    public void testPrepareRequestAcceptsTargetIndicesExactlyAtTheCap() throws Exception {
+        StringBuilder atCap = new StringBuilder("target-0");
+        for (int i = 1; i < RestCutoverSplitRoutingAction.MAX_TARGET_INDICES; i++) {
+            atCap.append(",target-").append(i);
+        }
+        Map<String, String> params = new HashMap<>();
+        params.put("alias", "my-alias");
+        params.put("target_indices", atCap.toString());
+        assertNotNull(action.prepareRequest(requestWithParams(params), null));
+    }
 }

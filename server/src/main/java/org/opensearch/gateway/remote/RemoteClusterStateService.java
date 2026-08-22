@@ -80,6 +80,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -1765,12 +1766,23 @@ public class RemoteClusterStateService implements Closeable {
             List<UploadedIndexMetadata> resolvedIndices = diff.getIndicesUpdated().isEmpty()
                 ? Collections.emptyList()
                 : remoteManifestManager.resolveIndices(manifest);
+            // Indexed once and looked up k times, rather than a linear scan of the resolved list per
+            // updated index. That scan was O(k x N) on every applied diff -- with N the whole cluster's
+            // index count and k the handful that changed, which is the ratio that makes it worth removing:
+            // at N=1,000,000 and k=10 it walked ten million entries to find ten.
+            final Map<String, UploadedIndexMetadata> resolvedByName = new HashMap<>(resolvedIndices.size());
+            for (UploadedIndexMetadata resolved : resolvedIndices) {
+                resolvedByName.put(resolved.getIndexName(), resolved);
+            }
             List<UploadedIndexMetadata> updatedIndices = diff.getIndicesUpdated().stream().map(idx -> {
-                Optional<UploadedIndexMetadata> uploadedIndexMetadataOptional = resolvedIndices.stream()
-                    .filter(idx2 -> idx2.getIndexName().equals(idx))
-                    .findFirst();
-                assert uploadedIndexMetadataOptional.isPresent() == true;
-                return uploadedIndexMetadataOptional.get();
+                UploadedIndexMetadata uploadedIndexMetadata = resolvedByName.get(idx);
+                assert uploadedIndexMetadata != null;
+                if (uploadedIndexMetadata == null) {
+                    // Same failure as the Optional#get this replaced, kept because assertions are off in
+                    // production and a null entry here would surface far away from its cause.
+                    throw new NoSuchElementException("no manifest entry for updated index [" + idx + "]");
+                }
+                return uploadedIndexMetadata;
             }).collect(Collectors.toList());
 
             Map<String, UploadedMetadataAttribute> updatedCustomMetadata = new HashMap<>();

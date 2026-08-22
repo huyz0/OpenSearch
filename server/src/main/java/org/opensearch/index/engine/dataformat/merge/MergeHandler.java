@@ -233,6 +233,28 @@ public class MergeHandler {
     }
 
     /**
+     * Releases the registration of merges that were selected but will never run.
+     * <p>
+     * {@link #findForceMerges(int)} registers every selected group in {@code currentlyMergingSegments}
+     * up front so that concurrent selection cannot pick the same segments twice, but it does not queue
+     * them as pending merges — the force-merge caller runs them itself, serially. If that caller stops
+     * early (a merge fails, or the scheduler shuts down mid-loop), the groups it never reached are still
+     * registered. Left behind, those segments would be silently excluded from every future background
+     * and force merge for the lifetime of the engine. This is the caller's way of handing them back.
+     * <p>
+     * Unlike {@link #onMergeFailure(OneMerge)} this is not a failure signal — nothing was attempted —
+     * so it logs at debug and does not warn.
+     *
+     * @param merges the merges to unregister; merges that are not registered are ignored
+     */
+    public synchronized void unregisterMerges(Collection<OneMerge> merges) {
+        for (OneMerge merge : merges) {
+            removeMergingSegments(merge);
+            logger.debug(() -> new ParameterizedMessage("Unregistered un-run merge [{}]", merge));
+        }
+    }
+
+    /**
      * Callback invoked when a merge fails.
      *
      * @param oneMerge the merge that failed

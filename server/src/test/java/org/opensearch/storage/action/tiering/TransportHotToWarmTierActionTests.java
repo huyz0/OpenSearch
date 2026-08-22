@@ -492,6 +492,42 @@ public class TransportHotToWarmTierActionTests extends OpenSearchTestCase {
         );
     }
 
+    /**
+     * Blocking must also persist {@code INDEX_TIERING_STATE=HOT}. That durable value is what lets the
+     * tiering service's orphan sweep recognise a tiering-owned write block after the cluster-manager
+     * dies mid-preparation (the in-memory prepare tracking is gone, but the setting survives), while
+     * still leaving alone a write block on an index tiering has never touched — which has no
+     * {@code INDEX_TIERING_STATE} at all.
+     */
+    public void testApplyWriteBlock_AddRecordsHotTieringState() {
+        String indexName = "test-dfa-index";
+        ClusterState state = buildClusterStateWithDfaIndex(indexName, 1, 1);
+        IndexMetadata before = state.metadata().index(indexName);
+        assertNull("precondition: index has no tiering state", before.getSettings().get(IndexModule.INDEX_TIERING_STATE.getKey()));
+
+        ClusterState result = TransportHotToWarmTierAction.applyWriteBlock(state, before, true);
+        IndexMetadata after = result.metadata().index(indexName);
+
+        assertEquals(
+            "blocking must record the tiering state as HOT",
+            IndexModule.TieringState.HOT.name(),
+            after.getSettings().get(IndexModule.INDEX_TIERING_STATE.getKey())
+        );
+        assertEquals(
+            "both settings must land in a single settingsVersion bump",
+            before.getSettingsVersion() + 1,
+            after.getSettingsVersion()
+        );
+
+        // Re-asserting the block on the already-marked index must stay a no-op.
+        ClusterState reasserted = TransportHotToWarmTierAction.applyWriteBlock(result, after, true);
+        assertEquals(
+            "settingsVersion must not bump when block and tiering state already match",
+            after.getSettingsVersion(),
+            reasserted.metadata().index(indexName).getSettingsVersion()
+        );
+    }
+
     public void testApplyWriteBlock_RemoveWhenBlocked_ClearsAndBumpsVersion() {
         String indexName = "test-dfa-index";
         ClusterState state = buildClusterStateWithDfaIndex(indexName, 1, 1);

@@ -1726,7 +1726,9 @@ public class NodeStatsTests extends OpenSearchTestCase {
             totalEstimatedNativeBytes,
             // The allocator stats travel through the generic pluginStats map, keyed by the same
             // getWriteableName() the arrow-base plugin contributes them under in production.
-            nativeAllocatorStats == null ? null : Map.<String, PluginNodeStats>of(nativeAllocatorStats.getWriteableName(), nativeAllocatorStats)
+            nativeAllocatorStats == null
+                ? null
+                : Map.<String, PluginNodeStats>of(nativeAllocatorStats.getWriteableName(), nativeAllocatorStats)
         );
     }
 

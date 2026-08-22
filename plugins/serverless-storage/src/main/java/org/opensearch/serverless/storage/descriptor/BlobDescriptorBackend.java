@@ -109,6 +109,14 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
      * another node is invalidated here by {@code DescriptorChangeTailer} within its poll interval, so the
      * window is a backstop for a change log entry that was lost, not the mechanism by which deletes become
      * visible. A minute bounds that backstop while cutting steady-state reads by sixty.
+     *
+     * <p><b>That argument is only as good as the feed underneath it, and for a while it was not.</b> It
+     * assumes every change to a descriptor produces a log entry, and only two of the five write paths
+     * recorded one: the publisher and the updater. Creation, the mapping compare-and-swap and the tombstone
+     * write recorded nothing, so a gated index deleted on one node went on resolving as live on every other
+     * node for the whole minute -- and accepted acknowledged writes against it, which is the direction that
+     * costs data rather than freshness. Every path records now, which is what {@code DescriptorGate} states
+     * at each of them; if a sixth is ever added, this window is the thing it silently breaks.
      */
     private final DescriptorCache descriptorCache;
 
@@ -292,10 +300,97 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
     public boolean create(IndexDescriptor descriptor) {
         try {
             BlobRegisterCasResult result = blobContainer.createRegisterIfAbsent(keyFor(descriptor.name()), encode(descriptor));
+            // Invalidated whichever way it went, and both directions matter.
+            //
+            // On a win: the cache can be holding this name's *tombstone*. readFromStore answers a deleted
+            // name with its tombstone rather than with null -- deliberately, since that is what stops a
+            // partitioned node resurrecting the index -- and the cache admits it like any other hit. So a
+            // name that was deleted, read once, and then recreated read back as deleted for the rest of the
+            // freshness window, which is a minute of an index that exists resolving as gone. That breaks the
+            // read-your-writes contract this interface and DescriptorCache both state, and it is worse than
+            // an ordinary stale read because the index cannot be used at all while it lasts.
+            //
+            // On a loss: createIdempotently's next act is a get() to find out whether the winner was its own
+            // earlier attempt, and a get() through the cache can answer from a descriptor written before
+            // either attempt -- with a different uuid, which is answered as TAKEN. A creation that actually
+            // succeeded is then reported as a name collision.
+            descriptorCache.invalidate(descriptor.name());
             return result.applied();
         } catch (IOException e) {
             throw new DescriptorUnavailableException(descriptor.name(), e);
         }
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>Past the cache on purpose, and it costs a round trip for exactly that reason. See the interface:
+     * a read that is about to become a write cannot come from a minute-old copy.
+     */
+    @Override
+    public VersionedDescriptor getForUpdate(String name) {
+        String key = keyFor(name);
+        try {
+            Optional<BlobRegister> live = blobContainer.readRegister(key);
+            if (live.isEmpty()) {
+                // Absent from the live prefix. The tombstone is not consulted: a caller about to write a
+                // descriptor needs to know the name is not live, and ABSENT_GENERATION is the version a
+                // conditional write of a name that must not already exist is made under.
+                return new VersionedDescriptor(null, BlobRegister.ABSENT_GENERATION);
+            }
+            return new VersionedDescriptor(decode(live.get().value()), live.get().generation());
+        } catch (IOException | RuntimeException e) {
+            throw new DescriptorUnavailableException(name, e);
+        }
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>One conditional write and no retry. Retrying here is the caller's decision because only the caller
+     * knows how to re-apply its change to what it now finds; retrying at the winner's generation -- which is
+     * what {@link #put} used to do -- is not a retry at all, it is an overwrite wearing one's clothes.
+     */
+    @Override
+    public boolean compareAndSwap(IndexDescriptor descriptor, long expectedStoreVersion) {
+        if (expectedStoreVersion == UNVERSIONED) {
+            throw new IllegalArgumentException(
+                "a conditional write of the descriptor for ["
+                    + descriptor.name()
+                    + "] needs the version it was read at; UNVERSIONED means the caller never read one"
+            );
+        }
+        try {
+            BlobRegisterCasResult result = blobContainer.compareAndSwapRegister(
+                keyFor(descriptor.name()),
+                expectedStoreVersion,
+                encode(descriptor)
+            );
+            if (result.applied()) {
+                // After the write, never before, for the reason put() states: dropping the entry first
+                // leaves a window where a concurrent read repopulates from the old value and outlives it.
+                descriptorCache.invalidate(descriptor.name());
+                return true;
+            }
+            // The loser's cached copy is now known to be behind, and its caller is about to re-read. Leaving
+            // it would send that re-read straight back into the value that just lost.
+            descriptorCache.invalidate(descriptor.name());
+            logger.debug(
+                "conditional descriptor write for [{}] lost at generation {}; the store is at {}",
+                descriptor.name(),
+                expectedStoreVersion,
+                result.currentGeneration()
+            );
+            return false;
+        } catch (IOException e) {
+            throw new DescriptorUnavailableException(descriptor.name(), e);
+        }
+    }
+
+    /** The pool this backend's writes run on, which the gate composes several of them onto. */
+    @Override
+    public Executor writeExecutor() {
+        return executor;
     }
 
     /**
@@ -314,30 +409,42 @@ public final class BlobDescriptorBackend implements DescriptorBackend {
      * {@inheritDoc}
      *
      * <p>Unconditional, so it advances the register's generation whatever it was. A caller needing
-     * compare-and-swap semantics against a known generation wants the register API directly; this is the
+     * compare-and-swap semantics against a known generation wants {@link #getForUpdate} and
+     * {@link #compareAndSwap}, which is the pair every read-modify-write must use; this is the
      * "write it, I know what I am doing" path the system index's {@code put} already was.
+     *
+     * <p><b>What changed and why.</b> A lost swap used to be retried at {@code result.currentGeneration()},
+     * the generation the winner had just established. That is not a retry, it is a guaranteed overwrite of
+     * whatever the winner wrote, and it made this method last-writer-wins by construction. It mattered
+     * because the mapping compare-and-swap sat on top of it: two shards inferring different dynamic fields
+     * both read generation N, both "succeeded", and one field's mapping was erased while documents carrying
+     * it were being indexed. That caller now uses the conditional pair, and this one re-reads instead of
+     * assuming, so each attempt is made against something actually observed.
      */
     @Override
     public void put(IndexDescriptor descriptor) {
         String key = keyFor(descriptor.name());
+        int maxAttempts = 3;
         try {
-            long generation = blobContainer.readRegister(key).map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
-            BlobRegisterCasResult result = blobContainer.compareAndSwapRegister(key, generation, encode(descriptor));
-            if (result.applied() == false) {
-                // Someone wrote between the read and the swap. Retrying once rather than looping, because
-                // an unconditional put losing twice means a writer is contending on a descriptor that is
-                // supposed to have one owner, and a silent retry loop would hide that.
-                BlobRegisterCasResult retry = blobContainer.compareAndSwapRegister(key, result.currentGeneration(), encode(descriptor));
-                if (retry.applied() == false) {
-                    throw new DescriptorUnavailableException(
-                        descriptor.name(),
-                        new IllegalStateException("descriptor write lost twice at generation " + retry.currentGeneration())
-                    );
+            for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+                long generation = blobContainer.readRegister(key).map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
+                BlobRegisterCasResult result = blobContainer.compareAndSwapRegister(key, generation, encode(descriptor));
+                if (result.applied()) {
+                    // Invalidated after the write, never before. Dropping the entry first would leave a
+                    // window where a concurrent read repopulates the cache from the old value and then
+                    // outlives the write.
+                    descriptorCache.invalidate(descriptor.name());
+                    return;
                 }
+                // Someone wrote between the read and the swap. Bounded rather than unbounded, because an
+                // unconditional put losing three times running means a writer is contending on a descriptor
+                // that is supposed to have one owner, and a silent retry loop would hide that.
+                logger.debug("descriptor write for [{}] lost at generation {}; re-reading", descriptor.name(), result.currentGeneration());
             }
-            // Invalidated after the write, never before. Dropping the entry first would leave a window
-            // where a concurrent read repopulates the cache from the old value and then outlives the write.
-            descriptorCache.invalidate(descriptor.name());
+            throw new DescriptorUnavailableException(
+                descriptor.name(),
+                new IllegalStateException("descriptor write lost " + maxAttempts + " times running, which is sustained contention")
+            );
         } catch (IOException e) {
             throw new DescriptorUnavailableException(descriptor.name(), e);
         }

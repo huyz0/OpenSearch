@@ -222,7 +222,6 @@ public class ComputedPlacementRequestPathsIT extends OpenSearchIntegTestCase {
         return builder.build();
     }
 
-
     private static String owner(List<String> dataNodes, int shardId) {
         return dataNodes.get(shardId % dataNodes.size());
     }

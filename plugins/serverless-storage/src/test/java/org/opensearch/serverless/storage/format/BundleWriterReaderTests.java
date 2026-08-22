@@ -112,6 +112,39 @@ public class BundleWriterReaderTests extends OpenSearchTestCase {
         assertTrue(e.getMessage(), e.getMessage().contains("bundle header checksum mismatch"));
     }
 
+    // Regression test for a real bug, the exact mirror of WalChunkReader's already-fixed record
+    // count: entryCount drove four allocations (a LinkedHashMap plus three arrays) before the
+    // trailing header checksum was ever verified, with only a `< 0` check -- so a corrupted
+    // entryCount field (magic/version intact) could demand an absurdly large allocation instead of
+    // failing closed with a clean BundleFormatException, which is what this reader's own contract
+    // promises.
+    public void testImpossiblyLargeEntryCountIsRejectedBeforeAllocatingAnything() {
+        SegmentBundle bundle = BundleWriter.write(List.of(new BundleFileContent("_0.si", randomByteArrayOfLength(64))));
+        byte[] corrupted = bundle.bytes().clone();
+        // entryCount is the 4-byte int immediately after the 4-byte magic + 4-byte version header,
+        // i.e. bytes [8, 12). Overwrite it with a huge, clearly-impossible value.
+        corrupted[8] = 0x7F;
+        corrupted[9] = (byte) 0xFF;
+        corrupted[10] = (byte) 0xFF;
+        corrupted[11] = (byte) 0xFF;
+
+        BundleFormatException e = expectThrows(BundleFormatException.class, () -> BundleReader.parseHeader(corrupted));
+        assertTrue(e.getMessage(), e.getMessage().contains("impossibly large"));
+    }
+
+    /** A negative entryCount must still be caught by its own, more specific check. */
+    public void testNegativeEntryCountIsRejectedWithSpecificMessage() {
+        SegmentBundle bundle = BundleWriter.write(List.of(new BundleFileContent("_0.si", randomByteArrayOfLength(64))));
+        byte[] corrupted = bundle.bytes().clone();
+        corrupted[8] = (byte) 0x80;
+        corrupted[9] = 0;
+        corrupted[10] = 0;
+        corrupted[11] = 0;
+
+        BundleFormatException e = expectThrows(BundleFormatException.class, () -> BundleReader.parseHeader(corrupted));
+        assertTrue(e.getMessage(), e.getMessage().contains("negative entry count"));
+    }
+
     public void testTruncatedBundleIsRejectedWithSpecificMessage() {
         SegmentBundle bundle = BundleWriter.write(
             List.of(new BundleFileContent("a", randomByteArrayOfLength(100)), new BundleFileContent("b", randomByteArrayOfLength(100)))

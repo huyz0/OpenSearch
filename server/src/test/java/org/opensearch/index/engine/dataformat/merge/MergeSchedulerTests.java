@@ -11,6 +11,7 @@ package org.opensearch.index.engine.dataformat.merge;
 import org.opensearch.Version;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.IndexModule;
@@ -23,10 +24,16 @@ import org.opensearch.threadpool.TestThreadPool;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
 
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -149,6 +156,7 @@ public class MergeSchedulerTests extends OpenSearchTestCase {
 
         when(mergeHandler.findForceMerges(1)).thenReturn(List.of(merge1, merge2));
         when(mergeHandler.doMerge(merge1)).thenReturn(new MergeResult(Map.of()));
+        List<OneMerge> unregistered = recordUnregistered(mergeHandler);
 
         final java.util.concurrent.atomic.AtomicReference<MergeScheduler> schedulerRef =
             new java.util.concurrent.atomic.AtomicReference<>();
@@ -173,5 +181,141 @@ public class MergeSchedulerTests extends OpenSearchTestCase {
 
         verify(mergeHandler).doMerge(merge1);
         verify(mergeHandler, never()).doMerge(merge2);
+        // merge2 was registered up front by findForceMerges but never ran — its segments must be handed
+        // back, otherwise they stay in currentlyMergingSegments forever and are silently excluded from
+        // every future merge.
+        assertEquals("the un-run merge must be unregistered on the shutdown exit", List.of(merge2), unregistered);
+    }
+
+    /**
+     * A force merge that fails part-way must hand back the registrations of every group it never
+     * reached. {@code findForceMerges} registers ALL selected groups up front (they are not queued as
+     * pending merges, the force-merge caller runs them itself); only the failing group is cleaned up by
+     * {@code onMergeFailure}. Without the fix, groups 2..N stayed in {@code currentlyMergingSegments}
+     * for the lifetime of the engine — invisible to every later background and force merge, so a
+     * subsequent force merge "succeeds" without ever reaching the requested segment count.
+     */
+    public void testForceMergeUnregistersRemainingMergesOnFailure() throws Exception {
+        MergeHandler mergeHandler = mock(MergeHandler.class);
+
+        OneMerge merge1 = new OneMerge(List.of(new Segment(1L, Map.of())));
+        OneMerge merge2 = new OneMerge(List.of(new Segment(2L, Map.of())));
+        OneMerge merge3 = new OneMerge(List.of(new Segment(3L, Map.of())));
+
+        when(mergeHandler.findForceMerges(1)).thenReturn(List.of(merge1, merge2, merge3));
+        when(mergeHandler.doMerge(merge1)).thenThrow(new IOException("merge blew up"));
+        List<OneMerge> unregistered = recordUnregistered(mergeHandler);
+
+        MergeScheduler scheduler = newScheduler(mergeHandler, IndexModule.TieringState.HOT);
+
+        String oldName = Thread.currentThread().getName();
+        Thread.currentThread().setName("TEST-" + ThreadPool.Names.FORCE_MERGE + "-0");
+        try {
+            expectThrows(IOException.class, () -> scheduler.forceMerge(1));
+        } finally {
+            Thread.currentThread().setName(oldName);
+        }
+
+        // The failing merge cleans itself up through onMergeFailure...
+        verify(mergeHandler).onMergeFailure(merge1);
+        verify(mergeHandler, never()).doMerge(merge2);
+        verify(mergeHandler, never()).doMerge(merge3);
+        // ...and everything after it is handed back explicitly.
+        assertEquals("all un-run merges must be unregistered", List.of(merge2, merge3), unregistered);
+    }
+
+    /**
+     * A force merge that completes normally must not unregister anything — every selected group ran and
+     * owns its own cleanup via {@code onMergeFinished}.
+     */
+    public void testForceMergeDoesNotUnregisterWhenAllMergesRun() throws Exception {
+        MergeHandler mergeHandler = mock(MergeHandler.class);
+
+        OneMerge merge1 = new OneMerge(List.of(new Segment(1L, Map.of())));
+        OneMerge merge2 = new OneMerge(List.of(new Segment(2L, Map.of())));
+        when(mergeHandler.findForceMerges(1)).thenReturn(List.of(merge1, merge2));
+        when(mergeHandler.doMerge(merge1)).thenReturn(new MergeResult(Map.of()));
+        when(mergeHandler.doMerge(merge2)).thenReturn(new MergeResult(Map.of()));
+
+        MergeScheduler scheduler = newScheduler(mergeHandler, IndexModule.TieringState.HOT);
+
+        String oldName = Thread.currentThread().getName();
+        Thread.currentThread().setName("TEST-" + ThreadPool.Names.FORCE_MERGE + "-0");
+        try {
+            scheduler.forceMerge(1);
+        } finally {
+            Thread.currentThread().setName(oldName);
+        }
+
+        verify(mergeHandler).doMerge(merge1);
+        verify(mergeHandler).doMerge(merge2);
+        verify(mergeHandler, never()).unregisterMerges(any());
+    }
+
+    /**
+     * The frozen state must be re-checked after the force-merge lock is acquired. The engine's
+     * pre-flight {@code isFrozenForTiering()} check happens before the caller parks on the lock, and a
+     * caller can sit there for the whole duration of the force merge already running (minutes) — long
+     * enough for tiering to start, drain, and take its "last ever" flush of the shard.
+     */
+    public void testForceMergeAbandonedWhenFrozenAfterAcquiringLock() throws IOException {
+        MergeHandler mergeHandler = mock(MergeHandler.class);
+        MergeScheduler scheduler = newScheduler(mergeHandler, IndexModule.TieringState.HOT);
+
+        scheduler.freeze();
+
+        String oldName = Thread.currentThread().getName();
+        Thread.currentThread().setName("TEST-" + ThreadPool.Names.FORCE_MERGE + "-0");
+        try {
+            scheduler.forceMerge(1);
+        } finally {
+            Thread.currentThread().setName(oldName);
+        }
+
+        verify(mergeHandler, never()).findForceMerges(anyInt());
+        assertEquals("the abandoned force merge must give back its active-merge slot", 0, scheduler.getActiveMergeCount());
+    }
+
+    /**
+     * A merge submission the executor rejects must give back the active-merge slot it took. Otherwise
+     * {@code activeMerges} stays permanently above zero and no drain listener can ever fire on the
+     * shard again, so every subsequent tiering prepare times out.
+     */
+    public void testRejectedMergeSubmissionReleasesActiveMergeSlot() {
+        MergeHandler mergeHandler = mock(MergeHandler.class);
+        when(mergeHandler.hasPendingMerges()).thenReturn(true, false);
+        when(mergeHandler.getNextMerge()).thenReturn(new OneMerge(List.of(new Segment(1L, Map.of()))));
+
+        ThreadPool rejectingThreadPool = mock(ThreadPool.class);
+        ExecutorService rejectingExecutor = mock(ExecutorService.class);
+        when(rejectingThreadPool.executor(ThreadPool.Names.MERGE)).thenReturn(rejectingExecutor);
+        doThrow(new OpenSearchRejectedExecutionException("merge queue full")).when(rejectingExecutor).execute(any(Runnable.class));
+
+        MergeScheduler scheduler = new MergeScheduler(
+            mergeHandler,
+            (result, merge) -> {},
+            () -> {},
+            shardId,
+            indexSettings(IndexModule.TieringState.HOT),
+            rejectingThreadPool
+        );
+
+        scheduler.triggerMerges();
+
+        assertEquals("a rejected submission must not leak an active-merge slot", 0, scheduler.getActiveMergeCount());
+        verify(mergeHandler).onMergeFailure(any(OneMerge.class));
+    }
+
+    /**
+     * Installs a recorder on {@code unregisterMerges} and returns the (initially empty) list it appends
+     * to, so a test can assert exactly which un-run merges were handed back.
+     */
+    private static List<OneMerge> recordUnregistered(MergeHandler mergeHandler) {
+        List<OneMerge> unregistered = new ArrayList<>();
+        doAnswer(invocation -> {
+            unregistered.addAll(invocation.<Collection<OneMerge>>getArgument(0));
+            return null;
+        }).when(mergeHandler).unregisterMerges(any());
+        return unregistered;
     }
 }

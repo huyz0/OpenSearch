@@ -126,10 +126,7 @@ public class DescriptorLifecycleIT extends org.opensearch.serverless.storage.Ser
 
         // 7. Awake again, on the next read, with no republication because there is nothing to republish.
         suspensions.reactivate(UUID, 1);
-        assertNotNull(
-            "waking must take effect on the next resolution",
-            stateWithoutIt.getIndexRoutingTable(INDEX).shard(1)
-        );
+        assertNotNull("waking must take effect on the next resolution", stateWithoutIt.getIndexRoutingTable(INDEX).shard(1));
 
         // 8. Deleted as a tombstone. H4b: absence cannot be told apart from not having looked, so a node
         // rejoining after a partition would otherwise adopt its dangling shard data.

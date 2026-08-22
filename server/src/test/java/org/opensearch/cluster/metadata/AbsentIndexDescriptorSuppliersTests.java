@@ -15,6 +15,9 @@ import org.junit.After;
 
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+
+import static org.hamcrest.Matchers.instanceOf;
 
 /**
  * H2e. The seam that lets resolution answer for an index cluster state does not hold.
@@ -37,6 +40,64 @@ public class AbsentIndexDescriptorSuppliersTests extends OpenSearchTestCase {
     @After
     public void clearSupplier() {
         AbsentIndexDescriptorSuppliers.register(null);
+        AbsentIndexDescriptorSuppliers.registerCached(null);
+    }
+
+    /**
+     * Refusing to block an event-loop thread must not be reported as absence.
+     *
+     * <p>The guard exists so a cold descriptor cannot stall a network thread shared by every connection
+     * multiplexed onto it. But {@code null} is this seam's word for "does not exist", so answering it on
+     * a cold read would tell a client that a perfectly live index is missing -- and invite it to create
+     * one over the top. {@link DescriptorUnavailableException} is the type that distinguishes the two,
+     * and it reports as SERVICE_UNAVAILABLE, so the client retries instead.
+     */
+    public void testAColdDescriptorOnAnEventLoopThreadIsUnavailableRatherThanAbsent() throws Exception {
+        AtomicInteger blockingSupplierCalls = new AtomicInteger();
+        AbsentIndexDescriptorSuppliers.register(name -> {
+            blockingSupplierCalls.incrementAndGet();
+            return descriptor(name, IndexDescriptor.State.OPEN);
+        });
+        AbsentIndexDescriptorSuppliers.registerCached(name -> null); // nothing warm
+
+        AtomicReference<Throwable> thrown = new AtomicReference<>();
+        Thread eventLoop = new Thread(() -> {
+            try {
+                AbsentIndexDescriptorSuppliers.supply("cold-index");
+            } catch (Throwable t) {
+                thrown.set(t);
+            }
+        }, "opensearch[node][http_server_worker][T#1]");
+        eventLoop.start();
+        eventLoop.join();
+
+        assertThat(
+            "a cold descriptor on an event loop must report unavailability, never absence",
+            thrown.get(),
+            instanceOf(DescriptorUnavailableException.class)
+        );
+        assertEquals("the blocking supplier must not be consulted from an event-loop thread", 0, blockingSupplierCalls.get());
+    }
+
+    /** A warm descriptor still answers on an event-loop thread, because serving it costs no I/O. */
+    public void testAWarmDescriptorStillAnswersOnAnEventLoopThread() throws Exception {
+        AbsentIndexDescriptorSuppliers.register(name -> { throw new AssertionError("the blocking supplier must not be reached"); });
+        AbsentIndexDescriptorSuppliers.registerCached(name -> descriptor(name, IndexDescriptor.State.OPEN));
+
+        AtomicReference<IndexDescriptor> resolved = new AtomicReference<>();
+        AtomicReference<Throwable> thrown = new AtomicReference<>();
+        Thread eventLoop = new Thread(() -> {
+            try {
+                resolved.set(AbsentIndexDescriptorSuppliers.supply("warm-index"));
+            } catch (Throwable t) {
+                thrown.set(t);
+            }
+        }, "opensearch[node][transport_worker][T#2]");
+        eventLoop.start();
+        eventLoop.join();
+
+        assertNull("a warm read must not throw", thrown.get());
+        assertNotNull("a warm descriptor must still resolve on an event-loop thread", resolved.get());
     }
 
     /** With nothing installed, behaviour is exactly what it was: metadata decides, and nothing else. */

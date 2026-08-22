@@ -150,14 +150,150 @@ public class ComputedPlacementMembershipServiceTests extends OpenSearchTestCase 
         assertEquals("a membership that already contains every node must not be rewritten", 0, updates.get());
     }
 
+    /**
+     * <b>The incident this gate exists for.</b> Decommission used to be counted purely in applied cluster
+     * states, and a node leaving is itself the thing that produces a burst of them: node-left, the shard
+     * failures behind it, the reroutes those trigger, plus whatever this plugin publishes on top. Ten
+     * observations therefore elapsed inside an ordinary restart, and the node came back to find its shards
+     * re-placed onto nodes holding none of its data -- which recover empty while looking healthy. So the
+     * observations may all be spent and the member must still survive until real time has passed.
+     */
+    public void testABurstOfEventsInsideARestartDoesNotDecommission() {
+        AtomicInteger updates = new AtomicInteger();
+        ClusterState state = stateWithMembershipFor(List.of("node-1", "node-2", "restarting"));
+        ClusterService clusterService = clusterService(state, Lifecycle.State.STARTED, updates);
+        java.util.concurrent.atomic.AtomicLong now = new java.util.concurrent.atomic.AtomicLong(0L);
+        ComputedPlacementMembershipService service = new ComputedPlacementMembershipService(
+            clusterService,
+            java.util.concurrent.TimeUnit.MINUTES.toMillis(15),
+            now::get
+        );
+        AbsentIndexRoutingSuppliers.register((s, metadata) -> null);
+
+        // Thirty cluster state events, all inside the first twenty seconds -- an entirely ordinary restart.
+        List<String> decommissioned = List.of();
+        for (int event = 0; event < 30; event++) {
+            now.addAndGet(700L);
+            service.clusterChanged(new ClusterChangedEvent("test", state, state));
+            decommissioned = service.decommissionableForTesting(state);
+        }
+
+        assertEquals(
+            "an absent member must not be decommissioned by cluster-state churn alone: the departure "
+                + "itself is what generates the churn",
+            List.of(),
+            decommissioned
+        );
+    }
+
+    /** And once the node really has been gone for the configured time, it is decommissioned. */
+    public void testASustainedAbsenceInRealTimeDecommissions() {
+        AtomicInteger updates = new AtomicInteger();
+        ClusterState state = stateWithMembershipFor(List.of("node-1", "node-2", "departed"));
+        ClusterService clusterService = clusterService(state, Lifecycle.State.STARTED, updates);
+        java.util.concurrent.atomic.AtomicLong now = new java.util.concurrent.atomic.AtomicLong(0L);
+        ComputedPlacementMembershipService service = new ComputedPlacementMembershipService(
+            clusterService,
+            java.util.concurrent.TimeUnit.MINUTES.toMillis(15),
+            now::get
+        );
+        AbsentIndexRoutingSuppliers.register((s, metadata) -> null);
+
+        List<String> decommissioned = List.of();
+        for (int event = 0; event < 30; event++) {
+            now.addAndGet(java.util.concurrent.TimeUnit.MINUTES.toMillis(1));
+            service.clusterChanged(new ClusterChangedEvent("test", state, state));
+            decommissioned = service.decommissionableForTesting(state);
+        }
+
+        assertEquals(
+            "a member absent across both a run of observations and a real stretch of time is gone",
+            List.of("departed"),
+            decommissioned
+        );
+    }
+
+    /**
+     * <b>The second half of the same incident.</b> The decommission list is captured when the task is
+     * submitted and applied when the task runs, and a queued task can wait behind exactly the burst of work
+     * a returning node produces. Applied unconditionally, it removed a node that was present again in the
+     * very state being transformed and then re-added it from the live node list -- bouncing every shard it
+     * owned through two epochs for nothing.
+     */
+    public void testANodeThatCameBackWhileTheTaskWasQueuedIsNotRemoved() throws Exception {
+        AtomicInteger updates = new AtomicInteger();
+        java.util.List<ClusterStateUpdateTask> submitted = new java.util.ArrayList<>();
+        ClusterState absentState = stateWithMembershipFor(List.of("node-1", "node-2", "restarting"));
+        ClusterService clusterService = clusterService(absentState, Lifecycle.State.STARTED, updates, submitted);
+        java.util.concurrent.atomic.AtomicLong now = new java.util.concurrent.atomic.AtomicLong(0L);
+        ComputedPlacementMembershipService service = new ComputedPlacementMembershipService(clusterService, 0L, now::get);
+        AbsentIndexRoutingSuppliers.register((s, metadata) -> null);
+        submitted.clear();
+
+        for (int event = 0; event < ComputedPlacementMembershipService.ABSENT_OBSERVATIONS_BEFORE_DECOMMISSION; event++) {
+            service.clusterChanged(new ClusterChangedEvent("test", absentState, absentState));
+        }
+        assertFalse("the premise: a decommission was submitted", submitted.isEmpty());
+
+        // The node rejoins before the queued task actually executes, which is what a restart finishing
+        // looks like from here.
+        List<String> allThree = List.of("node-1", "node-2", "restarting");
+        ClusterState rejoined = stateWithMembershipFor(allThree, allThree);
+        ClusterState result = submitted.get(submitted.size() - 1).execute(rejoined);
+
+        assertTrue(
+            "a member present in the state being updated must keep its membership, not be removed and " + "immediately re-added",
+            ComputedPlacementMembershipService.get(result).contains("restarting")
+        );
+        assertSame("and with nothing left to change, the state must be returned untouched", rejoined, result);
+    }
+
     // ---------------------------------------------------------------- helpers
 
+    /** A state whose live nodes are node-1 and node-2, with a membership naming whatever is passed. */
+    private static ClusterState stateWithMembershipFor(List<String> members) {
+        return stateWithMembershipFor(members, List.of("node-1", "node-2"));
+    }
+
+    private static ClusterState stateWithMembershipFor(List<String> members, List<String> liveNodeIds) {
+        DiscoveryNodes.Builder nodes = DiscoveryNodes.builder();
+        for (String nodeId : liveNodeIds) {
+            nodes.add(dataNode(nodeId));
+        }
+        nodes.localNodeId(liveNodeIds.get(0)).clusterManagerNodeId(liveNodeIds.get(0));
+        ClusterState state = ClusterState.builder(ClusterName.DEFAULT).nodes(nodes.build()).build();
+        return ClusterState.builder(state)
+            .metadata(
+                Metadata.builder(state.metadata()).putCustom(ComputedPlacementMembership.TYPE, ComputedPlacementMembership.of(members, 1L))
+            )
+            .build();
+    }
+
     private static ClusterService clusterService(ClusterState state, Lifecycle.State lifecycle, AtomicInteger updates) {
+        return clusterService(state, lifecycle, updates, null);
+    }
+
+    /**
+     * @param submitted when non-null, receives each submitted update task so a test can run it against a
+     *                  state of its own choosing -- which is how the "the node came back while the task was
+     *                  queued" case is reachable at all.
+     */
+    private static ClusterService clusterService(
+        ClusterState state,
+        Lifecycle.State lifecycle,
+        AtomicInteger updates,
+        java.util.List<ClusterStateUpdateTask> submitted
+    ) {
         ClusterService clusterService = mock(ClusterService.class);
         when(clusterService.state()).thenReturn(state);
         when(clusterService.lifecycleState()).thenReturn(lifecycle);
+        // The service reads its decommission delay from node settings, so a mock has to have some.
+        when(clusterService.getSettings()).thenReturn(org.opensearch.common.settings.Settings.EMPTY);
         doAnswer(invocation -> {
             updates.incrementAndGet();
+            if (submitted != null) {
+                submitted.add(invocation.getArgument(1));
+            }
             return null;
         }).when(clusterService).submitStateUpdateTask(anyString(), any(ClusterStateUpdateTask.class));
         return clusterService;

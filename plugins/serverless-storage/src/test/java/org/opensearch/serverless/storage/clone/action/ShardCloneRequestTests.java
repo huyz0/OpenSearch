@@ -85,4 +85,26 @@ public class ShardCloneRequestTests extends OpenSearchTestCase {
         assertEquals(original.targetIndexUuid(), deserialized.targetIndexUuid());
         assertEquals(original.targetShardId(), deserialized.targetShardId());
     }
+
+    /**
+     * The indexUuid becomes a blob-path segment ({@code BlobPath.cleanPath().add(indexUuid)}) that
+     * the underlying store resolves without normalising, so a {@code ..} or {@code /} in it used to
+     * be a path the caller chose rather than a shard the caller owns. The authoritative control is
+     * the transport action's cluster-metadata resolution; this boundary check is the cheap half
+     * that refuses the obviously hostile shapes outright.
+     */
+    public void testValidateRejectsATraversalShapedIndexUuidOnEitherSide() {
+        ActionRequestValidationException source = new ShardCloneRequest("../../../etc", 0, "target-idx", 0).validate();
+        assertNotNull(source);
+        assertTrue(source.getMessage(), source.getMessage().contains("source indexUuid must contain only"));
+
+        ActionRequestValidationException target = new ShardCloneRequest("source-idx", 0, "../../../etc", 0).validate();
+        assertNotNull(target);
+        assertTrue(target.getMessage(), target.getMessage().contains("target indexUuid must contain only"));
+    }
+
+    /** Every character a real generated uuid can carry must still be accepted. */
+    public void testValidateAcceptsTheFullRealIndexUuidAlphabet() {
+        assertNull(new ShardCloneRequest("Ab0-_zZ9", 0, "zZ9-_0bA", 0).validate());
+    }
 }

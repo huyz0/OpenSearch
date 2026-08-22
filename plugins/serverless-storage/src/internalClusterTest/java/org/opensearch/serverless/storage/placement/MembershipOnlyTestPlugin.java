@@ -50,6 +50,25 @@ public class MembershipOnlyTestPlugin extends Plugin {
         );
     }
 
+    /**
+     * The gateway half, mirroring {@code ServerlessStoragePlugin#getNamedXContent()}.
+     *
+     * <p>Without it this plugin reproduces the bug rather than the feature: the custom declares {@code
+     * API_AND_GATEWAY}, gateway persistence round-trips through XContent, and a custom with no parser is
+     * logged and skipped on read, so every full-cluster restart in a suite using this plugin would come
+     * back with no membership at all.
+     */
+    @Override
+    public List<NamedXContentRegistry.Entry> getNamedXContent() {
+        return List.of(
+            new NamedXContentRegistry.Entry(
+                Metadata.Custom.class,
+                new org.opensearch.core.ParseField(ComputedPlacementMembership.TYPE),
+                ComputedPlacementMembership::fromXContent
+            )
+        );
+    }
+
     @Override
     public Collection<Object> createComponents(
         Client client,

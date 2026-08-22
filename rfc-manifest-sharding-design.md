@@ -1,7 +1,17 @@
 # C2: how the cluster metadata manifest gets sharded
 
 Design output for Phase C of `rfc-scalable-index-metadata-tasks.md`. C3 through C6 implement what this
-decides. Nothing here is written yet.
+decides.
+
+> **Status (2026-08-22): shipped, default-off.** This is no longer a forward-looking design — the write
+> path, read path, codec and cleanup described below are implemented (`IndexMetadataManifestSharder`,
+> `ManifestShardFunction`, `UploadedManifestShard`, `RemoteManifestShard`, and the sharded branches of
+> `RemoteManifestManager` / `RemoteClusterStateService` / `RemoteClusterStateCleanupManager`), with
+> `ManifestShardingIT` covering live-data safety. Two things below differ from what shipped and are
+> corrected in place: the **shard-count default is 0 (sharding off)**, not 256 — 256 remains the
+> recommended value once an operator turns it on; and the measured win is **4.9x at N=1,000**, the only
+> scale actually re-measured on the shipped code. The 125x figure is a projection from the original
+> spike, not a validated result. Treat the rest of this document as the design record it is.
 
 ## Why this exists, restated from the measurements
 
@@ -44,9 +54,12 @@ rewrite the entire manifest repeatedly, which is precisely the cost sharding exi
 
 So:
 
-- `cluster.remote_store.state.manifest.shard_count`, node-scoped, default **256**. (Was 64 in the
-  first version of this design; C3a measured 64 saturating at 100 changed indices and turning into a
-  9.5% *loss*. See `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.md`.)
+- `cluster.remote_store.state.manifest.shard_count`, node-scoped, **shipped default 0 (sharding off)**;
+  **256 is the recommended value when an operator enables it**. (This design originally specified 256 as
+  the default and 64 before that; C3a measured 64 saturating at 100 changed indices and turning into a
+  9.5% *loss*. See `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.md`. Shipping off-by-default was chosen
+  because enabling sharding moves the repository to a codec stock OpenSearch cannot read — see
+  "Codec (C5)" below — so it must be an explicit operator decision, not a silent upgrade.)
 - The count in force is written into the top-level manifest. Readers use the value they find there,
   not the value they are configured with.
 - Changing it is an explicit operator action that costs one full rewrite, and takes effect on the next

@@ -47,7 +47,9 @@ public class CompositeMerger implements Merger {
     public CompositeMerger(CompositeIndexingExecutionEngine engine, CompositeDataFormat compositeDataFormat) {
         this.primaryFormat = compositeDataFormat.getPrimaryDataFormat();
         this.secondaryFormats = resolveSecondaryFormats(compositeDataFormat, primaryFormat);
-        this.executor = new CompositeMergeExecutor(buildMergerMap(engine));
+        // Cleanup on merge failure goes back through the engine's deleteFiles(), so each format's
+        // DataFormatStoreHandler sees the deletion instead of files vanishing under it.
+        this.executor = new CompositeMergeExecutor(buildMergerMap(engine), engine::deleteFiles);
         this.statsTracker = engine.statsTracker();
     }
 

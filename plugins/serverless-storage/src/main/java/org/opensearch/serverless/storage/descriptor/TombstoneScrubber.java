@@ -88,27 +88,30 @@ public final class TombstoneScrubber {
         }
 
         int reclaimed = 0;
-        List<String> toDeleteBatch = new ArrayList<>();
         for (String name : candidates) {
             try {
-                if (reclaimable(tombstones, name, cutoff)) {
-                    toDeleteBatch.add(name);
-                    if (toDeleteBatch.size() >= 100) {
-                        tombstones.deleteBlobsIgnoringIfNotExists(toDeleteBatch);
-                        reclaimed += toDeleteBatch.size();
-                        toDeleteBatch.clear();
-                    }
+                if (reclaimable(tombstones, name, cutoff) == false) {
+                    continue;
                 }
+                // Deleted here, immediately, rather than added to a batch.
+                //
+                // The batch is what made the freshness check below a fiction. It held up to a hundred names
+                // and flushed on the hundredth, so a name checked first was deleted up to ninety-nine blob
+                // reads after its age was read -- and the check exists precisely to catch a name that was
+                // deleted, recreated and deleted again in that gap, whose tombstone is now young and whose
+                // deletion is the one still inside its window. A check whose answer is acted on a hundred
+                // round trips later is not "immediately before the delete", which is what this method's own
+                // javadoc promised and what the promise is worth.
+                //
+                // The cost is one delete request per reclaimed tombstone instead of one per hundred. That is
+                // affordable because of what this pass reclaims: only tombstones already older than the
+                // retention window, which in a steady state is a trickle rather than the population. A store
+                // that can expire objects by age on its own should be doing this with a lifecycle rule and
+                // paying nothing at all, which the class javadoc already says.
+                tombstones.deleteBlobsIgnoringIfNotExists(List.of(name));
+                reclaimed++;
             } catch (IOException | RuntimeException e) {
                 logger.debug("could not reclaim tombstone [{}]; leaving it for a later pass: {}", name, e);
-            }
-        }
-        if (toDeleteBatch.isEmpty() == false) {
-            try {
-                tombstones.deleteBlobsIgnoringIfNotExists(toDeleteBatch);
-                reclaimed += toDeleteBatch.size();
-            } catch (IOException | RuntimeException e) {
-                logger.debug("could not reclaim remaining tombstone batch; leaving for a later pass", e);
             }
         }
         if (reclaimed > 0) {
@@ -126,6 +129,10 @@ public final class TombstoneScrubber {
      * a conditional delete the blob store does not offer. Losing it costs a tombstone reclaimed early for an
      * index deleted twice within that gap, whose consequence is stale shard data left on one node rather than
      * an index returning, because absence alone already prevents the shard being opened.
+     *
+     * <p>"Immediately" is load-bearing and was not true for a while: the caller batched a hundred names and
+     * deleted them together, so the first name's check preceded its own deletion by ninety-nine blob reads.
+     * The delete now follows this read directly.
      */
     private boolean reclaimable(BlobContainer tombstones, String name, long cutoff) throws IOException {
         Optional<BlobRegister> register = tombstones.readRegister(name);

@@ -1643,6 +1643,20 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         Setting.Property.NodeScope
     );
 
+    /**
+     * How long a member node must be continuously absent before computed-placement membership will
+     * decommission it -- see {@code ComputedPlacementMembershipService}, which aliases this and applies it
+     * alongside its observation count. Declared here for the same reason
+     * {@link #GATED_SHARD_SWEEP_INTERVAL_SETTING} is: a setting this plugin does not both declare here and
+     * register in {@link #getSettings()} is one an operator can never configure.
+     */
+    public static final Setting<TimeValue> PLACEMENT_DECOMMISSION_ABSENCE_SETTING = Setting.timeSetting(
+        "serverless_storage.placement.decommission_after_absence",
+        TimeValue.timeValueMinutes(15),
+        TimeValue.ZERO,
+        Setting.Property.NodeScope
+    );
+
     public static final Setting<TimeValue> DESCRIPTOR_CHANGE_LOG_RETENTION_SETTING = Setting.timeSetting(
         "serverless_storage.descriptor.change_log_retention",
         TimeValue.timeValueHours(1),
@@ -1680,6 +1694,9 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
             TOMBSTONE_RETENTION_SETTING,
             TOMBSTONE_SCRUB_INTERVAL_SETTING,
             COMPUTED_PLACEMENT_ENABLED_SETTING,
+            // How long a placement member must be gone before it is decommissioned -- see the setting's
+            // own javadoc for why an observation count alone was not a delay at all.
+            PLACEMENT_DECOMMISSION_ABSENCE_SETTING,
             SERVERLESS_STORAGE_ENABLED_SETTING,
             SERVERLESS_STORAGE_BASE_PATH_SETTING,
             SERVERLESS_STORAGE_ENCRYPTION_KEY_SETTING,
@@ -1851,9 +1868,7 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
         // checks election. It stays inert until a placement supplier is installed, so a cluster running
         // this plugin with the feature off never acquires the metadata.
         if (org.opensearch.cluster.node.DiscoveryNode.isClusterManagerNode(environment.settings())) {
-            clusterService.addListener(
-                new org.opensearch.serverless.storage.placement.ComputedPlacementMembershipService(clusterService)
-            );
+            clusterService.addListener(new org.opensearch.serverless.storage.placement.ComputedPlacementMembershipService(clusterService));
         }
         serverlessStorageIndexSettingProvider.setDependencies(dataStreamShardCountAdvisorCache);
         serverlessStorageExistingShardsAllocator.setDependencies(
@@ -3006,8 +3021,17 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
      * custom, relocated here from core's {@code ClusterModule} registration when the class itself moved
      * into this plugin. The wire name ({@code computed_placement_membership}) is byte-identical to what
      * core registered, so a rolling restart across the relocation reads its own persisted membership
-     * back. NamedWriteable-only, deliberately: this custom never had a NamedXContent parser in core
-     * either, and registering one here would be a behavior change rather than a move.
+     * back.
+     *
+     * <p><b>This used to be NamedWriteable-only, on the reasoning that the custom "never had a
+     * NamedXContent parser in core either, and registering one here would be a behavior change rather than
+     * a move."</b> The move was faithful and the original was broken. {@link
+     * org.opensearch.serverless.storage.placement.ComputedPlacementMembership#context()} declares {@code
+     * API_AND_GATEWAY}, but gateway persistence round-trips through XContent, and {@code
+     * Metadata.Builder.fromXContent} silently skips a custom with no registered parser. So the membership
+     * was written to disk and never read back: every full-cluster restart began with an empty membership
+     * and placement fell through to the live node list during the join window. {@link
+     * #getNamedXContent()} below is the missing half.
      */
     @Override
     public List<NamedWriteableRegistry.Entry> getNamedWriteables() {
@@ -3021,6 +3045,27 @@ public class ServerlessStoragePlugin extends Plugin implements EnginePlugin, Clu
                 NamedDiff.class,
                 org.opensearch.serverless.storage.placement.ComputedPlacementMembership.TYPE,
                 org.opensearch.serverless.storage.placement.ComputedPlacementMembership::readDiffFrom
+            )
+        );
+    }
+
+    /**
+     * The gateway half of the {@link org.opensearch.serverless.storage.placement.ComputedPlacementMembership}
+     * registration above.
+     *
+     * <p>Without this entry the custom is written to the gateway on every publication and dropped on every
+     * read, because {@code Metadata.Builder.fromXContent} logs and skips a custom it has no parser for
+     * rather than failing a node's startup over a plugin that might legitimately be gone. That silence is
+     * why the gap survived: nothing errors, the cluster comes up, and placement simply computes against
+     * whichever nodes happen to have joined so far.
+     */
+    @Override
+    public List<NamedXContentRegistry.Entry> getNamedXContent() {
+        return List.of(
+            new NamedXContentRegistry.Entry(
+                Metadata.Custom.class,
+                new org.opensearch.core.ParseField(org.opensearch.serverless.storage.placement.ComputedPlacementMembership.TYPE),
+                org.opensearch.serverless.storage.placement.ComputedPlacementMembership::fromXContent
             )
         );
     }

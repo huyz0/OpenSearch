@@ -10,6 +10,8 @@ package org.opensearch.cluster.routing;
 
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.node.DiscoveryNodes;
 
 import java.util.List;
 import java.util.Set;
@@ -108,6 +110,21 @@ public final class AbsentIndexRoutingSuppliers {
      * cached view placement reads on every request.
      */
     private static final AtomicReference<Function<String, Set<Integer>>> SUSPENDED_SHARDS = new AtomicReference<>();
+
+    /**
+     * Which shards of an index have only their <em>reader</em> copies asleep, by index uuid.
+     *
+     * <p>Separate from {@link #SUSPENDED_SHARDS} because the two mean different things and merging them
+     * broke shards. A shard in {@link #SUSPENDED_SHARDS} is not placed at all; a shard here keeps its
+     * writer copy and loses only its search-only copies. Scale-to-zero suspends the two roles on
+     * unrelated schedules, so a reader that had been idle long enough to sleep was, with one role-blind
+     * set, unplacing the writer of an index being actively written to -- an outage produced by an
+     * optimisation, on an index nobody had stopped using.
+     *
+     * <p>Unset by default, so a registry that only knows about whole-shard suspension behaves exactly as
+     * it did before this existed.
+     */
+    private static final AtomicReference<Function<String, Set<Integer>>> SUSPENDED_READER_SHARDS = new AtomicReference<>();
 
     private AbsentIndexRoutingSuppliers() {}
 
@@ -242,24 +259,63 @@ public final class AbsentIndexRoutingSuppliers {
 
             String uuid = indexMetadata.getIndexUUID();
             Set<Integer> suspended = suspendedShards(uuid);
+            Set<Integer> suspendedReaders = suspendedReaderShards(uuid);
+            Metadata metadata = state == null ? null : state.metadata();
+            DiscoveryNodes nodes = state == null ? null : state.nodes();
             Memo memo = MEMOS.get(uuid);
-            // Identity on the metadata, equality on the suspension set, and the asymmetry is deliberate.
+            // Identity on the metadata, equality on the suspension sets, and the asymmetry is deliberate.
             //
             // IndexMetadata is immutable, large, and replaced on every cluster state change that touches
             // the index, so identity is exactly the invalidation signal and costs one reference compare.
             //
-            // The suspension set is small and its source is a registered function this class does not
+            // The suspension sets are small and their source is a registered function this class does not
             // control. Identity there looked equivalent and was not: a source that builds a fresh set per
             // call, which the obvious lambda does, makes the memo miss every time. That is not a slow memo,
             // it is a negative one, because every resolution then pays the rebuild plus a map write. It
             // measured 159,499 ns against 8,728 ns without the memo at all. Equality on a set of a few
             // shard ids costs almost nothing and cannot be defeated by how a caller allocates.
-            if (memo != null && memo.metadata == indexMetadata && memo.suspended.equals(suspended)) {
+            //
+            // The state's own metadata and node list are part of the key, and leaving them out was a bug
+            // that no amount of local reasoning about this class would have found. A computed placement is
+            // a function of more than the index: the plugin that computes it reads the cluster's member
+            // list, which lives in a Metadata.Custom, and falls back to the live DiscoveryNodes while no
+            // member list is published. Neither of those touches the index's own IndexMetadata -- and a
+            // gated index's synthesised metadata is deliberately identity-cached, so it does not change at
+            // all -- so a node that joined, or one that was decommissioned, left every memo on this node
+            // answering from the member list of an earlier epoch, indefinitely. Two nodes then computed
+            // different placement for the same shard from the same published state, which is precisely the
+            // split view computed placement exists to make impossible: a coordinator derives one allocation
+            // id, the data node derives another, and the write fails with "expected allocation id [x] but
+            // found [y]".
+            //
+            // Keyed by identity rather than by version or epoch on purpose. An epoch has to be published by
+            // whoever changes it and read by whoever caches it, and a missed publication is a memo that is
+            // silently stale; two reference compares against the very state the answer was computed from
+            // cannot be missed, because there is nothing to remember to do. It costs one recomputation per
+            // index per metadata or node-list change, which is once per cluster state that changes either,
+            // not once per request.
+            if (memo != null
+                && memo.indexMetadata == indexMetadata
+                && memo.computedFrom(metadata, nodes)
+                && memo.suspended.equals(suspended)
+                && memo.suspendedReaders.equals(suspendedReaders)) {
                 return memo.result;
             }
 
             IndexRoutingTable result = withoutSuspendedShards(supplier.apply(state, indexMetadata));
-            MEMOS.put(uuid, new Memo(indexMetadata, suspended, result));
+            MEMOS.put(
+                uuid,
+                new Memo(
+                    new java.lang.ref.WeakReference<>(metadata),
+                    new java.lang.ref.WeakReference<>(nodes),
+                    indexMetadata,
+                    suspended,
+                    suspendedReaders,
+                    result,
+                    MEMO_CLOCK.incrementAndGet()
+                )
+            );
+            evictIfOverCapacity();
             return result;
         } catch (Exception e) {
             return null;
@@ -274,18 +330,82 @@ public final class AbsentIndexRoutingSuppliers {
      * with one cold shard cost about nine microseconds per request, linear in shard count, on a path taken
      * once per index per request.
      *
-     * <p>Bounded by the number of computed indices this node resolves, which is the same bound the routing
-     * table itself has, so this cannot grow past what the node already holds. Entries are replaced rather
-     * than accumulated: the key is the index uuid and each new cluster state for that index overwrites it.
+     * <p><b>Bounded by capacity, and the claim it used to make instead was the unbounded quantity itself.</b>
+     * This javadoc said the map was "bounded by the number of computed indices this node resolves, which is
+     * the same bound the routing table itself has". For a published routing table that is a real bound; here
+     * it is not one at all. A computed index has no routing entry to hold it, and the whole reason this area
+     * exists is that a node resolves indices it does not hold -- a coordinator that touches a million
+     * distinct gated indices over a week had a million synthesised {@link IndexMetadata} instances and a
+     * million routing tables pinned here, none of which anything ever removed. Entries being replaced per
+     * uuid bounds how often one index appears, not how many indices do.
      *
-     * <p>A {@code ConcurrentHashMap} with no access ordering, deliberately. Measurement put an access-ordered
-     * synchronized map on this same path at 9M reads per second across sixteen threads against 1,084M for a
-     * concurrent one, because access ordering makes a read mutate shared structure. Repeating that here
-     * would give back more than the memo saves.
+     * <p>Eviction costs a recomputation of one index's placement and nothing else: the entry is a memo, not
+     * a record, so an evicted one is rebuilt from inputs that are still there. That is what makes bounding
+     * it free of the argument {@code GatedShardSuspensionRegistry} has to make about evicting a suspension.
+     *
+     * <p><b>Bounded without an access-ordered cache, deliberately, and {@link org.opensearch.common.cache.Cache}
+     * is the tempting wrong answer.</b> That one is an LRU: every {@code get} promotes the entry under a
+     * single lock, and this map is read on every computed routing resolution -- every search and every
+     * write. Measurement on this exact shape put an access-ordered structure at 9M reads per second across
+     * sixteen threads against 1,084M for a concurrent map, throughput going backwards with concurrency,
+     * which is a lock convoy. So recency is stamped on write and never reordered on read, and a sweep drops
+     * the stalest tenth when the map goes over capacity -- the identical shape, and for the identical
+     * reason, that {@code GatedShardSuspensionRegistry} and {@code DescriptorCache} already use.
      */
+    private static final int MEMO_CAPACITY = 50_000;
+
     private static final java.util.concurrent.ConcurrentHashMap<String, Memo> MEMOS = new java.util.concurrent.ConcurrentHashMap<>();
 
-    private record Memo(IndexMetadata metadata, Set<Integer> suspended, IndexRoutingTable result) {
+    /** Stamps memos in write order, so eviction can find the stalest without a read ever mutating anything. */
+    private static final java.util.concurrent.atomic.AtomicLong MEMO_CLOCK = new java.util.concurrent.atomic.AtomicLong();
+
+    /**
+     * Drops the stalest entries once the map is over capacity.
+     *
+     * <p>A batch rather than one at a time, because finding the stalest costs a scan and doing that on every
+     * write past the bound would cost more than the memo saves. Amortised, the scan runs once per ten
+     * percent of capacity written. Writes here are already rare relative to reads: one per index per change
+     * to that index's inputs, not one per request.
+     */
+    private static void evictIfOverCapacity() {
+        if (MEMOS.size() <= MEMO_CAPACITY) {
+            return;
+        }
+        int toEvict = Math.max(1, MEMO_CAPACITY / 10);
+        long[] stamps = MEMOS.values().stream().mapToLong(Memo::stamp).sorted().toArray();
+        if (stamps.length == 0) {
+            return;
+        }
+        long threshold = stamps[Math.min(toEvict, stamps.length - 1)];
+        MEMOS.entrySet().removeIf(entry -> entry.getValue().stamp() < threshold);
+    }
+
+    /** How many indices this node currently holds a memoised placement for, which is what the capacity bounds. */
+    public static int memoisedIndexCountForTesting() {
+        return MEMOS.size();
+    }
+
+    /**
+     * One memoised placement, together with every input it was computed from.
+     *
+     * <p>{@code metadata} and {@code nodes} are the cluster-state inputs a computed placement may read
+     * beside the index itself -- see {@link #supply(ClusterState, IndexMetadata)} for why they are in the
+     * key.
+     *
+     * <p><b>Weakly, and that is not caution about a hypothetical.</b> A memo is replaced when its index is
+     * resolved again, so an index resolved once and then never again keeps whatever it was computed from
+     * until it is evicted. Held strongly, a few thousand such entries would pin a few thousand distinct
+     * {@code Metadata} generations, and at the index counts this area exists for one of those is the
+     * largest object in the process. Weak references make a stale memo cost a recomputation instead: the
+     * identity compare below simply fails once the generation it was computed from is gone, which is
+     * exactly what should happen to a memo whose inputs no longer exist. The compare cannot spuriously fail
+     * for a memo that is still current, because the caller is holding the very instance being compared.
+     */
+    private record Memo(java.lang.ref.WeakReference<Metadata> metadata, java.lang.ref.WeakReference<DiscoveryNodes> nodes,
+        IndexMetadata indexMetadata, Set<Integer> suspended, Set<Integer> suspendedReaders, IndexRoutingTable result, long stamp) {
+        boolean computedFrom(Metadata currentMetadata, DiscoveryNodes currentNodes) {
+            return metadata.get() == currentMetadata && nodes.get() == currentNodes;
+        }
     }
 
     /** Drops every memoised placement, which a test must do because this registry is static. */
@@ -308,9 +428,34 @@ public final class AbsentIndexRoutingSuppliers {
         org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.clearSynthesised();
     }
 
+    /**
+     * Installs the source of truth for which shards have only their reader copies asleep. Registering null
+     * clears it, and with nothing registered no shard's readers are suspended, so a caller that only knows
+     * about whole-shard suspension is unaffected.
+     *
+     * <p>See {@link #SUSPENDED_READER_SHARDS} for why this is a second source rather than a flag on the
+     * first one.
+     */
+    public static void registerSuspendedReaderShards(Function<String, Set<Integer>> suspendedReaderShards) {
+        SUSPENDED_READER_SHARDS.set(suspendedReaderShards);
+        MEMOS.clear();
+        org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers.clearSynthesised();
+    }
+
     /** The shards of this index that are asleep, empty when nothing is registered or the source fails. */
     public static Set<Integer> suspendedShards(String indexUuid) {
-        Function<String, Set<Integer>> source = SUSPENDED_SHARDS.get();
+        return read(SUSPENDED_SHARDS.get(), indexUuid);
+    }
+
+    /**
+     * The shards of this index whose reader copies are asleep while the shard itself stays placed, empty
+     * when nothing is registered or the source fails.
+     */
+    public static Set<Integer> suspendedReaderShards(String indexUuid) {
+        return read(SUSPENDED_READER_SHARDS.get(), indexUuid);
+    }
+
+    private static Set<Integer> read(Function<String, Set<Integer>> source, String indexUuid) {
         if (source == null) {
             return Set.of();
         }
@@ -329,26 +474,68 @@ public final class AbsentIndexRoutingSuppliers {
      * The same routing entry with sleeping shards removed, or the entry unchanged when none are.
      *
      * <p>Returns the original instance when nothing is suspended, which is the overwhelmingly common case,
-     * so a cluster that never scales to zero pays one hash lookup and no allocation.
+     * so a cluster that never scales to zero pays two hash lookups and no allocation.
+     *
+     * <p><b>Two kinds of asleep, because collapsing them broke live indices.</b> A shard in the whole-shard
+     * set is dropped entirely: nothing places it, which is what "this shard is asleep" means for an index
+     * whose routing is computed rather than allocated. A shard in the reader set keeps its writer copy and
+     * loses only its search-only copies, because scale-to-zero decides the two roles on unrelated
+     * schedules: a reader idle long enough to sleep says nothing about whether the index is being written,
+     * and treating the two alike unplaced the writer of an actively written index.
      */
     private static IndexRoutingTable withoutSuspendedShards(IndexRoutingTable computed) {
         if (computed == null) {
             return null;
         }
-        Set<Integer> suspended = suspendedShards(computed.getIndex().getUUID());
-        if (suspended.isEmpty()) {
+        String uuid = computed.getIndex().getUUID();
+        Set<Integer> suspended = suspendedShards(uuid);
+        Set<Integer> suspendedReaders = suspendedReaderShards(uuid);
+        if (suspended.isEmpty() && suspendedReaders.isEmpty()) {
             return computed;
         }
         IndexRoutingTable.Builder awake = IndexRoutingTable.builder(computed.getIndex());
-        boolean removedAny = false;
+        boolean changedAny = false;
         for (IndexShardRoutingTable shard : computed) {
             if (suspended.contains(shard.shardId().id())) {
-                removedAny = true;
+                changedAny = true;
                 continue;
+            }
+            if (suspendedReaders.contains(shard.shardId().id())) {
+                IndexShardRoutingTable withoutReaders = withoutSearchOnlyCopies(shard);
+                if (withoutReaders != shard) {
+                    changedAny = true;
+                    // A shard whose every copy was a search-only one is, with those asleep, a shard with
+                    // nothing to place: dropped rather than published as an entry serving nothing.
+                    if (withoutReaders.size() > 0) {
+                        awake.addIndexShard(withoutReaders);
+                    }
+                    continue;
+                }
             }
             awake.addIndexShard(shard);
         }
-        return removedAny ? awake.build() : computed;
+        return changedAny ? awake.build() : computed;
+    }
+
+    /** The same shard entry without its search-only copies, or the same instance when it has none. */
+    private static IndexShardRoutingTable withoutSearchOnlyCopies(IndexShardRoutingTable shard) {
+        boolean hasSearchOnly = false;
+        for (ShardRouting routing : shard) {
+            if (routing.isSearchOnly()) {
+                hasSearchOnly = true;
+                break;
+            }
+        }
+        if (hasSearchOnly == false) {
+            return shard;
+        }
+        IndexShardRoutingTable.Builder awake = new IndexShardRoutingTable.Builder(shard.shardId());
+        for (ShardRouting routing : shard) {
+            if (routing.isSearchOnly() == false) {
+                awake.addShard(routing);
+            }
+        }
+        return awake.build();
     }
 
     /** Whether a supplier is installed. Exposed so callers can skip work they would otherwise discard. */

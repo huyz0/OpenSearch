@@ -66,10 +66,7 @@ public class SecurityDirectorySettingGrantTests extends OpenSearchTestCase {
         Path dir = createTempDir();
         Settings settings = Settings.builder().put(SETTING, dir.toString()).build();
         Permissions policy = runAddFilePermissions(settings, false);
-        assertFalse(
-            "a setting no installed plugin declares must not produce a grant",
-            hasFilePermissionExact(policy, dir.toString())
-        );
+        assertFalse("a setting no installed plugin declares must not produce a grant", hasFilePermissionExact(policy, dir.toString()));
     }
 
     public void testDeclaredDirectorySettingPointsToExistingDirectoryAddsBothGrants() throws Exception {
@@ -123,10 +120,7 @@ public class SecurityDirectorySettingGrantTests extends OpenSearchTestCase {
                 StandardCharsets.UTF_8
             );
         }
-        Settings nodeSettings = Settings.builder()
-            .put(Environment.PATH_HOME_SETTING.getKey(), home.toString())
-            .put(extraSettings)
-            .build();
+        Settings nodeSettings = Settings.builder().put(Environment.PATH_HOME_SETTING.getKey(), home.toString()).put(extraSettings).build();
         Environment environment = new Environment(nodeSettings, null);
         Permissions policy = new Permissions();
         Security.addFilePermissions(policy, environment);

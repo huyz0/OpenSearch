@@ -9,7 +9,13 @@
 opensearchplugin {
   description = 'Parquet data format plugin for OpenSearch.'
   classname = 'org.opensearch.parquet.ParquetDataFormatPlugin'
-  extendedPlugins = ['arrow-base', 'composite-engine']
+  // arrow-base only. This plugin references no composite-engine class (verified: no
+  // org.opensearch.composite import anywhere under src/); the former
+  // extendedPlugins=['composite-engine'] edge existed solely to borrow composite-engine's
+  // bundled plugin-stats-spi jar, which inverted the layering — the data format could not be
+  // installed without the orchestrator that sits above it. plugin-stats-spi is bundled here
+  // directly instead (see dependencies below).
+  extendedPlugins = ['arrow-base']
 }
 
 java { sourceCompatibility = JavaVersion.toVersion(25); targetCompatibility = JavaVersion.toVersion(25) }
@@ -19,94 +25,67 @@ dependencies {
   compileOnly project(':plugins:arrow-base')
   testImplementation project(':plugins:arrow-base')
 
-  // Plugin stats SPI interfaces
-  compileOnly project(":sandbox:libs:plugin-stats-spi")
+  // Plugin stats SPI. Bundled (not compileOnly) so this plugin owns the jar it needs at
+  // runtime instead of borrowing it from composite-engine's classloader. Every use of the
+  // SPI registry is intra-plugin — ParquetStatsProvider registers "parquet" and only
+  // parquet's own REST/transport actions look "parquet" up — so a per-plugin copy of
+  // DataFormatStatsProviderRegistry is self-consistent. Nothing from this package crosses a
+  // plugin-classloader boundary, unlike Arrow below.
+  implementation project(":sandbox:libs:plugin-stats-spi")
 
   // Shared native bridge lib (provides the unified .so and FFM SymbolLookup)
   implementation project(':sandbox:libs:dataformat-native')
 
-  // Apache Arrow dependencies
-  implementation "org.apache.arrow:arrow-vector:${versions.arrow}"
-  implementation "org.apache.arrow:arrow-memory-core:${versions.arrow}"
+  // ── Provided at runtime by the arrow-base parent plugin ────────────────────────────────
+  // arrow-base declares every jar below as an `api` dependency and this plugin declares
+  // extendedPlugins=['arrow-base'], so arrow-base's classloader is this plugin's parent and
+  // supplies exactly one copy of these classes. That single copy is load-bearing: this plugin
+  // hands arrow-base's concrete ArrowNativeAllocator (and the Arrow buffers allocated from it)
+  // across the classloader boundary, which only type-checks when both sides resolve
+  // org.apache.arrow.* to the same Class objects. Bundling a second copy here would also trip
+  // PluginsService.checkBundleJarHell against the extended plugin.
+  compileOnly "org.apache.arrow:arrow-vector:${versions.arrow}"
+  compileOnly "org.apache.arrow:arrow-memory-core:${versions.arrow}"
   // Arrow 18.1's default AllocationManager is Netty. arrow-memory-netty + its buffer-patch
   // provide NettyAllocationManager and PooledByteBufAllocatorL.
-  implementation "org.apache.arrow:arrow-memory-netty:${versions.arrow}"
-  implementation "org.apache.arrow:arrow-memory-netty-buffer-patch:${versions.arrow}"
-  implementation "io.netty:netty-buffer:${versions.netty}"
-  implementation "io.netty:netty-common:${versions.netty}"
-  implementation "org.apache.arrow:arrow-format:${versions.arrow}"
+  compileOnly "org.apache.arrow:arrow-memory-netty:${versions.arrow}"
+  compileOnly "org.apache.arrow:arrow-memory-netty-buffer-patch:${versions.arrow}"
+  compileOnly "io.netty:netty-buffer:${versions.netty}"
+  compileOnly "io.netty:netty-common:${versions.netty}"
+  compileOnly "org.apache.arrow:arrow-format:${versions.arrow}"
+  compileOnly "com.google.flatbuffers:flatbuffers-java:${versions.flatbuffers}"
+  compileOnly "org.slf4j:slf4j-api:${versions.slf4j}"
+
+  // arrow-c-data is NOT shipped by arrow-base, so it must be bundled here. Its
+  // org.apache.arrow.c.* classes are used only inside this plugin (native export/import);
+  // no arrow-c-data type crosses a plugin boundary.
   implementation "org.apache.arrow:arrow-c-data:${versions.arrow}"
 
   // Required by Arrow
   compileOnly 'org.checkerframework:checker-qual:3.43.0'
-  implementation "com.google.flatbuffers:flatbuffers-java:${versions.flatbuffers}"
-  implementation "org.slf4j:slf4j-api:${versions.slf4j}"
-  implementation "org.apache.logging.log4j:log4j-api:${versions.log4j}"
-  implementation "org.apache.logging.log4j:log4j-core:${versions.log4j}"
+
+  // log4j-api/log4j-core are on the server (core) classpath — see server/build.gradle.
+  // Bundling them here would duplicate core codebases; compileOnly matches
+  // analytics-backend-datafusion.
+  compileOnly "org.apache.logging.log4j:log4j-api:${versions.log4j}"
+  compileOnly "org.apache.logging.log4j:log4j-core:${versions.log4j}"
+  // The SLF4J->Log4j2 binding is provided by neither server nor arrow-base, so it stays
+  // bundled; it is the only binding anywhere in this build.
   implementation "org.apache.logging.log4j:log4j-slf4j2-impl:${versions.log4j}"
-  // jackson-core is on the server classpath; jackson-databind and jackson-annotations are not.
+
+  // jackson-core is on the server classpath; jackson-databind and jackson-annotations come
+  // from arrow-base (which declares both as `api` at the identical versions this build pins,
+  // jackson=jackson_databind=2.22.0 and jackson_annotations=2.22).
   compileOnly "com.fasterxml.jackson.core:jackson-core:${versions.jackson}"
-  implementation("com.fasterxml.jackson.core:jackson-databind:${versions.jackson_databind}") {
-    exclude group: 'com.fasterxml.jackson.core', module: 'jackson-core'
-    exclude group: 'com.fasterxml.jackson.core', module: 'jackson-annotations'
-  }
-  implementation "com.fasterxml.jackson.core:jackson-annotations:${versions.jackson_annotations}"
+  compileOnly "com.fasterxml.jackson.core:jackson-databind:${versions.jackson_databind}"
+  compileOnly "com.fasterxml.jackson.core:jackson-annotations:${versions.jackson_annotations}"
 }
 
-tasks.named("dependencyLicenses").configure {
-  mapping from: /jackson-.*/, to: 'jackson'
-  mapping from: /netty-.*/, to: 'netty'
-}
-
-tasks.named('thirdPartyAudit').configure {
-  ignoreMissingClasses(
-    // Optional netty runtime deps (not used by arrow-memory-netty)
-    'org.apache.commons.logging.Log',
-    'org.apache.commons.logging.LogFactory',
-    'org.apache.log4j.Level',
-    'org.apache.log4j.Logger',
-    'reactor.blockhound.BlockHound$Builder',
-    'reactor.blockhound.integration.BlockHoundIntegration'
-  )
-  ignoreViolations(
-    'org.apache.arrow.memory.util.MemoryUtil',
-    'org.apache.arrow.memory.util.MemoryUtil$1',
-    // Netty internals — standard violations for any module bundling netty-buffer
-    'io.netty.buffer.AbstractAllocatorEvent',
-    'io.netty.buffer.AbstractBufferEvent',
-    'io.netty.buffer.AbstractChunkEvent',
-    'io.netty.buffer.AdaptivePoolingAllocator$AdaptiveByteBuf',
-    'io.netty.buffer.AdaptivePoolingAllocator$Chunk',
-    'io.netty.buffer.AllocateBufferEvent',
-    'io.netty.buffer.AllocateChunkEvent',
-    'io.netty.buffer.FreeBufferEvent',
-    'io.netty.buffer.FreeChunkEvent',
-    'io.netty.buffer.PooledByteBufAllocator',
-    'io.netty.buffer.ReallocateBufferEvent',
-    'io.netty.util.internal.PlatformDependent0',
-    'io.netty.util.internal.PlatformDependent0$1',
-    'io.netty.util.internal.PlatformDependent0$2',
-    'io.netty.util.internal.PlatformDependent0$3',
-    'io.netty.util.internal.PlatformDependent0$5',
-    'io.netty.util.internal.shaded.org.jctools.queues.BaseLinkedQueueConsumerNodeRef',
-    'io.netty.util.internal.shaded.org.jctools.queues.BaseLinkedQueueProducerNodeRef',
-    'io.netty.util.internal.shaded.org.jctools.queues.BaseMpscLinkedArrayQueueColdProducerFields',
-    'io.netty.util.internal.shaded.org.jctools.queues.BaseMpscLinkedArrayQueueConsumerFields',
-    'io.netty.util.internal.shaded.org.jctools.queues.BaseMpscLinkedArrayQueueProducerFields',
-    'io.netty.util.internal.shaded.org.jctools.queues.LinkedQueueNode',
-    'io.netty.util.internal.shaded.org.jctools.queues.MpmcArrayQueueConsumerIndexField',
-    'io.netty.util.internal.shaded.org.jctools.queues.MpmcArrayQueueProducerIndexField',
-    'io.netty.util.internal.shaded.org.jctools.queues.MpscArrayQueueConsumerIndexField',
-    'io.netty.util.internal.shaded.org.jctools.queues.MpscArrayQueueProducerIndexField',
-    'io.netty.util.internal.shaded.org.jctools.queues.MpscArrayQueueProducerLimitField',
-    'io.netty.util.internal.shaded.org.jctools.queues.unpadded.MpscUnpaddedArrayQueueConsumerIndexField',
-    'io.netty.util.internal.shaded.org.jctools.queues.unpadded.MpscUnpaddedArrayQueueProducerIndexField',
-    'io.netty.util.internal.shaded.org.jctools.queues.unpadded.MpscUnpaddedArrayQueueProducerLimitField',
-    'io.netty.util.internal.shaded.org.jctools.util.UnsafeAccess',
-    'io.netty.util.internal.shaded.org.jctools.util.UnsafeLongArrayAccess',
-    'io.netty.util.internal.shaded.org.jctools.util.UnsafeRefArrayAccess'
-  )
-}
+// thirdPartyAudit scans `runtimeClasspath minus compileOnly`, which after the arrow/netty/log4j
+// move above is just arrow-c-data and log4j-slf4j2-impl — neither has violations or missing
+// classes (analytics-backend-lucene bundles arrow-c-data with no exclusions at all). The former
+// exclusion block listed only org.apache.arrow.memory.* and io.netty.* classes, which are no
+// longer scanned; leaving them would fail the task via assertNoPointlessExclusions.
 
 spotless {
     format 'misc', {

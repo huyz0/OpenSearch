@@ -78,11 +78,13 @@ public interface DataFormatPlugin {
      *
      * @param fieldType the field type to assign capabilities to
      * @param indexSettings the index settings
-     * @param dataFormatRegistry the registry, used by composite plugins to resolve sub-format plugins
+     * @param dataFormatRegistry the registry, used by composite plugins to resolve sub-format plugins.
+     *                           The default implementation does not need it and tolerates {@code null},
+     *                           which is what a plugin exercised outside a wired node is handed.
      * @throws MapperParsingException if the field type's requested capabilities cannot be fully covered
      */
     default void assignCapabilities(MappedFieldType fieldType, IndexSettings indexSettings, DataFormatRegistry dataFormatRegistry) {
-        dataFormatRegistry.assignSingleFormatCapabilities(fieldType, getDataFormat());
+        DataFormatRegistry.assignSingleFormatCapabilities(fieldType, getDataFormat());
     }
 
     /**

@@ -15,6 +15,7 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.AbsentIndexDescriptorSuppliers;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.Randomness;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.ConcurrentCollections;
 import org.opensearch.core.index.Index;
@@ -25,6 +26,7 @@ import org.opensearch.indices.cluster.IndicesClusterStateService.AllocatedIndice
 import org.opensearch.indices.cluster.IndicesClusterStateService.Shard;
 
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
@@ -53,6 +55,40 @@ class GatedIndexResidency {
 
     /** How many resident indices to sample when choosing one to evict. See {@link #evictColdestOfASample}. */
     static final int EVICTION_SAMPLE_SIZE = 32;
+
+    /**
+     * How many descriptor reads one {@link #sweepDeletedGatedIndices} cycle may make.
+     *
+     * <p><b>The sweep cannot afford to be exhaustive.</b> Each held index whose descriptor is not currently
+     * cached costs one sequential remote read of about 30 ms, on the single MANAGEMENT thread this runs on.
+     * The idle descriptor of a held-but-quiet index is precisely the one that will not be cached -- the
+     * descriptor time-to-live and this sweep's interval are both a minute, so an index nobody has touched
+     * since the last cycle is guaranteed to be a cold read on this one. The resident-set ceiling
+     * ({@link #resolveGatedMaxOpen()}) allows tens of thousands of open indices per node, and at five
+     * thousand held that is roughly two and a half minutes of work inside a sixty-second interval: the
+     * sweep could never finish a cycle, and a scheduleWithFixedDelay sweep that overruns simply runs
+     * continuously.
+     *
+     * <p>So a cycle spends a bounded budget and the next resumes where it stopped ({@link #sweepCursor}).
+     * Two hundred reads is about six seconds of a sixty-second interval -- roughly a tenth of one
+     * MANAGEMENT thread rather than all of it and more.
+     *
+     * <p><b>What this costs: detection latency.</b> A deleted gated index is now noticed within
+     * {@code ceil(held / 200)} sweep intervals rather than one -- minutes rather than a minute for a node
+     * holding thousands. That is the same kind of bound the sweep already was (see
+     * {@link #sweepDeletedGatedIndices}'s own note that it trades latency for needing nothing that does not
+     * already exist), just a larger constant, and it is strictly better than the alternative it replaces:
+     * a cycle that never completes gives a detection latency that is not bounded at all.
+     */
+    static final int SWEEP_BUDGET_PER_CYCLE = 200;
+
+    /**
+     * Where the next {@link #sweepDeletedGatedIndices} cycle resumes, as an offset into that cycle's own
+     * snapshot of the held set. Only ever read and written from the single sweep thread, so a plain field
+     * rather than an atomic; a stale or wrapped value costs a re-check, never a missed index (the offset is
+     * taken modulo the snapshot's size, and the set is walked round-robin).
+     */
+    private int sweepCursor;
 
     /**
      * How long a first request waits for the shard it triggered.
@@ -209,8 +245,8 @@ class GatedIndexResidency {
      *
      * <p>The push version belongs on the change feed, which would let a node learn about a deletion the same
      * way it learns about any other descriptor change. That is not built, and a sweep is the honest stand-in
-     * rather than a design: it trades latency, bounded by the interval, for needing nothing that does not
-     * already exist.
+     * rather than a design: it trades latency, bounded by the interval times the number of cycles a full
+     * pass takes (see {@link #SWEEP_BUDGET_PER_CYCLE}), for needing nothing that does not already exist.
      *
      * <p><b>Closes rather than deletes, and that is what makes an ambiguous answer safe.</b> A descriptor
      * that will not resolve may mean deleted or may mean the store is briefly unreadable, and no caller can
@@ -227,13 +263,23 @@ class GatedIndexResidency {
         // AbsentIndexDescriptorSuppliers refuses to answer on a cluster state thread because that was
         // measured to deadlock. That is also why this cannot simply be folded into applyClusterState.
         ClusterState state = clusterService.state();
-        for (Index index : List.copyOf(openedOnDemand.keySet())) {
+        List<Index> held = List.copyOf(openedOnDemand.keySet());
+        // Resumed where the previous cycle stopped, so the set is covered round-robin across cycles rather
+        // than exhaustively within one. See SWEEP_BUDGET_PER_CYCLE for why.
+        int start = held.isEmpty() ? 0 : Math.floorMod(sweepCursor, held.size());
+        int examined = 0;
+        int checkedRemotely = 0;
+        while (examined < held.size() && checkedRemotely < SWEEP_BUDGET_PER_CYCLE) {
+            Index index = held.get((start + examined) % held.size());
+            examined++;
             if (state.metadata().index(index) != null) {
-                // Published after all, so the ordinary path owns its lifecycle now.
+                // Published after all, so the ordinary path owns its lifecycle now. Costs no remote read,
+                // so it does not count against this cycle's budget.
                 continue;
             }
             IndexMetadata descriptorMetadata;
             try {
+                checkedRemotely++;
                 descriptorMetadata = state.metadata().indexOrResolved(index);
             } catch (Exception e) {
                 logger.debug(() -> new ParameterizedMessage("[{}] could not be checked for deletion", index), e);
@@ -250,6 +296,7 @@ class GatedIndexResidency {
             // A racing on-demand open that rebuilds the shard costs a cold start, not an index.
             releaseGatedIndex(index, "gated index no longer has a descriptor");
         }
+        sweepCursor = held.isEmpty() ? 0 : start + examined;
     }
 
     /**
@@ -353,7 +400,31 @@ class GatedIndexResidency {
             Index coldest = null;
             long coldestIdle = -1;
             int sampled = 0;
-            for (Index candidate : openedOnDemand.keySet()) {
+            // Started at a random offset, which is what makes this a sample rather than a fixed window.
+            // Iterating openedOnDemand from the beginning always visits the same entries in the same order
+            // -- a ConcurrentHashMap's iteration order is a function of the keys' hashes, not of anything
+            // that varies -- so the "first 32" were one fixed region of the map. Indices that landed in it
+            // were re-considered on every single eviction and repeatedly closed while genuinely colder
+            // indices elsewhere in the map were never even looked at.
+            int population = openedOnDemand.size();
+            int skip = population > EVICTION_SAMPLE_SIZE ? Randomness.get().nextInt(population) : 0;
+            Iterator<Index> candidates = openedOnDemand.keySet().iterator();
+            for (int skipped = 0; skipped < skip && candidates.hasNext(); skipped++) {
+                candidates.next();
+            }
+            // Wraps once, so a random offset near the end of the map still yields a full sample rather than
+            // a truncated one.
+            boolean wrapped = false;
+            while (sampled < EVICTION_SAMPLE_SIZE) {
+                if (candidates.hasNext() == false) {
+                    if (wrapped || skip == 0) {
+                        break;
+                    }
+                    wrapped = true;
+                    candidates = openedOnDemand.keySet().iterator();
+                    continue;
+                }
+                Index candidate = candidates.next();
                 AllocatedIndex<? extends Shard> indexService = indicesService.indexService(candidate);
                 if (indexService == null) {
                     continue;
@@ -366,9 +437,7 @@ class GatedIndexResidency {
                     coldestIdle = idle;
                     coldest = candidate;
                 }
-                if (++sampled >= EVICTION_SAMPLE_SIZE) {
-                    break;
-                }
+                sampled++;
             }
             if (coldest == null) {
                 return;

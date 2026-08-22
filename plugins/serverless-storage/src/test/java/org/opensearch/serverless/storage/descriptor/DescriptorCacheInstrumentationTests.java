@@ -129,6 +129,48 @@ public class DescriptorCacheInstrumentationTests extends OpenSearchTestCase {
         assertEquals(0, cache.freshHitCount());
     }
 
+    /**
+     * A waiter that is interrupted says so, rather than saying the index does not exist.
+     *
+     * <p>Null is "there is no such descriptor" to every caller of this class, and that is the one answer
+     * this package keeps separate from "I could not find out" -- a client told an index is absent may go on
+     * to create it. An interrupt is not evidence about the index at all. It used to return null anyway,
+     * which turned a thread being asked to stop waiting into a cluster-wide claim that a tenant's index was
+     * gone.
+     */
+    public void testAnInterruptedWaiterReportsUnavailableRatherThanAbsent() throws Exception {
+        DescriptorCache cache = new DescriptorCache(System::nanoTime, DescriptorCache.DEFAULT_TTL_NANOS, 60_000, 100, 1 << 20);
+        cache.pretendReadIsInFlight("serverless_tenant-a");
+
+        java.util.concurrent.atomic.AtomicReference<Throwable> raised = new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.atomic.AtomicBoolean answeredNull = new java.util.concurrent.atomic.AtomicBoolean();
+        java.util.concurrent.atomic.AtomicBoolean stillInterrupted = new java.util.concurrent.atomic.AtomicBoolean();
+        java.util.concurrent.CountDownLatch waiting = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(1);
+
+        Thread waiter = new Thread(() -> {
+            waiting.countDown();
+            try {
+                answeredNull.set(cache.get("serverless_tenant-a", DescriptorCacheInstrumentationTests::descriptor) == null);
+            } catch (Throwable t) {
+                raised.set(t);
+            } finally {
+                stillInterrupted.set(Thread.currentThread().isInterrupted());
+                done.countDown();
+            }
+        });
+        waiter.start();
+        assertTrue(waiting.await(10, java.util.concurrent.TimeUnit.SECONDS));
+        // The collapse wait above is a minute, so the interrupt is what ends it rather than a timeout.
+        waiter.interrupt();
+        assertTrue(done.await(10, java.util.concurrent.TimeUnit.SECONDS));
+
+        assertFalse("an interrupt must not be reported as the index being absent", answeredNull.get());
+        assertNotNull("it must be reported as unavailability", raised.get());
+        assertTrue(raised.get().toString(), raised.get() instanceof org.opensearch.cluster.metadata.DescriptorUnavailableException);
+        assertTrue("and the interrupt must be left set for whatever handles it", stillInterrupted.get());
+    }
+
     /** Invalidation drops the entry, so the next lookup reads rather than serving a stale value. */
     public void testInvalidationTurnsTheNextLookupBackIntoARead() {
         ManualClock clock = new ManualClock();

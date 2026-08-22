@@ -72,6 +72,45 @@ public class WalShardRegistryTests extends OpenSearchTestCase {
         assertEquals(Set.of(new RegisteredShard("idx", 0)), registry.registeredShards());
     }
 
+    /**
+     * The registry is one marker blob per shard rather than one shared set, which is what makes
+     * registration O(1) instead of "read the whole set, deserialize it, CAS the whole set back" -- roughly
+     * ten megabytes moved per writer-engine activation at a hundred thousand shards, against a single
+     * register every concurrently-activating shard in the cluster contended.
+     */
+    public void testRegistrationWritesOneMarkerBlobPerShardAndNoSharedSet() throws Exception {
+        FsBlobStore blobStore = new FsBlobStore(1024, createTempDir(), false);
+        BlobContainer blobContainer = new FsBlobContainer(blobStore, BlobPath.cleanPath(), blobStore.path());
+        WalShardRegistry registry = new WalShardRegistry(blobContainer);
+
+        registry.register("idx", 0);
+        registry.register("idx", 1);
+        registry.register("other-idx", 0);
+
+        assertEquals("one blob per registered shard", 3, blobContainer.listBlobsByPrefix("registered-shard-").size());
+        assertTrue("registration must not write the shared set at all", blobContainer.readRegister("registered-shards").isEmpty());
+
+        registry.deregister("idx", 0);
+        assertEquals(2, blobContainer.listBlobsByPrefix("registered-shard-").size());
+    }
+
+    /**
+     * A marker blob's name carries the index uuid, so the encoding has to survive every byte an index uuid
+     * can hold and come back out unchanged -- an index uuid is URL-safe base64, whose alphabet includes the
+     * {@code _} and {@code -} that a naive name format would use as separators.
+     */
+    public void testShardIdentityRoundTripsThroughTheMarkerBlobName() throws Exception {
+        WalShardRegistry registry = newRegistry();
+        String awkwardUuid = "a_b-c__d-";
+        registry.register(awkwardUuid, 7);
+        registry.register("plain", 7);
+
+        assertEquals(Set.of(new RegisteredShard(awkwardUuid, 7), new RegisteredShard("plain", 7)), registry.registeredShards());
+
+        registry.deregister(awkwardUuid, 7);
+        assertEquals(Set.of(new RegisteredShard("plain", 7)), registry.registeredShards());
+    }
+
     public void testConcurrentRegistrationsFromManyThreadsAreAllCaptured() throws Exception {
         WalShardRegistry registry = newRegistry();
         int shardCount = 30;

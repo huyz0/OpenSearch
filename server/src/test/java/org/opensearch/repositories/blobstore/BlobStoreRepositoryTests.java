@@ -59,6 +59,7 @@ import org.opensearch.index.IndexSettings;
 import org.opensearch.index.remote.RemoteStoreEnums;
 import org.opensearch.index.remote.RemoteStorePathStrategy;
 import org.opensearch.index.snapshots.IndexShardSnapshotStatus;
+import org.opensearch.index.snapshots.blobstore.BlobStoreIndexShardSnapshots;
 import org.opensearch.index.snapshots.blobstore.EngineNativeShardSnapshot;
 import org.opensearch.index.store.RemoteSegmentStoreDirectoryFactory;
 import org.opensearch.index.store.Store;
@@ -108,6 +109,7 @@ import org.mockito.Mockito;
 
 import static org.opensearch.repositories.RepositoryDataTests.generateRandomRepoData;
 import static org.opensearch.repositories.blobstore.BlobStoreRepository.calculateMaxWithinIntLimit;
+import static org.hamcrest.Matchers.containsInAnyOrder;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.nullValue;
 import static org.mockito.ArgumentMatchers.any;
@@ -318,6 +320,34 @@ public class BlobStoreRepositoryTests extends BlobStoreRepositoryHelperTests {
         // must return empty rather than throw, letting StoreRecovery fall back to the classic
         // restore path instead of failing outright.
         assertEquals(Optional.empty(), repository.getEngineNativeShardSnapshotMetadata(snapshotId, indexId, shardId));
+    }
+
+    /**
+     * The stale-blob sweep must treat {@code engine-native-snap-<uuid>.dat} like {@code snap-<uuid>.dat}:
+     * it belongs to exactly one snapshot, so once that snapshot is gone the blob is garbage. Without the
+     * prefix in the filter, a removed snapshot's engine-native pointer blob was orphaned for as long as
+     * any other snapshot of the shard survived (only a whole-shard delete swept it), and a re-run of the
+     * same delete would read it again and release the engine's pin a second time.
+     */
+    public void testUnusedBlobsIncludesEngineNativeBlobsOfRemovedSnapshots() {
+        final String survivingUuid = "surviving-uuid";
+        final String removedUuid = "removed-uuid";
+        final Set<String> blobs = Set.of(
+            BlobStoreRepository.ENGINE_NATIVE_SNAPSHOT_PREFIX + survivingUuid + ".dat",
+            BlobStoreRepository.ENGINE_NATIVE_SNAPSHOT_PREFIX + removedUuid + ".dat",
+            BlobStoreRepository.SNAPSHOT_PREFIX + survivingUuid + ".dat",
+            BlobStoreRepository.SNAPSHOT_PREFIX + removedUuid + ".dat"
+        );
+
+        final List<String> unused = BlobStoreRepository.unusedBlobs(blobs, Set.of(survivingUuid), BlobStoreIndexShardSnapshots.EMPTY, null);
+
+        assertThat(
+            unused,
+            containsInAnyOrder(
+                BlobStoreRepository.ENGINE_NATIVE_SNAPSHOT_PREFIX + removedUuid + ".dat",
+                BlobStoreRepository.SNAPSHOT_PREFIX + removedUuid + ".dat"
+            )
+        );
     }
 
     public void testBadChunksize() throws Exception {

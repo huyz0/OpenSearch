@@ -135,6 +135,110 @@ public class AbsentIndexRoutingSuppliersTests extends OpenSearchTestCase {
         assertTrue(AbsentIndexRoutingSuppliers.shouldPublishRouting(null));
     }
 
+    /**
+     * The memo is the point of the cache, so the reuse it exists for is asserted before the invalidation
+     * rules that constrain it. Same state, same index: one computation.
+     */
+    public void testTheSameStateReusesTheMemoisedPlacement() {
+        IndexMetadata metadata = index("idx");
+        java.util.concurrent.atomic.AtomicInteger computations = new java.util.concurrent.atomic.AtomicInteger();
+        AbsentIndexRoutingSuppliers.register((state, index) -> {
+            computations.incrementAndGet();
+            return IndexRoutingTable.builder(index.getIndex()).build();
+        });
+        ClusterState state = state();
+
+        IndexRoutingTable first = AbsentIndexRoutingSuppliers.supply(state, metadata);
+        IndexRoutingTable second = AbsentIndexRoutingSuppliers.supply(state, metadata);
+
+        assertSame("the second resolution of an unchanged state must come from the memo", first, second);
+        assertEquals(1, computations.get());
+    }
+
+    /**
+     * The bug this key exists to prevent, in the smallest shape that reproduces it.
+     *
+     * <p>A computed placement depends on the cluster's member list, which lives in a {@code
+     * Metadata.Custom} and therefore changes the {@code Metadata} without touching the index's own {@code
+     * IndexMetadata} -- and for a gated index the {@code IndexMetadata} is a deliberately identity-cached
+     * synthesis, so it never changes at all. Keyed only on the index, the memo kept answering from the
+     * member list of an earlier epoch indefinitely: after a node joined or was decommissioned, this node
+     * went on routing computed shards against a node list nobody else had, which is how one coordinator's
+     * derived allocation id stops matching the data node's and writes start failing outright.
+     */
+    public void testAChangeToClusterMetadataInvalidatesTheMemo() {
+        IndexMetadata metadata = index("idx");
+        java.util.concurrent.atomic.AtomicInteger computations = new java.util.concurrent.atomic.AtomicInteger();
+        AbsentIndexRoutingSuppliers.register((state, index) -> {
+            computations.incrementAndGet();
+            return IndexRoutingTable.builder(index.getIndex()).build();
+        });
+
+        AbsentIndexRoutingSuppliers.supply(state(), metadata);
+        // A new Metadata instance carrying the same indices, which is exactly what publishing a changed
+        // membership custom produces: the index is untouched, the metadata is not.
+        ClusterState epochBumped = ClusterState.builder(ClusterName.DEFAULT)
+            .metadata(org.opensearch.cluster.metadata.Metadata.builder().build())
+            .build();
+        AbsentIndexRoutingSuppliers.supply(epochBumped, metadata);
+
+        assertEquals("a changed metadata must not be answered from a memo computed against the old one", 2, computations.get());
+    }
+
+    /**
+     * The other half of the same key. While no membership is published -- a fresh cluster, before the
+     * maintainer's first update -- placement falls back to the live node list, so a node joining or leaving
+     * has to invalidate the memo just as a published change does.
+     */
+    public void testAChangeToTheNodeListInvalidatesTheMemo() {
+        IndexMetadata metadata = index("idx");
+        java.util.concurrent.atomic.AtomicInteger computations = new java.util.concurrent.atomic.AtomicInteger();
+        AbsentIndexRoutingSuppliers.register((state, index) -> {
+            computations.incrementAndGet();
+            return IndexRoutingTable.builder(index.getIndex()).build();
+        });
+        ClusterState before = state();
+
+        AbsentIndexRoutingSuppliers.supply(before, metadata);
+        ClusterState afterJoin = ClusterState.builder(before)
+            .nodes(
+                org.opensearch.cluster.node.DiscoveryNodes.builder()
+                    .add(
+                        new org.opensearch.cluster.node.DiscoveryNode(
+                            "node-1",
+                            new org.opensearch.core.common.transport.TransportAddress(java.net.InetAddress.getLoopbackAddress(), 9300),
+                            java.util.Map.of(),
+                            java.util.Set.of(org.opensearch.cluster.node.DiscoveryNodeRole.DATA_ROLE),
+                            Version.CURRENT
+                        )
+                    )
+                    .build()
+            )
+            .build();
+        AbsentIndexRoutingSuppliers.supply(afterJoin, metadata);
+
+        assertEquals("a node joining must not be answered from a memo computed without it", 2, computations.get());
+    }
+
+    /**
+     * The memo is bounded, and the bound it used to claim was the unbounded quantity itself: "the number of
+     * computed indices this node resolves" is not a bound at all for indices that have no routing entry to
+     * hold them. A long-lived coordinator touching a large gated population pinned a synthesised {@code
+     * IndexMetadata} and a routing table per index, forever.
+     */
+    public void testTheMemoDoesNotGrowWithTheNumberOfIndicesResolved() {
+        AbsentIndexRoutingSuppliers.register((state, index) -> IndexRoutingTable.builder(index.getIndex()).build());
+        ClusterState state = state();
+
+        int resolved = 60_000;
+        for (int i = 0; i < resolved; i++) {
+            AbsentIndexRoutingSuppliers.supply(state, index("idx-" + i));
+        }
+
+        int memoised = AbsentIndexRoutingSuppliers.memoisedIndexCountForTesting();
+        assertTrue("resolving " + resolved + " indices must not leave " + resolved + " memos: found " + memoised, memoised < resolved);
+    }
+
     private static ClusterState state() {
         return ClusterState.builder(ClusterName.DEFAULT).build();
     }

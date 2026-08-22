@@ -222,9 +222,9 @@ New `BlobRegister` (generation + value pair returned by `readRegister`) and `Blo
 
 This generalizes CAS-over-blob as a repository capability, rather than something specific to this plugin's manifest store.
 
-## 6. REST handler serverless-scope annotation
+## 6. REST handler API-availability annotation
 
-A serverless deployment wants to control which REST APIs are reachable at all, but core had no way for a handler to declare that intent, only to be wired into the routing table or not.
+A deployment that restricts its API surface wants to control which REST APIs are reachable at all, but core had no way for a handler to declare that intent, only to be wired into the routing table or not.
 
 **`RestHandler.java`** — a new default method and its enum:
 
@@ -233,28 +233,30 @@ A serverless deployment wants to control which REST APIs are reachable at all, b
      // ... existing routes()/handleRequest()/etc ...
 
 +    /**
-+     * Declares this handler's availability on a node running in serverless mode. Defaults to
-+     * UNAVAILABLE deliberately: new APIs must opt in consciously rather than being silently
-+     * exposed by omission. This default has no behavioral effect today — nothing in
-+     * RestController reads this method yet, since enforcement needs a node-level "is this node
-+     * in serverless mode" flag that does not yet exist as a wired setting.
++     * Declares this handler's availability on a node whose storage/metadata plane is externally
++     * managed. Defaults to UNAVAILABLE deliberately: new APIs must opt in consciously rather than
++     * being silently exposed by omission. Core does not enforce this — enforcement is fully
++     * plugin-owned.
 +     */
-+    default ServerlessScope serverlessScope() {
-+        return ServerlessScope.UNAVAILABLE;
++    default ApiAvailabilityScope apiAvailabilityScope() {
++        return ApiAvailabilityScope.UNAVAILABLE;
 +    }
 +
-+    enum ServerlessScope {
-+        /** Available to ordinary callers on a node running in serverless mode. */
++    @PublicApi(since = "3.8.0")
++    enum ApiAvailabilityScope {
++        /** Available to ordinary callers on such a node. */
 +        AVAILABLE,
 +        /** Available only to internal/system callers, never external clients. */
 +        INTERNAL_ONLY,
-+        /** Not available at all — the default for any unannotated handler. */
++        /** Not available at all — the default for any handler that does not declare otherwise. */
 +        UNAVAILABLE
 +    }
  }
 ```
 
-Roughly fifteen existing `Rest*Action` classes (e.g. `RestGetAction`, `RestBulkAction`, `RestSearchAction`) then override `serverlessScope()` to return `AVAILABLE`. Nothing in `RestController` enforces this yet — it's a forward-declaring seam so handlers record their intended availability incrementally, ahead of a future gate that would reject `UNAVAILABLE` handlers in a serverless deployment. Treat this as scaffolding, not an active restriction.
+Roughly fifteen existing `Rest*Action` classes (e.g. `RestGetAction`, `RestBulkAction`, `RestSearchAction`) then override `apiAvailabilityScope()` to return `AVAILABLE`. Nothing in `RestController` enforces this — it is a declaration seam that a plugin's own REST gate reads, so handlers record their intended availability in core while the policy that acts on it stays out of core.
+
+> **Naming note.** This method and enum were originally called `serverlessScope()` / `ServerlessScope`, and earlier versions of this page documented them under those names. They were renamed when the product-named REST vocabulary was removed from core: the interface is `@PublicApi` and implemented by handlers throughout core, so tying it to one specific product was wrong — the question each handler answers ("is this API exposed on a restricted node") is generic.
 
 ## 7. Routing and recovery-source changes for split/merge
 
@@ -342,6 +344,16 @@ Classic `_snapshot` reads a real local Lucene commit via `Engine#acquireLastInde
 `EngineNativeSnapshotPointer` (an engine ID tag plus opaque payload bytes) and `EngineNativeShardSnapshot` (the on-disk envelope `BlobStoreRepository` writes) are two small new types alongside these. `Repository.java` gained matching `default` methods: `snapshotEngineNative(...)` throws `UnsupportedOperationException`, mirroring `snapshotRemoteStoreIndexShard`'s own default, and `getEngineNativeShardSnapshotMetadata(...)` returns `Optional.empty()`. Both are implemented for real once on `BlobStoreRepository` and forwarded by `FilterRepository` like everything else on that interface.
 
 Restore doesn't need a new flag on `SnapshotRecoverySource` to know which format a shard used. `StoreRecovery.recoverFromEngineNativeSnapshot` first checks a cheap, purely local capability flag — `EngineFactory#supportsEngineNativeSnapshots()`, default `false` — before ever calling `getEngineNativeShardSnapshotMetadata`, which is a real remote blob-existence check. Without that gate, every classic-shaped restore across every `BlobStoreRepository`-backed deployment would pay that round trip on every shard, even though almost no engine ever produces an engine-native snapshot. Only when the local flag is `true` does it call the probe; if that comes back empty too, it falls straight through to the original, unmodified `recoverFromRepository`. `SnapshotShardsService.snapshot()` gets the mirror-image branch on the write side: it tries `IndexShard#attemptEngineNativeSnapshot` ahead of the existing classic/remote-store-shallow-copy branching, and only takes the new path if that returns a pointer — cheap by construction, since the default there is a plain in-memory `Optional.empty()`, no remote call. See [Snapshot & Restore](/design/snapshot-restore-proposal/) for the plugin-side implementation this seam supports.
+
+## 10. What was subsequently taken back *out* of core
+
+The items above describe what this fork added to core. A later minimality pass reversed part of it, on the principle that core should hold the extension point and the plugin should hold the implementation. Recorded here because a reader comparing this page to the source will otherwise look for things that have moved:
+
+- **Relocated into `plugins/serverless-storage`**: the computed-placement membership custom and its maintenance service (its wire name is unchanged, so a rolling restart is unaffected — but a cluster that persisted this metadata and then starts *without* the plugin can no longer deserialize it), and the gated-index descriptor pre-warmer.
+- **Extracted within core**: the gated-index residency subsystem moved out of `IndicesClusterStateService` into its own class, and the per-index heap constant that sized its ceiling moved behind the residency-policy SPI so the plugin supplies the measurement rather than core hard-coding it.
+- **Moved onto the generic plugin-stats path**: native-allocator pool stats no longer occupy a hard-typed field on `NodeStats`; they travel through the generic `PluginNodeStats` map and render under their own top-level key. The dedicated wire slot is retained as vestigial (always absent) so the stream layout is unchanged.
+- **De-product-named**: the REST scope annotation (item 6), the descriptor's membership marker (core now asks the registered index-creation strategy for the setting key instead of naming a plugin's setting), and the policy-file directory grant, which is now a generic mechanism any plugin can use by declaring setting keys in a `plugin-security.properties` file rather than core naming one plugin's directory setting.
+- **Renamed**: the manifest-sidecar `IndexDescriptor` in `gateway.remote` became `ManifestIndexDescriptor`, ending a same-name collision with the descriptor-plane type in `cluster.metadata`.
 
 :::note
 This list reflects a diff against the OpenSearch upstream merge-base, filtered to exclude `plugins/serverless-storage` and this docs site. Class and method names are transcribed from that diff — confirm against the current source before relying on exact signatures.

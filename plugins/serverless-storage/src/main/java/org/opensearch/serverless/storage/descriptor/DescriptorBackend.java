@@ -132,7 +132,78 @@ public interface DescriptorBackend {
         }
     }
 
-    /** Writes a descriptor whether or not the name is taken. */
+    /**
+     * A descriptor as the store currently holds it, together with the version that read observed.
+     *
+     * <p>The version is opaque and belongs to the backend: for the blob backend it is the register's
+     * generation. It exists so a caller that intends to change the descriptor can hand back what it based
+     * that change on, which is the difference between a compare-and-swap and a hope.
+     *
+     * @param descriptor      what the store holds, or null when the name has no record at all
+     * @param storeVersion    what to pass to {@link #compareAndSwap} to mean "only if nothing has changed
+     *                        since", or {@link #UNVERSIONED} from a backend that cannot answer conditionally
+     */
+    record VersionedDescriptor(IndexDescriptor descriptor, long storeVersion) {
+    }
+
+    /** What a backend with no conditional write reports, and what {@link #compareAndSwap} then cannot check. */
+    long UNVERSIONED = -1L;
+
+    /**
+     * The descriptor for a name, read past any cache, with the version to write it back under.
+     *
+     * <p><b>Not the same call as {@link #get} and not interchangeable with it.</b> {@code get} is the
+     * request path and is allowed to answer from a cache whose freshness window is a minute. That is safe
+     * for resolving a name and unsafe for deciding what to write next: a read-modify-write based on a cached
+     * descriptor reverts everything that changed within the window, and does so silently. Every caller that
+     * intends to write must come through here.
+     *
+     * @throws org.opensearch.cluster.metadata.DescriptorUnavailableException if the store could not be read
+     */
+    default VersionedDescriptor getForUpdate(String name) {
+        return new VersionedDescriptor(get(name), UNVERSIONED);
+    }
+
+    /**
+     * Writes a descriptor only if the store is still at {@code expectedStoreVersion}.
+     *
+     * <p>This is the write half of {@link #getForUpdate}, and the pair is what makes a read-modify-write
+     * over a descriptor safe. Losing is a {@code false} rather than an exception, because losing is a
+     * correct outcome: the caller re-reads, re-applies its change to what it now finds, and tries again.
+     * That is the same contract {@code MappingGenerationStore.Store#compareAndSwap} states one level up, and
+     * it must never be satisfied by writing anyway.
+     *
+     * @return true when the write applied, false when something else wrote first
+     * @throws org.opensearch.cluster.metadata.DescriptorUnavailableException if the store could not be written
+     */
+    default boolean compareAndSwap(IndexDescriptor descriptor, long expectedStoreVersion) {
+        // A backend with no conditional write can only do the unconditional one, and saying so here keeps
+        // the degradation in one place rather than letting each caller invent its own.
+        put(descriptor);
+        return true;
+    }
+
+    /**
+     * Where this backend's own writes run, for a caller composing several of them off the calling thread.
+     *
+     * <p>Same-thread by default, which is right for an in-memory backend and for a test. A backend whose
+     * writes are network I/O overrides it, because the callers here are cluster state hooks: the gate's own
+     * comment records what happens otherwise -- "registering the blocking put hung the node instead of
+     * failing, which is how the constraint was found."
+     */
+    default java.util.concurrent.Executor writeExecutor() {
+        return Runnable::run;
+    }
+
+    /**
+     * Writes a descriptor whether or not the name is taken, and whatever it currently says.
+     *
+     * <p><b>Not for a read-modify-write.</b> This overwrites, so a caller that read the descriptor, changed
+     * part of it and put it back reverts every other change made in between -- and the read it based that on
+     * is usually a cached one. {@link #getForUpdate} with {@link #compareAndSwap} is that caller's pair. This
+     * is for a writer that already holds the whole truth about the index, which in practice means the
+     * publisher writing a descriptor derived from the cluster state entry that <em>is</em> the truth.
+     */
     void put(IndexDescriptor descriptor);
 
     /** {@link #put} without blocking the caller. */

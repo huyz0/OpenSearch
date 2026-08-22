@@ -234,8 +234,19 @@ public final class ShardSuspensionCoordinator {
             // design. Scale-to-zero suspends shards continuously, so at a hundred million indices a
             // publication per suspension would leave the cluster manager doing nothing else. Placement
             // reads this on the next routing resolution, with no publication and no round trip.
-            if (gatedSuspensions.suspend(indexUuid, shardId)) {
-                logger.debug("suspended gated shard [{}][{}] without a cluster state update", indexUuid, shardId);
+            //
+            // The role is carried through rather than dropped. It used to be discarded here, so a reader
+            // suspension recorded the shard as asleep outright and placement stopped placing its writer
+            // too -- an index nobody had stopped writing to lost its primary because its search traffic
+            // had gone quiet. The registry now keeps the two roles apart, and only a writer suspension
+            // takes a shard out of placement.
+            if (gatedSuspensions.suspend(indexUuid, shardId, reader)) {
+                logger.debug(
+                    "suspended gated {} shard [{}][{}] without a cluster state update",
+                    reader ? "reader" : "writer",
+                    indexUuid,
+                    shardId
+                );
             }
             // Eviction still runs on every tick for the same self-healing reason as the already-suspended
             // branch below: the reroute that unassigns the copies is asynchronous and can be lost.
@@ -626,14 +637,27 @@ public final class ShardSuspensionCoordinator {
     }
 
     /**
-     * The uuid index for one {@link Metadata} instance, rebuilt only when that instance changes.
+     * The uuid index for one {@link Metadata} instance, together with the instance it was built from.
      *
-     * <p>Two fields rather than a map keyed by metadata, because the access pattern is a tick walking
+     * <p>One holder rather than a map keyed by metadata, because the access pattern is a tick walking
      * many shards of the same cluster state: the previous entry is the one wanted almost every time, and
      * a cache holding more would retain old {@code Metadata} instances, each of which can be gigabytes.
+     *
+     * <p><b>One field rather than two, and that is a correctness fix rather than tidying.</b> The map and
+     * the metadata it was built from used to be two independent volatile fields, written one after the
+     * other and read one after the other, while this method is called concurrently from the scheduler
+     * thread and from cluster-state callbacks. A reader could load a map built from state A and then load
+     * the freshness marker already updated to state B, pass the identity check, and answer from the wrong
+     * map. The failure that produces is not a stale answer, it is a null one -- and a null here means "not
+     * in cluster state", which is precisely how this class recognises a gated index, so an ordinary index
+     * would be misrouted into the gated branch and recorded in a registry nothing in its own lifecycle
+     * ever reads. Publishing both together makes the pair indivisible, which is the only property the
+     * check was ever relying on.
      */
-    private volatile Metadata uuidIndexBuiltFrom;
-    private volatile Map<String, IndexMetadata> uuidIndex;
+    private record UuidIndex(Metadata builtFrom, Map<String, IndexMetadata> byUuid) {
+    }
+
+    private volatile UuidIndex uuidIndex;
 
     /**
      * Resolves an index by uuid, scanning once per cluster state version rather than once per call.
@@ -648,16 +672,17 @@ public final class ShardSuspensionCoordinator {
      * which is H9c, since suspension state currently lives inside {@code IndexMetadata}.
      */
     private IndexMetadata findByUuid(Metadata metadata, String indexUuid) {
-        Map<String, IndexMetadata> index = uuidIndex;
-        if (metadata != uuidIndexBuiltFrom || index == null) {
+        UuidIndex current = uuidIndex;
+        if (current == null || current.builtFrom() != metadata) {
             Map<String, IndexMetadata> rebuilt = new HashMap<>(metadata.indices().size());
             for (IndexMetadata indexMetadata : metadata.indices().values()) {
                 rebuilt.put(indexMetadata.getIndexUUID(), indexMetadata);
             }
-            index = rebuilt;
-            uuidIndex = rebuilt;
-            uuidIndexBuiltFrom = metadata;
+            current = new UuidIndex(metadata, rebuilt);
+            // Last writer wins, which is right: two threads racing here built the same map from the same
+            // metadata, or one built a newer one, and either is a valid answer for its own reader.
+            uuidIndex = current;
         }
-        return index.get(indexUuid);
+        return current.byUuid().get(indexUuid);
     }
 }

@@ -126,16 +126,13 @@ public class IndexRoutingResolverPropagationTests extends OpenSearchTestCase {
 
         java.util.concurrent.atomic.AtomicReference<IndexRoutingTable> result = new java.util.concurrent.atomic.AtomicReference<>();
         java.util.concurrent.atomic.AtomicReference<Throwable> failure = new java.util.concurrent.atomic.AtomicReference<>();
-        Thread clusterManagerThread = new Thread(
-            () -> {
-                try {
-                    result.set(state.getIndexRoutingTable("gated"));
-                } catch (Throwable t) {
-                    failure.set(t);
-                }
-            },
-            "opensearch[nodeA][clusterManagerService#updateTask][T#1]"
-        );
+        Thread clusterManagerThread = new Thread(() -> {
+            try {
+                result.set(state.getIndexRoutingTable("gated"));
+            } catch (Throwable t) {
+                failure.set(t);
+            }
+        }, "opensearch[nodeA][clusterManagerService#updateTask][T#1]");
         clusterManagerThread.start();
         clusterManagerThread.join();
 
@@ -148,9 +145,9 @@ public class IndexRoutingResolverPropagationTests extends OpenSearchTestCase {
         Metadata metadata = Metadata.builder().put(real, false).build();
         IndexRoutingTable published = emptyRoutingTable(real);
         RoutingTable routingTable = RoutingTable.builder().add(published).build();
-        routingTable.attachIndexRoutingResolver(
-            (state, meta) -> { throw new AssertionError("must not consult the resolver when routing is already published"); }
-        );
+        routingTable.attachIndexRoutingResolver((state, meta) -> {
+            throw new AssertionError("must not consult the resolver when routing is already published");
+        });
 
         ClusterState state = ClusterState.builder(ClusterName.DEFAULT).metadata(metadata).routingTable(routingTable).build();
 

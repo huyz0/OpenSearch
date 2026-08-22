@@ -64,7 +64,6 @@ import org.opensearch.monitor.process.ProcessStats;
 import org.opensearch.node.AdaptiveSelectionStats;
 import org.opensearch.node.NodesResourceUsageStats;
 import org.opensearch.node.remotestore.RemoteStoreNodeStats;
-import org.opensearch.plugin.stats.AnalyticsBackendNativeMemoryStats;
 import org.opensearch.plugin.stats.NativeAllocatorPoolStats;
 import org.opensearch.plugins.BlockCacheStats;
 import org.opensearch.plugins.PluginNodeStats;
@@ -308,8 +307,16 @@ public class NodeStats extends BaseNodeResponse implements ToXContentFragment {
             in.readOptionalWriteable(NativeAllocatorPoolStats::readAndDiscardV3_7);
         }
         if (in.getVersion().onOrAfter(Version.V_3_7_0)) {
-            // BWC: V_3_7_0 wrote AnalyticsBackendNativeMemoryStats here; read and discard.
-            in.readOptionalWriteable(AnalyticsBackendNativeMemoryStats::new);
+            // BWC: V_3_7_0 wrote an optional AnalyticsBackendNativeMemoryStats here (3 longs behind
+            // a boolean); read and discard. That type no longer exists in :server — it moved to the
+            // plugin side and now arrives through the generic pluginStats map under
+            // "analytics_backend" — so the slot is decoded inline rather than through a constructor
+            // reference. The write side already always writes it absent.
+            if (in.readBoolean()) {
+                in.readLong(); // allocatedBytes
+                in.readLong(); // residentBytes
+                in.readLong(); // purgeCount
+            }
         }
         if (in.getVersion().onOrAfter(Version.V_3_7_0)) {
             totalEstimatedNativeBytes = in.readLong();

@@ -176,7 +176,7 @@ public final class BlobDescriptorChangeLog {
      * entry as meaningful is relying on something this cannot provide.
      */
     public List<DescriptorChange> since(String fromBucket) {
-        List<LoggedChange> entries = entriesSince(fromBucket, java.util.Set.of());
+        List<LoggedChange> entries = readSince(fromBucket, java.util.Set.of()).entries();
         List<DescriptorChange> changes = new ArrayList<>(entries.size());
         for (LoggedChange entry : entries) {
             changes.add(entry.change());
@@ -194,9 +194,11 @@ public final class BlobDescriptorChangeLog {
      * reach yet.
      *
      * <p>Safe to run because nothing reads history any more. The tailer starts at the bucket its node
-     * started in and only ever revisits that one, so a bucket older than the retention window has no reader
-     * by construction. That was not true while the log fed a name index built by replaying it from the
-     * beginning, and pruning then would have silently broken a joining node.
+     * started in and never falls further behind than the cursor lag it holds itself back by, which is less
+     * than one bucket, so a bucket older than the retention window has no reader by construction as long as
+     * the window is more than a couple of buckets wide -- which the smallest sane retention already is.
+     * That was not true while the log fed a name index built by replaying it from the beginning, and
+     * pruning then would have silently broken a joining node.
      *
      * <p>The bucket being written to is never deleted, and that falls out of the arithmetic rather than
      * needing a guard: the cutoff is {@code bucketOf(now - retention)} and the live bucket is
@@ -248,17 +250,49 @@ public final class BlobDescriptorChangeLog {
     }
 
     /**
-     * Everything from {@code fromBucket} onward except the entries in {@code alreadyConsumed}.
+     * What one read of the log returned, and whether it is all of it.
      *
-     * <p>{@code alreadyConsumed} holds keys within {@code fromBucket} only, which is the sole bucket a
-     * reader ever revisits: the cursor is set to the bucket the read started in rather than past it, so
-     * entries written to that bucket after the listing are not missed. Without the exclusion those entries
-     * are delivered again on every pass until the bucket rolls, which at a one minute bucket and a five
-     * second interval is up to twelve times, and each redelivery invalidates a cache entry that did not
-     * need invalidating.
+     * <p><b>The second field is the whole point of this type.</b> The read used to catch its own
+     * {@link IOException} mid-iteration and return whatever it had reached so far, which is
+     * indistinguishable from a complete read of a shorter log. Its one real caller then advanced its cursor
+     * past the buckets it had never managed to list, permanently -- exactly what {@code
+     * DescriptorChangeTailer}'s "left un-advanced on purpose, so the next pass retries the same range
+     * rather than stepping over changes it never read" comment claimed could not happen. A partial success
+     * that looks like a success is worse here than a failure, because the entries lost are cache
+     * invalidations and shard releases for indices cluster state does not mention, and nothing else will
+     * ever mention them either.
+     *
+     * @param entries          what was read, oldest bucket first
+     * @param firstUnreadBucket the earliest bucket this read could not finish, or null when it finished all
+     *                          of them. A reader must not move its cursor past this.
      */
-    public List<LoggedChange> entriesSince(String fromBucket, java.util.Set<String> alreadyConsumed) {
+    public record ChangeBatch(List<LoggedChange> entries, String firstUnreadBucket) {
+        /** Whether everything from the requested bucket onward was actually read. */
+        public boolean complete() {
+            return firstUnreadBucket == null;
+        }
+    }
+
+    /**
+     * Everything from {@code fromBucket} onward except the entries in {@code alreadyConsumed}, and a note of
+     * whatever could not be read.
+     *
+     * <p>{@code alreadyConsumed} holds keys from any bucket at or after {@code fromBucket}, which is the
+     * range a reader can revisit: the cursor is set at or behind the bucket the read started in rather than
+     * past it, so entries written after the listing are not missed. Without the exclusion those entries are
+     * delivered again on every pass until the cursor moves beyond their bucket, which at a one minute bucket
+     * and a five second interval is up to twelve times or more, and each redelivery invalidates a cache
+     * entry that did not need invalidating.
+     *
+     * <p>It used to hold keys from {@code fromBucket} alone, because the cursor could only ever sit in the
+     * bucket the last read started in. It can now sit one bucket behind that, to absorb clock skew between
+     * an appender bucketing by its own clock and a reader bucketing by its own, so the exclusion set has to
+     * span the same range the read does. Entry names are UUIDs, so a key identifies an entry without its
+     * bucket.
+     */
+    public ChangeBatch readSince(String fromBucket, java.util.Set<String> alreadyConsumed) {
         List<LoggedChange> changes = new ArrayList<>();
+        String firstUnreadBucket = null;
         try {
             // Sorted, because children() gives no order and the buckets are the only ordering there is.
             Map<String, BlobContainer> buckets = new TreeMap<>(containers.apply(changelogPath()).children());
@@ -266,27 +300,63 @@ public final class BlobDescriptorChangeLog {
                 if (fromBucket != null && bucket.getKey().compareTo(fromBucket) < 0) {
                     continue;
                 }
-                boolean revisiting = bucket.getKey().equals(fromBucket);
-                // Directly under the bucket first, which is where appends landed before they were sharded.
-                // Costs one listing that is empty on anything written since, and means a log written by an
-                // older node is not silently skipped by a newer one.
-                readEntriesInto(changes, bucket.getKey(), bucket.getValue(), revisiting, alreadyConsumed);
-                // Then each shard that exists. Discovered rather than enumerated, so a reader never needs
-                // to know APPEND_SHARDS, an empty shard costs nothing, and changing the count is not a
-                // migration.
-                for (BlobContainer shard : new TreeMap<>(bucket.getValue().children()).values()) {
-                    readEntriesInto(changes, bucket.getKey(), shard, revisiting, alreadyConsumed);
+                boolean complete;
+                try {
+                    // Directly under the bucket first, which is where appends landed before they were
+                    // sharded. Costs one listing that is empty on anything written since, and means a log
+                    // written by an older node is not silently skipped by a newer one.
+                    complete = readEntriesInto(changes, bucket.getKey(), bucket.getValue(), alreadyConsumed);
+                    // Then each shard that exists. Discovered rather than enumerated, so a reader never
+                    // needs to know APPEND_SHARDS, an empty shard costs nothing, and changing the count is
+                    // not a migration.
+                    //
+                    // Non-short-circuiting on purpose. Every shard is read whatever the ones before it did,
+                    // because an entry that could not be read says nothing about the entries beside it.
+                    for (BlobContainer shard : new TreeMap<>(bucket.getValue().children()).values()) {
+                        complete &= readEntriesInto(changes, bucket.getKey(), shard, alreadyConsumed);
+                    }
+                } catch (IOException | RuntimeException e) {
+                    // A *listing* failure, which is different from an unreadable entry: nothing is known
+                    // about what this bucket holds, so there is nothing to deliver and the whole bucket has
+                    // to be retried. Per bucket rather than abandoning the pass, so a later bucket that is
+                    // readable is still delivered.
+                    logger.warn("could not list change log bucket [{}]; it will be retried: {}", bucket.getKey(), e);
+                    complete = false;
+                }
+                if (complete == false && (firstUnreadBucket == null || bucket.getKey().compareTo(firstUnreadBucket) < 0)) {
+                    // What must not happen is the caller treating this as read: the earliest incomplete
+                    // bucket is reported so the cursor stays at or before it.
+                    firstUnreadBucket = bucket.getKey();
                 }
             }
-        } catch (IOException e) {
-            logger.warn("could not read the change log from bucket [{}]: {}", fromBucket, e);
+        } catch (IOException | RuntimeException e) {
+            // The bucket listing itself failed, so nothing at all is known about this range. Reporting
+            // fromBucket as unread is what keeps the cursor where it is.
+            logger.warn("could not list the change log from bucket [{}]: {}", fromBucket, e);
+            return new ChangeBatch(List.copyOf(changes), fromBucket == null ? bucketOf(0L) : fromBucket);
         }
-        return changes;
+        return new ChangeBatch(List.copyOf(changes), firstUnreadBucket);
     }
 
     /** The bucket a reader should resume from next time, given it has consumed everything up to now. */
     public String currentBucket() {
         return bucketOf(clock.getAsLong());
+    }
+
+    /**
+     * The bucket that was current {@code lagMillis} ago, which is where a cursor belongs rather than at
+     * {@link #currentBucket}.
+     *
+     * <p>Appenders bucket by their own wall clock and a reader bucketing by its own; the two are only as
+     * close as NTP keeps them. A reader whose clock is a few seconds ahead, crossing a bucket boundary,
+     * sets its cursor to bucket N while an appender still writing entries by the same instant puts them in
+     * N-1 -- and the cursor is already past N-1, so those entries are never read by that node. Not
+     * eventually: never. Holding the cursor back by more than the skew makes that impossible for skew up to
+     * the lag, at the cost of re-listing one extra bucket per pass, whose entries are filtered out by the
+     * already-consumed set anyway.
+     */
+    public String bucketAtOrBefore(long lagMillis) {
+        return bucketOf(clock.getAsLong() - lagMillis);
     }
 
     /**
@@ -305,32 +375,54 @@ public final class BlobDescriptorChangeLog {
     }
 
     /**
-     * Reads every entry in one container into {@code changes}, skipping what a revisiting reader already had.
+     * Reads every entry in one container into {@code changes}, skipping what the reader already had.
      *
      * <p>Entries are identified by name alone rather than by shard and name, because the names are UUIDs
      * and a tailer's cursor was keyed that way before sharding existed. Qualifying them now would make
      * every cursor written by a running node stop matching.
+     *
+     * <p><b>A listing failure propagates and an unreadable entry does not, and that asymmetry is the whole
+     * of this method's contract.</b> A bucket that could not be listed holds an unknown set of entries, so
+     * there is nothing to deliver from it. An entry that could not be read is one entry: the ones beside it
+     * were listed, are readable, and must still be delivered.
+     *
+     * <p>Getting that backwards cost a run of green tests. Throwing on an unreadable entry aborted the
+     * caller's loop over the bucket's shards, so a single unparseable object under a bucket hid every real
+     * entry in it -- and Lucene's {@code ExtrasFS}, which drops an empty {@code extra0} file into every
+     * directory it creates on about one seed in four, produces exactly that object. Three suites read back
+     * empty while reporting that no append had failed, which is indistinguishable from a cluster where
+     * nothing happened.
+     *
+     * <p>The entry is still not <em>forgotten</em>: this reports the bucket as incomplete, which is what
+     * stops a reader's cursor stepping over an entry it never read. An entry can be listed between its key
+     * appearing and its body being complete on a store that does not make writes atomic, and that resolves
+     * on the next pass. One that never resolves is bounded by the reader rather than here -- see
+     * {@code DescriptorChangeTailer.MAX_PASSES_HELD_BY_ONE_BUCKET}.
+     *
+     * @return whether every listed entry was read, so the caller can tell a complete bucket from a partial
+     *         one without losing what the partial one did yield
      */
-    private void readEntriesInto(
+    private boolean readEntriesInto(
         List<LoggedChange> changes,
         String bucket,
         BlobContainer container,
-        boolean revisiting,
         java.util.Set<String> alreadyConsumed
     ) throws IOException {
+        boolean complete = true;
         for (String entry : container.listBlobs().keySet()) {
-            if (revisiting && alreadyConsumed.contains(entry)) {
+            if (alreadyConsumed.contains(entry)) {
                 continue;
             }
             try (InputStream stream = container.readBlob(entry); StreamInput in = StreamInput.wrap(stream.readAllBytes())) {
                 changes.add(new LoggedChange(bucket, entry, new DescriptorChange(in)));
             } catch (IOException e) {
-                // One unreadable entry is not a reason to lose the rest of the catch-up. It is also
-                // expected transiently: an entry can be listed between its key appearing and its body
-                // being complete, on a store that does not make writes atomic.
-                logger.debug("skipping an unreadable change log entry [{}/{}]: {}", bucket, entry, e);
+                // The loop continues, so one unreadable entry costs that entry rather than the rest of the
+                // catch-up. Reported rather than swallowed, so the cursor holds.
+                logger.debug("could not read change log entry [{}/{}] yet: {}", bucket, entry, e);
+                complete = false;
             }
         }
+        return complete;
     }
 
     /** Which of a bucket's prefixes an entry belongs in, derived from its own name. */

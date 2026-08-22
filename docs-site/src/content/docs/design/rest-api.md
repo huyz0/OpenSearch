@@ -3,9 +3,9 @@ title: REST API Surface
 description: The full REST endpoint table this plugin registers, grouped by subsystem.
 ---
 
-Every endpoint lives under the base path `/_plugins/_serverless/storage/...`. Each `Rest*Action` pairs 1:1 with a `Transport*Action` of the same feature name, in the same subpackage — the REST/transport layer is deliberately not centralized; every functional area owns its own `action/` subpackage (`writerengine/action`, `readerengine/action`, `retention/action`, `compaction/action`, `resharding/action`, `scaleup/action`, `scaletozero/action`, `clone/action`, `migration/action`, `wal/action`, `format/action`, `security/action`).
+Every endpoint lives under the base path `/_plugins/_serverless/storage/...`. Each `Rest*Action` pairs 1:1 with a `Transport*Action` of the same feature name, in the same subpackage — the REST/transport layer is deliberately not centralized; every functional area owns its own `action/` subpackage (`writerengine/action`, `readerengine/action`, `retention/action`, `deepsnapshot/action`, `compaction/action`, `resharding/action`, `scaleup/action`, `scaletozero/action`, `clone/action`, `migration/action`, `wal/action`, `format/action`, `security/action`, `nodecapacity/action`).
 
-New handlers here should also set `RestHandler.serverlessScope()` — see [Core Changes](/core-changes/) for what that annotation is for.
+New handlers here should also override `RestHandler.apiAvailabilityScope()` — see [Core Changes](/core-changes/) for what that is for. (Earlier versions of this page called it `serverlessScope()`; the method was renamed when the product-named REST vocabulary was removed from core.)
 
 ## Writer engine
 
@@ -70,6 +70,15 @@ New handlers here should also set `RestHandler.serverlessScope()` — see [Core 
 | POST | `index/{index}/_snapshot_pin` | Index-wide variant of pin |
 | POST | `index/{index}/_snapshot_release` | Index-wide variant of release |
 | POST | `index/{index}/_snapshot_restore` | Index-wide variant of restore |
+
+## Deep snapshot (`deepsnapshot/action`)
+
+Unlike the pointer-based pins above, these copy the bytes into a real repository, producing an ordinary snapshot restorable by a cluster that has never heard of this plugin. See [Snapshot/Restore](/design/snapshot-restore-proposal/) and [Durability Posture](/design/durability-posture/).
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `index/{index}/_snapshot_deep/{repository}/{snapshot}` | Deep-copy every shard of an index into the repository, finalizing on the cluster manager |
+| POST | `_snapshot_deep` | Per-shard variant (body-addressed), used internally by the index-wide action |
 
 ## Scale-up
 

@@ -204,11 +204,18 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done (reviewed before
       `ShardSplitCandidatesAction`'s threshold/hysteresis signal, same "signal exists, no auto
       action" boundary this plugin already draws elsewhere.
 
-      **What A15 (real end-to-end orchestration) still needs, now that the precondition is
+      **What A15 (real end-to-end orchestration) still needed, now that the precondition is
       closed**: chaining `ProvisionSplitTargetsAction` -> the existing per-partition
       `ShardSplitAction` calls -> `CutoverSplitRoutingAction` -> `EnableWritePartitionRoutingAction`
       into one resumable sequence, still explicitly operator-triggered (this action deliberately
       does not do that chaining itself). Not attempted here.
+
+      **UPDATE: A15 has since been built.** `TransportOrchestrateShardSplitAction` performs exactly
+      that chaining (provision -> split -> cutover -> fence -> enable write routing), resumable and
+      idempotent on retry, covered by
+      `...OrchestrateShardSplitActionIT#testOrchestratesTheFullSequenceAndIsResumableOnRetry`. The
+      "not attempted here" above is true of *this* increment only and is left in place as the
+      record of what this item scoped.
 
 - [x] **Elasticsearch-Serverless-style write-load autosharding -- built and verified.** Elastic
       Cloud Serverless's own "autosharding" (researched directly, not assumed) never live-splits an
@@ -276,11 +283,12 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done (reviewed before
       exists, so there is no write-loss/consistency window to solve, unlike a live-split controller
       would have.
 
-      **What A15 (real end-to-end orchestration for operator-triggered splits) still needs**:
+      **What A15 (real end-to-end orchestration for operator-triggered splits) still needed**:
       chaining `ProvisionSplitTargetsAction` -> the existing per-partition `ShardSplitAction` calls
       -> `CutoverSplitRoutingAction` -> `EnableWritePartitionRoutingAction` into one resumable
       sequence, still explicitly operator-triggered. Not attempted here -- deliberately out of
-      scope for this increment.
+      scope for this increment. **(A15 has since been built as
+      `TransportOrchestrateShardSplitAction`; see the A14 entry above for details.)**
 
 ## Effort B: Metadata-plane term-authority migration
 
@@ -508,3 +516,10 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done (reviewed before
   the REST-scope-widening precedent set earlier in this project, and for the same reason: this is a
   cross-cutting core change to shared primary-term-grant machinery, not a plugin-local decision.
   B6/B7 (TLA+ model extension) not yet started -- next candidate task.
+  **[Later correction, 2026-08-22: B8 was subsequently implemented and is checked off in the task
+  list above (`Engine#onPrimaryTermBumped` called inside `bumpPrimaryTerm`'s operations-blocked
+  window, overridden by `ObjectStoreWriterEngine`, covered by
+  `ServerlessStorageWriterReplicaPromotionIT`). This log entry is left intact as the record of the
+  bar that was set, but it should not be read as B8's current status. Whether the authorization that
+  bar called for was actually obtained is not recorded anywhere in this document — worth a
+  governance glance rather than an assumption.]**

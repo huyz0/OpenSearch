@@ -10,6 +10,7 @@ package org.opensearch.serverless.storage.retention.action;
 
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
@@ -26,6 +27,7 @@ import org.opensearch.serverless.storage.shardstate.CasResult;
 import org.opensearch.serverless.storage.shardstate.ShardHead;
 import org.opensearch.serverless.storage.shardstate.ShardStateStore;
 import org.opensearch.serverless.storage.shardstate.VersionedShardHead;
+import org.opensearch.serverless.storage.util.IndexMetadataUuidIndex;
 import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
@@ -54,7 +56,10 @@ import java.util.Set;
  * will correctly catch and fail on, not spin forever against.
  *
  * <p>Same dispatch shape as {@link TransportSnapshotPinAction}: no specific-node routing needed,
- * dispatched onto {@link ThreadPool.Names#GENERIC}.
+ * dispatched onto {@link ThreadPool.Names#GENERIC} -- and the same {@code
+ * TransportSnapshotPinAction#requireRealShard} guard on the way in, for the same reason: an
+ * unvalidated {@code indexUuid} becomes a blob path the caller chose rather than a shard the caller
+ * owns.
  */
 public class TransportSnapshotRestoreAction extends HandledTransportAction<SnapshotRestoreRequest, SnapshotRestoreResponse> {
 
@@ -63,6 +68,8 @@ public class TransportSnapshotRestoreAction extends HandledTransportAction<Snaps
 
     private final ServerlessStoragePlugin plugin;
     private final ThreadPool threadPool;
+    private final ClusterService clusterService;
+    private final IndexMetadataUuidIndex uuidIndex = new IndexMetadataUuidIndex();
 
     /**
      * Creates the transport action.
@@ -71,17 +78,20 @@ public class TransportSnapshotRestoreAction extends HandledTransportAction<Snaps
      * @param actionFilters applied by {@link HandledTransportAction} around every request.
      * @param plugin resolves each request's shard {@link BlobContainer}.
      * @param threadPool dispatches the actual restore attempt off the transport thread.
+     * @param clusterService resolves whether the requested {@code (indexUuid, shardId)} is a real shard.
      */
     @Inject
     public TransportSnapshotRestoreAction(
         TransportService transportService,
         ActionFilters actionFilters,
         ServerlessStoragePlugin plugin,
-        ThreadPool threadPool
+        ThreadPool threadPool,
+        ClusterService clusterService
     ) {
         super(SnapshotRestoreAction.NAME, transportService, actionFilters, SnapshotRestoreRequest::new);
         this.plugin = plugin;
         this.threadPool = threadPool;
+        this.clusterService = clusterService;
     }
 
     /**
@@ -93,6 +103,13 @@ public class TransportSnapshotRestoreAction extends HandledTransportAction<Snaps
     protected void doExecute(Task task, SnapshotRestoreRequest request, ActionListener<SnapshotRestoreResponse> listener) {
         threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
             try {
+                TransportSnapshotPinAction.requireRealShard(
+                    uuidIndex,
+                    clusterService.state().metadata(),
+                    request.indexUuid(),
+                    request.shardId()
+                );
+
                 // Credential scoping per tier (rfc-serverless-opensearch.md &sect;15): a restore
                 // never deletes anything (it CASes the head to point at an already-pinned
                 // generation), so this container is wrapped delete-denied.

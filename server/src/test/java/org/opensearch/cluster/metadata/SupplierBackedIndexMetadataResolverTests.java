@@ -63,10 +63,7 @@ public class SupplierBackedIndexMetadataResolverTests extends OpenSearchTestCase
         AbsentIndexDescriptorSuppliers.register(name -> "gated-index".equals(name) ? descriptor : null);
         Metadata metadata = Metadata.builder().build();
 
-        assertSame(
-            AbsentIndexDescriptorSuppliers.metadataOrDescriptor(metadata, "gated-index"),
-            resolver.resolve(metadata, "gated-index")
-        );
+        assertSame(AbsentIndexDescriptorSuppliers.metadataOrDescriptor(metadata, "gated-index"), resolver.resolve(metadata, "gated-index"));
     }
 
     private static IndexDescriptor descriptor(String name) {

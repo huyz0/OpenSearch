@@ -13,13 +13,13 @@ import org.apache.logging.log4j.Logger;
 import org.opensearch.analytics.backend.jni.NativeHandle;
 import org.opensearch.analytics.spi.QueryExecutionMetrics;
 import org.opensearch.be.datafusion.NativeErrorConverter;
+import org.opensearch.be.datafusion.stats.AnalyticsBackendTaskCancellationStats;
 import org.opensearch.be.datafusion.stats.DataFusionStats;
 import org.opensearch.be.datafusion.stats.NativeExecutorsStats;
 import org.opensearch.be.datafusion.stats.TaskMonitorStats;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.nativebridge.spi.NativeCall;
 import org.opensearch.nativebridge.spi.NativeLibraryLoader;
-import org.opensearch.plugin.stats.AnalyticsBackendTaskCancellationStats;
 import org.opensearch.plugins.NativeStoreHandle;
 
 import java.lang.foreign.Arena;

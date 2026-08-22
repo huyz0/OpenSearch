@@ -6,13 +6,12 @@
  * compatible open source license.
  */
 
-package org.opensearch.plugin.stats;
+package org.opensearch.be.datafusion.stats;
 
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
-import org.opensearch.core.common.io.stream.Writeable;
-import org.opensearch.core.xcontent.ToXContentFragment;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.plugins.PluginNodeStats;
 
 import java.io.IOException;
 import java.util.Objects;
@@ -22,8 +21,30 @@ import java.util.Objects;
  *
  * <p>Contains 4 counters tracking search tasks and search shard tasks that
  * continue executing in the analytics backend after cancellation.
+ *
+ * <p>A {@link PluginNodeStats}: read out of the native runtime by
+ * {@code NativeBridge#nativeNodeStats()} and contributed to {@code _nodes/stats} by
+ * {@code DataFusionPlugin#nodeStats()}, rendered by {@code NodeStats} under the top-level
+ * {@link #WRITEABLE_NAME} key.
+ *
+ * <p>This class used to live in {@code :server} under {@code org.opensearch.plugin.stats}, where
+ * core's {@code TaskCancellationStats} carried it as a nullable field fed through a product-named
+ * {@code SearchBackEndPlugin} SPI method and a {@code findFirst()} pick in {@code Node}. Core never
+ * read the values — it only passed them through to XContent — so the whole field was dropped from
+ * core and the type moved here, onto the generic {@code PluginNodeStats} path.
  */
-public class AnalyticsBackendTaskCancellationStats implements Writeable, ToXContentFragment {
+public class AnalyticsBackendTaskCancellationStats implements PluginNodeStats {
+
+    /**
+     * The {@code getWriteableName()} of this contribution: the wire-framing key, the
+     * {@code pluginStats} map key, and the top-level key it renders under in {@code _nodes/stats}.
+     *
+     * <p>The two objects this fragment emits keep the names they had when they rendered inside
+     * core's {@code task_cancellation} object ({@code analytics_search_task} /
+     * {@code analytics_search_shard_task}), as do their fields; only the parent key changed, from
+     * {@code task_cancellation} to this one.
+     */
+    public static final String WRITEABLE_NAME = "analytics_task_cancellation";
 
     private final long searchTaskCurrent;
     private final long searchTaskTotal;
@@ -89,6 +110,11 @@ public class AnalyticsBackendTaskCancellationStats implements Writeable, ToXCont
      */
     public long getSearchShardTaskTotal() {
         return searchShardTaskTotal;
+    }
+
+    @Override
+    public String getWriteableName() {
+        return WRITEABLE_NAME;
     }
 
     @Override

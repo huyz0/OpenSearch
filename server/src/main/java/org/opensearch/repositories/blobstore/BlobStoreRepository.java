@@ -4711,24 +4711,6 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
         long indexGeneration,
         RemoteStoreLockManagerFactory remoteStoreLockManagerFactory
     ) {
-        // Release any engine-native snapshot pointer this shard is about to lose, before computing
-        // which blobs to delete below -- best-effort (see EngineFactory#releaseEngineNativeSnapshot's
-        // own javadoc): a missing/failed release never blocks the delete itself from proceeding,
-        // it only risks the producing engine retaining something it no longer needs to.
-        //
-        // Skipped entirely when no releaser is registered on this node at all -- see
-        // EngineNativeSnapshotReleasers#isEmpty's own javadoc for why this is behaviorally
-        // identical to running the loop, just without paying a blob read per removed snapshot to
-        // confirm what an empty registry already guarantees.
-        if (EngineNativeSnapshotReleasers.isEmpty() == false) {
-            for (SnapshotId removedSnapshotId : snapshotIds) {
-                if (survivingSnapshots.contains(removedSnapshotId)) {
-                    continue;
-                }
-                releaseEngineNativeSnapshotIfPresent(shardContainer, removedSnapshotId);
-            }
-        }
-
         // Build a list of snapshots that should be preserved
         List<SnapshotFiles> newSnapshotsList = new ArrayList<>();
         final Set<String> survivingSnapshotNames = survivingSnapshots.stream().map(SnapshotId::getName).collect(Collectors.toSet());
@@ -4738,12 +4720,13 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
             }
         }
         String writtenGeneration = null;
+        final ShardSnapshotMetaDeleteResult result;
         try {
             // Using survivingSnapshots instead of newSnapshotsList as shallow snapshots can be present which won't be part of
             // newSnapshotsList
             if (survivingSnapshots.isEmpty()) {
                 // No shallow copy or full copy snapshot is surviving.
-                return new ShardSnapshotMetaDeleteResult(indexId, snapshotShardId, ShardGenerations.DELETED_SHARD_GEN, blobs);
+                result = new ShardSnapshotMetaDeleteResult(indexId, snapshotShardId, ShardGenerations.DELETED_SHARD_GEN, blobs);
             } else {
                 final BlobStoreIndexShardSnapshots updatedSnapshots;
                 // If we have surviving non shallow snapshots, update index- file.
@@ -4765,7 +4748,7 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
                     writtenGeneration = ShardGenerations.DELETED_SHARD_GEN;
                 }
                 final Set<String> survivingSnapshotUUIDs = survivingSnapshots.stream().map(SnapshotId::getUUID).collect(Collectors.toSet());
-                return new ShardSnapshotMetaDeleteResult(
+                result = new ShardSnapshotMetaDeleteResult(
                     indexId,
                     snapshotShardId,
                     writtenGeneration,
@@ -4783,14 +4766,42 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
                 e
             );
         }
+
+        // Finalize-then-release. The engine-native pointer is the durable pin that stops the producing
+        // engine from GC-ing the generation a snapshot restores from, so it must not be dropped until
+        // the new shard index blob is on disk and the snapshot is genuinely gone from this shard. If the
+        // write above throws, the delete fails and the snapshot SURVIVES in RepositoryData -- releasing
+        // beforehand would have left a surviving snapshot pointing at a generation nothing pins, i.e. an
+        // unrestorable snapshot.
+        //
+        // The release itself stays best-effort (see EngineFactory#releaseEngineNativeSnapshot's own
+        // javadoc): a missing/failed release never blocks the delete from proceeding, it only risks the
+        // producing engine retaining something it no longer needs to. The engine-native blob is included
+        // in the unused-blob list computed above, so it is removed by the caller after this returns and a
+        // re-run of the delete cannot double-release it.
+        //
+        // Skipped entirely when no releaser is registered on this node at all -- see
+        // EngineNativeSnapshotReleasers#isEmpty's own javadoc for why this is behaviorally
+        // identical to running the loop, just without paying a blob read per removed snapshot to
+        // confirm what an empty registry already guarantees.
+        if (EngineNativeSnapshotReleasers.isEmpty() == false) {
+            for (SnapshotId removedSnapshotId : snapshotIds) {
+                if (survivingSnapshots.contains(removedSnapshotId)) {
+                    continue;
+                }
+                releaseEngineNativeSnapshotIfPresent(shardContainer, removedSnapshotId);
+            }
+        }
+        return result;
     }
 
     /**
-     * Best-effort release of an engine-native snapshot pointer, called just before this shard's
-     * blobs for {@code removedSnapshotId} are computed for deletion. A missing engine-native blob
-     * (the common case -- most snapshots are classic or shallow-copy) or a missing/failed release
-     * is logged and otherwise ignored: see {@link EngineFactory#releaseEngineNativeSnapshot}'s own
-     * javadoc for why release must never block a delete from proceeding.
+     * Best-effort release of an engine-native snapshot pointer, called only after this shard's updated
+     * index- blob has been written -- i.e. once {@code removedSnapshotId} is definitively gone from the
+     * shard. A missing engine-native blob (the common case -- most snapshots are classic or
+     * shallow-copy) or a missing/failed release is logged and otherwise ignored: see
+     * {@link EngineFactory#releaseEngineNativeSnapshot}'s own javadoc for why release must never block a
+     * delete from proceeding.
      */
     private void releaseEngineNativeSnapshotIfPresent(BlobContainer shardContainer, SnapshotId removedSnapshotId) {
         final String blobName = ENGINE_NATIVE_SHARD_SNAPSHOT_FORMAT.blobName(removedSnapshotId.getUUID());
@@ -4852,7 +4863,13 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
     // Unused blobs are all previous index-, data- and meta-blobs and that are not referenced by the new index- as well as all
     // temporary blobs. If remoteStoreLockManagerFactory is non-null, the shallow-snap- files that do not belong to any of the
     // surviving snapshots are also added for cleanup.
-    private static List<String> unusedBlobs(
+    // engine-native-snap-<uuid>.dat blobs follow the same rule as snap-<uuid>.dat: they belong to exactly
+    // one snapshot, so any whose UUID is not surviving is stale. Without this the pointer blob of a
+    // removed snapshot would be orphaned for as long as any other snapshot of the shard survives (it is
+    // only swept when the whole shard container goes away), and a re-run of the same delete would read it
+    // again and release the pin a second time.
+    // Package-private (not private) so unit tests in the same package can pin the prefix rules directly.
+    static List<String> unusedBlobs(
         Set<String> blobs,
         Set<String> survivingSnapshotUUIDs,
         BlobStoreIndexShardSnapshots updatedSnapshots,
@@ -4861,6 +4878,11 @@ public abstract class BlobStoreRepository extends AbstractLifecycleComponent imp
         return blobs.stream()
             .filter(
                 blob -> blob.startsWith(SNAPSHOT_INDEX_PREFIX)
+                    || (blob.startsWith(ENGINE_NATIVE_SNAPSHOT_PREFIX)
+                        && blob.endsWith(".dat")
+                        && survivingSnapshotUUIDs.contains(
+                            blob.substring(ENGINE_NATIVE_SNAPSHOT_PREFIX.length(), blob.length() - ".dat".length())
+                        ) == false)
                     || (blob.startsWith(SNAPSHOT_PREFIX)
                         && blob.endsWith(".dat")
                         && survivingSnapshotUUIDs.contains(

@@ -31,11 +31,11 @@ It does not stop a bucket lifecycle rule, an operator with console access, a com
 
 So a snapshot taken into a GCS repository, from a cluster whose storage is in S3, does not put a single segment byte into GCS. If S3 becomes unreachable, that GCS snapshot restores nothing. The failure mode is easy to miss because the repository itself is perfectly healthy — the restore fails for a reason that is nowhere near the thing the operator is looking at. See the snapshot page for the full mechanism and for why this plugin, unlike remote-backed storage, has no classic path to fall back to.
 
-### The deep snapshot is a real copy, and is not shipped
+### The deep snapshot is a real copy, and it has shipped
 
-A snapshot that genuinely copies the bytes into the target repository has been proven end to end: a serverless index's data copied into an `fs` repository from a data node, finalized, and then restored through core's ordinary `_restore` under a new name with every document back. It produces an ordinary snapshot in the standard format, restorable by a cluster that has never heard of this plugin.
+A snapshot that genuinely copies the bytes into the target repository was first proven end to end: a serverless index's data copied into an `fs` repository from a data node, finalized, and then restored through core's ordinary `_restore` under a new name with every document back. It produces an ordinary snapshot in the standard format, restorable by a cluster that has never heard of this plugin.
 
-What exists is that proof, not a shipped API. There is no transport action, no `deep` versus `shallow` setting, and no pin lifecycle around the copy. Do not plan around it yet.
+That proof is now a shipped API. `POST /_plugins/_serverless/storage/index/{index}/_snapshot_deep/...` and its per-shard sibling are backed by real transport actions (`IndexDeepSnapshotAction`, `ShardDeepSnapshotAction` and their transports), and the pin lifecycle around the copy exists — `PinLedger` records the pin and `PinLedgerSweepTask` reclaims ledgers whose pins have lapsed.
 
 ## Fleet-wide disaster recovery is the object store's job
 
@@ -56,8 +56,8 @@ Per-index deep copy earns its keep for the cases the store cannot express: tenan
 Stated here rather than left to be discovered:
 
 - **A pin taken through `_snapshot_pin` has no automatic release.** It is released by `_snapshot_release` or not at all. A pin ledger makes a failed release retryable and abandoned pins enumerable, and an unconfirmed pin expires after ten minutes — but a confirmed pin whose owner never comes back holds its generation indefinitely, which is what "pin" means and is why the operator-visible listing matters more than a timer.
-- **Nothing sweeps ledgers whose pins have lapsed**, and nothing reconciles a ledger against the pins it names in either direction.
-- **A deep snapshot's pin lifecycle does not exist yet**, because the copy is a prototype. When it is built, the release has to be on both paths: a deep snapshot's repository entry carries no pin id, so unlike the pointer snapshot, the repository cannot serve as the ledger and a crashed copy would leak a pin nothing can find.
+- **Ledger sweeping exists (`PinLedgerSweepTask`), but nothing reconciles a ledger against the pins it names in either direction.** A ledger entry naming a pin the store no longer holds, or a held pin no ledger names, is still undetected.
+- **A deep snapshot's pin lifecycle now exists**, and the constraint that shaped it is still worth knowing: a deep snapshot's repository entry carries no pin id, so unlike the pointer snapshot the repository cannot serve as the ledger — which is why the separate `PinLedger` exists and why a crashed copy is reclaimed by the sweep rather than by the repository.
 - **Sub-commit precision is not available.** A point-in-time restore lands on the last commit at or before the instant, not on the instant. Going finer needs WAL records to carry a timestamp, which they do not.
 
 ## Related

@@ -225,7 +225,6 @@ import org.opensearch.persistent.PersistentTasksClusterService;
 import org.opensearch.persistent.PersistentTasksExecutor;
 import org.opensearch.persistent.PersistentTasksExecutorRegistry;
 import org.opensearch.persistent.PersistentTasksService;
-import org.opensearch.plugin.stats.AnalyticsBackendTaskCancellationStats;
 import org.opensearch.plugin.stats.NativeAllocatorPoolStats;
 import org.opensearch.plugin.stats.NativeAllocatorStatsRegistry;
 import org.opensearch.plugins.ActionPlugin;
@@ -1343,13 +1342,6 @@ public class Node implements Closeable {
                 .collect(Collectors.toList());
             pluginComponents.addAll(searchBackEndPluginComponents);
 
-            pluginsService.filterPlugins(SearchBackEndPlugin.class)
-                .stream()
-                .map(SearchBackEndPlugin::getAnalyticsBackendNativeMemoryStats)
-                .filter(Objects::nonNull)
-                .findFirst()
-                .ifPresent(supplier -> monitorService.memoryReportingService().setNativeStatsSupplier(supplier));
-
             List<SearchStatsContributor> searchStatsContributors = pluginsService.filterPlugins(SearchStatsContributor.class);
             if (searchStatsContributors.isEmpty() == false) {
                 indicesService.setSearchStatsContributors(searchStatsContributors);
@@ -1751,14 +1743,10 @@ public class Node implements Closeable {
                 settings,
                 clusterService.getClusterSettings()
             );
-            final Supplier<AnalyticsBackendTaskCancellationStats> analyticsTaskCancellationStatsSupplier = pluginsService.filterPlugins(
-                SearchBackEndPlugin.class
-            ).stream().map(SearchBackEndPlugin::getAnalyticsBackendTaskCancellationStats).filter(Objects::nonNull).findFirst().orElse(null);
             final TaskCancellationMonitoringService taskCancellationMonitoringService = new TaskCancellationMonitoringService(
                 threadPool,
                 transportService.getTaskManager(),
-                taskCancellationMonitoringSettings,
-                analyticsTaskCancellationStatsSupplier
+                taskCancellationMonitoringSettings
             );
 
             this.nodeService = new NodeService(

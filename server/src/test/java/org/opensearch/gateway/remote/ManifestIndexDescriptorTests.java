@@ -12,15 +12,18 @@ import org.opensearch.Version;
 import org.opensearch.cluster.metadata.AliasMetadata;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.metadata.IndexMetadataHolder;
+import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.xcontent.json.JsonXContent;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.bytes.BytesReference;
+import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.io.EOFException;
 import java.io.IOException;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -134,5 +137,23 @@ public class ManifestIndexDescriptorTests extends OpenSearchTestCase {
             .numberOfReplicas(1)
             .putAlias(AliasMetadata.builder("descriptor-alias").searchRouting("r").build())
             .build();
+    }
+
+    /**
+     * The alias count used to pre-size the map that receives the aliases -- {@code new
+     * HashMap<>(aliasCount)} -- straight from the wire, before a single alias was read. That is the
+     * cheap-input shape: the map allocates nothing on construction, so the count sailed past any
+     * "did you actually read that many bytes" intuition, and then the FIRST put built a table sized
+     * for the claimed count. A manifest blob claiming a billion aliases and carrying one was enough.
+     * Reading the list through the guarded path bounds the count by the bytes behind it.
+     */
+    public void testAnImpossiblyLargeAliasCountIsRejectedRatherThanPreSized() throws IOException {
+        BytesStreamOutput out = new BytesStreamOutput();
+        out.writeByte(IndexMetadata.State.OPEN.id());
+        out.writeVInt(1_000_000_000);
+
+        try (StreamInput in = out.bytes().streamInput()) {
+            expectThrows(EOFException.class, () -> new ManifestIndexDescriptor(in));
+        }
     }
 }

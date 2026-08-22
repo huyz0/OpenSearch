@@ -19,8 +19,6 @@ import org.opensearch.env.NodeEnvironment;
 import org.opensearch.index.engine.dataformat.DataFormatRegistry;
 import org.opensearch.index.engine.dataformat.ReaderManagerConfig;
 import org.opensearch.index.engine.exec.EngineReaderManager;
-import org.opensearch.plugin.stats.AnalyticsBackendNativeMemoryStats;
-import org.opensearch.plugin.stats.AnalyticsBackendTaskCancellationStats;
 import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.script.ScriptService;
 import org.opensearch.threadpool.ThreadPool;
@@ -144,27 +142,12 @@ public interface SearchBackEndPlugin<R> {
         );
     }
 
-    /**
-     * Returns a supplier for native task cancellation stats, or {@code null} if not available.
-     * <p>
-     * The server calls this supplier on each {@code _nodes/stats} request to fetch
-     * native task cancellation counters from the execution engine.
-     *
-     * @return a supplier of native task cancellation stats, or null
-     */
-    default @Nullable Supplier<AnalyticsBackendTaskCancellationStats> getAnalyticsBackendTaskCancellationStats() {
-        return null;
-    }
-
-    /**
-     * Returns a supplier for native memory stats, or {@code null} if not available.
-     * <p>
-     * The server calls this supplier on each {@code _nodes/stats} request to fetch
-     * jemalloc memory metrics from the native layer.
-     *
-     * @return a supplier of native memory stats, or null
-     */
-    default @Nullable Supplier<AnalyticsBackendNativeMemoryStats> getAnalyticsBackendNativeMemoryStats() {
-        return null;
-    }
+    // NOTE: this interface used to declare two more SPI methods —
+    // getAnalyticsBackendTaskCancellationStats() and getAnalyticsBackendNativeMemoryStats() —
+    // each returning a Supplier of a plugin-specific stats type that had to live in :server for
+    // core to name it. Node picked ONE arbitrary backend's supplier via findFirst() and pushed it
+    // into core services. Both stats now travel the generic Plugin#nodeStats() /
+    // Plugin#getNamedWriteables() path instead, so a backend contributes them itself, every
+    // installed backend is represented rather than just the first, and neither stats type needs
+    // to exist on the core classpath. Do not reintroduce product-specific stats SPI here.
 }

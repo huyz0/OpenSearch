@@ -30,7 +30,7 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -84,7 +84,11 @@ class CompositeWriter implements Writer<CompositeDocumentInput> {
         // acquires a NativeFSLock on construction, tracked in a static LOCK_HELD set. If not
         // closed, the path remains in LOCK_HELD and on engine restart (same JVM) when the
         // generation counter re-produces the same value, a LockObtainFailedException is thrown.
-        Map<DataFormat, Writer<DocumentInput<?>>> secondaries = new IdentityHashMap<>();
+        // LinkedHashMap keyed by DataFormat: addDoc iterates the document's secondary inputs and
+        // looks each one's writer up here, then rolls back the writers it touched "in order", and
+        // flush() iterates these writers directly — all of which need a defined, stable order.
+        // The engine hands out its secondaries in a fixed order, so this map inherits it.
+        Map<DataFormat, Writer<DocumentInput<?>>> secondaries = new LinkedHashMap<>();
         try {
             for (IndexingExecutionEngine<?, ?> delegate : engine.getSecondaryDelegates()) {
                 Writer<DocumentInput<?>> secondary = (Writer<DocumentInput<?>>) delegate.createWriter(config);
@@ -122,7 +126,9 @@ class CompositeWriter implements Writer<CompositeDocumentInput> {
         // Count every write attempt so write_*_failures can be read as a rate.
         statsTracker.incWriteTotal();
 
-        // Roll back exactly the writers we've called addDoc on, in order.
+        // Roll back exactly the writers we've called addDoc on, in order. The order is real, not
+        // incidental: the document's secondary inputs and this writer's secondary writers are both
+        // LinkedHashMaps built from the engine's fixed secondary ordering.
         List<Writer<DocumentInput<?>>> touched = new ArrayList<>();
         touched.add(primaryWriter);
         WriteResult primaryResult = primaryWriter.addDoc(doc.getPrimaryInput());

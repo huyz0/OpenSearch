@@ -109,6 +109,50 @@ public class ReaderShardPreWarmCoordinatorTests extends OpenSearchTestCase {
         );
     }
 
+    /**
+     * <b>The dedup this class used to argue it did not need.</b> Its comment read "ClusterStateApplier
+     * only fires on a real state transition, and previousNodeIds() only changes when withNodes shifts the
+     * epoch, so reaching here with a non-empty previous epoch already means something changed since the
+     * last transition. No separate dedup needed." Every clause is true and the conclusion is not:
+     * {@code previousNodeIds()} is non-empty permanently after the first epoch change, and an applier
+     * fires on every transition, so after one membership change every later cluster state event -- an
+     * index created, a suspension tick, anything -- re-dispatched the whole fan-out to the same targets.
+     * The per-event budget bounded each burst and nothing ever ended them.
+     */
+    public void testAnUnchangedMembershipIsNotAnEpochTransition() {
+        ComputedPlacementMembership membership = ComputedPlacementMembership.of(
+            List.of("node-a", "node-b", "node-c"),
+            List.of("node-a", "node-b"),
+            2L
+        );
+        // The identical membership republished, which is what every ordinary cluster state event carries.
+        org.opensearch.cluster.ClusterState state = stateWith(membership);
+
+        assertFalse(
+            "an event that does not change the membership must not re-run the fan-out, however non-empty " + "the previous epoch is",
+            ReaderShardPreWarmCoordinator.membershipChanged(new org.opensearch.cluster.ClusterChangedEvent("test", state, state))
+        );
+    }
+
+    /** And a real epoch transition still is one, or the fix would simply disable pre-warming. */
+    public void testARealEpochTransitionIsDetected() {
+        ComputedPlacementMembership before = ComputedPlacementMembership.of(List.of("node-a", "node-b"), List.of("node-a"), 2L);
+        ComputedPlacementMembership after = before.withNodes(List.of("node-c"));
+
+        assertTrue(
+            "a membership that actually gained a node must be acted on",
+            ReaderShardPreWarmCoordinator.membershipChanged(
+                new org.opensearch.cluster.ClusterChangedEvent("test", stateWith(after), stateWith(before))
+            )
+        );
+    }
+
+    private static org.opensearch.cluster.ClusterState stateWith(ComputedPlacementMembership membership) {
+        return org.opensearch.cluster.ClusterState.builder(org.opensearch.cluster.ClusterName.DEFAULT)
+            .metadata(org.opensearch.cluster.metadata.Metadata.builder().putCustom(ComputedPlacementMembership.TYPE, membership).build())
+            .build();
+    }
+
     public void testEmptyPreviousEpochProducesNoNewlyEligibleNodes() {
         // No previous epoch to diff against -- the coordinator itself short-circuits this case before
         // calling newlyEligibleCandidates at all (see applyClusterState's own early return), but the

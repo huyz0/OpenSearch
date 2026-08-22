@@ -22,9 +22,16 @@ import java.util.concurrent.ConcurrentMap;
  * acts as a thin shared lookup so engines can self-register their per-shard trackers
  * with the right provider via {@link #get(String)}.
  *
- * <p>The SPI library is loaded by composite-engine's classloader and shared with
- * dependent plugins via {@code extendedPlugins}, so a single registry instance is
- * shared across all plugins in a node JVM.
+ * <p><b>Scope:</b> this registry is per-classloader, not JVM-global. Each data-format plugin
+ * bundles its own copy of this SPI library so that no plugin has to extend another purely to
+ * borrow the jar, which means a node running several format plugins has several independent
+ * registry instances. That is sound only because every use is intra-plugin: a plugin registers
+ * exactly one provider under its own format name and only that plugin's REST/transport actions
+ * look that name up. Do not add a cross-plugin lookup (e.g. iterating {@link #all()} to report
+ * on formats owned by other plugins) — it would silently see only the calling plugin's
+ * providers. A genuinely shared registry would first need this library to move somewhere every
+ * format plugin already sits below, such as the server's {@code org.opensearch.plugin.stats}
+ * package where {@code NativeAllocatorStatsRegistry} already lives.
  *
  * @opensearch.experimental
  */

@@ -73,7 +73,14 @@ public class LuceneDataFormat extends DataFormat {
         return LUCENE_FORMAT_NAME;
     }
 
-    /** {@inheritDoc} Returns {@code 50}, lower than the primary Parquet format. */
+    /**
+     * {@inheritDoc}
+     * <p>
+     * {@code priority()} is a <em>precedence rank</em>: every place that orders formats sorts
+     * <b>ascending</b> and takes the earliest match, so a <b>lower</b> number is consulted
+     * <b>sooner</b>. {@code 50} therefore ranks behind Parquet's {@code 0} — Parquet claims a
+     * capability first and Lucene picks up whatever Parquet cannot serve.
+     */
     @Override
     public long priority() {
         return 50L;

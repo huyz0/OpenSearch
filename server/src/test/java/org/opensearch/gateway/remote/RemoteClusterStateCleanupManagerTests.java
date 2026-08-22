@@ -53,6 +53,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 
+import org.mockito.InOrder;
+
 import static org.opensearch.gateway.remote.ClusterMetadataManifest.CODEC_V1;
 import static org.opensearch.gateway.remote.ClusterMetadataManifest.CODEC_V2;
 import static org.opensearch.gateway.remote.ClusterMetadataManifest.CODEC_V3;
@@ -88,6 +90,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
@@ -163,6 +166,11 @@ public class RemoteClusterStateCleanupManagerTests extends OpenSearchTestCase {
         // mock would return an empty list unconditionally, which would make every "keep" and "stale"
         // computation over indices silently see nothing, not matching production behaviour at all.
         when(remoteManifestManager.resolveIndices(any(ClusterMetadataManifest.class))).thenAnswer(
+            invocation -> ((ClusterMetadataManifest) invocation.getArgument(0)).getIndices()
+        );
+        // The stale-manifest half of the sweep uses the tolerant variant instead (a stale manifest whose
+        // shard blobs are already gone must not wedge cleanup), so it needs the same passthrough.
+        when(remoteManifestManager.resolveIndicesToleratingMissingShards(any(ClusterMetadataManifest.class))).thenAnswer(
             invocation -> ((ClusterMetadataManifest) invocation.getArgument(0)).getIndices()
         );
         remoteClusterStateService = mock(RemoteClusterStateService.class);
@@ -334,6 +342,74 @@ public class RemoteClusterStateCleanupManagerTests extends OpenSearchTestCase {
         verify(container).deleteBlobsAsyncIgnoringIfNotExists(eq(new ArrayList<>(staleManifest)), any());
         verify(remoteRoutingTableService).deleteStaleIndexRoutingPaths(List.of(index3Metadata.getUploadedFilename()));
         verifyNoMoreInteractions(container);
+    }
+
+    /**
+     * The stale manifest shard blobs must be deleted <em>after</em> the manifests that reference them, and
+     * this test exists because getting that order wrong wedges cleanup permanently rather than merely
+     * leaking.
+     *
+     * <p>The failure it locks out: shard blobs deleted first, then the manifest delete fails transiently.
+     * The manifest is still stale on the next sweep, resolving it needs the shard blobs that are now gone,
+     * that resolution threw, and the sweep rethrew before ever reaching the manifest delete -- so cleanup
+     * never progressed again and remote state grew without bound. Deleting the manifest first makes that
+     * shape unreachable: once the manifest is gone, no later sweep has to resolve it.
+     */
+    public void testStaleManifestShardBlobsAreDeletedAfterTheManifestsThatReferenceThem() throws IOException {
+        String clusterUUID = "clusterUUID";
+        String clusterName = "test-cluster";
+        List<BlobMetadata> inactiveBlobs = List.of(new PlainBlobMetadata("manifest1.dat", 1L));
+        List<BlobMetadata> activeBlobs = List.of(new PlainBlobMetadata("manifest2.dat", 1L));
+
+        UploadedMetadataAttribute coordinationMetadata = new UploadedMetadataAttribute(COORDINATION_METADATA, "coordination_metadata");
+        UploadedMetadataAttribute templateMetadata = new UploadedMetadataAttribute(TEMPLATES_METADATA, "template_metadata");
+        UploadedMetadataAttribute settingMetadata = new UploadedMetadataAttribute(SETTING_METADATA, "settings_metadata");
+        String staleShardBlob = "manifest/shards/manifest-shard__0__stale";
+
+        ClusterMetadataManifest activeManifest = ClusterMetadataManifest.builder()
+            .indices(List.of())
+            .coordinationMetadata(coordinationMetadata)
+            .templatesMetadata(templateMetadata)
+            .settingMetadata(settingMetadata)
+            .clusterTerm(1L)
+            .stateVersion(1L)
+            .codecVersion(ClusterMetadataManifest.MANIFEST_CURRENT_CODEC_VERSION)
+            .stateUUID(randomAlphaOfLength(10))
+            .clusterUUID(clusterUUID)
+            .nodeId("nodeA")
+            .opensearchVersion(VersionUtils.randomOpenSearchVersion(random()))
+            .previousClusterUUID(ClusterState.UNKNOWN_UUID)
+            .committed(true)
+            .routingTableVersion(0L)
+            .build();
+        // The stale one is sharded, and its shard blob is referenced by nothing that is being retained.
+        ClusterMetadataManifest staleManifest = ClusterMetadataManifest.builder(activeManifest)
+            .manifestShardCount(1)
+            .indexMetadataShards(List.of(new UploadedManifestShard(0, staleShardBlob, 0)))
+            .build();
+
+        AsyncMultiStreamBlobContainer container = mock(AsyncMultiStreamBlobContainer.class);
+        doAnswer(invocation -> {
+            ActionListener<Void> listener = invocation.getArgument(1);
+            listener.onResponse(null);
+            return null;
+        }).when(container).deleteBlobsAsyncIgnoringIfNotExists(any(), any());
+        when(blobStore.blobContainer(any())).thenReturn(container);
+        when(remoteManifestManager.getManifestFolderPath(eq(clusterName), eq(clusterUUID))).thenReturn(
+            new BlobPath().add(encodeString(clusterName)).add(CLUSTER_STATE_PATH_TOKEN).add(clusterUUID).add(MANIFEST)
+        );
+        when(remoteManifestManager.fetchRemoteClusterMetadataManifest(eq(clusterName), eq(clusterUUID), any())).thenReturn(
+            activeManifest,
+            staleManifest
+        );
+
+        remoteClusterStateCleanupManager.start();
+        remoteClusterStateCleanupManager.deleteClusterMetadata(clusterName, clusterUUID, activeBlobs, inactiveBlobs);
+
+        String staleManifestPath = remoteManifestManager.getManifestFolderPath(clusterName, clusterUUID).buildAsString() + "manifest1.dat";
+        InOrder inOrder = inOrder(container);
+        inOrder.verify(container).deleteBlobsAsyncIgnoringIfNotExists(eq(List.of(staleManifestPath)), any());
+        inOrder.verify(container).deleteBlobsAsyncIgnoringIfNotExists(eq(List.of(staleShardBlob)), any());
     }
 
     /**

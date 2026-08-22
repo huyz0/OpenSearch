@@ -10,12 +10,14 @@ package org.opensearch.serverless.storage.retention.action;
 
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.serverless.storage.ServerlessStoragePlugin;
 import org.opensearch.serverless.storage.retention.BlobContainerDurablePinRegistry;
 import org.opensearch.serverless.storage.security.RestrictingBlobContainer;
+import org.opensearch.serverless.storage.util.IndexMetadataUuidIndex;
 import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportService;
@@ -29,12 +31,17 @@ import org.opensearch.transport.TransportService;
  *
  * <p>Same dispatch shape as {@link TransportSnapshotPinAction}: no specific-node routing needed
  * (pure object-store I/O against the shard's own container), dispatched onto {@link
- * ThreadPool.Names#GENERIC} rather than the transport thread.
+ * ThreadPool.Names#GENERIC} rather than the transport thread -- and the same {@code
+ * TransportSnapshotPinAction#requireRealShard} guard on the way in, for the same reason: an
+ * unvalidated {@code indexUuid} becomes a blob path the caller chose rather than a shard the caller
+ * owns.
  */
 public class TransportSnapshotReleaseAction extends HandledTransportAction<SnapshotReleaseRequest, SnapshotReleaseResponse> {
 
     private final ServerlessStoragePlugin plugin;
     private final ThreadPool threadPool;
+    private final ClusterService clusterService;
+    private final IndexMetadataUuidIndex uuidIndex = new IndexMetadataUuidIndex();
 
     /**
      * Creates the transport action.
@@ -43,17 +50,20 @@ public class TransportSnapshotReleaseAction extends HandledTransportAction<Snaps
      * @param actionFilters applied by {@link HandledTransportAction} around every request.
      * @param plugin resolves each request's shard {@link BlobContainer}.
      * @param threadPool dispatches the actual release attempt off the transport thread.
+     * @param clusterService resolves whether the requested {@code (indexUuid, shardId)} is a real shard.
      */
     @Inject
     public TransportSnapshotReleaseAction(
         TransportService transportService,
         ActionFilters actionFilters,
         ServerlessStoragePlugin plugin,
-        ThreadPool threadPool
+        ThreadPool threadPool,
+        ClusterService clusterService
     ) {
         super(SnapshotReleaseAction.NAME, transportService, actionFilters, SnapshotReleaseRequest::new);
         this.plugin = plugin;
         this.threadPool = threadPool;
+        this.clusterService = clusterService;
     }
 
     /**
@@ -65,6 +75,13 @@ public class TransportSnapshotReleaseAction extends HandledTransportAction<Snaps
     protected void doExecute(Task task, SnapshotReleaseRequest request, ActionListener<SnapshotReleaseResponse> listener) {
         threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
             try {
+                TransportSnapshotPinAction.requireRealShard(
+                    uuidIndex,
+                    clusterService.state().metadata(),
+                    request.indexUuid(),
+                    request.shardId()
+                );
+
                 // Credential scoping per tier (rfc-serverless-opensearch.md &sect;15): removePin is
                 // a CAS-based mutate, not a raw blob delete, so this container is wrapped
                 // delete-denied.

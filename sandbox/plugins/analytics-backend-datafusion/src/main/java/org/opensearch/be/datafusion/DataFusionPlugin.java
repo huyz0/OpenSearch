@@ -23,6 +23,7 @@ import org.opensearch.be.datafusion.cache.CacheManager;
 import org.opensearch.be.datafusion.cache.CacheSettings;
 import org.opensearch.be.datafusion.cache.CacheUtils;
 import org.opensearch.be.datafusion.nativelib.NativeBridge;
+import org.opensearch.be.datafusion.stats.AnalyticsBackendTaskCancellationStats;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.service.ClusterService;
@@ -52,16 +53,16 @@ import org.opensearch.index.engine.exec.EngineReaderManager;
 import org.opensearch.index.engine.exec.IndexReaderProvider;
 import org.opensearch.index.get.DocumentLookupResult;
 import org.opensearch.indices.breaker.BreakerSettings;
+import org.opensearch.nativebridge.spi.AnalyticsBackendNativeMemoryStats;
 import org.opensearch.nativebridge.spi.NativeMemoryFetcher;
 import org.opensearch.nativebridge.spi.RustLoggerBridge;
 import org.opensearch.node.resource.tracker.ResourceTrackerSettings;
-import org.opensearch.plugin.stats.AnalyticsBackendNativeMemoryStats;
-import org.opensearch.plugin.stats.AnalyticsBackendTaskCancellationStats;
 import org.opensearch.plugins.ActionPlugin;
 import org.opensearch.plugins.CircuitBreakerPlugin;
 import org.opensearch.plugins.DocumentLookupProvider;
 import org.opensearch.plugins.NativeStoreHandle;
 import org.opensearch.plugins.Plugin;
+import org.opensearch.plugins.PluginNodeStats;
 import org.opensearch.plugins.SearchBackEndPlugin;
 import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.rest.RestController;
@@ -1018,25 +1019,63 @@ public class DataFusionPlugin extends Plugin
         this.datafusionBreaker = circuitBreaker;
     }
 
-    public Supplier<AnalyticsBackendTaskCancellationStats> getAnalyticsBackendTaskCancellationStats() {
-        return () -> {
-            try {
-                return NativeBridge.nativeNodeStats();
-            } catch (Exception e) {
-                return new AnalyticsBackendTaskCancellationStats(0, 0, 0, 0);
-            }
-        };
+    /**
+     * Contributes this backend's node stats to {@code _nodes/stats} through the generic
+     * {@link PluginNodeStats} path, rendered under the top-level {@code getWriteableName()} of each
+     * contribution:
+     * <ul>
+     *   <li>{@link AnalyticsBackendTaskCancellationStats#WRITEABLE_NAME} {@code = "analytics_task_cancellation"}
+     *       — post-cancellation search / search-shard task counters read out of the native runtime.</li>
+     *   <li>{@link AnalyticsBackendNativeMemoryStats#WRITEABLE_NAME} {@code = "analytics_backend"}
+     *       — jemalloc allocated / resident bytes plus the arena purge count.</li>
+     * </ul>
+     *
+     * <p>Replaces the two {@code SearchBackEndPlugin} SPI methods core used to call, which forced
+     * both stats types onto the {@code :server} classpath and let {@code Node} surface only the
+     * first backend plugin's values. A failed native read degrades to a zeroed / {@code -1}
+     * snapshot rather than failing the whole {@code _nodes/stats} call, exactly as the old
+     * suppliers did.
+     */
+    @Override
+    public List<PluginNodeStats> nodeStats() {
+        AnalyticsBackendTaskCancellationStats cancellationStats;
+        try {
+            cancellationStats = NativeBridge.nativeNodeStats();
+        } catch (Exception e) {
+            logger.debug("Failed to fetch analytics backend task cancellation stats", e);
+            cancellationStats = new AnalyticsBackendTaskCancellationStats(0, 0, 0, 0);
+        }
+        AnalyticsBackendNativeMemoryStats memoryStats;
+        try {
+            memoryStats = NativeMemoryFetcher.fetch();
+        } catch (Exception e) {
+            logger.debug("Failed to fetch analytics backend native memory stats", e);
+            memoryStats = new AnalyticsBackendNativeMemoryStats(-1, -1, 0);
+        }
+        return List.of(cancellationStats, memoryStats);
     }
 
+    /**
+     * Registers the {@link PluginNodeStats} entries the {@code NodeStats} wire framing needs: the
+     * coordinator deserializes each per-node plugin payload via
+     * {@code readNamedWriteable(PluginNodeStats.class)}, resolving by the contribution's
+     * {@code getWriteableName()}. Without these entries a coordinator would skip this plugin's
+     * framed entries instead of decoding them.
+     */
     @Override
-    public Supplier<AnalyticsBackendNativeMemoryStats> getAnalyticsBackendNativeMemoryStats() {
-        return () -> {
-            try {
-                return NativeMemoryFetcher.fetch();
-            } catch (Exception e) {
-                return new AnalyticsBackendNativeMemoryStats(-1, -1, 0);
-            }
-        };
+    public List<NamedWriteableRegistry.Entry> getNamedWriteables() {
+        return List.of(
+            new NamedWriteableRegistry.Entry(
+                PluginNodeStats.class,
+                AnalyticsBackendTaskCancellationStats.WRITEABLE_NAME,
+                AnalyticsBackendTaskCancellationStats::new
+            ),
+            new NamedWriteableRegistry.Entry(
+                PluginNodeStats.class,
+                AnalyticsBackendNativeMemoryStats.WRITEABLE_NAME,
+                AnalyticsBackendNativeMemoryStats::new
+            )
+        );
     }
 
     @Override

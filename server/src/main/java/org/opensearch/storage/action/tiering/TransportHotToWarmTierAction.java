@@ -26,6 +26,7 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.support.DefaultShardOperationFailedException;
 import org.opensearch.core.index.Index;
+import org.opensearch.index.IndexModule;
 import org.opensearch.storage.common.tiering.TieringUtils;
 import org.opensearch.storage.tiering.HotToWarmTieringService;
 import org.opensearch.threadpool.ThreadPool;
@@ -92,8 +93,9 @@ public class TransportHotToWarmTierAction extends TransportTierAction {
             // If validation fails (e.g. warm nodes full, too many concurrent requests),
             // reject immediately without adding a write block or running prepare.
             // Note: validation also runs inside TieringService.tier() for double-safety.
+            final Index index;
             try {
-                Index index = resolveRequestIndex(indexNameExpressionResolver, request.getIndex(), state);
+                index = resolveRequestIndex(indexNameExpressionResolver, request.getIndex(), state);
                 hotToWarmTieringService.preflightValidate(state, index);
             } catch (Exception e) {
                 logger.info("Preflight validation failed for DFA index [{}]: {}", request.getIndex(), e.getMessage());
@@ -101,7 +103,7 @@ public class TransportHotToWarmTierAction extends TransportTierAction {
                 return;
             }
             logger.info("Index [{}] is a DFA index, adding write block and performing pre-tiering sync", request.getIndex());
-            addWriteBlockAndPrepare(request, state, listener);
+            addWriteBlockAndPrepare(request, index, state, listener);
         } else {
             super.clusterManagerOperation(request, state, listener);
         }
@@ -112,8 +114,27 @@ public class TransportHotToWarmTierAction extends TransportTierAction {
      * {@code blocks.write} setting (persisted in index metadata, cleanly reverted on cancel/failure) and
      * the {@link IndexMetadata#INDEX_WRITE_BLOCK} cluster block (enforced immediately). On success,
      * proceeds to step 2 (prepare tiering).
+     * <p>
+     * The index is marked prepare-in-progress on the tiering service for the whole flow. That mark is
+     * what stops {@code TieringService}'s orphan sweep from lifting the block we just added while this
+     * preparation is still running; because the mark lives only in this cluster-manager's memory, a
+     * preparation orphaned by a cluster-manager failover is correctly swept up by its successor instead
+     * of leaving the index write-blocked forever.
      */
-    private void addWriteBlockAndPrepare(IndexTieringRequest request, ClusterState state, ActionListener<AcknowledgedResponse> listener) {
+    private void addWriteBlockAndPrepare(
+        IndexTieringRequest request,
+        Index index,
+        ClusterState state,
+        ActionListener<AcknowledgedResponse> listener
+    ) {
+        hotToWarmTieringService.markPrepareInProgress(index);
+        // Every exit of the flow below — success, async failure, or synchronous throw — goes through
+        // this listener, so the mark is always cleared. By the time a success reaches it the index is
+        // already tracked in tieringIndices, so the block stays protected without a gap.
+        final ActionListener<AcknowledgedResponse> unmarkingListener = ActionListener.runAfter(
+            listener,
+            () -> hotToWarmTieringService.clearPrepareInProgress(index)
+        );
         clusterService.submitStateUpdateTask(
             "add-write-block-for-tiering [" + request.getIndex() + "]",
             new ClusterStateUpdateTask(Priority.URGENT) {
@@ -131,13 +152,13 @@ public class TransportHotToWarmTierAction extends TransportTierAction {
                 @Override
                 public void clusterStateProcessed(String source, ClusterState oldState, ClusterState newState) {
                     logger.info("Write block added for index [{}], proceeding with pre-tiering sync", request.getIndex());
-                    executePrepareTiering(request, newState, listener, 1);
+                    executePrepareTiering(request, newState, unmarkingListener, 1);
                 }
 
                 @Override
                 public void onFailure(String source, Exception e) {
                     logger.error(() -> "Failed to add write block for index [" + request.getIndex() + "]", e);
-                    listener.onFailure(
+                    unmarkingListener.onFailure(
                         new IllegalStateException("Failed to add write block for DFA index [" + request.getIndex() + "]. Please retry.", e)
                     );
                 }
@@ -328,6 +349,15 @@ public class TransportHotToWarmTierAction extends TransportTierAction {
      * the persisted {@code index.blocks.write} setting (and bumps {@code settingsVersion}) only when it
      * actually changes. Skipping the no-op rewrite avoids bumping {@code settingsVersion} without a real
      * settings change, which would violate the {@code IndexService.updateMetadata} invariant.
+     * <p>
+     * When blocking, {@code INDEX_TIERING_STATE} is written explicitly as {@code HOT} alongside the
+     * block. The value is durable, so it survives the cluster-manager failing over mid-preparation, and
+     * it is what lets {@code TieringService}'s orphan sweep tell a tiering-owned write block on a hot
+     * index apart from one a user set on an index tiering has never touched (which has no
+     * {@code INDEX_TIERING_STATE} at all and must be left alone). It is <em>not</em> a state transition:
+     * the index really is HOT throughout preparation, {@code tier()} is what moves it to
+     * {@code HOT_TO_WARM} later, and writing HOT here cannot unfreeze anything because engines are only
+     * frozen after this step.
      *
      * @param currentState  the current cluster state
      * @param indexMetadata the (non-null) metadata of the index to update
@@ -346,14 +376,22 @@ public class TransportHotToWarmTierAction extends TransportTierAction {
             blocks.removeIndexBlock(indexName, IndexMetadata.INDEX_WRITE_BLOCK);
         }
 
-        // Setting already matches the desired state — only (re)assert the cluster block, no version bump.
-        if (IndexMetadata.INDEX_BLOCKS_WRITE_SETTING.get(indexMetadata.getSettings()) == blockWrites) {
+        final boolean blockSettingMatches = IndexMetadata.INDEX_BLOCKS_WRITE_SETTING.get(indexMetadata.getSettings()) == blockWrites;
+        final boolean needsTieringStateMarker = blockWrites
+            && IndexModule.TieringState.HOT.name()
+                .equals(indexMetadata.getSettings().get(IndexModule.INDEX_TIERING_STATE.getKey())) == false;
+
+        // Settings already match the desired state — only (re)assert the cluster block, no version bump.
+        if (blockSettingMatches && needsTieringStateMarker == false) {
             return ClusterState.builder(currentState).blocks(blocks).build();
         }
 
         Settings.Builder indexSettingsBuilder = Settings.builder()
             .put(indexMetadata.getSettings())
             .put(IndexMetadata.INDEX_BLOCKS_WRITE_SETTING.getKey(), blockWrites);
+        if (needsTieringStateMarker) {
+            indexSettingsBuilder.put(IndexModule.INDEX_TIERING_STATE.getKey(), IndexModule.TieringState.HOT.name());
+        }
 
         IndexMetadata.Builder indexMetadataBuilder = IndexMetadata.builder(indexMetadata)
             .settings(indexSettingsBuilder)

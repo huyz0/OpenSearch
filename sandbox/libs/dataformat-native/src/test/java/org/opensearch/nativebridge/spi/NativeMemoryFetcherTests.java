@@ -8,7 +8,6 @@
 
 package org.opensearch.nativebridge.spi;
 
-import org.opensearch.plugin.stats.AnalyticsBackendNativeMemoryStats;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**

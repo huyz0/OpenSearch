@@ -95,6 +95,10 @@ public class SnapshotRestoreRequest extends ActionRequest {
         ActionRequestValidationException validationException = null;
         if (indexUuid == null || indexUuid.isEmpty()) {
             validationException = addValidationError("indexUuid is required", validationException);
+        } else if (SnapshotPinRequest.isWellFormedIndexUuid(indexUuid) == false) {
+            // See SnapshotPinRequest#isWellFormedIndexUuid for why this boundary check exists
+            // alongside the authoritative cluster-metadata resolution in the transport action.
+            validationException = addValidationError(SnapshotPinRequest.INDEX_UUID_CHARSET_ERROR, validationException);
         }
         if (shardId < 0) {
             validationException = addValidationError("shardId must be >= 0", validationException);

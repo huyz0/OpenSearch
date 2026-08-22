@@ -10,6 +10,9 @@ package org.opensearch.serverless.storage.compaction.action;
 
 import org.opensearch.action.support.ActionFilters;
 import org.opensearch.action.support.HandledTransportAction;
+import org.opensearch.cluster.metadata.IndexMetadata;
+import org.opensearch.cluster.metadata.Metadata;
+import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.core.action.ActionListener;
@@ -22,6 +25,7 @@ import org.opensearch.serverless.storage.manifest.BlobContainerManifestStore;
 import org.opensearch.serverless.storage.readerengine.ObjectStoreCommitMaterializer;
 import org.opensearch.serverless.storage.shardstate.BlobContainerShardStateStore;
 import org.opensearch.serverless.storage.shardstate.ShardStateStore;
+import org.opensearch.serverless.storage.util.IndexMetadataUuidIndex;
 import org.opensearch.serverless.storage.writerengine.ObjectStoreCommitPublisher;
 import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
@@ -44,6 +48,16 @@ import org.opensearch.transport.TransportService;
  * <p>Dispatched onto {@link ThreadPool.Names#GENERIC}, not run on the transport thread directly:
  * a compaction attempt does real blob-store I/O (reads the manifest, potentially opens and merges
  * segments, and CASes a new head), which must never block a transport/network thread.
+ *
+ * <p><b>Resolves the request's {@code indexUuid} against cluster metadata before touching the
+ * object store</b>, exactly as {@code TransportShardSplitAction} and {@code
+ * TransportMigrateShardAction} already do. {@link
+ * ServerlessStoragePlugin#blobContainerForDirectoryFactory} builds a blob path out of whatever
+ * string it is handed ({@code BlobPath.cleanPath().add(indexUuid)}), and the underlying store
+ * resolves path segments without normalising them -- so an unvalidated uuid is a path the caller
+ * chooses, not a shard the caller owns. Requiring the uuid to name a real, currently-existing index
+ * makes the check "this names a shard that exists" rather than the far weaker "this string looks
+ * harmless".
  */
 public class TransportCompactionTriggerAction extends HandledTransportAction<CompactionTriggerRequest, CompactionTriggerResponse> {
 
@@ -52,6 +66,12 @@ public class TransportCompactionTriggerAction extends HandledTransportAction<Com
 
     private final ServerlessStoragePlugin plugin;
     private final ThreadPool threadPool;
+    private final ClusterService clusterService;
+    // A real Guice singleton (see this constructor's own @Inject), so doExecute can use this
+    // concurrently across different in-flight requests -- IndexMetadataUuidIndex's own volatile-field
+    // cache is documented safe under exactly that access pattern. Same field, same reasoning, as
+    // TransportShardSplitAction's own copy.
+    private final IndexMetadataUuidIndex uuidIndex = new IndexMetadataUuidIndex();
 
     /**
      * Creates the transport action.
@@ -60,17 +80,59 @@ public class TransportCompactionTriggerAction extends HandledTransportAction<Com
      * @param actionFilters applied by {@link HandledTransportAction} around every request.
      * @param plugin resolves each request's shard {@link BlobContainer}.
      * @param threadPool dispatches the actual compaction attempt off the transport thread.
+     * @param clusterService resolves whether the requested {@code (indexUuid, shardId)} is a real shard.
      */
     @Inject
     public TransportCompactionTriggerAction(
         TransportService transportService,
         ActionFilters actionFilters,
         ServerlessStoragePlugin plugin,
-        ThreadPool threadPool
+        ThreadPool threadPool,
+        ClusterService clusterService
     ) {
         super(CompactionTriggerAction.NAME, transportService, actionFilters, CompactionTriggerRequest::new);
         this.plugin = plugin;
         this.threadPool = threadPool;
+        this.clusterService = clusterService;
+    }
+
+    /**
+     * Resolves {@code indexUuid} to a real index in {@code metadata}, and {@code shardId} to a real
+     * shard of it, or throws.
+     *
+     * <p>The same resolution {@code TransportShardSplitAction#requireRealShard} performs, and the
+     * same error-message shape, deliberately: a uuid that names nothing is reported as "does not
+     * exist" rather than being passed through to build a blob path out of.
+     *
+     * <p>The shard bound accepts an id at or beyond {@code getNumberOfShards()} when the index's
+     * split metadata knows it: an in-place split reserves child shard ids past the base range
+     * <em>without</em> growing {@code number_of_shards} (see {@code
+     * IndexMetadata#inSyncAllocationIds}), and a split child is a perfectly ordinary compaction
+     * target. Rejecting on the base count alone would have made this refuse real shards.
+     *
+     * @throws IllegalArgumentException if {@code indexUuid} doesn't resolve to a real,
+     *                                  currently-existing index, or {@code shardId} isn't one of its
+     *                                  shards.
+     */
+    // Visible for testing: pure metadata resolution, exercisable without a plugin or a blob store.
+    static void requireRealShard(IndexMetadataUuidIndex uuidIndex, Metadata metadata, String indexUuid, int shardId) {
+        IndexMetadata indexMetadata = uuidIndex.findByUuid(metadata, indexUuid);
+        if (indexMetadata == null) {
+            throw new IllegalArgumentException("index [" + indexUuid + "] does not exist");
+        }
+        if (shardId >= indexMetadata.getNumberOfShards() && indexMetadata.getSplitShardsMetadata().getRangeOfShard(shardId) == null) {
+            throw new IllegalArgumentException(
+                "shard ["
+                    + shardId
+                    + "] is out of bounds for index ["
+                    + indexMetadata.getIndex().getName()
+                    + "]["
+                    + indexUuid
+                    + "], which has "
+                    + indexMetadata.getNumberOfShards()
+                    + " shard(s)"
+            );
+        }
     }
 
     /**
@@ -82,6 +144,8 @@ public class TransportCompactionTriggerAction extends HandledTransportAction<Com
     protected void doExecute(Task task, CompactionTriggerRequest request, ActionListener<CompactionTriggerResponse> listener) {
         threadPool.executor(ThreadPool.Names.GENERIC).execute(() -> {
             try {
+                requireRealShard(uuidIndex, clusterService.state().metadata(), request.indexUuid(), request.shardId());
+
                 // Credential scoping per tier (rfc-serverless-opensearch.md &sect;15): the
                 // compaction service needs GET+PUT but no DELETE (deletion stays with GC) --
                 // CompactionSchedulerTask#maybeCompact never calls delete through any of the

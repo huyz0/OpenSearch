@@ -49,6 +49,10 @@ internalClusterTest {
 
 dependencies {
   api project(':libs:opensearch-concurrent-queue')
+  // Plugin stats SPI for this plugin's own composite-format stats. Bundled for our use only —
+  // parquet-data-format and analytics-backend-lucene bundle their own copies rather than
+  // extending this plugin to borrow ours, so that the lower layers stay installable without
+  // the orchestrator.
   implementation project(':sandbox:libs:plugin-stats-spi')
   compileOnly project(':server')
   testImplementation project(':test:framework')

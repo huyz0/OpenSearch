@@ -55,8 +55,9 @@ import java.util.function.BiFunction;
  * entirely for that tick rather than guessing a bound that could delete something still needed.
  *
  * <p><b>{@code clusterService} ({@code null} to always sweep, non-{@code null} to run only on
- * the elected cluster-manager)</b>: {@link WalShardRegistry} is a single durable, CAS-backed
- * register shared by the whole cluster, so every node's sweep of a shared, cluster-wide {@code
+ * the elected cluster-manager)</b>: {@link WalShardRegistry} is one durable registry shared by the
+ * whole cluster (a listing of per-shard marker blobs, plus whatever a pre-marker build left in the
+ * legacy register -- see that class's own javadoc), so every node's sweep of a shared, cluster-wide {@code
  * walBlobContainer} would compute the exact same {@code minCoveredSequence} bound from the exact
  * same registered-shard list -- running it on every node multiplies the same object-store read
  * traffic (one {@link ShardStateStore} read and one manifest read per registered shard, every

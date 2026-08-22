@@ -46,7 +46,7 @@ request today, and the rest are latent. Nothing yet makes an index routing-absen
 | A7.5 clusterless shard-started | reviewed, no change needed |
 | A7.6 integration coverage | done, tested |
 | C3b first slice (shard ref type) | done, tested |
-| C5 codec bump | blocked: needs a release-version decision |
+| C5 codec bump | done: resolved as direction 1 (3.8 unreleased), `CODEC_V6` mapped at `V_3_8_0` |
 | D1 integration test | done, passes; C5+C6 work end to end |
 | D1b diagnose the deferral gap | done: harness, not code |
 | D1c force a real remote read | done, that was the fix |
@@ -506,7 +506,19 @@ win is real; this implements it, and must also add the transitive cleanup resolu
 Read the top-level manifest, then the shards. For a full-state read that is all shards; check whether
 anything wants a single index without reading all of them.
 
-### C5. Codec bump -- BLOCKED on a release decision that is not mine
+### C5. Codec bump -- RESOLVED as direction 1; the rest of Phase C is unblocked
+
+> **Resolution (recorded 2026-08-22, after the fact).** The code took **direction 1**:
+> `VERSION_TO_CODEC_MAPPING` now maps `V_3_8_0` to `CODEC_V6` and `MANIFEST_CURRENT_CODEC_VERSION` is
+> `CODEC_V6`, written unconditionally by every node on this build (see `ClusterMetadataManifest`'s
+> static-initializer comment, which documents that as deliberate fork policy). That is only sound on the
+> premise that no released cluster wrote a `CODEC_V5` manifest — i.e. 3.8 was treated as unreleased.
+> **This document never recorded who took that decision or when**, which is exactly the gap the section
+> below asks to have closed; whoever owns release context should confirm the premise still holds. The
+> consequence is unchanged and worth restating: a repository written by this fork is no longer readable
+> by stock OpenSearch, a one-way door. C3b, C4 and C6 are all implemented on top of this.
+
+The original analysis follows, kept as the decision record.
 
 The mechanics are settled and unchanged: new `CODEC_V6`, its own parser, an entry in
 `VERSION_TO_CODEC_MAPPING`, a `CLUSTER_METADATA_MANIFEST_FORMAT_V5` for reading what is already in
@@ -538,8 +550,8 @@ someone with the release context should make in one sentence, recorded here so i
 than rediscovered.
 
 **Consequence for the rest of Phase C.** C3b's write path, C4's read path and C6's measurement all
-need a codec to write into, so all three are blocked behind this. The first slice of C3b that does not
--- the `UploadedManifestShard` reference type -- has landed.
+need a codec to write into, so all three were blocked behind this. *(All three have since landed on
+`CODEC_V6` — see the resolution note at the top of this section.)*
 
 ### C6. Measure
 

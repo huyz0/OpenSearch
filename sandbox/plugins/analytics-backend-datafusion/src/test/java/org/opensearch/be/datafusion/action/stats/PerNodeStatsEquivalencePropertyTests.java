@@ -8,8 +8,6 @@
 
 package org.opensearch.be.datafusion.action.stats;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-
 import org.opensearch.Version;
 import org.opensearch.be.datafusion.stats.DataFusionStats;
 import org.opensearch.be.datafusion.stats.NativeExecutorsStats;
@@ -24,6 +22,7 @@ import org.opensearch.core.common.transport.TransportAddress;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;
 import java.net.InetAddress;
@@ -33,17 +32,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-import net.jqwik.api.Arbitraries;
-import net.jqwik.api.Arbitrary;
-import net.jqwik.api.Combinators;
-import net.jqwik.api.ForAll;
-import net.jqwik.api.Property;
-import net.jqwik.api.Provide;
-
-import static org.junit.jupiter.api.Assertions.assertEquals;
-
 /**
- * Property-based tests for per-node stats equivalence.
+ * Randomized tests for per-node stats equivalence.
  *
  * <p>Feature: datafusion-cluster-stats, Property 2: Per-node stats equivalence
  *
@@ -55,86 +45,84 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  *
  * <p><b>Validates: Requirements 2.4</b>
  */
-public class PerNodeStatsEquivalencePropertyTests {
+public class PerNodeStatsEquivalencePropertyTests extends OpenSearchTestCase {
 
-    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final int TRIES = 150;
 
     /** Metadata fields that were previously added by DataFusionStatsNodesResponse (now removed). */
     private static final Set<String> NODE_METADATA_FIELDS = Set.of();
 
     // ---- Object generators ----
 
-    @Provide
-    Arbitrary<RuntimeMetrics> runtimeMetrics() {
-        return Arbitraries.longs()
-            .between(0, Long.MAX_VALUE / 2)
-            .list()
-            .ofSize(9)
-            .map(l -> new RuntimeMetrics(l.get(0), l.get(1), l.get(2), l.get(3), l.get(4), l.get(5), l.get(6), l.get(7), l.get(8)));
+    private long nonNegLong() {
+        return randomLongBetween(0, Long.MAX_VALUE / 2);
     }
 
-    @Provide
-    Arbitrary<TaskMonitorStats> taskMonitorStats() {
-        Arbitrary<Long> nonNeg = Arbitraries.longs().between(0, Long.MAX_VALUE / 2);
-        return Combinators.combine(nonNeg, nonNeg, nonNeg).as(TaskMonitorStats::new);
+    private RuntimeMetrics runtimeMetrics() {
+        return new RuntimeMetrics(
+            nonNegLong(),
+            nonNegLong(),
+            nonNegLong(),
+            nonNegLong(),
+            nonNegLong(),
+            nonNegLong(),
+            nonNegLong(),
+            nonNegLong(),
+            nonNegLong()
+        );
+    }
+
+    /** RuntimeMetrics with {@code workersCount > 0}, marking the CPU runtime as present. */
+    private RuntimeMetrics runtimeMetricsWithPositiveWorkers() {
+        return new RuntimeMetrics(
+            randomLongBetween(1, Long.MAX_VALUE / 2),
+            nonNegLong(),
+            nonNegLong(),
+            nonNegLong(),
+            nonNegLong(),
+            nonNegLong(),
+            nonNegLong(),
+            nonNegLong(),
+            nonNegLong()
+        );
+    }
+
+    private TaskMonitorStats taskMonitorStats() {
+        return new TaskMonitorStats(nonNegLong(), nonNegLong(), nonNegLong(), nonNegLong(), nonNegLong());
+    }
+
+    private Map<String, TaskMonitorStats> taskMonitors() {
+        Map<String, TaskMonitorStats> monitors = new LinkedHashMap<>();
+        monitors.put("coordinator_reduce", taskMonitorStats());
+        monitors.put("query_execution", taskMonitorStats());
+        monitors.put("stream_next", taskMonitorStats());
+        monitors.put("plan_setup", taskMonitorStats());
+        return monitors;
     }
 
     /** DataFusionStats with all sections populated (CPU runtime present). */
-    @Provide
-    Arbitrary<DataFusionStats> dataFusionStatsFullCpuPresent() {
-        return Combinators.combine(runtimeMetrics(), runtimeMetrics().map(rt -> {
-            if (rt.workersCount == 0) {
-                return new RuntimeMetrics(
-                    1,
-                    rt.totalPollsCount,
-                    rt.totalBusyDurationMs,
-                    rt.totalOverflowCount,
-                    rt.globalQueueDepth,
-                    rt.blockingQueueDepth,
-                    rt.numAliveTasks,
-                    rt.spawnedTasksCount,
-                    rt.totalLocalQueueDepth
-                );
-            }
-            return rt;
-        }), taskMonitorStats(), taskMonitorStats(), taskMonitorStats(), taskMonitorStats()).as((io, cpu, cr, qe, sn, ps) -> {
-            Map<String, TaskMonitorStats> monitors = new LinkedHashMap<>();
-            monitors.put("coordinator_reduce", cr);
-            monitors.put("query_execution", qe);
-            monitors.put("stream_next", sn);
-            monitors.put("plan_setup", ps);
-            return new DataFusionStats(
-                new NativeExecutorsStats(io, cpu, monitors),
-                new PartitionGateStats("fragment_executor_gate", 12, 3, 100, 50, 0, 12, 0, 0),
-                null,
-                null
-            );
-        });
+    private DataFusionStats dataFusionStatsFullCpuPresent() {
+        return new DataFusionStats(
+            new NativeExecutorsStats(runtimeMetrics(), runtimeMetricsWithPositiveWorkers(), taskMonitors()),
+            new PartitionGateStats("fragment_executor_gate", 12, 3, 100, 50, 0, 12, 0, 0),
+            null,
+            null
+        );
     }
 
     /** DataFusionStats with CPU runtime absent. */
-    @Provide
-    Arbitrary<DataFusionStats> dataFusionStatsFullCpuAbsent() {
-        return Combinators.combine(runtimeMetrics(), taskMonitorStats(), taskMonitorStats(), taskMonitorStats(), taskMonitorStats())
-            .as((io, cr, qe, sn, ps) -> {
-                Map<String, TaskMonitorStats> monitors = new LinkedHashMap<>();
-                monitors.put("coordinator_reduce", cr);
-                monitors.put("query_execution", qe);
-                monitors.put("stream_next", sn);
-                monitors.put("plan_setup", ps);
-                return new DataFusionStats(
-                    new NativeExecutorsStats(io, null, monitors),
-                    new PartitionGateStats("fragment_executor_gate", 12, 3, 100, 50, 0, 12, 0, 0),
-                    null,
-                    null
-                );
-            });
+    private DataFusionStats dataFusionStatsFullCpuAbsent() {
+        return new DataFusionStats(
+            new NativeExecutorsStats(runtimeMetrics(), null, taskMonitors()),
+            new PartitionGateStats("fragment_executor_gate", 12, 3, 100, 50, 0, 12, 0, 0),
+            null,
+            null
+        );
     }
 
     /** Combined DataFusionStats generator (CPU present or absent). */
-    @Provide
-    Arbitrary<DataFusionStats> dataFusionStats() {
-        return Arbitraries.oneOf(dataFusionStatsFullCpuPresent(), dataFusionStatsFullCpuAbsent());
+    private DataFusionStats dataFusionStats() {
+        return randomBoolean() ? dataFusionStatsFullCpuPresent() : dataFusionStatsFullCpuAbsent();
     }
 
     // ---- Property 2: Per-node stats equivalence ----
@@ -148,22 +136,24 @@ public class PerNodeStatsEquivalencePropertyTests {
      *
      * <p><b>Validates: Requirements 2.4</b>
      */
-    @Property(tries = 150)
-    @SuppressWarnings("unchecked")
-    void perNodeStatsMatchDirectRendering(@ForAll("dataFusionStats") DataFusionStats stats) throws Exception {
-        // Step 1: Render DataFusionStats directly
-        Map<String, Object> directMap = renderStatsDirect(stats);
+    public void testPerNodeStatsMatchDirectRendering() throws Exception {
+        for (int i = 0; i < TRIES; i++) {
+            DataFusionStats stats = dataFusionStats();
 
-        // Step 2: Wrap in a DataFusionStatsNodeResponse + DataFusionStatsNodesResponse and render
-        Map<String, Object> wrappedMap = renderStatsViaNodesResponse(stats);
+            // Step 1: Render DataFusionStats directly
+            Map<String, Object> directMap = renderStatsDirect(stats);
 
-        // Step 3: Compare — they should be identical
-        assertEquals(
-            directMap,
-            wrappedMap,
-            "Stats rendered directly via DataFusionStats.toXContent must equal "
-                + "the stats portion extracted from DataFusionStatsNodesResponse per-node entry"
-        );
+            // Step 2: Wrap in a DataFusionStatsNodeResponse + DataFusionStatsNodesResponse and render
+            Map<String, Object> wrappedMap = renderStatsViaNodesResponse(stats);
+
+            // Step 3: Compare — they should be identical
+            assertEquals(
+                "Stats rendered directly via DataFusionStats.toXContent must equal "
+                    + "the stats portion extracted from DataFusionStatsNodesResponse per-node entry",
+                directMap,
+                wrappedMap
+            );
+        }
     }
 
     // ---- Helper methods ----
@@ -172,7 +162,6 @@ public class PerNodeStatsEquivalencePropertyTests {
      * Renders DataFusionStats directly: {@code builder.startObject(); stats.toXContent(builder, params); builder.endObject();}
      * then parses to a Map.
      */
-    @SuppressWarnings("unchecked")
     private Map<String, Object> renderStatsDirect(DataFusionStats stats) throws IOException {
         XContentBuilder builder = XContentFactory.jsonBuilder();
         builder.startObject();
@@ -186,6 +175,9 @@ public class PerNodeStatsEquivalencePropertyTests {
      * puts it in a DataFusionStatsNodesResponse, renders to JSON, extracts the
      * per-node entry from the "nodes" object, and removes the metadata fields
      * (name, host, transport_address) to isolate just the stats portion.
+     *
+     * <p>{@link #NODE_METADATA_FIELDS} is intentionally empty today: the response no
+     * longer emits any per-node metadata, so the whole entry is the stats portion.
      */
     @SuppressWarnings("unchecked")
     private Map<String, Object> renderStatsViaNodesResponse(DataFusionStats stats) throws Exception {

@@ -99,14 +99,13 @@ import java.util.stream.Collectors;
  *       differ from the cluster defaults</li>
  * </ul>
  *
- * <p>Format plugins (e.g., Parquet) extend this plugin by declaring
- * {@code extendedPlugins = ['composite-engine']} in their {@code build.gradle}
- * and implementing {@link DataFormatPlugin}.
- *
- * <p>Implements {@link ExtensiblePlugin} so that other data-format plugins (parquet, lucene)
- * can declare {@code extendedPlugins=['composite-engine']} in their plugin descriptors. This
- * makes composite-engine's bundled {@code plugin-stats-spi} classes available to those plugins'
- * classloaders — ensuring all formats share the same {@link DataFormatStatsProviderRegistry}.
+ * <p>Format plugins (e.g., Parquet, Lucene) are discovered at runtime through the
+ * {@link DataFormatRegistry}; they implement {@link DataFormatPlugin} and do <em>not</em> need to
+ * declare {@code extendedPlugins = ['composite-engine']}. They previously did so only to borrow
+ * this plugin's bundled {@code plugin-stats-spi} jar, which inverted the layering by making the
+ * data formats uninstallable without the orchestrator above them; each now bundles that SPI
+ * itself and uses it strictly for its own format (see
+ * {@link DataFormatStatsProviderRegistry}'s scope note).
  *
  * @opensearch.experimental
  */
@@ -199,6 +198,22 @@ public class CompositeDataFormatPlugin extends Plugin implements DataFormatPlugi
         Setting.Property.IndexScope,
         Setting.Property.Dynamic
     );
+
+    /**
+     * The one ordering the composite uses for data formats.
+     * <p>
+     * {@link DataFormat#priority()} is a <em>precedence rank</em>: this sort and
+     * {@code DataFormatRegistry.supportsCapability} both order <b>ascending</b> and take the
+     * earliest match, so a <b>lower</b> number is preferred <b>sooner</b> (parquet {@code 0}
+     * before lucene {@code 50}, with {@link CompositeDataFormat} at {@link Long#MAX_VALUE} as the
+     * last-resort fallback). {@link java.util.List#sort} is stable, so formats of equal priority
+     * keep the order they were configured in.
+     * <p>
+     * {@link CompositeIndexingExecutionEngine} sorts its secondary engines with this same
+     * comparator, so the order in which a format claims capabilities is the order it is written
+     * in.
+     */
+    public static final Comparator<DataFormat> PRECEDENCE_ORDER = Comparator.comparingLong(DataFormat::priority);
 
     public CompositeDataFormatPlugin() {}
 
@@ -389,7 +404,7 @@ public class CompositeDataFormatPlugin extends Plugin implements DataFormatPlugi
             .filter(name -> name != null && name.isEmpty() == false)
             .map(name -> dataFormatRegistry.getRegisteredFormats().stream().filter(f -> f.name().equals(name)).findFirst().orElse(null))
             .filter(Objects::nonNull)
-            .sorted(Comparator.comparingLong(DataFormat::priority))
+            .sorted(PRECEDENCE_ORDER)
             .forEach(configured::add);
         return List.copyOf(configured);
     }

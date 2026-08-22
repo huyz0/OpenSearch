@@ -365,7 +365,9 @@ final class Security {
                         propertiesSet.add(property);
                         String previous = System.setProperty(property, directory);
                         if (previous != null) {
-                            throw new IllegalStateException("plugin directory-setting property already set: " + property + " -> " + previous);
+                            throw new IllegalStateException(
+                                "plugin directory-setting property already set: " + property + " -> " + previous
+                            );
                         }
                     }
                 }

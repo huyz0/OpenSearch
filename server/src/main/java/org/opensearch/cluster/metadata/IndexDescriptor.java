@@ -337,7 +337,14 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         this.shardCount = in.readVInt();
         this.searchOnlyReplicaCount = in.readVInt();
         this.claimed = in.readBoolean();
-        this.state = State.values()[in.readVInt()];
+        // readEnum rather than State.values()[readVInt()], and the difference is not stylistic. These bytes
+        // are read back from an object-store blob, so a truncated or corrupt register decodes here, and an
+        // unchecked array index turns that into an ArrayIndexOutOfBoundsException from inside a constructor
+        // -- an error no caller in this package catches, on a path whose whole contract is to distinguish
+        // "absent" from "could not be read". readEnum raises an IOException instead, which
+        // BlobDescriptorBackend.decode already maps onto DescriptorUnavailableException. The encoding is
+        // identical: writeEnum is writeVInt(ordinal), so nothing already in the store changes meaning.
+        this.state = in.readEnum(State.class);
         this.aliases = List.copyOf(in.readStringList());
         this.createdVersion = in.readVLong();
         this.system = in.readBoolean();
@@ -364,7 +371,9 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
         out.writeVInt(shardCount);
         out.writeVInt(searchOnlyReplicaCount);
         out.writeBoolean(claimed);
-        out.writeVInt(state.ordinal());
+        // Byte-for-byte what writeVInt(state.ordinal()) wrote, paired with the readEnum above so the two
+        // sides name the same primitive rather than one of them open-coding it.
+        out.writeEnum(state);
         out.writeStringCollection(aliases);
         out.writeVLong(createdVersion);
         out.writeBoolean(system);
@@ -658,65 +667,17 @@ public final class IndexDescriptor implements Writeable, ToXContentObject {
      */
     public static final long FIRST_PRIMARY_TERM = 1L;
 
-    /** Compact stream serialization for Object Storage blobs. */
-    public void writeCompact(StreamOutput out) throws IOException {
-        out.writeString(name);
-        out.writeString(uuid);
-        out.writeVInt(shardCount);
-        out.writeVInt(searchOnlyReplicaCount);
-        out.writeBoolean(claimed);
-        out.writeEnum(state);
-        out.writeVLong(createdVersion);
-        out.writeBoolean(system);
-        out.writeBoolean(hidden);
-        out.writeBoolean(remoteSnapshot);
-        out.writeBoolean(warm);
-        out.writeVLong(mappingGeneration);
-        out.writeVLong(creationDate);
-        out.writeVInt(routingNumShards);
-        out.writeVInt(routingPartitionSize);
-        out.writeVLong(deletedAtMillis);
-    }
-
-    public static IndexDescriptor readCompact(StreamInput in) throws IOException {
-        String name = in.readString();
-        String uuid = in.readString();
-        int shardCount = in.readVInt();
-        int searchOnlyReplicaCount = in.readVInt();
-        boolean claimed = in.readBoolean();
-        State state = in.readEnum(State.class);
-        long createdVersion = in.readVLong();
-        boolean system = in.readBoolean();
-        boolean hidden = in.readBoolean();
-        boolean remoteSnapshot = in.readBoolean();
-        boolean warm = in.readBoolean();
-        long mappingGeneration = in.readVLong();
-        long creationDate = in.readVLong();
-        int routingNumShards = in.readVInt();
-        int routingPartitionSize = in.readVInt();
-        long deletedAtMillis = in.readVLong();
-
-        return new IndexDescriptor(
-            name,
-            uuid,
-            shardCount,
-            searchOnlyReplicaCount,
-            claimed,
-            state,
-            List.of(),
-            createdVersion,
-            system,
-            hidden,
-            remoteSnapshot,
-            warm,
-            mappingGeneration,
-            creationDate,
-            routingNumShards,
-            routingPartitionSize,
-            deletedAtMillis,
-            null
-        );
-    }
+    // There was a second serialisation here, writeCompact/readCompact, described as "compact stream
+    // serialization for Object Storage blobs". Nothing wrote a blob with it: the object store goes through
+    // BlobDescriptorBackend.encode/decode, which uses writeTo and this class's stream constructor behind a
+    // format magic and a version. Its only caller was a test asserting it round-tripped.
+    //
+    // It is deleted rather than wired because it was not merely unused, it was lossy: readCompact rebuilt
+    // the descriptor with List.of() for aliases and null for the initial mapping, both silently. Anything
+    // that had adopted it for a real blob would have dropped every alias and every declared field of every
+    // index it read, which is the exact shape of failure this area keeps producing -- a mechanism that is
+    // correct-looking, tested, and wrong in the one direction nobody asserts on. A second wire format for
+    // one type is also the thing S6's format magic exists to make unnecessary.
 
     /** The same descriptor at a new mapping generation, which is what a mapping update records. */
     public IndexDescriptor withMappingGeneration(long generation) {

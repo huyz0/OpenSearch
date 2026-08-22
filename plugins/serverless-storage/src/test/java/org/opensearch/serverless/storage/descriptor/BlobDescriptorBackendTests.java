@@ -261,6 +261,135 @@ public class BlobDescriptorBackendTests extends OpenSearchTestCase {
         assertEquals(recreated.uuid(), read.uuid());
     }
 
+    /**
+     * A recreated name reads as live even when the tombstone was read -- and therefore cached -- first.
+     *
+     * <p>The existing recreation test never had a tombstone in the cache, because its last read happened
+     * before the delete. Any node that resolved the name while it was deleted did cache one: {@code
+     * readFromStore} answers a deleted name with its tombstone rather than with null, deliberately, and the
+     * cache admits it like any other hit. Creation invalidated nothing, so the recreated index read back as
+     * deleted for the whole freshness window -- a minute, by this backend's own default -- and could not be
+     * used at all in the meantime. That is read-your-writes, which both this interface and
+     * {@code DescriptorCache} state as a contract.
+     */
+    public void testARecreatedNameIsNotShadowedByACachedTombstone() throws Exception {
+        BlobDescriptorBackend backend = backendOver(createTempDir());
+        IndexDescriptor original = descriptor("serverless_tenant-a");
+        assertTrue(backend.create(original));
+        backend.putTombstoneAsync(original.tombstoned());
+
+        // Somebody resolves the name while it is deleted, which is what puts the tombstone in the cache.
+        assertFalse(backend.get("serverless_tenant-a").exists());
+
+        IndexDescriptor recreated = descriptor("serverless_tenant-a");
+        assertTrue(backend.create(recreated));
+
+        IndexDescriptor read = backend.get("serverless_tenant-a");
+        assertTrue("an index that exists must not read as deleted", read.exists());
+        assertEquals(recreated.uuid(), read.uuid());
+    }
+
+    /**
+     * And the same staleness must not make a retried creation look like a name collision.
+     *
+     * <p>{@code createIdempotently} answers a lost create by reading the name back and comparing uuids. That
+     * read goes through the cache, so a descriptor cached before either attempt -- here, the tombstone left
+     * by the delete -- decided the answer. A creation that had actually succeeded was reported as TAKEN.
+     */
+    public void testARetriedCreationIsNotToldTheNameIsTakenByAStaleCacheEntry() throws Exception {
+        BlobDescriptorBackend backend = backendOver(createTempDir());
+        IndexDescriptor first = descriptor("serverless_tenant-a");
+        assertTrue(backend.create(first));
+        backend.putTombstoneAsync(first.tombstoned());
+        assertFalse(backend.get("serverless_tenant-a").exists());
+
+        IndexDescriptor mine = descriptor("serverless_tenant-a");
+        assertEquals(DescriptorBackend.CreateOutcome.CREATED, backend.createIdempotently(mine));
+        assertEquals(
+            "the acknowledgement was lost, not the creation",
+            DescriptorBackend.CreateOutcome.ALREADY_MINE,
+            backend.createIdempotently(mine)
+        );
+    }
+
+    /**
+     * A read for update carries the version to write back under, and it does not come from the cache.
+     */
+    public void testAReadForUpdateCarriesTheVersionAndSeesTheStore() throws Exception {
+        Path shared = createTempDir();
+        BlobDescriptorBackend backend = backendOver(shared);
+        BlobDescriptorBackend otherNode = backendOver(shared);
+        IndexDescriptor original = descriptor("serverless_tenant-a");
+        assertTrue(backend.create(original));
+
+        // Warm this backend's cache, then change the descriptor from somewhere else entirely.
+        assertNotNull(backend.get("serverless_tenant-a"));
+        otherNode.put(original.withAliases(List.of("written-elsewhere")));
+
+        DescriptorBackend.VersionedDescriptor forUpdate = backend.getForUpdate("serverless_tenant-a");
+        assertEquals(
+            "a read that is about to become a write must not come from a cache",
+            List.of("written-elsewhere"),
+            forUpdate.descriptor().aliases()
+        );
+        assertNotEquals(DescriptorBackend.UNVERSIONED, forUpdate.storeVersion());
+    }
+
+    /**
+     * The property the mapping compare-and-swap rests on: of two writers at one version, exactly one wins
+     * and the loser is told so rather than overwriting.
+     *
+     * <p>This is the data loss finding. {@code put} used to answer a lost conditional write by retrying at
+     * the winner's generation, which is not a retry but a guaranteed overwrite, and the mapping swap sat on
+     * top of it. Two shards inferring different dynamic fields both read generation N, both were told they
+     * succeeded, and one field was erased while documents carrying it were being indexed.
+     */
+    public void testOfTwoConditionalWritesAtOneVersionExactlyOneWins() throws Exception {
+        BlobDescriptorBackend backend = backendOver(createTempDir());
+        IndexDescriptor original = descriptor("serverless_tenant-a");
+        assertTrue(backend.create(original));
+
+        DescriptorBackend.VersionedDescriptor observed = backend.getForUpdate("serverless_tenant-a");
+        long version = observed.storeVersion();
+
+        assertTrue(backend.compareAndSwap(observed.descriptor().withAliases(List.of("first")), version));
+        assertFalse(
+            "the second writer observed the same version and must lose rather than clobber",
+            backend.compareAndSwap(observed.descriptor().withAliases(List.of("second")), version)
+        );
+
+        assertEquals(List.of("first"), backend.get("serverless_tenant-a").aliases());
+    }
+
+    /** A losing conditional write drops the cached copy, so the caller's re-read sees what actually won. */
+    public void testALostConditionalWriteLeavesNoStaleCacheEntryBehind() throws Exception {
+        BlobDescriptorBackend backend = backendOver(createTempDir());
+        IndexDescriptor original = descriptor("serverless_tenant-a");
+        assertTrue(backend.create(original));
+
+        DescriptorBackend.VersionedDescriptor observed = backend.getForUpdate("serverless_tenant-a");
+        assertTrue(backend.compareAndSwap(observed.descriptor().withAliases(List.of("winner")), observed.storeVersion()));
+        assertFalse(backend.compareAndSwap(observed.descriptor().withAliases(List.of("loser")), observed.storeVersion()));
+
+        assertEquals(
+            "the loser is about to re-read and must not be served the value that just lost",
+            List.of("winner"),
+            backend.get("serverless_tenant-a").aliases()
+        );
+    }
+
+    /** A conditional write needs an observed version; UNVERSIONED means the caller never read one. */
+    public void testAConditionalWriteRefusesToBeUnconditional() throws Exception {
+        BlobDescriptorBackend backend = backendOver(createTempDir());
+        IndexDescriptor original = descriptor("serverless_tenant-a");
+        assertTrue(backend.create(original));
+
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> backend.compareAndSwap(original.withAliases(List.of("x")), DescriptorBackend.UNVERSIONED)
+        );
+    }
+
     public void testThereIsNothingToBootstrap() throws Exception {
         assertTrue(backendOver(createTempDir()).available());
     }

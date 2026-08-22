@@ -9,7 +9,9 @@
 package org.opensearch.action.admin.cluster.stats;
 
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Field type counts for the gated population, as one aggregate rather than an enumeration.
@@ -33,7 +35,9 @@ import java.util.concurrent.atomic.AtomicReference;
  * <p>The counts are inherently as fresh as that projection's last refresh, because an aggregation is a
  * search -- and, since the projection is written behind the mapping rather than with it, as fresh as
  * whatever has been projected. Both bounds are the right trade here: the alternative is a statistic bounded
- * by nothing because it was too expensive to compute.
+ * by nothing because it was too expensive to compute. {@link #aggregate()} adds a third bound of the same
+ * order by reusing its result for {@link #CACHE_TTL_NANOS}; see that field for why a statistic already
+ * bounded twice loses nothing by being bounded a third time, and gains not being recomputed per poll.
  */
 public final class GatedMappingStatsAggregator {
 
@@ -70,11 +74,50 @@ public final class GatedMappingStatsAggregator {
 
     private static final AtomicReference<Aggregator> AGGREGATOR = new AtomicReference<>();
 
+    /**
+     * How long an aggregate is reused before it is recomputed.
+     *
+     * <p><b>Why caching this at all is correct rather than a shortcut.</b> The aggregate is already
+     * inherently stale by construction -- see this class's own javadoc: it is a search over a write-behind
+     * projection, so it is as fresh as that projection's last refresh and no fresher. A one-minute reuse
+     * window adds a bound of the same order to a statistic that already has one, and the thing being
+     * measured -- the distribution of field <em>types</em> across a population -- changes glacially: a
+     * tenant adding a {@code keyword} field to an index that already has keyword fields does not move any
+     * number here at all.
+     *
+     * <p><b>What it buys.</b> {@code _cluster/stats} used to run this aggregation synchronously and
+     * uncached on every single call. In production that is a terms aggregation producing one nested
+     * document per {index, field-type} pair over the whole gated population -- hundreds of millions of
+     * nested documents at design scale -- and monitoring polls that endpoint on a fixed interval from every
+     * collector that watches the cluster. The cost was therefore paid per poll, per collector, forever,
+     * for a number that had not changed between any two of them.
+     */
+    private static final long CACHE_TTL_NANOS = TimeUnit.SECONDS.toNanos(60);
+
+    private record CachedCounts(GatedFieldTypeCounts counts, long computedAtNanos) {
+    }
+
+    private static final AtomicReference<CachedCounts> CACHE = new AtomicReference<>();
+
+    /**
+     * Held by whichever caller is recomputing, so a stats call that arrives while an aggregation is already
+     * running serves the previous answer instead of starting a second one. Concurrent {@code
+     * _cluster/stats} calls -- the normal condition when several collectors poll the same cluster --
+     * otherwise each ran their own full aggregation.
+     */
+    private static final ReentrantLock REFRESH_LOCK = new ReentrantLock();
+
     private GatedMappingStatsAggregator() {}
 
-    /** Installs the aggregator. Registering null clears it, which is how a test restores the default. */
+    /**
+     * Installs the aggregator. Registering null clears it, which is how a test restores the default.
+     *
+     * <p>Drops any cached aggregate, so a newly registered aggregator is never shadowed by the previous
+     * one's answer and a test that clears the registry does not leak counts into the next case.
+     */
     public static void register(Aggregator aggregator) {
         AGGREGATOR.set(aggregator);
+        CACHE.set(null);
     }
 
     public static boolean isRegistered() {
@@ -94,10 +137,40 @@ public final class GatedMappingStatsAggregator {
         if (aggregator == null) {
             return null;
         }
+        long now = System.nanoTime();
+        CachedCounts cached = CACHE.get();
+        if (cached != null && now - cached.computedAtNanos() < CACHE_TTL_NANOS) {
+            return cached.counts();
+        }
+        if (REFRESH_LOCK.tryLock() == false) {
+            // Somebody else is already recomputing. A slightly-too-old answer is a better response to a
+            // stats call than a second full aggregation queued behind the first.
+            return cached == null ? null : cached.counts();
+        }
         try {
-            return aggregator.aggregate();
+            // Re-checked under the lock, so a queue of callers that all missed does not each recompute in
+            // turn once the holder finishes.
+            cached = CACHE.get();
+            if (cached != null && System.nanoTime() - cached.computedAtNanos() < CACHE_TTL_NANOS) {
+                return cached.counts();
+            }
+            GatedFieldTypeCounts counts = aggregator.aggregate();
+            if (counts != null) {
+                CACHE.set(new CachedCounts(counts, System.nanoTime()));
+            }
+            // A failed aggregate answers null and leaves the cache alone, rather than caching the failure
+            // or serving a stale answer as if it were fresh -- exactly the behaviour this method documented
+            // before it cached anything.
+            return counts;
         } catch (Exception e) {
             return null;
+        } finally {
+            REFRESH_LOCK.unlock();
         }
+    }
+
+    /** Drops any cached aggregate, so the next call recomputes. For tests, which must not observe a previous case's answer. */
+    public static void clearCache() {
+        CACHE.set(null);
     }
 }

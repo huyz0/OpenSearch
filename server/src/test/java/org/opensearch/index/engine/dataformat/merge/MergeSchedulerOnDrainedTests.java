@@ -679,4 +679,131 @@ public class MergeSchedulerOnDrainedTests extends OpenSearchTestCase {
         forceMergeThread.join(10_000);
         assertEquals("activeMerges should be 0 after force merge", 0, scheduler.getActiveMergeCount());
     }
+
+    /**
+     * A drain listener registered while the scheduler was frozen must still fire when the merges it is
+     * waiting on finish, even if the freeze was lifted in the meantime.
+     * <p>
+     * This is the traced availability bug: a terminal prepare failure on a sibling shard flips
+     * {@code index.blocks.write}, which drives {@code onSettingsChanged} → unfreeze on every engine of
+     * the index. When the drain fire was gated on {@code isFrozen()}, the in-flight shard's listener was
+     * then neither fired nor cleared — the shard burned its whole prepare timeout (80% of the transport
+     * timeout) and the stale listener accumulated on the list across every retry.
+     */
+    public void testOnDrained_ListenerFiresAfterUnfreezeWhileMergeInFlight() throws Exception {
+        MergeHandler mockHandler = mock(MergeHandler.class);
+        when(mockHandler.hasPendingMerges()).thenReturn(false);
+
+        Segment s1 = new Segment(1L, Collections.emptyMap());
+        OneMerge oneMerge = new OneMerge(Collections.singletonList(s1));
+        when(mockHandler.findForceMerges(1)).thenReturn(Collections.singletonList(oneMerge));
+
+        CountDownLatch mergeStarted = new CountDownLatch(1);
+        CountDownLatch mergeCanProceed = new CountDownLatch(1);
+        when(mockHandler.doMerge(oneMerge)).thenAnswer(invocation -> {
+            mergeStarted.countDown();
+            mergeCanProceed.await(10, TimeUnit.SECONDS);
+            return new MergeResult(Collections.emptyMap());
+        });
+
+        IndexSettings indexSettings = IndexSettingsModule.newIndexSettings("test", Settings.EMPTY);
+        ShardId testShardId = new ShardId(indexSettings.getIndex(), 0);
+        MergeScheduler scheduler = new MergeScheduler(mockHandler, (result, merge) -> {}, () -> {}, testShardId, indexSettings, threadPool);
+
+        Thread forceMergeThread = new Thread(() -> {
+            try {
+                scheduler.forceMerge(1);
+            } catch (Exception e) {
+                // ignore
+            }
+        }, ThreadPool.Names.FORCE_MERGE + "-test");
+        forceMergeThread.setDaemon(true);
+        forceMergeThread.start();
+        assertTrue("Force merge should have started", mergeStarted.await(5, TimeUnit.SECONDS));
+
+        // Tiering prepare: freeze, then park a drain listener behind the in-flight merge.
+        scheduler.freeze();
+        CountDownLatch drained = new CountDownLatch(1);
+        scheduler.onDrained(drained::countDown);
+        assertEquals("listener must not fire while the merge is in flight", 1, drained.getCount());
+
+        // Prepare fails terminally elsewhere → blocks.write flips → every engine unfreezes.
+        // Do not resume merges here; the point is only that the freeze is gone.
+        assertTrue("unfreeze must win the transition", scheduler.unfreeze(() -> {}));
+        assertFalse("scheduler must be unfrozen", scheduler.isFrozen());
+        assertEquals("unfreeze must not fire the listener early — the merge is still running", 1, drained.getCount());
+
+        // The merge finishes on an unfrozen scheduler: the listener must still fire.
+        mergeCanProceed.countDown();
+        assertTrue("drain listener must fire when the merge completes, frozen or not", drained.await(10, TimeUnit.SECONDS));
+        forceMergeThread.join(10_000);
+        assertEquals("activeMerges should be 0 after force merge", 0, scheduler.getActiveMergeCount());
+    }
+
+    /**
+     * A second force-merge caller parked on the force-merge lock must count as outstanding merge work,
+     * and must abandon its merge if tiering froze the scheduler while it was parked.
+     * <p>
+     * Without this, force merge A running when tiering starts would let the drain fire the moment A
+     * finished ({@code activeMerges == 0}, B invisible because it had not incremented yet); prepare
+     * would take its "last ever" flush + remote sync + replica sync, and only then would B acquire the
+     * lock and mutate the catalog / upload new segments in the middle of the migration.
+     */
+    public void testOnDrained_QueuedForceMergeIsVisibleAndAbandonedWhenFrozen() throws Exception {
+        MergeHandler mockHandler = mock(MergeHandler.class);
+        when(mockHandler.hasPendingMerges()).thenReturn(false);
+
+        Segment s1 = new Segment(1L, Collections.emptyMap());
+        OneMerge oneMerge = new OneMerge(Collections.singletonList(s1));
+        when(mockHandler.findForceMerges(1)).thenReturn(Collections.singletonList(oneMerge));
+
+        CountDownLatch mergeStarted = new CountDownLatch(1);
+        CountDownLatch mergeCanProceed = new CountDownLatch(1);
+        when(mockHandler.doMerge(oneMerge)).thenAnswer(invocation -> {
+            mergeStarted.countDown();
+            mergeCanProceed.await(10, TimeUnit.SECONDS);
+            return new MergeResult(Collections.emptyMap());
+        });
+
+        IndexSettings indexSettings = IndexSettingsModule.newIndexSettings("test", Settings.EMPTY);
+        ShardId testShardId = new ShardId(indexSettings.getIndex(), 0);
+        MergeScheduler scheduler = new MergeScheduler(mockHandler, (result, merge) -> {}, () -> {}, testShardId, indexSettings, threadPool);
+
+        Thread forceMergeA = forceMergeThread(scheduler, "A");
+        forceMergeA.start();
+        assertTrue("force merge A should have started", mergeStarted.await(5, TimeUnit.SECONDS));
+
+        // B enters while A holds the lock — it parks, but is already counted as merge work.
+        Thread forceMergeB = forceMergeThread(scheduler, "B");
+        forceMergeB.start();
+        assertBusy(() -> assertEquals("a queued force merge must be visible to the drain", 2, scheduler.getActiveMergeCount()));
+
+        // Tiering starts now, with A running and B parked.
+        scheduler.freeze();
+        AtomicBoolean drainFired = new AtomicBoolean(false);
+        scheduler.onDrained(() -> drainFired.set(true));
+        assertFalse("drain must not fire with merges outstanding", drainFired.get());
+
+        // A completes; B then acquires the lock, finds the scheduler frozen and abandons. Only once B
+        // has also given back its slot can the drain fire.
+        mergeCanProceed.countDown();
+        forceMergeA.join(10_000);
+        forceMergeB.join(10_000);
+        assertTrue("drain must fire once the queued force merge has also finished", drainFired.get());
+        assertEquals("activeMerges must return to 0", 0, scheduler.getActiveMergeCount());
+        // B found the scheduler frozen after acquiring the lock and abandoned without selecting merges.
+        verify(mockHandler, times(1)).findForceMerges(1);
+    }
+
+    private static Thread forceMergeThread(MergeScheduler scheduler, String name) {
+        Thread t = new Thread(() -> {
+            try {
+                scheduler.forceMerge(1);
+            } catch (Exception e) {
+                // ignore
+            }
+        }, ThreadPool.Names.FORCE_MERGE + "-test-" + name);
+        t.setDaemon(true);
+        return t;
+    }
 }

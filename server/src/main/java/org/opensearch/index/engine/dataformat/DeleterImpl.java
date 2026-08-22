@@ -38,7 +38,14 @@ public class DeleterImpl<T extends Writer<?>> implements Deleter {
         this.writer = writer;
         this.deleterGeneration = writer.generation();
 
-        // TODO: Check if lock here is redundant??
+        // Not redundant, and the volatile `active` flag alone would not do: the flag makes the
+        // deactivation visible, but it cannot make the check and the act that follows it atomic.
+        // Without the read/write pair, recordBufferedDeletes can pass its `active` check, then
+        // deactivate() can snapshot and clear bufferedDeletes, and only then does the recorder add
+        // its id -- to a queue nobody will ever drain, since the deleter is now closed. That is a
+        // silently lost delete. deleteDoc has the same shape against the writer. deactivate() taking
+        // the write lock excludes every in-flight reader, so a delete is either in the snapshot or
+        // was rejected, never neither.
         this.deleterLock = new ReentrantReadWriteLock();
         this.deleterReadLock = new ReleasableLock(deleterLock.readLock());
         this.deleterWriteLock = new ReleasableLock(deleterLock.writeLock());

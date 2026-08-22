@@ -42,6 +42,22 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
     private static final int MINIMUM_RANGE_LENGTH_THRESHOLD = 1000;
 
     /**
+     * Hard ceiling on the {@code num_of_root_shards} an XContent blob may claim, checked before an
+     * array that large is allocated. The stream path gets this for free -- {@code
+     * StreamInput#readArray}'s guarded length read bounds the count by the bytes actually left in
+     * the stream -- but an XContent blob carries no such length, so ~20 characters of digits could
+     * otherwise demand a multi-gigabyte array.
+     *
+     * <p>Deliberately far above any real index's shard count (core's own default ceiling is 1024,
+     * see {@code opensearch.index.max_number_of_shards}) rather than exactly at it: the job here is
+     * to stop a corrupt or hostile count from turning a tiny blob into an OOM, not to re-litigate
+     * core's shard-count policy on a read path where a false rejection would make an otherwise
+     * healthy index's metadata unreadable. At this bound the pre-allocation costs single-digit
+     * megabytes, which fails cleanly on the real per-root validation right after.
+     */
+    private static final int MAX_ROOT_SHARDS = 1 << 20;
+
+    /**
      * Sentinel returned by {@link #getSplitCommitTimestamp(int)} when no split-commit timestamp is recorded
      * for a shard id -- because it isn't a committed split parent at all, or because the split committed on a
      * node/cluster-state old enough to predate the {@code splitCommitTimestamps} field (see wire-format gating
@@ -139,11 +155,14 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
     }
 
     public SplitShardsMetadata(StreamInput in) throws IOException {
-        int numberOfRootShards = in.readVInt();
-        this.rootShardsToAllChildren = new ShardRange[numberOfRootShards][];
-        for (int i = 0; i < numberOfRootShards; i++) {
-            this.rootShardsToAllChildren[i] = in.readOptionalArray(ShardRange::new, ShardRange[]::new);
-        }
+        // readArray, not a raw readVInt() followed by `new ShardRange[n][]`: the byte layout is
+        // identical (writeTo still writes a vint length then each element), but readArray's own
+        // length read is the guarded one -- it rejects a negative size, caps at
+        // ArrayUtil.MAX_ARRAY_LENGTH, and calls ensureCanReadBytes so a count larger than the bytes
+        // that could possibly back it fails before anything is allocated. The unguarded shape this
+        // replaces let ~5 bytes of vint demand a multi-gigabyte array up front, ahead of reading a
+        // single element.
+        this.rootShardsToAllChildren = in.readArray(i -> i.readOptionalArray(ShardRange::new, ShardRange[]::new), ShardRange[][]::new);
         this.maxShardId = in.readVInt();
         this.inProgressSplitShardIds = Collections.unmodifiableSet(in.readSet(StreamInput::readInt));
         this.activeShardIds = Collections.unmodifiableSet(in.readSet(StreamInput::readInt));
@@ -167,6 +186,7 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
             this.splitCommitTimestamps = Collections.emptyMap();
             this.inProgressMergeParentShardIds = Collections.emptySet();
         }
+        validateRootShardRanges(this.rootShardsToAllChildren);
     }
 
     public void writeTo(StreamOutput out) throws IOException {
@@ -193,7 +213,16 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
 
         ShardRange[] existingChildShards = rootShardsToAllChildren[rootShardId];
         ShardRange shardRange = binarySearchShards(existingChildShards, hash);
-        assert shardRange != null;
+        if (shardRange == null) {
+            // Unreachable given validateRootShardRanges (every root's children are a gapless,
+            // sorted partition of the whole hash space, so a binary search always lands somewhere).
+            // A real check rather than the bare `assert` this replaces, which is disabled in
+            // production: this is the document-routing hot path, and dereferencing null here would
+            // turn "one index carries bad metadata" into an NPE on every node that applied it.
+            throw new IllegalStateException(
+                "no child shard of root shard " + rootShardId + " owns hash " + hash + "; split metadata is inconsistent"
+            );
+        }
 
         return shardRange.shardId();
     }
@@ -344,6 +373,41 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
 
     public Iterator<Integer> getActiveShardIterator() {
         return new HashSet<>(activeShardIds).iterator();
+    }
+
+    /**
+     * Re-runs {@link #validateShardRanges} over every root shard's committed child list, which is
+     * what {@link Builder#splitShard} and {@link Builder#updateSplitMetadataForChildShards} already
+     * do on every mutation -- but which neither deserialization path used to do at all.
+     *
+     * <p>That gap mattered because both deserialization paths bypass {@link Builder} entirely, so a
+     * corrupt or tampered custom (transport bytes, or an XContent blob read back from a remote-store
+     * manifest) could install child ranges with gaps, overlaps, or in the wrong order, none of which
+     * {@link Builder} would ever produce. {@link #getShardIdOfHash} then binary-searches that list on
+     * the document-routing hot path and its only defence was a bare {@code assert}, disabled in
+     * production -- so a hash falling in a gap dereferenced null and crashed routing on every node
+     * that applied the metadata. Failing the deserialization instead keeps the invalid state out.
+     *
+     * <p>Only the {@code rootShardsToAllChildren} lists are checked, deliberately, and not
+     * {@code parentToChildShards}: a root's list is the complete partition of the whole hash space
+     * (which is exactly what {@link #validateShardRanges} verifies, and exactly what the binary
+     * search needs), whereas a nested split's parent-to-children entry covers only that parent's own
+     * sub-range and legitimately does not span {@code [MIN_VALUE, MAX_VALUE]}. Per-element sanity
+     * for those is {@link ShardRange}'s own read-path validation.
+     *
+     * @param rootShardsToAllChildren the just-deserialized root-to-children table; {@code null}
+     *                                entries (a never-split root) are skipped.
+     * @throws IllegalArgumentException if any root's child ranges are not a gapless, ordered,
+     *                                  full-width partition.
+     */
+    private static void validateRootShardRanges(ShardRange[][] rootShardsToAllChildren) {
+        for (int rootShardId = 0; rootShardId < rootShardsToAllChildren.length; rootShardId++) {
+            ShardRange[] childShards = rootShardsToAllChildren[rootShardId];
+            if (childShards == null) {
+                continue;
+            }
+            validateShardRanges(rootShardId, childShards);
+        }
     }
 
     // Visible for testing
@@ -975,6 +1039,24 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         return builder;
     }
 
+    /**
+     * Reads this custom back from an XContent blob (a remote-store manifest), applying the same
+     * invariants {@link Builder} enforces on every mutation -- see {@link #validateRootShardRanges}
+     * for why skipping them used to be a routing-crash vector.
+     *
+     * <p>Deliberately <b>field-order independent</b>: {@code num_of_root_shards} is now consumed
+     * once the whole object has been read rather than at the moment {@code
+     * root_shards_to_all_children} happens to arrive. The old shape sized the root array from
+     * whatever {@code numberOfRootShards} held at that instant, so a blob that merely listed its
+     * fields in the other order still carried the {@code -1} initial value into {@code new
+     * ShardRange[-1][]} and died with a bare {@link NegativeArraySizeException}. Every count and
+     * every map key that indexes into that array is now range-checked before it is used.
+     *
+     * @throws IllegalArgumentException if the blob is truncated, omits {@code num_of_root_shards},
+     *                                  claims an impossible shard count, names a root/parent shard id
+     *                                  outside the table, or carries child ranges that are not a
+     *                                  gapless ordered partition.
+     */
     public static SplitShardsMetadata parse(XContentParser parser) throws IOException {
         XContentParser.Token token;
         String currentFieldName = null;
@@ -982,11 +1064,13 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         Set<Integer> inProgressSplitShardIds = new HashSet<>();
         Set<Integer> inProgressMergeParentShardIds = new HashSet<>();
         Set<Integer> activeShardIds = new HashSet<>();
-        ShardRange[][] rootShardsToAllChildren = null;
+        Map<Integer, ShardRange[]> rootShards = new HashMap<>();
         Map<Integer, ShardRange[]> tempShardIdToChildShards = new HashMap<>();
         Map<Integer, Long> splitCommitTimestamps = new HashMap<>();
         int numberOfRootShards = -1;
-        while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
+        // `token != null` as well as the END_OBJECT check: at end of input nextToken() returns null
+        // forever, so a blob truncated mid-object would otherwise spin this loop indefinitely.
+        while ((token = parser.nextToken()) != null && token != XContentParser.Token.END_OBJECT) {
             if (token == XContentParser.Token.FIELD_NAME) {
                 currentFieldName = parser.currentName();
             } else if (token == XContentParser.Token.VALUE_NUMBER) {
@@ -997,13 +1081,9 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
                 }
             } else if (token == XContentParser.Token.START_OBJECT) {
                 if (KEY_ROOT_SHARDS_TO_ALL_CHILDREN.equals(currentFieldName)) {
-                    Map<Integer, ShardRange[]> rootShards = parseShardsMap(parser);
-                    rootShardsToAllChildren = new ShardRange[numberOfRootShards][];
-                    for (Map.Entry<Integer, ShardRange[]> entry : rootShards.entrySet()) {
-                        rootShardsToAllChildren[entry.getKey()] = entry.getValue();
-                    }
+                    rootShards = parseShardsMap(parser, KEY_ROOT_SHARDS_TO_ALL_CHILDREN);
                 } else if (KEY_PARENT_TO_CHILD_SHARDS.equals(currentFieldName)) {
-                    tempShardIdToChildShards = parseShardsMap(parser);
+                    tempShardIdToChildShards = parseShardsMap(parser, KEY_PARENT_TO_CHILD_SHARDS);
                 } else if (KEY_SPLIT_COMMIT_TIMESTAMPS.equals(currentFieldName)) {
                     splitCommitTimestamps = parseSplitCommitTimestamps(parser);
                 }
@@ -1023,6 +1103,57 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
                 }
             }
         }
+        if (token == null) {
+            throw new IllegalArgumentException("Split shards metadata is truncated");
+        }
+
+        if (numberOfRootShards < 0) {
+            throw new IllegalArgumentException(
+                "Split shards metadata is missing a valid [" + KEY_NUMBER_OF_ROOT_SHARDS + "]: got " + numberOfRootShards
+            );
+        }
+        if (numberOfRootShards > MAX_ROOT_SHARDS) {
+            throw new IllegalArgumentException(
+                "["
+                    + KEY_NUMBER_OF_ROOT_SHARDS
+                    + "] of "
+                    + numberOfRootShards
+                    + " exceeds the maximum supported value of "
+                    + MAX_ROOT_SHARDS
+            );
+        }
+        // maxShardId starts at numberOfRootShards - 1 (Builder(int)) and only ever grows, so
+        // anything below that floor means the blob's own fields disagree with each other.
+        if (maxShardId < numberOfRootShards - 1) {
+            throw new IllegalArgumentException(
+                "["
+                    + KEY_MAX_SHARD_ID
+                    + "] of "
+                    + maxShardId
+                    + " is inconsistent with ["
+                    + KEY_NUMBER_OF_ROOT_SHARDS
+                    + "] of "
+                    + numberOfRootShards
+            );
+        }
+
+        ShardRange[][] rootShardsToAllChildren = new ShardRange[numberOfRootShards][];
+        for (Map.Entry<Integer, ShardRange[]> entry : rootShards.entrySet()) {
+            int rootShardId = entry.getKey();
+            if (rootShardId < 0 || rootShardId >= numberOfRootShards) {
+                throw new IllegalArgumentException(
+                    "["
+                        + KEY_ROOT_SHARDS_TO_ALL_CHILDREN
+                        + "] names root shard "
+                        + rootShardId
+                        + ", which is outside the "
+                        + numberOfRootShards
+                        + " root shard(s) this index has"
+                );
+            }
+            rootShardsToAllChildren[rootShardId] = entry.getValue();
+        }
+        validateRootShardRanges(rootShardsToAllChildren);
 
         return new SplitShardsMetadata(
             rootShardsToAllChildren,
@@ -1039,37 +1170,69 @@ public class SplitShardsMetadata extends AbstractDiffable<SplitShardsMetadata> i
         XContentParser.Token token;
         String currentFieldName = null;
         Map<Integer, Long> timestamps = new HashMap<>();
-        while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
+        while ((token = parser.nextToken()) != null && token != XContentParser.Token.END_OBJECT) {
             if (token == XContentParser.Token.FIELD_NAME) {
                 currentFieldName = parser.currentName();
             } else if (token == XContentParser.Token.VALUE_NUMBER) {
-                assert currentFieldName != null;
-                timestamps.put(Integer.parseInt(currentFieldName), parser.longValue());
+                timestamps.put(parseShardIdKey(currentFieldName, KEY_SPLIT_COMMIT_TIMESTAMPS), parser.longValue());
             }
+        }
+        if (token == null) {
+            throw new IllegalArgumentException("[" + KEY_SPLIT_COMMIT_TIMESTAMPS + "] is truncated");
         }
         return timestamps;
     }
 
-    private static Map<Integer, ShardRange[]> parseShardsMap(XContentParser parser) throws IOException {
+    private static Map<Integer, ShardRange[]> parseShardsMap(XContentParser parser, String key) throws IOException {
         XContentParser.Token token;
         String currentFieldName = null;
         Map<Integer, ShardRange[]> shardsMap = new HashMap<>();
-        while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
+        while ((token = parser.nextToken()) != null && token != XContentParser.Token.END_OBJECT) {
             if (token == XContentParser.Token.FIELD_NAME) {
                 currentFieldName = parser.currentName();
             } else if (token == XContentParser.Token.START_ARRAY) {
+                // The key is read (and rejected if it isn't a real shard id) BEFORE the array is
+                // consumed, so a malformed key fails without first materialising whatever list of
+                // ranges follows it.
+                Integer parentShard = parseShardIdKey(currentFieldName, key);
                 List<ShardRange> childShardRanges = new ArrayList<>();
                 while (parser.nextToken() != XContentParser.Token.END_ARRAY) {
                     ShardRange shardRange = ShardRange.parse(parser);
                     childShardRanges.add(shardRange);
                 }
-                assert currentFieldName != null;
-                Integer parentShard = Integer.parseInt(currentFieldName);
                 shardsMap.put(parentShard, childShardRanges.toArray(new ShardRange[0]));
             }
         }
+        if (token == null) {
+            throw new IllegalArgumentException("[" + key + "] is truncated");
+        }
 
         return shardsMap;
+    }
+
+    /**
+     * Turns one of the shard-id-keyed objects' field names back into a shard id.
+     *
+     * <p>{@code Integer.parseInt} on its own throws a bare {@link NumberFormatException} naming
+     * nothing but the offending string, and accepts negatives that then flow on as array indices or
+     * map keys. Both are wrapped into the same descriptive {@link IllegalArgumentException} the rest
+     * of this class's validation raises, so a malformed blob reports which object it was malformed
+     * in rather than surfacing as an opaque failure.
+     */
+    private static int parseShardIdKey(String fieldName, String key) {
+        if (fieldName == null) {
+            throw new IllegalArgumentException("[" + key + "] has an entry with no field name");
+        }
+        final int shardId;
+        try {
+            shardId = Integer.parseInt(fieldName);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("[" + key + "] has a non-numeric shard id key [" + fieldName + "]", e);
+        }
+        if (shardId < 0) {
+            throw new IllegalArgumentException("[" + key + "] has a negative shard id key [" + fieldName + "]");
+        }
+        return shardId;
     }
 
     public static Diff<SplitShardsMetadata> readDiffFrom(StreamInput in) throws IOException {

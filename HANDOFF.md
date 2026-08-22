@@ -1,11 +1,12 @@
 # Session handoff
 
-Branch `feature/pluggable-engine-per-shard-role`, 237 commits ahead of its own remote and 946 ahead of
-`origin/main`. **Nothing from this work is pushed.**
+Branch **`feature/serverless`** — this work has since been renamed and moved off
+`feature/pluggable-engine-per-shard-role`, which earlier versions of this file named. **The work is
+pushed**; `origin/feature/serverless` tracks it.
 
-Measure it rather than incrementing it: `git rev-list --count origin/feature/pluggable-engine-per-shard-role..HEAD`.
-The count carried in earlier versions of this file was wrong and was being bumped by hand each session.
-Working tree clean.
+Measure the commit count rather than incrementing it:
+`git rev-list --count origin/main..HEAD`. The count carried in earlier versions of this file was wrong
+and was being bumped by hand each session, so it is deliberately not restated here.
 
 **Build note that costs an hour if you do not know it.** `:distribution:docker` shells out to the
 `docker` binary at *configuration* time, so when Docker is unavailable every Gradle task fails,
@@ -28,7 +29,9 @@ Evidence for every number claimed: `benchmarks/SCALABLE_METADATA_SPIKE_RESULTS.m
 | **G. Validation** | **G1 done**, S15. Publication latency measured, batching decided. G2 to G5 not started. |
 | **F. Cluster state diet** | **F1 done**, S16. Audit says `inSyncAllocationIds` is emptiable and `primaryTerms` is not. F2 to F4 not started. |
 | **H. Metadata off cluster state** | **in progress**, `plan-area-h-metadata-off-cluster-state.md`. Ceilings 2 and 3 measured as cleared on the gated path: creation flat at 0.0005 ms against 57.777 ms at 50k indices, and a thousand gated creations leave zero cluster state entries. Dynamic mappings are designed and proven in isolation (H6a to H6c) but **have no production caller yet**, which is the same shape as the two mechanisms C18 shipped correct and unreachable. |
-| B, D, E | not started |
+| **E. Manifest sharding** | **built and measured since this table was written** — write/read/codec/cleanup paths shipped with `ManifestShardingIT`, default-off (`cluster.remote_store.state.manifest.shard_count` = 0). See `rfc-manifest-sharding-design.md`'s status header. |
+| **B. Coordinator routing** | **partially built since this table was written** — an affinity-forwarding filter (`AffinityForwardingActionFilter`, default off) plus its IT exist; the wider B-area work is still open. `plan-100m-index-implementation.md` Area B.2 also still says "nothing exists" and is stale in the same way. |
+| D | not started |
 
 ## The one finding that matters most: this seam fails by succeeding
 

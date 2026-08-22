@@ -9,6 +9,8 @@
 package org.opensearch.serverless.storage.resharding;
 
 import org.opensearch.Version;
+import org.opensearch.action.admin.cluster.state.ClusterStateRequest;
+import org.opensearch.action.admin.cluster.state.ClusterStateResponse;
 import org.opensearch.action.index.IndexAction;
 import org.opensearch.action.index.IndexRequest;
 import org.opensearch.action.index.IndexResponse;
@@ -21,11 +23,13 @@ import org.opensearch.cluster.metadata.Metadata;
 import org.opensearch.cluster.routing.Murmur3HashFunction;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.test.ClusterServiceUtils;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.threadpool.TestThreadPool;
 import org.opensearch.threadpool.ThreadPool;
 
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -39,6 +43,13 @@ import java.util.concurrent.atomic.AtomicReference;
 public class WritePartitionRoutingActionFilterTests extends OpenSearchTestCase {
 
     private static final String ALIAS = "write-alias";
+
+    /**
+     * Mirrors {@code WritePartitionRoutingActionFilter}'s own private constant. Duplicated rather than
+     * exposed, because the tests below are asserting about the observable thread-context side effect the
+     * filter has (or must not have), which is exactly what an external observer would see.
+     */
+    private static final String REWRITTEN_MARKER_KEY = "serverless_storage_write_partition_routing_rewritten";
 
     private TestThreadPool threadPool;
 
@@ -153,6 +164,90 @@ public class WritePartitionRoutingActionFilterTests extends OpenSearchTestCase {
             for (int i = 0; i < 5; i++) {
                 assertRewrittenTo(filter, idForPartition0, "target-0");
             }
+        } finally {
+            clusterService.close();
+        }
+    }
+
+    /**
+     * The filter runs for every action on the node, so an idle feature must leave no trace on the thread
+     * context. It used to stash an identity set as a {@link ThreadContext} transient before it had looked
+     * at the request type or the metadata at all -- an {@code IdentityHashMap}, a set wrapper, and a
+     * {@code putTransient} that copies the whole transient map, on every single action.
+     */
+    public void testStashesNoThreadContextTransientWhenNothingIsRewritten() {
+        IndexMetadata unassigned = IndexMetadata.builder("ordinary")
+            .settings(
+                Settings.builder()
+                    .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
+                    .put(IndexMetadata.SETTING_INDEX_UUID, "ordinary-uuid")
+            )
+            .numberOfShards(1)
+            .numberOfReplicas(0)
+            .build();
+        ClusterService clusterService = ClusterServiceUtils.createClusterService(threadPool);
+        try {
+            ClusterServiceUtils.setState(clusterService, stateWithTargets(unassigned));
+            WritePartitionRoutingActionFilter filter = filter(clusterService, threadPool);
+            ThreadContext threadContext = threadPool.getThreadContext();
+
+            // A write against an index with no write-routing assignment at all.
+            IndexRequest request = new IndexRequest("ordinary").id("doc-1").source("f", "v");
+            AtomicReference<Boolean> proceeded = new AtomicReference<>(false);
+            filter.apply(null, IndexAction.NAME, request, null, null, recordingChain(proceeded));
+            assertTrue(proceeded.get());
+            assertEquals("ordinary", request.index());
+            assertNull(
+                "an idle feature must not allocate or stash the rewritten-marker set",
+                threadContext.getTransient(REWRITTEN_MARKER_KEY)
+            );
+
+            // And an action that is not a write at all must not even read cluster state, let alone stash.
+            AtomicReference<Boolean> nonWriteProceeded = new AtomicReference<>(false);
+            ActionFilterChain<ClusterStateRequest, ClusterStateResponse> nonWriteChain = (
+                task,
+                actionName,
+                req,
+                listener) -> nonWriteProceeded.set(true);
+            filter.apply(null, "cluster:monitor/state", new ClusterStateRequest(), null, null, nonWriteChain);
+            assertTrue(nonWriteProceeded.get());
+            assertNull(threadContext.getTransient(REWRITTEN_MARKER_KEY));
+        } finally {
+            clusterService.close();
+        }
+    }
+
+    /**
+     * The other half of the same change: the marker must still be stashed the moment a rewrite genuinely
+     * happens, because that is what makes this filter's own re-entrant second pass (see its class javadoc)
+     * recognise its own already-rewritten request rather than fencing it as a direct target write.
+     */
+    public void testStashesTheMarkerOnceARewriteActuallyHappens() {
+        IndexMetadata target0 = partitionTarget("target-0", 0, 2);
+        IndexMetadata target1 = partitionTarget("target-1", 1, 2);
+        ClusterService clusterService = ClusterServiceUtils.createClusterService(threadPool);
+        try {
+            ClusterServiceUtils.setState(clusterService, stateWithTargets(target0, target1));
+            WritePartitionRoutingActionFilter filter = filter(clusterService, threadPool);
+            ThreadContext threadContext = threadPool.getThreadContext();
+
+            IndexRequest request = new IndexRequest(ALIAS).id(idLandingOn(0, 2)).source("f", "v");
+            AtomicReference<Boolean> proceeded = new AtomicReference<>(false);
+            filter.apply(null, IndexAction.NAME, request, null, null, recordingChain(proceeded));
+            assertTrue(proceeded.get());
+            assertEquals("target-0", request.index());
+
+            Object marker = threadContext.getTransient(REWRITTEN_MARKER_KEY);
+            assertNotNull("a real rewrite must stash the marker", marker);
+            assertTrue(marker instanceof Set);
+            assertTrue("the rewritten request itself must be marked", ((Set<?>) marker).contains(request));
+
+            // Re-entry with the already-rewritten request (what TransportSingleItemBulkWriteAction does)
+            // must not now be fenced as a direct write to an assigned target.
+            AtomicReference<Boolean> reentrantProceeded = new AtomicReference<>(false);
+            filter.apply(null, IndexAction.NAME, request, null, null, recordingChain(reentrantProceeded));
+            assertTrue("the re-entrant pass must proceed rather than be rejected", reentrantProceeded.get());
+            assertEquals("target-0", request.index());
         } finally {
             clusterService.close();
         }

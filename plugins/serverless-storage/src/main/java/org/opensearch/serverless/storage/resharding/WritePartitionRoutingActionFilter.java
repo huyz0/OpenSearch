@@ -93,7 +93,18 @@ import java.util.concurrent.ConcurrentHashMap;
  * marker: an identity-based {@link Set} of requests this filter has itself rewritten, stashed once
  * per thread-context and consulted (not re-populated) on re-entry, the same "transient, not
  * wire-serialized, survives nested synchronous calls on one thread" property {@code ThreadContext}
- * transients are already used for elsewhere in core.
+ * transients are already used for elsewhere in core. That marker is created only at the moment a
+ * rewrite actually happens -- see {@link RewrittenMarkers} -- because an {@link
+ * org.opensearch.action.support.ActionFilter} runs for every action on the node and an idle feature
+ * must cost nothing.
+ *
+ * <p><b>Deliberately no "is this feature active at all" short-circuit keyed on {@link Metadata}
+ * identity</b>, which would be the obvious companion to {@link #tableCache}. Answering it means asking
+ * every index in the cluster whether it carries a write-routing assignment, and {@code
+ * Metadata#indices()} materializes each entry as it is read (see its own javadoc) -- so the check would
+ * materialize the whole cluster's index metadata once per metadata version to avoid a map lookup and two
+ * custom-data reads per document. The per-request work below is already only that, against the one index
+ * the request names.
  */
 public final class WritePartitionRoutingActionFilter implements ActionFilter {
 
@@ -147,11 +158,23 @@ public final class WritePartitionRoutingActionFilter implements ActionFilter {
         ActionListener<Response> listener,
         ActionFilterChain<Request, Response> chain
     ) {
+        // Every ActionFilter runs for every action, so nothing above the type check below may cost
+        // anything. Before this was restructured, the very first statement obtained the marker set --
+        // which, on a miss, allocated an IdentityHashMap plus its Set wrapper and then called
+        // ThreadContext#putTransient, and putTransient copies the entire transient map into a fresh
+        // HashMap on every call. That was ~3-5 allocations and a map copy on the hottest generic path in
+        // the product, for a feature that is inactive on almost every cluster and irrelevant to almost
+        // every action even where it is active. The cluster state read moved down for the same reason.
+        if (request instanceof DocWriteRequest<?> == false && request instanceof BulkRequest == false) {
+            chain.proceed(task, action, request, listener);
+            return;
+        }
+
         ClusterService currentClusterService = this.clusterService;
         ThreadPool currentThreadPool = this.threadPool;
         if (currentClusterService != null && currentThreadPool != null) {
             ClusterState state = currentClusterService.state();
-            Set<DocWriteRequest<?>> alreadyRewritten = rewrittenMarkerSet(currentThreadPool.getThreadContext());
+            RewrittenMarkers alreadyRewritten = new RewrittenMarkers(currentThreadPool.getThreadContext());
             if (request instanceof DocWriteRequest<?> docWriteRequest) {
                 String rejection = rejectIfDirectTargetWrite(state, docWriteRequest, alreadyRewritten);
                 if (rejection != null) {
@@ -159,7 +182,8 @@ public final class WritePartitionRoutingActionFilter implements ActionFilter {
                     return;
                 }
                 rewriteIfAssigned(state, docWriteRequest, alreadyRewritten);
-            } else if (request instanceof BulkRequest bulkRequest) {
+            } else {
+                BulkRequest bulkRequest = (BulkRequest) request;
                 for (DocWriteRequest<?> item : bulkRequest.requests()) {
                     String rejection = rejectIfDirectTargetWrite(state, item, alreadyRewritten);
                     if (rejection != null) {
@@ -176,19 +200,56 @@ public final class WritePartitionRoutingActionFilter implements ActionFilter {
     }
 
     /**
-     * The identity-based set of requests this filter has itself rewritten during the current
-     * request's lifetime, stashed once per {@link ThreadContext} and reused (never re-created) on
-     * this filter's own re-entrant invocations -- see this class's own javadoc.
+     * The identity-based set of requests this filter has itself rewritten during the current request's
+     * lifetime -- see this class's own javadoc for the re-entrancy bug it exists to fix.
+     *
+     * <p><b>Lazy on both sides, which is the whole point of the type.</b> The contains-check does a
+     * read-only {@link ThreadContext#getTransient} and stops there: an idle feature never reaches a
+     * rewrite, so it must never allocate the set nor pay {@code putTransient}'s copy of the whole
+     * transient map. The set is created and stashed at the one moment it becomes necessary -- the first
+     * actual rewrite in this thread context (see {@link #rewriteIfAssigned}) -- and after that it is the
+     * same set the re-entrant second pass finds, which is what the fix requires.
+     *
+     * <p>Instantiated per {@link #apply} invocation and never shared, so the un-synchronised laziness
+     * below is confined to one thread: an {@link ActionFilter} runs synchronously on the calling thread,
+     * and the {@link ThreadContext} it reads is that thread's own.
      */
-    @SuppressWarnings("unchecked")
-    private static Set<DocWriteRequest<?>> rewrittenMarkerSet(ThreadContext threadContext) {
-        Object existing = threadContext.getTransient(REWRITTEN_MARKER_KEY);
-        if (existing instanceof Set) {
-            return (Set<DocWriteRequest<?>>) existing;
+    private static final class RewrittenMarkers {
+
+        private final ThreadContext threadContext;
+        private Set<DocWriteRequest<?>> markers;
+        private boolean looked;
+
+        RewrittenMarkers(ThreadContext threadContext) {
+            this.threadContext = threadContext;
         }
-        Set<DocWriteRequest<?>> created = Collections.newSetFromMap(new IdentityHashMap<>());
-        threadContext.putTransient(REWRITTEN_MARKER_KEY, created);
-        return created;
+
+        @SuppressWarnings("unchecked")
+        private Set<DocWriteRequest<?>> existing() {
+            if (looked == false) {
+                looked = true;
+                Object stashed = threadContext.getTransient(REWRITTEN_MARKER_KEY);
+                if (stashed instanceof Set) {
+                    markers = (Set<DocWriteRequest<?>>) stashed;
+                }
+            }
+            return markers;
+        }
+
+        boolean contains(DocWriteRequest<?> request) {
+            Set<DocWriteRequest<?>> set = existing();
+            return set != null && set.contains(request);
+        }
+
+        void add(DocWriteRequest<?> request) {
+            Set<DocWriteRequest<?>> set = existing();
+            if (set == null) {
+                set = Collections.newSetFromMap(new IdentityHashMap<>());
+                threadContext.putTransient(REWRITTEN_MARKER_KEY, set);
+                markers = set;
+            }
+            set.add(request);
+        }
     }
 
     /**
@@ -198,11 +259,7 @@ public final class WritePartitionRoutingActionFilter implements ActionFilter {
      *         already-rewritten request re-entering on a nested dispatch (see this class's own
      *         javadoc).
      */
-    private static String rejectIfDirectTargetWrite(
-        ClusterState state,
-        DocWriteRequest<?> request,
-        Set<DocWriteRequest<?>> alreadyRewritten
-    ) {
+    private static String rejectIfDirectTargetWrite(ClusterState state, DocWriteRequest<?> request, RewrittenMarkers alreadyRewritten) {
         if (alreadyRewritten.contains(request)) {
             return null;
         }
@@ -232,7 +289,7 @@ public final class WritePartitionRoutingActionFilter implements ActionFilter {
             + "] -- writes must go through the alias, not the target index directly";
     }
 
-    private void rewriteIfAssigned(ClusterState state, DocWriteRequest<?> request, Set<DocWriteRequest<?>> alreadyRewritten) {
+    private void rewriteIfAssigned(ClusterState state, DocWriteRequest<?> request, RewrittenMarkers alreadyRewritten) {
         String aliasName = request.index();
         String id = request.id();
         if (aliasName == null || id == null) {

@@ -45,6 +45,18 @@ public final class ClusterStateMutationThreads {
      * Thread-name substrings identical to the ones the pre-existing static registries already treat as
      * unsafe -- kept exactly in sync rather than re-derived, since that list is itself the product of real
      * production investigation, not a guess.
+     *
+     * <p><b>Deliberately shorter than {@code AbsentIndexDescriptorSuppliers}' list, which also names the
+     * event-loop threads ({@code http_server_worker}, {@code transport_worker}).</b> The two lists answer
+     * different questions and have different fallbacks, so they are no longer identical and must not be
+     * "resynchronised" without reading this. That registry has a second, explicitly cache-only supplier
+     * tier, so refusing there degrades a cold lookup to a fresh-cache-only one and a warm descriptor still
+     * answers. This check has no second tier: its two consultation points ({@code
+     * Metadata#indexOrResolved}, {@code ClusterState#getIndexRoutingTable}) return {@code null} outright
+     * when it trips, which for a request coordinated on an event loop -- which is nearly all of them --
+     * would mean "no such index" for every gated index, warm or cold. Since every resolver that actually
+     * blocks reaches the object store through that registry's {@code supply}, guarding it there is what
+     * removes the event-loop stall; adding the same names here would remove the feature instead.
      */
     private static final String[] THREADS_WHERE_BLOCKING_IS_UNSAFE = {
         "clusterApplierService#updateTask",

@@ -9,7 +9,14 @@
 package org.opensearch.serverless.storage.placement;
 
 import org.opensearch.common.io.stream.BytesStreamOutput;
+import org.opensearch.common.xcontent.json.JsonXContent;
+import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.common.io.stream.StreamInput;
+import org.opensearch.core.xcontent.DeprecationHandler;
+import org.opensearch.core.xcontent.NamedXContentRegistry;
+import org.opensearch.core.xcontent.ToXContent;
+import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;
@@ -152,6 +159,71 @@ public class ComputedPlacementMembershipTests extends OpenSearchTestCase {
             List.of("node-c"),
             read.previousNodeIds()
         );
+    }
+
+    /**
+     * <b>The round trip that was declared and never performed.</b> {@link
+     * ComputedPlacementMembership#context()} says {@code API_AND_GATEWAY}, but gateway persistence goes
+     * through XContent, and this type wrote three fields to the wire and two to XContent while nothing
+     * could read either back: no parser was registered, so {@code Metadata.Builder.fromXContent} logged
+     * "Skipping unknown custom object" and dropped it. Every full-cluster restart therefore came up with an
+     * empty membership and placement fell back to whichever nodes had joined so far -- the time-varying
+     * node list this whole type exists to stop using.
+     */
+    public void testXContentRoundTripKeepsEveryField() throws IOException {
+        ComputedPlacementMembership membership = ComputedPlacementMembership.of(List.of("node-b", "node-a"), List.of("node-c"), 42L);
+
+        ComputedPlacementMembership read = parse(membership);
+
+        assertEquals("the persisted form must equal what was persisted, field for field", membership, read);
+        assertEquals("a version that restarts at 1 defeats every staleness check that compares one", 42L, read.version());
+        assertEquals(
+            "the predecessor must survive the gateway, or a restart makes every shard in the cluster look cold",
+            List.of("node-c"),
+            read.previousNodeIds()
+        );
+    }
+
+    /** An empty predecessor is a real value ("no previous epoch"), so it has to survive as one. */
+    public void testXContentRoundTripOfAMembershipWithNoPredecessor() throws IOException {
+        ComputedPlacementMembership membership = ComputedPlacementMembership.of(List.of("node-a"), 1L);
+
+        ComputedPlacementMembership read = parse(membership);
+
+        assertEquals(membership, read);
+        assertTrue(read.previousNodeIds().isEmpty());
+    }
+
+    /**
+     * A field written by a later version must be skipped rather than refused. A node that cannot parse the
+     * membership does not get a degraded membership, it gets none at all, which is the failure this parser
+     * was written to remove.
+     */
+    public void testAnUnknownFieldIsSkipped() throws IOException {
+        String json = "{\"version\":3,\"node_ids\":[\"node-a\"],\"previous_node_ids\":[\"node-b\"],\"future_field\":{\"a\":1}}";
+
+        assertEquals(ComputedPlacementMembership.of(List.of("node-a"), List.of("node-b"), 3L), parse(json));
+    }
+
+    /** Serialises through XContent exactly as gateway persistence does, then reads it back. */
+    private static ComputedPlacementMembership parse(ComputedPlacementMembership membership) throws IOException {
+        XContentBuilder builder = JsonXContent.contentBuilder();
+        builder.startObject();
+        membership.toXContent(builder, ToXContent.EMPTY_PARAMS);
+        builder.endObject();
+        return parse(BytesReference.bytes(builder).utf8ToString());
+    }
+
+    private static ComputedPlacementMembership parse(String json) throws IOException {
+        try (
+            XContentParser parser = JsonXContent.jsonXContent.createParser(
+                NamedXContentRegistry.EMPTY,
+                DeprecationHandler.THROW_UNSUPPORTED_OPERATION,
+                json
+            )
+        ) {
+            return ComputedPlacementMembership.fromXContent(parser);
+        }
     }
 
     public void testEmptyIsEmpty() {

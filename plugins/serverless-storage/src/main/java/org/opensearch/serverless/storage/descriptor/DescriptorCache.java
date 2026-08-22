@@ -242,7 +242,12 @@ public final class DescriptorCache {
             return load(name, loader, clock.getAsLong());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            return null;
+            // Not null. Null means "there is no such descriptor" to every caller of this class, and that is
+            // the one answer this whole package is careful to keep separate from "I could not find out" --
+            // the distinction DescriptorUnavailableException exists for, because a client told an index is
+            // absent may go on to create it. An interrupt says nothing whatsoever about whether the index
+            // exists; it says this thread was asked to stop waiting.
+            throw new DescriptorUnavailableException(name, e);
         } catch (TimeoutException e) {
             collapseFallbacks.incrementAndGet();
             logger.debug("waited [{}] ms on an in-flight descriptor read for [{}]; reading directly", collapseWaitMillis, name);

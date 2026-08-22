@@ -10,8 +10,10 @@ package org.opensearch.composite;
 
 import org.opensearch.index.engine.dataformat.DataFormat;
 import org.opensearch.index.engine.dataformat.FieldTypeCapabilities;
+import org.opensearch.index.engine.dataformat.FieldTypeCapabilities.Capability;
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 
@@ -26,10 +28,19 @@ public class CompositeDataFormatTests extends OpenSearchTestCase {
         assertEquals("composite", format.name());
     }
 
-    public void testPriorityReturnsMinValue() {
+    /**
+     * priority() is a precedence rank sorted ascending, so the composite — a last-resort fallback
+     * for anything a concrete format can serve on its own — must sort LAST. It used to return
+     * Long.MIN_VALUE while claiming "lowest priority", which sorted it first.
+     */
+    public void testPriorityRanksCompositeLast() {
         DataFormat primary = mockFormat("lucene", 1, Set.of());
         CompositeDataFormat format = new CompositeDataFormat(primary, List.of(primary));
-        assertEquals(Long.MIN_VALUE, format.priority());
+        assertEquals(Long.MAX_VALUE, format.priority());
+
+        List<DataFormat> sorted = new ArrayList<>(List.of(format, primary));
+        sorted.sort(CompositeDataFormatPlugin.PRECEDENCE_ORDER);
+        assertSame("the concrete format must be preferred over the composite fallback", primary, sorted.get(0));
     }
 
     public void testGetPrimaryDataformatReturnsPrimary() {
@@ -39,15 +50,43 @@ public class CompositeDataFormatTests extends OpenSearchTestCase {
         assertSame(primary, composite.getPrimaryDataFormat());
     }
 
-    public void testSupportedFieldsDelegatesToFirstFormat() {
+    public void testSupportedFieldsIsUnionAcrossFormats() {
         FieldTypeCapabilities cap1 = new FieldTypeCapabilities("keyword", Set.of(FieldTypeCapabilities.Capability.FULL_TEXT_SEARCH));
         FieldTypeCapabilities cap2 = new FieldTypeCapabilities("integer", Set.of(FieldTypeCapabilities.Capability.COLUMNAR_STORAGE));
         DataFormat primary = mockFormat("lucene", 1, Set.of(cap1));
         DataFormat secondary = mockFormat("parquet", 2, Set.of(cap2));
 
         CompositeDataFormat composite = new CompositeDataFormat(primary, List.of(primary, secondary));
-        // supportedFields() returns the first format's fields
-        assertEquals(Set.of(cap1), composite.supportedFields());
+        // It used to return only dataFormats.get(0), dropping every secondary-only capability.
+        assertEquals(Set.of(cap1, cap2), composite.supportedFields());
+    }
+
+    public void testSupportedFieldsUnionsCapabilitiesOfTheSameFieldType() {
+        FieldTypeCapabilities luceneKeyword = new FieldTypeCapabilities("keyword", Set.of(Capability.FULL_TEXT_SEARCH));
+        FieldTypeCapabilities parquetKeyword = new FieldTypeCapabilities(
+            "keyword",
+            Set.of(Capability.COLUMNAR_STORAGE, Capability.STORED_FIELDS)
+        );
+        DataFormat primary = mockFormat("lucene", 1, Set.of(luceneKeyword));
+        DataFormat secondary = mockFormat("parquet", 2, Set.of(parquetKeyword));
+
+        CompositeDataFormat composite = new CompositeDataFormat(primary, List.of(primary, secondary));
+        Set<FieldTypeCapabilities> union = composite.supportedFields();
+        assertEquals(1, union.size());
+        FieldTypeCapabilities keyword = union.iterator().next();
+        assertEquals("keyword", keyword.fieldType());
+        assertEquals(Set.of(Capability.FULL_TEXT_SEARCH, Capability.COLUMNAR_STORAGE, Capability.STORED_FIELDS), keyword.capabilities());
+    }
+
+    /**
+     * The instance the registry stores comes from the no-arg constructor, so it has no
+     * constituents. It reports an empty set — per-field routing for a composite index is decided
+     * by CompositeDataFormatPlugin.assignCapabilities from index settings, not from here.
+     */
+    public void testRegistryVisibleInstanceHasNoConstituentsAndReportsNoFields() {
+        CompositeDataFormat registryInstance = new CompositeDataFormat();
+        assertTrue(registryInstance.getDataFormats().isEmpty());
+        assertEquals(Set.of(), registryInstance.supportedFields());
     }
 
     public void testSupportedFieldsEmptyWhenNoFormats() {

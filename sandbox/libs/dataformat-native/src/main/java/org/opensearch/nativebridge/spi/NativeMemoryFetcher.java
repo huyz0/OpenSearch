@@ -10,7 +10,6 @@ package org.opensearch.nativebridge.spi;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.opensearch.plugin.stats.AnalyticsBackendNativeMemoryStats;
 
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.Linker;

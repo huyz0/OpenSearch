@@ -9,10 +9,14 @@
 package org.opensearch.composite;
 
 import org.apache.lucene.search.Query;
+import org.opensearch.OpenSearchException;
+import org.opensearch.OpenSearchStatusException;
+import org.opensearch.core.rest.RestStatus;
 import org.opensearch.index.engine.dataformat.DataFormat;
 import org.opensearch.index.engine.dataformat.DocumentInput;
 import org.opensearch.index.engine.dataformat.FieldTypeCapabilities;
 import org.opensearch.index.mapper.MappedFieldType;
+import org.opensearch.index.mapper.MapperParsingException;
 import org.opensearch.index.mapper.TextSearchInfo;
 import org.opensearch.index.mapper.ValueFetcher;
 import org.opensearch.index.query.QueryShardContext;
@@ -125,6 +129,62 @@ public class CompositeDocumentInputTests extends OpenSearchTestCase {
         );
     }
 
+    // --- addField failure translation (client 4xx must not be laundered into a 5xx) ---
+
+    public void testAddFieldPropagatesPrimaryMapperParsingExceptionUnchanged() {
+        MapperParsingException thrown = new MapperParsingException("failed to parse field [f]");
+        CompositeDocumentInput composite = new CompositeDocumentInput(
+            mockFormat("parquet", 0, Set.of()),
+            new ThrowingDocumentInput(thrown),
+            Map.of()
+        );
+
+        MapperParsingException actual = expectThrows(MapperParsingException.class, () -> composite.addField(mockFieldType("keyword"), "v"));
+        assertSame("mapping errors must not be rewrapped", thrown, actual);
+        assertEquals("a mapping error is a client error", RestStatus.BAD_REQUEST, actual.status());
+    }
+
+    public void testAddFieldPropagatesSecondaryMapperParsingExceptionUnchanged() {
+        MapperParsingException thrown = new MapperParsingException("failed to parse field [f]");
+        CompositeDocumentInput composite = new CompositeDocumentInput(
+            mockFormat("parquet", 0, Set.of()),
+            new RecordingDocumentInput(),
+            Map.of(mockFormat("lucene", 50, Set.of()), new ThrowingDocumentInput(thrown))
+        );
+
+        MapperParsingException actual = expectThrows(MapperParsingException.class, () -> composite.addField(mockFieldType("keyword"), "v"));
+        assertSame(thrown, actual);
+        assertEquals(RestStatus.BAD_REQUEST, actual.status());
+    }
+
+    public void testAddFieldPropagatesAnyOpenSearchExceptionStatus() {
+        // Any OpenSearchException subtype keeps its own status — not just MapperParsingException.
+        OpenSearchStatusException thrown = new OpenSearchStatusException("too many requests", RestStatus.TOO_MANY_REQUESTS);
+        CompositeDocumentInput composite = new CompositeDocumentInput(
+            mockFormat("parquet", 0, Set.of()),
+            new ThrowingDocumentInput(thrown),
+            Map.of()
+        );
+
+        OpenSearchException actual = expectThrows(OpenSearchException.class, () -> composite.addField(mockFieldType("keyword"), "v"));
+        assertSame(thrown, actual);
+        assertEquals(RestStatus.TOO_MANY_REQUESTS, actual.status());
+    }
+
+    public void testAddFieldWrapsUnexpectedThrowableWithFormatContext() {
+        RuntimeException thrown = new RuntimeException("boom");
+        CompositeDocumentInput composite = new CompositeDocumentInput(
+            mockFormat("parquet", 0, Set.of()),
+            new RecordingDocumentInput(),
+            Map.of(mockFormat("lucene", 50, Set.of()), new ThrowingDocumentInput(thrown))
+        );
+
+        IllegalStateException actual = expectThrows(IllegalStateException.class, () -> composite.addField(mockFieldType("keyword"), "v"));
+        assertSame(thrown, actual.getCause());
+        assertTrue(actual.getMessage(), actual.getMessage().contains("secondary format [lucene]"));
+        assertTrue(actual.getMessage(), actual.getMessage().contains("keyword"));
+    }
+
     // --- helpers ---
 
     private DataFormat mockFormat(String name, long priority, Set<FieldTypeCapabilities> fields) {
@@ -194,5 +254,19 @@ public class CompositeDocumentInputTests extends OpenSearchTestCase {
 
         @Override
         public void close() {}
+    }
+
+    /** A {@link DocumentInput} whose {@code addField} always throws the supplied exception. */
+    static class ThrowingDocumentInput extends RecordingDocumentInput {
+        private final RuntimeException toThrow;
+
+        ThrowingDocumentInput(RuntimeException toThrow) {
+            this.toThrow = toThrow;
+        }
+
+        @Override
+        public void addField(MappedFieldType fieldType, Object value) {
+            throw toThrow;
+        }
     }
 }

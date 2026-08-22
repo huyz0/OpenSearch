@@ -16,6 +16,8 @@ import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -163,6 +165,132 @@ public class TombstoneScrubberTests extends OpenSearchTestCase {
         IndexDescriptor still = backend.get("serverless_tenant-churn");
         assertNotNull("deleting it would lose the record for the deletion that just happened", still);
         assertFalse(still.exists());
+    }
+
+    /**
+     * The freshness check and the delete it authorises are adjacent, with nothing in between.
+     *
+     * <p>{@link #testATombstoneRefreshedDuringThePassIsKept} pins that the check happens; this pins that its
+     * answer is acted on while it is still true. The candidates used to be batched a hundred at a time, so a
+     * name checked first was deleted up to ninety-nine blob reads later -- and the window that opens is
+     * exactly the one the check exists to close, because what can happen inside it is the name being deleted,
+     * recreated and deleted again, leaving a young tombstone for a deletion still inside its window.
+     *
+     * <p>Asserted as the operation sequence rather than as an outcome, because the outcome under the old
+     * code was right in every test that did not race. A property about ordering has to be tested as one.
+     */
+    public void testTheAgeCheckAndTheDeleteAreAdjacent() {
+        for (int i = 0; i < 3; i++) {
+            tombstone("serverless_tenant-old-" + i, now - 10 * DAY);
+        }
+        tombstone("serverless_tenant-recent", now - DAY);
+
+        List<String> operations = new ArrayList<>();
+        TombstoneScrubber recording = new TombstoneScrubber(
+            path -> new RecordingContainer(store.blobContainer(path), operations),
+            BlobPath.cleanPath(),
+            () -> now
+        );
+
+        assertEquals(3, recording.scrubOnce(7 * DAY));
+
+        // Every delete must be preceded directly by the read of the name it deletes.
+        int deletes = 0;
+        for (int i = 0; i < operations.size(); i++) {
+            String operation = operations.get(i);
+            if (operation.startsWith("delete ") == false) {
+                continue;
+            }
+            deletes++;
+            String name = operation.substring("delete ".length());
+            assertTrue("a delete must not be the first operation", i > 0);
+            assertEquals(
+                "the age check must be the operation immediately before the delete it authorises, "
+                    + "or it is not a freshness check at all: "
+                    + operations,
+                "read " + name,
+                operations.get(i - 1)
+            );
+        }
+        assertEquals("one delete per reclaimed tombstone", 3, deletes);
+    }
+
+    /** Records which blob each read and each delete touched, in order. */
+    private static final class RecordingContainer implements org.opensearch.common.blobstore.BlobContainer {
+        private final org.opensearch.common.blobstore.BlobContainer delegate;
+        private final List<String> operations;
+
+        RecordingContainer(org.opensearch.common.blobstore.BlobContainer delegate, List<String> operations) {
+            this.delegate = delegate;
+            this.operations = operations;
+        }
+
+        @Override
+        public java.util.Optional<org.opensearch.common.blobstore.BlobRegister> readRegister(String blobName) throws java.io.IOException {
+            operations.add("read " + blobName);
+            return delegate.readRegister(blobName);
+        }
+
+        @Override
+        public void deleteBlobsIgnoringIfNotExists(List<String> blobNames) throws java.io.IOException {
+            for (String blobName : blobNames) {
+                operations.add("delete " + blobName);
+            }
+            delegate.deleteBlobsIgnoringIfNotExists(blobNames);
+        }
+
+        @Override
+        public java.util.Map<String, org.opensearch.common.blobstore.BlobMetadata> listBlobs() throws java.io.IOException {
+            return delegate.listBlobs();
+        }
+
+        @Override
+        public java.util.Map<String, org.opensearch.common.blobstore.BlobContainer> children() throws java.io.IOException {
+            return delegate.children();
+        }
+
+        @Override
+        public java.util.Map<String, org.opensearch.common.blobstore.BlobMetadata> listBlobsByPrefix(String prefix)
+            throws java.io.IOException {
+            return delegate.listBlobsByPrefix(prefix);
+        }
+
+        @Override
+        public BlobPath path() {
+            return delegate.path();
+        }
+
+        @Override
+        public boolean blobExists(String blobName) throws java.io.IOException {
+            return delegate.blobExists(blobName);
+        }
+
+        @Override
+        public java.io.InputStream readBlob(String blobName) throws java.io.IOException {
+            return delegate.readBlob(blobName);
+        }
+
+        @Override
+        public java.io.InputStream readBlob(String blobName, long position, long length) throws java.io.IOException {
+            return delegate.readBlob(blobName, position, length);
+        }
+
+        @Override
+        public void writeBlob(String blobName, java.io.InputStream inputStream, long blobSize, boolean failIfAlreadyExists)
+            throws java.io.IOException {
+            delegate.writeBlob(blobName, inputStream, blobSize, failIfAlreadyExists);
+        }
+
+        @Override
+        public void writeBlobAtomic(String blobName, java.io.InputStream inputStream, long blobSize, boolean failIfAlreadyExists)
+            throws java.io.IOException {
+            delegate.writeBlobAtomic(blobName, inputStream, blobSize, failIfAlreadyExists);
+        }
+
+        @Override
+        public org.opensearch.common.blobstore.DeleteResult delete() throws java.io.IOException {
+            return delegate.delete();
+        }
     }
 
     /**

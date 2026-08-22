@@ -69,9 +69,13 @@ public class ShardCloneRequest extends ActionRequest {
         ActionRequestValidationException validationException = null;
         if (sourceIndexUuid == null || sourceIndexUuid.isEmpty()) {
             validationException = addValidationError("source indexUuid is required", validationException);
+        } else if (isWellFormedIndexUuid(sourceIndexUuid) == false) {
+            validationException = addValidationError("source " + INDEX_UUID_CHARSET_ERROR, validationException);
         }
         if (targetIndexUuid == null || targetIndexUuid.isEmpty()) {
             validationException = addValidationError("target indexUuid is required", validationException);
+        } else if (isWellFormedIndexUuid(targetIndexUuid) == false) {
+            validationException = addValidationError("target " + INDEX_UUID_CHARSET_ERROR, validationException);
         }
         if (sourceShardId < 0) {
             validationException = addValidationError("source shardId must be >= 0", validationException);
@@ -89,6 +93,33 @@ public class ShardCloneRequest extends ActionRequest {
             validationException = addValidationError("source and target must not name the same shard", validationException);
         }
         return validationException;
+    }
+
+    /** The message reported for an {@code indexUuid} carrying characters no real uuid contains. */
+    static final String INDEX_UUID_CHARSET_ERROR = "indexUuid must contain only [A-Za-z0-9_-]";
+
+    /**
+     * Whether {@code indexUuid} is drawn from the alphabet a real index UUID is drawn from --
+     * OpenSearch generates them as unpadded URL-safe base64, so letters, digits, {@code -} and
+     * {@code _} and nothing else (the {@code _na_} placeholder also fits).
+     *
+     * <p>Defence in depth, not the primary control: the authoritative check is
+     * {@code TransportShardCloneAction#requireRealShard}, which resolves each uuid against cluster
+     * metadata and so answers "does this name a real shard", which no character test can. This one
+     * exists because the uuid ends up as a blob-path segment
+     * ({@code BlobPath.cleanPath().add(indexUuid)}) resolved without normalisation, and a boundary
+     * that refuses {@code /} and {@code ..} outright is worth having independently of whether the
+     * metadata lookup downstream is ever bypassed or reordered.
+     */
+    static boolean isWellFormedIndexUuid(String indexUuid) {
+        for (int i = 0; i < indexUuid.length(); i++) {
+            char c = indexUuid.charAt(i);
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_') {
+                continue;
+            }
+            return false;
+        }
+        return true;
     }
 
     /** The index being cloned from. */

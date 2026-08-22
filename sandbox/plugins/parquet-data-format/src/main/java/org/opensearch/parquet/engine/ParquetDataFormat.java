@@ -34,6 +34,14 @@ public class ParquetDataFormat extends DataFormat {
         return PARQUET_DATA_FORMAT_NAME;
     }
 
+    /**
+     * {@inheritDoc}
+     * <p>
+     * {@code priority()} is a <em>precedence rank</em>: every place that orders formats sorts
+     * <b>ascending</b> and takes the earliest match, so a <b>lower</b> number is consulted
+     * <b>sooner</b>. {@code 0} makes Parquet the first format offered each requested capability;
+     * Lucene ({@code 50}) picks up whatever Parquet cannot serve.
+     */
     @Override
     public long priority() {
         return 0;

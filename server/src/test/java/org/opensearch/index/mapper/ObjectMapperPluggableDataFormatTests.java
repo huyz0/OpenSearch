@@ -47,10 +47,7 @@ public class ObjectMapperPluggableDataFormatTests extends MapperServiceTestCase 
         Settings pluggableSettings = Settings.builder().put(getIndexSettings()).put("index.pluggable.dataformat.enabled", true).build();
         MapperParsingException e = expectThrows(
             MapperParsingException.class,
-            () -> createDocumentMapper(
-                pluggableSettings,
-                mapping(b -> b.startObject("nested_field").field("type", "nested").endObject())
-            )
+            () -> createDocumentMapper(pluggableSettings, mapping(b -> b.startObject("nested_field").field("type", "nested").endObject()))
         );
         assertTrue(e.getMessage().contains("nested type is not supported with pluggable data format"));
     }

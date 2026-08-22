@@ -243,9 +243,12 @@ public class DataFormatAwareEngine implements Indexer {
 
     /**
      * System property to enable or disable pluggable dataformat merge operations.
-     * Set to "true" to enable merges (e.g., {@code -Dopensearch.pluggable.dataformat.merge.enabled=true}).
-     * Defaults to "false" (merges disabled) as the merge implementations are not yet complete
-     * for all data formats.
+     * Defaults to {@code true} (merges enabled); set it to "false" to disable them
+     * (e.g., {@code -Dopensearch.pluggable.dataformat.merge.enabled=false}).
+     * <p>
+     * The gate is enforced in exactly one place — {@link #triggerPossibleMerges()} — which is the only
+     * route by which this engine asks the scheduler to look for new merges, including the resume after
+     * a tiering unfreeze.
      * <p>
      * TODO: Remove this flag once merge implementations are complete for all data formats.
      */
@@ -303,7 +306,14 @@ public class DataFormatAwareEngine implements Indexer {
         }
 
         boolean success = false;
+        // Local mirrors of the final fields that own a native/OS resource. The failure path below closes
+        // these, so a retried engine open does not trip over an IndexWriter write lock (or a leaked
+        // reader/execution-engine handle) left behind by the attempt that failed. Blank final fields
+        // cannot be read before assignment, hence the locals.
         TranslogManager translogManagerRef = null;
+        Committer committerRef = null;
+        IndexingExecutionEngine indexingExecutionEngineRef = null;
+        Map<DataFormat, EngineReaderManager<?>> readerManagersRef = null;
 
         try {
             store.incRef();
@@ -321,11 +331,12 @@ public class DataFormatAwareEngine implements Indexer {
             // Lucene merges that skip because the shared writer has no matching segments —
             // applyMergeChanges acquires refreshLock itself. Either way, applyMergeChanges
             // releases the lock before returning.
-            this.committer = engineConfig.getCommitterFactory().getCommitter(new CommitterConfig(engineConfig, () -> {
+            committerRef = engineConfig.getCommitterFactory().getCommitter(new CommitterConfig(engineConfig, () -> {
                 if (refreshLock.isHeldByCurrentThread() == false) {
                     refreshLock.lock();
                 }
             }));
+            this.committer = committerRef;
 
             // 2. Read translogUUID and history UUID from last committed data
             final Map<String, String> userData = committer.getLastCommittedData();
@@ -348,7 +359,7 @@ public class DataFormatAwareEngine implements Indexer {
 
             // 5. Create IndexingExecutionEngine and ReaderManagers
             DataFormatRegistry registry = engineConfig.getDataFormatRegistry();
-            this.indexingExecutionEngine = registry.getIndexingEngine(
+            indexingExecutionEngineRef = registry.getIndexingEngine(
                 new IndexingEngineConfig(
                     committer,
                     config().getMapperService(),
@@ -359,6 +370,7 @@ public class DataFormatAwareEngine implements Indexer {
                 ),
                 registry.format(config().getIndexSettings().pluggableDataFormat())
             );
+            this.indexingExecutionEngine = indexingExecutionEngineRef;
 
             long maxGenFromCommit = 0L;
             try {
@@ -381,7 +393,7 @@ public class DataFormatAwareEngine implements Indexer {
             // Create Reader managers
             // We will pass IndexStoreProvider to this, which would contain store
             // and any index specific attributes useful for reads.
-            this.readerManagers = indexingExecutionEngine.buildReaderManager(
+            readerManagersRef = indexingExecutionEngine.buildReaderManager(
                 new ReaderManagerConfig(
                     Optional.ofNullable(indexingExecutionEngine.getProvider()),
                     indexingExecutionEngine.getDataFormat(),
@@ -391,6 +403,7 @@ public class DataFormatAwareEngine implements Indexer {
                     engineConfig.getIndexSettings()
                 )
             );
+            this.readerManagers = readerManagersRef;
 
             // 6. Create CombinedCatalogSnapshotDeletionPolicy
             CombinedCatalogSnapshotDeletionPolicy combinedPolicy = new CombinedCatalogSnapshotDeletionPolicy(
@@ -506,7 +519,15 @@ public class DataFormatAwareEngine implements Indexer {
             throw new EngineCreationFailureException(shardId, "failed to create engine", e);
         } finally {
             if (success == false) {
-                IOUtils.closeWhileHandlingException(translogManagerRef);
+                // Close everything constructed so far, not just the translog. The committer typically
+                // owns an IndexWriter (and therefore the Lucene write.lock on the shard directory); if it
+                // were left open, the next engine-open attempt for this shard would fail with
+                // LockObtainFailedException and the shard would never recover. Reader managers and the
+                // indexing execution engine hold their own file handles / native memory.
+                IOUtils.closeWhileHandlingException(indexingExecutionEngineRef, committerRef, translogManagerRef);
+                if (readerManagersRef != null) {
+                    IOUtils.closeWhileHandlingException(readerManagersRef.values());
+                }
                 if (isClosed.get() == false) {
                     store.decRef();
                 }
@@ -943,169 +964,182 @@ public class DataFormatAwareEngine implements Indexer {
         try (ReleasableLock ignored = readLock.acquire()) {
             ensureOpen();
             ensureNoTragicException();
+            // refreshLock.lock() must be the last statement before the try whose finally unlocks it, and
+            // nothing that can throw may sit between the acquire and that try. Both listener notification
+            // and the writer closes below throw IOException; when they ran outside the protected region a
+            // single throwing refresh listener leaked refreshLock permanently, and every subsequent merge
+            // thread blocked forever in applyMergeChanges -> refreshLock.lock() (leaking a thread from the
+            // node-wide MERGE pool each time and pinning activeMerges so tiering drains never complete).
             refreshLock.lock();
+            try {
+                // refresh only if new segments have been created or force param is true
+                notifyRefreshListenersBefore();
+                try (GatedCloseable<CatalogSnapshot> catalogSnapshot = catalogSnapshotManager.acquireSnapshot()) {
+                    if (store.tryIncRef()) {
+                        try {
+                            List<DefaultLockableHolder<Writer<?>>> writers = writerPool.checkoutAll();
+                            List<Segment> existingSegments = catalogSnapshot.get().getSegments();
+                            List<Segment> newSegments = new ArrayList<>();
 
-            // refresh only if new segments have been created or force param is true
-            notifyRefreshListenersBefore();
-            try (GatedCloseable<CatalogSnapshot> catalogSnapshot = catalogSnapshotManager.acquireSnapshot()) {
-                if (store.tryIncRef()) {
-                    try {
-                        List<DefaultLockableHolder<Writer<?>>> writers = writerPool.checkoutAll();
-                        List<Segment> existingSegments = catalogSnapshot.get().getSegments();
-                        List<Segment> newSegments = new ArrayList<>();
+                            final long flushAllStartNanos = System.nanoTime();
+                            int writerCount = writers.size();
+                            long rowsToRelease = 0L;
 
-                        final long flushAllStartNanos = System.nanoTime();
-                        int writerCount = writers.size();
-                        long rowsToRelease = 0L;
+                            // Add all checked-out writers to the shared flushQueue with a latch
+                            // so the refresh thread can wait for ALL writers to be flushed
+                            // (by itself + write threads cooperatively).
+                            CountDownLatch flushLatch = new CountDownLatch(writerCount);
+                            this.activeFlushLatch = flushLatch;
+                            for (var lockable : writers) {
+                                flushQueue.add(lockable.get());
+                            }
 
-                        // Add all checked-out writers to the shared flushQueue with a latch
-                        // so the refresh thread can wait for ALL writers to be flushed
-                        // (by itself + write threads cooperatively).
-                        CountDownLatch flushLatch = new CountDownLatch(writerCount);
-                        this.activeFlushLatch = flushLatch;
-                        for (var lockable : writers) {
-                            flushQueue.add(lockable.get());
-                        }
+                            // Refresh thread drains the queue itself (it's not idle — it does work)
+                            Writer<?> writerToFlush;
+                            while ((writerToFlush = flushQueue.poll()) != null) {
+                                ensureOpen(); // short-circuit if engine has failed/closed concurrently
+                                try {
+                                    final long writerFlushStartNanos = System.nanoTime();
+                                    FileInfos fileInfos = writerToFlush.flush(FlushInput.EMPTY);
+                                    final long writerFlushElapsedMs = TimeValue.nsecToMSec(System.nanoTime() - writerFlushStartNanos);
 
-                        // Refresh thread drains the queue itself (it's not idle — it does work)
-                        Writer<?> writerToFlush;
-                        while ((writerToFlush = flushQueue.poll()) != null) {
-                            ensureOpen(); // short-circuit if engine has failed/closed concurrently
-                            try {
-                                final long writerFlushStartNanos = System.nanoTime();
-                                FileInfos fileInfos = writerToFlush.flush(FlushInput.EMPTY);
-                                final long writerFlushElapsedMs = TimeValue.nsecToMSec(System.nanoTime() - writerFlushStartNanos);
-
-                                Segment.Builder segmentBuilder = Segment.builder(writerToFlush.generation());
-                                boolean hasFiles = false;
-                                for (Map.Entry<DataFormat, WriterFileSet> entry : fileInfos.writerFilesMap().entrySet()) {
+                                    Segment.Builder segmentBuilder = Segment.builder(writerToFlush.generation());
+                                    boolean hasFiles = false;
+                                    for (Map.Entry<DataFormat, WriterFileSet> entry : fileInfos.writerFilesMap().entrySet()) {
+                                        logger.trace(
+                                            "Writer gen={} flushed format=[{}] files={}",
+                                            writerToFlush.generation(),
+                                            entry.getKey().name(),
+                                            entry.getValue().files()
+                                        );
+                                        segmentBuilder.addSearchableFiles(entry.getKey(), entry.getValue());
+                                        hasFiles = true;
+                                    }
                                     logger.trace(
-                                        "Writer gen={} flushed format=[{}] files={}",
+                                        "refresh[{}]: writer gen={} flush took [{}ms] hasFiles={}",
+                                        source,
                                         writerToFlush.generation(),
-                                        entry.getKey().name(),
-                                        entry.getValue().files()
+                                        writerFlushElapsedMs,
+                                        hasFiles
                                     );
-                                    segmentBuilder.addSearchableFiles(entry.getKey(), entry.getValue());
-                                    hasFiles = true;
+                                    if (hasFiles) {
+                                        Segment segment = segmentBuilder.build();
+                                        newSegments.add(segment);
+                                        rowsToRelease += segment.dfGroupedSearchableFiles().values().stream().findFirst().get().numRows();
+                                    }
+                                    refreshed |= hasFiles;
+                                } catch (Exception e) {
+                                    IOUtils.closeWhileHandlingException(writerToFlush);
+                                    throw e;
                                 }
-                                logger.trace(
-                                    "refresh[{}]: writer gen={} flush took [{}ms] hasFiles={}",
-                                    source,
-                                    writerToFlush.generation(),
-                                    writerFlushElapsedMs,
-                                    hasFiles
-                                );
-                                if (hasFiles) {
-                                    Segment segment = segmentBuilder.build();
-                                    newSegments.add(segment);
-                                    rowsToRelease += segment.dfGroupedSearchableFiles().values().stream().findFirst().get().numRows();
+                                toClose.add(writerToFlush);
+                                flushLatch.countDown();
+                            }
+
+                            // Wait for any writers that write threads picked up to finish.
+                            // Use active polling so we detect engine close/failure promptly
+                            // instead of blocking indefinitely on the latch.
+                            while (flushLatch.getCount() > 0) {
+                                if (isClosed.get() || failedEngine.get() != null) {
+                                    throw new AlreadyClosedException("engine closed during refresh flush");
                                 }
-                                refreshed |= hasFiles;
-                            } catch (Exception e) {
-                                IOUtils.closeWhileHandlingException(writerToFlush);
-                                throw e;
-                            }
-                            toClose.add(writerToFlush);
-                            flushLatch.countDown();
-                        }
-
-                        // Wait for any writers that write threads picked up to finish.
-                        // Use active polling so we detect engine close/failure promptly
-                        // instead of blocking indefinitely on the latch.
-                        while (flushLatch.getCount() > 0) {
-                            if (isClosed.get() || failedEngine.get() != null) {
-                                throw new AlreadyClosedException("engine closed during refresh flush");
-                            }
-                            try {
-                                if (flushLatch.await(1, TimeUnit.SECONDS) == false) {
-                                    continue; // re-check isClosed / failedEngine
+                                try {
+                                    if (flushLatch.await(1, TimeUnit.SECONDS) == false) {
+                                        continue; // re-check isClosed / failedEngine
+                                    }
+                                } catch (InterruptedException e) {
+                                    Thread.currentThread().interrupt();
+                                    throw new IOException("Refresh interrupted waiting for flush completion", e);
                                 }
-                            } catch (InterruptedException e) {
-                                Thread.currentThread().interrupt();
-                                throw new IOException("Refresh interrupted waiting for flush completion", e);
                             }
-                        }
-                        this.activeFlushLatch = null;
-                        final long flushAllElapsedMs = TimeValue.nsecToMSec(System.nanoTime() - flushAllStartNanos);
+                            this.activeFlushLatch = null;
+                            final long flushAllElapsedMs = TimeValue.nsecToMSec(System.nanoTime() - flushAllStartNanos);
 
-                        // Drain any segments flushed by write threads (via preIndex)
-                        Segment pendingSeg;
-                        while ((pendingSeg = pendingSegments.poll()) != null) {
-                            newSegments.add(pendingSeg);
-                            rowsToRelease += pendingSeg.dfGroupedSearchableFiles().values().stream().findFirst().get().numRows();
-                            refreshed = true;
-                        }
-                        // Drain pending writers so they get closed after addIndexes incorporates their files
-                        Writer<?> pendingWriter;
-                        while ((pendingWriter = pendingWritersToClose.poll()) != null) {
-                            toClose.add(pendingWriter);
-                        }
+                            // Drain any segments flushed by write threads (via preIndex)
+                            Segment pendingSeg;
+                            while ((pendingSeg = pendingSegments.poll()) != null) {
+                                newSegments.add(pendingSeg);
+                                rowsToRelease += pendingSeg.dfGroupedSearchableFiles().values().stream().findFirst().get().numRows();
+                                refreshed = true;
+                            }
+                            // Drain pending writers so they get closed after addIndexes incorporates their files
+                            Writer<?> pendingWriter;
+                            while ((pendingWriter = pendingWritersToClose.poll()) != null) {
+                                toClose.add(pendingWriter);
+                            }
 
-                        logger.debug(
-                            "refresh[{}]: flushed {} writers producing {} new segments in [{}ms]",
-                            source,
-                            writerCount,
-                            newSegments.size(),
-                            flushAllElapsedMs
-                        );
-                        // Every new segment must contain files from at least one data format
-                        assert newSegments.stream().allMatch(s -> s.dfGroupedSearchableFiles().isEmpty() == false)
-                            : "new segments must have at least one format's files";
-                        // No two new segments may share the same generation
-                        assert newSegments.stream().map(Segment::generation).distinct().count() == newSegments.size()
-                            : "new segments must have unique generations";
-
-                        // New segment generations must not collide with existing segment generations
-                        assert newSegments.stream()
-                            .noneMatch(ns -> existingSegments.stream().anyMatch(es -> es.generation() == ns.generation()))
-                            : "new segment generation collides with an existing segment generation";
-
-                        if (refreshed) {
-                            final long engineRefreshStartNanos = System.nanoTime();
-                            long nextGen = newSegments.size() > 1 ? writerGenerationCounter.incrementAndGet() : RefreshInput.NO_GENERATION;
-                            RefreshInput refreshInput = new RefreshInput(existingSegments, newSegments, nextGen);
-                            RefreshResult result = indexingExecutionEngine.refresh(refreshInput);
-                            final long engineRefreshElapsedMs = TimeValue.nsecToMSec(System.nanoTime() - engineRefreshStartNanos);
                             logger.debug(
-                                "refresh[{}]: indexingExecutionEngine.refresh took [{}ms] "
-                                    + "existingSegments={} newSegments={} resultSegments={}",
+                                "refresh[{}]: flushed {} writers producing {} new segments in [{}ms]",
                                 source,
-                                engineRefreshElapsedMs,
-                                existingSegments.size(),
+                                writerCount,
                                 newSegments.size(),
-                                result.refreshedSegments().size()
+                                flushAllElapsedMs
                             );
-                            // Refresh result must contain at least as many segments as existed before (existing + new)
-                            assert result.refreshedSegments().size() >= existingSegments.size()
-                                : "refresh must not lose existing segments; had "
-                                    + existingSegments.size()
-                                    + " but got "
-                                    + result.refreshedSegments().size();
+                            // Every new segment must contain files from at least one data format
+                            assert newSegments.stream().allMatch(s -> s.dfGroupedSearchableFiles().isEmpty() == false)
+                                : "new segments must have at least one format's files";
+                            // No two new segments may share the same generation
+                            assert newSegments.stream().map(Segment::generation).distinct().count() == newSegments.size()
+                                : "new segments must have unique generations";
 
-                            final long commitStartNanos = System.nanoTime();
-                            catalogSnapshotManager.commitNewSnapshot(result.refreshedSegments());
-                            assert rowsToRelease > 0L : "Rows to release from active writes should be greater than 0 but was: "
-                                + rowsToRelease
-                                + " for shard: "
-                                + shardId;
-                            pendingRowCount.addAndGet(-rowsToRelease);
-                            final long commitElapsedMs = TimeValue.nsecToMSec(System.nanoTime() - commitStartNanos);
-                            logger.trace("refresh[{}]: catalogSnapshot commit took [{}ms]", source, commitElapsedMs);
-                        } else if ("flush".equals(source)) {
-                            catalogSnapshotManager.bumpGeneration();
+                            // New segment generations must not collide with existing segment generations
+                            assert newSegments.stream()
+                                .noneMatch(ns -> existingSegments.stream().anyMatch(es -> es.generation() == ns.generation()))
+                                : "new segment generation collides with an existing segment generation";
+
+                            if (refreshed) {
+                                final long engineRefreshStartNanos = System.nanoTime();
+                                long nextGen = newSegments.size() > 1
+                                    ? writerGenerationCounter.incrementAndGet()
+                                    : RefreshInput.NO_GENERATION;
+                                RefreshInput refreshInput = new RefreshInput(existingSegments, newSegments, nextGen);
+                                RefreshResult result = indexingExecutionEngine.refresh(refreshInput);
+                                final long engineRefreshElapsedMs = TimeValue.nsecToMSec(System.nanoTime() - engineRefreshStartNanos);
+                                logger.debug(
+                                    "refresh[{}]: indexingExecutionEngine.refresh took [{}ms] "
+                                        + "existingSegments={} newSegments={} resultSegments={}",
+                                    source,
+                                    engineRefreshElapsedMs,
+                                    existingSegments.size(),
+                                    newSegments.size(),
+                                    result.refreshedSegments().size()
+                                );
+                                // Refresh result must contain at least as many segments as existed before (existing + new)
+                                assert result.refreshedSegments().size() >= existingSegments.size()
+                                    : "refresh must not lose existing segments; had "
+                                        + existingSegments.size()
+                                        + " but got "
+                                        + result.refreshedSegments().size();
+
+                                final long commitStartNanos = System.nanoTime();
+                                catalogSnapshotManager.commitNewSnapshot(result.refreshedSegments());
+                                assert rowsToRelease > 0L : "Rows to release from active writes should be greater than 0 but was: "
+                                    + rowsToRelease
+                                    + " for shard: "
+                                    + shardId;
+                                pendingRowCount.addAndGet(-rowsToRelease);
+                                final long commitElapsedMs = TimeValue.nsecToMSec(System.nanoTime() - commitStartNanos);
+                                logger.trace("refresh[{}]: catalogSnapshot commit took [{}ms]", source, commitElapsedMs);
+                            } else if ("flush".equals(source)) {
+                                catalogSnapshotManager.bumpGeneration();
+                            }
+                        } finally {
+                            store.decRef();
                         }
-                    } finally {
-                        store.decRef();
+                        if (refreshed) {
+                            lastRefreshedCheckpointListener.updateRefreshedCheckpoint(localCheckpointBeforeRefresh);
+                            maybePruneDeletes();
+                            triggerPossibleMerges(); // trigger merges
+                        }
                     }
-                    if (refreshed) {
-                        lastRefreshedCheckpointListener.updateRefreshedCheckpoint(localCheckpointBeforeRefresh);
-                        maybePruneDeletes();
-                        triggerPossibleMerges(); // trigger merges
-                    }
+                } finally {
+                    // Both of these can throw IOException. They stay inside the refreshLock-protected
+                    // region (correct — the writers being closed are the ones this refresh flushed), and
+                    // the unlock now lives in the enclosing finally so a throw here cannot strand the lock.
+                    notifyRefreshListenersAfter(refreshed);
+                    IOUtils.close(toClose);
                 }
             } finally {
-                notifyRefreshListenersAfter(refreshed);
-                IOUtils.close(toClose);
                 refreshLock.unlock();
             }
         } catch (AlreadyClosedException ex) {
@@ -1326,6 +1360,11 @@ public class DataFormatAwareEngine implements Indexer {
             logger.debug("forceMerge blocked — engine is frozen for tiering");
             return;
         }
+        // This check is only a fast reject: a second force-merge caller parks on the scheduler's
+        // force-merge lock for the whole duration of the one already running (minutes), by which time
+        // tiering may have started and drained. MergeScheduler#forceMerge re-checks the frozen state
+        // after it acquires the lock, and counts a parked caller as active merge work so a tiering
+        // drain cannot report quiescence while a force merge is queued.
         mergeScheduler.forceMerge(maxNumSegments);
         if (flush) {
             flush(true, true);
@@ -1409,7 +1448,10 @@ public class DataFormatAwareEngine implements Indexer {
         } else {
             if (frozenForTiering.compareAndSet(true, false)) {
                 logger.info("Unfreezing engine — tiering cancelled, resuming normal operations");
-                mergeScheduler.unfreeze();
+                // Resume through triggerPossibleMerges, not the scheduler's own triggerMerges: the
+                // MERGE_ENABLED_PROPERTY gate must hold on this path too, otherwise a node configured
+                // with merges disabled would silently start merging again after a tiering cancel.
+                mergeScheduler.unfreeze(this::triggerPossibleMerges);
             }
         }
     }
