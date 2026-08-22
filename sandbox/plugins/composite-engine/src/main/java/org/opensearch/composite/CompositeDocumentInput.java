@@ -8,6 +8,7 @@
 
 package org.opensearch.composite;
 
+import org.opensearch.OpenSearchException;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.index.engine.dataformat.DataFormat;
 import org.opensearch.index.engine.dataformat.DocumentInput;
@@ -33,6 +34,7 @@ public class CompositeDocumentInput implements DocumentInput<List<? extends Docu
     private final DocumentInput<?> primaryDocumentInput;
     private final DataFormat primaryFormat;
     private final Map<DataFormat, DocumentInput<?>> secondaryDocumentInputs;
+    private long rowId = -1L;
 
     /**
      * Constructs a CompositeDocumentInput with a primary format input and secondary format inputs.
@@ -58,21 +60,36 @@ public class CompositeDocumentInput implements DocumentInput<List<? extends Docu
         try {
             primaryDocumentInput.addField(fieldType, value);
         } catch (Exception e) {
-            throw new IllegalStateException(
-                "Failed to add field [" + fieldType.name() + "] in primary format [" + primaryFormat.name() + "]",
-                e
-            );
+            throw wrapAddFieldFailure(e, fieldType, "primary", primaryFormat);
         }
         for (Map.Entry<DataFormat, DocumentInput<?>> entry : secondaryDocumentInputs.entrySet()) {
             try {
                 entry.getValue().addField(fieldType, value);
             } catch (Exception e) {
-                throw new IllegalStateException(
-                    "Failed to add field [" + fieldType.name() + "] in secondary format [" + entry.getKey().name() + "]",
-                    e
-                );
+                throw wrapAddFieldFailure(e, fieldType, "secondary", entry.getKey());
             }
         }
+    }
+
+    /**
+     * Decides how a sub-format's {@code addField} failure leaves this method.
+     * <p>
+     * A sub-format reports a mapping/parse problem as an {@link OpenSearchException} subtype that
+     * carries the right HTTP status — {@code ParquetDocumentInput}, for instance, throws
+     * {@link org.opensearch.index.mapper.MapperParsingException}, a 400. Those are rethrown
+     * untouched: rewrapping them in {@link IllegalStateException}, which has no {@code status()}
+     * override, laundered every client-side mapping error in every sub-format into a 500. The
+     * originating exception already names the offending field, so no context is lost.
+     * <p>
+     * Anything else really is unexpected here, so it keeps the wrapper that names the failing
+     * role and format.
+     */
+    private static RuntimeException wrapAddFieldFailure(Exception e, MappedFieldType fieldType, String role, DataFormat format) {
+        if (e instanceof OpenSearchException openSearchException) {
+            return openSearchException;
+        }
+        String message = "Failed to add field [" + fieldType.name() + "] in " + role + " format [" + format.name() + "]";
+        return new IllegalStateException(message, e);
     }
 
     @Override
@@ -81,6 +98,12 @@ public class CompositeDocumentInput implements DocumentInput<List<? extends Docu
         for (DocumentInput<?> input : secondaryDocumentInputs.values()) {
             input.setRowId(rowIdFieldName, rowId);
         }
+        this.rowId = rowId;
+    }
+
+    /** Returns the row ID assigned via {@link #setRowId}, or {@code -1} if none. */
+    public long getRowId() {
+        return rowId;
     }
 
     public long getFieldCount(String fieldName) {

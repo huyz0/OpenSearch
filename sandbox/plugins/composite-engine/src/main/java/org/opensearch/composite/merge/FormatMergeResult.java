@@ -13,33 +13,21 @@ import org.opensearch.index.engine.dataformat.DataFormat;
 import org.opensearch.index.engine.dataformat.RowIdMapping;
 import org.opensearch.index.engine.exec.WriterFileSet;
 
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.Optional;
 
 /**
  * Result of merging a single data format's files.
+ * <p>
+ * Deliberately has no {@code cleanup()} of its own. Deleting merge output on failure is the
+ * store layer's job and is done by {@link CompositeMergeExecutor} through
+ * {@link CompositeMergeExecutor.MergeOutputCleaner}; a raw {@code Files.deleteIfExists} here
+ * bypassed each format's {@code DataFormatStoreHandler} — notably parquet's native
+ * {@code TieredObjectStore} registry, which was left holding entries for deleted files.
  */
 @ExperimentalApi
 public record FormatMergeResult(DataFormat format, WriterFileSet mergedFiles, RowIdMapping rowIdMapping) {
 
     public Optional<RowIdMapping> rowIdMappingOpt() {
         return Optional.ofNullable(rowIdMapping);
-    }
-
-    /**
-     * Deletes the merged output files. Called during cleanup on merge failure.
-     */
-    public void cleanup() {
-        if (mergedFiles == null) return;
-        for (String file : mergedFiles.files()) {
-            try {
-                Path resolved = mergedFiles.directory() != null ? Path.of(mergedFiles.directory(), file) : Path.of(file);
-                Files.deleteIfExists(resolved);
-            } catch (IOException ignored) {
-                // Best-effort cleanup
-            }
-        }
     }
 }

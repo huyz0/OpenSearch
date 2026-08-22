@@ -14,12 +14,14 @@ import org.opensearch.common.concurrent.GatedCloseable;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.composite.CompositeDataFormat;
 import org.opensearch.composite.CompositeIndexingExecutionEngine;
+import org.opensearch.composite.stats.CompositeShardStatsTracker;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.dataformat.DataFormat;
 import org.opensearch.index.engine.dataformat.FieldTypeCapabilities;
 import org.opensearch.index.engine.dataformat.IndexingExecutionEngine;
+import org.opensearch.index.engine.dataformat.MergeInput;
 import org.opensearch.index.engine.dataformat.MergeResult;
 import org.opensearch.index.engine.dataformat.Merger;
 import org.opensearch.index.engine.dataformat.PackedRowIdMapping;
@@ -33,11 +35,12 @@ import org.opensearch.index.engine.exec.coord.CatalogSnapshot;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -46,6 +49,7 @@ import java.util.function.Supplier;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -79,6 +83,7 @@ public class CompositeMergerTests extends OpenSearchTestCase {
         IndexingExecutionEngine<?, ?> secondaryEngine = mockEngine(secondaryFormat, secondaryMerger);
 
         compositeEngine = mock(CompositeIndexingExecutionEngine.class);
+        when(compositeEngine.statsTracker()).thenReturn(new CompositeShardStatsTracker());
         doReturn(primaryEngine).when(compositeEngine).getPrimaryDelegate();
         doReturn(Set.of(secondaryEngine)).when(compositeEngine).getSecondaryDelegates();
         when(compositeEngine.getNextWriterGeneration()).thenReturn(99L);
@@ -118,6 +123,7 @@ public class CompositeMergerTests extends OpenSearchTestCase {
 
     public void testDoMergePrimaryOnlyNoSecondaries() throws IOException {
         CompositeIndexingExecutionEngine engineNoSecondary = mock(CompositeIndexingExecutionEngine.class);
+        when(engineNoSecondary.statsTracker()).thenReturn(new CompositeShardStatsTracker());
         IndexingExecutionEngine<?, ?> primaryEngine = mockEngine(primaryFormat, primaryMerger);
         doReturn(primaryEngine).when(engineNoSecondary).getPrimaryDelegate();
         doReturn(Set.of()).when(engineNoSecondary).getSecondaryDelegates();
@@ -151,7 +157,12 @@ public class CompositeMergerTests extends OpenSearchTestCase {
 
     // ========== doMerge: primary merge throws IOException ==========
 
-    public void testDoMergePrimaryFailureThrowsUncheckedIOException() throws IOException {
+    /**
+     * A per-format merger's IOException must reach the caller as an IOException. CompositeMerger
+     * declares {@code throws IOException}, so the executor rewrapping it as UncheckedIOException
+     * meant every {@code catch (IOException)} around a composite merge silently missed it.
+     */
+    public void testDoMergePrimaryFailurePropagatesIOException() throws IOException {
         Path tempDir = createTempDir();
         WriterFileSet primaryWfs = wfs(tempDir, 1L, Set.of("p.dat"), 5);
         WriterFileSet secondaryWfs = wfs(tempDir, 1L, Set.of("s.dat"), 5);
@@ -161,14 +172,13 @@ public class CompositeMergerTests extends OpenSearchTestCase {
         when(primaryMerger.merge(any())).thenThrow(new IOException("primary disk error"));
 
         MergeHandler handler = createHandler();
-        UncheckedIOException ex = expectThrows(UncheckedIOException.class, () -> handler.doMerge(oneMerge));
-        assertNotNull(ex.getCause());
-        assertEquals("primary disk error", ex.getCause().getMessage());
+        IOException ex = expectThrows(IOException.class, () -> handler.doMerge(oneMerge));
+        assertEquals("primary disk error", ex.getMessage());
     }
 
     // ========== doMerge: single secondary failure ==========
 
-    public void testDoMergeSingleSecondaryFailureThrowsUncheckedIOException() throws IOException {
+    public void testDoMergeSingleSecondaryFailurePropagatesIOException() throws IOException {
         Path tempDir = createTempDir();
         WriterFileSet primaryWfs = wfs(tempDir, 1L, Set.of("p.dat"), 5);
         WriterFileSet secondaryWfs = wfs(tempDir, 1L, Set.of("s.dat"), 5);
@@ -181,9 +191,8 @@ public class CompositeMergerTests extends OpenSearchTestCase {
         when(secondaryMerger.merge(any())).thenThrow(new IOException("secondary disk error"));
 
         MergeHandler handler = createHandler();
-        UncheckedIOException ex = expectThrows(UncheckedIOException.class, () -> handler.doMerge(oneMerge));
-        assertNotNull(ex.getCause());
-        assertEquals("secondary disk error", ex.getCause().getMessage());
+        IOException ex = expectThrows(IOException.class, () -> handler.doMerge(oneMerge));
+        assertEquals("secondary disk error", ex.getMessage());
     }
 
     // ========== doMerge: multiple secondaries — fails fast on first error ==========
@@ -193,6 +202,7 @@ public class CompositeMergerTests extends OpenSearchTestCase {
         Merger secondaryMerger2 = mock(Merger.class);
 
         CompositeIndexingExecutionEngine multiEngine = mock(CompositeIndexingExecutionEngine.class);
+        when(multiEngine.statsTracker()).thenReturn(new CompositeShardStatsTracker());
         IndexingExecutionEngine<?, ?> primaryEngine = mockEngine(primaryFormat, primaryMerger);
         doReturn(primaryEngine).when(multiEngine).getPrimaryDelegate();
         doReturn(Set.of(mockEngine(secondaryFormat, secondaryMerger), mockEngine(secondaryFormat2, secondaryMerger2))).when(multiEngine)
@@ -227,10 +237,9 @@ public class CompositeMergerTests extends OpenSearchTestCase {
             () -> 1L
         );
 
-        UncheckedIOException ex = expectThrows(UncheckedIOException.class, () -> handler.doMerge(oneMerge));
-        assertNotNull(ex.getCause());
+        IOException ex = expectThrows(IOException.class, () -> handler.doMerge(oneMerge));
         // Fail-fast: only the first secondary failure is reported, no suppressed exceptions
-        assertEquals(0, ex.getCause().getSuppressed().length);
+        assertEquals(0, ex.getSuppressed().length);
     }
 
     // ========== doMerge: missing rowIdMapping throws IllegalStateException ==========
@@ -253,9 +262,15 @@ public class CompositeMergerTests extends OpenSearchTestCase {
         assertTrue(ex.getMessage().contains("secondaries"));
     }
 
-    // ========== doMerge: cleanup on failure deletes stale files ==========
+    // ========== doMerge: cleanup on failure goes through the store layer ==========
 
-    public void testDoMergeCleanupDeletesStaleMergedFilesOnFailure() throws IOException {
+    /**
+     * Cleanup after a failed merge must be routed through the engine's {@code deleteFiles}, which
+     * fans out to each format's {@code DataFormatStoreHandler}. It used to delete the merge output
+     * with raw {@code Files.deleteIfExists}, which for parquet left its native TieredObjectStore
+     * registry holding entries for files that no longer existed.
+     */
+    public void testDoMergeCleanupRoutesStaleMergedFilesThroughStoreLayer() throws IOException {
         Path tempDir = createTempDir();
 
         Path staleFile = tempDir.resolve("mp.dat");
@@ -271,16 +286,51 @@ public class CompositeMergerTests extends OpenSearchTestCase {
         MergeResult primaryResult = new MergeResult(Map.of(primaryFormat, mergedPrimaryWfs), STUB_ROW_ID_MAPPING);
         when(primaryMerger.merge(any())).thenReturn(primaryResult);
         when(secondaryMerger.merge(any())).thenThrow(new IOException("secondary fail"));
+        List<Map<String, Collection<String>>> cleanupRequests = new ArrayList<>();
+        when(compositeEngine.deleteFiles(any())).thenAnswer(invocation -> {
+            Map<String, Collection<String>> requested = invocation.getArgument(0);
+            cleanupRequests.add(Map.copyOf(requested));
+            return Map.of();
+        });
 
         MergeHandler handler = createHandler();
-        expectThrows(UncheckedIOException.class, () -> handler.doMerge(oneMerge));
+        IOException ex = expectThrows(IOException.class, () -> handler.doMerge(oneMerge));
+        assertEquals("secondary fail", ex.getMessage());
 
-        assertFalse("Stale merged file should be deleted on failure", Files.exists(staleFile));
+        assertEquals(1, cleanupRequests.size());
+        Map<String, Collection<String>> requested = cleanupRequests.get(0);
+        assertEquals("only the format that produced output is cleaned up", Set.of(primaryFormat.name()), requested.keySet());
+        assertEquals(List.of("mp.dat"), new ArrayList<>(requested.get(primaryFormat.name())));
+
+        // The store handler owns the actual unlink; nothing deletes behind its back any more.
+        assertTrue("cleanup must not bypass the store layer", Files.exists(staleFile));
     }
 
-    // ========== doMerge: cleanup handles non-existent files gracefully ==========
+    /** A cleanup failure is best-effort: it is suppressed onto the merge failure, never replaces it. */
+    public void testDoMergeCleanupFailureIsSuppressedOntoMergeFailure() throws IOException {
+        Path tempDir = createTempDir();
 
-    public void testDoMergeCleanupHandlesNonExistentFilesGracefully() throws IOException {
+        WriterFileSet primaryWfs = wfs(tempDir, 1L, Set.of("p.dat"), 5);
+        WriterFileSet secondaryWfs = wfs(tempDir, 1L, Set.of("s.dat"), 5);
+        Segment segment = buildSegment(0L, primaryFormat, primaryWfs, secondaryFormat, secondaryWfs);
+        OneMerge oneMerge = new OneMerge(List.of(segment));
+
+        WriterFileSet mergedPrimaryWfs = wfs(tempDir, 99L, Set.of("mp.dat"), 5);
+        MergeResult primaryResult = new MergeResult(Map.of(primaryFormat, mergedPrimaryWfs), STUB_ROW_ID_MAPPING);
+        when(primaryMerger.merge(any())).thenReturn(primaryResult);
+        when(secondaryMerger.merge(any())).thenThrow(new IOException("secondary fail"));
+        when(compositeEngine.deleteFiles(any())).thenThrow(new IOException("store handler refused"));
+
+        MergeHandler handler = createHandler();
+        IOException ex = expectThrows(IOException.class, () -> handler.doMerge(oneMerge));
+        assertEquals("secondary fail", ex.getMessage());
+        assertEquals(1, ex.getSuppressed().length);
+        assertEquals("store handler refused", ex.getSuppressed()[0].getMessage());
+    }
+
+    // ========== doMerge: cleanup tolerates a store layer that reports nothing ==========
+
+    public void testDoMergeCleanupHandlesNullCleanupResultGracefully() throws IOException {
         Path tempDir = createTempDir();
 
         WriterFileSet primaryWfs = wfs(tempDir, 1L, Set.of("p.dat"), 5);
@@ -292,10 +342,12 @@ public class CompositeMergerTests extends OpenSearchTestCase {
         MergeResult primaryResult = new MergeResult(Map.of(primaryFormat, mergedPrimaryWfs), STUB_ROW_ID_MAPPING);
         when(primaryMerger.merge(any())).thenReturn(primaryResult);
         when(secondaryMerger.merge(any())).thenThrow(new IOException("fail"));
+        // compositeEngine is a mock, so deleteFiles returns null here — cleanup must not NPE.
 
         MergeHandler handler = createHandler();
-        // Should not throw during cleanup even though file doesn't exist
-        expectThrows(UncheckedIOException.class, () -> handler.doMerge(oneMerge));
+        IOException ex = expectThrows(IOException.class, () -> handler.doMerge(oneMerge));
+        assertEquals("fail", ex.getMessage());
+        assertEquals(0, ex.getSuppressed().length);
     }
 
     // ========== doMerge: no cleanup when mergedWriterFileSet is empty ==========
@@ -310,8 +362,10 @@ public class CompositeMergerTests extends OpenSearchTestCase {
         when(primaryMerger.merge(any())).thenThrow(new IOException("primary fail"));
 
         MergeHandler handler = createHandler();
-        UncheckedIOException ex = expectThrows(UncheckedIOException.class, () -> handler.doMerge(oneMerge));
-        assertEquals("primary fail", ex.getCause().getMessage());
+        IOException ex = expectThrows(IOException.class, () -> handler.doMerge(oneMerge));
+        assertEquals("primary fail", ex.getMessage());
+        // Nothing was produced, so the store layer is never asked to delete anything.
+        verify(compositeEngine, never()).deleteFiles(any());
     }
 
     // ========== doMerge: multiple segments ==========
@@ -354,6 +408,7 @@ public class CompositeMergerTests extends OpenSearchTestCase {
         IndexingExecutionEngine<?, ?> duplicateEngine = mockEngine(primaryFormat, primaryMerger);
 
         CompositeIndexingExecutionEngine dupEngine = mock(CompositeIndexingExecutionEngine.class);
+        when(dupEngine.statsTracker()).thenReturn(new CompositeShardStatsTracker());
         doReturn(primaryEngine).when(dupEngine).getPrimaryDelegate();
         doReturn(Set.of(duplicateEngine)).when(dupEngine).getSecondaryDelegates();
         when(dupEngine.getNextWriterGeneration()).thenReturn(99L);
@@ -439,7 +494,7 @@ public class CompositeMergerTests extends OpenSearchTestCase {
         handler.registerMerge(oneMerge);
         assertTrue(handler.hasPendingMerges());
 
-        handler.onMergeFinished(oneMerge);
+        handler.onMergeFinished(oneMerge, false);
     }
 
     public void testRegisterMergeAndOnMergeFailure() {
@@ -532,12 +587,12 @@ public class CompositeMergerTests extends OpenSearchTestCase {
         assertFalse("Expected force merge candidates when targeting 1 segment from 5", merges.isEmpty());
     }
 
-    // ========== cleanup: exception during file deletion is logged but not thrown ==========
+    // ========== cleanup: files the store layer could not delete are logged, not thrown ==========
 
-    public void testCleanupStaleMergedFilesLogsExceptionOnDeleteFailure() throws IOException {
+    public void testCleanupReportsUndeletedFilesWithoutMaskingMergeFailure() throws IOException {
         Path tempDir = createTempDir();
-        // Create a directory with the same name as the file to delete — deleteIfExists on a
-        // non-empty directory throws DirectoryNotEmptyException
+        // The store handler cannot unlink "mp.dat" yet (e.g. still referenced), so it hands it
+        // back as pending rather than throwing.
         Path dirAsFile = tempDir.resolve("mp.dat");
         Files.createDirectory(dirAsFile);
         Files.createFile(dirAsFile.resolve("child.txt"));
@@ -547,17 +602,21 @@ public class CompositeMergerTests extends OpenSearchTestCase {
         Segment segment = buildSegment(0L, primaryFormat, primaryWfs, secondaryFormat, secondaryWfs);
         OneMerge oneMerge = new OneMerge(List.of(segment));
 
-        // mergedPrimaryWfs points to "mp.dat" which is a non-empty directory
         WriterFileSet mergedPrimaryWfs = wfs(tempDir, 99L, Set.of("mp.dat"), 5);
         MergeResult primaryResult = new MergeResult(Map.of(primaryFormat, mergedPrimaryWfs), STUB_ROW_ID_MAPPING);
         when(primaryMerger.merge(any())).thenReturn(primaryResult);
         when(secondaryMerger.merge(any())).thenThrow(new IOException("secondary fail"));
 
+        Map<String, Collection<String>> pending = new LinkedHashMap<>();
+        pending.put(primaryFormat.name(), List.of("mp.dat"));
+        when(compositeEngine.deleteFiles(any())).thenReturn(pending);
+
         MergeHandler handler = createHandler();
-        // The merge fails due to secondary, cleanup tries to delete "mp.dat" (a non-empty dir)
-        // which throws DirectoryNotEmptyException — caught and logged, not re-thrown
-        expectThrows(UncheckedIOException.class, () -> handler.doMerge(oneMerge));
-        // The directory should still exist since deleteIfExists fails on non-empty dirs
+        // Undeleted files are logged and retried on the next refresh; the merge failure is what
+        // reaches the caller, unchanged and un-suppressed.
+        IOException ex = expectThrows(IOException.class, () -> handler.doMerge(oneMerge));
+        assertEquals("secondary fail", ex.getMessage());
+        assertEquals(0, ex.getSuppressed().length);
         assertTrue(Files.exists(dirAsFile));
     }
 
@@ -637,5 +696,99 @@ public class CompositeMergerTests extends OpenSearchTestCase {
         CatalogSnapshot snapshot = mock(CatalogSnapshot.class);
         when(snapshot.getSegments()).thenReturn(segments);
         return snapshot;
+    }
+
+    // ── Cross-format merge verification tests ──
+
+    public void testExecutorThrowsWhenSecondaryReturnsNullButPrimaryHasOutput() throws IOException {
+        Merger primaryMerger = mock(Merger.class);
+        Merger secondaryMerger = mock(Merger.class);
+
+        DataFormat primary = stubFormat("parquet", 0);
+        DataFormat secondary = stubFormat("lucene", 50);
+
+        String dir = createTempDir().toString();
+        WriterFileSet primaryFiles = new WriterFileSet(dir, 10L, Set.of("file.parquet"), 100, 1L);
+
+        RowIdMapping mapping = mock(RowIdMapping.class);
+        when(mapping.size()).thenReturn(100);
+
+        when(primaryMerger.merge(any(MergeInput.class))).thenReturn(new MergeResult(Map.of(primary, primaryFiles), mapping));
+        when(secondaryMerger.merge(any(MergeInput.class))).thenReturn(new MergeResult(Map.of()));
+
+        RecordingCleaner cleaner = new RecordingCleaner();
+        CompositeMergeExecutor executor = new CompositeMergeExecutor(Map.of(primary, primaryMerger, secondary, secondaryMerger), cleaner);
+
+        WriterFileSet inputP = new WriterFileSet(createTempDir().toString(), 1L, Set.of("in.parquet"), 50, 1L);
+        WriterFileSet inputS = new WriterFileSet(createTempDir().toString(), 1L, Set.of("in.si"), 50, 1L);
+
+        MergePlan plan = new MergePlan(10L, primary, List.of(secondary), Map.of(primary, List.of(inputP), secondary, List.of(inputS)));
+
+        IllegalStateException ex = expectThrows(IllegalStateException.class, () -> executor.execute(plan));
+        assertTrue(ex.getMessage().contains("returned null"));
+        // The primary's already-written merge output is handed back to the store layer.
+        assertEquals(1, cleaner.calls.size());
+        assertEquals(Set.of(primary.name()), cleaner.calls.get(0).keySet());
+    }
+
+    public void testExecutorThrowsOnRowCountMismatch() throws IOException {
+        Merger primaryMerger = mock(Merger.class);
+        Merger secondaryMerger = mock(Merger.class);
+
+        DataFormat primary = stubFormat("parquet", 0);
+        DataFormat secondary = stubFormat("lucene", 50);
+
+        WriterFileSet primaryFiles = new WriterFileSet(createTempDir().toString(), 10L, Set.of("file.parquet"), 100, 1L);
+        WriterFileSet secondaryFiles = new WriterFileSet(createTempDir().toString(), 10L, Set.of("file.si"), 90, 1L);
+
+        RowIdMapping mapping = mock(RowIdMapping.class);
+        when(mapping.size()).thenReturn(100);
+
+        when(primaryMerger.merge(any(MergeInput.class))).thenReturn(new MergeResult(Map.of(primary, primaryFiles), mapping));
+        when(secondaryMerger.merge(any(MergeInput.class))).thenReturn(new MergeResult(Map.of(secondary, secondaryFiles)));
+
+        RecordingCleaner cleaner = new RecordingCleaner();
+        CompositeMergeExecutor executor = new CompositeMergeExecutor(Map.of(primary, primaryMerger, secondary, secondaryMerger), cleaner);
+
+        WriterFileSet inputP = new WriterFileSet(createTempDir().toString(), 1L, Set.of("in.parquet"), 50, 1L);
+        WriterFileSet inputS = new WriterFileSet(createTempDir().toString(), 1L, Set.of("in.si"), 50, 1L);
+
+        MergePlan plan = new MergePlan(10L, primary, List.of(secondary), Map.of(primary, List.of(inputP), secondary, List.of(inputS)));
+
+        IllegalStateException ex = expectThrows(IllegalStateException.class, () -> executor.execute(plan));
+        assertTrue(ex.getMessage().contains("Row count mismatch"));
+        // Both formats produced output before the mismatch was detected, so both are cleaned up.
+        assertEquals(1, cleaner.calls.size());
+        assertEquals(Set.of(primary.name(), secondary.name()), cleaner.calls.get(0).keySet());
+    }
+
+    /** Records the per-format file map each cleanup pass hands to the store layer. */
+    private static final class RecordingCleaner implements CompositeMergeExecutor.MergeOutputCleaner {
+        final List<Map<String, Collection<String>>> calls = new ArrayList<>();
+
+        @Override
+        public Map<String, Collection<String>> deleteFiles(Map<String, Collection<String>> filesByFormat) {
+            calls.add(Map.copyOf(filesByFormat));
+            return Map.of();
+        }
+    }
+
+    private static DataFormat stubFormat(String name, long priority) {
+        return new DataFormat() {
+            @Override
+            public String name() {
+                return name;
+            }
+
+            @Override
+            public long priority() {
+                return priority;
+            }
+
+            @Override
+            public Set<FieldTypeCapabilities> supportedFields() {
+                return Set.of();
+            }
+        };
     }
 }

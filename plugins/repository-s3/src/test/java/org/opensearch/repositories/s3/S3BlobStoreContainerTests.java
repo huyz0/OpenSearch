@@ -64,6 +64,7 @@ import software.amazon.awssdk.services.s3.model.ObjectIdentifier;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.s3.model.PutObjectResponse;
 import software.amazon.awssdk.services.s3.model.S3Error;
+import software.amazon.awssdk.services.s3.model.S3Exception;
 import software.amazon.awssdk.services.s3.model.S3Object;
 import software.amazon.awssdk.services.s3.model.ServerSideEncryption;
 import software.amazon.awssdk.services.s3.model.StorageClass;
@@ -76,18 +77,22 @@ import org.opensearch.action.LatchedActionListener;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.BlobRegister;
+import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.BlobStoreException;
 import org.opensearch.common.blobstore.DeleteResult;
 import org.opensearch.common.blobstore.stream.read.ReadContext;
 import org.opensearch.common.collect.Tuple;
 import org.opensearch.common.io.InputStreamContainer;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.unit.ByteSizeUnit;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.FileAlreadyExistsException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -120,6 +125,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -134,7 +140,7 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
 
         final IllegalArgumentException e = expectThrows(
             IllegalArgumentException.class,
-            () -> blobContainer.executeSingleUpload(blobStore, randomAlphaOfLengthBetween(1, 10), null, blobSize, null, null)
+            () -> blobContainer.executeSingleUpload(blobStore, randomAlphaOfLengthBetween(1, 10), null, blobSize, null, null, false)
         );
         assertEquals("Upload request size [" + blobSize + "] can't be larger than 5gb", e.getMessage());
     }
@@ -154,7 +160,8 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
                 new ByteArrayInputStream(new byte[0]),
                 ByteSizeUnit.MB.toBytes(2),
                 null,
-                null
+                null,
+                false
             )
         );
         assertEquals("Upload request size [2097152] can't be larger than buffer size", e.getMessage());
@@ -672,7 +679,7 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
         when(client.putObject(putReqCaptor.capture(), bodyCaptor.capture())).thenReturn(PutObjectResponse.builder().build());
 
         // Pass the known-length stream + tell the code the exact size
-        blobContainer.executeSingleUpload(blobStore, blobName, inputStream, blobSize, metadata, null);
+        blobContainer.executeSingleUpload(blobStore, blobName, inputStream, blobSize, metadata, null, false);
 
         final PutObjectRequest request = putReqCaptor.getValue();
         final RequestBody requestBody = bodyCaptor.getValue();
@@ -703,6 +710,117 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * The precondition that makes {@code failIfAlreadyExists} mean anything on S3.
+     *
+     * <p>Before this was wired up the flag was accepted and dropped, so a create-only write silently
+     * became an overwrite. That is not detectable from the outside, which is why this asserts on the
+     * request the SDK is handed rather than on an outcome: an assertion about behaviour would pass
+     * against a container that ignores the flag as long as the key happened to be free.
+     */
+    public void testSingleUploadSetsIfNoneMatchOnlyWhenFailIfAlreadyExists() throws IOException {
+        for (boolean failIfAlreadyExists : new boolean[] { true, false }) {
+            final S3BlobStore blobStore = mock(S3BlobStore.class);
+            when(blobStore.bucket()).thenReturn("bucket");
+            when(blobStore.bufferSizeInBytes()).thenReturn(ByteSizeUnit.MB.toBytes(1));
+            when(blobStore.getStatsMetricPublisher()).thenReturn(new StatsMetricPublisher());
+            when(blobStore.serverSideEncryptionType()).thenReturn(ServerSideEncryption.AES256.toString());
+
+            final S3Client client = mock(S3Client.class);
+            when(blobStore.clientReference()).thenReturn(new AmazonS3Reference(client));
+            final ArgumentCaptor<PutObjectRequest> captor = ArgumentCaptor.forClass(PutObjectRequest.class);
+            when(client.putObject(captor.capture(), any(RequestBody.class))).thenReturn(PutObjectResponse.builder().build());
+
+            final S3BlobContainer blobContainer = new S3BlobContainer(BlobPath.cleanPath(), blobStore);
+            blobContainer.executeSingleUpload(blobStore, "blob", new ByteArrayInputStream(new byte[8]), 8, null, null, failIfAlreadyExists);
+
+            if (failIfAlreadyExists) {
+                assertEquals("create-only write must carry the precondition", "*", captor.getValue().ifNoneMatch());
+            } else {
+                assertNull("an overwriting write must not carry it", captor.getValue().ifNoneMatch());
+            }
+        }
+    }
+
+    /**
+     * 412 is S3 saying the key was already there, and callers must see the same exception
+     * {@code FsBlobContainer} throws so one catch covers both.
+     */
+    public void testSingleUploadTranslatesPreconditionFailedToFileAlreadyExists() {
+        final S3BlobStore blobStore = mock(S3BlobStore.class);
+        when(blobStore.bucket()).thenReturn("bucket");
+        when(blobStore.bufferSizeInBytes()).thenReturn(ByteSizeUnit.MB.toBytes(1));
+        when(blobStore.getStatsMetricPublisher()).thenReturn(new StatsMetricPublisher());
+        when(blobStore.serverSideEncryptionType()).thenReturn(ServerSideEncryption.AES256.toString());
+
+        final S3Client client = mock(S3Client.class);
+        when(blobStore.clientReference()).thenReturn(new AmazonS3Reference(client));
+        when(client.putObject(any(PutObjectRequest.class), any(RequestBody.class))).thenThrow(
+            S3Exception.builder().statusCode(412).message("At least one of the pre-conditions you specified did not hold").build()
+        );
+
+        final S3BlobContainer blobContainer = new S3BlobContainer(BlobPath.cleanPath(), blobStore);
+
+        expectThrows(
+            FileAlreadyExistsException.class,
+            () -> blobContainer.executeSingleUpload(blobStore, "blob", new ByteArrayInputStream(new byte[8]), 8, null, null, true)
+        );
+
+        // And a 412 with the flag off is not a precondition failure at all, so it stays a plain IOException
+        // rather than being reported as a name collision that never happened.
+        final IOException wrapped = expectThrows(
+            IOException.class,
+            () -> blobContainer.executeSingleUpload(blobStore, "blob", new ByteArrayInputStream(new byte[8]), 8, null, null, false)
+        );
+        assertFalse(wrapped instanceof FileAlreadyExistsException);
+    }
+
+    /**
+     * The saving is the point, so it is asserted directly: one PUT and no GET.
+     *
+     * <p>A test that only checked the return value would pass against the default implementation, which
+     * is correct and twice as expensive. Index creation is one of these calls, at the scale this design
+     * targets, so the round trip count is the behaviour under test rather than an implementation detail.
+     */
+    public void testCreateRegisterIfAbsentIssuesOnePutAndNoGet() throws IOException {
+        final S3BlobStore blobStore = mock(S3BlobStore.class);
+        when(blobStore.bucket()).thenReturn("bucket");
+        when(blobStore.getStatsMetricPublisher()).thenReturn(new StatsMetricPublisher());
+
+        final S3Client client = mock(S3Client.class);
+        when(blobStore.clientReference()).thenReturn(new AmazonS3Reference(client));
+        final ArgumentCaptor<PutObjectRequest> captor = ArgumentCaptor.forClass(PutObjectRequest.class);
+        when(client.putObject(captor.capture(), any(RequestBody.class))).thenReturn(PutObjectResponse.builder().build());
+
+        final S3BlobContainer blobContainer = new S3BlobContainer(BlobPath.cleanPath(), blobStore);
+        final BlobRegisterCasResult result = blobContainer.createRegisterIfAbsent("head", new BytesArray(new byte[] { 1, 2, 3 }));
+
+        assertTrue(result.applied());
+        assertEquals(BlobRegister.ABSENT_GENERATION + 1, result.currentGeneration());
+        assertEquals("*", captor.getValue().ifNoneMatch());
+        verify(client, times(1)).putObject(any(PutObjectRequest.class), any(RequestBody.class));
+        verify(client, never()).getObject(any(GetObjectRequest.class));
+    }
+
+    /** Losing the create race is a conflict, not an exception, and still costs one round trip. */
+    public void testCreateRegisterIfAbsentReportsConflictOnPreconditionFailure() throws IOException {
+        final S3BlobStore blobStore = mock(S3BlobStore.class);
+        when(blobStore.bucket()).thenReturn("bucket");
+        when(blobStore.getStatsMetricPublisher()).thenReturn(new StatsMetricPublisher());
+
+        final S3Client client = mock(S3Client.class);
+        when(blobStore.clientReference()).thenReturn(new AmazonS3Reference(client));
+        when(client.putObject(any(PutObjectRequest.class), any(RequestBody.class))).thenThrow(
+            S3Exception.builder().statusCode(412).message("precondition failed").build()
+        );
+
+        final S3BlobContainer blobContainer = new S3BlobContainer(BlobPath.cleanPath(), blobStore);
+        final BlobRegisterCasResult result = blobContainer.createRegisterIfAbsent("head", new BytesArray(new byte[] { 1 }));
+
+        assertFalse(result.applied());
+        verify(client, never()).getObject(any(GetObjectRequest.class));
+    }
+
     public void testExecuteMultipartUploadBlobSizeTooLarge() {
         final long blobSize = ByteSizeUnit.TB.toBytes(randomIntBetween(6, 10));
         final S3BlobStore blobStore = mock(S3BlobStore.class);
@@ -710,7 +828,7 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
 
         final IllegalArgumentException e = expectThrows(
             IllegalArgumentException.class,
-            () -> blobContainer.executeMultipartUpload(blobStore, randomAlphaOfLengthBetween(1, 10), null, blobSize, null, null)
+            () -> blobContainer.executeMultipartUpload(blobStore, randomAlphaOfLengthBetween(1, 10), null, blobSize, null, null, false)
         );
         assertEquals("Multipart upload request size [" + blobSize + "] can't be larger than 5tb", e.getMessage());
     }
@@ -722,7 +840,7 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
 
         final IllegalArgumentException e = expectThrows(
             IllegalArgumentException.class,
-            () -> blobContainer.executeMultipartUpload(blobStore, randomAlphaOfLengthBetween(1, 10), null, blobSize, null, null)
+            () -> blobContainer.executeMultipartUpload(blobStore, randomAlphaOfLengthBetween(1, 10), null, blobSize, null, null, false)
         );
         assertEquals("Multipart upload request size [" + blobSize + "] can't be smaller than 5mb", e.getMessage());
     }
@@ -816,7 +934,7 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
 
         final ByteArrayInputStream inputStream = new ByteArrayInputStream(new byte[0]);
         final S3BlobContainer blobContainer = new S3BlobContainer(blobPath, blobStore);
-        blobContainer.executeMultipartUpload(blobStore, blobName, inputStream, blobSize, metadata, null);
+        blobContainer.executeMultipartUpload(blobStore, blobName, inputStream, blobSize, metadata, null, false);
 
         final CreateMultipartUploadRequest initRequest = createMultipartUploadRequestArgumentCaptor.getValue();
         assertEquals(bucketName, initRequest.bucket());
@@ -946,7 +1064,7 @@ public class S3BlobStoreContainerTests extends OpenSearchTestCase {
 
         final IOException e = expectThrows(IOException.class, () -> {
             final S3BlobContainer blobContainer = new S3BlobContainer(blobPath, blobStore);
-            blobContainer.executeMultipartUpload(blobStore, blobName, new ByteArrayInputStream(new byte[0]), blobSize, null, null);
+            blobContainer.executeMultipartUpload(blobStore, blobName, new ByteArrayInputStream(new byte[0]), blobSize, null, null, false);
         });
 
         assertEquals("Unable to upload object [" + blobName + "] using multipart upload", e.getMessage());

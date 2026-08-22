@@ -71,7 +71,7 @@ impl LocalSession {
     pub fn new(runtime_env: &RuntimeEnv) -> Self {
         let runtime_env = Arc::new(runtime_env.clone());
         let mut config = SessionConfig::new();
-        config.options_mut().execution.target_partitions = 4;
+        config.options_mut().execution.target_partitions = crate::api::get_reduce_target_partitions();
         let state = SessionStateBuilder::new()
             .with_config(config)
             .with_runtime_env(runtime_env)
@@ -179,17 +179,21 @@ impl LocalSession {
     pub async fn execute_substrait(
         &self,
         bytes: &[u8],
-    ) -> Result<SendableRecordBatchStream, DataFusionError> {
+    ) -> Result<(SendableRecordBatchStream, Arc<dyn datafusion::physical_plan::ExecutionPlan>), DataFusionError> {
         let plan = Plan::decode(bytes).map_err(|e| {
             DataFusionError::Execution(format!("Failed to decode Substrait plan: {}", e))
         })?;
         let logical_plan = from_substrait_plan(&self.ctx.state(), &plan).await?;
+        log_debug!("DataFusion logical plan:\n{}", logical_plan.display_indent());
         let dataframe = self.ctx.execute_logical_plan(logical_plan).await?;
         let physical_plan = dataframe.create_physical_plan().await?;
+
         let target_schema = crate::schema_coerce::coerce_inferred_schema(physical_plan.schema());
         let physical_plan = crate::relabel_exec::wrap_if_relabel_needed(physical_plan, target_schema)?;
-        datafusion::physical_plan::execute_stream(physical_plan, self.ctx.task_ctx())
-            .map_err(|e| DataFusionError::Execution(format!("execute_substrait: {}", e)))
+        log_debug!("DataFusion coordinator reduce physical plan:\n{}", displayable(physical_plan.as_ref()).indent(true));
+        let stream = datafusion::physical_plan::execute_stream(physical_plan.clone(), self.ctx.task_ctx())
+            .map_err(|e| DataFusionError::Execution(format!("execute_substrait: {}", e)))?;
+        Ok((stream, physical_plan))
     }
 
     /// Returns the memory pool the session's `RuntimeEnv` was built with.
@@ -217,16 +221,20 @@ impl LocalSession {
             ))
         })?;
         let logical_plan = from_substrait_plan(&self.ctx.state(), &plan).await?;
-        log_debug!("DataFusion logical plan (reduce):\n{}", logical_plan.display_indent());
         let dataframe = self.ctx.execute_logical_plan(logical_plan).await?;
         let physical_plan = dataframe.create_physical_plan().await?;
-        let target_schema = crate::schema_coerce::coerce_inferred_schema(physical_plan.schema());
-        let physical_plan = crate::relabel_exec::wrap_if_relabel_needed(physical_plan, target_schema)?;
-        log_debug!("DataFusion physical plan (reduce):\n{}", displayable(physical_plan.as_ref()).indent(true));
+        // Strip first so `force_aggregate_mode(Final)` can find the Final/Partial pair
+        // through the raw plan; then derive `target_schema` and wrap with RelabelExec from
+        // the stripped output (otherwise the relabel target would carry the pre-strip Final
+        // output type tag and fail when wrapping the stripped tree).
         let stripped = crate::agg_mode::apply_aggregate_mode(
             physical_plan,
             crate::agg_mode::Mode::Final,
+            false,
         )?;
+
+        let target_schema = crate::schema_coerce::coerce_inferred_schema(stripped.schema());
+        let stripped = crate::relabel_exec::wrap_if_relabel_needed(stripped, target_schema)?;
         self.prepared_plan = Some(stripped);
         Ok(())
     }
@@ -248,7 +256,7 @@ impl LocalSession {
 mod tests {
     use super::*;
 
-    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::execution::runtime_env::RuntimeEnvBuilder;
     use datafusion_substrait::logical_plan::producer::to_substrait_plan;
@@ -275,6 +283,24 @@ mod tests {
             vec![Arc::new(Int64Array::from(values.to_vec()))],
         )
         .expect("batch builds")
+    }
+
+    fn two_string_schema(a: &str, b: &str) -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new(a, DataType::Utf8, false),
+            Field::new(b, DataType::Utf8, false),
+        ]))
+    }
+
+    fn two_string_batch(schema: &SchemaRef, col_a: &[&str], col_b: &[&str]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(StringArray::from(col_a.to_vec())),
+                Arc::new(StringArray::from(col_b.to_vec())),
+            ],
+        )
+        .expect("string batch builds")
     }
 
     #[tokio::test]
@@ -330,14 +356,13 @@ mod tests {
         let handle = Handle::current();
         let producer = std::thread::spawn(move || {
             for chunk in &[vec![1i64, 2, 3], vec![4, 5, 6], vec![7, 8, 9]] {
-                sender
-                    .send_blocking(Ok(i64_batch(&producer_schema, chunk)), &handle)
-                    .expect("send");
+                let outcome = sender.send_blocking(Ok(i64_batch(&producer_schema, chunk)), &handle);
+                assert!(matches!(outcome, crate::partition_stream::SendOutcome::Sent));
             }
             drop(sender); // EOF
         });
 
-        let mut stream = session
+        let (mut stream, _plan) = session
             .execute_substrait(&substrait_bytes)
             .await
             .expect("execute");
@@ -394,7 +419,7 @@ mod tests {
             buf
         };
 
-        let mut stream = session
+        let (mut stream, _plan) = session
             .execute_substrait(&substrait_bytes)
             .await
             .expect("execute");
@@ -412,6 +437,73 @@ mod tests {
             }
         }
         assert_eq!(total, 45);
+    }
+
+    /// `concat(substring(a, ...), '|', substring(b, ...))` over a WHERE filter —
+    /// the outer operands are scalar-function calls and the middle operand is a
+    /// string literal. Round-trips through SQL → Substrait → `from_substrait_plan`
+    /// and asserts one concatenated row per input.
+    #[tokio::test]
+    async fn execute_substrait_concat_substring_literal_substring() {
+        let env = test_runtime_env();
+        let mut session = LocalSession::new(&env);
+        let schema = two_string_schema("url", "referer");
+
+        // Two rows, both non-empty so they survive the WHERE filter.
+        let batch = two_string_batch(
+            &schema,
+            &["http://alpha", "http://bravo"],
+            &["https://gamma", "https://delta"],
+        );
+        session
+            .register_memtable("input-0", Arc::clone(&schema), vec![batch])
+            .expect("register memtable");
+
+        let sql = "SELECT concat(substring(url, 1, 7), '|', substring(referer, 1, 8)) AS r \
+                   FROM \"input-0\" WHERE url <> '' AND referer <> ''";
+
+        let substrait_bytes = {
+            let env = test_runtime_env();
+            let mut producer = LocalSession::new(&env);
+            producer
+                .register_memtable("input-0", Arc::clone(&schema), vec![])
+                .expect("producer register");
+            let df = producer.ctx.sql(sql).await.expect("concat sql parses");
+            let plan = df.logical_plan().clone();
+            let substrait = to_substrait_plan(&plan, &producer.ctx.state()).expect("to_substrait");
+            let mut buf = Vec::new();
+            substrait.encode(&mut buf).expect("encode");
+            buf
+        };
+
+        let (mut stream, _plan) = session
+            .execute_substrait(&substrait_bytes)
+            .await
+            .expect("execute");
+
+        let mut results: Vec<String> = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.expect("batch ok");
+            // DataFusion's string functions may return Utf8/LargeUtf8/Utf8View depending on
+            // version; cast to Utf8 so the assertion is independent of the concrete string type.
+            let col = datafusion::arrow::compute::cast(batch.column(0), &DataType::Utf8)
+                .expect("cast concat output to Utf8");
+            let col = col.as_any().downcast_ref::<StringArray>().expect("utf8 col");
+            for i in 0..col.len() {
+                results.push(col.value(i).to_string());
+            }
+        }
+
+        // Each row joins the two substring results with the middle '|' literal.
+        results.sort();
+        assert_eq!(
+            results,
+            vec![
+                "http://|https://".to_string(),
+                "http://|https://".to_string(),
+            ],
+            "concat(substring, '|', substring) must yield one '|'-joined row per input"
+        );
     }
 
     #[tokio::test]
@@ -472,7 +564,7 @@ mod tests {
         let ctx_id = 98_765;
         let pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> =
             Arc::new(GreedyMemoryPool::new(10_000));
-        let _tracking = QueryTrackingContext::new(ctx_id, pool);
+        let _tracking = QueryTrackingContext::new(ctx_id, pool, query_tracker::QueryType::Coordinator);
 
         // A future that would block indefinitely — `cancel_query` is the
         // only way out. Mirrors a coord reduce stalled on an input partition

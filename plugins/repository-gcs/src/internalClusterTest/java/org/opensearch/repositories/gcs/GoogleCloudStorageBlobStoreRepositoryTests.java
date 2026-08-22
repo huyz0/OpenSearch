@@ -48,6 +48,8 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.SuppressForbidden;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.BlobRegister;
+import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.common.io.Streams;
 import org.opensearch.common.regex.Regex;
@@ -73,6 +75,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Optional;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -166,6 +169,133 @@ public class GoogleCloudStorageBlobStoreRepositoryTests extends OpenSearchMockAP
                     )
                 )
         );
+    }
+
+    /**
+     * Exercises {@link GoogleCloudStorageBlobContainer#compareAndSwapRegister}/{@code
+     * readRegister} against the real {@link GoogleCloudStorageHttpHandler} fixture (extended to
+     * enforce real GCS {@code ifGenerationMatch} conditional-write semantics for exactly this
+     * purpose): proof that the conditional-write guard is actually enforced server-side.
+     */
+    public void testCompareAndSwapRegisterUsesRealConditionalWrites() throws Exception {
+        final String repoName = createRepository(randomName());
+        final BlobStoreRepository repository = getRepository(repoName);
+        final BlobContainer container = repository.blobStore().blobContainer(repository.basePath());
+        final String registerName = "test-register";
+        try {
+            runOnGenericThreadPool(repository, () -> {
+                BlobRegisterCasResult first = container.compareAndSwapRegister(
+                    registerName,
+                    BlobRegister.ABSENT_GENERATION,
+                    new BytesArray("v1")
+                );
+                assertTrue(first.applied());
+
+                BlobRegisterCasResult racerConflict = container.compareAndSwapRegister(
+                    registerName,
+                    BlobRegister.ABSENT_GENERATION,
+                    new BytesArray("racer")
+                );
+                assertFalse("a second put-if-absent must lose to the one that already succeeded", racerConflict.applied());
+                assertEquals(first.currentGeneration(), racerConflict.currentGeneration());
+
+                Optional<BlobRegister> read = container.readRegister(registerName);
+                assertTrue(read.isPresent());
+                assertEquals(first.currentGeneration(), read.get().generation());
+                assertEquals("v1", read.get().value().utf8ToString());
+
+                BlobRegisterCasResult staleUpdate = container.compareAndSwapRegister(
+                    registerName,
+                    first.currentGeneration() - 1,
+                    new BytesArray("stale")
+                );
+                assertFalse(staleUpdate.applied());
+
+                BlobRegisterCasResult goodUpdate = container.compareAndSwapRegister(
+                    registerName,
+                    first.currentGeneration(),
+                    new BytesArray("v2")
+                );
+                assertTrue(goodUpdate.applied());
+                assertEquals("v2", container.readRegister(registerName).get().value().utf8ToString());
+                return null;
+            });
+        } finally {
+            runOnGenericThreadPool(repository, () -> {
+                container.deleteBlobsIgnoringIfNotExists(Collections.singletonList(registerName));
+                return null;
+            });
+        }
+    }
+
+    /**
+     * Concurrent CAS-retry-loop updates against the same register must never lose an update: only
+     * meaningful against a fixture that actually enforces conditional writes server-side.
+     */
+    public void testConcurrentCompareAndSwapRegisterRetryLoopLosesNoUpdates() throws Exception {
+        final String repoName = createRepository(randomName());
+        final BlobStoreRepository repository = getRepository(repoName);
+        final BlobContainer container = repository.blobStore().blobContainer(repository.basePath());
+        final String registerName = "counter-register";
+
+        int incrementerCount = 8;
+        java.util.concurrent.ExecutorService executor = java.util.concurrent.Executors.newFixedThreadPool(incrementerCount);
+        java.util.concurrent.CountDownLatch startLatch = new java.util.concurrent.CountDownLatch(1);
+        try {
+            java.util.List<java.util.concurrent.Future<?>> futures = new java.util.ArrayList<>();
+            for (int i = 0; i < incrementerCount; i++) {
+                futures.add(executor.submit(() -> runOnGenericThreadPool(repository, () -> {
+                    startLatch.await();
+                    for (int attempt = 0; attempt < 50; attempt++) {
+                        Optional<BlobRegister> current = container.readRegister(registerName);
+                        long currentGeneration = current.map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
+                        int currentValue = current.map(r -> Integer.parseInt(r.value().utf8ToString())).orElse(0);
+                        BlobRegisterCasResult result = container.compareAndSwapRegister(
+                            registerName,
+                            currentGeneration,
+                            new BytesArray(Integer.toString(currentValue + 1))
+                        );
+                        if (result.applied()) {
+                            return null;
+                        }
+                    }
+                    throw new AssertionError("failed to apply an increment after 50 attempts");
+                })));
+            }
+            startLatch.countDown();
+            for (java.util.concurrent.Future<?> future : futures) {
+                future.get(60, java.util.concurrent.TimeUnit.SECONDS);
+            }
+        } finally {
+            executor.shutdown();
+        }
+
+        try {
+            int finalValue = Integer.parseInt(container.readRegister(registerName).get().value().utf8ToString());
+            assertEquals(
+                "every concurrent incrementer's update must be reflected, none lost to a missed conflict",
+                incrementerCount,
+                finalValue
+            );
+        } finally {
+            container.deleteBlobsIgnoringIfNotExists(Collections.singletonList(registerName));
+        }
+    }
+
+    private BlobStoreRepository getRepository(String repoName) {
+        final RepositoriesService repositoriesService = internalCluster().getClusterManagerNodeInstance(RepositoriesService.class);
+        return (BlobStoreRepository) repositoriesService.repository(repoName);
+    }
+
+    /** GCS blob container calls must run on the generic thread pool, matching {@code testDeleteSingleItem} above. */
+    private <T> T runOnGenericThreadPool(BlobStoreRepository repository, java.util.concurrent.Callable<T> action) {
+        return PlainActionFuture.get(f -> repository.threadPool().generic().execute(ActionRunnable.supply(f, () -> {
+            try {
+                return action.call();
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        })));
     }
 
     public void testChunkSize() {

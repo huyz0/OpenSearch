@@ -46,11 +46,14 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.SuppressForbidden;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.BlobRegister;
+import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.common.regex.Regex;
 import org.opensearch.common.settings.MockSecureSettings;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.unit.ByteSizeUnit;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.indices.recovery.RecoverySettings;
@@ -70,6 +73,7 @@ import org.opensearch.test.OpenSearchIntegTestCase;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -77,6 +81,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
@@ -235,6 +240,166 @@ public class S3BlobStoreRepositoryTests extends OpenSearchMockAPIBasedRepository
         String assertionErrorMsg = String.format("SDK sent [%s] calls and handler measured [%s] calls", aggregatedStats, mockCalls);
 
         assertEquals(assertionErrorMsg, mockCalls, aggregatedStats);
+    }
+
+    /**
+     * The same proof for {@link S3BlobContainer#createRegisterIfAbsent}, which is the call index creation
+     * actually makes.
+     *
+     * <p>It belongs here rather than only in the unit tests for the reason the test below already gives.
+     * The unit test captures the {@code PutObjectRequest} and asserts {@code ifNoneMatch} is set, which
+     * proves the request-construction code is right and nothing else. Whether the store enforces the
+     * precondition is a server-side question, and creation depends on that enforcement for name
+     * uniqueness: if the header were ignored, every concurrent creator would win and the unit test would
+     * still pass.
+     */
+    public void testCreateRegisterIfAbsentIsEnforcedServerSide() throws Exception {
+        final String repository = createRepository(randomName());
+        final BlobContainer container = getBlobContainer(repository);
+        final String registerName = "create-if-absent-register";
+        try {
+            BlobRegisterCasResult winner = container.createRegisterIfAbsent(
+                registerName,
+                new BytesArray("winner".getBytes(StandardCharsets.UTF_8))
+            );
+            assertTrue(winner.applied());
+            assertEquals(1L, winner.currentGeneration());
+
+            BlobRegisterCasResult loser = container.createRegisterIfAbsent(
+                registerName,
+                new BytesArray("loser".getBytes(StandardCharsets.UTF_8))
+            );
+            assertFalse("a name can only be taken once, and the store is what enforces that", loser.applied());
+
+            // The winner's value survives. Without server-side enforcement the loser would have
+            // overwritten it and this is the assertion that would notice.
+            assertEquals("winner", container.readRegister(registerName).get().value().utf8ToString());
+            assertEquals(1L, container.readRegister(registerName).get().generation());
+        } finally {
+            container.deleteBlobsIgnoringIfNotExists(Collections.singletonList(registerName));
+        }
+    }
+
+    /**
+     * Exercises {@link S3BlobContainer#compareAndSwapRegister}/{@code readRegister} against the
+     * real {@link fixture.s3.S3HttpHandler} fixture (extended to enforce real S3 If-Match/
+     * If-None-Match semantics for exactly this purpose): proof that the conditional-write guard is
+     * actually enforced server-side, not merely that our request-construction code compiles.
+     */
+    public void testCompareAndSwapRegisterUsesRealConditionalWrites() throws Exception {
+        final String repository = createRepository(randomName());
+        final BlobContainer container = getBlobContainer(repository);
+        final String registerName = "test-register";
+        try {
+            // No register yet: put-if-absent succeeds once, and a second put-if-absent from a
+            // "loser" conflicts against what the winner just wrote.
+            BlobRegisterCasResult first = container.compareAndSwapRegister(
+                registerName,
+                BlobRegister.ABSENT_GENERATION,
+                new BytesArray("v1".getBytes(StandardCharsets.UTF_8))
+            );
+            assertTrue(first.applied());
+            assertEquals(1L, first.currentGeneration());
+
+            BlobRegisterCasResult racerConflict = container.compareAndSwapRegister(
+                registerName,
+                BlobRegister.ABSENT_GENERATION,
+                new BytesArray("racer".getBytes(StandardCharsets.UTF_8))
+            );
+            assertFalse("a second put-if-absent must lose to the one that already succeeded", racerConflict.applied());
+            assertEquals(1L, racerConflict.currentGeneration());
+
+            // readRegister sees exactly what won.
+            Optional<BlobRegister> read = container.readRegister(registerName);
+            assertTrue(read.isPresent());
+            assertEquals(1L, read.get().generation());
+            assertEquals("v1", read.get().value().utf8ToString());
+
+            // A CAS against a stale generation conflicts; against the current one, it succeeds.
+            BlobRegisterCasResult staleUpdate = container.compareAndSwapRegister(
+                registerName,
+                0L,
+                new BytesArray("stale".getBytes(StandardCharsets.UTF_8))
+            );
+            assertFalse(staleUpdate.applied());
+            assertEquals(1L, staleUpdate.currentGeneration());
+
+            BlobRegisterCasResult goodUpdate = container.compareAndSwapRegister(
+                registerName,
+                1L,
+                new BytesArray("v2".getBytes(StandardCharsets.UTF_8))
+            );
+            assertTrue(goodUpdate.applied());
+            assertEquals(2L, goodUpdate.currentGeneration());
+            assertEquals("v2", container.readRegister(registerName).get().value().utf8ToString());
+        } finally {
+            container.deleteBlobsIgnoringIfNotExists(Collections.singletonList(registerName));
+        }
+    }
+
+    /**
+     * Concurrent CAS-retry-loop updates against the same register must never lose an update: this
+     * is exactly the pattern {@code BlobContainerShardStateStore} and friends rely on, and it's
+     * only meaningful against a fixture that actually enforces conditional writes server-side.
+     */
+    public void testConcurrentCompareAndSwapRegisterRetryLoopLosesNoUpdates() throws Exception {
+        final String repository = createRepository(randomName());
+        final BlobContainer container = getBlobContainer(repository);
+        final String registerName = "counter-register";
+
+        int incrementerCount = 8;
+        java.util.concurrent.ExecutorService executor = Executors.newFixedThreadPool(incrementerCount);
+        java.util.concurrent.CountDownLatch startLatch = new java.util.concurrent.CountDownLatch(1);
+        try {
+            List<java.util.concurrent.Future<?>> futures = new ArrayList<>();
+            for (int i = 0; i < incrementerCount; i++) {
+                futures.add(executor.submit(() -> {
+                    try {
+                        startLatch.await();
+                        for (int attempt = 0; attempt < 50; attempt++) {
+                            Optional<BlobRegister> current = container.readRegister(registerName);
+                            long currentGeneration = current.map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
+                            int currentValue = current.map(r -> Integer.parseInt(r.value().utf8ToString())).orElse(0);
+                            BlobRegisterCasResult result = container.compareAndSwapRegister(
+                                registerName,
+                                currentGeneration,
+                                new BytesArray(Integer.toString(currentValue + 1).getBytes(StandardCharsets.UTF_8))
+                            );
+                            if (result.applied()) {
+                                return;
+                            }
+                        }
+                        throw new AssertionError("failed to apply an increment after 50 attempts");
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                }));
+            }
+            startLatch.countDown();
+            for (java.util.concurrent.Future<?> future : futures) {
+                future.get(60, TimeUnit.SECONDS);
+            }
+        } finally {
+            executor.shutdown();
+        }
+
+        try {
+            int finalValue = Integer.parseInt(container.readRegister(registerName).get().value().utf8ToString());
+            assertEquals(
+                "every concurrent incrementer's update must be reflected, none lost to a missed conflict",
+                incrementerCount,
+                finalValue
+            );
+        } finally {
+            container.deleteBlobsIgnoringIfNotExists(Collections.singletonList(registerName));
+        }
+    }
+
+    private BlobContainer getBlobContainer(String repository) {
+        final BlobStoreRepository blobStoreRepository = (BlobStoreRepository) internalCluster().getClusterManagerNodeInstance(
+            RepositoriesService.class
+        ).repository(repository);
+        return blobStoreRepository.blobStore().blobContainer(blobStoreRepository.basePath());
     }
 
     /**

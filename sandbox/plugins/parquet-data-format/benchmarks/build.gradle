@@ -45,14 +45,29 @@ dependencies {
   runtimeOnly 'net.sf.jopt-simple:jopt-simple:5.0.4'
   runtimeOnly 'org.apache.commons:commons-math3:3.6.1'
 
-  // Arrow dependencies for benchmark data generation
+  // Arrow dependencies for benchmark data generation.
+  // This is a plain application classpath, not a plugin classloader chain, so every Arrow jar the
+  // benchmark needs must be listed here. parquet-data-format declares its Arrow/Netty/Jackson deps
+  // compileOnly (arrow-base ships them at runtime in production), so none of them arrive
+  // transitively through the project dependency above.
   api "org.apache.arrow:arrow-vector:${versions.arrow}"
   api "org.apache.arrow:arrow-memory-core:${versions.arrow}"
   api "org.apache.arrow:arrow-memory-unsafe:${versions.arrow}"
   api "org.apache.arrow:arrow-c-data:${versions.arrow}"
   api "org.apache.arrow:arrow-format:${versions.arrow}"
+  // Arrow's default AllocationManager is Netty; keep it available so the benchmark allocates the
+  // same way production does rather than silently falling back to the Unsafe manager.
+  api "org.apache.arrow:arrow-memory-netty:${versions.arrow}"
+  api "org.apache.arrow:arrow-memory-netty-buffer-patch:${versions.arrow}"
+  api "io.netty:netty-buffer:${versions.netty}"
+  api "io.netty:netty-common:${versions.netty}"
 
   api "com.google.flatbuffers:flatbuffers-java:${versions.flatbuffers}"
+
+  // arrow-vector's JsonStringArrayList builds an ObjectMapper on <clinit>; server ships
+  // jackson-core but not jackson-databind/-annotations.
+  api "com.fasterxml.jackson.core:jackson-databind:${versions.jackson_databind}"
+  api "com.fasterxml.jackson.core:jackson-annotations:${versions.jackson_annotations}"
 
   // Logging dependencies required by Arrow
   api "org.slf4j:slf4j-api:${versions.slf4j}"
@@ -81,7 +96,7 @@ spotless {
 }
 
 run.jvmArgs += [
-  '--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED'
+  '--add-opens=java.base/java.nio=ALL-UNNAMED'
 ]
 
 run.environment += [

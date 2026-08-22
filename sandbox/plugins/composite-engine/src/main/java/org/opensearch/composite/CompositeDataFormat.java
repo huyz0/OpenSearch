@@ -12,7 +12,12 @@ import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.index.engine.dataformat.DataFormat;
 import org.opensearch.index.engine.dataformat.FieldTypeCapabilities;
 
+import java.util.Collections;
+import java.util.EnumSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 
@@ -25,6 +30,9 @@ import java.util.Set;
  */
 @ExperimentalApi
 public class CompositeDataFormat extends DataFormat {
+
+    /** Canonical format name for the composite engine. */
+    public static final String COMPOSITE_FORMAT_NAME = "composite";
 
     private final DataFormat primaryDataFormat;
     private final List<DataFormat> dataFormats;
@@ -68,24 +76,57 @@ public class CompositeDataFormat extends DataFormat {
 
     @Override
     public String name() {
-        return "composite";
+        return COMPOSITE_FORMAT_NAME;
     }
 
+    /**
+     * {@inheritDoc}
+     * <p>
+     * {@code priority()} is a <em>precedence rank</em>: both places that order formats —
+     * {@code DataFormatRegistry.supportsCapability} and
+     * {@link CompositeDataFormatPlugin#assignCapabilities} — sort <b>ascending</b> and take the
+     * earliest match, so a <b>lower</b> number means the format is preferred <b>sooner</b>
+     * (parquet {@code 0} is consulted before lucene {@code 50}).
+     * <p>
+     * The composite format is a last-resort fallback for any field that a concrete format can
+     * serve on its own, so it returns {@link Long#MAX_VALUE} and sorts last. It previously
+     * returned {@link Long#MIN_VALUE} while its comment claimed "lowest priority" — under an
+     * ascending sort that put the composite <em>first</em>, the exact opposite of the intent.
+     */
     @Override
     public long priority() {
-        // In case some other format can independently support,
-        // the composite format should have the lowest priority
-        return Long.MIN_VALUE;
+        return Long.MAX_VALUE;
     }
 
+    /**
+     * {@inheritDoc}
+     * <p>
+     * The union — per field type — of every constituent format's capabilities, matching what
+     * {@link CompositeIndexingExecutionEngine} documents this format as exposing. It previously
+     * returned only {@code dataFormats.get(0).supportedFields()}, which under-reported any
+     * capability that only a secondary format could serve.
+     * <p>
+     * The instance the registry stores comes from {@link #CompositeDataFormat() the no-arg
+     * constructor} and therefore has no constituents, so it correctly reports an empty set: that
+     * instance is a name/priority placeholder, and per-field routing for a composite index is
+     * decided by {@link CompositeDataFormatPlugin#assignCapabilities}, which resolves the
+     * configured formats from index settings rather than reading this method.
+     */
     @Override
     public Set<FieldTypeCapabilities> supportedFields() {
-        // Union of all constituent formats' supported fields
-        // TODO:: Post the changes done in mappings, we will relook this
         if (dataFormats.isEmpty()) {
             return Set.of();
         }
-        return dataFormats.get(0).supportedFields();
+        Map<String, EnumSet<FieldTypeCapabilities.Capability>> byFieldType = new LinkedHashMap<>();
+        for (DataFormat dataFormat : dataFormats) {
+            for (FieldTypeCapabilities ftc : dataFormat.supportedFields()) {
+                byFieldType.computeIfAbsent(ftc.fieldType(), k -> EnumSet.noneOf(FieldTypeCapabilities.Capability.class))
+                    .addAll(ftc.capabilities());
+            }
+        }
+        Set<FieldTypeCapabilities> union = new LinkedHashSet<>(byFieldType.size());
+        byFieldType.forEach((fieldType, capabilities) -> union.add(new FieldTypeCapabilities(fieldType, capabilities)));
+        return Collections.unmodifiableSet(union);
     }
 
     @Override

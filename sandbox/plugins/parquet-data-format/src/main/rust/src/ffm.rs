@@ -154,6 +154,9 @@ pub unsafe extern "C" fn parquet_finalize_writer(
             if !sort_perm_ptr_out.is_null() && !sort_perm_len_out.is_null() {
                 if let Some(perm) = result.row_id_mapping {
                     let len = perm.len();
+                    let mapping_bytes = len * std::mem::size_of::<i64>();
+                    // Track mapping handoff to Java — Java holds until parquet_free_row_id_mapping
+                    crate::memory::write_pool().grow(mapping_bytes);
                     let boxed = perm.into_boxed_slice();
                     *sort_perm_len_out = len as i64;
                     *sort_perm_ptr_out = Box::into_raw(boxed) as *mut i64 as i64;
@@ -169,17 +172,6 @@ pub unsafe extern "C" fn parquet_finalize_writer(
     }
 }
 
-#[ffm_safe]
-#[no_mangle]
-pub unsafe extern "C" fn parquet_sync_to_disk(
-    file_ptr: *const u8,
-    file_len: i64,
-) -> i64 {
-    let filename = str_from_raw(file_ptr, file_len).map_err(|e| format!("parquet_sync_to_disk: {}", e))?.to_string();
-    NativeParquetWriter::sync_to_disk(filename)
-        .map(|_| 0)
-        .map_err(|e| e.to_string())
-}
 
 #[ffm_safe]
 #[no_mangle]
@@ -296,7 +288,6 @@ pub unsafe extern "C" fn parquet_on_settings_update(
     bloom_filter_fpp: f64,
     bloom_filter_ndv: i64,
     sort_in_memory_threshold_bytes: i64,
-    sort_batch_size: i64,
     row_group_max_rows: i64,
     row_group_max_bytes: i64,
     merge_batch_size: i64,
@@ -440,7 +431,6 @@ pub unsafe extern "C" fn parquet_on_settings_update(
         bloom_filter_fpp: opt_f64(bloom_filter_fpp),
         bloom_filter_ndv: opt_u64(bloom_filter_ndv),
         sort_in_memory_threshold_bytes: opt_u64(sort_in_memory_threshold_bytes),
-        sort_batch_size: opt_usize(sort_batch_size),
         row_group_max_rows: opt_usize(row_group_max_rows),
         row_group_max_bytes: opt_usize(row_group_max_bytes),
         merge_batch_size: opt_usize(merge_batch_size),
@@ -498,6 +488,10 @@ pub unsafe extern "C" fn parquet_merge_files(
     out_gen_offsets_ptr: *mut i64,
     out_gen_sizes_ptr: *mut i64,
     out_gen_count: *mut i64,
+    // Per-merge stats forwarded to the per-shard ParquetShardStatsTracker on the Java side.
+    out_flush_and_sort_chunk_count: *mut i64,
+    out_flush_and_sort_chunk_time_millis: *mut i64,
+    out_row_id_mapping_max: *mut i64,
 ) -> i64 {
     let input_files = str_array_from_raw(input_ptrs, input_lens, input_count)
         .map_err(|e| format!("parquet_merge_files inputs: {}", e))?;
@@ -559,6 +553,9 @@ pub unsafe extern "C" fn parquet_merge_files(
     // Write row-ID mapping into out-pointers as heap-allocated arrays.
     // Java reads them and then calls parquet_free_merge_result to deallocate.
     let mapping = result.mapping.into_boxed_slice();
+    let mapping_bytes = mapping.len() * std::mem::size_of::<i64>();
+    // Track merge mapping handoff to Java — Java holds until parquet_free_merge_result
+    crate::memory::merge_pool().grow(mapping_bytes);
     *out_mapping_len = mapping.len() as i64;
     *out_mapping_ptr = Box::into_raw(mapping) as *mut i64 as i64;
 
@@ -570,6 +567,11 @@ pub unsafe extern "C" fn parquet_merge_files(
     *out_gen_keys_ptr = Box::into_raw(keys) as *mut i64 as i64;
     *out_gen_offsets_ptr = Box::into_raw(offsets) as *mut i32 as i64;
     *out_gen_sizes_ptr = Box::into_raw(sizes) as *mut i32 as i64;
+
+    // Per-merge stats out-pointers — callers always pass valid pointers (matches existing convention).
+    *out_flush_and_sort_chunk_count = result.flush_and_sort_chunk_count;
+    *out_flush_and_sort_chunk_time_millis = result.flush_and_sort_chunk_time_millis;
+    *out_row_id_mapping_max = result.row_id_mapping_max;
 
     Ok(0)
 }
@@ -585,6 +587,9 @@ pub unsafe extern "C" fn parquet_free_merge_result(
     gen_count: i64,
 ) {
     if mapping_ptr != 0 && mapping_len > 0 {
+        let mapping_bytes = mapping_len as usize * std::mem::size_of::<i64>();
+        // Java released merge mapping — free from pool
+        crate::memory::merge_pool().shrink(mapping_bytes);
         let _ = Box::from_raw(slice::from_raw_parts_mut(mapping_ptr as *mut i64, mapping_len as usize));
     }
     let n = gen_count as usize;
@@ -691,6 +696,104 @@ pub unsafe extern "C" fn parquet_free_row_id_mapping(
     mapping_len: i64,
 ) {
     if mapping_ptr != 0 && mapping_len > 0 {
+        let mapping_bytes = mapping_len as usize * std::mem::size_of::<i64>();
+        // Java released write mapping — free from pool
+        crate::memory::write_pool().shrink(mapping_bytes);
         let _ = Box::from_raw(slice::from_raw_parts_mut(mapping_ptr as *mut i64, mapping_len as usize));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Native runtime metrics
+// ---------------------------------------------------------------------------
+
+/// Collect a snapshot of native runtime stats for the parquet merge path.
+///
+/// The caller passes a buffer of 11 i64s. On success, writes the 11-stat snapshot in the order
+/// documented in `ParquetNativeRuntimeStats.fromArray`. Returns 0 on success, or a negative
+/// error pointer on failure (per FFM convention).
+/// Returns 0 on success, negative error pointer on failure (per FFM convention).
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn parquet_collect_runtime_metrics(
+    out_buf: *mut i64,
+    out_len: i64,
+) -> i64 {
+    if out_buf.is_null() {
+        return Err("parquet_collect_runtime_metrics: null out_buf".to_string());
+    }
+    if out_len < 17 {
+        return Err(format!(
+            "parquet_collect_runtime_metrics: out_len {} < 17",
+            out_len
+        ));
+    }
+    let s = crate::merge::metrics::collect();
+    let arr: [i64; 17] = [
+        s.rayon_configured_threads,
+        s.rayon_merge_tasks_submitted,
+        s.rayon_merge_tasks_started,
+        s.rayon_merge_tasks_completed,
+        s.rayon_merge_tasks_failed,
+        s.rayon_merge_tasks_panicked,
+        s.rayon_merge_wall_millis,
+        s.tokio_num_workers,
+        s.tokio_num_blocking_threads,
+        s.tokio_active_tasks,
+        s.tokio_global_queue_depth,
+        s.tokio_blocking_queue_depth,
+        s.tokio_local_queue_depth_total,
+        s.tokio_polls_count_total,
+        s.tokio_overflow_count_total,
+        s.tokio_spawned_tasks_total,
+        s.tokio_workers_busy_millis_total,
+    ];
+    std::ptr::copy_nonoverlapping(arr.as_ptr(), out_buf, 17);
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// Memory pool management (Phase 1 stubs)
+// ---------------------------------------------------------------------------
+
+/// Initialize write and merge memory pool counters.
+#[no_mangle]
+pub extern "C" fn parquet_init_memory_pools(write_limit: i64, merge_limit: i64) {
+    crate::memory::init_pools(write_limit as usize, merge_limit as usize);
+}
+
+/// Set write pool limit. Called by Java rebalancer via FFM.
+#[no_mangle]
+pub extern "C" fn parquet_set_write_pool_limit(new_limit: i64) {
+    crate::memory::set_write_limit(new_limit as usize);
+}
+
+/// Set merge pool limit. Called by Java rebalancer via FFM.
+#[no_mangle]
+pub extern "C" fn parquet_set_merge_pool_limit(new_limit: i64) {
+    crate::memory::set_merge_limit(new_limit as usize);
+}
+
+/// Register the over-commit decision callbacks (FFM upcall stubs from the Java allocator).
+///
+/// `decider(requested_bytes) -> 1|0` decides whether a full pool may over-commit; `releaser(bytes)`
+/// is called with the granted byte count when the reservation is released. Because all native
+/// modules share one cdylib (and thus one `native-bridge-common` instance), this single
+/// registration covers every pool that uses `Reject`.
+#[no_mangle]
+pub extern "C" fn parquet_register_overcommit_callbacks(
+    decider: native_bridge_common::memory_pool::OverCommitDecider,
+    releaser: native_bridge_common::memory_pool::OverCommitReleaser,
+) {
+    native_bridge_common::memory_pool::set_overcommit_callbacks(decider, releaser);
+}
+
+/// Get pool stats: writes 6 i64s to out_buf.
+/// Layout: [write_limit, write_used, write_peak, merge_limit, merge_used, merge_peak]
+#[no_mangle]
+pub unsafe extern "C" fn parquet_get_pool_stats(out_buf: *mut i64) {
+    let stats = crate::memory::get_stats();
+    for (i, val) in stats.iter().enumerate() {
+        *out_buf.add(i) = *val as i64;
     }
 }
