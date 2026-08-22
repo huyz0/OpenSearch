@@ -1,0 +1,24 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
+
+apply plugin: 'opensearch.internal-cluster-test'
+
+opensearchplugin {
+  description = 'Object-store-native storage format (segment bundles, commit manifests, GC) for the serverless data plane'
+  classname = 'org.opensearch.serverless.storage.ServerlessStoragePlugin'
+  hasClientJar = false
+}
+
+dependencies {
+  testImplementation project(':test:framework')
+  // Real cloud-object-store integration test (rfc-serverless-opensearch.md §16 Phase 1): reuses
+  // repository-s3's own production plugin against the s3-fixture's real (in-process) S3 HTTP API
+  // surface, rather than only ever exercising this plugin against local-filesystem/mock containers.
+  internalClusterTestImplementation project(':plugins:repository-s3')
+  internalClusterTestImplementation project(':test:fixtures:s3-fixture')
+}

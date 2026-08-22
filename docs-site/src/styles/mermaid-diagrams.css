@@ -1,0 +1,53 @@
+.mmd-wrapper {
+	border: 1px solid var(--sl-color-hairline);
+	border-radius: 0.5rem;
+	background: var(--sl-color-bg-nav);
+	margin: 1.5rem 0;
+	padding: 1.25rem;
+	display: flex;
+	justify-content: center;
+	cursor: zoom-in;
+}
+
+.mmd-wrapper svg {
+	display: block;
+	max-width: 100%;
+	height: auto;
+}
+
+.mmd-source-holder {
+	display: none;
+}
+
+.mmd-lightbox-overlay {
+	position: fixed;
+	inset: 0;
+	background: rgba(0, 0, 0, 0.75);
+	z-index: 999;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	justify-content: center;
+	cursor: zoom-out;
+}
+
+.mmd-lightbox-stage {
+	width: min(94vw, 1400px);
+	height: min(88vh, 1000px);
+	background: var(--sl-color-bg);
+	border-radius: 0.5rem;
+	overflow: hidden;
+	cursor: default;
+}
+
+.mmd-lightbox-stage svg {
+	width: 100%;
+	height: 100%;
+}
+
+.mmd-lightbox-hint {
+	margin-top: 0.75rem;
+	color: var(--sl-color-gray-2);
+	font-size: 0.85rem;
+	cursor: zoom-out;
+}

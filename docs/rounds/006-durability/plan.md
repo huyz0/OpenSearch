@@ -1,0 +1,276 @@
+# Round 006 — Durability for the gated fleet
+
+Written 2026-08-15. The question that started it: *will snapshot work?* It does not, and answering why
+turned up a set of gaps that are smaller and better-shaped than they look, because most of the machinery
+already exists and is pointed at the wrong authority.
+
+## Where this starts
+
+Measured, not assumed (each of these has a test on the branch):
+
+- **Snapshot by name of a gated index** is refused with an honest error. Deliberate, already tested.
+- **Snapshot of everything succeeds and silently omits the gated fleet.** All four spellings — no indices
+  set, `*`, `_all`, a matching prefix wildcard — report `SUCCESS` with only ordinary indices captured.
+- **A shallow snapshot already exists**: `_snapshot_pin` writes a durable pin naming a manifest generation
+  and copies nothing; `_snapshot_restore` compare-and-swaps the shard head back to a pinned generation;
+  `_snapshot_release` drops the pin. GC honours durable pins.
+- **It cannot name a gated index.** The three index-level actions resolve through
+  `clusterService.state().metadata().index(name)`, which is null for a gated index, so a pin fails
+  `IndexNotFoundException` for an index that is serving traffic and has manifests to pin. The shard-level
+  actions underneath take a uuid and a shard id and never consult cluster state.
+- **Core `_snapshot` against a serverless index is pointer-based unconditionally**, and already writes a
+  durable pin underneath (`EngineNativeSnapshotPayload` carries a `pinId`). The two shallow front doors are
+  one mechanism.
+- **Nothing resolves a timestamp.** `CommitManifest.createdAtMillis` is read only by retention policies
+  deciding what to keep. `serverless_storage.pitr_window` defaults to `-1`, disabled.
+
+So: two front doors onto one shallow mechanism, zero deep ones, and no way to ask for a point in time.
+
+## What decides the shape
+
+**Three tiers, insuring against three different failures.** Conflating them is how a backup story becomes a
+false one.
+
+| tier | protects against | cost | belongs at |
+|---|---|---|---|
+| pin (shallow) | your own GC; logical error, bad write, tenant rollback | one blob write per shard | per index, always on |
+| pointer snapshot | same as pin, plus cataloguing and standard tooling | a few hundred bytes | per index, on request |
+| independent copy | loss of the source bucket, account, or region | O(bytes) | **per index only on request; per fleet at the store** |
+
+The third row is the one that must not be built the obvious way. A per-index deep snapshot across a hundred
+million indices is O(N) cluster work and an unbounded copy, for a fleet whose entire premise is that
+per-index work was removed. Fleet-wide physical DR belongs to the object store — bucket versioning, a
+deny-delete policy, cross-region replication — where the provider does it asynchronously at storage cost
+with no per-index work in the cluster. Per-index deep copy earns its keep only for tenant export, legal
+hold, and a "protect these specific indices properly" policy.
+
+**The pin is protection against our own GC and nothing else.** Stated here because it is the sentence that
+is easiest to forget: a pin stops `ManifestRetentionPolicy` from reclaiming a generation. It does not stop a
+lifecycle rule, an operator, or a compromised credential. Versioning and deny-delete are what stop those,
+and they are out of band by design — the two enforcements should not share a failure domain.
+
+## The work
+
+Ordered so each item is usable on its own and each unblocks the next.
+
+### 1. The pin surface reaches gated indices — DONE, and it found something bigger
+
+`TransportIndexSnapshotPinAction`, `...RestoreAction` and `...ReleaseAction` resolve the index name through
+`AbsentIndexDescriptorSuppliers.metadataOrDescriptor(metadata, name)` instead of `metadata.index(name)`.
+That call already synthesises an `IndexMetadata` carrying the uuid and shard count for a gated index, and
+these actions run on transport/GENERIC threads, so a descriptor read is safe here — `blockingIsUnsafeHere`
+forbids it only on cluster state threads.
+
+*Verification*: `GatedShallowSnapshotIT` already pins the failure; it becomes the success. Extend it to the
+full round trip — pin, write more, restore, assert the later write is gone — because a pin that can be
+taken and not restored from is not a snapshot.
+
+*Risk assessed as none. That was right about the resolution and wrong about the round trip.*
+
+**What landed**: all three actions resolve through `metadataOrDescriptor`. Pin and release now work on a
+gated index, asserted.
+
+**What the round trip found — a defect two layers down.** Restore-in-place refuses while a writer lease is
+held. The ordinary-index restore test releases that lease by closing the index. Closing a *gated* index did
+not release it, and pulling that thread found that closing a gated index did not do anything at all:
+
+- `IndexDescriptor.toIndexMetadata()` never set the state, so every reader that synthesised metadata saw
+  `OPEN` whatever the descriptor said.
+- `IndexNameExpressionResolver`'s gated branch returns a concrete index and `continue`s **before**
+  `shouldTrackConcreteIndex`, the one place that refuses a closed index.
+
+So `MetadataIndexStateService.closeGatedIndices` wrote `descriptor.withState(CLOSE)`, answered
+acknowledged, and the index went on accepting writes and answering searches. Measured against an ordinary
+index, which refuses both with `IndexClosedException`. The existing test for gated close asserted the
+descriptor's own state — the label it had just written — which is exactly why a label was all it was.
+
+**Both fixed**, and a closed gated index now refuses precisely what a closed ordinary one refuses, compared
+against it rather than against a written-down expectation.
+
+**Still open, and it is what blocks the restore round trip**: the *shard* is not released on close, so the
+writer lease survives. The only channel that tells other nodes about a gated index's change is the
+descriptor change log, and `DescriptorChange` carries `(name, uuid, kind, atMillis)` with no state — so the
+tailer cannot distinguish a close from a mapping update and releases shards only for deletions. Fixing it
+means either a persisted change-log format carrying state, or a descriptor read per update change. That is
+a decision about a format that lives on the object store, and it is the next thing to do in this round.
+The round-trip test is `AwaitsFix` against it rather than weakened to assert the refusal, which would turn
+a defect into a specification.
+
+### 2. Restore to a time — DONE, with one thing it found
+
+Add `restoreToMillis` to the shard-level restore request and `restore_to` to the REST surface. When set,
+the target generation is resolved by time rather than by pin id: **the newest manifest whose
+`createdAtMillis` is at or before the requested instant**. `BlobContainerManifestStore.listManifests()`
+supplies the input; the resolution itself is a pure function and gets a unit test of its own, in the shape
+`PitrRetentionPolicy` already established.
+
+Two refusals matter more than the happy path, and both get tests:
+
+- **Nothing at or before the instant** — the requested time predates the shard's oldest surviving manifest.
+  Refuse naming the oldest available instant, rather than silently restoring to the oldest.
+- **The resolved generation is no longer pinned** — it fell out of the PITR window between resolution and
+  restore, or PITR was never enabled. Refuse naming the generation, rather than restoring to something that
+  GC may be about to reclaim.
+
+**What landed.** `PitrRestoreResolution` (pure, unit-tested: boundary inclusivity, ties by term then
+generation, order-independence, and the two empty cases), `restoreToMillis` on both the shard and index
+requests, `restore_to` on both REST routes, and both refusals wired with the messages the plan asked for.
+The index-level resolution runs per shard, twice — once to validate every shard before any head moves, once
+inside the shard action that moves it — because shards have their own commit histories and one instant is
+one generation *per shard*, not one across the index.
+
+**Proven end to end**: after a restore to an instant between two commits, the durable head sits at the
+generation that answers for that instant, asserted against the manifest list itself rather than against a
+number written into the test.
+
+**What it found.** A restore does not survive reopening the index: the writes past the restore point come
+back. The likelier cause is WAL replay, which is designed to reapply writes a manifest does not yet carry
+and cannot tell "not yet published" from "deliberately rolled back"; the alternative is that opening
+resolves the newest manifest rather than the head. The distinguishing measurement is whether the reopened
+shard's first new manifest descends from the restored generation or the latest one. `AwaitsFix`, because
+this is the assertion the existing restore coverage could not have made —
+`ServerlessStorageIndexSnapshotActionIT` checks the head record and never reopens the index, so a restore
+undone by recovery looks identical to one that holds.
+
+**This is now the gating question for the whole time machine**, and it outranks the remaining plan items: a
+restore that recovery undoes is not a restore, whichever of the two causes it turns out to be.
+
+*Granularity, stated so nobody expects otherwise*: this lands on the last commit at or before the instant,
+not on the instant. Sub-commit precision needs WAL replay to a timestamp, and `WalRecord` carries
+`(indexUuid, shardId, primaryTerm, seqNo)` and no time. That is a separate piece of work with a separate
+decision behind it (add a timestamp per record, or keep a periodic time-to-seqNo index) and is out of scope
+here.
+
+### 3. The silent omission becomes audible
+
+A wildcard snapshot on a cluster with the gate installed logs a warning naming the omission. Deliberately
+**not** a count: counting means a descriptor prefix search on the snapshot path, which is O(fleet) work to
+produce a number nobody can act on differently. A fixed, honest warning is what the operator needs, and it
+costs a boolean check.
+
+Also **not** a new field on `SnapshotInfo`: the engine-native design explicitly kept that surface unchanged,
+and this is not the change that should break it.
+
+### 4. The durability posture, written down
+
+A design page saying, in one place: what each of the three tiers protects against; that neither snapshot
+surface is an independent copy; that fleet-wide physical DR is the object store's job and requires
+versioning, deny-delete and replication to be configured; and that the pin protects only against our own
+GC. This is the piece that prevents the next person from reading "snapshot" and believing they have a
+backup — which is exactly what the current documentation would let them believe.
+
+### 5. An independent copy, with OpenSearch as the compute — PROVEN END TO END
+
+The one that changes what is possible rather than fixing what is misrouted. The design doc previously
+declined this on the grounds that `BlobContainer` has no `copyBlob` and no repository plugin uses
+server-side copy — a valid objection to the *optimization*, not to the operation. If the node moves the
+bytes, server-side copy was never on the table and the repack-versus-bulk-copy tension it created
+disappears.
+
+**The shape**, and why it is much smaller than the previous estimate:
+
+1. Pin the generation being copied, so GC cannot reclaim it mid-copy.
+2. Build a `LazyBundleDirectory` over that manifest. It already exists, and it needs only a manifest, a
+   cache directory and a transfer manager — not a live shard, not the writer.
+3. Wrap it in a `Store`, open its `IndexCommit`.
+4. Hand both to core's existing `Repository#snapshotShard`, which takes the `Store` and the `IndexCommit`
+   **as parameters** rather than reading them off a shard.
+5. Release the pin, on both the success and failure paths.
+
+What this buys that the pointer snapshot does not: a genuine independent copy, in the standard repository
+format, restorable by a cluster that has never heard of this plugin, incremental for free (the repository
+dedupes by file name, length and checksum against earlier snapshots), with no new `BlobContainer` SPI, no
+repack format, no new restore path, and no temporary disk. Lucene-file granularity is what the repository
+format already wants, so the copy is correctly sized without repacking anything.
+
+It also runs without the writer: the lazy directory needs only the object store and a manifest, so this can
+execute on a node holding no shard of the index — off the serving path entirely, which classic snapshot
+cannot do.
+
+**The spike passed, so the rest of this is wiring.** `BundleBackedCommitIsCopyableTests` builds a
+`LazyBundleDirectory` over a published manifest with no live shard, engine or local directory anywhere,
+takes its `IndexCommit`, and reads every file end to end with `CodecUtil.checksumEntireFile` -- the same
+call `BlobStoreRepository` makes when deciding whether a file can be reused or must be uploaded. Twenty
+files and 12,953 bytes, matching the local commit exactly in both byte count and file set: nothing copied
+that the commit does not name, nothing it names missed, and no whole-bundle over-read. This is the opposite
+access pattern to the one the lazy directory was built for -- searches read the blocks a query touches, a
+snapshot reads all of every file -- and nothing else exercised it.
+
+**The three things that are real work rather than wiring**, and the order to find out about them:
+
+- ~~*Does a `Store` over a lazy directory yield a commit whose files can be read end to end?*~~ **Answered:
+  yes.** The design above exists.
+- ~~*Orchestration.*~~ **Answered.** `DeepSnapshotOrchestrationIT` copies a serverless index's bytes into an
+  `fs` repository from a data node, finalizes the snapshot, and then **restores it through core's ordinary
+  `_restore` API** under a new name, with every document coming back. Not "the files are there" — core
+  restores it, so what was written is a snapshot rather than something shaped like one.
+
+  Two things the doing taught, both of which shape the feature:
+
+  * **`Store#getMetadata` asserts the commit's directory is identity-equal to the store's own**, so the
+    commit has to be listed from `store.directory()` rather than from the lazy directory underneath it.
+    That is a good assertion — it is what stops a snapshot copying files from one directory while
+    describing another — and it is the kind of thing only building it finds.
+  * **The copy distributes; the finalization does not.** `finalizeSnapshot` submits a cluster state update
+    ("set pending repository generation"), so on any other node it fails `NotClusterManagerException`. The
+    copy itself has no such constraint: it ran on a data node, reading the object store and writing the
+    repository. So a deep snapshot is *one cluster-manager operation per snapshot* with all of the byte
+    movement off it — which is the right shape for this branch, since per-index cluster-manager work is
+    exactly what it spent the year removing.
+- *The opt-in.* `attemptEngineNativeSnapshot` returns a pointer unconditionally today; deep versus shallow
+  has to become a choice, mirroring `remote_store_index_shallow_copy`'s shape.
+
+**What is left to ship it**, now that nothing about it is uncertain: a transport action that pins the
+generation, drives the copy per shard (parallelisable across nodes), finalizes on the cluster manager, and
+releases the pin on both paths; the deep-versus-shallow setting; and gated-index resolution, which item 1
+already built.
+
+## Sequencing, and what "done" means for each
+
+| # | item | state | size |
+|---|---|---|---|
+| 1 | pin surface reaches gated indices | pin and release **done** | small → medium |
+| 1b | **close releases a gated shard** (new, found by 1) | **done** — the harness now drives a real change feed; `GatedShallowSnapshotIT` no longer carries `AwaitsFix` | medium |
+| 2 | restore to a time | **done**: resolution unit-tested, both refusals tested, head lands correctly | small |
+| 2b | **a restore must survive reopening** (new, found by 2) | **done** — cause was the local store, not the WAL | small once measured |
+| 3 | audible omission | **done**: wildcard snapshot on a gated cluster warns, predicate tested per spelling | small |
+| 4 | posture written down | **done**: `design/durability-posture.md`, banner on the snapshot page | small |
+| 5 | independent copy | **shipped** for an ordinary source; **a new `AwaitsFix`** for a gated source — see below | small–medium |
+| 6 | **ledger sweep** (new) | **done**, node-local by design — see below | small, once the resolver exists |
+
+### 2b, resolved: the cause was the local store
+
+Two things undid a restore, and the guess recorded above named the second one. The first, and the one that actually carries it: reopening on a node that still holds the pre-restore Lucene files recovers from those files and never consults the object store at all. `recoverMissingLocalStore` only runs when there is no readable local commit. So `EngineFactory#localStoreIsStale` was added — an engine whose authority lives elsewhere can say its local copy is out of date, and `StoreRecovery` cleans and re-materialises. Core already did exactly this for a revived in-place-merge parent a few lines below; that branch is the precedent this generalises.
+
+The second is real but unproven: a rewound head also rewinds WAL replay's floor. A restore now publishes a new generation carrying the target's segments and the *newest* manifest's WAL position (`RestoreManifestSynthesis`), so it moves forward like every other publication — which also keeps head generations monotonic, makes a restore itself restorable-past, and lets GC keep the restored files because the live head manifest names them directly. **But no test demonstrates the WAL half.** With mirroring on, reverting that one field leaves the reopen test green, and so does leaving the write unflushed so it lives only in the WAL. It is kept because advertising a replay floor beneath a range you have decided not to replay is wrong by construction, and the test says plainly that it does not isolate it.
+
+### 1b, resolved: three layers, and the third was the harness
+
+`DescriptorChange` now carries `CLOSED`, and the tailer asks `releasesShard()` rather than `!live()` — a closed index keeps its name and loses its shard, and conflating those is what let a closed gated index go on serving. That changed nothing when measured, which surfaced the second layer: a close is written through `IndexDescriptorPublisher.updateGated`, and that path appended no change of any kind, so no entry existed for the new kind to travel in. It records one now, which also stops a mapping update republished that way leaving other nodes' caches stale.
+
+The third layer was `GatedShallowSnapshotIT`'s own harness: `installBlobBackedDescriptorPlane` installs the descriptor store and never calls `DescriptorGate.setChangeFeed`, so every test using it ran with an appender writing to nothing and no tailer reading anything, regardless of what the first two layers fixed. `startDescriptorChangeTail` wires a real `BlobDescriptorChangeLog` and a real `DescriptorChangeTailer` polling it, opted into only by the round-trip test. With that running the release holds: closing appends `CLOSED`, the tailer applies it, `IndicesClusterStateService.releaseGatedIndex` releases the shard, the lease lapses, and restore-in-place becomes reachable — proven both directions, since reverting the wiring reproduces the exact `IllegalStateException` the round trip named.
+
+### 5, shipped for an ordinary source, and what the gated case found
+
+`IndexDeepSnapshotAction`/`ShardDeepSnapshotAction` are the shipped action the spike was proven ahead of: pin, copy through a `Store` over a `LazyBundleDirectory` into the target repository via `Repository#snapshotShard`, finalize on the cluster manager, release on both paths. `IndexDeepSnapshotActionIT` proves an ordinary serverless index end to end — copied and restored by core's own `_restore`, every document back — and found two real bugs on the way that the spike's manual wiring never exercised: a same-thread-pool self-deadlock (the shard action blocked on a pin call that shares its own `GENERIC` dispatch, fixed by chaining through `ActionListener` instead of blocking) and a null `IndexMetadata` lookup inside `BlobStoreRepository#finalizeSnapshot` for a gated index's own metadata (fixed by folding the already-resolved descriptor metadata into the `Metadata` handed to finalize).
+
+**What is not shipped.** A deep snapshot of a *gated* source completes — the copy and the finalize both succeed — and the restored shard then never allocates, stuck at `allocation_status[fetching_shard_data]`. Traced to `PrimaryShardAllocator` refusing a snapshot-recovery shard until `InternalSnapshotsInfoService` supplies a shard size via `Repository#getShardSnapshotStatus`, and that fetch (or the reroute it should trigger) never resolving — plausibly because this action does not replicate `SnapshotsService`'s own in-memory concurrent-snapshot tracking, which is a boundary this action's javadoc already named rather than one this finding introduces. Computed placement enabled on the node is the one variable that distinguishes the passing case from the stuck one. Left `AwaitsFix` in `IndexDeepSnapshotActionIT`, the test bounded to a 30-second wait plus a diagnostic failure rather than the indefinite hang that first surfaced it.
+
+### 6, built once the blocker was gone
+
+The per-index container resolver the plan said this needed already existed: `ShardCloner.ContainerResolver`, built for clone lineage-chasing, has exactly the `(indexUuid, shardId) -> BlobContainer` shape a sweep needs. `PinLedgerSweeper` reads every shard a ledger names through it and deletes the ledger only once none of them still carry a live `PinRecord` under its pin id — an unreadable shard counts as still holding the pin, not as absent, so a transient failure can never manufacture the exact leak the ledger exists to prevent. `PinLedgerSweepTask` schedules it per index, off by default, built where `getEngineFactory` already has both shard 0's container and a resolver for its siblings in scope, and deduped by index uuid so a relocation cannot race a second task against the first.
+
+**Coverage is node-local by design**, and that is stated rather than discovered later: an index whose shard 0 has never opened on this node is not swept, because there is no fleet-wide registry of which indices carry a ledger to drive this from — the same gap that made a truly global sweep out of scope when this item was first written. Building that registry, if it is ever wanted, is a new, separate item.
+
+Items 1–4 are each independently shippable and none depends on 5. Item 5's spike gated whether the
+rest of it was a days-long piece or a different design entirely; it turned out to be wiring, plus one
+real deadlock and one real null-lookup that only a genuine end-to-end test found.
+
+## What this round deliberately does not do
+
+- **Sub-commit precision.** Needs a decision about WAL record timestamps first.
+- **Fleet-wide deep snapshot.** The wrong layer, per the table above.
+- **A new `Repository` implementation.** Investigated and deferred twice already; nothing here changes
+  that reasoning.
+- **Cross-region replication itself.** That is object-store configuration, not code. What this round owes
+  it is documentation saying it is required and why.

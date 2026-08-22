@@ -1,0 +1,15 @@
+/*
+ * Starlight's right "On this page" column grows to absorb all leftover
+ * horizontal space beyond the fixed content width on wide screens (its
+ * default width formula is effectively max(sidebarWidth, leftover-space)),
+ * which on a typical desktop leaves the main content column looking
+ * cramped in the middle. Give content more room and cap the right column
+ * to a fixed, comfortable width instead of letting it expand.
+ */
+:root {
+	--sl-content-width: 62rem;
+}
+
+.right-sidebar-container {
+	width: 16rem;
+}
