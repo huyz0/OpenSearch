@@ -24,6 +24,11 @@ import org.opensearch.core.xcontent.ToXContentFragment;
  * {@link Plugin#getNamedWriteables()} so the coordinator can deserialize
  * per-node payloads it received over transport.
  *
+ * <p>Restored after being deleted in favor of hardcoding one plugin's stats (native-allocator pool
+ * stats) directly onto {@code NodeStats}, which left every other plugin with no generic way to
+ * contribute node stats. Reintroducing this interface gives every plugin that generic path again, and
+ * sets up migrating the hardcoded stats onto it.
+ *
  * @opensearch.experimental
  */
 @ExperimentalApi

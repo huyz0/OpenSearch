@@ -102,6 +102,7 @@ import org.opensearch.index.translog.TranslogDeletionPolicy;
 import org.opensearch.index.translog.TranslogManager;
 import org.opensearch.indices.pollingingest.PollingIngestStats;
 import org.opensearch.search.suggest.completion.CompletionStats;
+import org.opensearch.snapshots.SnapshotId;
 
 import java.io.Closeable;
 import java.io.FileNotFoundException;
@@ -117,6 +118,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -127,6 +129,7 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.BiFunction;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
 
 import static org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_PRIMARY_TERM;
 import static org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO;
@@ -218,6 +221,24 @@ public abstract class Engine implements LifecycleAware, Closeable {
 
     public MergeStats getMergeStats() {
         return new MergeStats();
+    }
+
+    /**
+     * Returns {@code true} if the underlying merge scheduler has merges queued but not yet started.
+     * Default returns {@code false}; engines with a pending-merge queue (e.g., {@link InternalEngine}'s
+     * {@link DocumentIndexWriter}) override.
+     */
+    public boolean hasPendingMerges() {
+        return false;
+    }
+
+    /**
+     * Returns the number of merges currently in flight on this engine.
+     * Default returns {@code 0}; engines with a running-merges accessor (e.g.,
+     * {@link InternalEngine}'s {@code OpenSearchConcurrentMergeScheduler}) override.
+     */
+    public int getActiveMergeCount() {
+        return 0;
     }
 
     public MergedSegmentTransferTracker getMergedSegmentTransferTracker() {
@@ -968,6 +989,25 @@ public abstract class Engine implements LifecycleAware, Closeable {
         return null;
     }
 
+    /**
+     * Additional operations, beyond local translog, this engine needs replayed to reconstruct its
+     * state -- called by {@code IndexShard#openEngineAndRecoverFromTranslog()} once local translog
+     * recovery has completed, through the same {@code applyTranslogOperation} path (so mapping
+     * updates and version/seqno bookkeeping are handled identically to local translog recovery),
+     * before the shard proceeds toward being started. Empty by default: an engine whose durability
+     * is entirely local translog (every {@code InternalEngine} today) has nothing extra to supply.
+     * An engine backed by a durability mechanism beyond local disk (e.g. a write-ahead log mirrored
+     * to remote storage) overrides this to return whatever operations were durably written but not
+     * yet reflected in this shard's local state. A real override carries a subtle correctness
+     * obligation: replayed operations must be fenced against a competing writer that has taken over
+     * the shard since the operations were written, or a naive implementation reintroduces a
+     * lost-write bug. The plugin supplying such an engine keeps a formal model of that fencing
+     * argument alongside its implementation.
+     */
+    public List<Translog.Operation> engineRecoveryOperations() {
+        return List.of();
+    }
+
     protected TranslogDeletionPolicy getTranslogDeletionPolicy(EngineConfig engineConfig) {
         TranslogDeletionPolicy customTranslogDeletionPolicy = null;
         if (engineConfig.getCustomTranslogDeletionPolicyFactory() != null) {
@@ -982,6 +1022,26 @@ public abstract class Engine implements LifecycleAware, Closeable {
                 engineConfig.getIndexSettings().getTranslogRetentionTotalFiles()
             )
         );
+    }
+
+    /**
+     * The floor {@link CombinedDeletionPolicy} uses to decide which local Lucene commits are safe
+     * to delete: a commit whose max seq-no is at or below this value is eligible for deletion.
+     * Defaults to the translog's own last-synced global checkpoint -- unchanged from every
+     * engine's behavior before this method existed, since that is exactly what {@link
+     * InternalEngine} always passed directly before this hook was introduced.
+     *
+     * <p>Overriding this is for an engine whose durability model does not depend on the classic
+     * global-checkpoint/retention-lease chain (for example, one that treats an independent,
+     * already-durable remote store as authoritative and can safely retain less locally than a
+     * replica-recovery-oriented global checkpoint alone would justify). Widening the returned
+     * value only ever permits deleting <em>more</em> than the default would -- it can never keep a
+     * commit that core's own logic would otherwise have deleted, since {@link
+     * CombinedDeletionPolicy} always uses this value as a pure "safe to delete at or below"
+     * threshold, never as a floor that suppresses deletion.
+     */
+    protected LongSupplier globalCheckpointSupplierForCombinedDeletionPolicy(TranslogManager translogManagerRef) {
+        return translogManagerRef::getLastSyncedGlobalCheckpoint;
     }
 
     protected void fillSegmentStats(SegmentReader segmentReader, boolean includeSegmentFileSizes, SegmentsStats stats) {
@@ -1187,6 +1247,32 @@ public abstract class Engine implements LifecycleAware, Closeable {
     }
 
     /**
+     * Called synchronously by {@link org.opensearch.index.shard.IndexShard#bumpPrimaryTerm} the
+     * moment this shard's primary term is durably advanced on an already-open engine (the live
+     * promotion of an existing shard copy to primary) -- fired inside the same window write
+     * operations are already blocked in, strictly after the new term is set and strictly before
+     * operations resume, so an override observes exactly one atomic instant: "this engine is now
+     * definitely operating under {@code newPrimaryTerm}, and nothing has written under it yet."
+     *
+     * <p>No-op by default; every classic engine is unaffected. Exists purely as an extension seam
+     * for engine implementations (e.g. a plugin-supplied {@link EngineFactory}) that need to
+     * capture activation-time state atomically with the term bump itself, rather than merely at
+     * this engine's own constructor time -- which, for an engine object that already existed
+     * before promotion (as opposed to one freshly constructed to serve as this shard's first-ever
+     * primary), can observe the term only as it was before this exact promotion.
+     *
+     * <p>This is <em>not</em> called for a brand-new engine's own construction (e.g. this shard's
+     * primary being freshly allocated to a node that never held a copy before) -- there,
+     * {@link EngineConfig#getPrimaryTermSupplier()} already reflects the correct term by the time
+     * the engine's constructor runs, since {@code IndexShard}'s own constructor sets
+     * {@code pendingPrimaryTerm} from cluster metadata before anything about engine construction
+     * begins; no atomicity gap exists for that path, so no additional call is needed there.
+     *
+     * @param newPrimaryTerm the primary term this engine is now operating under.
+     */
+    public void onPrimaryTermBumped(long newPrimaryTerm) {}
+
+    /**
      * Synchronously refreshes the engine for new search operations to reflect the latest
      * changes.
      */
@@ -1261,6 +1347,37 @@ public abstract class Engine implements LifecycleAware, Closeable {
      */
     @Deprecated
     public abstract GatedCloseable<IndexCommit> acquireSafeIndexCommit() throws EngineException;
+
+    /**
+     * Returns an opaque pointer to this engine's own already-durable remote copy of its current
+     * state, if this engine maintains one independent of {@link #acquireLastIndexCommit}-based
+     * snapshotting. Called by {@code SnapshotShardsService} before falling back to the classic,
+     * copy-based snapshot path (which reads real bytes off this engine's local {@code Store}
+     * directory via {@link #acquireLastIndexCommit}) or the remote-store shallow-copy path.
+     *
+     * <p>Default returns {@link Optional#empty()}: current behavior unchanged for every existing
+     * engine, which falls back to {@code acquireLastIndexCommit}-based snapshotting exactly as it
+     * does today.
+     *
+     * <p>An engine that overrides this to return a non-empty {@link Optional} is asserting the
+     * returned {@link EngineNativeSnapshotPointer#payload()} is sufficient, on its own, to
+     * reconstruct this exact point-in-time state later via the matching {@link
+     * EngineFactory#recoverFromEngineNativeSnapshot}, including retaining/pinning whatever it
+     * references for as long as the resulting snapshot exists in the repository -- core has no
+     * visibility into what the payload means and cannot pin or garbage-collect anything on the
+     * engine's behalf. {@link EngineFactory#releaseEngineNativeSnapshot} is core's corresponding
+     * notification when a snapshot referencing it is deleted, resolved by the pointer's own {@link
+     * EngineNativeSnapshotPointer#engineId()} tag via {@link EngineNativeSnapshotReleasers} -- an
+     * engine that overrides this method is responsible for registering a matching releaser there
+     * during its own plugin initialization.
+     *
+     * @throws EngineException if this engine does support engine-native snapshots but this
+     *                          specific attempt failed -- surfaced as this shard's own snapshot
+     *                          failure, not silently downgraded to the copy-based fallback.
+     */
+    public Optional<EngineNativeSnapshotPointer> attemptEngineNativeSnapshot(SnapshotId snapshotId) throws EngineException {
+        return Optional.empty();
+    }
 
     /**
      * Acquires a safe {@link CatalogSnapshot} for the latest commit. Default implementation

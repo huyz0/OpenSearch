@@ -79,6 +79,24 @@ public interface IndexStorePlugin {
          */
         Directory newDirectory(IndexSettings indexSettings, ShardPath shardPath) throws IOException;
 
+        /**
+         * Same as {@link #newDirectory(IndexSettings, ShardPath)}, but also given the {@link ShardRouting}
+         * of the specific shard copy being created, so an implementation can pick a different directory
+         * depending on the copy's role (e.g. a read-only, remote-backed directory for a search-only
+         * replica vs. a normal writable one for a primary) -- the same per-copy differentiation
+         * {@link EnginePlugin#getEngineFactory(IndexSettings, ShardRouting)} already provides for engines.
+         * Defaults to delegating to the two-argument overload, so every existing {@link DirectoryFactory}
+         * keeps its current behavior unchanged; only an implementation that wants per-copy behavior needs
+         * to override this one instead.
+         *
+         * @param shardRouting the routing of the specific shard copy being created, or {@code null} if
+         *                      not available to the caller
+         */
+        default Directory newDirectory(IndexSettings indexSettings, ShardPath shardPath, @Nullable ShardRouting shardRouting)
+            throws IOException {
+            return newDirectory(indexSettings, shardPath);
+        }
+
         Directory newFSDirectory(Path location, LockFactory lockFactory, IndexSettings indexSettings) throws IOException;
     }
 
